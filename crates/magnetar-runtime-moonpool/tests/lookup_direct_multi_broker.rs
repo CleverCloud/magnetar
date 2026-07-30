@@ -604,3 +604,92 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
         })
         .await;
 }
+
+/// A single-bit corruption of the `pulsar` scheme word, the shape
+/// moonpool-sim's bit-flip chaos actually produced for issue #364.
+const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-sim.proxy.internal:6650";
+
+/// 1:1 twin of the tokio integration test of the same name (ADR-0024 layer c):
+/// a DIRECT lookup advertising a corrupted-scheme `broker_service_url` must
+/// fail the producer open with a scheme rejection, not dial a fabricated
+/// broker.
+///
+/// Moonpool's `direct_broker_authority` already rejected this input (issue
+/// #364, commit `db96010`), so this test was green the day it was written —
+/// the red/green proof for the shared contract lives on the tokio side, whose
+/// `parse_direct_broker_url` used to return
+/// `Ok(ParsedUrl { host: "ptlsar", port: 6650 })` and dial it. What this test
+/// adds is the moonpool half of the now-symmetric pair: until the tokio fix
+/// the two engines genuinely disagreed here, and moonpool's DIRECT-path
+/// rejection had integration coverage only in `tests/proxy_multi_conn.rs`
+/// (one of xtask's `PARITY_EXEMPT_FILES`, so it could not stand as the parity
+/// twin of anything). Cross-engine equivalence is asserted in
+/// `crates/magnetar-differential/tests/corrupted_broker_scheme_equivalence.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_producer_rejects_corrupted_scheme_broker_url() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host_a, sessions_a) = spawn_broker(BrokerRole {
+                redirect_to: Some(CORRUPTED_SCHEME_BROKER_URL.to_owned()),
+            })
+            .await;
+
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_plain_supervised(&engine, &host_a, supervised_config(), None, None),
+            )
+            .await
+            .expect("connect ok")
+            .expect("connect ok");
+
+            let open_result = tokio::time::timeout(
+                HANG_GUARD,
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/moonpool-direct-corrupted-scheme"
+                        .to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("open_producer did not time out");
+
+            let snap = sessions_a.lock().clone();
+            if let Some(d) = client.take_driver() {
+                d.abort();
+            }
+            drop(client);
+
+            let err = open_result.expect_err(
+                "open_producer must fail on a corrupted-scheme broker_service_url, not silently \
+                 succeed through a fabricated dial target",
+            );
+            assert!(
+                matches!(err, magnetar_runtime_moonpool::ClientError::Other(_)),
+                "the corrupted scheme must be rejected before any dial is attempted (a dial \
+                 failure would surface as ClientError::Io); got {err:?}",
+            );
+
+            assert_eq!(
+                snap.len(),
+                1,
+                "only the bootstrap session may be opened, got {snap:?}",
+            );
+            let kinds: Vec<_> = snap[0]
+                .frames
+                .iter()
+                .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+                .collect();
+            assert!(
+                kinds.contains(&pb::base_command::Type::Lookup),
+                "bootstrap session must have seen the LOOKUP, got {kinds:?}",
+            );
+            assert!(
+                !kinds.contains(&pb::base_command::Type::Producer),
+                "the PRODUCER must never be sent — the lookup target could not be resolved, got \
+                 {kinds:?}",
+            );
+        })
+        .await;
+}

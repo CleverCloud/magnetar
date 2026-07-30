@@ -399,6 +399,54 @@ mod tests {
         assert!(matches!(out, LookupOutcome::Connect { .. }));
     }
 
+    /// The sans-io core surfaces `broker_service_url` **verbatim** — it never
+    /// validates, normalises, or sanitises the scheme. Both engines depend on
+    /// that: rejecting a corrupted scheme (a single-bit corruption of the
+    /// `pulsar` word, `"ptlsar://…"`, the shape moonpool-sim's bit-flip chaos
+    /// produced for issue #364) is the CLIENT layer's contract —
+    /// `magnetar_runtime_tokio::client::parse_direct_broker_url` and
+    /// `magnetar_runtime_moonpool::client::direct_broker_authority`. If proto
+    /// ever started filtering here, those two rejections would become
+    /// unreachable and the engines' error surface would silently change.
+    ///
+    /// This pins the invariant from the proto side so the split of
+    /// responsibility stays explicit.
+    #[test]
+    fn connect_outcome_surfaces_a_corrupted_scheme_verbatim() {
+        const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-sim.proxy.internal:6650";
+
+        let resp = pb::CommandLookupTopicResponse {
+            broker_service_url: Some(CORRUPTED_SCHEME_BROKER_URL.to_owned()),
+            broker_service_url_tls: None,
+            response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+            request_id: 1,
+            authoritative: Some(false),
+            error: None,
+            message: None,
+            proxy_through_service_url: Some(false),
+        };
+        let req = fresh_lookup_request("persistent://public/default/corrupted-scheme", false);
+        match translate_lookup_response(&resp, &req) {
+            LookupOutcome::Connect {
+                broker_service_url,
+                proxy_through_service_url,
+                ..
+            } => {
+                assert_eq!(
+                    broker_service_url.as_deref(),
+                    Some(CORRUPTED_SCHEME_BROKER_URL),
+                    "proto must not rewrite or drop a corrupted scheme — the engines' \
+                     client layers are the ones that reject it",
+                );
+                assert!(
+                    !proxy_through_service_url,
+                    "DIRECT path implies proxy_through_service_url = false",
+                );
+            }
+            other => panic!("expected LookupOutcome::Connect, got {other:?}"),
+        }
+    }
+
     /// ADR-0060: the engine-side lookup-retry-on-`SessionLost`
     /// loop is bounded by [`MAX_LOOKUP_SESSION_REISSUES`]. The const must be
     /// non-zero (at least one re-issue is allowed — otherwise a single transient

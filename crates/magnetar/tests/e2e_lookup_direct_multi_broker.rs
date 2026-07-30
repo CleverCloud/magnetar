@@ -29,6 +29,42 @@
 //! hashes to a non-bootstrap broker. The e2e test here closes the loop
 //! that the runtime survives a real Pulsar standalone with the
 //! advertised `broker_service_url` round-tripping through it.
+//!
+//! # `parse_direct_broker_url` hardening — ADR-0024 layer 5
+//!
+//! This file also carries the e2e layer for the corrupted-scheme
+//! hardening of `magnetar_runtime_tokio::client::parse_direct_broker_url`:
+//! the helper now rejects an input containing
+//! `"://"` whose scheme `ParsedUrl::parse` does not recognise, instead of
+//! falling through to its bare-`host:port` fallback and prefixing a second
+//! scheme onto a string that already carried one.
+//!
+//! Every lookup on this test's path flows through that helper — a real
+//! standalone advertises a well-formed `pulsar://host:port`, so this is the
+//! `Ok(_)` branch, end to end against real infrastructure.
+//!
+//! **Honest scope note: this test was NOT red pre-fix**, and it is not the
+//! regression proof. The hardening only narrowed a fallback, so a
+//! well-formed URL behaves identically before and after. The red/green
+//! proof lives in
+//! `crates/magnetar-runtime-tokio/src/client.rs`'s
+//! `parse_direct_broker_url_rejects_corrupted_scheme` (verified red pre-fix
+//! at `Ok(ParsedUrl { host: "ptlsar", port: 6650 })`), its integration
+//! sibling `open_producer_rejects_corrupted_scheme_broker_url`, and the
+//! cross-engine
+//! `crates/magnetar-differential/tests/corrupted_broker_scheme_equivalence.rs`.
+//!
+//! **No dedicated corrupted-scheme e2e test exists, deliberately.** A
+//! genuinely corrupted scheme is not reachable against a real broker — TCP
+//! checksums make single-bit command-frame corruption practically
+//! unreachable in production, which is why the defect was found by
+//! moonpool-sim's bit-flip chaos rather than in the field; the same
+//! reasoning is recorded in `e2e_moonpool_direct_broker_authority.rs` about
+//! its own sibling hardening. Extending this test rather than adding a new
+//! `e2e_*.rs` also keeps the suite at one `pulsar standalone` container for
+//! the DIRECT path, per the container-memory budget in
+//! [`docs/testing.md` § "e2e container memory budget"](../../../docs/testing.md)
+//! and the open follow-up for a gate enforcing it.
 
 use std::time::Duration;
 
@@ -95,10 +131,27 @@ async fn start_pulsar()
 /// runtime ignored the advertised URL entirely — this is fine on
 /// standalone because the URL pointed at the bootstrap anyway, but the
 /// post-amendment routing must still hit the same code path.
+///
+/// Also the ADR-0024 layer-5 coverage for the `parse_direct_broker_url`
+/// corrupted-scheme hardening: the advertised URL a real broker produces
+/// must still take that helper's `Ok(_)` branch. See the module doc for
+/// why no corrupted-scheme e2e sibling exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_open_producer_against_standalone_after_direct_lookup()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _container) = start_pulsar().await?;
+
+    // The shape a real standalone advertises on every lookup response, and
+    // therefore the shape `parse_direct_broker_url` must keep accepting: a
+    // scheme it recognises, so the narrowed bare-`host:port` fallback is
+    // never reached. Pinned here because the whole round-trip below depends
+    // on it — if the broker ever advertised something else, the failure
+    // should name the URL rather than surface as an opaque producer error.
+    assert!(
+        service_url.starts_with("pulsar://"),
+        "the standalone's advertised service URL must carry a scheme \
+         parse_direct_broker_url recognises, got {service_url:?}",
+    );
 
     let client = PulsarClient::builder()
         .service_url(service_url)
