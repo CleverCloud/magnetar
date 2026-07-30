@@ -317,6 +317,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-log-fields
 
+  e2e-container-memory:
+    name: e2e-container-memory (JVM budget)
+    # Asserts every `pulsar standalone` container the e2e suite starts caps
+    # its JVM with `.with_env_var("PULSAR_MEM", …)` before `.start()`. The
+    # image default costs ~2.3 GiB RSS per container; four uncapped
+    # standalones stall brokers past `operation_timeout` and surface as a
+    # flaky timeout in whichever unrelated test is running. Mirrors
+    # docs/testing.md § "e2e container memory budget".
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-e2e-container-memory
+
   msrv:
     name: msrv (1.91)
     # Pin-check against the workspace MSRV declared in `Cargo.toml`
