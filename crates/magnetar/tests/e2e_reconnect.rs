@@ -87,6 +87,14 @@ const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
 /// job, so its worst case is materially higher than anything measured here. 90 s is therefore 3.5×
 /// the measured worst case rather than the 2× a captured tail would justify.
 ///
+/// A later run under a deliberately over-aggressive profile (11 Pulsar JVMs resident on the host at
+/// once) had a publish still unresolved **59.6 s** after enqueue. That one is NOT a
+/// successful-replay measurement — it ended in `PeerClosed` because the broker JVM itself died,
+/// which is a dead broker rather than a slow one, and no publish budget can or should absorb that.
+/// It is still the sharpest evidence for this number: the window demonstrably reaches well past 2×
+/// the table maximum above, and a 50 s budget (what the literal 2×-the-worst-case rule would have
+/// picked) would have fired a spurious `send timeout` there.
+///
 /// Only `e2e_transparent_inflight_publish_replay_across_broker_restart` actually holds a `SendFut`
 /// across the restart; the other broker-restart tests here wrap every publish in a 10 s
 /// `tokio::time::timeout` retry loop that tolerates `Err`, so the default can never fire on a live
