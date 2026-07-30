@@ -19,13 +19,14 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                         | Status                                                                                           |
-| --- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)              | 🧠 needs design decision on the fan-out surface                                                  |
-| 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)               | ⚡ ready to dispatch                                                                             |
-| 5   | [`HealthProbe::authority` shares the scheme-truncation pattern](#5-health-probe-authority-scheme-truncation) | ⚡ ready to dispatch                                                                             |
-| 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                   | ⚡ ready to dispatch                                                                             |
+| #   | Item                                                                                                                              | Status                                                                                           |
+| --- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                     | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                                   | 🧠 needs design decision on the fan-out surface                                                  |
+| 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)                                    | ⚡ ready to dispatch                                                                             |
+| 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                                        | ⚡ ready to dispatch                                                                             |
+| 8   | [Broker-URL authority parsers are not unified on `probe_authority`](#8-broker-url-authority-parser-unification)                   | 🟡 deferred (not load-bearing)                                                                   |
+| 9   | [`e2e_transparent_inflight_publish_replay_across_broker_restart` races `send_timeout`](#9-inflight-replay-e2e-races-send_timeout) | ⚡ ready to dispatch                                                                             |
 
 ---
 
@@ -71,23 +72,6 @@ Surfaced during the #347 work; the differential test `aggregate_stats_equivalenc
 
 ---
 
----
-
-## 5. Health-probe authority scheme truncation
-
-**Gap.** `MoonpoolHealthProbe::authority` (`crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs`) and its tokio twin `TokioHealthProbe::authority` (`crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs`) share the same defect pattern that `Client::proxy_broker_authority` had before it was hardened for issue #364: on an input containing `"://"` with an unrecognised scheme (e.g. a bit-flipped `"ptlsar://host:port"`), `strip_prefix("pulsar+ssl://").or_else(|| strip_prefix("pulsar://")).unwrap_or(endpoint)` falls through to the ORIGINAL unstripped string, and the subsequent `split('/').next()` then truncates it into the nonsense authority `"ptlsar:"` instead of failing.
-Unlike `proxy_broker_authority`'s corrupted value (which used to flow into `CommandConnect.proxy_to_broker_url` sent to a live proxy), this one only feeds `NetworkProvider::connect` / `tokio::net::lookup_host` inside the ADR-0044 auto-cluster-failover health probe — a doomed connect to `"ptlsar:"` just makes that probe attempt report unhealthy (`spawn_probe` already treats a DNS/connect failure as `verdict = false`), so the blast radius is a probe false-negative, not a routing/security defect.
-
-**Why it stays open.** Found via the full `strip_prefix("pulsar` reference sweep while hardening `Client::proxy_broker_authority` (see [ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md) and the moonpool chaos-pack hardening it mandates); fixing it was out of that unit's mandate, which named only `Client::proxy_broker_authority`. It affects both engines identically (no cross-engine parity angle — this one truly is a shared, symmetric gap) and needs its own ADR-0024 four-layer changeset since `authority()` is production code in both `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`.
-
-**`/goal`.**
-
-```text
-/goal harden HealthProbe::authority in both crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs and crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs per docs/follow-ups.md §5: make an input containing "://" with an unrecognised scheme return None (probe reports unhealthy) instead of falling through to a naive split('/') that truncates it into a nonsense authority like "ptlsar:", while still accepting a genuine scheme-less bare host:port unchanged. Ship the ADR-0024 four-layer test set (both engines already share the identical fix, so layer (d)'s differential test should assert both authority() functions now agree on rejecting the same corrupted input) plus a regression test pinning a corrupted-scheme probe endpoint. Validation chain per CLAUDE.md.
-```
-
----
-
 ## 7. e2e container memory gate
 
 **Gap.** Every `pulsar standalone` container in `crates/magnetar/tests/e2e_*.rs` now passes `PULSAR_MEM = PULSAR_MEM_LIMIT` (see [`docs/testing.md` § "e2e container memory budget"](testing.md#e2e-container-memory-budget)), but nothing enforces it.
@@ -104,6 +88,65 @@ The failure mode is a flaky timeout in whichever unrelated test happens to be ru
 
 ---
 
+## 8. Broker-URL authority parser unification
+
+**Gap.** [ADR-0085](../specs/adr/0085-probe-endpoint-parsing-in-proto.md) single-sourced the **health-probe** endpoint parse into `magnetar_proto::probe_authority`, but two sibling parsers with the same arm-for-arm shape still live in `crates/magnetar-runtime-moonpool/src/client.rs`: `proxy_broker_authority` and `direct_broker_authority`.
+All three now agree on behaviour — reject an unrecognised `"://"` scheme, synthesise the scheme default port, pass a bare `host:port` through — but they agree by having been written to match, not by construction.
+That is exactly the arrangement that produced the ADR-0085 defect in the first place: two copies of one rule, drifting silently.
+
+Concretely, the shared limitation they must keep in lockstep is the port-less bracketed IPv6 case (`pulsar://[::1]` gets no synthesised port, because the synthesis triggers on "authority contains no `:`").
+Fixing it in one place without the other is precisely the drift this entry exists to prevent.
+
+**Full site inventory** (from the `strip_prefix("pulsar` sweep run while landing ADR-0085), so a unifier does not merge parsers that are deliberately different:
+
+| Site                                                                                           | Contract                                                                              | Unify?                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `magnetar_proto::probe_authority`                                                              | scheme optional; bare `host:port` accepted; default port synthesised                  | canonical — the target                                                                                                                                                                                                                                                                          |
+| `magnetar-runtime-moonpool/src/client.rs` `proxy_broker_authority` / `direct_broker_authority` | same rules, `Result<_, ClientError>`                                                  | **yes** — this entry                                                                                                                                                                                                                                                                            |
+| `magnetar-runtime-moonpool/src/driver.rs` `strip_url_to_host_port`                             | scheme **required** (a bare `host:port` returns `None`); also trims `?` / `#`         | **no** — stricter on purpose (service URLs must carry a scheme). Already correct: it uses `?` on the `strip_prefix` chain, never `unwrap_or`, so it has never had the ADR-0085 defect.                                                                                                          |
+| `magnetar-proto/src/conn_types.rs` `extract_pulsar_host`                                       | returns the **host only**, no port; IPv6-bracket carve-out                            | **no** — different job (allow-list host matching, ADR-0044 redirect gate)                                                                                                                                                                                                                       |
+| `magnetar-runtime-tokio/src/client.rs` `parse_direct_broker_url`                               | returns `ParsedUrl { host, port }`, not an authority string; `Result<_, ClientError>` | **maybe** — it grew its own `broker_url.contains("://")` guard when the tokio DIRECT-path gap was closed, so the reject rule now has a fifth independent copy. Worth folding in, but it parses to a struct rather than a `host:port` string, so it needs a different seam than the other three. |
+
+**Why it stays open.** Not a behavioural bug — it is a duplication that is currently correct, so the payoff is drift prevention rather than a fix.
+The two client-side parsers return `Result<String, ClientError>` with caller-specific error text and sit on the lookup/routing path, whose blast radius (a corrupted value reaching `CommandConnect.proxy_to_broker_url` on the wire, per issue #364) differs from a probe verdict.
+Unifying them means either threading a proto-level error type into `ClientError` or having the callers map `None` to their own message, plus re-validating the routing path — wider than the probe hardening that surfaced it.
+
+**`/goal`.**
+
+```text
+/goal unify the broker-URL authority parsers per docs/follow-ups.md §8: refactor proxy_broker_authority and direct_broker_authority in crates/magnetar-runtime-moonpool/src/client.rs to delegate their scheme/port parsing to magnetar_proto::probe_authority (added by ADR-0085) rather than each re-implementing the same arms, mapping None to the existing ClientError::Other messages so the caller-visible error text and the routing-path behaviour are unchanged. Prove equivalence with a table-driven test covering every input class both functions already pin (recognised schemes, unrecognised scheme, bare host:port, default-port synthesis, port-less bracketed IPv6), then close the shared port-less-IPv6 limitation in probe_authority so all three parsers gain the fix at once. Ship the ADR-0024 four-layer test set. Validation chain per CLAUDE.md.
+```
+
+---
+
+## 9. Inflight-replay e2e races `send_timeout`
+
+**Gap.** `e2e_transparent_inflight_publish_replay_across_broker_restart` (`crates/magnetar/tests/e2e_reconnect.rs`) is flaky on a loaded machine.
+It `docker restart`s the broker with publishes in flight and asserts every `SendFut` resolves `Ok`, but it builds its client with only `operation_timeout(2 min)` — leaving `send_timeout` at its 30 s Java-parity default ([ADR-0072](../specs/adr/0072-java-parity-default-send-timeout.md), `crates/magnetar-proto/src/conn_types.rs`).
+A `pulsar standalone` container restart is a full JVM boot; on a busy runner it exceeds 30 s, `send_timeout` fires on the relocated publishes, and the test panics at `e2e_reconnect.rs:485` with `SendRejected { code: -1, message: "send timeout" }`.
+
+The failing runs log `send timed out while relocated across reconnect` immediately before the panic — the timeout is being enforced **correctly**; the test's own budget is simply shorter than the restart it triggers.
+
+**Measured** (single test, isolated runs, 2026-07-29, 20-core workstation under concurrent build load):
+
+| Tree                            | Runs | Failures |
+| ------------------------------- | ---- | -------- |
+| `main` (clean)                  | 6    | 1        |
+| `main` + the ADR-0085 changeset | 4    | 2        |
+
+Both sides flake, so this is **not** a regression from any one changeset — it was surfaced (not caused) by the #369 `send_timeout` hardening, which made publishes relocated across a reconnect visible to timeout enforcement for the first time; before that they were silently exempt, so a slow restart went unnoticed.
+
+**Why it stays open.** The fix is a one-line test-side budget change (`.send_timeout(...)` above the worst-case container restart, or an explicit assertion that the restart completed inside the budget), but picking the number needs a measured worst case across the CI runner profile rather than a guess, and this is a test-harness timing bug rather than a client defect.
+Per [ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md) it must NOT be `#[ignore]`d or have its assertion loosened — the assertion is correct; only the budget is wrong.
+
+**`/goal`.**
+
+```text
+/goal de-flake e2e_transparent_inflight_publish_replay_across_broker_restart per docs/follow-ups.md §9: the test leaves send_timeout at its 30s default while docker-restarting a pulsar standalone container whose JVM boot can exceed 30s on a loaded runner, so the relocated publishes correctly time out and the test panics at crates/magnetar/tests/e2e_reconnect.rs:485 with SendRejected { message: "send timeout" }. First measure the restart duration across several runs under load and record it in the test as a comment, then raise ONLY the client's send_timeout for this test above that measured worst case (do NOT weaken the Ok-resolution assertion, do NOT add #[ignore], and do NOT raise operation_timeout as a substitute). Prove the fix by running the single test 10 times under artificial CPU load with zero failures. Check whether the sibling broker-restart tests in the same file share the gap. Validation chain per CLAUDE.md.
+```
+
+---
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.
@@ -113,4 +156,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3, §5 and §7 are dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is a drift-prevention refactor with no behavioural bug behind it; §3, §7 and §9 are dispatch-ready.
+Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

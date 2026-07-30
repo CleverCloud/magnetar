@@ -25,11 +25,13 @@
 //!
 //! ## Skipped sub-tests (deferred scope)
 //!
-//! * **`AutoClusterFailover` + `HealthProbe`** — the runtime engine already ships the auto variant,
-//!   but exercising it end-to-end needs a probe that flips its verdict in lock-step with the live
-//!   cluster state; tracking that without a channel (per ADR-0003) tangles the test plumbing more
-//!   than it pays back. The controlled variant covers the underlying supervisor + provider
-//!   contract.
+//! * **`AutoClusterFailover` + `HealthProbe`, general case** — the runtime engine already ships the
+//!   auto variant, but exercising a *verdict flip* end-to-end needs a probe that tracks live
+//!   cluster state in lock-step; doing that without a channel (per ADR-0003) tangles the test
+//!   plumbing more than it pays back. The controlled variant covers the underlying supervisor +
+//!   provider contract. The narrow case where the primary is unhealthy *by construction* — a
+//!   corrupted URL scheme, which needs no verdict flipping — IS covered end-to-end, in
+//!   `e2e_probe_corrupted_scheme.rs` (ADR-0085).
 //! * **PIP-188 `TOPIC_MIGRATED` injection** — requires either a broker admin operation that emits
 //!   the frame on demand or a fake broker that synthesizes it. `magnetar-fakes` has no
 //!   `CommandTopicMigrated` emitter today; the supervised-reset path is unit-tested in

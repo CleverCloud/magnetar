@@ -87,6 +87,85 @@ pub trait HealthProbe: Send + Sync + Debug {
     fn poll_probe(&self, endpoint: &str, deadline: Instant, cx: &mut Context<'_>) -> Poll<bool>;
 }
 
+/// Canonical parse of a [`HealthProbe`] `endpoint` string into the
+/// `host:port` authority an engine hands to its dialer
+/// (`tokio::net::lookup_host`, `moonpool_core::NetworkProvider::connect`, …).
+///
+/// Accepts exactly three shapes, mirroring the module-level contract:
+///
+/// | Input                              | Output                       |
+/// | ---------------------------------- | ---------------------------- |
+/// | `pulsar://host:port[/path…]`       | `Some("host:port")`          |
+/// | `pulsar+ssl://host:port[/path…]`   | `Some("host:port")`          |
+/// | `host:port` (no scheme)            | `Some("host:port")`          |
+/// | `pulsar://host` (no port)          | `Some("host:6650")`          |
+/// | `pulsar+ssl://host` (no port)      | `Some("host:6651")`          |
+/// | anything else containing `"://"`   | `None`                       |
+/// | empty authority                    | `None`                       |
+///
+/// # Why unrecognised schemes are rejected rather than passed through
+///
+/// The obvious implementation —
+/// `strip_prefix("pulsar+ssl://").or_else(|| strip_prefix("pulsar://")).unwrap_or(endpoint)` —
+/// silently falls through to the ORIGINAL unstripped string when the scheme
+/// is neither Pulsar scheme. The subsequent `split('/').next()` then truncates
+/// a bit-flipped `"ptlsar://broker:6650"` into the nonsense authority
+/// `"ptlsar:"`, and the engine dials that fabricated target instead of
+/// refusing the input. Both engines carried that bug verbatim until it was
+/// replaced by this shared helper (ADR-0085).
+///
+/// Returning `None` is the safe outcome: per the [`HealthProbe`] contract an
+/// endpoint that cannot be parsed is reported unhealthy, so a corrupted URL
+/// costs one probe verdict and zero I/O.
+///
+/// # Known limitation — port-less bracketed IPv6
+///
+/// The default-port synthesis triggers on "the authority contains no `:`",
+/// so a bracketed IPv6 literal with no port (`pulsar://[::1]`) keeps its
+/// colons and gets NO synthesised port. This is inherited deliberately from
+/// `magnetar_runtime_moonpool`'s `proxy_broker_authority`, whose behaviour
+/// this function mirrors arm-for-arm; a one-sided divergence between the two
+/// would be worse than the shared gap. `pulsar://[::1]:6650` (the form that
+/// actually appears in deployments) round-trips correctly.
+///
+/// # Sans-io
+///
+/// A hand-rolled scan with no `url` crate, matching the `extract_pulsar_host`
+/// precedent in this crate's `conn_types` module, so [`magnetar-proto`](crate)
+/// keeps its zero-I/O dependency surface ([ADR-0004]).
+///
+/// [ADR-0004]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md
+/// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
+#[must_use]
+pub fn probe_authority(endpoint: &str) -> Option<String> {
+    let (rest, default_port) = if let Some(rest) = endpoint.strip_prefix("pulsar+ssl://") {
+        (rest, Some(6651u16))
+    } else if let Some(rest) = endpoint.strip_prefix("pulsar://") {
+        (rest, Some(6650u16))
+    } else if endpoint.contains("://") {
+        // Unrecognised scheme — refuse rather than truncate. See the
+        // "Why unrecognised schemes are rejected" section above.
+        return None;
+    } else {
+        (endpoint, None)
+    };
+
+    // Trim trailing path segments — `pulsar://host:port/anything` becomes
+    // `host:port`. Bare `host:port` round-trips unchanged.
+    let host_port = rest.split('/').next().unwrap_or(rest);
+
+    // Must precede the synthesis below, otherwise `"pulsar://"` would yield
+    // the portless-host branch and produce the garbage authority `":6650"`.
+    if host_port.is_empty() {
+        return None;
+    }
+
+    Some(match default_port {
+        Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
+        _ => host_port.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -229,6 +308,115 @@ mod tests {
             probe.poll_probe("pulsar://broker:6650", deadline, &mut cx),
             Poll::Ready(true)
         ));
+    }
+
+    // ----- probe_authority ----------------------------------------------------
+
+    #[test]
+    fn probe_authority_strips_pulsar_scheme() {
+        assert_eq!(
+            probe_authority("pulsar://broker.local:6650"),
+            Some("broker.local:6650".to_owned()),
+        );
+        assert_eq!(
+            probe_authority("pulsar+ssl://broker.local:6651"),
+            Some("broker.local:6651".to_owned()),
+        );
+    }
+
+    #[test]
+    fn probe_authority_passes_through_bare_host_port() {
+        assert_eq!(
+            probe_authority("127.0.0.1:6650"),
+            Some("127.0.0.1:6650".to_owned()),
+        );
+    }
+
+    #[test]
+    fn probe_authority_trims_trailing_path() {
+        assert_eq!(
+            probe_authority("pulsar://broker.local:6650/admin/v2"),
+            Some("broker.local:6650".to_owned()),
+        );
+    }
+
+    #[test]
+    fn probe_authority_rejects_empty_input() {
+        assert_eq!(probe_authority(""), None);
+        // A scheme with no authority behind it must reject too, NOT synthesise
+        // the garbage authority `":6650"` from an empty host.
+        assert_eq!(probe_authority("pulsar://"), None);
+        assert_eq!(probe_authority("pulsar+ssl://"), None);
+    }
+
+    /// Regression test for ADR-0085: an input
+    /// carrying `"://"` with a scheme that is neither Pulsar scheme must be
+    /// REFUSED, not truncated.
+    ///
+    /// Before the fix both engines' `authority()` fell through to the
+    /// unstripped string and `split('/')` reduced it to `"ptlsar:"`, which the
+    /// probe then dialled. `"ptlsar://…"` is the exact single-bit corruption
+    /// of the `pulsar` scheme word that moonpool-sim's bit-flip chaos produced
+    /// for issue #364.
+    #[test]
+    fn probe_authority_rejects_unrecognised_scheme() {
+        assert_eq!(
+            probe_authority("ptlsar://broker-sim.proxy.internal:6650"),
+            None,
+            "a bit-flipped pulsar scheme must be refused, not truncated to 'ptlsar:'",
+        );
+        assert_eq!(probe_authority("http://broker:8080"), None);
+        assert_eq!(probe_authority("https://broker:8443"), None);
+        // Not a Pulsar scheme even though it starts with the right letters.
+        assert_eq!(probe_authority("pulsarx://broker:6650"), None);
+    }
+
+    /// A scheme-carrying endpoint with no explicit port resolves to the
+    /// scheme's default port instead of a portless authority the dialer would
+    /// reject. Mirrors `magnetar_runtime_moonpool`'s `proxy_broker_authority`.
+    #[test]
+    fn probe_authority_synthesises_default_port() {
+        assert_eq!(
+            probe_authority("pulsar://broker.local"),
+            Some("broker.local:6650".to_owned()),
+        );
+        assert_eq!(
+            probe_authority("pulsar+ssl://broker.local"),
+            Some("broker.local:6651".to_owned()),
+        );
+        // Path-only trailing segment still resolves the default port.
+        assert_eq!(
+            probe_authority("pulsar://broker.local/admin/v2"),
+            Some("broker.local:6650".to_owned()),
+        );
+        // An explicit port always wins over the default.
+        assert_eq!(
+            probe_authority("pulsar://broker.local:7000"),
+            Some("broker.local:7000".to_owned()),
+        );
+        // A scheme-less bare host has no scheme to take a default from, so it
+        // is returned verbatim — the caller's dialer decides what to do.
+        assert_eq!(
+            probe_authority("broker.local"),
+            Some("broker.local".to_owned()),
+        );
+    }
+
+    /// Pins the documented limitation rather than leaving it to chance: a
+    /// bracketed IPv6 literal already contains `:`, so no default port is
+    /// synthesised for the port-less form. The ported form round-trips.
+    #[test]
+    fn probe_authority_leaves_bracketed_ipv6_untouched() {
+        assert_eq!(
+            probe_authority("pulsar://[::1]:6650"),
+            Some("[::1]:6650".to_owned()),
+        );
+        assert_eq!(
+            probe_authority("pulsar+ssl://[2001:db8::1]:6651"),
+            Some("[2001:db8::1]:6651".to_owned()),
+        );
+        // Documented gap: no port is appended here (see the fn doc comment).
+        assert_eq!(probe_authority("pulsar://[::1]"), Some("[::1]".to_owned()));
     }
 
     #[test]
