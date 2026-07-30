@@ -20,12 +20,11 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                              | Status                                                                                           |
-| --- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                     | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                                   | 🧠 needs design decision on the fan-out surface                                                  |
-| 8   | [Broker-URL authority parser unification — residual](#8-broker-url-authority-parser-unification--residual)                        | 🟡 deferred (three of four parsers unified; `parse_direct_broker_url` audited, not unified)      |
-| 9   | [`e2e_transparent_inflight_publish_replay_across_broker_restart` races `send_timeout`](#9-inflight-replay-e2e-races-send_timeout) | ⚡ ready to dispatch                                                                             |
+| #   | Item                                                                                                       | Status                                                                                           |
+| --- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                              | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)            | 🧠 needs design decision on the fan-out surface                                                  |
+| 8   | [Broker-URL authority parser unification — residual](#8-broker-url-authority-parser-unification--residual) | 🟡 deferred (three of four parsers unified; `parse_direct_broker_url` audited, not unified)      |
 
 ---
 
@@ -84,34 +83,6 @@ Left alone deliberately, since changing it is a user-visible text change with no
 
 ---
 
-## 9. Inflight-replay e2e races `send_timeout`
-
-**Gap.** `e2e_transparent_inflight_publish_replay_across_broker_restart` (`crates/magnetar/tests/e2e_reconnect.rs`) is flaky on a loaded machine.
-It `docker restart`s the broker with publishes in flight and asserts every `SendFut` resolves `Ok`, but it builds its client with only `operation_timeout(2 min)` — leaving `send_timeout` at its 30 s Java-parity default ([ADR-0072](../specs/adr/0072-java-parity-default-send-timeout.md), `crates/magnetar-proto/src/conn_types.rs`).
-A `pulsar standalone` container restart is a full JVM boot; on a busy runner it exceeds 30 s, `send_timeout` fires on the relocated publishes, and the test panics at `e2e_reconnect.rs:485` with `SendRejected { code: -1, message: "send timeout" }`.
-
-The failing runs log `send timed out while relocated across reconnect` immediately before the panic — the timeout is being enforced **correctly**; the test's own budget is simply shorter than the restart it triggers.
-
-**Measured** (single test, isolated runs, 2026-07-29, 20-core workstation under concurrent build load):
-
-| Tree                            | Runs | Failures |
-| ------------------------------- | ---- | -------- |
-| `main` (clean)                  | 6    | 1        |
-| `main` + the ADR-0085 changeset | 4    | 2        |
-
-Both sides flake, so this is **not** a regression from any one changeset — it was surfaced (not caused) by the #369 `send_timeout` hardening, which made publishes relocated across a reconnect visible to timeout enforcement for the first time; before that they were silently exempt, so a slow restart went unnoticed.
-
-**Why it stays open.** The fix is a one-line test-side budget change (`.send_timeout(...)` above the worst-case container restart, or an explicit assertion that the restart completed inside the budget), but picking the number needs a measured worst case across the CI runner profile rather than a guess, and this is a test-harness timing bug rather than a client defect.
-Per [ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md) it must NOT be `#[ignore]`d or have its assertion loosened — the assertion is correct; only the budget is wrong.
-
-**`/goal`.**
-
-```text
-/goal de-flake e2e_transparent_inflight_publish_replay_across_broker_restart per docs/follow-ups.md §9: the test leaves send_timeout at its 30s default while docker-restarting a pulsar standalone container whose JVM boot can exceed 30s on a loaded runner, so the relocated publishes correctly time out and the test panics at crates/magnetar/tests/e2e_reconnect.rs:485 with SendRejected { message: "send timeout" }. First measure the restart duration across several runs under load and record it in the test as a comment, then raise ONLY the client's send_timeout for this test above that measured worst case (do NOT weaken the Ok-resolution assertion, do NOT add #[ignore], and do NOT raise operation_timeout as a substitute). Prove the fix by running the single test 10 times under artificial CPU load with zero failures. Check whether the sibling broker-restart tests in the same file share the gap. Validation chain per CLAUDE.md.
-```
-
----
-
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.
@@ -121,5 +92,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question; §9 is dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.
