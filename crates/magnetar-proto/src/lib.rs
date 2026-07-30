@@ -186,7 +186,7 @@ pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
 };
-pub use crate::health_probe::HealthProbe;
+pub use crate::health_probe::{HealthProbe, probe_authority};
 pub use crate::markers::{
     ClusterMessageId, MarkerDecodeError, MarkersMessageIdData, ReplicatedSubscriptionMarker,
     ReplicatedSubscriptionMarkerDetails, ReplicatedSubscriptionMarkerKind,

@@ -363,8 +363,9 @@ impl<P: Providers> ServiceUrlProvider for AutoClusterFailover<P> {
 ///
 /// Each `poll_probe` call (against an endpoint with no in-flight slot)
 /// spawns a background task on [`moonpool_core::TaskProvider`] that:
-/// 1. parses the endpoint string (accepts `pulsar://host:port`, `pulsar+ssl://host:port`, or a bare
-///    `host:port`),
+/// 1. parses the endpoint string via [`magnetar_proto::probe_authority`] (accepts
+///    `pulsar://host[:port]`, `pulsar+ssl://host[:port]`, or a bare `host:port`; an unrecognised
+///    `"://"` scheme is REFUSED here, so the probe reports unhealthy without any I/O — ADR-0085),
 /// 2. runs [`NetworkProvider::connect`] against the resulting `host:port` authority,
 /// 3. wraps the connect attempt in [`TimeProvider::timeout`] so the probe respects the
 ///    caller-supplied deadline.
@@ -429,21 +430,21 @@ impl<P: Providers> MoonpoolHealthProbe<P> {
     }
 
     /// Strip the optional `pulsar://` / `pulsar+ssl://` scheme so we have
-    /// a `host:port` ready for [`NetworkProvider::connect`]. Returns
-    /// `None` for inputs we cannot interpret as `host:port`.
+    /// a `host:port` ready for [`NetworkProvider::connect`], filling in the
+    /// scheme's default port (`6650` / `6651`) when the URL carries none.
+    /// Returns `None` for inputs we cannot interpret as `host:port` — an
+    /// empty authority, or a `"://"` URL whose scheme is neither Pulsar
+    /// scheme.
+    ///
+    /// Delegates to [`magnetar_proto::probe_authority`] so this engine and
+    /// `magnetar-runtime-tokio` cannot drift apart on endpoint parsing;
+    /// both previously carried a copy of the logic and rotted identically
+    /// (a corrupted `"ptlsar://host:6650"` truncated to the nonsense
+    /// authority `"ptlsar:"` and got dialled). See [ADR-0085].
+    ///
+    /// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
     fn authority(endpoint: &str) -> Option<String> {
-        let stripped = endpoint
-            .strip_prefix("pulsar+ssl://")
-            .or_else(|| endpoint.strip_prefix("pulsar://"))
-            .unwrap_or(endpoint);
-        // Trim trailing path segments — `pulsar://host:port/anything`
-        // becomes `host:port`. Bare `host:port` round-trips unchanged.
-        let auth = stripped.split('/').next().unwrap_or(stripped);
-        if auth.is_empty() {
-            None
-        } else {
-            Some(auth.to_owned())
-        }
+        magnetar_proto::probe_authority(endpoint)
     }
 
     /// Spawn the actual TCP-connect probe task for `endpoint` honouring
@@ -846,6 +847,45 @@ mod tests {
     #[test]
     fn moonpool_probe_authority_rejects_empty_input() {
         assert_eq!(MoonpoolHealthProbe::<TokioProviders>::authority(""), None,);
+    }
+
+    /// Regression test for ADR-0085. Mirrors the
+    /// tokio engine's identically-shaped test.
+    ///
+    /// Before the fix this returned `Some("ptlsar:")` — the naive
+    /// `unwrap_or(endpoint)` fell through to the unstripped string and
+    /// `split('/')` truncated it — and the probe then handed that fabricated
+    /// authority to [`NetworkProvider::connect`]. `"ptlsar://…"` is the exact
+    /// single-bit corruption of the `pulsar` scheme word that moonpool-sim's
+    /// bit-flip chaos produced for issue #364.
+    #[test]
+    fn moonpool_probe_authority_rejects_unrecognised_scheme() {
+        assert_eq!(
+            MoonpoolHealthProbe::<TokioProviders>::authority(
+                "ptlsar://broker-sim.proxy.internal:6650"
+            ),
+            None,
+            "a bit-flipped pulsar scheme must be refused, not truncated to 'ptlsar:'",
+        );
+        assert_eq!(
+            MoonpoolHealthProbe::<TokioProviders>::authority("http://broker:8080"),
+            None,
+        );
+    }
+
+    /// A scheme-carrying endpoint with no explicit port resolves to the
+    /// scheme's default port rather than a portless authority
+    /// [`NetworkProvider::connect`] would reject outright.
+    #[test]
+    fn moonpool_probe_authority_synthesises_default_port() {
+        assert_eq!(
+            MoonpoolHealthProbe::<TokioProviders>::authority("pulsar://broker.local"),
+            Some("broker.local:6650".to_owned()),
+        );
+        assert_eq!(
+            MoonpoolHealthProbe::<TokioProviders>::authority("pulsar+ssl://broker.local"),
+            Some("broker.local:6651".to_owned()),
+        );
     }
 
     /// Connect to a real local TCP listener through the moonpool
