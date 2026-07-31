@@ -50,6 +50,7 @@
 //! [ADR-0023]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md
 
 use core::fmt::Debug;
+use std::net::Ipv6Addr;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -87,22 +88,29 @@ pub trait HealthProbe: Send + Sync + Debug {
     fn poll_probe(&self, endpoint: &str, deadline: Instant, cx: &mut Context<'_>) -> Poll<bool>;
 }
 
-/// Canonical parse of a [`HealthProbe`] `endpoint` string into the
+/// Canonical parse of a Pulsar endpoint string into the
 /// `host:port` authority an engine hands to its dialer
 /// (`tokio::net::lookup_host`, `moonpool_core::NetworkProvider::connect`, …).
 ///
-/// Accepts exactly three shapes, mirroring the module-level contract:
+/// `schemeless_default_port` supplies the runtime's bootstrap default when a
+/// broker advertises a bare host with no scheme and no port. A recognised
+/// Pulsar scheme always selects its own default, and an explicit port always
+/// wins over either default. Pulsar schemes are matched ASCII-case-insensitively,
+/// as required for URI schemes.
 ///
-/// | Input                              | Output                       |
-/// | ---------------------------------- | ---------------------------- |
-/// | `pulsar://host:port[/path…]`       | `Some("host:port")`          |
-/// | `pulsar+ssl://host:port[/path…]`   | `Some("host:port")`          |
-/// | `host:port` (no scheme)            | `Some("host:port")`          |
-/// | `pulsar://host` (no port)          | `Some("host:6650")`          |
-/// | `pulsar+ssl://host` (no port)      | `Some("host:6651")`          |
-/// | `pulsar://[::1]` (no port)         | `Some("[::1]:6650")`         |
-/// | anything else containing `"://"`   | `None`                       |
-/// | empty authority                    | `None`                       |
+/// Accepts the following shapes:
+///
+/// | Input                                  | Fallback     | Output                       |
+/// | -------------------------------------- | ------------ | ---------------------------- |
+/// | `pulsar://host:port[/path…]`           | any          | `Some("host:port")`          |
+/// | `pulsar+ssl://host:port[/path…]`       | any          | `Some("host:port")`          |
+/// | `host:port` (no scheme)                | any          | `Some("host:port")`          |
+/// | `pulsar://host` (no port)              | any          | `Some("host:6650")`          |
+/// | `pulsar+ssl://host` (no port)          | any          | `Some("host:6651")`          |
+/// | `host` (no scheme or port)             | `Some(6650)` | `Some("host:6650")`          |
+/// | `host` (no scheme or port)             | `None`       | `Some("host")`               |
+/// | `[::1]` (no scheme or port)            | `Some(6650)` | `Some("[::1]:6650")`         |
+/// | unrecognised scheme / invalid authority | any          | `None`                       |
 ///
 /// # Why unrecognised schemes are rejected rather than passed through
 ///
@@ -115,20 +123,16 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// refusing the input. Both engines carried that bug verbatim until it was
 /// replaced by this shared helper (ADR-0085).
 ///
-/// Returning `None` is the safe outcome: per the [`HealthProbe`] contract an
-/// endpoint that cannot be parsed is reported unhealthy, so a corrupted URL
-/// costs one probe verdict and zero I/O.
+/// Returning `None` is the safe outcome: health probes report the endpoint
+/// unhealthy, and DIRECT-routing callers reject it before pool insertion or
+/// I/O.
 ///
 /// # Bracketed IPv6 literals
 ///
 /// A bracketed IPv6 literal is full of colons that belong to the *address*, so
 /// "does this authority already carry a port?" cannot be answered with
-/// `contains(':')` — that test reports "already ported" for `[::1]` and
-/// suppresses the synthesis. The private `authority_has_explicit_port` answers
-/// it properly: for a bracketed authority the port, when present, follows the
-/// closing `]`. (Named without an intra-doc link on purpose — it is private, and
-/// linking it from this public item trips `rustdoc::private_intra_doc_links`
-/// under the workspace's `RUSTDOCFLAGS="-D warnings"`.)
+/// `contains(':')`. The private validator parses the bracket body as
+/// [`Ipv6Addr`] and accepts only an empty suffix or `:<u16>`.
 ///
 /// Until ADR-0087 this function (and the three parsers now delegating to it)
 /// shared the naive test, so `pulsar://[::1]` got no port and the dialer
@@ -136,9 +140,9 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// one place closed it for every caller at once, which is the whole point of
 /// the parse living here.
 ///
-/// An **unterminated** bracket (`pulsar://[::1`) is malformed and gets no
-/// synthesised port either — appending one to a string we cannot parse would
-/// only fabricate a different kind of garbage.
+/// An unterminated bracket, an invalid IPv6 body, an empty/non-numeric/out-of-range
+/// explicit port, or an unbracketed authority containing multiple colons is
+/// rejected before a dial target is constructed.
 ///
 /// # Sans-io
 ///
@@ -149,63 +153,115 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// [ADR-0004]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md
 /// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
 #[must_use]
-pub fn probe_authority(endpoint: &str) -> Option<String> {
-    let (rest, default_port) = if let Some(rest) = endpoint.strip_prefix("pulsar+ssl://") {
-        (rest, Some(6651u16))
-    } else if let Some(rest) = endpoint.strip_prefix("pulsar://") {
-        (rest, Some(6650u16))
-    } else if endpoint.contains("://") {
-        // Unrecognised scheme — refuse rather than truncate. See the
-        // "Why unrecognised schemes are rejected" section above.
-        return None;
-    } else {
-        (endpoint, None)
+pub fn broker_authority(endpoint: &str, schemeless_default_port: Option<u16>) -> Option<String> {
+    let (scheme, rest) = split_broker_endpoint(endpoint)?;
+    let default_port = match scheme {
+        BrokerEndpointScheme::Pulsar => Some(6650),
+        BrokerEndpointScheme::PulsarTls => Some(6651),
+        BrokerEndpointScheme::Schemeless => schemeless_default_port,
     };
 
     // Trim trailing path segments — `pulsar://host:port/anything` becomes
     // `host:port`. Bare `host:port` round-trips unchanged.
-    let host_port = rest.split('/').next().unwrap_or(rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let has_explicit_port = validate_authority(authority)?;
 
-    // Must precede the synthesis below, otherwise `"pulsar://"` would yield
-    // the portless-host branch and produce the garbage authority `":6650"`.
-    if host_port.is_empty() {
-        return None;
-    }
-
-    Some(match default_port {
-        Some(port) if !authority_has_explicit_port(host_port) => format!("{host_port}:{port}"),
-        _ => host_port.to_owned(),
+    Some(match (has_explicit_port, default_port) {
+        (false, Some(port)) => format!("{authority}:{port}"),
+        _ => authority.to_owned(),
     })
 }
 
-/// Does `authority` already carry an explicit `:port`?
+/// Scheme classification for a broker endpoint accepted by
+/// [`broker_authority`].
 ///
-/// The naive answer — `authority.contains(':')` — is wrong for a bracketed
-/// IPv6 literal, whose colons belong to the address: it reports `true` for
-/// `[::1]` and so suppresses [`probe_authority`]'s default-port synthesis,
-/// yielding a port-less authority every dialer rejects. In a bracketed
-/// authority the port, when present, always follows the closing `]`.
+/// URI schemes are ASCII case-insensitive. `PULSAR://`, `Pulsar://`, and the
+/// lowercase spelling therefore all classify as [`Self::Pulsar`]; the same
+/// rule applies to [`Self::PulsarTls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerEndpointScheme {
+    /// `pulsar://` in any ASCII letter case.
+    Pulsar,
+    /// `pulsar+ssl://` in any ASCII letter case.
+    PulsarTls,
+    /// No `://` scheme marker is present.
+    Schemeless,
+}
+
+/// Classify the scheme of a broker endpoint without parsing its authority.
 ///
-/// An unterminated bracket (`[::1`) is malformed; report `true` so no port is
-/// appended to a string we cannot parse. That keeps such input byte-identical
-/// to what this function returned before the bracket handling existed — the
-/// caller's dialer rejects it either way, and inventing `[::1:6650` would just
-/// swap one unusable authority for another.
-///
-/// Not a `Host`/`Authority` type: `magnetar-proto` parses this by hand to keep
-/// its zero-I/O dependency surface (see the [`probe_authority`] `# Sans-io`
-/// section).
-fn authority_has_explicit_port(authority: &str) -> bool {
-    if authority.starts_with('[') {
-        // `rfind` rather than `find`: the closing bracket of the literal is the
-        // LAST one, so a nested-looking `[[::1]]` still measures from the end.
-        match authority.rfind(']') {
-            Some(close) => authority[close + 1..].starts_with(':'),
-            None => true,
-        }
+/// Returns `None` for an explicit scheme other than `pulsar` or
+/// `pulsar+ssl`. Authority validation remains the responsibility of
+/// [`broker_authority`].
+#[must_use]
+pub fn broker_endpoint_scheme(endpoint: &str) -> Option<BrokerEndpointScheme> {
+    split_broker_endpoint(endpoint).map(|(scheme, _rest)| scheme)
+}
+
+fn split_broker_endpoint(endpoint: &str) -> Option<(BrokerEndpointScheme, &str)> {
+    if let Some(rest) = strip_prefix_ascii_case(endpoint, "pulsar+ssl://") {
+        Some((BrokerEndpointScheme::PulsarTls, rest))
+    } else if let Some(rest) = strip_prefix_ascii_case(endpoint, "pulsar://") {
+        Some((BrokerEndpointScheme::Pulsar, rest))
+    } else if endpoint.contains("://") {
+        // Unrecognised scheme — refuse rather than truncate. See the
+        // "Why unrecognised schemes are rejected" section above.
+        None
     } else {
-        authority.contains(':')
+        Some((BrokerEndpointScheme::Schemeless, endpoint))
     }
+}
+
+fn strip_prefix_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = input.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &input[prefix.len()..])
+}
+
+/// Parse a [`HealthProbe`] endpoint without inventing a default for a
+/// scheme-less, portless authority.
+///
+/// Recognised Pulsar schemes still supply their own defaults. The absence of a
+/// scheme leaves a bare host unchanged, preserving the health-probe contract.
+#[must_use]
+pub fn probe_authority(endpoint: &str) -> Option<String> {
+    broker_authority(endpoint, None)
+}
+
+/// Validate `authority` and report whether it carries an explicit port.
+fn validate_authority(authority: &str) -> Option<bool> {
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[1..close];
+        host.parse::<Ipv6Addr>().ok()?;
+        let suffix = &authority[close + 1..];
+        return match suffix {
+            "" => Some(false),
+            _ => validate_port(suffix.strip_prefix(':')?).map(|()| true),
+        };
+    }
+
+    if authority.is_empty() || authority.contains('[') || authority.contains(']') {
+        return None;
+    }
+
+    match authority.split_once(':') {
+        None => Some(false),
+        Some((host, port)) => {
+            if host.is_empty() || port.contains(':') {
+                return None;
+            }
+            validate_port(port).map(|()| true)
+        }
+    }
+}
+
+fn validate_port(port: &str) -> Option<()> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>().ok().map(|_| ())
 }
 
 #[cfg(test)]
@@ -480,12 +536,74 @@ mod tests {
             probe_authority("pulsar://[::1]/admin/v2"),
             Some("[::1]:6650".to_owned()),
         );
-        // Malformed — unterminated bracket. No port is invented; the input is
-        // returned as-is, exactly as before the bracket handling existed.
-        assert_eq!(probe_authority("pulsar://[::1"), Some("[::1".to_owned()));
+        // Malformed — an unterminated bracket is rejected before a caller can
+        // hand it to a dialer.
+        assert_eq!(probe_authority("pulsar://[::1"), None);
         // Scheme-less: there is no scheme to take a default from, so the
         // bracket handling must not start synthesising one here either.
         assert_eq!(probe_authority("[::1]"), Some("[::1]".to_owned()));
+    }
+
+    #[test]
+    fn broker_authority_applies_only_the_selected_default() {
+        let cases = [
+            ("broker.local", Some(6650), Some("broker.local:6650")),
+            ("broker.local", Some(6651), Some("broker.local:6651")),
+            ("broker.local", None, Some("broker.local")),
+            (
+                "pulsar://broker.local",
+                Some(6651),
+                Some("broker.local:6650"),
+            ),
+            (
+                "pulsar+ssl://broker.local",
+                Some(6650),
+                Some("broker.local:6651"),
+            ),
+            (
+                "PULSAR://broker.local",
+                Some(6651),
+                Some("broker.local:6650"),
+            ),
+            (
+                "PuLsAr+SsL://broker.local",
+                Some(6650),
+                Some("broker.local:6651"),
+            ),
+            ("broker.local:7000", Some(6650), Some("broker.local:7000")),
+            ("[::1]", Some(6650), Some("[::1]:6650")),
+        ];
+        for (input, fallback, expected) in cases {
+            assert_eq!(
+                broker_authority(input, fallback).as_deref(),
+                expected,
+                "unexpected normalization for {input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn broker_authority_rejects_structurally_unusable_authorities() {
+        for input in [
+            "",
+            "pulsar://",
+            "broker:",
+            "broker:abc",
+            "broker:65536",
+            "2001:db8::1",
+            "[::1",
+            "[not-ipv6]",
+            "[::1]suffix",
+            "[::1]:",
+            "[::1]:abc",
+            "[::1]:65536",
+        ] {
+            assert_eq!(
+                broker_authority(input, Some(6650)),
+                None,
+                "{input:?} must be rejected before a dial",
+            );
+        }
     }
 
     #[test]

@@ -292,6 +292,7 @@ impl<P: Providers> Client<P> {
             providers: engine.providers().clone(),
             service_url_provider,
             dns_resolver,
+            schemeless_default_port: 6650,
         };
         let pool = ProxyConnectionPool::new(factory);
         Ok(Self::assemble(
@@ -740,7 +741,7 @@ impl<P: Providers> Client<P> {
             return Ok(self.shared.clone());
         };
 
-        let physical = direct_broker_authority(broker_url)?;
+        let physical = direct_broker_authority(broker_url, pool.schemeless_default_port())?;
         // Bootstrap-equality fast path: same `host:port` as the connect-time URL → reuse the
         // bootstrap connection. Saves one TCP handshake on every single-broker / bootstrap-broker
         // lookup, and keeps existing single-broker tests on exactly one socket (no spurious pool
@@ -1540,17 +1541,17 @@ impl Drop for RequestFut {
 /// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
 /// [ADR-0087]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0087-unify-broker-url-authority-parsers.md
 fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
-    magnetar_proto::probe_authority(input).ok_or_else(|| {
-        // One message for every rejection class `probe_authority` folds into
-        // `None` — unrecognised scheme, empty input, scheme with no authority.
-        // The text it replaced asserted "carries an unrecognised scheme", which
-        // is simply false for `""`.
-        ClientError::Other(format!(
-            "broker-advertised URL '{input}' is not a usable authority (expected \
-             'pulsar://host[:port]', 'pulsar+ssl://host[:port]', or a bare 'host:port'); \
-             refusing to derive a proxy authority from it"
-        ))
-    })
+    magnetar_proto::probe_authority(input).ok_or_else(|| unusable_broker_authority(input))
+}
+
+fn unusable_broker_authority(input: &str) -> ClientError {
+    // One message for every rejection class the canonical helper folds into
+    // `None` — unrecognised scheme, empty input, scheme with no authority.
+    ClientError::Other(format!(
+        "broker-advertised URL '{input}' is not a usable authority (expected \
+         'pulsar://host[:port]', 'pulsar+ssl://host[:port]', or a scheme-less host with an \
+         optional numeric port); refusing to derive a broker authority from it"
+    ))
 }
 
 /// Normalise an advertised broker URL into the `host:port` form moonpool's
@@ -1558,20 +1559,19 @@ fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
 /// multi-broker DIRECT routing path (ADR-0039 §"Multi-broker DIRECT routing
 /// (2026-06-01)") — the pool keys on `(logical, physical = host:port)` and dials
 /// `physical` directly, so the helper must produce exactly the address shape
-/// `connect_with_resolver` consumes.
+/// `connect_with_resolver` consumes. A scheme-less broker inherits the
+/// bootstrap connection's protocol default before reaching the pool.
 ///
 /// Accepts the same input shapes as the tokio engine's
 /// `parse_direct_broker_url`: a full Pulsar URL (`pulsar://host:port` or
-/// `pulsar+ssl://host:port`) **or** a bare `host:port`. The scheme is stripped
-/// and the default port is filled in when the URL omitted it; bare `host:port`
-/// input is forwarded unchanged.
+/// `pulsar+ssl://host:port`) **or** a scheme-less host with an optional port.
+/// An explicit scheme supplies its protocol default; otherwise
+/// `schemeless_default_port` supplies it. An explicit port always wins.
 ///
-/// Reuses the same scheme-strip logic as [`proxy_broker_authority`] since
-/// moonpool dials by `host:port` regardless of routing shape (TLS posture for
-/// per-broker DIRECT dials is the bootstrap's posture — see ADR-0039
-/// §"TLS posture"). The two helpers are deliberately distinct so each carries
-/// its own contract docstring; both engines pin this contract at the type
-/// level (see the tokio counterparts).
+/// Shares the canonical parser with [`proxy_broker_authority`], but supplies
+/// the bootstrap default because the DIRECT transport requires `host:port`.
+/// Proxy routing keeps the no-fallback wrapper because a scheme-less logical
+/// broker string is forwarded on the wire rather than dialled directly.
 ///
 /// On the DIRECT path the two engines now agree: tokio's
 /// `parse_direct_broker_url` rejects the same corrupted-scheme input rather
@@ -1585,8 +1585,12 @@ fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
 /// hardening: tokio's PROXY-path `preferred_broker_url` still forwards an
 /// unrecognised scheme unchanged with a warning, relying on the downstream
 /// Pulsar Proxy's `validateBrokerTarget()` to reject it.
-fn direct_broker_authority(input: &str) -> Result<String, ClientError> {
-    proxy_broker_authority(input)
+fn direct_broker_authority(
+    input: &str,
+    schemeless_default_port: u16,
+) -> Result<String, ClientError> {
+    magnetar_proto::broker_authority(input, Some(schemeless_default_port))
+        .ok_or_else(|| unusable_broker_authority(input))
 }
 
 #[cfg(test)]
@@ -1845,7 +1849,7 @@ mod tests {
     /// `tests/proxy_multi_conn.rs::open_producer_through_proxy_rejects_corrupted_broker_scheme`.
     #[test]
     fn direct_broker_authority_rejects_corrupted_scheme() {
-        let err = direct_broker_authority(CORRUPTED_SCHEME_BROKER_URL)
+        let err = direct_broker_authority(CORRUPTED_SCHEME_BROKER_URL, 6650)
             .expect_err("a corrupted scheme must not resolve to a dial target");
         assert!(
             matches!(err, ClientError::Other(_)),
@@ -1854,21 +1858,19 @@ mod tests {
     }
 
     /// Twin of tokio's `parse_direct_broker_url_accepts_bare_host_port`:
-    /// scheme-less input is a legitimate, unchanged DIRECT-path shape on both
-    /// engines — the rejection above narrows the fallback, it does not remove
-    /// it.
+    /// scheme-less input is a legitimate DIRECT-path shape on both engines.
+    /// An explicit port is preserved; a missing port inherits the bootstrap
+    /// default.
     #[test]
     fn direct_broker_authority_accepts_bare_host_port() {
         assert_eq!(
-            direct_broker_authority("b-c3-n12:6650").unwrap(),
+            direct_broker_authority("b-c3-n12:6650", 6650).unwrap(),
             "b-c3-n12:6650"
         );
-        // No port either: moonpool dials by `host:port` and has no URL scheme
-        // to derive a default from, so a bare host is forwarded verbatim (the
-        // transport layer supplies the port). Tokio's twin synthesises the
-        // bootstrap scheme's default port instead — the engines differ in
-        // *representation* here, not in what they accept.
-        assert_eq!(direct_broker_authority("b-c3-n12").unwrap(), "b-c3-n12");
+        assert_eq!(
+            direct_broker_authority("b-c3-n12", 6650).unwrap(),
+            "b-c3-n12:6650"
+        );
     }
 
     /// Twin of tokio's `parse_direct_broker_url_accepts_full_pulsar_url`: the
@@ -1876,92 +1878,67 @@ mod tests {
     #[test]
     fn direct_broker_authority_accepts_full_pulsar_url() {
         assert_eq!(
-            direct_broker_authority("pulsar://b-c3-n12:6650").unwrap(),
+            direct_broker_authority("pulsar://b-c3-n12:6650", 7000).unwrap(),
             "b-c3-n12:6650"
         );
         assert_eq!(
-            direct_broker_authority("pulsar+ssl://b-c3-n12").unwrap(),
+            direct_broker_authority("pulsar+ssl://b-c3-n12", 6650).unwrap(),
             "b-c3-n12:6651"
         );
     }
 
-    /// Every input class the two helpers pin, in one table, asserted three ways:
-    /// `proxy_broker_authority` == `direct_broker_authority` ==
-    /// [`magnetar_proto::probe_authority`].
-    ///
-    /// This is the equivalence proof for ADR-0087's delegation. The individual
-    /// tests above each pin one arm and would stay green if a future edit
-    /// re-forked a *different* arm back into a local copy; this one goes red for
-    /// any divergence on any row, which is the property the unification is for.
-    ///
-    /// `None` means "rejected" — the helpers map it to `ClientError::Other`,
-    /// whose text this test deliberately does not assert (the mapping is the
-    /// contract; the wording is not).
+    /// Both local adapters must follow their respective canonical helper:
+    /// proxy parsing has no scheme-less default, while DIRECT parsing inherits
+    /// the plaintext bootstrap default.
     #[test]
-    fn broker_authority_parsers_agree_with_probe_authority() {
-        // (input, expected authority or None for a rejection)
-        const CASES: &[(&str, Option<&str>)] = &[
-            // Recognised schemes, explicit port.
-            ("pulsar://b-c3-n12:6650", Some("b-c3-n12:6650")),
-            ("pulsar+ssl://b-c3-n12:6651", Some("b-c3-n12:6651")),
-            // Default-port synthesis, per scheme.
-            ("pulsar://b-c3-n12", Some("b-c3-n12:6650")),
-            ("pulsar+ssl://b-c3-n12", Some("b-c3-n12:6651")),
-            // An explicit port always wins over the scheme default.
-            ("pulsar://b-c3-n12:7000", Some("b-c3-n12:7000")),
-            // Trailing path segments are trimmed.
-            ("pulsar://b-c3-n12:6650/extra/path", Some("b-c3-n12:6650")),
-            ("pulsar://b-c3-n12/extra/path", Some("b-c3-n12:6650")),
-            // Bare `host:port` — no scheme at all — passes through, and a bare
-            // host has no scheme to take a default port from.
-            ("b-c3-n12:6650", Some("b-c3-n12:6650")),
-            ("b-c3-n12", Some("b-c3-n12")),
-            // Bracketed IPv6, with and without a port (ADR-0087).
-            ("pulsar://[::1]:6650", Some("[::1]:6650")),
-            ("pulsar://[::1]", Some("[::1]:6650")),
-            ("pulsar+ssl://[2001:db8::1]", Some("[2001:db8::1]:6651")),
-            ("[::1]:6650", Some("[::1]:6650")),
-            // Unrecognised schemes are refused, never truncated (ADR-0085).
-            // `ptlsar` is the single-bit corruption of the scheme word that
-            // moonpool-sim's chaos produced for issue #364.
-            ("ptlsar://broker-sim.proxy.internal:6650", None),
-            ("http://broker:8080", None),
-            ("https://broker:8443", None),
-            ("pulsarx://broker:6650", None),
-            // No authority to derive anything from.
-            ("", None),
-            ("pulsar://", None),
-            ("pulsar+ssl://", None),
+    fn broker_authority_adapters_follow_canonical_defaults() {
+        const CASES: &[&str] = &[
+            "pulsar://b-c3-n12:6650",
+            "pulsar+ssl://b-c3-n12:6651",
+            "PULSAR://b-c3-n12:6650",
+            "PuLsAr+SsL://b-c3-n12:6651",
+            "pulsar://b-c3-n12",
+            "pulsar+ssl://b-c3-n12",
+            "pulsar://b-c3-n12:7000",
+            "pulsar://b-c3-n12:6650/extra/path",
+            "b-c3-n12:6650",
+            "b-c3-n12",
+            "pulsar://[::1]:6650",
+            "pulsar://[::1]",
+            "[::1]",
+            "ptlsar://broker-sim.proxy.internal:6650",
+            "pulsar://broker:abc",
+            "pulsar://[::1",
+            ":6650",
+            "broker:6650:extra",
+            "",
+            "pulsar://",
         ];
 
-        for (input, expected) in CASES {
+        for input in CASES {
             let proxy = proxy_broker_authority(input);
-            let direct = direct_broker_authority(input);
-            let proto = magnetar_proto::probe_authority(input);
+            let direct = direct_broker_authority(input, 6650);
+            let canonical_proxy = magnetar_proto::probe_authority(input);
+            let canonical_direct = magnetar_proto::broker_authority(input, Some(6650));
 
             assert_eq!(
-                proto.as_deref(),
-                *expected,
-                "probe_authority disagrees with the table for {input:?}",
-            );
-            assert_eq!(
                 proxy.as_deref().ok(),
-                *expected,
+                canonical_proxy.as_deref(),
                 "proxy_broker_authority({input:?}) diverged from probe_authority",
             );
             assert_eq!(
                 direct.as_deref().ok(),
-                *expected,
-                "direct_broker_authority({input:?}) diverged from probe_authority",
+                canonical_direct.as_deref(),
+                "direct_broker_authority({input:?}) diverged from broker_authority",
             );
-            // Rejections must arrive as `ClientError::Other` on both helpers —
-            // the differential suite classifies on that variant.
-            if expected.is_none() {
+            if canonical_proxy.is_none() {
                 assert!(
                     matches!(proxy, Err(ClientError::Other(_))),
                     "proxy_broker_authority({input:?}) must reject via ClientError::Other, \
                      got {proxy:?}",
                 );
+            }
+            if canonical_direct.is_none() {
                 assert!(
                     matches!(direct, Err(ClientError::Other(_))),
                     "direct_broker_authority({input:?}) must reject via ClientError::Other, \
@@ -1990,6 +1967,20 @@ mod tests {
         }
     }
 
+    /// Twin of tokio's `parse_direct_broker_url_reports_unusable_authority`:
+    /// every structural rejection uses the shared operator-facing diagnostic.
+    #[test]
+    fn direct_broker_authority_reports_unusable_authority() {
+        for input in ["pulsar://", "pulsar://broker:abc", "pulsar://[::1"] {
+            let err = direct_broker_authority(input, 6650)
+                .expect_err("an unusable authority must be rejected");
+            assert!(
+                err.to_string().contains("not a usable authority"),
+                "unexpected rejection for {input:?}: {err}",
+            );
+        }
+    }
+
     /// Regression test for ADR-0087, the closed half of ADR-0085's documented
     /// limitation: the synthesis used to trigger on "the authority contains no
     /// `:`", which is never true of a bracketed IPv6 literal, so
@@ -2010,7 +2001,7 @@ mod tests {
             "[::1]:6650"
         );
         assert_eq!(
-            direct_broker_authority("pulsar://[::1]").unwrap(),
+            direct_broker_authority("pulsar://[::1]", 6650).unwrap(),
             "[::1]:6650"
         );
     }

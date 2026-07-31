@@ -1,49 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end coverage for `magnetar_runtime_moonpool::client::direct_broker_authority`
-//! (private helper) after its issue #364 hardening.
+//! End-to-end coverage for Moonpool DIRECT broker-authority normalization
+//! through the public `PulsarClient<MoonpoolEngine<TokioProviders>>` facade.
 //!
-//! `direct_broker_authority` (and its sibling `proxy_broker_authority`, both
-//! in `crates/magnetar-runtime-moonpool/src/client.rs`) changed from
-//! `fn(&str) -> String` to `fn(&str) -> Result<String, ClientError>`: an
-//! input containing `"://"` with an unrecognised scheme (a single-bit
-//! corruption of `pulsar`, e.g. `"ptlsar://..."`) now fails explicitly
-//! instead of falling through to a naive `split('/')` that silently
-//! truncated it into a nonsense authority.
+//! One Docker Pulsar broker serves two sequential scenarios:
 //!
-//! **Honest scope note: this test is NOT the fix's regression proof, and
-//! was never red pre-fix.** It only exercises `PulsarClient`'s public
-//! surface against a well-formed broker URL, never calling
-//! `proxy_broker_authority` / `direct_broker_authority` directly or
-//! indirectly through a corrupted input — verified empirically by
-//! reverting the `client.rs` signature change back to `fn(&str) -> String`
-//! and confirming this file still compiles and behaves identically (it
-//! does). A genuinely corrupted scheme is NOT reproducible against a real
-//! broker anyway (TCP checksums make single-bit command-frame corruption
-//! practically unreachable in production — see `docs/follow-ups.md`'s
-//! citation of this same reasoning). The actual red/green regression proof
-//! for this fix lives in
-//! `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs`'s
-//! `open_producer_through_proxy_rejects_corrupted_broker_scheme` (verified
-//! red pre-fix, green post-fix — see the commit message). What THIS test
-//! proves is narrower but still load-bearing for the e2e obligation: since
-//! neither engine's unit-test suite nor the moonpool integration suite
-//! touches a REAL broker, this test closes the loop against production
-//! infrastructure by proving the `Result`-returning signature change's
-//! happy path (a real Pulsar 4 standalone broker, which always advertises a
-//! well-formed `pulsar://host:port` `broker_service_url`) still
-//! round-trips end-to-end through `MoonpoolEngine<TokioProviders>` — the
-//! moonpool engine driven over real host sockets against real Docker
-//! infrastructure, not the deterministic `SimProviders` the chaos suite
-//! uses.
+//! 1. the real broker advertises its ordinary `pulsar://host:port` URL and the runtime exercises
+//!    bootstrap equality; and
+//! 2. an in-process lookup bootstrap advertises the defensive portless shape
+//!    `resolved-broker.internal`, while a recording resolver maps the logical
+//!    `resolved-broker.internal:6650` request to that same Docker broker.
 //!
-//! Mirrors `e2e_lookup_direct_multi_broker.rs`'s single-standalone-container
-//! DIRECT-routing scenario (a real Pulsar 4 standalone advertises its own
-//! URL on every lookup, exercising the bootstrap-equality fast path through
-//! `direct_broker_authority`), but drives `PulsarClient<MoonpoolEngine<TokioProviders>>`
-//! instead of the tokio façade — see `e2e_reconnect.rs`'s
-//! `e2e_moonpool_transient_producer_open_retry_across_broker_restart` for
-//! the construction pattern this test reuses.
+//! The second scenario is ADR-0024's facade e2e witness for ADR-0091. It
+//! reaches a real broker only if Moonpool applies the plaintext bootstrap
+//! default before resolver dispatch and pool insertion. Keeping both paths in
+//! one test preserves the repository's one-container budget.
 //!
 //! Gated on `feature = "moonpool"` because a moonpool-engine client cannot
 //! compile without it (engine selection, not test-hiding — every other
@@ -54,20 +25,30 @@
 
 #![cfg(feature = "moonpool")]
 
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
-use magnetar::runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
+use magnetar::proto::{FrameError, decode_one, encode_command, pb};
+use magnetar::runtime_moonpool::{
+    Client as MoonpoolClient, DnsResolveFuture, DnsResolver, MoonpoolEngine,
+};
 use magnetar::{OutgoingMessage, PulsarClient};
 use moonpool_core::TokioProviders;
+use parking_lot::Mutex;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
+const PORTLESS_BROKER_HOST: &str = "resolved-broker.internal";
 
 /// JVM budget for the `pulsar standalone` container.
 /// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
@@ -114,6 +95,175 @@ async fn start_pulsar()
     Ok((service_url, container))
 }
 
+#[derive(Debug)]
+struct RecordingResolver {
+    mapped_address: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl DnsResolver for RecordingResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> DnsResolveFuture<'a> {
+        let requested_host = host.to_owned();
+        Box::pin(async move {
+            self.requests.lock().push((requested_host, port));
+            let address = if host == PORTLESS_BROKER_HOST {
+                self.mapped_address
+            } else {
+                SocketAddr::new(
+                    host.parse::<IpAddr>().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })?,
+                    port,
+                )
+            };
+            Ok(vec![address])
+        })
+    }
+}
+
+async fn start_portless_lookup_broker()
+-> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let Ok((stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        let _ = serve_portless_lookup(stream).await;
+    });
+    Ok((address.to_string(), task))
+}
+
+async fn serve_portless_lookup(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut read_buffer = BytesMut::with_capacity(8 * 1024);
+    let mut output_buffer = BytesMut::with_capacity(8 * 1024);
+    loop {
+        loop {
+            let mut framed = read_buffer.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(frame) => frame,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buffer.split_to(consumed);
+            if let Some(command) = portless_lookup_response(&frame) {
+                let _ = encode_command(&mut output_buffer, &command);
+            }
+        }
+
+        if !output_buffer.is_empty() {
+            stream.write_all(&output_buffer).await?;
+            stream.flush().await?;
+            output_buffer.clear();
+        }
+        match stream.read_buf(&mut read_buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn portless_lookup_response(frame: &magnetar::proto::Frame) -> Option<pb::BaseCommand> {
+    let kind = pb::base_command::Type::try_from(frame.command.r#type).ok()?;
+    match kind {
+        pb::base_command::Type::Connect => Some(pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-e2e-portless-lookup".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        }),
+        pb::base_command::Type::Ping => Some(pb::BaseCommand {
+            r#type: pb::base_command::Type::Pong as i32,
+            pong: Some(pb::CommandPong {}),
+            ..Default::default()
+        }),
+        pb::base_command::Type::PartitionedMetadata => frame
+            .command
+            .partition_metadata
+            .as_ref()
+            .map(|metadata| pb::BaseCommand {
+                r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+                partition_metadata_response: Some(pb::CommandPartitionedTopicMetadataResponse {
+                    partitions: Some(0),
+                    request_id: metadata.request_id,
+                    response: Some(
+                        pb::command_partitioned_topic_metadata_response::LookupType::Success as i32,
+                    ),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            }),
+        pb::base_command::Type::Lookup => {
+            frame
+                .command
+                .lookup_topic
+                .as_ref()
+                .map(|lookup| pb::BaseCommand {
+                    r#type: pb::base_command::Type::LookupResponse as i32,
+                    lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                        broker_service_url: Some(PORTLESS_BROKER_HOST.to_owned()),
+                        broker_service_url_tls: None,
+                        response: Some(
+                            pb::command_lookup_topic_response::LookupType::Connect as i32,
+                        ),
+                        request_id: lookup.request_id,
+                        authoritative: Some(true),
+                        error: None,
+                        message: None,
+                        proxy_through_service_url: Some(false),
+                    }),
+                    ..Default::default()
+                })
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn portless_lookup_stub_answers_partition_metadata() {
+    const REQUEST_ID: u64 = 41;
+    let request = magnetar::proto::Frame {
+        command: pb::BaseCommand {
+            r#type: pb::base_command::Type::PartitionedMetadata as i32,
+            partition_metadata: Some(pb::CommandPartitionedTopicMetadata {
+                topic: "persistent://public/default/portless-direct".to_owned(),
+                request_id: REQUEST_ID,
+                original_principal: None,
+                original_auth_data: None,
+                original_auth_method: None,
+                metadata_auto_creation_enabled: Some(true),
+            }),
+            ..Default::default()
+        },
+        payload: None,
+    };
+
+    let response = portless_lookup_response(&request)
+        .expect("the facade bootstrap must answer partition metadata before lookup");
+    assert_eq!(
+        response.r#type,
+        pb::base_command::Type::PartitionedMetadataResponse as i32,
+    );
+    let metadata = response
+        .partition_metadata_response
+        .expect("partition metadata response payload");
+    assert_eq!(metadata.request_id, REQUEST_ID);
+    assert_eq!(metadata.partitions, Some(0));
+    assert_eq!(
+        metadata.response,
+        Some(pb::command_partitioned_topic_metadata_response::LookupType::Success as i32),
+    );
+    assert_eq!(metadata.error, None);
+}
+
 /// Pulsar 4 standalone advertises its own well-formed `pulsar://host:port`
 /// URL on every lookup response's `broker_service_url`. The moonpool
 /// engine's `Client::resolve_direct_broker` feeds that value through
@@ -123,7 +273,9 @@ async fn start_pulsar()
 /// real broker's real advertised URL — still resolves to `Ok(_)` and the
 /// producer/consumer round-trip completes, i.e. the signature change from
 /// `String` to `Result<String, ClientError>` did not regress ordinary
-/// operation.
+/// operation. The same test then inserts a lookup-only bootstrap that
+/// advertises a bare host and verifies the public facade reaches this real
+/// broker through a resolver request for port 6650.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -183,6 +335,61 @@ async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
         received,
         vec![b"hello".to_vec(), b"world".to_vec()],
         "two messages must round-trip through direct_broker_authority's Ok(_) happy path",
+    );
+
+    // Facade-level ADR-0024 witness for a portless DIRECT lookup target. The
+    // bootstrap stub emits the defensive wire shape real brokers normally do
+    // not: a scheme-less hostname with no port. The resolver records the
+    // logical target and maps it to the same real Docker broker used above.
+    let resolved_authority = service_url
+        .strip_prefix("pulsar://")
+        .unwrap_or(&service_url);
+    let resolved_address = tokio::net::lookup_host(resolved_authority)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("Docker broker authority {resolved_authority:?} did not resolve"),
+            )
+        })?;
+    let (bootstrap_address, _bootstrap_task) = start_portless_lookup_broker().await?;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = Arc::new(RecordingResolver {
+        mapped_address: resolved_address,
+        requests: requests.clone(),
+    });
+    let runtime_client = MoonpoolClient::connect_plain_supervised(
+        &MoonpoolEngine::new(TokioProviders::new()),
+        &bootstrap_address,
+        magnetar_proto::ConnectionConfig {
+            supervisor: Some(magnetar_proto::SupervisorConfig::default()),
+            operation_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+        None,
+        Some(resolver),
+    )
+    .await?;
+    let client = PulsarClient::from_runtime_client(runtime_client);
+    let producer = client
+        .producer("persistent://public/default/magnetar-e2e-moonpool-portless-direct")
+        .create()
+        .await?;
+    producer
+        .send(OutgoingMessage::with_payload(b"portless-direct".to_vec()).into())
+        .await?;
+    producer.close().await?;
+    client.close().await;
+
+    let resolver_requests = requests.lock().clone();
+    assert!(
+        resolver_requests
+            .iter()
+            .any(|(host, port)| host == PORTLESS_BROKER_HOST && *port == BROKER_BINARY_PORT),
+        "the facade must resolve the portless DIRECT broker as \
+         {PORTLESS_BROKER_HOST}:{BROKER_BINARY_PORT}; got {resolver_requests:?}",
     );
     Ok(())
 }
