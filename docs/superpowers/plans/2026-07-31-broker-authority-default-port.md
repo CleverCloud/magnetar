@@ -451,7 +451,7 @@ git commit -s -S -m "docs(adr): accept broker authority defaulting contract"
 
 - [ ] **Step 1: Run the real-Pulsar DIRECT e2e witness**
 
-Run: `cargo test -p magnetar --test e2e_lookup_direct_multi_broker`
+Run: `cargo test -p magnetar-driver --test e2e_lookup_direct_multi_broker`
 
 Expected: the existing full-service-URL/bootstrap-reuse path passes against Pulsar 4.0.4.
 
