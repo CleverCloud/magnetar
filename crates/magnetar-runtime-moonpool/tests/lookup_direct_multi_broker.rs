@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -38,7 +39,7 @@ use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, SubscribeRequest, SupervisorConfig,
     decode_one, encode_command, pb,
 };
-use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
+use magnetar_runtime_moonpool::{Client, DnsResolveFuture, DnsResolver, MoonpoolEngine};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +61,32 @@ struct BrokerRole {
     /// answers lookups by claiming itself (useful as the data plane on
     /// broker B).
     redirect_to: Option<String>,
+}
+
+#[derive(Debug)]
+struct RecordingResolver {
+    mapped_host: &'static str,
+    mapped_address: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl DnsResolver for RecordingResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> DnsResolveFuture<'a> {
+        let requested_host = host.to_owned();
+        Box::pin(async move {
+            self.requests.lock().push((requested_host, port));
+            let address = if host == self.mapped_host {
+                self.mapped_address
+            } else {
+                SocketAddr::new(
+                    host.parse::<IpAddr>()
+                        .expect("test resolver only receives its mapped host or an IP literal"),
+                    port,
+                )
+            };
+            Ok(vec![address])
+        })
+    }
 }
 
 async fn spawn_broker(role: BrokerRole) -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
@@ -369,6 +396,82 @@ async fn open_producer_routes_to_resolved_broker() {
                 "bootstrap session must NOT have seen PRODUCER (multi-broker DIRECT routing must \
                  have landed it on the pinned session)",
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn portless_direct_broker_uses_plaintext_default_port() {
+    const RESOLVED_BROKER_HOST: &str = "broker-b.internal";
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host_b, _url_b, sessions_b) =
+                spawn_broker_advertising(BrokerRole { redirect_to: None }).await;
+            let broker_b_address = host_b.parse().expect("broker B address parses");
+            let (host_a, _sessions_a) = spawn_broker(BrokerRole {
+                redirect_to: Some(RESOLVED_BROKER_HOST.to_owned()),
+            })
+            .await;
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let resolver = Arc::new(RecordingResolver {
+                mapped_host: RESOLVED_BROKER_HOST,
+                mapped_address: broker_b_address,
+                requests: requests.clone(),
+            });
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_plain_supervised(
+                    &engine,
+                    &host_a,
+                    supervised_config(),
+                    None,
+                    Some(resolver),
+                ),
+            )
+            .await
+            .expect("connect did not time out")
+            .expect("connect succeeds");
+
+            let _producer = tokio::time::timeout(
+                HANG_GUARD,
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/moonpool-direct-portless-broker".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("open_producer did not time out")
+            .expect("open_producer succeeds");
+
+            let resolver_requests = requests.lock().clone();
+            let snap_b = sessions_b.lock().clone();
+            if let Some(driver) = client.take_driver() {
+                driver.abort();
+            }
+            drop(client);
+
+            assert!(
+                resolver_requests
+                    .iter()
+                    .any(|(host, port)| host == RESOLVED_BROKER_HOST && *port == 6650),
+                "the portless DIRECT broker must use the plaintext bootstrap default; got \
+                 {resolver_requests:?}",
+            );
+            assert_eq!(
+                snap_b.len(),
+                1,
+                "the mapped broker must receive exactly one pooled connection; got {snap_b:?}",
+            );
+            let producer_frames_on_b = snap_b[0]
+                .frames
+                .iter()
+                .filter(|kind| **kind == pb::base_command::Type::Producer as i32)
+                .count();
+            assert_eq!(producer_frames_on_b, 1);
         })
         .await;
 }

@@ -81,6 +81,10 @@ pub(crate) struct ConnectionFactory<P: Providers> {
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     /// Pluggable DNS resolver.
     pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
+    /// Protocol default used when a DIRECT lookup advertises a scheme-less
+    /// broker hostname. The current pooled constructor is plaintext-only, so
+    /// it records Pulsar's plaintext default (`6650`).
+    pub(crate) schemeless_default_port: u16,
 }
 
 impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
@@ -96,6 +100,7 @@ impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
                 &self.service_url_provider.is_some(),
             )
             .field("has_dns_resolver", &self.dns_resolver.is_some())
+            .field("schemeless_default_port", &self.schemeless_default_port)
             .finish_non_exhaustive()
     }
 }
@@ -248,6 +253,11 @@ impl<P: Providers> ProxyConnectionPool<P> {
     #[allow(dead_code)] // diagnostics-only accessor; kept on parity with tokio
     pub(crate) fn bootstrap_addr(&self) -> &str {
         &self.factory.addr
+    }
+
+    /// Default port inherited by a scheme-less DIRECT broker authority.
+    pub(crate) const fn schemeless_default_port(&self) -> u16 {
+        self.factory.schemeless_default_port
     }
 
     /// Number of currently-tracked entries (Ready + Pending). Used by tests
@@ -655,6 +665,7 @@ mod tests {
             providers: TokioProviders::new(),
             service_url_provider: None,
             dns_resolver: None,
+            schemeless_default_port: 6650,
         }
     }
 
