@@ -184,6 +184,23 @@ fn portless_lookup_response(frame: &magnetar::proto::Frame) -> Option<pb::BaseCo
             pong: Some(pb::CommandPong {}),
             ..Default::default()
         }),
+        pb::base_command::Type::PartitionedMetadata => frame
+            .command
+            .partition_metadata
+            .as_ref()
+            .map(|metadata| pb::BaseCommand {
+                r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+                partition_metadata_response: Some(pb::CommandPartitionedTopicMetadataResponse {
+                    partitions: Some(0),
+                    request_id: metadata.request_id,
+                    response: Some(
+                        pb::command_partitioned_topic_metadata_response::LookupType::Success as i32,
+                    ),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            }),
         pb::base_command::Type::Lookup => {
             frame
                 .command
@@ -208,6 +225,43 @@ fn portless_lookup_response(frame: &magnetar::proto::Frame) -> Option<pb::BaseCo
         }
         _ => None,
     }
+}
+
+#[test]
+fn portless_lookup_stub_answers_partition_metadata() {
+    const REQUEST_ID: u64 = 41;
+    let request = magnetar::proto::Frame {
+        command: pb::BaseCommand {
+            r#type: pb::base_command::Type::PartitionedMetadata as i32,
+            partition_metadata: Some(pb::CommandPartitionedTopicMetadata {
+                topic: "persistent://public/default/portless-direct".to_owned(),
+                request_id: REQUEST_ID,
+                original_principal: None,
+                original_auth_data: None,
+                original_auth_method: None,
+                metadata_auto_creation_enabled: Some(true),
+            }),
+            ..Default::default()
+        },
+        payload: None,
+    };
+
+    let response = portless_lookup_response(&request)
+        .expect("the facade bootstrap must answer partition metadata before lookup");
+    assert_eq!(
+        response.r#type,
+        pb::base_command::Type::PartitionedMetadataResponse as i32,
+    );
+    let metadata = response
+        .partition_metadata_response
+        .expect("partition metadata response payload");
+    assert_eq!(metadata.request_id, REQUEST_ID);
+    assert_eq!(metadata.partitions, Some(0));
+    assert_eq!(
+        metadata.response,
+        Some(pb::command_partitioned_topic_metadata_response::LookupType::Success as i32),
+    );
+    assert_eq!(metadata.error, None);
 }
 
 /// Pulsar 4 standalone advertises its own well-formed `pulsar://host:port`
