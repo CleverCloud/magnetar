@@ -391,6 +391,9 @@ Every behavioural row below ships **in the same commit**. The 1:1 tokio ↔ moon
 The two functional tests (`happy_path` + `drops_on_dag_change`) script the **same** DAG + update sequence as their tokio counterparts.
 
 `cargo xtask check-sim-coverage` requires **100% diff coverage** on the new `magnetar-proto::dag_watch` module + the new conn entries.
+That requirement is enforced, not aspirational: the gate's report covers `magnetar-proto`, so added lines in [`crates/magnetar-proto/src/dag_watch.rs`](../../crates/magnetar-proto/src/dag_watch.rs) and [`crates/magnetar-proto/src/conn.rs`](../../crates/magnetar-proto/src/conn.rs) fail the check while uncovered.
+It can only be satisfied from what the gate executes — the `magnetar-runtime-moonpool` and `magnetar-differential` test binaries — because `magnetar-proto`'s own unit tests never run under it.
+The (a) proto-layer tests above therefore discharge ADR-0024 layer (a), not this gate; the (c) and (d) rows are what make its lines go green.
 
 ### (d) `magnetar-differential`
 

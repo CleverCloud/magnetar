@@ -58,13 +58,19 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
    ([ADR-0021](specs/adr/0021-no-silent-test-ignore-or-remove.md), [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md))
 9. **Cross-runtime test + coverage policy.** Every behavioral change (runtime behavior, public API, wire format) and every change inside `magnetar-proto` ships with **all four** test layers in the same commit: (a) `magnetar-proto` unit test, (b) `magnetar-runtime-tokio` integration test, (c) `magnetar-runtime-moonpool` integration test, (d) `magnetar-differential` equivalence test asserting tokio ↔ moonpool `EventStream` parity, plus an end-to-end test under `crates/magnetar/tests/e2e_*.rs`.
    Moonpool sim coverage is **100% on the diff** (`cargo run -p xtask -- check-sim-coverage`, `cargo-llvm-cov` patch-coverage style).
-   **That gate is much narrower than the policy**: measured 2026-07-30, its LCOV report covers only `crates/magnetar-runtime-moonpool/src/**` and `crates/magnetar-differential/src/**` (16 files) — **not** their dependencies, so `magnetar-proto`, `magnetar-runtime-tokio` and the `magnetar` façade are never gated.
-   Additions there print as `not gated` and do **not** fail the check ([ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md)); broadening it is [`docs/follow-ups.md`](docs/follow-ups.md) §10.
-   So a green run means "covered wherever the gate can see" — read its `not gated` lines, and on a `magnetar-proto` change the four-layer test policy above is what actually carries the requirement.
+   Its LCOV report covers the six crates the run compiles — measured 2026-07-31, 63 `SF:` records: `magnetar-proto` 28, `magnetar-runtime-tokio` 12, `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5, `magnetar-differential` 4, `magnetar-auth-sasl` 2 — so a `magnetar-proto` addition is measured, where before it was invisible to the gate.
+   Execution is unchanged and still runs only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries, so a `magnetar-proto` or `magnetar-runtime-tokio` line counts as covered only when a sim test reaches it transitively; those crates' own unit tests never run under the gate and can never satisfy it.
+   **The uncovered-line verdict is advisory**: `SIM_COVERAGE_ENFORCES_UNCOVERED` is `false`, so uncovered added lines are printed in full with a count and the check **exits 0**.
+   While that constant is `false`, a green `check-sim-coverage` is **not** evidence of ADR-0024 patch coverage — it proves only that the gate ran and printed what it found, so never cite one as coverage proof.
+   `cargo run -p xtask -- check-sim-coverage --enforce` restores the failing exit code for that one invocation: that is how you check whether a branch would pass, and how the fail path stays exercised until the constant flips.
+   One case hard-fails at any setting — an added file whose whole gated crate emitted **no** coverage records, which means the gate could not measure rather than that a test is missing, and a gate that cannot measure must never report success.
+   What stays ungated is everything the run never compiles — the `magnetar` façade above all, whose Docker-bound `crates/magnetar/tests/e2e_*.rs` suite is deliberately kept out of the coverage run — plus the generated `crates/magnetar-proto/src/pb/`, which is excluded outright.
+   Façade additions print as `not gated` and do **not** fail the check, `--enforce` included — the ungated report is a scope limit, not a verdict ([ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md)).
+   So read the run's `not gated` lines and its advisory uncovered count as findings, not as a verdict — on a façade change, and on anything the advisory verdict lets through, the four-layer test policy above is what carries the requirement.
    `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep a **strict 1:1 test count** (`cargo run -p xtask -- check-runtime-test-parity`).
-   Both checks are hard-failing in the local + CI validation chain.
+   `check-runtime-test-parity` is hard-failing in the local + CI validation chain; `check-sim-coverage` hard-fails only on the record-less-crate case above, or when invoked with `--enforce`.
    Exemptions: docs-only, comment-only, formatter-only, and dependency bumps with no functional impact — justify in the commit message.
-   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md))
+   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md))
 10. **Lock-ordering: global → per-slot, never the reverse.** `Connection` is wrapped in a `parking_lot::Mutex` by the runtime engines; every `ProducerSlot` / `ConsumerSlot` carries its own `parking_lot::Mutex`.
     A holder of `slot.state.lock()` MUST NOT then take the connection-wide mutex.
     The hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection buffer under the global lock via `poll_transmit`.
@@ -124,9 +130,11 @@ find . -name '*.md' -not -path './target/*' -not -path './.git/*' -not -name AGE
 Run before declaring a task done (in this order):
 
 > **Linux + FIPS note**: every `--all-features` command pulls in `crypto-fips`, which builds `aws-lc-fips-sys`.
-> Its `delocate` step requires clang-emitted assembly — gcc 16+ (Fedora 44 default) emits `.data.rel.ro.local` sections that delocate rejects.
+> Its `delocate` step requires clang-emitted assembly, and a gcc-emitted `.data.rel.ro.local` section aborts it with `.data section found in module`.
+> That is not a gcc-version threshold: it reproduced on gcc 14.4.0 on 2026-07-31, and whether a given build trips it depends on which aws-lc sources cargo's feature unification pulls into `bcm.c`.
+> A Linux FIPS build therefore pins the C/asm toolchain to clang whatever the host gcc version is.
 > Prefix the build / test / clippy commands below with `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` on Linux.
-> `cargo run -p xtask -- check-crypto-matrix` sets these automatically for its `crypto-fips` cells.
+> `cargo run -p xtask -- check-crypto-matrix` (for its `crypto-fips` cells) and `cargo run -p xtask -- check-sim-coverage` (for its `--all-features` coverage run) set those five variables themselves, so neither takes the manual prefix.
 
 ```
 cargo +nightly fmt --all
@@ -154,7 +162,7 @@ cargo run -p xtask -- check-no-internal-clock   # no Instant::now() / SystemTime
 cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
 cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container caps PULSAR_MEM (docs/testing.md)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff, instrumented pkgs only (ADR-0024, ADR-0088)
+cargo run -p xtask -- check-sim-coverage        # patch coverage on diff over the 6 crates the sim run compiles; ADVISORY — reports and exits 0, add --enforce to fail (ADR-0024, ADR-0088, ADR-0090)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
 # (known-failing seed replay runs in CI via the per-PR `seed-replay` job; ADR-0047)
@@ -167,7 +175,8 @@ The PIP-33 two-cluster tests additionally require the `crates/magnetar/tests/fix
 The auto-format hook handles `cargo fmt` / `gofmt` / `ruff format` on edited files; lints and tests stay manual.
 
 The three heavy / diff-shaped xtask gates (`check-sim-coverage`, `check-runtime-test-parity`, `check-crypto-matrix`) are local-first but also run in CI via the scheduled [`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml) (daily cron + `workflow_dispatch`), which keeps per-PR [`ci.yml`](.github/workflows/ci.yml) fast.
-`check-sim-coverage` is a diff gate, so its scheduled `main` run short-circuits ("nothing to verify"); dispatch it from a feature branch for real patch-coverage gating.
+`check-sim-coverage` is a diff gate, so its scheduled `main` run short-circuits ("nothing to verify"); dispatch it from a feature branch to measure a real diff.
+Both the scheduled job and the chain entry above run without `--enforce`, so they report uncovered added lines and exit 0 — add `--enforce` locally when you want the verdict rather than the finding.
 
 ## Common slash workflows
 

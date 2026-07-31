@@ -17,10 +17,12 @@
 //!   `docs/testing.md` § "e2e container memory budget".
 //! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
 //!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
-//!   Mirrors ADR-0024. Enforcement covers only the packages in the coverage run
-//!   (`magnetar-runtime-moonpool` + `magnetar-differential` and their dependencies); additions in
-//!   packages outside it — the `magnetar` façade above all — are reported as `not gated` rather
-//!   than silently passed (ADR-0088).
+//!   Mirrors ADR-0024. The moonpool + differential tests are the only ones that run, but the report
+//!   is re-exported over `SIM_COVERAGE_REPORT_PACKAGES` — the packages the run actually compiles —
+//!   so a `magnetar-proto` or `magnetar-runtime-tokio` line executed transitively is measured. A
+//!   crate under `SIM_COVERAGE_GATED_CRATE_PREFIXES` that emits no records at all is a hard
+//!   failure; anything else outside the report is still printed as `not gated` rather than silently
+//!   passed (ADR-0088).
 //! - `check-runtime-test-parity`: assert `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
 //!   carry the same number of `#[test]` / `#[tokio::test]` / `#[moonpool::test]` items. Mirrors
 //!   ADR-0024.
@@ -35,6 +37,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
+use std::time::SystemTime;
 use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -123,19 +126,42 @@ enum Cmd {
     /// Assert that every line added relative to the merge base is covered
     /// by at least one `magnetar-runtime-moonpool` test.
     ///
-    /// Runs `cargo llvm-cov --json -p magnetar-runtime-moonpool` and
-    /// intersects the LCOV-equivalent JSON with `git diff
-    /// merge-base...HEAD` line ranges. Any added line not executed under
-    /// the moonpool runner fails the check. See ADR-0024.
+    /// Runs the moonpool + differential tests under `cargo llvm-cov`, then
+    /// re-exports the same profile data over a wider package set, and
+    /// intersects the resulting LCOV with `git diff merge-base...HEAD` line
+    /// ranges. An added line the moonpool runner never executed is reported
+    /// with a count; it fails the check only under `--enforce`, because the
+    /// widened report landed advisory (`SIM_COVERAGE_ENFORCES_UNCOVERED`,
+    /// ADR-0090). A gated crate that emitted no records at all fails either
+    /// way. See ADR-0024.
     ///
-    /// The `-p` filter restricts instrumentation as well as execution, so
-    /// packages outside that graph (notably the `magnetar` façade) are
-    /// never measured. Their additions are reported as `not gated`
-    /// instead of counting as covered — see ADR-0088.
+    /// `-p` selects which test binaries run and which sources the report
+    /// keeps; instrumentation itself is workspace-wide. The re-export
+    /// therefore measures `magnetar-proto` and `magnetar-runtime-tokio`
+    /// lines the sim reached transitively. Packages the run never compiles
+    /// (the `magnetar-driver` façade, `magnetarctl`, `xtask`, and everything
+    /// reachable only through them) still surface as `not gated` rather than
+    /// counting as covered — see ADR-0088.
     CheckSimCoverage {
         /// Base ref to diff against. Defaults to `origin/main`.
         #[arg(long, default_value = "origin/main")]
         base: String,
+        /// Reuse an existing target/sim-coverage.lcov instead of running the coverage
+        /// commands. SIZING / DEBUG ONLY — never in the validation chain or CI.
+        /// Every line the run prints is tagged `[REUSED LCOV — NOT A FRESH
+        /// MEASUREMENT]`, because a stale report maps old line numbers onto new
+        /// code and the success sentence is otherwise identical to a real run.
+        #[arg(long)]
+        reuse_lcov: bool,
+        /// Fail on uncovered added lines instead of only reporting them.
+        ///
+        /// The widened report lands advisory (see
+        /// `SIM_COVERAGE_ENFORCES_UNCOVERED`), so by default an uncovered line
+        /// prints but exits 0. This flag restores the ADR-0024 behaviour for a
+        /// single invocation, which is how the fail path stays exercised — and
+        /// how you check whether a branch would survive the flip.
+        #[arg(long)]
+        enforce: bool,
     },
     /// Assert tokio ↔ moonpool runtime crates carry the same number of
     /// test items.
@@ -183,7 +209,11 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::CheckLogFields => check_log_fields(),
         Cmd::CheckE2eContainerMemory => check_e2e_container_memory(),
-        Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
+        Cmd::CheckSimCoverage {
+            base,
+            reuse_lcov,
+            enforce,
+        } => check_sim_coverage(&base, reuse_lcov, enforce),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
         Cmd::CheckCryptoMatrix => check_crypto_matrix(),
         Cmd::VendorProto { rev, source } => vendor_proto(&rev, source.as_deref()),
@@ -1620,6 +1650,52 @@ const SIM_COVERAGE_EXCLUDE_PREFIXES: &[&str] = &[
 /// File-name fragments excluded from sim-coverage (test files and benches).
 const SIM_COVERAGE_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/examples/"];
 
+/// Source trees whose total absence from the sim-coverage report is a hard
+/// failure rather than an advisory `not gated` line.
+///
+/// Every crate here is compiled and linked into the moonpool + differential
+/// test binaries, so [`run_sim_lcov`]'s re-export must emit `SF:` records for
+/// it. A prefix that contributes *no* record at all means one of two things,
+/// and `llvm-cov` reports neither: nothing linked the crate into the sim
+/// binaries, or the re-export silently produced nothing. Both would make
+/// [`intersect_diff_with_coverage`] read every added line in that crate as
+/// "not executable" and pass — the exact fail-open hole ADR-0088 documented.
+/// Failing loudly is the only honest answer.
+///
+/// **The check is per-CRATE, never per-FILE.** LLVM builds its coverage mapping
+/// from per-function `covfun` records, so a source file holding only `pub mod`
+/// / `pub use` / `pub const` / attributes emits no `SF:` record at all even
+/// when its crate is fully instrumented. `crates/magnetar-proto/src/lib.rs`,
+/// `crates/magnetar-proto/src/trackers/mod.rs`,
+/// `crates/magnetar-differential/src/lib.rs`,
+/// `crates/magnetar-runtime-moonpool/src/crypto.rs` and
+/// `crates/magnetar-runtime-tokio/src/crypto.rs` are all in that shape today —
+/// none of them declares a single `fn`. Adding a module to `magnetar-proto`
+/// requires a `pub mod foo;` line in `src/lib.rs`, and a per-file rule would
+/// hard-fail that routine diff with no possible remedy: the added line is not
+/// executable, so no test could ever cover it. The residual gap is deliberate
+/// and documented — a record-less file inside a crate that DID emit records
+/// stays on the advisory path.
+///
+/// Entries are exactly the crates the executed closure compiles:
+/// `magnetar-runtime-moonpool` and `magnetar-differential` are step 1's `-p`
+/// set, `magnetar-proto` and `magnetar-runtime-tokio` are normal dependencies
+/// of them, and `magnetar-auth-sasl` / `magnetar-auth-athenz` are dev-
+/// dependencies of both runners — visible as
+/// `--extern magnetar_auth_sasl=…rlib --extern magnetar_auth_athenz=…rlib` on
+/// the rustc invocation for `crates/magnetar-runtime-moonpool/tests/*`. Every
+/// other workspace member is reachable only through `magnetar-driver` /
+/// `magnetarctl`, which step 1 never compiles, so it can never emit a record
+/// and must not be listed here.
+const SIM_COVERAGE_GATED_CRATE_PREFIXES: &[&str] = &[
+    "crates/magnetar-proto/src/",
+    "crates/magnetar-runtime-tokio/src/",
+    "crates/magnetar-runtime-moonpool/src/",
+    "crates/magnetar-differential/src/",
+    "crates/magnetar-auth-sasl/src/",
+    "crates/magnetar-auth-athenz/src/",
+];
+
 /// Returns true if `relpath` (workspace-relative, forward slashes) is excluded
 /// from sim-coverage enforcement.
 fn is_sim_coverage_excluded(relpath: &str) -> bool {
@@ -1671,11 +1747,6 @@ fn git_merge_base(base: &str, cwd: &Path) -> Result<String> {
     Ok(raw.trim().to_owned())
 }
 
-/// Parse a unified-diff blob produced by `git diff --unified=0` and return
-/// the set of added new-side line numbers per workspace-relative file path.
-///
-/// Only `+` lines (excluding `+++` file headers) are considered additions.
-/// Hunk headers `@@ -... +start,count @@` reset the new-side cursor.
 /// Return the 1-indexed line number of the first `#[cfg(test)]` attribute in
 /// `path`, or `None` if the file has no inline test module. Used to drop
 /// inline-test lines from the sim-coverage diff scan: every `src/**/*.rs` in
@@ -1716,6 +1787,11 @@ fn unreachable_lines(path: &Path) -> std::collections::BTreeSet<u32> {
     out
 }
 
+/// Parse a unified-diff blob produced by `git diff --unified=0` and return
+/// the set of added new-side line numbers per workspace-relative file path.
+///
+/// Only `+` lines (excluding `+++` file headers) are considered additions.
+/// Hunk headers `@@ -... +start,count @@` reset the new-side cursor.
 fn parse_diff_added_lines(
     diff: &str,
 ) -> std::collections::HashMap<String, std::collections::BTreeSet<u32>> {
@@ -1765,6 +1841,27 @@ fn parse_diff_added_lines(
     by_file
 }
 
+/// Normalize a path into the key both sides of the coverage intersection are
+/// compared on.
+///
+/// LCOV `SF:` paths come from `llvm-cov`, the diff side is
+/// `workspace_root.join(relpath)`; nothing guarantees the two spell the same
+/// file the same way. A symlinked checkout (`/home/x/work` →
+/// `/mnt/nvme/work`) is enough to make every comparison miss, and a miss does
+/// not fail loudly — it degrades the file to "no LCOV record", i.e. the whole
+/// gate silently passes. Canonicalizing both sides collapses symlinks, `..`
+/// segments and `.` segments so the keys agree.
+///
+/// Falls back to the un-normalized path when canonicalization fails: the unit
+/// tests key off a nonexistent `/ws` root, and a real run must not start
+/// erroring because one tracked file was deleted after the diff was taken.
+fn coverage_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Parse an LCOV report and return `(executable, covered)` line sets per
 /// absolute source path. LCOV format key lines:
 ///
@@ -1777,6 +1874,8 @@ fn parse_diff_added_lines(
 /// additions (use statements, doc comments, blank lines, closing braces),
 /// which are always absent from the LCOV and would otherwise be flagged as
 /// "uncovered" forever.
+///
+/// Keys go through [`coverage_key`] so they compare equal to the diff side.
 fn parse_lcov_coverage(
     lcov: &str,
 ) -> std::collections::HashMap<
@@ -1793,7 +1892,8 @@ fn parse_lcov_coverage(
 
     for line in lcov.lines() {
         if let Some(path) = line.strip_prefix("SF:") {
-            current_file = Some(path.to_owned());
+            // Normalized so a symlinked checkout still matches the diff side.
+            current_file = Some(coverage_key(Path::new(path)));
             continue;
         }
         if line == "end_of_record" {
@@ -1820,35 +1920,144 @@ fn parse_lcov_coverage(
     by_file
 }
 
-/// Run `cargo llvm-cov` against the moonpool runtime + differential test
-/// crates and return the emitted LCOV report as a string.
+/// Packages whose sources the sim-coverage report keeps.
 ///
-/// The emitted report covers ONLY the two `-p` packages' own sources — measured
-/// 2026-07-30: 16 `SF:` records, 12 under `magnetar-runtime-moonpool/src/` and 4
-/// under `magnetar-differential/src/`, and nothing else. It does NOT reach their
-/// dependencies, so `magnetar-proto`, `magnetar-runtime-tokio` and the `magnetar`
-/// façade emit no records at all and their additions cannot be gated here.
-/// Reproduce with `rg -o '^SF:.*' target/sim-coverage.lcov`.
+/// Exactly the executed closure of step 1, and nothing else. `-p` on
+/// `cargo llvm-cov report` cannot *widen* a report: it only removes a package's
+/// manifest directory from the `-ignore-filename-regex` handed to
+/// `llvm-cov export`. The object files are walked out of the target directory,
+/// so a package cargo never compiled has no coverage mapping and cannot be
+/// conjured back by naming it here.
 ///
-/// [`uninstrumented_files`] turns that into an explicit `not gated` report rather
-/// than a silent pass (ADR-0088); broadening the scope is tracked as
-/// `docs/follow-ups.md` §10.
-fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
+/// That rules out `magnetar-driver`, `magnetarctl` and `xtask`, and equally
+/// `magnetar-admin`, `magnetar-auth-oauth2`, `magnetar-fakes` and
+/// `magnetar-messagecrypto`: no `crates/*/Cargo.toml` outside
+/// `crates/magnetar` (the façade) and `crates/magnetarctl` names any of the
+/// four, and neither of those is in step 1's `-p` set. Listing them would not
+/// add a single record, but [`report_ungated`] prints this list as "the
+/// reported closure", so a record-less file in one of them would be told it
+/// sits outside a closure that names its own crate. `magnetar-auth-athenz` and
+/// `magnetar-auth-sasl` stay because they ARE compiled — both are dev-
+/// dependencies of `magnetar-runtime-moonpool` and `magnetar-differential`.
+///
+/// Only the report step consumes this; the execution step keeps its own two
+/// `-p` flags, because those decide which test binaries actually run.
+const SIM_COVERAGE_REPORT_PACKAGES: &[&str] = &[
+    "magnetar-proto",
+    "magnetar-runtime-tokio",
+    "magnetar-runtime-moonpool",
+    "magnetar-differential",
+    "magnetar-auth-athenz",
+    "magnetar-auth-sasl",
+];
+
+/// Greppable tag stamped on every line `check-sim-coverage` emits when it was
+/// handed `--reuse-lcov`.
+///
+/// Without it a reused-report run is textually identical to a measured one —
+/// same success sentence, same exit code — so pasting the transcript as proof
+/// of ADR-0024 patch coverage cannot be distinguished from the real thing. The
+/// flag stays out of CI and out of the `CLAUDE.md` validation chain, so the
+/// exposure is exactly that: a transcript that overstates what ran.
+const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMENT]";
+
+/// Produce the sim-coverage LCOV report and return it as a string.
+///
+/// Two steps, because execution scope and report scope are different questions:
+///
+/// 1. **Execute** — `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential
+///    --all-features --locked`, writing `target/sim-coverage-exec.lcov`. This builds, runs the
+///    tests, and leaves the merged profile data plus the object files on disk. Its own LCOV output
+///    is a by-product we never read.
+/// 2. **Re-export** — `cargo llvm-cov report` over the same artifacts with
+///    [`SIM_COVERAGE_REPORT_PACKAGES`], writing `target/sim-coverage.lcov`. No clean, no build, no
+///    test run: it is a second `llvm-cov export` against files already on disk.
+///
+/// The second step is what closes ADR-0088's scope gap, and it is nearly free
+/// because instrumentation was never the limit. `cargo-llvm-cov`'s `RUSTC_WRAPPER`
+/// builds its instrumentation list from every workspace member and ignores `-p`
+/// entirely; `-p` only selects which test binaries run, which packages get
+/// cleaned, and the `-ignore-filename-regex` handed to `llvm-cov export`
+/// (verified against cargo-llvm-cov 0.8.7: `src/wrapper.rs`, `src/report.rs`).
+/// So `magnetar-proto`'s counters were always in the profile data — the report
+/// filter was hiding them.
+///
+/// The `--no-report` + `report` stitch is NOT usable here: `--no-report` implies
+/// `--no-clean`, so stale `*.profraw` from an earlier run would merge in and
+/// could report an uncovered line as covered.
+///
+/// The final artifact stays at `target/sim-coverage.lcov`, so the reproduction
+/// command in the ADRs is unchanged: `rg -o '^SF:.*' target/sim-coverage.lcov`.
+/// Measured 2026-07-31, the widened report carries 63 `SF:` records against 16
+/// before: `magnetar-proto` 28, `magnetar-runtime-tokio` 12,
+/// `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5,
+/// `magnetar-differential` 4, `magnetar-auth-sasl` 2 — the six packages of
+/// [`SIM_COVERAGE_REPORT_PACKAGES`] and nothing else, which is what pins that
+/// constant to the executed closure.
+///
+/// A crate under [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] that emits no record at
+/// all is a hard failure ([`report_missing_gated`]); anything else the report
+/// does not mention — including a function-less file inside a crate that did
+/// emit records — is reported as `not gated` rather than silently passed
+/// (ADR-0088).
+///
+/// With `reuse_lcov`, both commands are skipped and the existing
+/// `target/sim-coverage.lcov` is read as-is — sizing and debugging only. That
+/// path announces itself on stderr and tags the final summary, because a
+/// reused report is indistinguishable from a fresh one in every other respect
+/// (see [`SIM_COVERAGE_REUSE_MARKER`]).
+fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     let lcov_path = workspace_root.join("target/sim-coverage.lcov");
+    if reuse_lcov {
+        if !lcov_path.is_file() {
+            bail!(
+                "--reuse-lcov was passed but {} does not exist — run \
+                 `cargo run -p xtask -- check-sim-coverage` without the flag first.",
+                lcov_path.display()
+            );
+        }
+        // `target/` is gitignored build state that outlives commits, and LCOV
+        // keys on line numbers: a report written before a rebase or an
+        // unrelated edit maps stale covered line numbers onto brand-new code,
+        // so added line 812 reads as covered because *old* line 812 was. Say so
+        // loudly — without this the transcript is byte-identical to a real run.
+        let age = fs::metadata(&lcov_path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        let age_desc = age.map_or_else(
+            || "mtime unavailable".to_owned(),
+            |elapsed| format!("last written {} second(s) ago", elapsed.as_secs()),
+        );
+        eprintln!(
+            "{SIM_COVERAGE_REUSE_MARKER} --reuse-lcov: NO coverage run \
+             happened. Reading {} as-is ({age_desc}). LCOV keys on line \
+             numbers, so a report older than the diff maps stale covered lines \
+             onto new code. This run is NOT evidence of ADR-0024 patch \
+             coverage — re-run without the flag before citing it.",
+            lcov_path.display()
+        );
+        return fs::read_to_string(&lcov_path)
+            .with_context(|| format!("reading {}", lcov_path.display()));
+    }
+
+    let exec_lcov_path = workspace_root.join("target/sim-coverage-exec.lcov");
     if let Some(parent) = lcov_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    // `-p` is a cargo flag, not a test-runner flag. Putting it after `--`
-    // routes it to libtest, which rejects it ("Unrecognized option: 'p'") and
-    // aborts the whole coverage run. Filtering the packages with `-p` (and
-    // dropping `--workspace`, which is mutually exclusive) restricts both
-    // instrumentation and test execution to the moonpool + differential
-    // crates — the surface ADR-0024 demands patch coverage on.
-    let status = StdCommand::new(&cargo)
-        .current_dir(workspace_root)
+
+    // Step 1 — execution. `-p` is a cargo flag, not a test-runner flag. Putting
+    // it after `--` routes it to libtest, which rejects it ("Unrecognized
+    // option: 'p'") and aborts the whole coverage run. Here it picks the test
+    // binaries to run (and `--workspace`, mutually exclusive with it, would drag
+    // in the façade's Docker-bound e2e suite). It does NOT restrict
+    // instrumentation: cargo-llvm-cov instruments every workspace member
+    // regardless, which is exactly why step 2 can widen the report for free.
+    let mut exec = StdCommand::new(&cargo);
+    exec.current_dir(workspace_root)
         .args(["llvm-cov", "--lcov", "--output-path"])
-        .arg(&lcov_path)
+        .arg(&exec_lcov_path)
         .args([
             "-p",
             "magnetar-runtime-moonpool",
@@ -1857,12 +2066,39 @@ fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
             "--all-features",
             "--locked",
             "--quiet",
-        ])
-        .status()
-        .context("failed to invoke `cargo llvm-cov`")?;
+        ]);
+    // `--all-features` reaches `crypto-fips`, so this build compiles
+    // `aws-lc-fips-sys`. On Linux that needs clang or it dies in `delocate`
+    // — see [`force_clang_toolchain`]. Without this the gate is unrunnable on
+    // a bare Linux checkout, which is how it shipped until 2026-07-31.
+    force_clang_toolchain(&mut exec);
+    let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
     if !status.success() {
         bail!("`cargo llvm-cov` exited with status {status}");
     }
+
+    // Step 2 — re-export the same profdata + object files over the wider
+    // package set. `cargo llvm-cov report` accepts `-p` only; `--workspace`,
+    // `--exclude-from-report` and `--exclude-from-test` are all rejected on it.
+    let mut report = StdCommand::new(&cargo);
+    report
+        .current_dir(workspace_root)
+        .args(["llvm-cov", "report", "--lcov", "--output-path"])
+        .arg(&lcov_path);
+    for package in SIM_COVERAGE_REPORT_PACKAGES {
+        report.args(["-p", package]);
+    }
+    // Generated proto is excluded from the gate diff-side already
+    // (`SIM_COVERAGE_EXCLUDE_PREFIXES`); dropping it here too keeps the report
+    // from carrying tens of thousands of prost-generated lines.
+    report.args(["--ignore-filename-regex", "crates/magnetar-proto/src/pb/"]);
+    let status = report
+        .status()
+        .context("failed to invoke `cargo llvm-cov report`")?;
+    if !status.success() {
+        bail!("`cargo llvm-cov report` exited with status {status}");
+    }
+
     fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
 }
 
@@ -1887,8 +2123,7 @@ fn intersect_diff_with_coverage(
 ) -> Vec<(String, u32)> {
     let mut uncovered = Vec::new();
     for (relpath, added_lines) in tracked {
-        let abs = workspace_root.join(relpath);
-        let abs_key = abs.to_string_lossy().into_owned();
+        let abs_key = coverage_key(&workspace_root.join(relpath));
         let entry = covered.get(&abs_key);
         for &line in added_lines {
             let is_executable = entry.is_some_and(|(exec, _)| exec.contains(&line));
@@ -1903,16 +2138,18 @@ fn intersect_diff_with_coverage(
 
 /// Partition off the tracked files that LCOV never mentions at all.
 ///
-/// `run_moonpool_lcov` filters the run with `-p magnetar-runtime-moonpool -p
-/// magnetar-differential`, and the emitted report carries only those two
-/// packages' own sources — not their dependencies. Every other crate,
-/// `magnetar-proto` and the `magnetar` façade included, therefore emits no `DA:`
-/// records at all, and every added line in it reads as "not executable" to
-/// [`intersect_diff_with_coverage`].
+/// [`run_sim_lcov`]'s report covers [`SIM_COVERAGE_REPORT_PACKAGES`]; a file
+/// outside them — in the `magnetar-driver` façade, `magnetarctl` or `xtask` —
+/// emits no `DA:` records at all, so every added line in it reads as "not
+/// executable" to [`intersect_diff_with_coverage`] and passes.
 ///
-/// That is a real scope limit on ADR-0024's patch-coverage gate, not a pass.
+/// That is a scope limit on ADR-0024's patch-coverage gate, not a pass.
 /// Returning it separately lets the caller say so out loud instead of folding
 /// those files into a "100% covered" summary they were never measured against.
+///
+/// [`classify_uninstrumented`] splits this result again: a file whose whole
+/// gated crate is missing from the report is not a scope limit but a broken
+/// run, and goes to [`report_missing_gated`] to fail the check.
 ///
 /// Returns `(relpath, added_line_count)` per uninstrumented file, sorted by path.
 fn uninstrumented_files(
@@ -1928,38 +2165,178 @@ fn uninstrumented_files(
 ) -> Vec<(String, usize)> {
     let mut ungated: Vec<(String, usize)> = tracked
         .iter()
-        .filter(|(relpath, _)| {
-            let abs_key = workspace_root.join(relpath).to_string_lossy().into_owned();
-            !covered.contains_key(&abs_key)
-        })
+        .filter(|(relpath, _)| !covered.contains_key(&coverage_key(&workspace_root.join(relpath))))
         .map(|(relpath, lines)| (relpath.clone(), lines.len()))
         .collect();
     ungated.sort_by(|a, b| a.0.cmp(&b.0));
     ungated
 }
 
+/// The entries of [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] that contributed no
+/// `SF:` record whatsoever to `covered`.
+///
+/// This — not a per-file record miss — is the "the run is broken" signal. A
+/// gated crate is compiled and linked into the sim test binaries, so its object
+/// files carry a coverage mapping and `llvm-cov export` must emit records for
+/// it. Zero records for the entire crate means nothing linked it or the
+/// re-export produced nothing, and `llvm-cov` reports neither.
+///
+/// `covered` is keyed on canonicalized absolute paths ([`coverage_key`]) while
+/// the prefixes are workspace-relative, so the match is a substring test rather
+/// than `starts_with`. Canonicalization only rewrites the checkout-root portion
+/// of a key; the `crates/<name>/src/` tail survives it, which is exactly the
+/// property that makes the substring safe here.
+fn silent_gated_prefixes(
+    covered: &std::collections::HashMap<
+        String,
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+    >,
+) -> Vec<&'static str> {
+    SIM_COVERAGE_GATED_CRATE_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| !covered.keys().any(|key| key.contains(prefix)))
+        .collect()
+}
+
+/// `(missing_gated, ungated)` — the two record-less buckets.
+type UninstrumentedSplit = (Vec<(String, usize)>, Vec<(String, usize)>);
+
+/// Split [`uninstrumented_files`] into the files that prove a broken run and
+/// the files that merely sit outside the report's reach.
+///
+/// A record-less file hard-fails only when its own gated crate produced no
+/// records at all ([`silent_gated_prefixes`]). Inside a crate that *did* emit
+/// records the miss is expected: LLVM derives its coverage mapping from
+/// per-function records, so `pub mod` / `pub use` / `pub const`-only files
+/// legitimately have no `SF:` entry and nothing a test could ever cover. See
+/// [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] for why that distinction is
+/// load-bearing rather than a convenience.
+///
+/// `check_sim_coverage` and its unit tests both call this, so the classification
+/// has exactly one implementation and cannot drift from what the check does.
+fn classify_uninstrumented(
+    workspace_root: &Path,
+    tracked: &[(String, std::collections::BTreeSet<u32>)],
+    covered: &std::collections::HashMap<
+        String,
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+    >,
+) -> UninstrumentedSplit {
+    let silent = silent_gated_prefixes(covered);
+    uninstrumented_files(workspace_root, tracked, covered)
+        .into_iter()
+        .partition(|(relpath, _)| silent.iter().any(|prefix| relpath.starts_with(prefix)))
+}
+
 /// Print the files ADR-0024's patch-coverage gate could not measure.
 ///
-/// Deliberately does NOT fail the check: broadening the coverage run to reach
-/// them would pull the façade's Docker-dependent e2e suite (ADR-0046: no
-/// feature gate, no `#[ignore]`) into every invocation. Reporting keeps the
-/// limit visible instead of silent — see ADR-0088.
+/// Deliberately does NOT fail the check: these live outside
+/// [`SIM_COVERAGE_REPORT_PACKAGES`], and pulling the `magnetar-driver` façade
+/// into the run would drag its Docker-dependent e2e suite (ADR-0046: no feature
+/// gate, no `#[ignore]`) along with it. Reporting keeps the limit visible
+/// instead of silent — see ADR-0088.
 fn report_ungated(ungated: &[(String, usize)]) {
     for (path, count) in ungated {
-        eprintln!("not gated (outside the moonpool coverage run): {path}: {count} added line(s)");
+        eprintln!("not gated (outside the sim-coverage report): {path}: {count} added line(s)");
     }
     eprintln!(
-        "xtask check-sim-coverage: {} file(s) above are outside the \
-         `-p magnetar-runtime-moonpool -p magnetar-differential` coverage run, so \
-         ADR-0024 patch coverage was NOT enforced on them (ADR-0088). Cover them \
-         from a moonpool or differential test if the added code is engine-visible.",
-        ungated.len()
+        "xtask check-sim-coverage: {} file(s) above sit outside the reported \
+         closure ({}), so ADR-0024 patch coverage was NOT enforced on them \
+         (ADR-0088). Cover them from a moonpool or differential test if the \
+         added code is engine-visible.",
+        ungated.len(),
+        SIM_COVERAGE_REPORT_PACKAGES.join(", ")
     );
 }
 
-/// Print per-file uncovered ranges and bail with a summary. Always returns
-/// `Err` — the caller relies on `?` to surface the failure.
-fn report_uncovered(workspace_root: &Path, uncovered: &[(String, u32)]) -> Result<()> {
+/// Print the added lines that landed in a gated crate the report never
+/// mentioned, then bail. Always returns `Err` — the caller relies on `?`.
+///
+/// Reaching this means [`classify_uninstrumented`] found the file's entire
+/// crate absent from `target/sim-coverage.lcov`, not merely the file. Those
+/// crates ARE compiled and linked into the sim binaries, so either the link
+/// never happened or the re-export produced nothing. `llvm-cov` reports neither
+/// case, and both make every added line in the crate read as "not executable"
+/// and pass. Treating that as an advisory would be a fail-open hole exactly
+/// where the gate is supposed to bite hardest.
+fn report_missing_gated(missing: &[(String, usize)]) -> Result<()> {
+    for (path, count) in missing {
+        eprintln!("no coverage records (gated crate): {path}: {count} added line(s)");
+    }
+    bail!(
+        "xtask check-sim-coverage: {} file(s) above sit in a gated crate that \
+         emitted no coverage records at all — not one file of it reached the \
+         report. Either nothing links that crate into the moonpool / \
+         differential test binaries, or the report step produced nothing for \
+         it; `llvm-cov` reports neither, so this cannot be treated as covered. \
+         Inspect `target/sim-coverage.lcov` \
+         (`rg -o '^SF:.*' target/sim-coverage.lcov`); if the crate legitimately \
+         emits no records at all, reconcile SIM_COVERAGE_GATED_CRATE_PREFIXES \
+         against that measurement.",
+        missing.len()
+    );
+}
+
+/// Report both record-less buckets produced by [`classify_uninstrumented`],
+/// then propagate the hard failure if there was one.
+///
+/// The ordering is load-bearing and belongs here rather than inlined at the
+/// call site: [`report_missing_gated`] bails, so the advisory has to be printed
+/// first or a diff carrying both classes would show only the failure and hide
+/// the scope limit entirely.
+fn report_record_less(split: &UninstrumentedSplit) -> Result<()> {
+    let (missing_gated, ungated) = split;
+    if !ungated.is_empty() {
+        report_ungated(ungated);
+    }
+    if !missing_gated.is_empty() {
+        report_missing_gated(missing_gated)?;
+    }
+    Ok(())
+}
+
+/// Whether an uncovered added line fails the check by default.
+///
+/// `false` — the widened report lands ADVISORY. Uncovered lines are printed in
+/// full but the check exits 0.
+///
+/// This is a deliberate, time-boxed decision and not the end state. Replaying
+/// history through the widened gate on 2026-07-31 measured 450 uncovered added
+/// lines across 15 files against `HEAD~25`, and 6 across 4 files against
+/// `HEAD~10`. The backlog exists because the gate has never actually run
+/// per-PR: `.github/workflows/xtask-gates.yml` only runs it on a schedule
+/// against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the
+/// diff empty and the check short-circuits with "nothing to verify".
+///
+/// Note what this costs: as long as this is `false`, a green
+/// `check-sim-coverage` is NOT evidence of ADR-0024 patch coverage — it is
+/// evidence that the gate ran and printed its findings. That is the same shape
+/// of claim ADR-0088 was written to stop making, which is why the advisory
+/// output is loud, carries a count, and names this constant.
+///
+/// `--enforce` overrides it per-invocation, which is how the fail path stays
+/// exercised while the default is `false`. Flipping this to `true` is the
+/// follow-up; see ADR-0090 and `docs/follow-ups.md`.
+const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = false;
+
+/// Print per-file uncovered ranges, then fail only when enforcing.
+///
+/// Returns `Err` when `enforcing`; otherwise prints an advisory summary and
+/// returns `Ok(())`. The per-file lines above are identical either way, so the
+/// only difference between the two modes is the exit code and the final
+/// sentence — a reader diffing two transcripts sees exactly what changed.
+fn report_uncovered(
+    workspace_root: &Path,
+    uncovered: &[(String, u32)],
+    enforcing: bool,
+) -> Result<()> {
     let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
     for (path, line) in uncovered {
         by_file.entry(path.as_str()).or_default().push(*line);
@@ -1975,6 +2352,21 @@ fn report_uncovered(workspace_root: &Path, uncovered: &[(String, u32)]) -> Resul
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+    if !enforcing {
+        eprintln!(
+            "xtask check-sim-coverage: ADVISORY — {} added line(s) across {} \
+             file(s) were NOT executed by `magnetar-runtime-moonpool` / \
+             `magnetar-differential` tests (workspace root: {}). ADR-0024 wants \
+             100%, and this run does NOT prove it: the check is exiting 0 \
+             because SIM_COVERAGE_ENFORCES_UNCOVERED is false (ADR-0090). Do \
+             not cite a green run here as patch-coverage evidence. Re-run with \
+             `--enforce` to get the failing exit code.",
+            uncovered.len(),
+            by_file.len(),
+            workspace_root.display(),
+        );
+        return Ok(());
     }
     bail!(
         "xtask check-sim-coverage: {} added line(s) across {} file(s) not \
@@ -2002,8 +2394,15 @@ fn ensure_cargo_llvm_cov() -> Result<()> {
     }
 }
 
-fn check_sim_coverage(base: &str) -> Result<()> {
-    ensure_cargo_llvm_cov()?;
+fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()> {
+    if !reuse_lcov {
+        ensure_cargo_llvm_cov()?;
+    }
+    // `--enforce` can only ever tighten: it turns uncovered lines fatal. The
+    // record-less-gated-crate bail is NOT governed by either, because that
+    // signals a broken or misconfigured gate rather than a missing test, and a
+    // gate that cannot measure must never report success.
+    let enforcing = enforce || SIM_COVERAGE_ENFORCES_UNCOVERED;
 
     let workspace_root = workspace_root()?;
     let merge_base = git_merge_base(base, &workspace_root)?;
@@ -2058,19 +2457,13 @@ fn check_sim_coverage(base: &str) -> Result<()> {
         return Ok(());
     }
 
-    if tracked.is_empty() {
-        eprintln!(
-            "xtask check-sim-coverage: no production-surface .rs additions \
-             relative to {base} — nothing to verify."
-        );
-        return Ok(());
-    }
-
     // 3. Run moonpool-side coverage and emit LCOV. We run the moonpool runtime crate's tests + the
     //    differential harness, both gated on `--all-features` so chaos-pack scenarios participate.
-    //    The whole workspace is instrumented so coverage attributes to the originating crate (e.g.
-    //    magnetar-proto), not just the runner.
-    let lcov = run_moonpool_lcov(&workspace_root)?;
+    //    The whole workspace is instrumented — cargo-llvm-cov's RUSTC_WRAPPER builds its crate list
+    //    from every workspace member and ignores `-p` — so coverage attributes to the originating
+    //    crate (e.g. magnetar-proto), not just the runner, and `run_sim_lcov`'s report step is what
+    //    makes that visible.
+    let lcov = run_sim_lcov(&workspace_root, reuse_lcov)?;
     let covered = parse_lcov_coverage(&lcov);
 
     // 4. Intersect: for every added line in a tracked file, check that the moonpool runner reached
@@ -2081,23 +2474,55 @@ fn check_sim_coverage(base: &str) -> Result<()> {
     // 4b. Separate the files the run never instrumented from the files it
     //     measured and found wanting. Both were silently identical before —
     //     an uninstrumented file has no `DA:` records, so every added line in
-    //     it looked "not executable" and passed. Report the scope limit first
-    //     so it survives the `?` below (ADR-0088).
-    let ungated = uninstrumented_files(&workspace_root, &tracked, &covered);
-    if !ungated.is_empty() {
-        report_ungated(&ungated);
-    }
+    //     it looked "not executable" and passed (ADR-0088). Split the
+    //     record-less files again: a gated crate that reached the report not at
+    //     all is a broken run and must fail, everything else is a scope limit.
+    //     `report_record_less` owns the ordering (advisory first, so it survives
+    //     the bail) and the `?`.
+    let record_less = classify_uninstrumented(&workspace_root, &tracked, &covered);
+    report_record_less(&record_less)?;
+    let (missing_gated, ungated) = record_less;
 
     if !uncovered.is_empty() {
-        report_uncovered(&workspace_root, &uncovered)?;
+        report_uncovered(&workspace_root, &uncovered, enforcing)?;
     }
 
-    let gated = tracked.len() - ungated.len();
-    eprintln!(
-        "xtask check-sim-coverage: all added lines across {gated} file(s) are \
-         covered by the moonpool runner ({} file(s) outside its scope).",
-        ungated.len()
-    );
+    // Three buckets now: measured-and-clean, ungated, missing-gated. The last
+    // is empty here (it bails above), but subtract it anyway so the count stays
+    // right if the ordering ever changes.
+    let gated = tracked
+        .len()
+        .saturating_sub(ungated.len())
+        .saturating_sub(missing_gated.len());
+    // A reused report produces this exact sentence off stale line numbers, so
+    // the success line has to carry the caveat with it — the warning printed
+    // back in `run_sim_lcov` is thousands of lines up a real transcript.
+    let reuse_suffix = if reuse_lcov {
+        format!(" {SIM_COVERAGE_REUSE_MARKER}")
+    } else {
+        String::new()
+    };
+    // Reaching here with a non-empty `uncovered` means advisory mode swallowed
+    // a real failure. Saying "all added lines are covered" then would be the
+    // exact false summary ADR-0088 was written to stop — it counted files it
+    // never measured. Keep the two cases textually distinct.
+    if uncovered.is_empty() {
+        eprintln!(
+            "xtask check-sim-coverage: all added lines across {gated} file(s) are \
+             covered by the moonpool runner ({} file(s) outside the reported \
+             closure).{reuse_suffix}",
+            ungated.len()
+        );
+    } else {
+        eprintln!(
+            "xtask check-sim-coverage: exiting 0 with {} uncovered added line(s) \
+             still outstanding across {gated} measured file(s) ({} file(s) \
+             outside the reported closure). This is NOT a pass — see the \
+             ADVISORY line above.{reuse_suffix}",
+            uncovered.len(),
+            ungated.len()
+        );
+    }
     Ok(())
 }
 
@@ -2424,7 +2849,7 @@ fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
 /// Force clang for `crypto-fips` cells on Linux.
 ///
 /// aws-lc's FIPS BCM is post-processed by the `delocate` tool, which
-/// rejects any `.data*` section in the module assembly. GCC 16+ emits
+/// rejects any `.data*` section in the module assembly. GCC emits
 /// `.data.rel.ro.local` for some `-fPIC` const-pointer patterns; clang
 /// places the equivalent in `.rodata`. `aws-lc-fips-sys` only
 /// auto-switches to clang for the `asan` feature, so a plain Linux
@@ -2433,11 +2858,48 @@ fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
 /// depends on which aws-lc sources cargo's feature unification pulls
 /// into `bcm.c`. Setting the C/asm toolchain explicitly here keeps the
 /// matrix green regardless of host gcc version.
+///
+/// This used to say "GCC 16+". That is wrong and was load-bearing
+/// enough to mislead: on 2026-07-31 the same `delocate` failure
+/// reproduced on **gcc 14.4.0** while running `check-sim-coverage`.
+/// The feature-unification sentence above is the real explanation, so
+/// no gcc version is safe and none is named.
+///
+/// Beware a stale `CMake` cache when debugging this. `cmake-rs` reuses
+/// `OUT_DIR/build`, and a re-run with `CC=clang` after a failed gcc run
+/// re-configures the top level while `try_compile` probes still use the
+/// cached `/usr/host/bin/cc`; `CMake` reports "You have changed variables
+/// that require your cache to be deleted" and the build fails a second
+/// time for what looks like the first reason. Delete the
+/// `aws-lc-fips-sys-*` build directory before re-testing.
 fn apply_fips_toolchain(cmd: &mut StdCommand, features: &str) {
-    if !cfg!(target_os = "linux") {
+    if !features.split(',').any(|f| f.trim() == "crypto-fips") {
         return;
     }
-    if !features.split(',').any(|f| f.trim() == "crypto-fips") {
+    force_clang_toolchain(cmd);
+}
+
+/// Pin `cmd`'s C/C++/asm toolchain to clang on Linux.
+///
+/// Split out of [`apply_fips_toolchain`] because that helper matches a
+/// comma-separated feature list, and the callers that need this most pass
+/// `--all-features` instead — a shape no feature-name match can recognise.
+///
+/// Any Linux build that reaches `crypto-fips` needs this. `--all-features`
+/// always does: `magnetar-runtime-moonpool` and `magnetar-runtime-tokio` both
+/// declare `crypto-fips = ["rustls/fips"]`, which pulls `aws-lc-fips-sys`.
+/// Without it the build dies inside aws-lc's `delocate` pass with
+/// `".data section found in module"`, because `cmake-rs` falls back to the
+/// host `cc` (gcc) and gcc emits `.data.rel.ro.local` for some `-fPIC`
+/// const-pointer patterns where clang emits `.rodata`.
+///
+/// Not gated on a host gcc version on purpose. That failure was long
+/// attributed to "gcc 16+", but it reproduced on **gcc 14.4.0** on
+/// 2026-07-31 while running `check-sim-coverage`; which sources land in
+/// `bcm.c` depends on cargo's feature unification, so the version is the
+/// wrong axis. Pin the toolchain unconditionally instead.
+fn force_clang_toolchain(cmd: &mut StdCommand) {
+    if !cfg!(target_os = "linux") {
         return;
     }
     cmd.env("CC", "clang")
@@ -3048,11 +3510,11 @@ fn pop(now: Instant) {
             .collect()
     }
 
-    /// The defect this reporting exists for: `run_moonpool_lcov` filters with
-    /// `-p magnetar-runtime-moonpool -p magnetar-differential`, and neither
-    /// depends on the `magnetar` façade, so façade files emit no LCOV records
-    /// at all. Before ADR-0088 those lines were indistinguishable from
-    /// non-executable ones and passed silently.
+    /// The defect this reporting exists for: `run_sim_lcov`'s report step
+    /// covers `SIM_COVERAGE_REPORT_PACKAGES`, which deliberately omits the
+    /// `magnetar-driver` façade, so façade files emit no LCOV records at all.
+    /// Before ADR-0088 those lines were indistinguishable from non-executable
+    /// ones and passed silently.
     #[test]
     fn sim_coverage_reports_a_facade_file_the_runner_never_instrumented() {
         let root = Path::new("/ws");
@@ -3122,6 +3584,388 @@ fn pop(now: Instant) {
                 "crates/magnetar-runtime-moonpool/src/driver.rs".to_owned(),
                 81
             )]
+        );
+    }
+
+    /// `magnetar-proto` IS in the reported closure, so a diff touching it while
+    /// the report carries not one `magnetar-proto` record does not mean "out of
+    /// scope" — it means nothing linked the crate into the sim binaries, or the
+    /// report step produced nothing. `llvm-cov` reports neither, and every added
+    /// line would read as non-executable and pass. That must fail, not print an
+    /// advisory.
+    #[test]
+    fn sim_coverage_fails_when_a_gated_crate_reached_the_report_not_at_all() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/producer.rs", &[10, 11])]);
+        // Records exist — but none of them are `magnetar-proto`'s.
+        let covered = coverage_of(
+            root,
+            &[("crates/magnetar-runtime-moonpool/src/driver.rs", &[7], &[7])],
+        );
+
+        assert!(
+            silent_gated_prefixes(&covered).contains(&"crates/magnetar-proto/src/"),
+            "a gated crate with zero records is the broken-run signal"
+        );
+        let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+        assert_eq!(
+            missing_gated,
+            vec![("crates/magnetar-proto/src/producer.rs".to_owned(), 2)],
+            "a gated crate emitting no records is a broken run, not a scope limit"
+        );
+        assert!(
+            ungated.is_empty(),
+            "it must not be routed to the advisory bucket"
+        );
+        assert!(
+            report_missing_gated(&missing_gated).is_err(),
+            "the missing-gated report must fail the check"
+        );
+    }
+
+    /// The counterpart, and the reason the hard failure is per-CRATE rather
+    /// than per-FILE: LLVM derives its coverage mapping from per-function
+    /// records, so a file declaring no `fn` at all emits no `SF:` record even
+    /// though its crate is fully instrumented. `crates/magnetar-proto/src/lib.rs`
+    /// is exactly that file — and adding a module to `magnetar-proto` means
+    /// adding a `pub mod` line to it. A per-file rule would hard-fail that diff
+    /// with no possible remedy, since the added line is not executable and no
+    /// test could ever cover it.
+    #[test]
+    fn sim_coverage_keeps_a_function_less_file_advisory_when_its_crate_reported() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/lib.rs", &[42])]);
+        // A covered sibling in the SAME crate: the crate did reach the report.
+        let covered = coverage_of(root, &[("crates/magnetar-proto/src/conn.rs", &[40], &[40])]);
+
+        assert!(
+            !silent_gated_prefixes(&covered).contains(&"crates/magnetar-proto/src/"),
+            "the crate emitted records, so it is not the broken-run signal"
+        );
+        let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+        assert!(
+            missing_gated.is_empty(),
+            "a `pub mod`-only file must not hard-fail — nothing there is executable"
+        );
+        assert_eq!(
+            ungated,
+            vec![("crates/magnetar-proto/src/lib.rs".to_owned(), 1)],
+            "it stays visible on the advisory path"
+        );
+    }
+
+    /// The five function-less files that exist in the gated crates today. Each
+    /// is a real path in this workspace with zero `fn` declarations, so each
+    /// legitimately emits no `SF:` record — pinned here so a future per-file
+    /// tightening trips this test instead of a routine commit.
+    #[test]
+    fn sim_coverage_never_hard_fails_the_known_function_less_files() {
+        let root = Path::new("/ws");
+        let function_less = [
+            "crates/magnetar-proto/src/lib.rs",
+            "crates/magnetar-proto/src/trackers/mod.rs",
+            "crates/magnetar-differential/src/lib.rs",
+            "crates/magnetar-runtime-moonpool/src/crypto.rs",
+            "crates/magnetar-runtime-tokio/src/crypto.rs",
+        ];
+        // Every gated crate reported at least one file, which is the state a
+        // healthy run is in.
+        let covered = coverage_of(
+            root,
+            &[
+                ("crates/magnetar-proto/src/conn.rs", &[1], &[1]),
+                ("crates/magnetar-runtime-tokio/src/client.rs", &[1], &[1]),
+                ("crates/magnetar-runtime-moonpool/src/driver.rs", &[1], &[1]),
+                ("crates/magnetar-differential/src/trace.rs", &[1], &[1]),
+                ("crates/magnetar-auth-sasl/src/lib.rs", &[1], &[1]),
+                ("crates/magnetar-auth-athenz/src/lib.rs", &[1], &[1]),
+            ],
+        );
+        assert!(
+            silent_gated_prefixes(&covered).is_empty(),
+            "the fixture must model a healthy report, or the assertion below is vacuous"
+        );
+
+        for path in function_less {
+            let tracked = tracked_of(&[(path, &[1])]);
+            let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+            assert!(
+                missing_gated.is_empty(),
+                "{path} declares no `fn`, so it can never emit an SF: record — \
+                 hard-failing it would block a routine diff forever"
+            );
+            assert_eq!(ungated, vec![(path.to_owned(), 1)]);
+        }
+    }
+
+    /// `report_record_less` is the single place the two buckets are turned into
+    /// output and into an exit code. Pin both halves: a non-empty gated bucket
+    /// must produce `Err` (otherwise `check_sim_coverage` runs on to its
+    /// success sentence), and a gated bucket alongside a non-empty advisory one
+    /// must still fail — the advisory does not absorb it.
+    #[test]
+    fn sim_coverage_record_less_report_fails_only_on_the_gated_bucket() {
+        let advisory = vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 3)];
+        let gated = vec![("crates/magnetar-proto/src/producer.rs".to_owned(), 2)];
+
+        assert!(
+            report_record_less(&(Vec::new(), Vec::new())).is_ok(),
+            "nothing record-less at all is a pass"
+        );
+        assert!(
+            report_record_less(&(Vec::new(), advisory.clone())).is_ok(),
+            "an advisory-only diff must still exit 0 — ADR-0088 scope limit"
+        );
+        assert!(
+            report_record_less(&(gated.clone(), Vec::new())).is_err(),
+            "a silent gated crate must fail the check"
+        );
+        assert!(
+            report_record_less(&(gated, advisory)).is_err(),
+            "the advisory bucket must not swallow the hard failure"
+        );
+    }
+
+    /// Split one crate manifest's `magnetar-*` dependency entries into
+    /// `(normal, dev)`. `[dependencies]` and `[build-dependencies]` are
+    /// compiled for every node of the closure; `[dev-dependencies]` only for
+    /// the packages whose test targets are actually built. Feature strings such
+    /// as `scalable-topics = ["magnetar-proto/scalable-topics"]` live under
+    /// `[features]` and are ignored by the section match.
+    fn manifest_magnetar_deps(manifest: &str) -> (Vec<String>, Vec<String>) {
+        let mut normal = Vec::new();
+        let mut dev = Vec::new();
+        let mut section = String::new();
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed.to_owned();
+                continue;
+            }
+            let Some((name, _)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.starts_with("magnetar-") {
+                continue;
+            }
+            match section.as_str() {
+                "[dependencies]" | "[build-dependencies]" => normal.push(name.to_owned()),
+                "[dev-dependencies]" => dev.push(name.to_owned()),
+                _ => {}
+            }
+        }
+        (normal, dev)
+    }
+
+    /// `-p` on `cargo llvm-cov report` cannot widen a report: it only drops a
+    /// package's manifest directory from the `-ignore-filename-regex`. Object
+    /// files are walked out of the target directory, so a package cargo never
+    /// compiled has no coverage mapping and naming it here adds nothing — while
+    /// `report_ungated` still prints the list as "the reported closure", telling
+    /// the operator a file sits outside a closure that names its own crate.
+    ///
+    /// So the constant must equal the closure step 1 really builds: the two
+    /// `-p` roots, their dev-dependencies (their test targets are what runs),
+    /// and the normal dependencies reachable from there. Computed from the
+    /// manifests rather than restated, so adding `magnetar-admin` back — it is
+    /// reachable only through `magnetar-driver` / `magnetarctl` — trips here.
+    #[test]
+    fn sim_coverage_report_packages_are_exactly_the_compiled_closure() {
+        let root = workspace_root().expect("resolve workspace root");
+        let manifest_of = |package: &str| {
+            let path = root.join("crates").join(package).join("Cargo.toml");
+            fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
+        };
+
+        // Step 1 runs these two packages' test targets, so their
+        // dev-dependencies are compiled; nothing deeper contributes its own.
+        let roots = ["magnetar-runtime-moonpool", "magnetar-differential"];
+        let mut closure: std::collections::BTreeSet<String> =
+            roots.iter().map(|p| (*p).to_owned()).collect();
+        let mut queue: Vec<(String, bool)> =
+            roots.iter().map(|p| ((*p).to_owned(), true)).collect();
+        while let Some((package, with_dev)) = queue.pop() {
+            let (normal, dev) = manifest_magnetar_deps(&manifest_of(&package));
+            let reachable = normal
+                .into_iter()
+                .chain(if with_dev { dev } else { Vec::new() });
+            for dep in reachable {
+                if closure.insert(dep.clone()) {
+                    queue.push((dep, false));
+                }
+            }
+        }
+
+        let declared: std::collections::BTreeSet<String> = SIM_COVERAGE_REPORT_PACKAGES
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect();
+        assert_eq!(
+            declared, closure,
+            "SIM_COVERAGE_REPORT_PACKAGES must be exactly the packages step 1 \
+             compiles — a package cargo never built emits no records however it \
+             is named on `cargo llvm-cov report`"
+        );
+    }
+
+    /// Every gated prefix must name a crate the executed closure actually
+    /// compiles, otherwise the hard failure fires on a scope limit. The closure
+    /// is step 1's `-p` set plus its transitive normal and dev dependencies,
+    /// which is precisely `SIM_COVERAGE_REPORT_PACKAGES`.
+    #[test]
+    fn sim_coverage_gated_prefixes_are_all_reported_packages() {
+        for prefix in SIM_COVERAGE_GATED_CRATE_PREFIXES {
+            let package = prefix
+                .strip_prefix("crates/")
+                .and_then(|rest| rest.strip_suffix("/src/"))
+                .unwrap_or_else(|| panic!("gated prefix `{prefix}` is not `crates/<pkg>/src/`"));
+            assert!(
+                SIM_COVERAGE_REPORT_PACKAGES.contains(&package),
+                "`{package}` is hard-gated but absent from SIM_COVERAGE_REPORT_PACKAGES, \
+                 so the report filters its sources out and every added line in it fails"
+            );
+        }
+    }
+
+    /// The façade is deliberately outside `SIM_COVERAGE_REPORT_PACKAGES` —
+    /// reaching it would drag its Docker-bound e2e suite into every run — so a
+    /// record-less façade file stays advisory and the check still exits 0.
+    #[test]
+    fn sim_coverage_keeps_a_facade_file_with_no_records_advisory() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[("crates/magnetar/src/pattern_consumer.rs", &[10])]);
+        let covered = coverage_of(root, &[]);
+
+        let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+        assert!(
+            missing_gated.is_empty(),
+            "the façade is not a gated crate — it must not hard-fail"
+        );
+        assert_eq!(
+            ungated,
+            vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 1)]
+        );
+        // `report_ungated` returns `()`: advisory only, the check exits 0.
+        report_ungated(&ungated);
+    }
+
+    /// Generated proto is dropped diff-side by `SIM_COVERAGE_EXCLUDE_PREFIXES`,
+    /// so it reaches neither bucket. Without that it would land in the
+    /// hard-failing one — `crates/magnetar-proto/src/` is a gated prefix, and
+    /// the report explicitly filters `src/pb/` back out.
+    #[test]
+    fn sim_coverage_never_buckets_generated_proto() {
+        let root = Path::new("/ws");
+        assert!(
+            is_sim_coverage_excluded("crates/magnetar-proto/src/pb/pulsar_api.rs"),
+            "generated proto must be dropped before the bucket split"
+        );
+
+        let tracked: Vec<_> = tracked_of(&[
+            ("crates/magnetar-proto/src/pb/pulsar_api.rs", &[10, 11]),
+            ("crates/magnetar-proto/src/conn.rs", &[40]),
+        ])
+        .into_iter()
+        .filter(|(relpath, _)| !is_sim_coverage_excluded(relpath))
+        .collect();
+        let covered = coverage_of(root, &[("crates/magnetar-proto/src/conn.rs", &[40], &[40])]);
+
+        let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+        assert!(
+            missing_gated.is_empty(),
+            "generated proto must not hard-fail"
+        );
+        assert!(ungated.is_empty(), "generated proto must not be advisory");
+        assert!(intersect_diff_with_coverage(root, &tracked, &covered).is_empty());
+    }
+
+    /// Regression: the diff side keys on `workspace_root.join(relpath)` while
+    /// the LCOV side keys on whatever `llvm-cov` printed after `SF:`. Reaching
+    /// the checkout through a symlink is enough to make the two spellings
+    /// diverge — and a divergence does not fail loudly, it degrades EVERY file
+    /// to "no LCOV record" and passes the whole gate. Both sides go through
+    /// `coverage_key`, which canonicalizes.
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_matches_lcov_paths_through_a_symlinked_checkout() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        // The checkout `llvm-cov` walked: `SF:` carries this spelling.
+        let real_root = tmp.path().join("real-checkout");
+        let src_dir = real_root.join("crates/magnetar-proto/src");
+        fs::create_dir_all(&src_dir).expect("create source tree");
+        let real_file = src_dir.join("conn.rs");
+        fs::write(&real_file, "fn covered() {}\nfn missed() {}\n").expect("write source");
+
+        // The spelling the gate was invoked through.
+        let link_root = tmp.path().join("linked-checkout");
+        symlink(&real_root, &link_root).expect("symlink the checkout");
+
+        let lcov = format!(
+            "SF:{}\nDA:1,1\nDA:2,0\nend_of_record\n",
+            real_file.display()
+        );
+        let covered = parse_lcov_coverage(&lcov);
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/conn.rs", &[1, 2])]);
+
+        assert!(
+            uninstrumented_files(&link_root, &tracked, &covered).is_empty(),
+            "the file IS instrumented — a symlinked checkout must not read as \
+             'no LCOV record'"
+        );
+        assert_eq!(
+            intersect_diff_with_coverage(&link_root, &tracked, &covered),
+            vec![("crates/magnetar-proto/src/conn.rs".to_owned(), 2)],
+            "the uncovered line must still be caught through the symlink"
+        );
+    }
+
+    /// The mirror of the case above, and the one that actually pins the
+    /// normalisation inside `parse_lcov_coverage`: here the SYMLINKED spelling
+    /// is what `llvm-cov` printed after `SF:` and the REAL one is what the diff
+    /// side derives from `workspace_root()`. Which side is which is not a
+    /// choice the gate makes — `workspace_root()` is baked from
+    /// `CARGO_MANIFEST_DIR` at compile time while `llvm-cov` prints whatever
+    /// cargo handed it, so either spelling can land on either side. Without
+    /// canonicalizing the `SF:` key too, this direction degrades every file to
+    /// "no LCOV record" and the whole gate passes silently.
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_matches_lcov_paths_when_the_symlink_is_on_the_lcov_side() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let real_root = tmp.path().join("real-checkout");
+        let src_dir = real_root.join("crates/magnetar-proto/src");
+        fs::create_dir_all(&src_dir).expect("create source tree");
+        fs::write(src_dir.join("conn.rs"), "fn covered() {}\nfn missed() {}\n")
+            .expect("write source");
+
+        let link_root = tmp.path().join("linked-checkout");
+        symlink(&real_root, &link_root).expect("symlink the checkout");
+
+        // `SF:` carries the SYMLINKED spelling this time.
+        let lcov = format!(
+            "SF:{}\nDA:1,1\nDA:2,0\nend_of_record\n",
+            link_root
+                .join("crates/magnetar-proto/src/conn.rs")
+                .display()
+        );
+        let covered = parse_lcov_coverage(&lcov);
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/conn.rs", &[1, 2])]);
+
+        // …and the diff side is invoked on the REAL one.
+        assert!(
+            uninstrumented_files(&real_root, &tracked, &covered).is_empty(),
+            "equality must be reachable from either spelling, not just one"
+        );
+        assert_eq!(
+            intersect_diff_with_coverage(&real_root, &tracked, &covered),
+            vec![("crates/magnetar-proto/src/conn.rs".to_owned(), 2)],
+            "the uncovered line must still be caught with the symlink on the LCOV side"
         );
     }
 }

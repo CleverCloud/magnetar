@@ -1,6 +1,6 @@
 # ADR-0088 — Report additions outside the moonpool coverage run instead of passing them silently
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) — the report is widened to the six crates the sim run compiles, so the narrow scope measured below is historical; the `not gated` reporting and the fail-open analysis remain binding)
 - **Date**: 2026-07-30
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, xtask, moonpool, adr-0024
@@ -19,6 +19,7 @@ The emitted `target/sim-coverage.lcov` carries **16 `SF:` records: 12 under `cra
 The report covers only the two selected packages' own sources, not their dependencies.
 `magnetar-proto`, `magnetar-runtime-tokio` and the `magnetar` façade emit no records at all.
 Reproduce with `rg -o '^SF:.*' target/sim-coverage.lcov | sed 's|^SF:.*/crates/||'`.
+That 16-record figure is the 2026-07-30 measurement of the gate as it then stood; [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) re-exports the same profile data over the six crates the run compiles and measures 63, so the numbers below are a historical record of the narrow scope rather than the gate's current reach.
 
 `intersect_diff_with_coverage` reports an added line only when LCOV considers it executable **and** unhit:
 

@@ -6,7 +6,13 @@
 //! engine-level `Debug` / `EngineError` formatting so the deterministic-
 //! simulation runner's patch-coverage gate (`cargo xtask
 //! check-sim-coverage`, ADR-0024) reports zero uncovered lines on the
-//! 5 core source files listed in `CLAUDE.md`.
+//! moonpool engine's core source files.
+//!
+//! Those files were the gate's whole world when this suite was written.
+//! The report has since been widened from the two packages the run names
+//! with `-p` to every package the run compiles — `magnetar-proto`,
+//! `magnetar-runtime-tokio` and the two auth crates as well — so the
+//! moonpool files below are no longer the only ones it measures.
 //!
 //! Each test pairs with a tokio-engine counterpart of the same name in
 //! `crates/magnetar-runtime-tokio/tests/coverage_close.rs` so

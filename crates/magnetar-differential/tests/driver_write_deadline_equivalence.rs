@@ -6,11 +6,17 @@
 //! The bounded, cancellation-safe, `operation_timeout`-bounded write
 //! `select!` arm is applied IDENTICALLY to both engines. This is the ONLY
 //! layer that exercises the modified `magnetar-runtime-tokio` driver.rs
-//! lines under the coverage instrumentation `check-sim-coverage` actually
-//! runs (`-p magnetar-runtime-moonpool -p magnetar-differential`) — a Trace
+//! lines under the test binaries `check-sim-coverage` actually executes
+//! (`-p magnetar-runtime-moonpool -p magnetar-differential`) — a Trace
 //! that never triggers the stalled-write path would leave the tokio-side
 //! `write_one_budget` (including its `Err(_elapsed)` deadline branch)
-//! uncovered even with the moonpool engine's own tests green.
+//! uncovered even with the moonpool engine's own tests green. Since the
+//! gate's report was widened from those two packages to every package the
+//! run compiles, `magnetar-runtime-tokio` carries `SF:` records, so such a
+//! gap is now REPORTED as uncovered instead of being skipped as untracked.
+//! The widened gate landed advisory (`SIM_COVERAGE_ENFORCES_UNCOVERED =
+//! false`, ADR-0090), so that report still exits 0 — pass `--enforce` for
+//! the failing exit code.
 //!
 //! ## How the stall is produced against a real broker
 //!
