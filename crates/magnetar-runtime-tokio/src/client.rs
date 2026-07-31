@@ -1995,59 +1995,39 @@ fn direct_broker_url(
 
 /// Parse a broker URL captured on the DIRECT lookup path into a
 /// [`ParsedUrl`] usable by the pool's [`Transport::connect_with_resolver`]
-/// call. Accepts both the full `pulsar://host:port` form and the bare
-/// `host:port` form (the latter is what [`preferred_broker_url`] emits for the
-/// proxy path — when a DIRECT lookup ever hands us that form we still want to
-/// dial it). The scheme falls back to the bootstrap scheme when missing —
-/// brokers in a single cluster typically run the same TLS posture, and the
-/// bootstrap's `tls_config` is the only one the pool has on hand.
-///
-/// The bare-`host:port` fallback fires **only** for input carrying no `"://"`
-/// at all. Input that already carries a scheme [`ParsedUrl::parse`] rejected —
-/// e.g. a single-bit corruption of the `pulsar` scheme word,
-/// `"ptlsar://broker:6650"` — is a scheme error, not a bare-authority input,
-/// and is rejected outright. Letting it reach the fallback used to prefix a
-/// SECOND scheme onto it (`"pulsar://ptlsar://broker:6650"`), which
-/// `url::Url::parse` does NOT reject: for the non-special `pulsar` scheme the
-/// authority ends at the first `/`, so it read the authority as `"ptlsar:"` —
-/// host `"ptlsar"`, no port digits — and the
-/// `.port().unwrap_or_else(default_port)` fallback substituted the WRONG
-/// default port. The function then returned a plausible-looking but entirely
-/// fabricated dial target instead of the `Err` this doc comment and
-/// [`Client::resolve_direct_broker`] both assume.
-///
-/// Mirrors the same distinction
-/// `magnetar_runtime_moonpool::client::proxy_broker_authority` /
-/// `direct_broker_authority` make (issue #364, ADR-0055): a genuine
-/// scheme-less `host:port` stays accepted, an unrecognised scheme fails.
+/// call. [`magnetar_proto::broker_authority`] owns authority validation and
+/// default-port synthesis. This adapter preserves the explicit Pulsar scheme
+/// when present and otherwise inherits the bootstrap connection's TLS posture.
 fn parse_direct_broker_url(
     broker_url: &str,
     bootstrap_scheme: Scheme,
 ) -> Result<ParsedUrl, ClientError> {
-    match ParsedUrl::parse(broker_url) {
-        Ok(parsed) => return Ok(parsed),
-        Err(err) if broker_url.contains("://") => {
-            return Err(ClientError::Other(format!(
-                "lookup advertised broker URL '{broker_url}' carries an unrecognised scheme \
-                 (expected 'pulsar://' or 'pulsar+ssl://'); refusing to derive a dial target \
-                 from it: {err}"
-            )));
-        }
-        Err(_) => {}
-    }
-    // Try as bare `host:port`. We synthesise a `pulsar://`-prefixed URL using
-    // the bootstrap scheme so [`ParsedUrl::parse`] does the host/port split
-    // for us — this also catches subtle inputs like IPv6 literals consistently
-    // with the rest of the runtime.
-    let scheme_prefix = match bootstrap_scheme {
+    let bootstrap_prefix = match bootstrap_scheme {
         Scheme::Tls => "pulsar+ssl://",
         Scheme::Plain => "pulsar://",
     };
-    let synthetic = format!("{scheme_prefix}{broker_url}");
+
+    let authority =
+        magnetar_proto::broker_authority(broker_url, Some(bootstrap_scheme.default_port()))
+            .ok_or_else(|| {
+                ClientError::Other(format!(
+                    "lookup advertised broker URL '{broker_url}' is not a usable authority \
+             (expected 'pulsar://', 'pulsar+ssl://', or a scheme-less host with an \
+             optional numeric port)"
+                ))
+            })?;
+    let scheme_prefix = if broker_url.starts_with("pulsar+ssl://") {
+        "pulsar+ssl://"
+    } else if broker_url.starts_with("pulsar://") {
+        "pulsar://"
+    } else {
+        bootstrap_prefix
+    };
+    let synthetic = format!("{scheme_prefix}{authority}");
     ParsedUrl::parse(&synthetic).map_err(|err| {
         ClientError::Other(format!(
-            "lookup advertised broker URL '{broker_url}' that is neither a Pulsar URL nor a \
-             host:port pair the runtime can dial: {err}"
+            "canonical broker authority '{authority}' derived from lookup URL '{broker_url}' \
+             could not be represented as a Tokio dial target: {err}"
         ))
     })
 }
@@ -3352,31 +3332,16 @@ mod tests {
         assert_eq!(parsed.scheme, Scheme::Tls);
     }
 
-    /// ADR-0087 audit of the **fifth** copy of the broker-URL rule.
-    ///
-    /// `docs/follow-ups.md` §8 unified `magnetar_proto::probe_authority` with
-    /// moonpool's `proxy_broker_authority` / `direct_broker_authority` /
-    /// `strip_url_to_host_port`, but left this function on `url::Url` because it
-    /// returns a [`ParsedUrl`] struct rather than a `host:port` string — a
-    /// different seam. Unified-by-construction is therefore not available here,
-    /// so this test supplies the next best thing: an explicit, table-driven
-    /// audit of where the two agree and where they deliberately do not.
-    ///
-    /// A row whose expectation changes is not automatically a bug — but it is
-    /// automatically a decision, which is exactly what §8 existed to force.
+    /// The Tokio adapter and the canonical authority helper must remain in
+    /// lock-step. The wrapper's output is the exact host/port pair carried by
+    /// the resulting [`ParsedUrl`].
     #[test]
-    fn parse_direct_broker_url_agrees_with_probe_authority() {
-        /// What the two parsers are expected to do with one input.
+    fn parse_direct_broker_url_agrees_with_broker_authority() {
         enum Expect {
-            /// Both produce the same authority.
             Agree(&'static str),
-            /// Both reject.
             BothReject,
-            /// They differ, deliberately. Carries `(tokio, proto)` where
-            /// `None` means "rejects".
-            Diverge(Option<&'static str>, Option<&'static str>),
         }
-        use Expect::{Agree, BothReject, Diverge};
+        use Expect::{Agree, BothReject};
 
         let cases: &[(&str, Expect)] = &[
             // Recognised schemes, explicit port.
@@ -3389,8 +3354,9 @@ mod tests {
             ("pulsar://b-c3-n12:7000", Agree("b-c3-n12:7000")),
             ("pulsar://b-c3-n12:6650/extra/path", Agree("b-c3-n12:6650")),
             ("pulsar://b-c3-n12/extra/path", Agree("b-c3-n12:6650")),
-            // Bare `host:port` — no scheme at all — passes through both.
+            // Scheme-less authorities use the caller-supplied default.
             ("b-c3-n12:6650", Agree("b-c3-n12:6650")),
+            ("b-c3-n12", Agree("b-c3-n12:6650")),
             // Bracketed IPv6. The port-less row is the one ADR-0087 moved:
             // this function was ALREADY correct here (`url` parses the
             // brackets), so before the fix it and `probe_authority` genuinely
@@ -3399,6 +3365,7 @@ mod tests {
             ("pulsar://[::1]", Agree("[::1]:6650")),
             ("pulsar+ssl://[2001:db8::1]", Agree("[2001:db8::1]:6651")),
             ("[::1]:6650", Agree("[::1]:6650")),
+            ("[::1]", Agree("[::1]:6650")),
             // Unrecognised schemes: refused by both, never truncated
             // (ADR-0085). `ptlsar` is the single-bit corruption of the scheme
             // word moonpool-sim's chaos produced for issue #364.
@@ -3409,44 +3376,26 @@ mod tests {
             ("", BothReject),
             ("pulsar://", BothReject),
             ("pulsar+ssl://", BothReject),
-            // --- Deliberate divergences -------------------------------------
-            // A scheme-LESS input has no scheme for `probe_authority` to take a
-            // default port from, so it passes the bare host through; this
-            // function synthesises a URL from the BOOTSTRAP scheme and so always
-            // lands a port. Pinned by
-            // `parse_direct_broker_url_accepts_bare_host_port` on this side and
-            // `direct_broker_authority_accepts_bare_host_port` on moonpool's.
-            ("b-c3-n12", Diverge(Some("b-c3-n12:6650"), Some("b-c3-n12"))),
-            ("[::1]", Diverge(Some("[::1]:6650"), Some("[::1]"))),
-            // A malformed bracket: `url` rejects it outright, while
-            // `probe_authority` returns it verbatim rather than inventing a
-            // port for a string it cannot parse (both refuse to fabricate; they
-            // differ only in whether the caller or the dialer says no).
-            ("pulsar://[::1", Diverge(None, Some("[::1"))),
+            ("pulsar://[::1", BothReject),
+            ("pulsar://broker:abc", BothReject),
         ];
 
         for (input, expect) in cases {
             let tokio_authority = parse_direct_broker_url(input, Scheme::Plain)
                 .ok()
                 .map(|p| format!("{}:{}", p.host, p.port));
-            let proto_authority = magnetar_proto::probe_authority(input);
+            let proto_authority = magnetar_proto::broker_authority(input, Some(6650));
             let observed = (tokio_authority.as_deref(), proto_authority.as_deref());
 
             match expect {
                 Agree(authority) => assert_eq!(
                     observed,
                     (Some(*authority), Some(*authority)),
-                    "parse_direct_broker_url and probe_authority must agree on {input:?}",
+                    "parse_direct_broker_url and broker_authority must agree on {input:?}",
                 ),
                 BothReject => {
                     assert_eq!(observed, (None, None), "both parsers must reject {input:?}");
                 }
-                Diverge(tokio_expected, proto_expected) => assert_eq!(
-                    observed,
-                    (*tokio_expected, *proto_expected),
-                    "the documented divergence on {input:?} changed shape — re-read the \
-                     rationale in this table before updating it",
-                ),
             }
         }
     }
@@ -3465,6 +3414,18 @@ mod tests {
             assert!(
                 matches!(err, ClientError::Other(_)),
                 "expected the authority rejection for {input:?}, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_direct_broker_url_reports_unusable_authority() {
+        for input in ["pulsar://", "pulsar://broker:abc", "pulsar://[::1"] {
+            let err = parse_direct_broker_url(input, Scheme::Plain)
+                .expect_err("an unusable authority must be rejected");
+            assert!(
+                err.to_string().contains("not a usable authority"),
+                "unexpected rejection for {input:?}: {err}",
             );
         }
     }

@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -41,7 +42,7 @@ use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, SubscribeRequest, decode_one,
     encode_command, pb,
 };
-use magnetar_runtime_tokio::Client;
+use magnetar_runtime_tokio::{Client, DnsResolveFuture, DnsResolver, ParsedUrl};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -64,6 +65,32 @@ struct BrokerRole {
     /// answers lookups by claiming itself (which makes the runtime reuse
     /// the bootstrap connection — useful as the data plane on broker B).
     redirect_to: Option<String>,
+}
+
+#[derive(Debug)]
+struct RecordingResolver {
+    mapped_host: &'static str,
+    mapped_address: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl DnsResolver for RecordingResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> DnsResolveFuture<'a> {
+        let requested_host = host.to_owned();
+        Box::pin(async move {
+            self.requests.lock().push((requested_host, port));
+            if host == self.mapped_host {
+                return Ok(vec![self.mapped_address]);
+            }
+
+            let ip = host.parse::<IpAddr>().map_err(|err| {
+                magnetar_runtime_tokio::ClientError::Other(format!(
+                    "test resolver has no mapping for {host}:{port}: {err}"
+                ))
+            })?;
+            Ok(vec![SocketAddr::new(ip, port)])
+        })
+    }
 }
 
 /// Spawn an in-process broker on `127.0.0.1:0`. Returns the bound URL and
@@ -330,6 +357,80 @@ async fn open_producer_routes_to_resolved_broker() {
         !bootstrap_kinds.contains(&pb::base_command::Type::Producer),
         "bootstrap session must NOT have seen PRODUCER (multi-broker DIRECT routing must have \
          landed it on the pinned session)",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn portless_direct_broker_uses_plaintext_default_port() {
+    const RESOLVED_BROKER_HOST: &str = "broker-b.internal";
+
+    let (url_b, sessions_b) = spawn_broker(BrokerRole { redirect_to: None }).await;
+    let parsed_b = ParsedUrl::parse(&url_b).expect("broker B URL parses");
+    let broker_b_address = SocketAddr::new(
+        parsed_b.host.parse().expect("broker B binds an IP literal"),
+        parsed_b.port,
+    );
+    let (url_a, _sessions_a) = spawn_broker(BrokerRole {
+        redirect_to: Some(RESOLVED_BROKER_HOST.to_owned()),
+    })
+    .await;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = Arc::new(RecordingResolver {
+        mapped_host: RESOLVED_BROKER_HOST,
+        mapped_address: broker_b_address,
+        requests: requests.clone(),
+    });
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect_with_resolver_and_provider(
+            ParsedUrl::parse(&url_a).expect("broker A URL parses"),
+            None,
+            ConnectionConfig::default(),
+            None,
+            None,
+            Some(resolver),
+        ),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect succeeds");
+
+    let _producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/direct-portless-broker".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("open_producer succeeds");
+
+    let resolver_requests = requests.lock().clone();
+    let snap_b = sessions_b.lock().clone();
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    drop(client);
+
+    assert!(
+        resolver_requests
+            .iter()
+            .any(|(host, port)| host == RESOLVED_BROKER_HOST && *port == 6650),
+        "the portless DIRECT broker must be resolved with Pulsar's plaintext default port; got \
+         {resolver_requests:?}",
+    );
+    assert_eq!(
+        snap_b.len(),
+        1,
+        "the mapped broker must receive exactly one pooled connection; got {snap_b:?}",
+    );
+    assert!(
+        snap_b[0]
+            .frames
+            .contains(&(pb::base_command::Type::Producer as i32)),
+        "the mapped broker must receive the producer; got {snap_b:?}",
     );
 }
 
