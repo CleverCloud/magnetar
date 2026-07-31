@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   No fan-out method was added to any wrapper, deliberately: Java's wrappers have none either (`PartitionedProducerImpl.getStats()` only resets and folds children), and since `fold` sums rates as bare f64 with no window metadata, a caller ticking three children of four would get an authoritative-looking total that means nothing — one clock ticking every slot is what makes the sum well-defined.
   Costs no new state, no task, no `select!` arm, and emits no frame or `ConnectionEvent`, so the golden `EventStream` traces are untouched. With the knob at its `None` default the moonpool wake schedule is bit-for-bit unchanged.
   A producer or consumer created mid-window is seeded at its own creation and reports `0.0` for its first full interval; Java's recorders behave identically. `record_rate_window` stays public for manual sampling, but the two cadences interleave — pick one.
-  Divergence from Java, deliberate and temporary: the default is `None` where Java's `statsIntervalSeconds` is `60`. The flip to `Some(60 s)` is a follow-on commit gated on a clean 1..32 moonpool seed sweep, so a seed regression bisects to one line rather than to the whole mechanism.
+  The default is Java's `Some(60 s)` (`ClientConfigurationData.statsIntervalSeconds`), so rates are published out of the box. It landed in two commits on purpose — the mechanism first with the sweep off, then the one-line default flip once a 1..32 moonpool seed sweep ran clean **with the sweep armed** — so a seed regression bisects to one line rather than to the whole mechanism.
   (docs/follow-ups.md §2; ADR-0089)
 
 ### Fixed

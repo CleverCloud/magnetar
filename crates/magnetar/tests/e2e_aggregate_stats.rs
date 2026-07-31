@@ -165,8 +165,13 @@ async fn e2e_pattern_consumer_aggregate_stats_folds_children()
         pattern.len()
     );
 
+    // Explicitly disabled, not merely defaulted: the shipped default is Java's
+    // `Some(60 s)` (ADR-0089), so relying on the default would make the exact-zero
+    // assertion below true only because this test finishes inside one window.
+    // `Duration::ZERO` is the disable, spelling Java's `statsIntervalSeconds = 0`.
     let client = PulsarClient::builder()
         .service_url(service_url)
+        .stats_interval(Duration::ZERO)
         .build()
         .await?;
 
@@ -224,12 +229,11 @@ async fn e2e_pattern_consumer_aggregate_stats_folds_children()
     // for the MultiTopicsConsumer sibling.
     assert!(stats.receive_latency_max_ms >= stats.receive_latency_p99_ms);
     assert!(stats.receive_latency_p99_ms >= stats.receive_latency_p50_ms);
-    // This client leaves `stats_interval` unset, so it inherits the shipped
-    // `None` default: the ADR-0089 sweep never runs, no caller ticks a rate
-    // window either, and the rates are therefore an exact structural zero. That
-    // is the assertion — the disabled default must stay bit-for-bit what it was.
-    // Scenario 1 proves the armed case on the partitioned wrappers, scenario 2
-    // the caller-driven case on a plain pair.
+    // This client disables the sweep outright, so no ADR-0089 tick runs and no
+    // caller ticks a rate window either: the rates are an exact structural zero.
+    // That is the assertion — the disable must remain a true disable, not merely
+    // a long interval. Scenario 1 proves the armed case on the partitioned
+    // wrappers, scenario 2 the caller-driven case on a plain pair.
     assert_eq!(stats.msgs_per_sec, 0.0);
     assert_eq!(stats.bytes_per_sec, 0.0);
 

@@ -57,7 +57,9 @@ Two details are load-bearing rather than incidental.
 Seeding lazily instead — letting the first `handle_timeout` install the baseline — looks equivalent and is not: the only deadline a bare producer/consumer connection arms is keepalive, whose base (`last_activity`) is refreshed by every decoded frame (ADR-0058), so on a continuously busy connection it slides forward indefinitely and `handle_timeout` may not run for a very long time. A slot left unseeded would go unswept for exactly as long. A baseline is a fixed instant, so the deadline armed from it cannot slide.
 A slot opened before the handshake response has no `last_activity` to anchor to; `handle_timeout` treats an unseeded slot as due, so that one case seeds on the first sweep instead of being stranded at `0.0`.
 
-**The default ships as `None`.** Java's value is `Some(60 s)`, and that is the intended end state. Landing the mechanism with the sweep off keeps this commit a no-op for every existing caller and makes the default flip a one-line diff, so a moonpool seed regression bisects to it rather than to 500 lines of mechanism. The flip is gated on a clean 1..32 seed sweep.
+**The default shipped as `None`, then flipped to Java's `Some(60 s)`.** Landing the mechanism with the sweep off kept the first commit a no-op for every existing caller and made the default flip a one-line diff, so a moonpool seed regression would bisect to it rather than to 500 lines of mechanism.
+
+The flip landed separately once a 1..32 moonpool seed sweep ran clean **with the sweep armed** — the mechanism commit's own sweep ran with it off and therefore proved nothing about the armed schedule. `Duration::ZERO` on the builder remains the disable, spelling Java's `statsIntervalSeconds = 0`.
 
 ### Why no wrapper fan-out method
 
@@ -94,7 +96,7 @@ Every wrapper's children are slots on some connection, so driving the tick from 
 
 **Interleaving.** `record_rate_window` remains public and callable. Calling it while the sweep is also running re-seeds the window, so the two cadences interfere; pick one. The doc comments on both methods say so.
 
-**Residual.** The default is still `None`, so out of the box the rates remain zero. The follow-on commit flips it to `Some(60 s)` for Java parity after a clean 1..32 moonpool seed sweep.
+**Residual — closed.** The default is now `Some(60 s)`, so rates are published out of the box. Every in-tree test that needs the disabled behaviour sets `stats_interval: None` (or `Duration::ZERO` on the builder) explicitly rather than relying on the default, so those assertions test a real disable instead of an interval that merely has not elapsed.
 
 ## References
 
