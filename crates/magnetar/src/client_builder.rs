@@ -432,8 +432,8 @@ impl ClientBuilder {
         }
         // ADR-0089 / Java `statsIntervalSeconds`: zero disables the sweep, any
         // other value arms it. Unset leaves `ConnectionConfig::default()`'s
-        // value untouched, so the eventual default flip to Java's 60 s reaches
-        // callers who never touched this knob.
+        // value untouched, which is Java's 60 s — so a caller who never touched
+        // this knob still gets Java-parity sampling.
         if let Some(d) = self.stats_interval {
             config.stats_interval = (d != Duration::ZERO).then_some(d);
         }

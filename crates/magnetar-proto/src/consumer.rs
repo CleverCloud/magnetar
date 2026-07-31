@@ -892,10 +892,11 @@ impl ConsumerState {
     /// magnetar's equivalent of Java's per-recorder tick on the client-wide
     /// `HashedWheelTimer`.
     ///
-    /// The knob defaults to `None`, which leaves sampling **caller-driven**: no
-    /// engine calls this, so a caller that never invokes it — and never sets
-    /// `stats_interval` — leaves [`Self::current_msgs_per_sec`] /
-    /// [`Self::current_bytes_per_sec`] at `0.0` forever. Calling it directly
+    /// The knob defaults to `Some(60 s)` (Java parity). Setting it to `None`
+    /// leaves sampling **caller-driven**: no engine calls this, so a caller that
+    /// never invokes it — and disabled the sweep — leaves
+    /// [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`] at `0.0`
+    /// forever. Calling it directly
     /// while the sweep is also running is supported but re-seeds the window,
     /// so the two cadences interleave; pick one.
     pub fn record_rate_window(&mut self, now: std::time::Instant) {

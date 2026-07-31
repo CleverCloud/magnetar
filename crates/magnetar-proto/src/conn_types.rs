@@ -301,14 +301,14 @@ pub struct ConnectionConfig {
     /// `poll_timeout` / `handle_timeout` loop instead of a task
     /// (ADR-0089).
     ///
-    /// Default `None` — sampling stays caller-driven until the follow-on
-    /// commit flips this to Java's `Some(60 s)`. `None` disables the sweep
-    /// entirely: no deadline is ever computed by `poll_timeout` and no
-    /// spurious wakeups are scheduled (load-bearing for moonpool
-    /// determinism — an armed deadline that never fires would still
-    /// perturb the simulated clock's wake schedule, exactly as documented
-    /// for [`Self::ack_response_timeout`] above). Java spells the same
-    /// disable as `statsIntervalSeconds = 0`.
+    /// Default `Some(60 s)` — the Java-parity canonical value. `None`
+    /// disables the sweep entirely: no deadline is ever computed by
+    /// `poll_timeout` and no spurious wakeups are scheduled (load-bearing
+    /// for moonpool determinism — an armed deadline that never fires would
+    /// still perturb the simulated clock's wake schedule, exactly as
+    /// documented for [`Self::ack_response_timeout`] above). Java spells the
+    /// same disable as `statsIntervalSeconds = 0`, which
+    /// `ClientBuilder::stats_interval(Duration::ZERO)` maps onto.
     ///
     /// The per-slot baseline is each slot's existing `last_rate_snapshot`
     /// timestamp, so a slot created mid-window has none yet: its first
@@ -368,10 +368,11 @@ impl Default for ConnectionConfig {
             // ack whose CommandAckResponse never arrives fails deterministically after
             // 30s instead of hanging the caller's `ack().await` forever.
             ack_response_timeout: Some(Duration::from_secs(30)),
-            // Deliberately NOT Java's 60 s yet (ADR-0089): this commit lands
-            // the mechanism with the sweep off, so the follow-on default flip
-            // is a one-line diff a moonpool seed regression can bisect to.
-            stats_interval: None,
+            // Java-parity canonical default: `ClientConfigurationData
+            // .statsIntervalSeconds` is 60. ADR-0089 landed the mechanism with
+            // the sweep off so this flip could be its own one-line commit,
+            // bisectable on its own moonpool seed sweep.
+            stats_interval: Some(Duration::from_mins(1)),
         }
     }
 }
@@ -526,15 +527,29 @@ mod stats_interval_config_tests {
     use super::ConnectionConfig;
 
     #[test]
-    fn default_stats_interval_is_none_pending_the_java_parity_flip() {
+    fn default_stats_interval_matches_java_stats_interval_seconds() {
         let cfg = ConnectionConfig::default();
         assert_eq!(
-            cfg.stats_interval, None,
-            "stats_interval ships disabled so the sweep lands with no behaviour \
-             change; the flip to Java's Some(60s) \
-             (ClientConfigurationData.statsIntervalSeconds) is a deliberate \
-             one-line follow-on commit, gated on a clean 1..32 moonpool seed \
-             sweep so a seed regression bisects to it (ADR-0089)",
+            cfg.stats_interval,
+            Some(Duration::from_mins(1)),
+            "stats_interval default must be Some(60s), mirroring Java's \
+             ClientConfigurationData.statsIntervalSeconds (ADR-0089). Java \
+             spells the disable as 0; magnetar spells it as None, reachable \
+             through ClientBuilder::stats_interval(Duration::ZERO)",
+        );
+    }
+
+    #[test]
+    fn stats_interval_none_round_trips_as_the_disable() {
+        let cfg = ConnectionConfig {
+            stats_interval: None,
+            ..ConnectionConfig::default()
+        };
+        assert_eq!(
+            cfg.clone().stats_interval,
+            None,
+            "None is the disable and must survive Clone — the engines clone the \
+             config at each dial site",
         );
     }
 

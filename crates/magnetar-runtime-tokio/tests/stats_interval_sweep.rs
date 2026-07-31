@@ -274,7 +274,13 @@ fn stats_interval_sweep_publishes_real_rates_through_engine_shared() {
 #[test]
 fn stats_interval_disabled_leaves_rates_zero_and_wake_schedule_untouched() {
     let t0 = Instant::now();
-    let shared = ConnectionShared::new(ConnectionConfig::default());
+    // Explicitly disabled, not merely defaulted: since ADR-0089's follow-on the
+    // shipped default is Java's `Some(60 s)`, so a `default()` here would arm
+    // the sweep and this test would pass only because 60 s never elapses.
+    let shared = ConnectionShared::new(ConnectionConfig {
+        stats_interval: None,
+        ..ConnectionConfig::default()
+    });
     let mut conn = shared.inner.lock();
 
     conn.begin_handshake().expect("handshake");
