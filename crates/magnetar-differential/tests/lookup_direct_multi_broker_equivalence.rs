@@ -474,11 +474,13 @@ fn resolved_request(requests: &parking_lot::Mutex<Vec<(String, u16)>>) -> Option
         .cloned()
 }
 
-async fn tokio_portless_observation() -> Result<PortlessDirectObservation, String> {
+async fn tokio_direct_observation(
+    advertised_broker: &str,
+) -> Result<PortlessDirectObservation, String> {
     let (broker_b_address, _host_b, _url_b, sessions_b) =
         spawn_client_broker(BrokerRole { redirect_to: None }).await;
     let (_broker_a_address, _host_a, url_a, _sessions_a) = spawn_client_broker(BrokerRole {
-        redirect_to: Some(PORTLESS_BROKER_HOST.to_owned()),
+        redirect_to: Some(advertised_broker.to_owned()),
     })
     .await;
     let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -522,11 +524,13 @@ async fn tokio_portless_observation() -> Result<PortlessDirectObservation, Strin
     Ok(observation)
 }
 
-async fn moonpool_portless_observation() -> Result<PortlessDirectObservation, String> {
+async fn moonpool_direct_observation(
+    advertised_broker: &str,
+) -> Result<PortlessDirectObservation, String> {
     let (broker_b_address, _host_b, _url_b, sessions_b) =
         spawn_client_broker(BrokerRole { redirect_to: None }).await;
     let (_broker_a_address, host_a, _url_a, _sessions_a) = spawn_client_broker(BrokerRole {
-        redirect_to: Some(PORTLESS_BROKER_HOST.to_owned()),
+        redirect_to: Some(advertised_broker.to_owned()),
     })
     .await;
     let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -584,16 +588,45 @@ async fn portless_direct_broker_resolution_is_engine_equivalent() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let tokio_observation = tokio_portless_observation()
+            let tokio_observation = tokio_direct_observation(PORTLESS_BROKER_HOST)
                 .await
                 .expect("tokio must route through the portless broker");
             assert_eq!(tokio_observation, expected, "tokio observation changed");
 
-            let moonpool_observation = moonpool_portless_observation().await;
+            let moonpool_observation = moonpool_direct_observation(PORTLESS_BROKER_HOST).await;
             assert_eq!(
                 moonpool_observation,
                 Ok(expected),
                 "moonpool must match Tokio's portless DIRECT routing observation",
+            );
+        })
+        .await;
+}
+
+/// URI schemes are ASCII case-insensitive. Both runtime adapters must
+/// therefore preserve the behavior Tokio's `url::Url` parser provided before
+/// authority normalization moved into `magnetar-proto`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uppercase_pulsar_scheme_is_engine_equivalent() {
+    let expected = PortlessDirectObservation {
+        requested_authority: (PORTLESS_BROKER_HOST.to_owned(), 6650),
+        producer_reached_resolved_broker: true,
+    };
+    let advertised = format!("PULSAR://{PORTLESS_BROKER_HOST}");
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let tokio_observation = tokio_direct_observation(&advertised)
+                .await
+                .expect("Tokio must accept an uppercase Pulsar scheme");
+            let moonpool_observation = moonpool_direct_observation(&advertised)
+                .await
+                .expect("Moonpool must accept an uppercase Pulsar scheme");
+
+            assert_eq!(tokio_observation, expected, "Tokio observation changed");
+            assert_eq!(
+                moonpool_observation, expected,
+                "Moonpool must match Tokio for case-insensitive schemes",
             );
         })
         .await;

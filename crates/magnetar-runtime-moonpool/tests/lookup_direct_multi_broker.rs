@@ -407,71 +407,81 @@ async fn portless_direct_broker_uses_plaintext_default_port() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (host_b, _url_b, sessions_b) =
-                spawn_broker_advertising(BrokerRole { redirect_to: None }).await;
-            let broker_b_address = host_b.parse().expect("broker B address parses");
-            let (host_a, _sessions_a) = spawn_broker(BrokerRole {
-                redirect_to: Some(RESOLVED_BROKER_HOST.to_owned()),
-            })
-            .await;
+            for advertised in [
+                RESOLVED_BROKER_HOST.to_owned(),
+                format!("PULSAR://{RESOLVED_BROKER_HOST}"),
+            ] {
+                let (host_b, _url_b, sessions_b) =
+                    spawn_broker_advertising(BrokerRole { redirect_to: None }).await;
+                let broker_b_address = host_b.parse().expect("broker B address parses");
+                let (host_a, _sessions_a) = spawn_broker(BrokerRole {
+                    redirect_to: Some(advertised.clone()),
+                })
+                .await;
 
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let resolver = Arc::new(RecordingResolver {
-                mapped_host: RESOLVED_BROKER_HOST,
-                mapped_address: broker_b_address,
-                requests: requests.clone(),
-            });
-            let engine = MoonpoolEngine::new(TokioProviders::new());
-            let client = tokio::time::timeout(
-                HANG_GUARD,
-                Client::connect_plain_supervised(
-                    &engine,
-                    &host_a,
-                    supervised_config(),
-                    None,
-                    Some(resolver),
-                ),
-            )
-            .await
-            .expect("connect did not time out")
-            .expect("connect succeeds");
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let resolver = Arc::new(RecordingResolver {
+                    mapped_host: RESOLVED_BROKER_HOST,
+                    mapped_address: broker_b_address,
+                    requests: requests.clone(),
+                });
+                let engine = MoonpoolEngine::new(TokioProviders::new());
+                let client = tokio::time::timeout(
+                    HANG_GUARD,
+                    Client::connect_plain_supervised(
+                        &engine,
+                        &host_a,
+                        supervised_config(),
+                        None,
+                        Some(resolver),
+                    ),
+                )
+                .await
+                .expect("connect did not time out")
+                .expect("connect succeeds");
 
-            let _producer = tokio::time::timeout(
-                HANG_GUARD,
-                client.open_producer(CreateProducerRequest {
-                    topic: "persistent://public/default/moonpool-direct-portless-broker".to_owned(),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("open_producer did not time out")
-            .expect("open_producer succeeds");
+                let _producer = tokio::time::timeout(
+                    HANG_GUARD,
+                    client.open_producer(CreateProducerRequest {
+                        topic: "persistent://public/default/moonpool-direct-portless-broker"
+                            .to_owned(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("open_producer did not time out")
+                .expect("open_producer succeeds");
 
-            let resolver_requests = requests.lock().clone();
-            let snap_b = sessions_b.lock().clone();
-            if let Some(driver) = client.take_driver() {
-                driver.abort();
-            }
-            drop(client);
+                let resolver_requests = requests.lock().clone();
+                let snap_b = sessions_b.lock().clone();
+                if let Some(driver) = client.take_driver() {
+                    driver.abort();
+                }
+                drop(client);
 
-            assert!(
-                resolver_requests
+                assert!(
+                    resolver_requests
+                        .iter()
+                        .any(|(host, port)| host == RESOLVED_BROKER_HOST && *port == 6650),
+                    "DIRECT target {advertised:?} must use the plaintext bootstrap default; got \
+                     {resolver_requests:?}",
+                );
+                assert_eq!(
+                    snap_b.len(),
+                    1,
+                    "the mapped broker must receive exactly one pooled connection for \
+                     {advertised:?}; got {snap_b:?}",
+                );
+                let producer_frames_on_b = snap_b[0]
+                    .frames
                     .iter()
-                    .any(|(host, port)| host == RESOLVED_BROKER_HOST && *port == 6650),
-                "the portless DIRECT broker must use the plaintext bootstrap default; got \
-                 {resolver_requests:?}",
-            );
-            assert_eq!(
-                snap_b.len(),
-                1,
-                "the mapped broker must receive exactly one pooled connection; got {snap_b:?}",
-            );
-            let producer_frames_on_b = snap_b[0]
-                .frames
-                .iter()
-                .filter(|kind| **kind == pb::base_command::Type::Producer as i32)
-                .count();
-            assert_eq!(producer_frames_on_b, 1);
+                    .filter(|kind| **kind == pb::base_command::Type::Producer as i32)
+                    .count();
+                assert_eq!(
+                    producer_frames_on_b, 1,
+                    "mapped broker producer count changed for {advertised:?}",
+                );
+            }
         })
         .await;
 }

@@ -438,6 +438,12 @@ git add CHANGELOG.md docs/follow-ups.md docs/superpowers/specs/2026-07-31-broker
 git commit -s -S -m "docs(adr): accept broker authority defaulting contract"
 ```
 
+### Cross-review corrections
+
+- Preserve RFC 3986's case-insensitive URI-scheme contract by moving scheme classification into `magnetar-proto`, making Tokio consume that same classification, and covering uppercase Pulsar URLs in proto, both runtimes, and the differential harness.
+- Extend the existing one-container Moonpool facade e2e with a lookup-only bootstrap that advertises a bare hostname.
+  Map the resolver's logical `host:6650` request to the real Docker broker and complete a producer send, proving the exact default-port path without increasing the container count.
+
 ### Task 6: Complete Verification and Branch Audit
 
 **Files:**

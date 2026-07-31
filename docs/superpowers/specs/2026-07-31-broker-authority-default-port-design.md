@@ -115,11 +115,12 @@ Before the fix it must fail because `split_host_port` receives no colon; after t
 
 The change carries the repository's cross-runtime layers:
 
-- `magnetar-proto` unit tables cover explicit schemes, bare inputs with and without fallback, bracketed IPv6, invalid ports, empty authority, and malformed brackets.
-- Tokio tests cover plaintext and TLS bootstrap fallbacks, explicit-scheme precedence, accurate rejection text, and agreement with the canonical normalizer.
-- Moonpool integration tests cover the real resolver-to-dial path for a portless DIRECT target.
-- Differential tests assert both engines select the same normalized physical authority and rejection shape.
-- The existing real-Pulsar DIRECT-routing end-to-end test is rerun to prove full broker URLs and bootstrap reuse remain unchanged; Pulsar itself always advertises a full service URL, so it cannot emit the defensive portless wire shape.
+- `magnetar-proto` unit tables cover explicit schemes in mixed ASCII case, bare inputs with and without fallback, bracketed IPv6, invalid ports, empty authority, and malformed brackets.
+- Tokio tests cover plaintext and TLS bootstrap fallbacks, case-insensitive explicit-scheme precedence, accurate rejection text, and agreement with the canonical normalizer.
+- Moonpool integration tests cover the real resolver-to-dial path for both a portless DIRECT target and an uppercase Pulsar URL.
+- Differential tests assert both engines select the same normalized physical authority, accept case-insensitive Pulsar schemes, and preserve the same rejection shape.
+- The one-container Moonpool facade e2e first proves a real broker's full URL and bootstrap reuse, then uses a lookup-only stub to advertise a bare hostname.
+  A recording resolver maps the resulting logical `host:6650` request to the same real Docker broker, so the exact portless fallback crosses the public facade without adding another container.
 
 The new Moonpool regression test must be observed red with production code unchanged, then green after the fix.
 The production diff is searched against test literals after the green run so the fix cannot merely mirror a test string.

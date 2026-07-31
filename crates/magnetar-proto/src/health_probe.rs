@@ -95,7 +95,8 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// `schemeless_default_port` supplies the runtime's bootstrap default when a
 /// broker advertises a bare host with no scheme and no port. A recognised
 /// Pulsar scheme always selects its own default, and an explicit port always
-/// wins over either default.
+/// wins over either default. Pulsar schemes are matched ASCII-case-insensitively,
+/// as required for URI schemes.
 ///
 /// Accepts the following shapes:
 ///
@@ -153,16 +154,11 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
 #[must_use]
 pub fn broker_authority(endpoint: &str, schemeless_default_port: Option<u16>) -> Option<String> {
-    let (rest, default_port) = if let Some(rest) = endpoint.strip_prefix("pulsar+ssl://") {
-        (rest, Some(6651u16))
-    } else if let Some(rest) = endpoint.strip_prefix("pulsar://") {
-        (rest, Some(6650u16))
-    } else if endpoint.contains("://") {
-        // Unrecognised scheme — refuse rather than truncate. See the
-        // "Why unrecognised schemes are rejected" section above.
-        return None;
-    } else {
-        (endpoint, schemeless_default_port)
+    let (scheme, rest) = split_broker_endpoint(endpoint)?;
+    let default_port = match scheme {
+        BrokerEndpointScheme::Pulsar => Some(6650),
+        BrokerEndpointScheme::PulsarTls => Some(6651),
+        BrokerEndpointScheme::Schemeless => schemeless_default_port,
     };
 
     // Trim trailing path segments — `pulsar://host:port/anything` becomes
@@ -174,6 +170,53 @@ pub fn broker_authority(endpoint: &str, schemeless_default_port: Option<u16>) ->
         (false, Some(port)) => format!("{authority}:{port}"),
         _ => authority.to_owned(),
     })
+}
+
+/// Scheme classification for a broker endpoint accepted by
+/// [`broker_authority`].
+///
+/// URI schemes are ASCII case-insensitive. `PULSAR://`, `Pulsar://`, and the
+/// lowercase spelling therefore all classify as [`Self::Pulsar`]; the same
+/// rule applies to [`Self::PulsarTls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerEndpointScheme {
+    /// `pulsar://` in any ASCII letter case.
+    Pulsar,
+    /// `pulsar+ssl://` in any ASCII letter case.
+    PulsarTls,
+    /// No `://` scheme marker is present.
+    Schemeless,
+}
+
+/// Classify the scheme of a broker endpoint without parsing its authority.
+///
+/// Returns `None` for an explicit scheme other than `pulsar` or
+/// `pulsar+ssl`. Authority validation remains the responsibility of
+/// [`broker_authority`].
+#[must_use]
+pub fn broker_endpoint_scheme(endpoint: &str) -> Option<BrokerEndpointScheme> {
+    split_broker_endpoint(endpoint).map(|(scheme, _rest)| scheme)
+}
+
+fn split_broker_endpoint(endpoint: &str) -> Option<(BrokerEndpointScheme, &str)> {
+    if let Some(rest) = strip_prefix_ascii_case(endpoint, "pulsar+ssl://") {
+        Some((BrokerEndpointScheme::PulsarTls, rest))
+    } else if let Some(rest) = strip_prefix_ascii_case(endpoint, "pulsar://") {
+        Some((BrokerEndpointScheme::Pulsar, rest))
+    } else if endpoint.contains("://") {
+        // Unrecognised scheme — refuse rather than truncate. See the
+        // "Why unrecognised schemes are rejected" section above.
+        None
+    } else {
+        Some((BrokerEndpointScheme::Schemeless, endpoint))
+    }
+}
+
+fn strip_prefix_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = input.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &input[prefix.len()..])
 }
 
 /// Parse a [`HealthProbe`] endpoint without inventing a default for a
@@ -514,6 +557,16 @@ mod tests {
             ),
             (
                 "pulsar+ssl://broker.local",
+                Some(6650),
+                Some("broker.local:6651"),
+            ),
+            (
+                "PULSAR://broker.local",
+                Some(6651),
+                Some("broker.local:6650"),
+            ),
+            (
+                "PuLsAr+SsL://broker.local",
                 Some(6650),
                 Some("broker.local:6651"),
             ),

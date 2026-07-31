@@ -1895,6 +1895,8 @@ mod tests {
         const CASES: &[&str] = &[
             "pulsar://b-c3-n12:6650",
             "pulsar+ssl://b-c3-n12:6651",
+            "PULSAR://b-c3-n12:6650",
+            "PuLsAr+SsL://b-c3-n12:6651",
             "pulsar://b-c3-n12",
             "pulsar+ssl://b-c3-n12",
             "pulsar://b-c3-n12:7000",

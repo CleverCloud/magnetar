@@ -2007,21 +2007,22 @@ fn parse_direct_broker_url(
         Scheme::Plain => "pulsar://",
     };
 
-    let authority =
-        magnetar_proto::broker_authority(broker_url, Some(bootstrap_scheme.default_port()))
-            .ok_or_else(|| {
-                ClientError::Other(format!(
-                    "lookup advertised broker URL '{broker_url}' is not a usable authority \
+    let unusable = || {
+        ClientError::Other(format!(
+            "lookup advertised broker URL '{broker_url}' is not a usable authority \
              (expected 'pulsar://', 'pulsar+ssl://', or a scheme-less host with an \
              optional numeric port)"
-                ))
-            })?;
-    let scheme_prefix = if broker_url.starts_with("pulsar+ssl://") {
-        "pulsar+ssl://"
-    } else if broker_url.starts_with("pulsar://") {
-        "pulsar://"
-    } else {
-        bootstrap_prefix
+        ))
+    };
+    let endpoint_scheme =
+        magnetar_proto::broker_endpoint_scheme(broker_url).ok_or_else(&unusable)?;
+    let authority =
+        magnetar_proto::broker_authority(broker_url, Some(bootstrap_scheme.default_port()))
+            .ok_or_else(unusable)?;
+    let scheme_prefix = match endpoint_scheme {
+        magnetar_proto::BrokerEndpointScheme::Pulsar => "pulsar://",
+        magnetar_proto::BrokerEndpointScheme::PulsarTls => "pulsar+ssl://",
+        magnetar_proto::BrokerEndpointScheme::Schemeless => bootstrap_prefix,
     };
     let synthetic = format!("{scheme_prefix}{authority}");
     ParsedUrl::parse(&synthetic).map_err(|err| {
@@ -3347,6 +3348,8 @@ mod tests {
             // Recognised schemes, explicit port.
             ("pulsar://b-c3-n12:6650", Agree("b-c3-n12:6650")),
             ("pulsar+ssl://b-c3-n12:6651", Agree("b-c3-n12:6651")),
+            ("PULSAR://b-c3-n12:6650", Agree("b-c3-n12:6650")),
+            ("PuLsAr+SsL://b-c3-n12:6651", Agree("b-c3-n12:6651")),
             // Default-port synthesis from the URL's OWN scheme.
             ("pulsar://b-c3-n12", Agree("b-c3-n12:6650")),
             ("pulsar+ssl://b-c3-n12", Agree("b-c3-n12:6651")),

@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **`magnetar_proto::broker_authority` centralizes broker authority normalization with an optional scheme-less default port:** callers now share one sans-io implementation for Pulsar scheme recognition, path trimming, explicit-port precedence, bracketed IPv6 handling, and structural rejection.
+- **`magnetar_proto::broker_authority` centralizes broker authority normalization with an optional scheme-less default port:** callers now share one sans-io implementation for ASCII-case-insensitive Pulsar scheme recognition, path trimming, explicit-port precedence, bracketed IPv6 handling, and structural rejection.
+  The additive `broker_endpoint_scheme` and `BrokerEndpointScheme` API lets runtime adapters preserve that same canonical scheme classification.
   `probe_authority` remains the unchanged no-fallback wrapper, while DIRECT-routing clients can supply the bootstrap protocol default.
   The API is additive; `probe_authority`, Tokio's `ParsedUrl`, and every ergonomic façade signature remain unchanged.
   (ADR-0091, amends ADR-0087)

@@ -41,12 +41,14 @@ pub fn broker_authority(
 
 `probe_authority(endpoint)` remains public with its existing signature and delegates to `broker_authority(endpoint, None)`.
 The optional argument applies only when the input carries no recognized Pulsar scheme and no explicit port.
+`broker_endpoint_scheme(endpoint)` exposes the same canonical classification to adapters that must retain scheme identity, and returns `BrokerEndpointScheme::{Pulsar, PulsarTls, Schemeless}`.
+Recognized URI schemes are matched ASCII-case-insensitively, preserving Tokio's prior `url::Url` behavior for inputs such as `PULSAR://broker`.
 
 ### Precedence and rejection contract
 
 | Input shape                                                                              | Result                     |
 | ---------------------------------------------------------------------------------------- | -------------------------- |
-| Recognized Pulsar scheme plus explicit port                                              | Preserve the explicit port |
+| Recognized Pulsar scheme in any ASCII case plus explicit port                            | Preserve the explicit port |
 | `pulsar://host`                                                                          | `host:6650`                |
 | `pulsar+ssl://host`                                                                      | `host:6651`                |
 | Scheme-less host plus explicit port                                                      | Preserve the explicit port |
@@ -62,7 +64,7 @@ The helper validates structure only: DNS labels and reachability remain resolver
 
 ### Tokio adapter
 
-`parse_direct_broker_url` calls `broker_authority` with `bootstrap_scheme.default_port()`, preserves an explicit recognized scheme when present, otherwise applies the bootstrap scheme, reconstructs one Pulsar URL, and returns the existing `ParsedUrl`.
+`parse_direct_broker_url` calls `broker_authority` with `bootstrap_scheme.default_port()`, consumes `broker_endpoint_scheme` to preserve an explicit recognized scheme when present, otherwise applies the bootstrap scheme, reconstructs one Pulsar URL, and returns the existing `ParsedUrl`.
 It no longer owns a separate authority rule.
 
 Its public return shape and every client façade signature stay unchanged.
@@ -79,9 +81,10 @@ This decision does not introduce a supervised TLS constructor or a TLS-capable M
 
 ## Compatibility
 
-`broker_authority` is an additive public `magnetar-proto` API.
+`broker_authority`, `broker_endpoint_scheme`, and `BrokerEndpointScheme` are additive public `magnetar-proto` APIs.
 `probe_authority`, Tokio's `ParsedUrl`, both runtime clients, and the ergonomic `magnetar` façade keep their signatures.
 Explicit schemes and ports retain their precedence.
+Mixed- or uppercase Pulsar schemes remain accepted, matching RFC 3986 and Tokio's pre-refactor URL parser.
 
 Inputs with invalid explicit ports, malformed brackets, or structurally ambiguous unbracketed IPv6 are rejected earlier instead of reaching a resolver or dialer.
 That is correctness hardening, not a façade break, and requires no `BREAKING CHANGE:` footer.
@@ -112,10 +115,10 @@ Focused helper, Tokio integration, Moonpool integration, and differential suites
 The test layers are:
 
 - proto unit tables for precedence and structural rejection;
-- Tokio resolver integration against two in-process brokers;
-- Moonpool resolver integration against the same topology;
+- Tokio resolver integration against two in-process brokers, including an uppercase scheme;
+- Moonpool resolver integration against the same topology and scheme cases;
 - client-level differential comparison of requested authority and producer routing;
-- the existing real-Pulsar multi-broker DIRECT e2e witness.
+- a one-container facade e2e whose lookup stub advertises a bare hostname, whose recording resolver observes port 6650, and whose resolved connection reaches a real Docker Pulsar broker.
 
 ## Consequences
 
@@ -135,5 +138,6 @@ Proxy behavior remains intentionally asymmetric with Tokio's warn-and-forward pr
 - `crates/magnetar-runtime-moonpool/src/pool.rs` — stored scheme-less default.
 - `crates/magnetar-runtime-{tokio,moonpool}/tests/lookup_direct_multi_broker.rs` — runtime resolver witnesses.
 - `crates/magnetar-differential/tests/lookup_direct_multi_broker_equivalence.rs` — client-level parity witness.
+- `crates/magnetar/tests/e2e_moonpool_direct_broker_authority.rs` — facade-level portless resolver-to-Docker-broker witness.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — required cross-runtime test layers.
 - [ADR-0087](0087-unify-broker-url-authority-parsers.md) — parser unification this decision completes.
