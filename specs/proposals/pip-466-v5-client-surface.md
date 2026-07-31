@@ -175,7 +175,11 @@ The translation layer is what's under test, not the v4 wire — but the v4 wire 
 **Same five test files, same test names, 1:1 with (b).** Located at `crates/magnetar/tests/v5_*_moonpool.rs`, or — once we settle on a parameterised pattern — share `tests/v5_*.rs` and select the engine via a `cfg` shim.
 Decision: **separate files**, mirrored, to preserve clarity of the test-parity invariant `cargo xtask check-runtime-test-parity` enforces.
 
-Coverage: `cargo xtask check-sim-coverage` enforces 100% diff coverage on the new `magnetar::v5` module.
+Coverage: `cargo xtask check-sim-coverage` does **not** enforce diff coverage on the new `magnetar::v5` module, and cannot be made to without a separate decision.
+V5 lives on the `magnetar` façade, which sits outside the gate's reported package set: the gate's run never compiles the façade, and pulling it in would drag the façade's Docker-dependent e2e suite (per [ADR-0046](../adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md), those tests carry no `#[ignore]` and no feature gate) into the coverage run.
+Added `crates/magnetar/src/v5/**` lines therefore print as `not gated` and pass advisorily — see [ADR-0088](../adr/0088-sim-coverage-gate-scope-report-ungated-additions.md).
+Widening the report to every package the sim run compiles did not change this: it reaches `magnetar-proto`, `magnetar-runtime-tokio` and the auth crates, all of which the run links, and stops short of the façade.
+The five test files above are the coverage contract for this surface; the gate is not.
 Because the module is a thin skin, the tests above are sufficient — every line in `mapping.rs` is touched by the table-driven test in `v5_builder_defaults.rs`.
 
 ### (d) `magnetar-differential`

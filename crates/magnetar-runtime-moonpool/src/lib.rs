@@ -1720,7 +1720,12 @@ mod tests {
     /// [`Self::try_reserve_memory_or_register_succeeds_when_budget_available`]
     /// above and by the producer-side `producer_block_*` tests; this
     /// test exists solely to keep the `cargo xtask check-sim-coverage`
-    /// hit count on lines 327 / 328 non-zero (ADR-0024 patch coverage).
+    /// hit count non-zero on the "won the recheck" branch of
+    /// [`ConnectionShared::try_reserve_memory_or_register`] — the
+    /// `cancel_memory_waker` + `return Ok(())` pair (ADR-0024 patch
+    /// coverage). The branch is named rather than cited by line number:
+    /// the two numbers this comment used to carry had drifted onto an
+    /// unrelated field's doc comment.
     #[test]
     fn try_reserve_memory_or_register_wins_recheck_under_contention() {
         use std::sync::Arc;

@@ -30,7 +30,7 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
 cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011, ADR-0086)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
+cargo run -p xtask -- check-sim-coverage        # patch coverage over the 6 sim-compiled crates; advisory, --enforce to fail (ADR-0024, ADR-0088, ADR-0090)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
@@ -38,6 +38,13 @@ cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl
 `check-crypto-matrix` exhaustively covers ALL providers — including `crypto-fips` — in a controlled CI environment where the native build toolchain is available.
 Contributors with a FIPS toolchain locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 Per-package invocations (`cargo test -p <crate>`) need an explicit crypto feature because dependency features don't transitively activate under `-p`.
+
+`check-sim-coverage` executes only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries but reports over six crates, `magnetar-proto` included; the two scopes and the façade's advisory `not gated` path are spelled out in `GUIDELINES.md#cross-runtime-test--coverage-policy`.
+Its uncovered-line verdict is **advisory** as it ships: uncovered added lines are printed with a count and the check exits 0, so a green run above does **not** prove your patch is covered — don't cite it as if it did.
+Run `cargo run -p xtask -- check-sim-coverage --enforce` to get the failing exit code and the real answer to "would my branch pass".
+An added file whose whole gated crate emitted no coverage records fails the check either way — that means the gate could not measure, not that a test is missing.
+It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
+On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
 
 Moonpool seed sweep: CI runs a daily 128-random-seed job per [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md); locally you can reproduce a flaky run with:
 

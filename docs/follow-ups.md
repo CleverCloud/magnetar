@@ -20,11 +20,11 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                          | Status                                                                                           |
-| --- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                 | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 8   | [Broker-URL authority parser unification — residual](#8-broker-url-authority-parser-unification--residual)    | 🟡 deferred (three of four parsers unified; `parse_direct_broker_url` audited, not unified)      |
-| 10  | [`check-sim-coverage` never instruments `magnetar-proto`](#10-check-sim-coverage-instruments-only-two-crates) | 🧠 needs a decision on how to broaden the coverage run                                           |
+| #   | Item                                                                                                                  | Status                                                                                               |
+| --- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                         | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460     |
+| 8   | [Broker-URL authority parser unification — residual](#8-broker-url-authority-parser-unification--residual)            | 🟡 deferred (three of four parsers unified; `parse_direct_broker_url` audited, not unified)          |
+| 10  | [`check-sim-coverage` scope closed — enforcement residual](#10-check-sim-coverage-scope-closed--enforcement-residual) | ⚡ report now covers six crates; uncovered lines still only print, and the gate has never run per-PR |
 
 ---
 
@@ -74,40 +74,63 @@ Left alone deliberately, since changing it is a user-visible text change with no
 
 ---
 
-## 10. `check-sim-coverage` instruments only two crates
+## 10. `check-sim-coverage` scope closed — enforcement residual
 
-**Gap.** [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) requires 100% moonpool coverage on the diff, and `cargo run -p xtask -- check-sim-coverage` is the gate.
-Its LCOV report covers **only** `crates/magnetar-runtime-moonpool/src/**` and `crates/magnetar-differential/src/**`.
-
-Measured 2026-07-30 on this branch — `target/sim-coverage.lcov` carried 16 `SF:` records, 12 moonpool + 4 differential, and nothing else:
+**Closed (the report scope).** `cargo run -p xtask -- check-sim-coverage` no longer reports on two crates only.
+It now runs two steps: execution is unchanged — `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential --all-features --locked`, so only those two crates' test binaries ever run — and a new second step re-exports the _same_ profile data and object files with `cargo llvm-cov report`, one `-p` per entry of `SIM_COVERAGE_REPORT_PACKAGES` (`xtask/src/main.rs`) plus `--ignore-filename-regex 'crates/magnetar-proto/src/pb/'`.
+That list is the six crates the sim run actually compiles, derived from measurement and corroborated by reading the `--extern` flags on the rustc invocations for the moonpool / differential test targets.
+Measured 2026-07-31 on `fix/sim-coverage-scope`, `target/sim-coverage.lcov` went from the 16 `SF:` records ADR-0088 recorded on 2026-07-30 to 63:
 
 ```
 rg -o '^SF:.*' target/sim-coverage.lcov | sed 's|^SF:.*/crates/||' | cut -d/ -f1 | sort | uniq -c
-     4 magnetar-differential
-    12 magnetar-runtime-moonpool
+      5 magnetar-auth-athenz
+      2 magnetar-auth-sasl
+      4 magnetar-differential
+     28 magnetar-proto
+     12 magnetar-runtime-moonpool
+     12 magnetar-runtime-tokio
 ```
 
-`run_moonpool_lcov` filters with `-p magnetar-runtime-moonpool -p magnetar-differential`, and the report carries those two packages' own sources rather than their dependency closure.
-So **`magnetar-proto` has never been gated** — the crate invariant #9 in [`CLAUDE.md`](../CLAUDE.md) singles out — nor has `magnetar-runtime-tokio`, nor the `magnetar` façade.
+`magnetar-proto` — the crate invariant #9 in [`CLAUDE.md`](../CLAUDE.md) singles out — is in the report for the first time, and so is `magnetar-runtime-tokio`, deliberately: it is a regular dependency of `magnetar-differential` (`crates/magnetar-differential/Cargo.toml`), so the equivalence suite drives it, and [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) already requires a differential test for every behavioural change.
+`magnetar-admin`, `magnetar-auth-oauth2`, `magnetar-fakes` and `magnetar-messagecrypto` were tried in the `-p` list and emit zero records — they are not linked into the sim binaries — so they are not listed as gated.
+The `magnetar` façade stays out for the same reason: nothing in the sim closure depends on it, so step 1 never compiles it and its 58 Docker-bound `crates/magnetar/tests/e2e_*.rs` ([ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md): no `#[ignore]`, no feature gate) never enter the coverage run.
+Façade additions keep printing `not gated (outside the sim-coverage report)` and exiting 0.
+See [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) for the post-implementation reference.
 
-Before [ADR-0088](../specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) this was invisible: a file with no LCOV entry has no `DA:` records, so every added line in it read as "not executable" and the run printed "all added lines are covered" over files it had never measured.
-The gate now prints `not gated (outside the moonpool coverage run): <path>: N added line(s)` for them and still exits 0, which is what surfaced the proto extent.
+**The premise this entry was written on was wrong.** It said fixing the scope was "a rework of the gate's mechanics, not a flag change", and priced the stitched-report option at "a longer run".
+Both are false, and the correction is worth carrying because it changes how a similar widening should be sized: the change cost **zero** recompilation.
+`cargo-llvm-cov`'s `RUSTC_WRAPPER` instruments every workspace member regardless of `-p` (`cargo-llvm-cov-0.8.7`, `src/wrapper.rs:63-83`); `-p` only selects which test binaries run, what gets cleaned, and the `--ignore-filename-regex` handed to `llvm-cov export` (`src/report.rs:869-986`).
+`magnetar-proto`'s counters were always in the profile data — only the report filter hid them.
 
-**Why it stays open.** Fixing the scope is a rework of the gate's mechanics, not a flag change, and the options differ in cost and blast radius:
+**Remaining (the enforcement half).** `const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = false`.
+Uncovered added lines are printed in full with a count, and the check **exits 0**; the new `--enforce` flag restores the failing exit code per invocation, which is how the fail path stays exercised.
+So while that constant is false, a green `check-sim-coverage` is **not** evidence of ADR-0024 patch coverage — it is evidence that the gate ran and printed its findings.
+That is the same shape of over-claim [ADR-0088](../specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) was written to stop, accepted temporarily and with eyes open rather than overlooked.
+One thing does hard-fail regardless of the advisory setting: a file whose whole gated crate emitted no records at all, which signals a broken or misconfigured gate rather than a missing test.
 
-| Option                                                                                                    | Trade-off                                                                                                                                                                                                                                                     |
-| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cargo llvm-cov --workspace` with execution still restricted to the moonpool + differential test binaries | closest to ADR-0024's intent — report on everything, execute only the sim surface. Needs the right `--workspace` + test-target selection so no tokio-only or Docker-bound target runs.                                                                        |
-| per-package `--no-report` runs stitched with `llvm-cov report`                                            | precise control over which crates are reported, at the cost of a multi-step invocation and a longer run.                                                                                                                                                      |
-| add `-p magnetar-driver`                                                                                  | reaches the façade, but per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) its `tests/e2e_*.rs` carry no feature gate and no `#[ignore]`, so every coverage run would need Docker and a live `apachepulsar/pulsar` container. |
+The backlog, measured 2026-07-31 by replaying real history through the widened gate:
 
-Whichever lands, expect the gate to start failing on real, previously-invisible gaps — so it needs a deliberate first run on `main` to size the backlog before it becomes hard-failing.
-Until then, ADR-0024 on proto changes is carried by the four-layer test policy and review, not by this gate.
+| Diff base                                                        | Uncovered added lines | Files                                             | Where they sit                                                                                                                                                                           |
+| ---------------------------------------------------------------- | --------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--base HEAD~10` — roughly the last ten merged PRs               | 6                     | 4                                                 | `magnetar-proto/src/conn.rs` (284, 1528), `magnetar-proto/src/health_probe.rs` (204), `magnetar-runtime-tokio/src/client.rs` (2036), `magnetar-runtime-tokio/src/consumer.rs` (228, 231) |
+| `--base HEAD~25` — back to 2026-07-01, six commits past `v1.2.0` | 450                   | 15, plus 20 more on the advisory `not gated` path | dominated by `magnetar-runtime-tokio/src/client.rs` (191) and `magnetar-runtime-tokio/src/consumer.rs` (61), then `magnetar-proto/src/conn.rs` (142)                                     |
+
+The 450 is an artifact of diffing against a 25-commit-old base, which no ordinary workflow does.
+Because the gate is a _patch_ gate against `git merge-base origin/main HEAD`, that backlog is never charged to a future PR: each PR is measured only on its own added lines.
+
+**Second blocker, newly measured: the gate has never run per-PR at all.** [`.github/workflows/xtask-gates.yml`](../.github/workflows/xtask-gates.yml) runs `check-sim-coverage` on a daily cron and on `workflow_dispatch` only, and [`ci.yml`](../.github/workflows/ci.yml) carries no sim-coverage job.
+Both scheduled runs target `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the diff empty and the check short-circuits with "nothing to verify" before it builds anything.
+That is also why `magnetar-runtime-moonpool` — gated since ADR-0024 — itself carries 43 uncovered added lines over `HEAD~25`.
+Flipping `SIM_COVERAGE_ENFORCES_UNCOVERED` without also wiring the gate into per-PR CI would therefore change nothing in practice, so the two must land in one changeset.
+
+**Why the residual stays open.** Not a design question any more — the scope, the gated crate list, and the advisory landing are all settled ([ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md)).
+What is left is a cost call that wants a measurement first: an instrumented `--all-features` build of the sim closure (aws-lc-fips-sys included) has never been timed in CI on a branch whose diff touches a gated crate, and that number decides whether the per-PR job blocks merge or runs advisory-in-CI for a while.
+Note also that execution scope is unchanged: `magnetar-proto`'s and `magnetar-runtime-tokio`'s own unit tests never run under this gate and can never satisfy it, so burning the backlog down means writing moonpool or differential tests that reach those lines.
 
 **`/goal`.**
 
 ```text
-/goal broaden check-sim-coverage to actually gate magnetar-proto per docs/follow-ups.md §10. Today run_moonpool_lcov in xtask/src/main.rs filters with `-p magnetar-runtime-moonpool -p magnetar-differential` and the emitted target/sim-coverage.lcov carries only those two crates' own sources (16 SF records, measured 2026-07-30), so ADR-0024's 100%-patch-coverage requirement has never been enforced on magnetar-proto, magnetar-runtime-tokio, or the magnetar façade. First reproduce the scope with `rg -o '^SF:.*' target/sim-coverage.lcov` and record the baseline count. Then rework the invocation so the REPORT covers the dependency closure while EXECUTION stays restricted to the moonpool + differential test binaries — prefer a `--workspace` run with explicit test-target selection, or per-package `--no-report` runs stitched with `llvm-cov report`; do NOT add `-p magnetar-driver` if that pulls the Docker-bound e2e suite (ADR-0046) into every run. Prove the fix by adding a deliberately-uncovered line to crates/magnetar-proto/src/ and showing the gate FAILS on it, then removing it and showing the gate passes — a gate never seen red detects nothing. Run it once against main to size the pre-existing backlog and report the count before deciding whether it hard-fails immediately or lands with a documented allowlist. Update ADR-0088's measured-scope paragraph, the run_moonpool_lcov doc comment, and CLAUDE.md invariant #9. Validation chain per CLAUDE.md.
+/goal make check-sim-coverage enforce ADR-0024 instead of merely reporting it, per docs/follow-ups.md §10. Two things must land in the SAME changeset or neither is worth anything: flip `SIM_COVERAGE_ENFORCES_UNCOVERED` from false to true in xtask/src/main.rs, and give the gate a per-PR home. Today .github/workflows/xtask-gates.yml runs it on a daily cron plus workflow_dispatch only, and .github/workflows/ci.yml has no sim-coverage job at all; because it is a patch gate against `git merge-base origin/main HEAD`, the scheduled `main` run short-circuits with "nothing to verify", so the gate has never measured a real PR. Start with CI: add a check-sim-coverage job on `pull_request`, copying the `sim-coverage` job out of xtask-gates.yml step for step (fetch-depth 0 plus the explicit `git fetch origin main`, the free-disk-space step, `clang llvm libclang-dev libkrb5-dev`, cargo-llvm-cov), then measure its wall clock on a branch that touches a gated crate before deciding whether it blocks merge — it budgets 90 minutes today against 180 for the comparable `--all-features` jobs. Then flip the constant, keeping `--enforce` as the per-invocation override so the fail path stays exercised, and prove the flip red-then-green: add a deliberately-uncovered line under crates/magnetar-proto/src/, show the gate exits non-zero on it, remove it, show it passes. Size the burn-down first — measured 2026-07-31, `--base HEAD~10` reports 6 uncovered added lines across 4 files and `--base HEAD~25` reports 450 across 15, and the second number is an artifact of a 25-commit-old base that is never charged to a future PR since each PR is measured on its own added lines only. Covering any of them means writing a moonpool or differential test: this gate never runs magnetar-proto's or magnetar-runtime-tokio's own unit tests, so a line there counts only when a sim or equivalence test reaches it. Do not edit ADR-0090 in place (CLAUDE.md) — record the flip in a new ADR that supersedes its advisory decision, and update CLAUDE.md invariant #9, the SIM_COVERAGE_ENFORCES_UNCOVERED doc comment, the xtask-gates.yml header note, and this entry in the same commit. Validation chain per CLAUDE.md, and note that check-sim-coverage is only runnable on Linux because the gate now pins CC/CXX/ASM to clang for aws-lc-fips-sys's delocate pass.
 ```
 
 ---
@@ -121,5 +144,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question; §10 needs a call on how to broaden the coverage run before it can be dispatched. Nothing is currently dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question; §10 is trimmed to its enforcement half — the report scope landed ([ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md)), but uncovered added lines still only print, and the gate has never run per-PR. §10 is the only dispatch-ready item.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

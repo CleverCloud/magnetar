@@ -6,7 +6,8 @@ name: xtask gates (scheduled)
 #
 #   - check-runtime-test-parity : tokio <-> moonpool 1:1 test count (ADR-0024)
 #   - check-crypto-matrix       : per-provider build matrix incl. FIPS (ADR-0035)
-#   - check-sim-coverage        : 100% moonpool patch coverage on the diff (ADR-0024)
+#   - check-sim-coverage        : 100% patch coverage on the diff, over every
+#                                 crate the sim run instruments (ADR-0024)
 #
 # They run daily on a cron (like the moonpool seed sweep, ADR-0036) and on
 # manual dispatch, keeping per-PR `ci.yml` fast.
@@ -15,10 +16,25 @@ name: xtask gates (scheduled)
 # `git merge-base origin/main HEAD`). On the scheduled run against `main`
 # that diff is empty, so it short-circuits with "nothing to verify" and
 # never builds the instrumented binaries. It only does real work on a
-# `workflow_dispatch` from a feature branch that touches the moonpool sim
-# surface. Per-PR / pre-merge patch-coverage gating remains the developer's
-# local validation chain (CLAUDE.md). The job is wired here so the gate has
-# a CI home and is dispatchable against any branch.
+# `workflow_dispatch` from a feature branch whose diff touches one of the
+# gated crates. Per-PR / pre-merge patch-coverage gating remains the
+# developer's local validation chain (CLAUDE.md). The job is wired here so
+# the gate has a CI home and is dispatchable against any branch.
+#
+# SCOPE of check-sim-coverage: the run executes only the moonpool +
+# differential test binaries, but it reports coverage over every crate that
+# run compiles — `magnetar-proto`, `magnetar-runtime-tokio`,
+# `magnetar-runtime-moonpool`, `magnetar-differential`,
+# `magnetar-auth-athenz` and `magnetar-auth-sasl`. An added line in one of
+# those that the sim run never executes is REPORTED with a count, but does
+# not fail this job: the widened report landed advisory
+# (`SIM_COVERAGE_ENFORCES_UNCOVERED = false`, ADR-0090) and the invocation
+# below deliberately omits `--enforce`. One case does fail — an added file
+# whose whole gated crate emitted no coverage records at all, which means
+# the gate could not measure rather than that a test is missing.
+# The `magnetar-driver` façade is deliberately not compiled here —
+# its e2e suite is Docker-bound (ADR-0046) — so façade additions still print
+# as advisory `not gated` lines and cannot fail the job.
 #
 # Security note: no `github.event.*` inputs are interpolated anywhere in
 # this workflow.
@@ -109,8 +125,18 @@ jobs:
           RANLIB: llvm-ranlib
 
   sim-coverage:
-    name: sim-coverage (moonpool patch coverage)
+    name: sim-coverage (patch coverage, sim-instrumented crates)
     runs-on: ubuntu-latest
+    # Budget for one instrumented `--all-features` build of the moonpool +
+    # differential test binaries and their dependency closure
+    # (aws-lc-fips-sys included) plus the sim run itself. Widening the
+    # report to the six crates named in the header note cost no extra
+    # compilation — it is a second `cargo llvm-cov report` over artifacts
+    # already on disk — so this number did not move with that change. It
+    # only ever binds a `workflow_dispatch` run: the scheduled `main` run
+    # short-circuits before the build. The two comparable `--all-features`
+    # jobs (crypto-matrix above, `test` in ci.yml) both sit at 180, so raise
+    # this if a dispatched cold-cache run is ever cancelled here.
     timeout-minutes: 90
     steps:
       # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
@@ -121,8 +147,10 @@ jobs:
           fetch-depth: 0
       - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
       # check-sim-coverage runs `cargo llvm-cov --all-features` over the
-      # moonpool + differential crates, which builds aws-lc-fips-sys under
-      # coverage instrumentation; reclaim disk like the heavy build jobs.
+      # moonpool + differential test binaries — which builds aws-lc-fips-sys
+      # under coverage instrumentation — then re-exports the same profile
+      # data over the wider report package set. Reclaim disk like the heavy
+      # build jobs.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
@@ -140,9 +168,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # --all-features can transitively pull libgssapi (auth-sasl-kerberos);
-      # install the MIT KRB5 / libclang headers like the other --all-features
-      # jobs. Harmless if the coverage build does not reach it.
-      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
+      # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
+      # so the MIT KRB5 / libclang headers go in like every other
+      # --all-features job. `clang` and `llvm` are the crypto-matrix
+      # requirement repeated here: --all-features includes crypto-fips, and
+      # the gate exports CC/CXX/ASM=clang plus AR/RANLIB=llvm-ar/llvm-ranlib
+      # for that build (xtask's apply_fips_toolchain), so those five tools
+      # must exist. `libclang-dev` ships the bindgen shared library, not the
+      # clang driver and not the llvm binutils, and the free-disk-space step
+      # above purges `^llvm-.*` from the runner image exactly as it does in
+      # the crypto-matrix job — where its absence surfaced as cc-rs
+      # `failed to find tool "llvm-ar"`.
+      - name: Install clang + llvm + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libclang-dev libkrb5-dev
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage

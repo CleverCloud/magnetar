@@ -52,19 +52,35 @@
 //! equivalence of the actual `Client` surface, not of a proto snapshot.
 //!
 //! It is also the only test in the moonpool/differential runner set that
-//! actually *executes* the fixed tokio helper. Note what that does and does
-//! not buy: `cargo run -p xtask -- check-sim-coverage` runs
+//! actually *executes* the fixed tokio helper, and since the sim-coverage
+//! gate was rescoped that execution is what the gate measures.
+//! `cargo run -p xtask -- check-sim-coverage` still EXECUTES only
 //! `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential`,
-//! and the `-p` form instruments only those two crates — verified on this
-//! changeset's own `target/sim-coverage.lcov`, whose `SF:` records cover 12
-//! `magnetar-runtime-moonpool` files and 4 `magnetar-differential` files and
-//! **zero** `magnetar-runtime-tokio` files. `intersect_diff_with_coverage`
-//! treats a file absent from the LCOV as non-executable, so added lines in
-//! `magnetar-runtime-tokio/src/client.rs` are silently skipped, not enforced:
-//! the gate's "all added lines across 2 file(s) are covered" counts *tracked*
-//! files, not verified ones. The execution here is therefore real coverage in
-//! the ordinary sense and no coverage at all in the gate's sense — do not
-//! rely on `check-sim-coverage` to police a tokio-only change.
+//! but `-p` never controlled instrumentation — `cargo-llvm-cov`'s
+//! `RUSTC_WRAPPER` instruments every workspace member and `-p` only narrowed
+//! the report filter — so the gate now re-exports that same profile data
+//! over `SIM_COVERAGE_REPORT_PACKAGES`. `target/sim-coverage.lcov` carries
+//! 63 `SF:` records where it used to carry 16, among them 12
+//! `magnetar-runtime-tokio` files where it used to carry zero. Added lines
+//! in `magnetar-runtime-tokio/src/client.rs` are therefore measured like any
+//! other, and the crate is additionally hard-gated: a report mentioning no
+//! `magnetar-runtime-tokio` file at all fails the check outright instead of
+//! reading its added lines as non-executable.
+//!
+//! What did NOT change is the execution scope, and that is the part of the
+//! old warning worth keeping. `magnetar-runtime-tokio`'s own tests still
+//! never run under the gate: the only tokio lines that can be covered are
+//! the ones the differential suite reaches through its tokio half. So the
+//! conclusion inverts rather than disappearing — a tokio-only change IS
+//! measured now, but only a differential test can satisfy it, and an added
+//! tokio line no differential test executes is REPORTED as uncovered instead
+//! of being silently skipped.
+//!
+//! Reported, not failed: the widened gate landed advisory
+//! (`SIM_COVERAGE_ENFORCES_UNCOVERED = false`, ADR-0090), so an uncovered
+//! added line prints with a count and the check still exits 0. Pass
+//! `--enforce` for the failing exit code. The record-less-crate case above
+//! is the one thing that fails either way.
 //!
 //! # Still deliberately NOT asserted
 //!
