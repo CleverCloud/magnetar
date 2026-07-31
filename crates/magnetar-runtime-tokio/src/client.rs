@@ -3428,6 +3428,20 @@ mod tests {
                 "unexpected rejection for {input:?}: {err}",
             );
         }
+
+        let input = "broker name";
+        assert_eq!(
+            magnetar_proto::broker_authority(input, Some(6650)).as_deref(),
+            Some("broker name:6650"),
+            "the canonical sans-I/O helper deliberately leaves DNS-name validation to the adapter",
+        );
+        let err = parse_direct_broker_url(input, Scheme::Plain)
+            .expect_err("Tokio must reject an authority its URL adapter cannot represent");
+        assert!(
+            err.to_string()
+                .contains("could not be represented as a Tokio dial target"),
+            "unexpected adapter rejection for {input:?}: {err}",
+        );
     }
 
     /// A port-less bracketed IPv6 literal resolves to the scheme's default port.

@@ -29,7 +29,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_differential::HANG_GUARD;
@@ -597,4 +597,127 @@ async fn portless_direct_broker_resolution_is_engine_equivalent() {
             );
         })
         .await;
+}
+
+/// Tokio preserves an advertised TLS scheme while canonicalizing the
+/// authority. The resolver request is the externally visible seam: a
+/// portless `pulsar+ssl://` target must use 6651 even when the bootstrap was
+/// plaintext. The deliberately closed socket keeps this a routing test rather
+/// than a TLS-fixture test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_tls_direct_broker_uses_the_tls_default_port() {
+    let closed_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("closed target bind");
+    let closed_address = closed_listener.local_addr().expect("closed target address");
+    drop(closed_listener);
+
+    let advertised = format!("pulsar+ssl://{PORTLESS_BROKER_HOST}");
+    let (_broker_a_address, _host_a, url_a, _sessions_a) = spawn_client_broker(BrokerRole {
+        redirect_to: Some(advertised),
+    })
+    .await;
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let resolver = Arc::new(TokioRecordingResolver {
+        mapped_address: closed_address,
+        requests: requests.clone(),
+    });
+    let config = ConnectionConfig {
+        supervisor: Some(SupervisorConfig::default()),
+        operation_timeout: Duration::from_secs(1),
+        connect_timeout: Duration::from_millis(200),
+        connect_max_retries: 0,
+        ..ConnectionConfig::default()
+    };
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        magnetar_runtime_tokio::Client::connect_with_resolver_and_provider(
+            magnetar_runtime_tokio::ParsedUrl::parse(&url_a).expect("bootstrap URL parse"),
+            None,
+            config,
+            None,
+            None,
+            Some(resolver),
+        ),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("tokio bootstrap connect");
+
+    let open_result = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: PORTLESS_TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("tokio TLS DIRECT routing did not time out");
+    let requested = resolved_request(&requests);
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    drop(client);
+
+    assert!(
+        open_result.is_err(),
+        "the deliberately closed TLS target must refuse the producer dial",
+    );
+    assert_eq!(
+        requested,
+        Some((PORTLESS_BROKER_HOST.to_owned(), 6651)),
+        "the advertised TLS scheme must select its own default port",
+    );
+}
+
+/// The proto helper is intentionally sans-I/O and therefore does not validate
+/// DNS label syntax. Tokio's retained URL adapter must turn an authority it
+/// cannot represent into the documented `ClientError::Other`, before DNS or a
+/// producer frame reaches any broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_rejects_a_canonical_authority_its_url_adapter_cannot_represent() {
+    const UNREPRESENTABLE_BROKER: &str = "broker name";
+
+    let (_broker_a_address, _host_a, url_a, sessions_a) = spawn_client_broker(BrokerRole {
+        redirect_to: Some(UNREPRESENTABLE_BROKER.to_owned()),
+    })
+    .await;
+    let config = ConnectionConfig {
+        supervisor: Some(SupervisorConfig::default()),
+        ..ConnectionConfig::default()
+    };
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        magnetar_runtime_tokio::Client::connect(&url_a, config),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("tokio bootstrap connect");
+    let error = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: PORTLESS_TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("tokio adapter rejection did not time out")
+    .expect_err("an unrepresentable canonical authority must be rejected");
+    let snapshot = sessions_a.lock().clone();
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    drop(client);
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not be represented as a Tokio dial target"),
+        "unexpected adapter rejection: {error}",
+    );
+    assert_eq!(snapshot.len(), 1, "only the bootstrap session may exist");
+    assert!(
+        !producer_reached(&snapshot),
+        "the adapter must reject before any producer frame is sent",
+    );
 }

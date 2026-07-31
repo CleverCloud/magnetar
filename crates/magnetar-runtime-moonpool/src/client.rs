@@ -1907,6 +1907,8 @@ mod tests {
             "ptlsar://broker-sim.proxy.internal:6650",
             "pulsar://broker:abc",
             "pulsar://[::1",
+            ":6650",
+            "broker:6650:extra",
             "",
             "pulsar://",
         ];
