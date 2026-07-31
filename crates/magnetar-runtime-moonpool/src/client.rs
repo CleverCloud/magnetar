@@ -1963,6 +1963,20 @@ mod tests {
         }
     }
 
+    /// Twin of tokio's `parse_direct_broker_url_reports_unusable_authority`:
+    /// every structural rejection uses the shared operator-facing diagnostic.
+    #[test]
+    fn direct_broker_authority_reports_unusable_authority() {
+        for input in ["pulsar://", "pulsar://broker:abc", "pulsar://[::1"] {
+            let err = direct_broker_authority(input, 6650)
+                .expect_err("an unusable authority must be rejected");
+            assert!(
+                err.to_string().contains("not a usable authority"),
+                "unexpected rejection for {input:?}: {err}",
+            );
+        }
+    }
+
     /// Regression test for ADR-0087, the closed half of ADR-0085's documented
     /// limitation: the synthesis used to trigger on "the authority contains no
     /// `:`", which is never true of a bracketed IPv6 literal, so
