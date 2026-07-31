@@ -1,6 +1,6 @@
 # Broker Authority Default-Port Unification Design
 
-**Status:** Proposed on 2026-07-31.
+**Status:** Approved on 2026-07-31.
 
 ## Context
 

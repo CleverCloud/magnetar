@@ -1,10 +1,12 @@
 # Broker Authority Default-Port Unification Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+> Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace Tokio's independent DIRECT broker-authority rule with the proto-owned rule and make Moonpool resolve a portless DIRECT broker name through its plaintext bootstrap default port.
 
-**Architecture:** `magnetar-proto` exposes one string normalizer that validates an authority and accepts an optional default for scheme-less inputs; `probe_authority` remains its no-fallback wrapper. Tokio converts the normalized authority back into its existing `ParsedUrl`, while Moonpool stores the current pooled bootstrap's default port and supplies it before resolver dispatch.
+**Architecture:** `magnetar-proto` exposes one string normalizer that validates an authority and accepts an optional default for scheme-less inputs; `probe_authority` remains its no-fallback wrapper.
+Tokio converts the normalized authority back into its existing `ParsedUrl`, while Moonpool stores the current pooled bootstrap's default port and supplies it before resolver dispatch.
 
 **Tech Stack:** Rust 2024 workspace, `magnetar-proto` sans-I/O core, Tokio and Moonpool runtimes, in-process Pulsar protocol fakes, `cargo`, xtask, Markdown/Prettier.
 
@@ -242,7 +244,8 @@ Expected: every focused parser test passes.
 
 - [ ] **Step 5: Add and run the Tokio resolver integration twin**
 
-In `tests/lookup_direct_multi_broker.rs`, add a recording resolver that maps `broker-b.internal` to a random in-process broker while retaining the requested port. Advertise the portless `broker-b.internal`, connect with `Client::connect_with_resolver_and_provider`, open a producer, and assert the resolver observed `("broker-b.internal", 6650)` and the producer reached broker B.
+In `tests/lookup_direct_multi_broker.rs`, add a recording resolver that maps `broker-b.internal` to a random in-process broker while retaining the requested port.
+Advertise the portless `broker-b.internal`, connect with `Client::connect_with_resolver_and_provider`, open a producer, and assert the resolver observed `("broker-b.internal", 6650)` and the producer reached broker B.
 
 Run: `cargo test -p magnetar-runtime-tokio --test lookup_direct_multi_broker portless`
 
