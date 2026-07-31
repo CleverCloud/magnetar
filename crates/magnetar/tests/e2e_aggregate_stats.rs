@@ -8,13 +8,14 @@
 //! 1. [`e2e_partitioned_aggregate_stats_propagates_totals_and_batch_acks`] — a 2-partition topic,
 //!    partitioned producer + partitioned consumer: send a batched round, receive it, and assert
 //!    `aggregate_stats()` totals equal the real send/receive counts, `pending_batch_acks` is
-//!    propagated (nonzero before any ack — the issue's headline symptom), and the latency
-//!    percentile ordering (`max >= p99 >= p50`) holds. The rolling `msgs_per_sec` / `bytes_per_sec`
-//!    rates are NOT asserted here: rate sampling is caller-driven, no engine ticks it, and
-//!    `PartitionedConsumer` exposes no way to reach its per-partition children (only the concrete
-//!    `magnetar_runtime_tokio::{Producer, Consumer}` types carry `record_rate_window` at all), so a
-//!    partitioned child's rate fields are structurally zero today. Scenario 2 carries the
-//!    rate-propagation proof; closing the sampling gap is tracked as `docs/follow-ups.md` §2.
+//!    propagated (nonzero before any ack — the issue's headline symptom), the latency percentile
+//!    ordering (`max >= p99 >= p50`) holds, and — with `ClientBuilder::stats_interval` armed
+//!    (ADR-0089) — the rolling `msgs_per_sec` / `bytes_per_sec` rates go nonzero on BOTH wrappers
+//!    without a single caller-side `record_rate_window` call. That last one is ADR-0089's layer
+//!    (e): the sweep runs inside the sans-io `poll_timeout` / `handle_timeout` loop, so it reaches
+//!    every per-partition child even though `PartitionedConsumer` deliberately exposes no way to
+//!    reach them (Java's wrappers expose none either). Before ADR-0089 those two fields were
+//!    structurally zero for every wrapper type, which is what `docs/follow-ups.md` §2 tracked.
 //! 2. [`e2e_aggregate_stats_fold_propagates_real_rate`] — a single (non-partitioned) producer +
 //!    consumer pair, driven exactly like `e2e_rolling_stats.rs`, proves `ConsumerStats::fold` /
 //!    `ProducerStats::fold` propagate a REAL nonzero rolling rate (and every other field)
@@ -223,9 +224,12 @@ async fn e2e_pattern_consumer_aggregate_stats_folds_children()
     // for the MultiTopicsConsumer sibling.
     assert!(stats.receive_latency_max_ms >= stats.receive_latency_p99_ms);
     assert!(stats.receive_latency_p99_ms >= stats.receive_latency_p50_ms);
-    // Sampling is caller-driven and this test never ticks a rate window, so the
-    // rates are structurally zero here (docs/follow-ups.md §2). Scenario 2 is
-    // where a real nonzero rate is proven.
+    // This client leaves `stats_interval` unset, so it inherits the shipped
+    // `None` default: the ADR-0089 sweep never runs, no caller ticks a rate
+    // window either, and the rates are therefore an exact structural zero. That
+    // is the assertion — the disabled default must stay bit-for-bit what it was.
+    // Scenario 1 proves the armed case on the partitioned wrappers, scenario 2
+    // the caller-driven case on a plain pair.
     assert_eq!(stats.msgs_per_sec, 0.0);
     assert_eq!(stats.bytes_per_sec, 0.0);
 
@@ -235,18 +239,35 @@ async fn e2e_pattern_consumer_aggregate_stats_folds_children()
 
 /// Scenario 1: partitioned producer + partitioned consumer, batched send.
 /// Asserts `aggregate_stats()` totals, `pending_batch_acks` propagation
-/// (the issue's headline symptom), and percentile ordering.
+/// (the issue's headline symptom), percentile ordering, and — ADR-0089 layer
+/// (e) — that the connection-driven rate sweep reaches every per-partition
+/// child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // single-shot e2e scenario; splitting scatters the send → receive → sweep → assert narrative
 async fn e2e_partitioned_aggregate_stats_propagates_totals_and_batch_acks()
 -> Result<(), Box<dyn std::error::Error>> {
     const TOTAL_MSGS: usize = 6;
+
+    /// ADR-0089 sampling cadence. Java's default is 60 s
+    /// (`ClientConfigurationData.statsIntervalSeconds`), which no test can wait
+    /// out; 1 s keeps several windows inside this test's lifetime while staying
+    /// far above the sub-millisecond work each sweep does.
+    const STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Ceiling on the wait for a sweep to publish a nonzero rate. Generous
+    /// because it also absorbs broker latency on the send/receive round below.
+    const RATE_DEADLINE: Duration = Duration::from_secs(30);
 
     let (service_url, admin_url, _container) = start_pulsar().await?;
     let topic = fresh_topic("aggregate-stats-partitioned");
     create_partitioned_topic(&admin_url, &topic).await?;
 
+    // The ONLY thing this test does to get rolling rates: arm the client-wide
+    // sweep. No `record_rate_window` call appears anywhere below, and neither
+    // wrapper offers a fan-out method to make one — which is the point.
     let client = PulsarClient::builder()
         .service_url(service_url)
+        .stats_interval(STATS_INTERVAL)
         .build()
         .await?;
 
@@ -322,6 +343,40 @@ async fn e2e_partitioned_aggregate_stats_propagates_totals_and_batch_acks()
     for msg in &received {
         consumer.ack(&msg.topic, msg.message.message_id).await?;
     }
+
+    // ADR-0089 layer (e). `msgs_per_sec` / `bytes_per_sec` are a ROLLING window:
+    // the sweep publishes a nonzero rate for the window that contains the
+    // send/receive burst and then falls back to zero for the idle windows after
+    // it. So each side is latched on first sight rather than read once at the
+    // end, which would be a race against whichever window the read lands in.
+    //
+    // Both sides are partitioned wrappers over per-partition children. Nothing
+    // here reaches those children — `PartitionedConsumer` exposes no accessor
+    // for them at all — so a nonzero folded rate can only come from the sweep
+    // inside the state machine ticking every slot on the connection.
+    let rate_deadline = tokio::time::Instant::now() + RATE_DEADLINE;
+    let mut producer_rate_seen = false;
+    let mut consumer_rate_seen = false;
+    while tokio::time::Instant::now() < rate_deadline && !(producer_rate_seen && consumer_rate_seen)
+    {
+        let p = producer.aggregate_stats();
+        let c = consumer.aggregate_stats();
+        producer_rate_seen |= p.msgs_per_sec > 0.0 && p.bytes_per_sec > 0.0;
+        consumer_rate_seen |= c.msgs_per_sec > 0.0 && c.bytes_per_sec > 0.0;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        producer_rate_seen,
+        "PartitionedProducer::aggregate_stats() must fold a REAL rolling send rate \
+         once stats_interval is armed — before ADR-0089 this summed zeros because \
+         nothing in either engine ever ticked a child's rate window"
+    );
+    assert!(
+        consumer_rate_seen,
+        "PartitionedConsumer::aggregate_stats() must fold a REAL rolling receive \
+         rate once stats_interval is armed — same gap, and the one the wrapper had \
+         no way to close on its own"
+    );
 
     let producer_stats = producer.aggregate_stats();
     let consumer_stats = consumer.aggregate_stats();

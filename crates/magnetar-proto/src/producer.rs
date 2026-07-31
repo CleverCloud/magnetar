@@ -739,10 +739,18 @@ impl ProducerState {
     ///
     /// Sans-io discipline: `now` is injected (see [ADR-0011]).
     ///
-    /// Sampling is **caller-driven**: no engine calls this, so a caller that never invokes it
-    /// leaves [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`] at `0.0` forever.
-    /// Java instead self-ticks each recorder on the client-wide timer; wiring an equivalent to
-    /// the `poll_timeout` / `handle_timeout` sweep is tracked as `docs/follow-ups.md` §2.
+    /// Sampling is **connection-driven when
+    /// [`ConnectionConfig::stats_interval`](crate::conn::ConnectionConfig) is set**:
+    /// `Connection::handle_timeout` re-samples every registered producer once per
+    /// interval, off a deadline `Connection::poll_timeout` arms from this slot's own
+    /// [`Self::last_rate_snapshot`] (ADR-0089). That is magnetar's equivalent of Java's
+    /// per-recorder tick on the client-wide `HashedWheelTimer`.
+    ///
+    /// The knob defaults to `None`, which leaves sampling **caller-driven**: no engine
+    /// calls this, so a caller that never invokes it — and never sets `stats_interval` —
+    /// leaves [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`] at `0.0`
+    /// forever. Calling it directly while the sweep is also running is supported but
+    /// re-seeds the window, so the two cadences interleave; pick one.
     ///
     /// [ADR-0011]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
     pub fn record_rate_window(&mut self, now: std::time::Instant) {

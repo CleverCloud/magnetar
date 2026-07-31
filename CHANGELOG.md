@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`ClientBuilder::stats_interval` — the client now samples its own rolling rate windows, so `aggregate_stats()` stops summing zeros:** `ConsumerStats::msgs_per_sec` / `bytes_per_sec` and the `ProducerStats` pair are computed by `record_rate_window`, which needs two snapshots of the same slot before it can publish anything. Nothing in either engine ever made the second call — every caller in the tree was a test — so the fields stayed `0.0` forever unless the application ticked them itself.
+  That hit the three aggregating wrappers hardest. `PartitionedProducer::aggregate_stats`, `MultiTopicsConsumer::aggregate_stats` (and its `PartitionedConsumer` alias) and `PatternConsumer::aggregate_stats` fold their children's rates as an f64 sum, so all three reported a structural zero; only `PartitionedProducer` even exposed its children, and only on the tokio engine, while the moonpool `Producer<P>` / `Consumer<P>` carried no `record_rate_window` method at all.
+  `record_rate_window` was also the one periodic obligation in the client not expressed as a deadline — keepalive, the nack / unacked / ack-grouping trackers, chunk expiry, receiver-queue auto-adjust, batch flush, send timeout, relocated in-flight sends and `ack_response_timeout` are all armed in `Connection::poll_timeout` and swept in `Connection::handle_timeout`, magnetar's structural equivalent of Java's client-wide `HashedWheelTimer`.
+  Setting `ClientBuilder::stats_interval(dur)` (new `ConnectionConfig::stats_interval: Option<Duration>`, additive field, default `None`) arms it there: every producer and consumer on the connection is re-sampled once per interval, which reaches every per-partition and per-topic child that no public API can reach. `Duration::ZERO` disables, spelling Java's `statsIntervalSeconds = 0`.
+  No fan-out method was added to any wrapper, deliberately: Java's wrappers have none either (`PartitionedProducerImpl.getStats()` only resets and folds children), and since `fold` sums rates as bare f64 with no window metadata, a caller ticking three children of four would get an authoritative-looking total that means nothing — one clock ticking every slot is what makes the sum well-defined.
+  Costs no new state, no task, no `select!` arm, and emits no frame or `ConnectionEvent`, so the golden `EventStream` traces are untouched. With the knob at its `None` default the moonpool wake schedule is bit-for-bit unchanged.
+  A producer or consumer created mid-window is seeded at its own creation and reports `0.0` for its first full interval; Java's recorders behave identically. `record_rate_window` stays public for manual sampling, but the two cadences interleave — pick one.
+  Divergence from Java, deliberate and temporary: the default is `None` where Java's `statsIntervalSeconds` is `60`. The flip to `Some(60 s)` is a follow-on commit gated on a clean 1..32 moonpool seed sweep, so a seed regression bisects to one line rather than to the whole mechanism.
+  (docs/follow-ups.md §2; ADR-0089)
+
 ### Fixed
 
 - **Port-less bracketed IPv6 broker URLs now get the scheme's default port, and an empty broker-advertised authority is rejected instead of reaching the wire:** the "strip `pulsar://` / `pulsar+ssl://`, trim the path, synthesise the default port" rule existed in four hand-rolled copies — `magnetar_proto::probe_authority`, `proxy_broker_authority` / `direct_broker_authority` (`magnetar-runtime-moonpool`), and `strip_url_to_host_port` (same crate's driver). They agreed only because each had been written to match, which is the arrangement that produced the ADR-0085 defect in the first place.

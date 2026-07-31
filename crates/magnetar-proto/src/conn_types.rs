@@ -288,6 +288,36 @@ pub struct ConnectionConfig {
     /// without ever tearing the consumer down (e.g. a dropped
     /// `CommandAckResponse` on an otherwise healthy connection).
     pub ack_response_timeout: Option<Duration>,
+    /// Cadence at which `handle_timeout` re-samples every producer's and
+    /// consumer's rolling rate window
+    /// ([`ProducerState::record_rate_window`](crate::producer::ProducerState::record_rate_window)
+    /// /
+    /// [`ConsumerState::record_rate_window`](crate::consumer::ConsumerState::record_rate_window)),
+    /// which is what makes `ProducerStats::msgs_per_sec` /
+    /// `bytes_per_sec` and their `ConsumerStats` counterparts nonzero.
+    /// Mirrors Java `ClientConfigurationData.statsIntervalSeconds`, whose
+    /// recorders self-tick on the client-wide `HashedWheelTimer`; magnetar
+    /// expresses the same obligation as a deadline on the existing
+    /// `poll_timeout` / `handle_timeout` loop instead of a task
+    /// (ADR-0089).
+    ///
+    /// Default `None` — sampling stays caller-driven until the follow-on
+    /// commit flips this to Java's `Some(60 s)`. `None` disables the sweep
+    /// entirely: no deadline is ever computed by `poll_timeout` and no
+    /// spurious wakeups are scheduled (load-bearing for moonpool
+    /// determinism — an armed deadline that never fires would still
+    /// perturb the simulated clock's wake schedule, exactly as documented
+    /// for [`Self::ack_response_timeout`] above). Java spells the same
+    /// disable as `statsIntervalSeconds = 0`.
+    ///
+    /// The per-slot baseline is each slot's existing `last_rate_snapshot`
+    /// timestamp, so a slot created mid-window has none yet: its first
+    /// sweep only seeds a baseline and it reports `0.0` for one further
+    /// interval. Java's recorders have the identical property (a recorder
+    /// constructed mid-window publishes its first rate one
+    /// `statsIntervalSeconds` later), so this is parity-correct rather
+    /// than a rounding artefact.
+    pub stats_interval: Option<Duration>,
 }
 
 /// Policy applied when the configured global publish memory budget is
@@ -338,6 +368,10 @@ impl Default for ConnectionConfig {
             // ack whose CommandAckResponse never arrives fails deterministically after
             // 30s instead of hanging the caller's `ack().await` forever.
             ack_response_timeout: Some(Duration::from_secs(30)),
+            // Deliberately NOT Java's 60 s yet (ADR-0089): this commit lands
+            // the mechanism with the sweep off, so the follow-on default flip
+            // is a one-line diff a moonpool seed regression can bisect to.
+            stats_interval: None,
         }
     }
 }
@@ -474,6 +508,48 @@ mod ack_response_timeout_config_tests {
             cloned.ack_response_timeout, None,
             "None must survive Clone unchanged — the engines clone the config \
              at each dial site",
+        );
+    }
+}
+
+#[cfg(test)]
+mod stats_interval_config_tests {
+    //! Pins the [`ConnectionConfig::stats_interval`] default and its round trip
+    //! through `Clone` (ADR-0089). The sweep itself — `poll_timeout` arming the
+    //! deadline and `handle_timeout` re-sampling every slot — is exercised by
+    //! `conn_state_tests::stats_interval_*` in this crate and the cross-runtime
+    //! ladder in `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` /
+    //! `magnetar-differential`.
+
+    use core::time::Duration;
+
+    use super::ConnectionConfig;
+
+    #[test]
+    fn default_stats_interval_is_none_pending_the_java_parity_flip() {
+        let cfg = ConnectionConfig::default();
+        assert_eq!(
+            cfg.stats_interval, None,
+            "stats_interval ships disabled so the sweep lands with no behaviour \
+             change; the flip to Java's Some(60s) \
+             (ClientConfigurationData.statsIntervalSeconds) is a deliberate \
+             one-line follow-on commit, gated on a clean 1..32 moonpool seed \
+             sweep so a seed regression bisects to it (ADR-0089)",
+        );
+    }
+
+    #[test]
+    fn stats_interval_survives_clone() {
+        let cfg = ConnectionConfig {
+            stats_interval: Some(Duration::from_mins(1)),
+            ..ConnectionConfig::default()
+        };
+        let cloned = cfg.clone();
+        assert_eq!(
+            cloned.stats_interval,
+            Some(Duration::from_mins(1)),
+            "the engines clone the config at each dial site, so a set interval \
+             must survive Clone unchanged",
         );
     }
 }
