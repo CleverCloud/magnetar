@@ -1748,29 +1748,32 @@ fn git_merge_base(base: &str, cwd: &Path) -> Result<String> {
     Ok(raw.trim().to_owned())
 }
 
-/// Return the 1-indexed line number of the first `#[cfg(test)]` attribute in
-/// `path`, or `None` if the file has no inline test module. Used to drop
-/// inline-test lines from the sim-coverage diff scan: every `src/**/*.rs` in
-/// magnetar puts its unit tests inside `#[cfg(test)] mod tests { … }` at the
-/// bottom of the file, so the first occurrence is a reliable upper bound on
-/// the production region.
-fn first_cfg_test_line(path: &Path) -> Option<u32> {
-    let contents = fs::read_to_string(path).ok()?;
-    for (idx, line) in contents.lines().enumerate() {
-        if line.trim_start().starts_with("#[cfg(test)]") {
-            // 1-indexed to match git diff line numbering.
-            return Some((idx as u32).saturating_add(1));
-        }
-    }
-    None
-}
-
 /// Return the 1-indexed set of source lines that contain a
 /// by-design-never-executed marker (`unreachable!`, `unimplemented!`,
 /// `todo!`). Coverage tools instrument these as executable but no live
 /// test can hit them. Demanding 100% coverage on them is meaningless and
 /// would force authors to add fake tests or `#[coverage(off)]` (nightly-
 /// only) — neither helps. We drop them at the diff stage instead.
+/// The 1-indexed lines of `contents` that sit inside a `#[cfg(test)]` span,
+/// and so are unit-test code rather than production code for sim-coverage
+/// purposes.
+///
+/// Thin adapter over the shared [`cfg_test_line_flags`], existing so that
+/// `check_sim_coverage`'s stripping is a named, directly testable step rather
+/// than an inline expression — `sim_coverage_cfg_test_import_does_not_exempt_the_rest_of_the_file`
+/// asserts on exactly what the gate applies, and `dead_code` under
+/// `-D warnings` catches the call site being replaced by another ad-hoc scan.
+/// It was an ad-hoc scan until ADR-0092, and it exempted 71% of the gated
+/// lines added over ten merged pull requests.
+fn sim_coverage_cfg_test_lines(contents: &str) -> std::collections::BTreeSet<u32> {
+    cfg_test_line_flags(contents)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, gated)| *gated)
+        .map(|(idx, _)| (idx as u32).saturating_add(1))
+        .collect()
+}
+
 fn unreachable_lines(path: &Path) -> std::collections::BTreeSet<u32> {
     let mut out = std::collections::BTreeSet::new();
     let Ok(contents) = fs::read_to_string(path) else {
@@ -2468,18 +2471,34 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
         .collect();
     tracked.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // 2b. Inside `src/**/*.rs`, strip lines that live below the file's first
-    //     `#[cfg(test)]` attribute — those are unit tests, not production
-    //     code. The path-level excludes already drop `tests/`, `benches/`,
-    //     `examples/`; this handles the same intent for inline test modules
-    //     (the project convention is `#[cfg(test)] mod tests { … }` at the
-    //     bottom of every src file). Also drop lines marked
-    //     `unreachable!()` / `unimplemented!()` / `todo!()` — coverage
+    // 2b. Inside `src/**/*.rs`, strip lines that live INSIDE a `#[cfg(test)]`
+    //     span — those are unit tests, not production code. The path-level
+    //     excludes already drop `tests/`, `benches/`, `examples/`; this
+    //     handles the same intent for inline test modules. Also drop lines
+    //     marked `unreachable!()` / `unimplemented!()` / `todo!()` — coverage
     //     tools count them as executable but they are by-design dead arms.
+    //
+    //     Span membership comes from the shared [`cfg_test_line_flags`], the
+    //     same brace-tracking scanner `check-log-fields` and
+    //     `check-no-internal-clock` use. Until ADR-0092 this gate instead cut
+    //     at the file's FIRST `#[cfg(test)]` line and dropped everything
+    //     below it, on the stated premise that every file puts its tests in
+    //     one `mod tests` at the bottom, making that "a reliable upper bound
+    //     on the production region". Measured 2026-08-01, that premise is
+    //     false and the cost was enormous: the first `#[cfg(test)]` is often
+    //     a gated `use` or helper near the top, so the cut exempted 48% of
+    //     all gated lines — 2781 of the 2828 lines of
+    //     `magnetar-runtime-tokio/src/driver.rs`, whose cut sits at line 48
+    //     on a `#[cfg(test)] use std::io::IoSlice;` — and 71% of the gated
+    //     lines added over the preceding ten merged pull requests. A gate
+    //     silently exempting most of its own surface is the fail-open shape
+    //     ADR-0088 exists to prevent, and enforcing it (ADR-0092) without
+    //     fixing it would have made the enforcement mostly theatre.
     for (relpath, lines) in &mut tracked {
         let abs = workspace_root.join(relpath);
-        if let Some(cfg_test_start) = first_cfg_test_line(&abs) {
-            lines.retain(|&line| line < cfg_test_start);
+        if let Ok(contents) = fs::read_to_string(&abs) {
+            let cfg_test = sim_coverage_cfg_test_lines(&contents);
+            lines.retain(|line| !cfg_test.contains(line));
         }
         let unreachable = unreachable_lines(&abs);
         lines.retain(|line| !unreachable.contains(line));
@@ -3863,6 +3882,74 @@ fn pop(now: Instant) {
                 SIM_COVERAGE_REPORT_PACKAGES.contains(&package),
                 "`{package}` is hard-gated but absent from SIM_COVERAGE_REPORT_PACKAGES, \
                  so the report filters its sources out and every added line in it fails"
+            );
+        }
+    }
+
+    /// A `#[cfg(test)]` item near the top of a file must not exempt the
+    /// production code below it.
+    ///
+    /// The regression this pins was measured, not imagined. Until ADR-0092 the
+    /// gate cut at the file's first `#[cfg(test)]` line and dropped everything
+    /// after it, which exempted 48% of all gated lines and 71% of the gated
+    /// lines added over ten merged pull requests — worst case
+    /// `magnetar-runtime-tokio/src/driver.rs`, where a `#[cfg(test)] use` on
+    /// line 48 exempted the remaining 2781 of 2828 lines. The shape below is
+    /// that file in miniature.
+    #[test]
+    fn sim_coverage_cfg_test_import_does_not_exempt_the_rest_of_the_file() {
+        let contents = "\
+use std::io::Write;
+
+#[cfg(test)]
+use std::io::IoSlice;
+
+pub fn production_one() -> u32 {
+    1
+}
+
+#[cfg(test)]
+fn test_helper() -> u32 {
+    2
+}
+
+pub fn production_two() -> u32 {
+    3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+";
+        // Assert on what the gate actually applies, not on the underlying
+        // scanner — the scanner was always correct; it was this gate that
+        // reinvented a worse one.
+        let cfg_test = sim_coverage_cfg_test_lines(contents);
+        let gated = |line: u32| cfg_test.contains(&line);
+
+        // The two gated non-`mod` items are excluded, and nothing else is.
+        assert!(
+            gated(3) && gated(4),
+            "the `#[cfg(test)] use` itself is test-only"
+        );
+        assert!(
+            gated(11) && gated(12) && gated(13),
+            "the gated helper is test-only"
+        );
+        assert!(
+            gated(20) && gated(23),
+            "the bottom `mod tests` is test-only"
+        );
+
+        // The production code BELOW the first `#[cfg(test)]` survives. Under
+        // the old first-line cut every one of these was silently exempt.
+        for line in [1, 6, 7, 8, 16, 17, 18] {
+            assert!(
+                !gated(line),
+                "line {line} is production code and must stay gated by \
+                 sim coverage; a `#[cfg(test)]` item above it must not exempt it"
             );
         }
     }

@@ -16,6 +16,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege, stated rather than inherited. The repository default is
+# currently `read` (`GET /actions/permissions/workflow` →
+# `default_workflow_permissions: read`, checked 2026-08-01), but that is a
+# repo setting outside this tree that one admin toggle flips to `write`.
+# These jobs execute every build script and proc macro in the
+# `--all-features` dependency closure — `aws-lc-fips-sys`'s C build
+# included, and under coverage instrumentation in check-sim-coverage — so
+# the token they see should not depend on a setting they cannot see.
+# `moonpool-seed-sweep.yml` already sets the precedent. No job here writes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -396,8 +408,8 @@ jobs:
     # before compiling anything when every added production `.rs` line is
     # excluded — `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`,
     # `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`,
-    # `/benches/`, `/examples/` path, and anything below a file's first
-    # `#[cfg(test)]` (SIM_COVERAGE_EXCLUDE_PREFIXES /
+    # `/benches/`, `/examples/` path, and anything inside a `#[cfg(test)]`
+    # span (SIM_COVERAGE_EXCLUDE_PREFIXES /
     # SIM_COVERAGE_EXCLUDE_FRAGMENTS in xtask/src/main.rs, which is the
     # authority). Note what that does NOT cover: the bail is not keyed on
     # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
@@ -411,7 +423,7 @@ jobs:
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
     # copy budgets. That 90 was only ever binding on a `workflow_dispatch`
-    # run, since the scheduled one short-circuits; this job blocks merges, so
+    # run, since the scheduled one short-circuits; this job is meant to gate, so
     # a cold-cache cancel here is a false red on someone's PR.
     timeout-minutes: 180
     steps:
@@ -421,7 +433,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
+      # `--force` + a leading `+` on the refspec. Without them a
+      # non-fast-forward update — `main` force-pushed, or
+      # `refs/remotes/origin/main` already present at a diverged commit —
+      # is REJECTED, and the old `|| git fetch origin main` fallback could
+      # not repair it: that form writes only FETCH_HEAD and never creates
+      # `refs/remotes/origin/main`. The step still exited 0 and the xtask
+      # then died in `git_merge_base` with "could not resolve merge-base
+      # against `origin/main`" — a red check for an infrastructure reason,
+      # wearing a message that reads like a coverage failure.
+      - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
       # check-sim-coverage runs `cargo llvm-cov --all-features` over the
       # moonpool + differential test binaries — which builds aws-lc-fips-sys
       # under coverage instrumentation — then re-exports the same profile

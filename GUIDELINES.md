@@ -128,7 +128,8 @@ Execution scope and report scope are two different sets, and the distinction is 
   A `magnetar-proto` unit test never satisfies this gate.
 - **Reported** — `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl` (measured 2026-07-31: 63 `SF:` records, against 16 before).
   Instrumentation is workspace-wide regardless of `-p`, so the wider report is a second `cargo llvm-cov report` pass over artifacts already on disk — no extra compilation and no second test run.
-  Generated code under `crates/magnetar-proto/src/pb/` stays excluded.
+  Generated code under `crates/magnetar-proto/src/pb/` stays excluded, as is every line inside a `#[cfg(test)]` span — span membership via the shared `cfg_test_line_flags`, the same scanner `check-no-internal-clock` and `check-log-fields` use.
+  Until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) this gate instead cut at a file's **first** `#[cfg(test)]` line and dropped everything below it; because that line is usually a gated `use` or helper rather than the bottom `mod tests`, it exempted 48% of all gated lines and 71% of those added over the preceding ten merged PRs. Do not reintroduce a line-cut heuristic here.
 
 The `magnetar` façade is deliberately in neither set: the run never compiles it, which keeps its Docker-bound `crates/magnetar/tests/e2e_*.rs` suite out of the coverage run.
 Additions under `crates/magnetar/src/**` therefore print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), which also records the narrower scope this widening replaces.

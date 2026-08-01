@@ -153,7 +153,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
+      # `--force` + leading `+`: see the identical step in ci.yml. Without
+      # them a non-fast-forward update is rejected and the old fallback
+      # (`|| git fetch origin main`) could not repair it, since that form
+      # writes only FETCH_HEAD.
+      - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
       # check-sim-coverage runs `cargo llvm-cov --all-features` over the
       # moonpool + differential test binaries — which builds aws-lc-fips-sys
       # under coverage instrumentation — then re-exports the same profile
