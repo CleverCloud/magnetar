@@ -130,10 +130,10 @@ enum Cmd {
     /// re-exports the same profile data over a wider package set, and
     /// intersects the resulting LCOV with `git diff merge-base...HEAD` line
     /// ranges. An added line the moonpool runner never executed is reported
-    /// with a count; it fails the check only under `--enforce`, because the
-    /// widened report landed advisory (`SIM_COVERAGE_ENFORCES_UNCOVERED`,
-    /// ADR-0090). A gated crate that emitted no records at all fails either
-    /// way. See ADR-0024.
+    /// with a count and fails the check (`SIM_COVERAGE_ENFORCES_UNCOVERED`,
+    /// ADR-0092, which supersedes ADR-0090's advisory landing). A gated crate
+    /// that emitted no records at all fails too, and did so even while the
+    /// verdict was advisory. See ADR-0024.
     ///
     /// `-p` selects which test binaries run and which sources the report
     /// keeps; instrumentation itself is workspace-wide. The re-export
@@ -155,11 +155,12 @@ enum Cmd {
         reuse_lcov: bool,
         /// Fail on uncovered added lines instead of only reporting them.
         ///
-        /// The widened report lands advisory (see
-        /// `SIM_COVERAGE_ENFORCES_UNCOVERED`), so by default an uncovered line
-        /// prints but exits 0. This flag restores the ADR-0024 behaviour for a
-        /// single invocation, which is how the fail path stays exercised — and
-        /// how you check whether a branch would survive the flip.
+        /// Redundant since ADR-0092: `SIM_COVERAGE_ENFORCES_UNCOVERED` is
+        /// `true`, so an uncovered added line already fails without this flag.
+        /// It is retained rather than removed because it ORs into that constant
+        /// — existing invocations keep working, the CI job passes it so the
+        /// workflow states its own intent, and it stays the one explicit way to
+        /// ask for the verdict if the constant is ever flipped back.
         #[arg(long)]
         enforce: bool,
     },
@@ -1747,29 +1748,32 @@ fn git_merge_base(base: &str, cwd: &Path) -> Result<String> {
     Ok(raw.trim().to_owned())
 }
 
-/// Return the 1-indexed line number of the first `#[cfg(test)]` attribute in
-/// `path`, or `None` if the file has no inline test module. Used to drop
-/// inline-test lines from the sim-coverage diff scan: every `src/**/*.rs` in
-/// magnetar puts its unit tests inside `#[cfg(test)] mod tests { … }` at the
-/// bottom of the file, so the first occurrence is a reliable upper bound on
-/// the production region.
-fn first_cfg_test_line(path: &Path) -> Option<u32> {
-    let contents = fs::read_to_string(path).ok()?;
-    for (idx, line) in contents.lines().enumerate() {
-        if line.trim_start().starts_with("#[cfg(test)]") {
-            // 1-indexed to match git diff line numbering.
-            return Some((idx as u32).saturating_add(1));
-        }
-    }
-    None
-}
-
 /// Return the 1-indexed set of source lines that contain a
 /// by-design-never-executed marker (`unreachable!`, `unimplemented!`,
 /// `todo!`). Coverage tools instrument these as executable but no live
 /// test can hit them. Demanding 100% coverage on them is meaningless and
 /// would force authors to add fake tests or `#[coverage(off)]` (nightly-
 /// only) — neither helps. We drop them at the diff stage instead.
+/// The 1-indexed lines of `contents` that sit inside a `#[cfg(test)]` span,
+/// and so are unit-test code rather than production code for sim-coverage
+/// purposes.
+///
+/// Thin adapter over the shared [`cfg_test_line_flags`], existing so that
+/// `check_sim_coverage`'s stripping is a named, directly testable step rather
+/// than an inline expression — `sim_coverage_cfg_test_import_does_not_exempt_the_rest_of_the_file`
+/// asserts on exactly what the gate applies, and `dead_code` under
+/// `-D warnings` catches the call site being replaced by another ad-hoc scan.
+/// It was an ad-hoc scan until ADR-0092, and it exempted 71% of the gated
+/// lines added over ten merged pull requests.
+fn sim_coverage_cfg_test_lines(contents: &str) -> std::collections::BTreeSet<u32> {
+    cfg_test_line_flags(contents)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, gated)| *gated)
+        .map(|(idx, _)| (idx as u32).saturating_add(1))
+        .collect()
+}
+
 fn unreachable_lines(path: &Path) -> std::collections::BTreeSet<u32> {
     let mut out = std::collections::BTreeSet::new();
     let Ok(contents) = fs::read_to_string(path) else {
@@ -2304,34 +2308,72 @@ fn report_record_less(split: &UninstrumentedSplit) -> Result<()> {
 
 /// Whether an uncovered added line fails the check by default.
 ///
-/// `false` — the widened report lands ADVISORY. Uncovered lines are printed in
-/// full but the check exits 0.
+/// `true` — an added line inside the reported scope that the sim run never
+/// executed fails `check-sim-coverage`. That is ADR-0024's 100%-on-the-diff
+/// requirement stated as an exit code instead of as a printed finding.
 ///
-/// This is a deliberate, time-boxed decision and not the end state. Replaying
-/// history through the widened gate on 2026-07-31 measured 450 uncovered added
-/// lines across 15 files against `HEAD~25`, and 6 across 4 files against
-/// `HEAD~10`. The backlog exists because the gate has never actually run
-/// per-PR: `.github/workflows/xtask-gates.yml` only runs it on a schedule
-/// against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the
-/// diff empty and the check short-circuits with "nothing to verify".
+/// It was `false` from ADR-0090 until ADR-0092, and the reason was not doubt
+/// about the requirement: enforcing it would have changed nothing, because the
+/// gate had no per-PR home. `.github/workflows/xtask-gates.yml` ran it on a
+/// daily cron against `main`, where `merge-base(origin/main, HEAD) == HEAD`
+/// makes the diff empty and the check short-circuits with "nothing to verify"
+/// before it builds anything. ADR-0092 closes both halves in one changeset:
+/// `.github/workflows/ci.yml` carries a `check-sim-coverage` job on
+/// `pull_request`, and this constant is `true`.
 ///
-/// Note what this costs: as long as this is `false`, a green
-/// `check-sim-coverage` is NOT evidence of ADR-0024 patch coverage — it is
-/// evidence that the gate ran and printed its findings. That is the same shape
-/// of claim ADR-0088 was written to stop making, which is why the advisory
-/// output is loud, carries a count, and names this constant.
+/// The backlog that argued for the advisory landing is charged to no branch.
+/// This is a *patch* gate against `git merge-base origin/main HEAD`, so each
+/// PR is measured only on its own added lines. Replaying history on 2026-07-31
+/// measured 6 uncovered added lines across 4 files against `HEAD~10` — the
+/// realistic per-PR shape — while the 450 against `HEAD~25` is an artifact of
+/// a 25-commit-old base no ordinary workflow diffs against.
 ///
-/// `--enforce` overrides it per-invocation, which is how the fail path stays
-/// exercised while the default is `false`. Flipping this to `true` is the
-/// follow-up; see ADR-0090 and `docs/follow-ups.md`.
-const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = false;
+/// `--enforce` still ORs into this (see [`check_sim_coverage`]), so it is now
+/// redundant rather than removed: existing invocations keep working, and the
+/// flag remains the one explicit way to ask for the verdict if this is ever
+/// flipped back. `sim_coverage_enforces_uncovered_by_default` pins this value
+/// with a `const` assertion — reverting it stops the `xtask` test build
+/// compiling, which `cargo test --workspace` and `clippy --all-targets` both
+/// reach in CI — because
+/// the CI job passes `--enforce` and would therefore stay green straight
+/// through a silent regression here.
+const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = true;
 
-/// Print per-file uncovered ranges, then fail only when enforcing.
+/// Resolve whether uncovered added lines are fatal for this invocation.
+///
+/// `--enforce` can only ever tighten: it turns uncovered lines fatal. Since
+/// ADR-0092 the constant is `true`, so the flag adds nothing and this is always
+/// `true` — kept as an OR rather than collapsed so that flipping the constant
+/// back restores the flag's meaning without touching the call site.
+///
+/// This is a named function rather than an inline expression so that
+/// `sim_coverage_enforces_uncovered_by_default` can pin its semantics, and so
+/// the concept has a name to point at. Note where the protection against
+/// cutting the CALL SITE actually comes from, because it is not this test:
+/// measured 2026-08-01, rewriting `check_sim_coverage` to `let enforcing =
+/// enforce;` leaves the test passing (the helper still returns `true`), and
+/// what fails is `cargo clippy -p xtask -- -D warnings` with `constant
+/// SIM_COVERAGE_ENFORCES_UNCOVERED is never used` / `function
+/// sim_coverage_enforcing is never used`. The `dead_code` lint is the
+/// tripwire; keep both this function and the constant reachable from exactly
+/// one production call site so it stays one.
+const fn sim_coverage_enforcing(enforce: bool) -> bool {
+    enforce || SIM_COVERAGE_ENFORCES_UNCOVERED
+}
+
+/// Print per-file uncovered ranges, then fail unless the caller asked not to.
 ///
 /// Returns `Err` when `enforcing`; otherwise prints an advisory summary and
 /// returns `Ok(())`. The per-file lines above are identical either way, so the
 /// only difference between the two modes is the exit code and the final
 /// sentence — a reader diffing two transcripts sees exactly what changed.
+///
+/// Since ADR-0092 every production caller passes `enforcing = true`, because
+/// `SIM_COVERAGE_ENFORCES_UNCOVERED` is `true` and `--enforce` only ORs into
+/// it. The advisory arm is kept — and pinned by
+/// `sim_coverage_enforces_uncovered_by_default` — so that flipping the constant
+/// back stays a one-line change rather than a rewrite, and so the cost of doing
+/// so is spelled out in the message a reader would then see.
 fn report_uncovered(
     workspace_root: &Path,
     uncovered: &[(String, u32)],
@@ -2359,9 +2401,9 @@ fn report_uncovered(
              file(s) were NOT executed by `magnetar-runtime-moonpool` / \
              `magnetar-differential` tests (workspace root: {}). ADR-0024 wants \
              100%, and this run does NOT prove it: the check is exiting 0 \
-             because SIM_COVERAGE_ENFORCES_UNCOVERED is false (ADR-0090). Do \
-             not cite a green run here as patch-coverage evidence. Re-run with \
-             `--enforce` to get the failing exit code.",
+             because SIM_COVERAGE_ENFORCES_UNCOVERED has been set back to false, \
+             reversing ADR-0092. Do not cite a green run here as patch-coverage \
+             evidence. Re-run with `--enforce` to get the failing exit code.",
             uncovered.len(),
             by_file.len(),
             workspace_root.display(),
@@ -2398,11 +2440,10 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     if !reuse_lcov {
         ensure_cargo_llvm_cov()?;
     }
-    // `--enforce` can only ever tighten: it turns uncovered lines fatal. The
-    // record-less-gated-crate bail is NOT governed by either, because that
+    // The record-less-gated-crate bail is NOT governed by this, because that
     // signals a broken or misconfigured gate rather than a missing test, and a
     // gate that cannot measure must never report success.
-    let enforcing = enforce || SIM_COVERAGE_ENFORCES_UNCOVERED;
+    let enforcing = sim_coverage_enforcing(enforce);
 
     let workspace_root = workspace_root()?;
     let merge_base = git_merge_base(base, &workspace_root)?;
@@ -2430,18 +2471,34 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
         .collect();
     tracked.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // 2b. Inside `src/**/*.rs`, strip lines that live below the file's first
-    //     `#[cfg(test)]` attribute — those are unit tests, not production
-    //     code. The path-level excludes already drop `tests/`, `benches/`,
-    //     `examples/`; this handles the same intent for inline test modules
-    //     (the project convention is `#[cfg(test)] mod tests { … }` at the
-    //     bottom of every src file). Also drop lines marked
-    //     `unreachable!()` / `unimplemented!()` / `todo!()` — coverage
+    // 2b. Inside `src/**/*.rs`, strip lines that live INSIDE a `#[cfg(test)]`
+    //     span — those are unit tests, not production code. The path-level
+    //     excludes already drop `tests/`, `benches/`, `examples/`; this
+    //     handles the same intent for inline test modules. Also drop lines
+    //     marked `unreachable!()` / `unimplemented!()` / `todo!()` — coverage
     //     tools count them as executable but they are by-design dead arms.
+    //
+    //     Span membership comes from the shared [`cfg_test_line_flags`], the
+    //     same brace-tracking scanner `check-log-fields` and
+    //     `check-no-internal-clock` use. Until ADR-0092 this gate instead cut
+    //     at the file's FIRST `#[cfg(test)]` line and dropped everything
+    //     below it, on the stated premise that every file puts its tests in
+    //     one `mod tests` at the bottom, making that "a reliable upper bound
+    //     on the production region". Measured 2026-08-01, that premise is
+    //     false and the cost was enormous: the first `#[cfg(test)]` is often
+    //     a gated `use` or helper near the top, so the cut exempted 48% of
+    //     all gated lines — 2781 of the 2828 lines of
+    //     `magnetar-runtime-tokio/src/driver.rs`, whose cut sits at line 48
+    //     on a `#[cfg(test)] use std::io::IoSlice;` — and 71% of the gated
+    //     lines added over the preceding ten merged pull requests. A gate
+    //     silently exempting most of its own surface is the fail-open shape
+    //     ADR-0088 exists to prevent, and enforcing it (ADR-0092) without
+    //     fixing it would have made the enforcement mostly theatre.
     for (relpath, lines) in &mut tracked {
         let abs = workspace_root.join(relpath);
-        if let Some(cfg_test_start) = first_cfg_test_line(&abs) {
-            lines.retain(|&line| line < cfg_test_start);
+        if let Ok(contents) = fs::read_to_string(&abs) {
+            let cfg_test = sim_coverage_cfg_test_lines(&contents);
+            lines.retain(|line| !cfg_test.contains(line));
         }
         let unreachable = unreachable_lines(&abs);
         lines.retain(|line| !unreachable.contains(line));
@@ -3827,6 +3884,127 @@ fn pop(now: Instant) {
                  so the report filters its sources out and every added line in it fails"
             );
         }
+    }
+
+    /// A `#[cfg(test)]` item near the top of a file must not exempt the
+    /// production code below it.
+    ///
+    /// The regression this pins was measured, not imagined. Until ADR-0092 the
+    /// gate cut at the file's first `#[cfg(test)]` line and dropped everything
+    /// after it, which exempted 48% of all gated lines and 71% of the gated
+    /// lines added over ten merged pull requests — worst case
+    /// `magnetar-runtime-tokio/src/driver.rs`, where a `#[cfg(test)] use` on
+    /// line 48 exempted the remaining 2781 of 2828 lines. The shape below is
+    /// that file in miniature.
+    #[test]
+    fn sim_coverage_cfg_test_import_does_not_exempt_the_rest_of_the_file() {
+        let contents = "\
+use std::io::Write;
+
+#[cfg(test)]
+use std::io::IoSlice;
+
+pub fn production_one() -> u32 {
+    1
+}
+
+#[cfg(test)]
+fn test_helper() -> u32 {
+    2
+}
+
+pub fn production_two() -> u32 {
+    3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+";
+        // Assert on what the gate actually applies, not on the underlying
+        // scanner — the scanner was always correct; it was this gate that
+        // reinvented a worse one.
+        let cfg_test = sim_coverage_cfg_test_lines(contents);
+        let gated = |line: u32| cfg_test.contains(&line);
+
+        // The two gated non-`mod` items are excluded, and nothing else is.
+        assert!(
+            gated(3) && gated(4),
+            "the `#[cfg(test)] use` itself is test-only"
+        );
+        assert!(
+            gated(11) && gated(12) && gated(13),
+            "the gated helper is test-only"
+        );
+        assert!(
+            gated(20) && gated(23),
+            "the bottom `mod tests` is test-only"
+        );
+
+        // The production code BELOW the first `#[cfg(test)]` survives. Under
+        // the old first-line cut every one of these was silently exempt.
+        for line in [1, 6, 7, 8, 16, 17, 18] {
+            assert!(
+                !gated(line),
+                "line {line} is production code and must stay gated by \
+                 sim coverage; a `#[cfg(test)]` item above it must not exempt it"
+            );
+        }
+    }
+
+    /// The uncovered-line verdict is ENFORCED, and both arms behave as their
+    /// messages claim.
+    ///
+    /// Nothing else pins this. The per-PR `check-sim-coverage` job in
+    /// `.github/workflows/ci.yml` passes `--enforce`, which ORs into the
+    /// constant, so CI would stay green through a silent revert of ADR-0092 to
+    /// ADR-0090's advisory landing and every *other* caller — the local
+    /// validation chain in `CLAUDE.md`, the scheduled `xtask-gates.yml` job —
+    /// would quietly stop failing. That is exactly the fail-open shape ADR-0088
+    /// was written to stop, so it gets a test rather than a comment.
+    #[test]
+    fn sim_coverage_enforces_uncovered_by_default() {
+        // A `const` block, so reverting the constant breaks compilation rather
+        // than waiting for someone to run the test. `assert!` on a constant is
+        // a clippy error otherwise (`assertions_on_constants`), and the lint is
+        // right: the compile-time form is the stronger tripwire.
+        const {
+            assert!(
+                SIM_COVERAGE_ENFORCES_UNCOVERED,
+                "ADR-0092 enforces uncovered added lines; flipping this back to \
+                 `false` reverts the gate to ADR-0090's advisory landing, where \
+                 a green run proves only that the gate ran. Write an ADR \
+                 superseding ADR-0092 before changing it."
+            );
+        }
+
+        // The helper's semantics: an invocation with no flag still enforces.
+        // This does NOT catch the call site being cut — verified 2026-08-01,
+        // `let enforcing = enforce;` keeps this test green. What catches that
+        // is `dead_code` under `-D warnings`, since the constant and the helper
+        // both become unreachable from production code. See the note on
+        // `sim_coverage_enforcing`.
+        assert!(
+            sim_coverage_enforcing(false),
+            "an invocation with no `--enforce` must still enforce; the flag is \
+             redundant since ADR-0092, not load-bearing"
+        );
+        assert!(sim_coverage_enforcing(true), "`--enforce` can only tighten");
+
+        let root = Path::new("/ws");
+        let uncovered = [("crates/magnetar-proto/src/conn.rs".to_owned(), 41)];
+
+        assert!(
+            report_uncovered(root, &uncovered, true).is_err(),
+            "an uncovered added line must fail the check when enforcing"
+        );
+        assert!(
+            report_uncovered(root, &uncovered, false).is_ok(),
+            "the advisory arm must still exit 0 — it is what the constant \
+             selects, and keeping it working is what makes a revert one line"
+        );
     }
 
     /// The façade is deliberately outside `SIM_COVERAGE_REPORT_PACKAGES` —

@@ -119,7 +119,7 @@ Any change that alters runtime behavior, public API, wire format, or touches `ma
 
 **Sim coverage** — every line the diff (`merge-base origin/main HEAD`) adds inside the gate's reported scope must be executed by the moonpool run: **100% line coverage on the diff**.
 Measured by `cargo run -p xtask -- check-sim-coverage`, which drives `cargo llvm-cov` to the LCOV report `target/sim-coverage.lcov` and intersects it with the merge-base diff.
-The requirement on the author is hard; the gate's enforcement of it currently is not — see **Advisory landing** below.
+The requirement on the author is hard, and since [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) the gate's enforcement of it is too — see **Enforcing landing** below.
 
 Execution scope and report scope are two different sets, and the distinction is binding:
 
@@ -128,19 +128,23 @@ Execution scope and report scope are two different sets, and the distinction is 
   A `magnetar-proto` unit test never satisfies this gate.
 - **Reported** — `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl` (measured 2026-07-31: 63 `SF:` records, against 16 before).
   Instrumentation is workspace-wide regardless of `-p`, so the wider report is a second `cargo llvm-cov report` pass over artifacts already on disk — no extra compilation and no second test run.
-  Generated code under `crates/magnetar-proto/src/pb/` stays excluded.
+  Generated code under `crates/magnetar-proto/src/pb/` stays excluded, as is every line inside a `#[cfg(test)]` span — span membership via the shared `cfg_test_line_flags`, the same scanner `check-no-internal-clock` and `check-log-fields` use.
+  Until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) this gate instead cut at a file's **first** `#[cfg(test)]` line and dropped everything below it; because that line is usually a gated `use` or helper rather than the bottom `mod tests`, it exempted 48% of all gated lines and 71% of those added over the preceding ten merged PRs. Do not reintroduce a line-cut heuristic here.
 
 The `magnetar` façade is deliberately in neither set: the run never compiles it, which keeps its Docker-bound `crates/magnetar/tests/e2e_*.rs` suite out of the coverage run.
 Additions under `crates/magnetar/src/**` therefore print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), which also records the narrower scope this widening replaces.
 That holds under `--enforce` too: the ungated report is a scope limit, not a verdict, so no flag turns it fatal.
 See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the policy the gate serves.
 
-**Advisory landing** — the widened report ships with `SIM_COVERAGE_ENFORCES_UNCOVERED = false` in `xtask/src/main.rs`, so an uncovered added line inside the reported scope is printed in full, with a count, and the check **exits 0** ([ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md)).
-Be exact about the cost: while that constant is `false`, a green `check-sim-coverage` is **not** evidence of the 100%-on-the-diff requirement above and must never be cited as such.
-It proves the gate ran and printed its findings, nothing more — the same shape of over-claim [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) was written to stop, accepted here temporarily and with eyes open.
-`cargo run -p xtask -- check-sim-coverage --enforce` restores the failing exit code for that single invocation.
-Run it when you need to know whether the branch would pass rather than what it left uncovered; it is also what keeps the fail path exercised while the default stays advisory.
-Flipping the constant to `true` is the tracked follow-up, and it belongs in the same change as wiring the gate into per-PR CI — until then flipping it would change nothing in practice, because the scheduled run against `main` diffs `main` against itself and short-circuits with "nothing to verify".
+**Enforcing landing** — `SIM_COVERAGE_ENFORCES_UNCOVERED = true` in `xtask/src/main.rs`, so an uncovered added line inside the reported scope is printed in full, with a count, and **fails** the check ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)).
+A green `check-sim-coverage` is therefore evidence of the 100%-on-the-diff requirement above, for the lines in the reported scope — and still says nothing about anything outside it, which is what the `not gated` lines are for.
+The gate ran advisory from [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) until ADR-0092, for one reason worth remembering: it had no per-PR home, so enforcing it would have changed nothing.
+`.github/workflows/xtask-gates.yml` ran it on a daily cron against `main`, where the merge-base is `HEAD`, the diff is empty and the check short-circuits with "nothing to verify" before building anything.
+ADR-0092 landed both halves together — the flip, and a `check-sim-coverage` job in [`ci.yml`](.github/workflows/ci.yml) on every `pull_request`.
+Making that job actually block a merge is a branch-protection step in repository settings, not in this tree; `main` had no protection at all as of 2026-08-01, so treat a red run as a real verdict that a human can still merge past (ADR-0092 § Required check).
+`--enforce` now only ORs into the constant, so it is redundant; it is retained because existing invocations keep working, the CI job passes it to state its own intent, and it stays the explicit way to ask for the verdict if the constant is ever flipped back.
+Because the flag would mask exactly that regression, the constant is pinned outside the CI job by a `const` assertion in `sim_coverage_enforces_uncovered_by_default`: reverting the flip stops the `xtask` **test** build compiling (`cargo test` / `clippy --all-targets`, both of which CI runs workspace-wide), while a plain `cargo build` is unaffected since the assertion lives in a `#[cfg(test)]` module.
+Cutting the call site instead — `let enforcing = enforce;` — slips past that assertion and past the whole test; what catches it is `dead_code` under `-D warnings`, which is why `sim_coverage_enforcing` exists as a named `const fn` with one production call site.
 
 One failure stays unconditional: an added file in a gated crate whose crate emitted **no** coverage records at all fails the check whatever the constant says.
 That signals a broken or misconfigured gate rather than a missing test, and a gate that cannot measure must never report success.

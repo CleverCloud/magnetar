@@ -768,7 +768,7 @@ The bulk of the parity matrix above ships on `main`, including:
 - **Daily 128-random-seed moonpool sweep** ([ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md)).
 - **Anti-thrash supervised reconnect policy** (opt-in, [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
-Known open work is narrow and tracked in [`docs/follow-ups.md`](docs/follow-ups.md): PIP-460 e2e waits for a Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few simulation / test-harness gaps remain.
+Known open work is narrow and tracked in [`docs/follow-ups.md`](docs/follow-ups.md), which now holds exactly one entry: the PIP-460 e2e, waiting on a Pulsar 5.0 RC that pins the scalable-topic wire commands.
 
 The public API is stable as of `1.0.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 

@@ -16,6 +16,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege, stated rather than inherited. The repository default is
+# currently `read` (`GET /actions/permissions/workflow` →
+# `default_workflow_permissions: read`, checked 2026-08-01), but that is a
+# repo setting outside this tree that one admin toggle flips to `write`.
+# These jobs execute every build script and proc macro in the
+# `--all-features` dependency closure — `aws-lc-fips-sys`'s C build
+# included, and under coverage instrumentation in check-sim-coverage — so
+# the token they see should not depend on a setting they cannot see.
+# `moonpool-seed-sweep.yml` already sets the precedent. No job here writes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -377,6 +389,102 @@ jobs:
       - name: Install protoc (for prost-build via xtask codegen)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
+
+  check-sim-coverage:
+    name: check-sim-coverage (patch coverage, sim-instrumented crates)
+    # ADR-0024 requires 100% moonpool patch coverage on the diff. ADR-0092
+    # flips the gate to enforcing and gives it the per-PR home it never had.
+    # `xtask-gates.yml` still carries the same job on its daily cron and on
+    # `workflow_dispatch`, but both scheduled runs target `main`, where
+    # `merge-base(origin/main, HEAD) == HEAD` empties the diff and the check
+    # short-circuits before building anything — so until this job existed the
+    # gate had never measured a real pull request.
+    #
+    # This job running red does NOT by itself block a merge: that takes a
+    # branch-protection rule naming it a required check, which lives in
+    # repository settings and not in this tree. See ADR-0092 § Required check.
+    #
+    # Cost. The check is a *diff* gate and bails with "nothing to verify"
+    # before compiling anything when every added production `.rs` line is
+    # excluded — `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`,
+    # `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`,
+    # `/benches/`, `/examples/` path, and anything inside a `#[cfg(test)]`
+    # span (SIM_COVERAGE_EXCLUDE_PREFIXES /
+    # SIM_COVERAGE_EXCLUDE_FRAGMENTS in xtask/src/main.rs, which is the
+    # authority). Note what that does NOT cover: the bail is not keyed on
+    # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
+    # sim run never compiles — the façade, magnetar-admin, magnetarctl —
+    # still pays the full instrumented build and then prints those files as
+    # advisory `not gated`. Measured over the last 40 merged PRs: 30%
+    # short-circuit, 60% build and can produce a verdict, 10% build for a
+    # verdict that is impossible. Keeping that 10% is deliberate — bailing
+    # early would suppress the `not gated` report ADR-0088 exists to print.
+    runs-on: ubuntu-latest
+    # 180 to match the two comparable `--all-features` jobs (`test` above,
+    # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
+    # copy budgets. That 90 was only ever binding on a `workflow_dispatch`
+    # run, since the scheduled one short-circuits; this job is meant to gate, so
+    # a cold-cache cancel here is a false red on someone's PR.
+    timeout-minutes: 180
+    steps:
+      # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
+      # `git merge-base origin/main HEAD` resolves. The default shallow
+      # checkout has no merge base and the gate cannot compute a diff at all.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # `--force` + a leading `+` on the refspec. Without them a
+      # non-fast-forward update — `main` force-pushed, or
+      # `refs/remotes/origin/main` already present at a diverged commit —
+      # is REJECTED, and the old `|| git fetch origin main` fallback could
+      # not repair it: that form writes only FETCH_HEAD and never creates
+      # `refs/remotes/origin/main`. The step still exited 0 and the xtask
+      # then died in `git_merge_base` with "could not resolve merge-base
+      # against `origin/main`" — a red check for an infrastructure reason,
+      # wearing a message that reads like a coverage failure.
+      - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
+      # check-sim-coverage runs `cargo llvm-cov --all-features` over the
+      # moonpool + differential test binaries — which builds aws-lc-fips-sys
+      # under coverage instrumentation — then re-exports the same profile
+      # data over the wider report package set. Reclaim disk like the heavy
+      # build jobs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
+      # so the MIT KRB5 / libclang headers go in like every other
+      # --all-features job. `clang` and `llvm` are the crypto-matrix
+      # requirement repeated here: --all-features includes crypto-fips, and
+      # the gate exports CC/CXX/ASM=clang plus AR/RANLIB=llvm-ar/llvm-ranlib
+      # for that build (xtask's force_clang_toolchain), so those five tools
+      # must exist. `libclang-dev` ships the bindgen shared library, not the
+      # clang driver and not the llvm binutils, and the free-disk-space step
+      # above purges `^llvm-.*` from the runner image exactly as it does in
+      # the crypto-matrix job — where its absence surfaced as cc-rs
+      # `failed to find tool "llvm-ar"`.
+      - name: Install clang + llvm + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libclang-dev libkrb5-dev
+      # `--enforce` is redundant since ADR-0092 flipped
+      # SIM_COVERAGE_ENFORCES_UNCOVERED to true, and is passed anyway so this
+      # workflow states its own intent and keeps gating if that constant is
+      # ever flipped back. The constant itself is pinned by
+      # `sim_coverage_enforces_uncovered_by_default` in xtask/src/main.rs,
+      # since this flag would otherwise mask such a regression.
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage --enforce
 
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its
   # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron

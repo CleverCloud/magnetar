@@ -17,24 +17,32 @@ name: xtask gates (scheduled)
 # that diff is empty, so it short-circuits with "nothing to verify" and
 # never builds the instrumented binaries. It only does real work on a
 # `workflow_dispatch` from a feature branch whose diff touches one of the
-# gated crates. Per-PR / pre-merge patch-coverage gating remains the
-# developer's local validation chain (CLAUDE.md). The job is wired here so
-# the gate has a CI home and is dispatchable against any branch.
+# gated crates.
+#
+# Per-PR gating is NOT this job's responsibility and no longer belongs to
+# the developer's local validation chain alone: ADR-0092 added a
+# `check-sim-coverage` job to `ci.yml` that runs on every `pull_request`
+# (making it a required check is a branch-protection step outside this tree
+# — see ADR-0092). This copy stays for the dispatchable-against-any-branch
+# case (measuring a diff without opening a PR) and for the daily heartbeat
+# that proves the gate still builds.
 #
 # SCOPE of check-sim-coverage: the run executes only the moonpool +
 # differential test binaries, but it reports coverage over every crate that
 # run compiles — `magnetar-proto`, `magnetar-runtime-tokio`,
 # `magnetar-runtime-moonpool`, `magnetar-differential`,
 # `magnetar-auth-athenz` and `magnetar-auth-sasl`. An added line in one of
-# those that the sim run never executes is REPORTED with a count, but does
-# not fail this job: the widened report landed advisory
-# (`SIM_COVERAGE_ENFORCES_UNCOVERED = false`, ADR-0090) and the invocation
-# below deliberately omits `--enforce`. One case does fail — an added file
-# whose whole gated crate emitted no coverage records at all, which means
-# the gate could not measure rather than that a test is missing.
+# those that the sim run never executes is REPORTED with a count and FAILS
+# the job: ADR-0092 flipped `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true`,
+# superseding ADR-0090's advisory landing, so no flag is needed to get the
+# verdict. A second case fails too, and did so even while the verdict was
+# advisory — an added file whose whole gated crate emitted no coverage
+# records at all, which means the gate could not measure rather than that a
+# test is missing.
 # The `magnetar-driver` façade is deliberately not compiled here —
 # its e2e suite is Docker-bound (ADR-0046) — so façade additions still print
-# as advisory `not gated` lines and cannot fail the job.
+# as advisory `not gated` lines and cannot fail the job. That is a scope
+# limit rather than a verdict, and no setting of the constant turns it fatal.
 #
 # Security note: no `github.event.*` inputs are interpolated anywhere in
 # this workflow.
@@ -145,7 +153,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
+      # `--force` + leading `+`: see the identical step in ci.yml. Without
+      # them a non-fast-forward update is rejected and the old fallback
+      # (`|| git fetch origin main`) could not repair it, since that form
+      # writes only FETCH_HEAD.
+      - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
       # check-sim-coverage runs `cargo llvm-cov --all-features` over the
       # moonpool + differential test binaries — which builds aws-lc-fips-sys
       # under coverage instrumentation — then re-exports the same profile
@@ -173,7 +185,9 @@ jobs:
       # --all-features job. `clang` and `llvm` are the crypto-matrix
       # requirement repeated here: --all-features includes crypto-fips, and
       # the gate exports CC/CXX/ASM=clang plus AR/RANLIB=llvm-ar/llvm-ranlib
-      # for that build (xtask's apply_fips_toolchain), so those five tools
+      # for that build (xtask's force_clang_toolchain — apply_fips_toolchain
+      # is the check-crypto-matrix wrapper, a different call site), so those
+      # five tools
       # must exist. `libclang-dev` ships the bindgen shared library, not the
       # clang driver and not the llvm binutils, and the free-disk-space step
       # above purges `^llvm-.*` from the runner image exactly as it does in
