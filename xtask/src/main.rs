@@ -130,10 +130,10 @@ enum Cmd {
     /// re-exports the same profile data over a wider package set, and
     /// intersects the resulting LCOV with `git diff merge-base...HEAD` line
     /// ranges. An added line the moonpool runner never executed is reported
-    /// with a count; it fails the check only under `--enforce`, because the
-    /// widened report landed advisory (`SIM_COVERAGE_ENFORCES_UNCOVERED`,
-    /// ADR-0090). A gated crate that emitted no records at all fails either
-    /// way. See ADR-0024.
+    /// with a count and fails the check (`SIM_COVERAGE_ENFORCES_UNCOVERED`,
+    /// ADR-0092, which supersedes ADR-0090's advisory landing). A gated crate
+    /// that emitted no records at all fails too, and did so even while the
+    /// verdict was advisory. See ADR-0024.
     ///
     /// `-p` selects which test binaries run and which sources the report
     /// keeps; instrumentation itself is workspace-wide. The re-export
@@ -155,11 +155,12 @@ enum Cmd {
         reuse_lcov: bool,
         /// Fail on uncovered added lines instead of only reporting them.
         ///
-        /// The widened report lands advisory (see
-        /// `SIM_COVERAGE_ENFORCES_UNCOVERED`), so by default an uncovered line
-        /// prints but exits 0. This flag restores the ADR-0024 behaviour for a
-        /// single invocation, which is how the fail path stays exercised — and
-        /// how you check whether a branch would survive the flip.
+        /// Redundant since ADR-0092: `SIM_COVERAGE_ENFORCES_UNCOVERED` is
+        /// `true`, so an uncovered added line already fails without this flag.
+        /// It is retained rather than removed because it ORs into that constant
+        /// — existing invocations keep working, the CI job passes it so the
+        /// workflow states its own intent, and it stays the one explicit way to
+        /// ask for the verdict if the constant is ever flipped back.
         #[arg(long)]
         enforce: bool,
     },
@@ -2304,34 +2305,48 @@ fn report_record_less(split: &UninstrumentedSplit) -> Result<()> {
 
 /// Whether an uncovered added line fails the check by default.
 ///
-/// `false` — the widened report lands ADVISORY. Uncovered lines are printed in
-/// full but the check exits 0.
+/// `true` — an added line inside the reported scope that the sim run never
+/// executed fails `check-sim-coverage`. That is ADR-0024's 100%-on-the-diff
+/// requirement stated as an exit code instead of as a printed finding.
 ///
-/// This is a deliberate, time-boxed decision and not the end state. Replaying
-/// history through the widened gate on 2026-07-31 measured 450 uncovered added
-/// lines across 15 files against `HEAD~25`, and 6 across 4 files against
-/// `HEAD~10`. The backlog exists because the gate has never actually run
-/// per-PR: `.github/workflows/xtask-gates.yml` only runs it on a schedule
-/// against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the
-/// diff empty and the check short-circuits with "nothing to verify".
+/// It was `false` from ADR-0090 until ADR-0092, and the reason was not doubt
+/// about the requirement: enforcing it would have changed nothing, because the
+/// gate had no per-PR home. `.github/workflows/xtask-gates.yml` ran it on a
+/// daily cron against `main`, where `merge-base(origin/main, HEAD) == HEAD`
+/// makes the diff empty and the check short-circuits with "nothing to verify"
+/// before it builds anything. ADR-0092 closes both halves in one changeset:
+/// `.github/workflows/ci.yml` carries a `check-sim-coverage` job on
+/// `pull_request`, and this constant is `true`.
 ///
-/// Note what this costs: as long as this is `false`, a green
-/// `check-sim-coverage` is NOT evidence of ADR-0024 patch coverage — it is
-/// evidence that the gate ran and printed its findings. That is the same shape
-/// of claim ADR-0088 was written to stop making, which is why the advisory
-/// output is loud, carries a count, and names this constant.
+/// The backlog that argued for the advisory landing is charged to no branch.
+/// This is a *patch* gate against `git merge-base origin/main HEAD`, so each
+/// PR is measured only on its own added lines. Replaying history on 2026-07-31
+/// measured 6 uncovered added lines across 4 files against `HEAD~10` — the
+/// realistic per-PR shape — while the 450 against `HEAD~25` is an artifact of
+/// a 25-commit-old base no ordinary workflow diffs against.
 ///
-/// `--enforce` overrides it per-invocation, which is how the fail path stays
-/// exercised while the default is `false`. Flipping this to `true` is the
-/// follow-up; see ADR-0090 and `docs/follow-ups.md`.
-const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = false;
+/// `--enforce` still ORs into this (see [`check_sim_coverage`]), so it is now
+/// redundant rather than removed: existing invocations keep working, and the
+/// flag remains the one explicit way to ask for the verdict if this is ever
+/// flipped back. `sim_coverage_enforces_uncovered_by_default` pins this value
+/// with a `const` assertion — reverting it stops `xtask` compiling — because
+/// the CI job passes `--enforce` and would therefore stay green straight
+/// through a silent regression here.
+const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = true;
 
-/// Print per-file uncovered ranges, then fail only when enforcing.
+/// Print per-file uncovered ranges, then fail unless the caller asked not to.
 ///
 /// Returns `Err` when `enforcing`; otherwise prints an advisory summary and
 /// returns `Ok(())`. The per-file lines above are identical either way, so the
 /// only difference between the two modes is the exit code and the final
 /// sentence — a reader diffing two transcripts sees exactly what changed.
+///
+/// Since ADR-0092 every production caller passes `enforcing = true`, because
+/// `SIM_COVERAGE_ENFORCES_UNCOVERED` is `true` and `--enforce` only ORs into
+/// it. The advisory arm is kept — and pinned by
+/// `sim_coverage_enforces_uncovered_by_default` — so that flipping the constant
+/// back stays a one-line change rather than a rewrite, and so the cost of doing
+/// so is spelled out in the message a reader would then see.
 fn report_uncovered(
     workspace_root: &Path,
     uncovered: &[(String, u32)],
@@ -2359,9 +2374,9 @@ fn report_uncovered(
              file(s) were NOT executed by `magnetar-runtime-moonpool` / \
              `magnetar-differential` tests (workspace root: {}). ADR-0024 wants \
              100%, and this run does NOT prove it: the check is exiting 0 \
-             because SIM_COVERAGE_ENFORCES_UNCOVERED is false (ADR-0090). Do \
-             not cite a green run here as patch-coverage evidence. Re-run with \
-             `--enforce` to get the failing exit code.",
+             because SIM_COVERAGE_ENFORCES_UNCOVERED has been set back to false, \
+             reversing ADR-0092. Do not cite a green run here as patch-coverage \
+             evidence. Re-run with `--enforce` to get the failing exit code.",
             uncovered.len(),
             by_file.len(),
             workspace_root.display(),
@@ -2398,7 +2413,10 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     if !reuse_lcov {
         ensure_cargo_llvm_cov()?;
     }
-    // `--enforce` can only ever tighten: it turns uncovered lines fatal. The
+    // `--enforce` can only ever tighten: it turns uncovered lines fatal. Since
+    // ADR-0092 the constant is `true`, so the flag adds nothing and this is
+    // always `true` — kept as an OR rather than collapsed so that flipping the
+    // constant back restores the flag's meaning without touching this line. The
     // record-less-gated-crate bail is NOT governed by either, because that
     // signals a broken or misconfigured gate rather than a missing test, and a
     // gate that cannot measure must never report success.
@@ -3827,6 +3845,46 @@ fn pop(now: Instant) {
                  so the report filters its sources out and every added line in it fails"
             );
         }
+    }
+
+    /// The uncovered-line verdict is ENFORCED, and both arms behave as their
+    /// messages claim.
+    ///
+    /// Nothing else pins this. The per-PR `check-sim-coverage` job in
+    /// `.github/workflows/ci.yml` passes `--enforce`, which ORs into the
+    /// constant, so CI would stay green through a silent revert of ADR-0092 to
+    /// ADR-0090's advisory landing and every *other* caller — the local
+    /// validation chain in `CLAUDE.md`, the scheduled `xtask-gates.yml` job —
+    /// would quietly stop failing. That is exactly the fail-open shape ADR-0088
+    /// was written to stop, so it gets a test rather than a comment.
+    #[test]
+    fn sim_coverage_enforces_uncovered_by_default() {
+        // A `const` block, so reverting the constant breaks compilation rather
+        // than waiting for someone to run the test. `assert!` on a constant is
+        // a clippy error otherwise (`assertions_on_constants`), and the lint is
+        // right: the compile-time form is the stronger tripwire.
+        const {
+            assert!(
+                SIM_COVERAGE_ENFORCES_UNCOVERED,
+                "ADR-0092 enforces uncovered added lines; flipping this back to \
+                 `false` reverts the gate to ADR-0090's advisory landing, where \
+                 a green run proves only that the gate ran. Write an ADR \
+                 superseding ADR-0092 before changing it."
+            );
+        }
+
+        let root = Path::new("/ws");
+        let uncovered = [("crates/magnetar-proto/src/conn.rs".to_owned(), 41)];
+
+        assert!(
+            report_uncovered(root, &uncovered, true).is_err(),
+            "an uncovered added line must fail the check when enforcing"
+        );
+        assert!(
+            report_uncovered(root, &uncovered, false).is_ok(),
+            "the advisory arm must still exit 0 — it is what the constant \
+             selects, and keeping it working is what makes a revert one line"
+        );
     }
 
     /// The façade is deliberately outside `SIM_COVERAGE_REPORT_PACKAGES` —

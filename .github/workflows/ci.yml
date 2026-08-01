@@ -378,6 +378,81 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
 
+  check-sim-coverage:
+    name: check-sim-coverage (patch coverage, sim-instrumented crates)
+    # ADR-0024 requires 100% moonpool patch coverage on the diff. ADR-0092
+    # makes that a merge gate: this job is the per-PR home the check never
+    # had. `xtask-gates.yml` still carries the same job on its daily cron and
+    # on `workflow_dispatch`, but both scheduled runs target `main`, where
+    # `merge-base(origin/main, HEAD) == HEAD` empties the diff and the check
+    # short-circuits before building anything — so until this job existed the
+    # gate had never measured a real pull request.
+    #
+    # Cost on an ordinary PR is near zero. The check is a *diff* gate and
+    # bails with "nothing to verify" before it compiles anything when the
+    # diff adds no line under one of the six gated crates
+    # (SIM_COVERAGE_GATED_CRATE_PREFIXES). `xtask/`, `.github/`, `docs/`,
+    # `specs/`, `crates/magnetar-proto/src/pb/` and any `/tests/`,
+    # `/benches/`, `/examples/` path are excluded outright, so docs-only and
+    # tooling-only PRs never pay the instrumented build.
+    runs-on: ubuntu-latest
+    # 180 to match the two comparable `--all-features` jobs (`test` above,
+    # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
+    # copy budgets. That 90 was only ever binding on a `workflow_dispatch`
+    # run, since the scheduled one short-circuits; this job blocks merges, so
+    # a cold-cache cancel here is a false red on someone's PR.
+    timeout-minutes: 180
+    steps:
+      # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
+      # `git merge-base origin/main HEAD` resolves. The default shallow
+      # checkout has no merge base and the gate cannot compute a diff at all.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
+      # check-sim-coverage runs `cargo llvm-cov --all-features` over the
+      # moonpool + differential test binaries — which builds aws-lc-fips-sys
+      # under coverage instrumentation — then re-exports the same profile
+      # data over the wider report package set. Reclaim disk like the heavy
+      # build jobs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
+      # so the MIT KRB5 / libclang headers go in like every other
+      # --all-features job. `clang` and `llvm` are the crypto-matrix
+      # requirement repeated here: --all-features includes crypto-fips, and
+      # the gate exports CC/CXX/ASM=clang plus AR/RANLIB=llvm-ar/llvm-ranlib
+      # for that build (xtask's force_clang_toolchain), so those five tools
+      # must exist. `libclang-dev` ships the bindgen shared library, not the
+      # clang driver and not the llvm binutils, and the free-disk-space step
+      # above purges `^llvm-.*` from the runner image exactly as it does in
+      # the crypto-matrix job — where its absence surfaced as cc-rs
+      # `failed to find tool "llvm-ar"`.
+      - name: Install clang + llvm + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libclang-dev libkrb5-dev
+      # `--enforce` is redundant since ADR-0092 flipped
+      # SIM_COVERAGE_ENFORCES_UNCOVERED to true, and is passed anyway so this
+      # workflow states its own intent and keeps gating if that constant is
+      # ever flipped back. The constant itself is pinned by
+      # `sim_coverage_enforces_uncovered_by_default` in xtask/src/main.rs,
+      # since this flag would otherwise mask such a regression.
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage --enforce
+
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its
   # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron
   # schedule with 16 freshly-generated random seeds in parallel. Per

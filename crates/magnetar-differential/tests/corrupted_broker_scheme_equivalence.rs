@@ -76,11 +76,11 @@
 //! tokio line no differential test executes is REPORTED as uncovered instead
 //! of being silently skipped.
 //!
-//! Reported, not failed: the widened gate landed advisory
-//! (`SIM_COVERAGE_ENFORCES_UNCOVERED = false`, ADR-0090), so an uncovered
-//! added line prints with a count and the check still exits 0. Pass
-//! `--enforce` for the failing exit code. The record-less-crate case above
-//! is the one thing that fails either way.
+//! Reported and failed: the gate landed advisory under ADR-0090, but
+//! ADR-0092 flipped `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true` and put the
+//! check on every pull request, so an uncovered added line now prints with a
+//! count and fails. The record-less-crate case above failed even while the
+//! verdict was advisory.
 //!
 //! # Still deliberately NOT asserted
 //!

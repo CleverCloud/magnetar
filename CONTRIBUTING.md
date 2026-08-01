@@ -30,7 +30,7 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
 cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011, ADR-0086)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # patch coverage over the 6 sim-compiled crates; advisory, --enforce to fail (ADR-0024, ADR-0088, ADR-0090)
+cargo run -p xtask -- check-sim-coverage        # patch coverage over the 6 sim-compiled crates; enforcing (ADR-0024, ADR-0088, ADR-0090, ADR-0092)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
@@ -40,9 +40,11 @@ Contributors with a FIPS toolchain locally can substitute `--all-features` for `
 Per-package invocations (`cargo test -p <crate>`) need an explicit crypto feature because dependency features don't transitively activate under `-p`.
 
 `check-sim-coverage` executes only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries but reports over six crates, `magnetar-proto` included; the two scopes and the façade's advisory `not gated` path are spelled out in `GUIDELINES.md#cross-runtime-test--coverage-policy`.
-Its uncovered-line verdict is **advisory** as it ships: uncovered added lines are printed with a count and the check exits 0, so a green run above does **not** prove your patch is covered — don't cite it as if it did.
-Run `cargo run -p xtask -- check-sim-coverage --enforce` to get the failing exit code and the real answer to "would my branch pass".
-An added file whose whole gated crate emitted no coverage records fails the check either way — that means the gate could not measure, not that a test is missing.
+Its uncovered-line verdict is **enforcing** ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)): an uncovered added line is printed with a count and fails the check, and the same job runs on every pull request in [`ci.yml`](.github/workflows/ci.yml), where it blocks merge.
+Note what it can and cannot be satisfied by: only the moonpool and differential binaries execute, so covering a `magnetar-proto` or `magnetar-runtime-tokio` line means writing a sim or equivalence test that reaches it — that crate's own unit tests never run under this gate.
+`--enforce` is redundant now and accepted for compatibility.
+An added file whose whole gated crate emitted no coverage records fails the check too, and did so while the verdict was advisory — that means the gate could not measure, not that a test is missing.
+A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `crates/magnetar-proto/src/pb/`, or any `/tests/`, `/benches/`, `/examples/` path short-circuits with "nothing to verify" and never pays the build.
 It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
 On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
 

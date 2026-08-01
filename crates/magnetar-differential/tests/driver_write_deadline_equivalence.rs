@@ -14,9 +14,10 @@
 //! gate's report was widened from those two packages to every package the
 //! run compiles, `magnetar-runtime-tokio` carries `SF:` records, so such a
 //! gap is now REPORTED as uncovered instead of being skipped as untracked.
-//! The widened gate landed advisory (`SIM_COVERAGE_ENFORCES_UNCOVERED =
-//! false`, ADR-0090), so that report still exits 0 — pass `--enforce` for
-//! the failing exit code.
+//! That report landed advisory under ADR-0090; ADR-0092 flipped
+//! `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true` and put the check on every
+//! pull request, so the gap fails the gate rather than exiting 0 — which is
+//! what makes this test load-bearing rather than merely informative.
 //!
 //! ## How the stall is produced against a real broker
 //!
