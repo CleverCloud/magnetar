@@ -72,8 +72,12 @@ Measured 2026-08-01 on a `workflow_dispatch` run against a scratch branch whose 
 | Case                                                           | Wall clock                                                |
 | -------------------------------------------------------------- | --------------------------------------------------------- |
 | Diff touching a gated crate, `Swatinem/rust-cache` **hit**     | **11.3 min** (16:44:50Z → 16:56:09Z), concluded `failure` |
-| This changeset's own PR run — short-circuit, no build          | **2m1s**                                                  |
+| Short-circuit, no build — this changeset's own PR runs         | **2m0s – 7m21s** across three runs                        |
 | Local warm run on a 16-core workstation, NFS-backed target dir | ~5 min                                                    |
+
+The short-circuit row is a range, not a number, and the spread is worth understanding before treating this job as cheap: it is **fixed setup overhead**, not the check.
+Every run pays `actions/checkout` at `fetch-depth: 0`, the free-disk-space reclaim, an apt install of four packages, a `cargo-llvm-cov` download and a cache restore before `check-sim-coverage` is invoked at all — after which it prints "nothing to verify" in seconds.
+So the floor this job puts on **every** pull request, including one that touches nothing it measures, is a few minutes of runner time rather than the near-zero the short-circuit might suggest.
 
 **Cold cache is unmeasured.** The dispatched run logged `Cache hit for: v0-rust-sim-coverage-Linux-x64-…` / `Cache restored successfully`, so 11.3 minutes is a warm number and must not be quoted as a cold one. `timeout-minutes: 180` leaves room for a large multiple of it, which is the point of choosing 180 over the scheduled copy's 90 rather than a number derived from this measurement.
 
@@ -82,7 +86,7 @@ That run is also the CI-side half of the red-then-green proof, and it exercises 
 Two properties keep this affordable:
 
 - The check is a diff gate and bails with "nothing to verify" before compiling anything when **every** added production `.rs` line is excluded: `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/`, every `/tests/`, `/benches/`, `/examples/` path, and everything inside a `#[cfg(test)]` span (`SIM_COVERAGE_EXCLUDE_PREFIXES`, `SIM_COVERAGE_EXCLUDE_FRAGMENTS`, `sim_coverage_cfg_test_lines`).
-  This very changeset is one of them, and its own `check-sim-coverage` run finished in **2m1s**.
+  This very changeset is one of them; its own `check-sim-coverage` runs finished in 2m0s–7m21s, all of it setup rather than measurement.
 - Widening the report cost no extra compilation (ADR-0090), so the job's cost is one instrumented `--all-features` build of the sim closure and the sim run — the same order as the existing `test` and `crypto-matrix` jobs, which both budget 180 minutes.
 
 **Be precise about what the bail is _not_ keyed on**, because the obvious reading is wrong: it tests the exclusion lists, not `SIM_COVERAGE_GATED_CRATE_PREFIXES`.
