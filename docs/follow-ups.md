@@ -52,5 +52,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question; §10 is trimmed to its enforcement half — the report scope landed ([ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md)), but uncovered added lines still only print, and the gate has never run per-PR. §10 is the only dispatch-ready item.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460) and is the only item left open; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md) and §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md). Nothing here is currently dispatch-ready.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

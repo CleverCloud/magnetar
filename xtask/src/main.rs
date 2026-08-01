@@ -2329,10 +2329,34 @@ fn report_record_less(split: &UninstrumentedSplit) -> Result<()> {
 /// redundant rather than removed: existing invocations keep working, and the
 /// flag remains the one explicit way to ask for the verdict if this is ever
 /// flipped back. `sim_coverage_enforces_uncovered_by_default` pins this value
-/// with a `const` assertion — reverting it stops `xtask` compiling — because
+/// with a `const` assertion — reverting it stops the `xtask` test build
+/// compiling, which `cargo test --workspace` and `clippy --all-targets` both
+/// reach in CI — because
 /// the CI job passes `--enforce` and would therefore stay green straight
 /// through a silent regression here.
 const SIM_COVERAGE_ENFORCES_UNCOVERED: bool = true;
+
+/// Resolve whether uncovered added lines are fatal for this invocation.
+///
+/// `--enforce` can only ever tighten: it turns uncovered lines fatal. Since
+/// ADR-0092 the constant is `true`, so the flag adds nothing and this is always
+/// `true` — kept as an OR rather than collapsed so that flipping the constant
+/// back restores the flag's meaning without touching the call site.
+///
+/// This is a named function rather than an inline expression so that
+/// `sim_coverage_enforces_uncovered_by_default` can pin its semantics, and so
+/// the concept has a name to point at. Note where the protection against
+/// cutting the CALL SITE actually comes from, because it is not this test:
+/// measured 2026-08-01, rewriting `check_sim_coverage` to `let enforcing =
+/// enforce;` leaves the test passing (the helper still returns `true`), and
+/// what fails is `cargo clippy -p xtask -- -D warnings` with `constant
+/// SIM_COVERAGE_ENFORCES_UNCOVERED is never used` / `function
+/// sim_coverage_enforcing is never used`. The `dead_code` lint is the
+/// tripwire; keep both this function and the constant reachable from exactly
+/// one production call site so it stays one.
+const fn sim_coverage_enforcing(enforce: bool) -> bool {
+    enforce || SIM_COVERAGE_ENFORCES_UNCOVERED
+}
 
 /// Print per-file uncovered ranges, then fail unless the caller asked not to.
 ///
@@ -2413,14 +2437,10 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     if !reuse_lcov {
         ensure_cargo_llvm_cov()?;
     }
-    // `--enforce` can only ever tighten: it turns uncovered lines fatal. Since
-    // ADR-0092 the constant is `true`, so the flag adds nothing and this is
-    // always `true` — kept as an OR rather than collapsed so that flipping the
-    // constant back restores the flag's meaning without touching this line. The
-    // record-less-gated-crate bail is NOT governed by either, because that
+    // The record-less-gated-crate bail is NOT governed by this, because that
     // signals a broken or misconfigured gate rather than a missing test, and a
     // gate that cannot measure must never report success.
-    let enforcing = enforce || SIM_COVERAGE_ENFORCES_UNCOVERED;
+    let enforcing = sim_coverage_enforcing(enforce);
 
     let workspace_root = workspace_root()?;
     let merge_base = git_merge_base(base, &workspace_root)?;
@@ -3872,6 +3892,19 @@ fn pop(now: Instant) {
                  superseding ADR-0092 before changing it."
             );
         }
+
+        // The helper's semantics: an invocation with no flag still enforces.
+        // This does NOT catch the call site being cut — verified 2026-08-01,
+        // `let enforcing = enforce;` keeps this test green. What catches that
+        // is `dead_code` under `-D warnings`, since the constant and the helper
+        // both become unreachable from production code. See the note on
+        // `sim_coverage_enforcing`.
+        assert!(
+            sim_coverage_enforcing(false),
+            "an invocation with no `--enforce` must still enforce; the flag is \
+             redundant since ADR-0092, not load-bearing"
+        );
+        assert!(sim_coverage_enforcing(true), "`--enforce` can only tighten");
 
         let root = Path::new("/ws");
         let uncovered = [("crates/magnetar-proto/src/conn.rs".to_owned(), 41)];

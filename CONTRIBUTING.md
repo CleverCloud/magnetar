@@ -40,11 +40,12 @@ Contributors with a FIPS toolchain locally can substitute `--all-features` for `
 Per-package invocations (`cargo test -p <crate>`) need an explicit crypto feature because dependency features don't transitively activate under `-p`.
 
 `check-sim-coverage` executes only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries but reports over six crates, `magnetar-proto` included; the two scopes and the façade's advisory `not gated` path are spelled out in `GUIDELINES.md#cross-runtime-test--coverage-policy`.
-Its uncovered-line verdict is **enforcing** ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)): an uncovered added line is printed with a count and fails the check, and the same job runs on every pull request in [`ci.yml`](.github/workflows/ci.yml), where it blocks merge.
+Its uncovered-line verdict is **enforcing** ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)): an uncovered added line is printed with a count and fails the check, and the same job runs on every pull request in [`ci.yml`](.github/workflows/ci.yml).
 Note what it can and cannot be satisfied by: only the moonpool and differential binaries execute, so covering a `magnetar-proto` or `magnetar-runtime-tokio` line means writing a sim or equivalence test that reaches it — that crate's own unit tests never run under this gate.
 `--enforce` is redundant now and accepted for compatibility.
 An added file whose whole gated crate emitted no coverage records fails the check too, and did so while the verdict was advisory — that means the gate could not measure, not that a test is missing.
-A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `crates/magnetar-proto/src/pb/`, or any `/tests/`, `/benches/`, `/examples/` path short-circuits with "nothing to verify" and never pays the build.
+A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`, `/benches/`, `/examples/` path, or anything below a file's first `#[cfg(test)]` short-circuits with "nothing to verify" and never pays the build.
+That bail is keyed on those exclusions and not on the gated crates, so a PR touching only the façade, `magnetar-admin` or `magnetarctl` does pay the full build before printing them as `not gated`.
 It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
 On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
 

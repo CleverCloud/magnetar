@@ -381,20 +381,32 @@ jobs:
   check-sim-coverage:
     name: check-sim-coverage (patch coverage, sim-instrumented crates)
     # ADR-0024 requires 100% moonpool patch coverage on the diff. ADR-0092
-    # makes that a merge gate: this job is the per-PR home the check never
-    # had. `xtask-gates.yml` still carries the same job on its daily cron and
-    # on `workflow_dispatch`, but both scheduled runs target `main`, where
+    # flips the gate to enforcing and gives it the per-PR home it never had.
+    # `xtask-gates.yml` still carries the same job on its daily cron and on
+    # `workflow_dispatch`, but both scheduled runs target `main`, where
     # `merge-base(origin/main, HEAD) == HEAD` empties the diff and the check
     # short-circuits before building anything — so until this job existed the
     # gate had never measured a real pull request.
     #
-    # Cost on an ordinary PR is near zero. The check is a *diff* gate and
-    # bails with "nothing to verify" before it compiles anything when the
-    # diff adds no line under one of the six gated crates
-    # (SIM_COVERAGE_GATED_CRATE_PREFIXES). `xtask/`, `.github/`, `docs/`,
-    # `specs/`, `crates/magnetar-proto/src/pb/` and any `/tests/`,
-    # `/benches/`, `/examples/` path are excluded outright, so docs-only and
-    # tooling-only PRs never pay the instrumented build.
+    # This job running red does NOT by itself block a merge: that takes a
+    # branch-protection rule naming it a required check, which lives in
+    # repository settings and not in this tree. See ADR-0092 § Required check.
+    #
+    # Cost. The check is a *diff* gate and bails with "nothing to verify"
+    # before compiling anything when every added production `.rs` line is
+    # excluded — `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`,
+    # `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`,
+    # `/benches/`, `/examples/` path, and anything below a file's first
+    # `#[cfg(test)]` (SIM_COVERAGE_EXCLUDE_PREFIXES /
+    # SIM_COVERAGE_EXCLUDE_FRAGMENTS in xtask/src/main.rs, which is the
+    # authority). Note what that does NOT cover: the bail is not keyed on
+    # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
+    # sim run never compiles — the façade, magnetar-admin, magnetarctl —
+    # still pays the full instrumented build and then prints those files as
+    # advisory `not gated`. Measured over the last 40 merged PRs: 30%
+    # short-circuit, 60% build and can produce a verdict, 10% build for a
+    # verdict that is impossible. Keeping that 10% is deliberate — bailing
+    # early would suppress the `not gated` report ADR-0088 exists to print.
     runs-on: ubuntu-latest
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled

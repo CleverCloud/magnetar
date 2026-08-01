@@ -139,9 +139,11 @@ See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the
 A green `check-sim-coverage` is therefore evidence of the 100%-on-the-diff requirement above, for the lines in the reported scope — and still says nothing about anything outside it, which is what the `not gated` lines are for.
 The gate ran advisory from [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) until ADR-0092, for one reason worth remembering: it had no per-PR home, so enforcing it would have changed nothing.
 `.github/workflows/xtask-gates.yml` ran it on a daily cron against `main`, where the merge-base is `HEAD`, the diff is empty and the check short-circuits with "nothing to verify" before building anything.
-ADR-0092 landed both halves together — the flip, and a `check-sim-coverage` job in [`ci.yml`](.github/workflows/ci.yml) on every `pull_request` that blocks merge.
+ADR-0092 landed both halves together — the flip, and a `check-sim-coverage` job in [`ci.yml`](.github/workflows/ci.yml) on every `pull_request`.
+Making that job actually block a merge is a branch-protection step in repository settings, not in this tree; `main` had no protection at all as of 2026-08-01, so treat a red run as a real verdict that a human can still merge past (ADR-0092 § Required check).
 `--enforce` now only ORs into the constant, so it is redundant; it is retained because existing invocations keep working, the CI job passes it to state its own intent, and it stays the explicit way to ask for the verdict if the constant is ever flipped back.
-Because the flag would mask exactly that regression, the constant's value is pinned by a `const` assertion in the `sim_coverage_enforces_uncovered_by_default` unit test rather than by the CI job — reverting the flip stops `xtask` compiling.
+Because the flag would mask exactly that regression, the constant is pinned outside the CI job by a `const` assertion in `sim_coverage_enforces_uncovered_by_default`: reverting the flip stops the `xtask` **test** build compiling (`cargo test` / `clippy --all-targets`, both of which CI runs workspace-wide), while a plain `cargo build` is unaffected since the assertion lives in a `#[cfg(test)]` module.
+Cutting the call site instead — `let enforcing = enforce;` — slips past that assertion and past the whole test; what catches it is `dead_code` under `-D warnings`, which is why `sim_coverage_enforcing` exists as a named `const fn` with one production call site.
 
 One failure stays unconditional: an added file in a gated crate whose crate emitted **no** coverage records at all fails the check whatever the constant says.
 That signals a broken or misconfigured gate rather than a missing test, and a gate that cannot measure must never report success.

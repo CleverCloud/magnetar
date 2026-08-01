@@ -1,6 +1,6 @@
 # ADR-0088 — Report additions outside the moonpool coverage run instead of passing them silently
 
-- **Status**: Accepted (amended by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) — the report is widened to the six crates the sim run compiles, so the narrow scope measured below is historical; the `not gated` reporting and the fail-open analysis remain binding)
+- **Status**: Accepted (amended by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) — the report is widened to the six crates the sim run compiles, so the narrow scope measured below is historical; the `not gated` reporting and the fail-open analysis remain binding. Further amended by [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md) — the gate is enforcing and runs on every pull request, so this ADR's residual instruction "do not read a green `check-sim-coverage` on a proto change as coverage evidence" is inverted for the reported scope, and only the `not gated` set stays outside the verdict)
 - **Date**: 2026-07-30
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, xtask, moonpool, adr-0024
@@ -74,6 +74,10 @@ It means "the diff is covered wherever the gate can see", and the run now prints
 **Residual — the important one.** Everything outside the two instrumented crates remains unmeasured, `magnetar-proto` included.
 Until `docs/follow-ups.md` §10 lands, ADR-0024's patch-coverage requirement on proto changes is carried by review and by the four-layer test policy, not by this gate.
 Do not read a green `check-sim-coverage` on a proto change as coverage evidence.
+
+> **This residual is closed.** [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) put `magnetar-proto` in the report, and [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md) made an uncovered added line fatal and put the check on every pull request.
+> The instruction immediately above is now inverted: a green `check-sim-coverage` on a proto change **is** patch-coverage evidence for the lines in the reported scope.
+> What it still says nothing about is the `not gated` set — the façade and everything else the sim run never compiles — which is the part of this ADR that remains binding.
 
 ## References
 

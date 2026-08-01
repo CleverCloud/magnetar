@@ -22,7 +22,8 @@ name: xtask gates (scheduled)
 # Per-PR gating is NOT this job's responsibility and no longer belongs to
 # the developer's local validation chain alone: ADR-0092 added a
 # `check-sim-coverage` job to `ci.yml` that runs on every `pull_request`
-# and blocks merge. This copy stays for the dispatchable-against-any-branch
+# (making it a required check is a branch-protection step outside this tree
+# — see ADR-0092). This copy stays for the dispatchable-against-any-branch
 # case (measuring a diff without opening a PR) and for the daily heartbeat
 # that proves the gate still builds.
 #
@@ -180,7 +181,9 @@ jobs:
       # --all-features job. `clang` and `llvm` are the crypto-matrix
       # requirement repeated here: --all-features includes crypto-fips, and
       # the gate exports CC/CXX/ASM=clang plus AR/RANLIB=llvm-ar/llvm-ranlib
-      # for that build (xtask's apply_fips_toolchain), so those five tools
+      # for that build (xtask's force_clang_toolchain — apply_fips_toolchain
+      # is the check-crypto-matrix wrapper, a different call site), so those
+      # five tools
       # must exist. `libclang-dev` ships the bindgen shared library, not the
       # clang driver and not the llvm binutils, and the free-disk-space step
       # above purges `^llvm-.*` from the runner image exactly as it does in

@@ -44,14 +44,33 @@ Those crates' own unit tests never run under this gate and can never satisfy it.
 
 ### Cost of the per-PR job
 
-Measured on a `workflow_dispatch` run against a branch whose diff touches a gated crate — the case the scheduled run can never exercise: **<!-- MEASURED --> minutes** on a cold cache.
+Measured 2026-08-01 on a `workflow_dispatch` run against a scratch branch whose diff adds one uncovered line to `crates/magnetar-proto/src/frame.rs` — the case the scheduled run can never exercise ([run 30708811273](https://github.com/CleverCloud/magnetar/actions/runs/30708811273)):
 
-Two properties keep this affordable on every pull request:
+| Case                                                           | Wall clock                                                |
+| -------------------------------------------------------------- | --------------------------------------------------------- |
+| Diff touching a gated crate, `Swatinem/rust-cache` **hit**     | **11.3 min** (16:44:50Z → 16:56:09Z), concluded `failure` |
+| This changeset's own PR run — short-circuit, no build          | **2m1s**                                                  |
+| Local warm run on a 16-core workstation, NFS-backed target dir | ~5 min                                                    |
 
-- The check is a diff gate and bails before compiling anything when the diff adds no line under one of the six gated crates.
-  `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/` and every `/tests/`, `/benches/`, `/examples/` path are excluded outright (`SIM_COVERAGE_EXCLUDE_PREFIXES`, `SIM_COVERAGE_EXCLUDE_FRAGMENTS`), so docs-only and tooling-only PRs never pay the instrumented build.
-  This very changeset is one of them.
+**Cold cache is unmeasured.** The dispatched run logged `Cache hit for: v0-rust-sim-coverage-Linux-x64-…` / `Cache restored successfully`, so 11.3 minutes is a warm number and must not be quoted as a cold one. `timeout-minutes: 180` leaves room for a large multiple of it, which is the point of choosing 180 over the scheduled copy's 90 rather than a number derived from this measurement.
+
+That run is also the CI-side half of the red-then-green proof, and it exercises the path the `ci.yml` job does not: `xtask-gates.yml` passes **no** `--enforce`, so its `failure` conclusion on `uncovered (moonpool runner): crates/magnetar-proto/src/frame.rs: 1 line(s)` is the flipped **constant** enforcing in CI, not the flag.
+
+Two properties keep this affordable:
+
+- The check is a diff gate and bails with "nothing to verify" before compiling anything when **every** added production `.rs` line is excluded: `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/`, every `/tests/`, `/benches/`, `/examples/` path, and everything below a file's first `#[cfg(test)]` (`SIM_COVERAGE_EXCLUDE_PREFIXES`, `SIM_COVERAGE_EXCLUDE_FRAGMENTS`).
+  This very changeset is one of them, and its own `check-sim-coverage` run finished in **2m1s**.
 - Widening the report cost no extra compilation (ADR-0090), so the job's cost is one instrumented `--all-features` build of the sim closure and the sim run — the same order as the existing `test` and `crypto-matrix` jobs, which both budget 180 minutes.
+
+**Be precise about what the bail is _not_ keyed on**, because the obvious reading is wrong: it tests the exclusion lists, not `SIM_COVERAGE_GATED_CRATE_PREFIXES`.
+A PR touching only a crate the sim run never compiles — the `magnetar` façade, `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, `magnetar-fakes` — does **not** short-circuit.
+It pays the full instrumented build and then prints those files as advisory `not gated`, a verdict derivable from the path alone.
+
+Measured over the last 40 merged pull requests: **30%** short-circuit, **60%** build and can produce a real verdict, **10%** build for a verdict that is impossible (#374, #306, #293, #292 — façade, `magnetar-admin` and `magnetarctl` only).
+
+That 10% is a deliberate accepted cost, not an oversight.
+Bailing early whenever nothing gated was touched would be provably verdict-preserving — with no gated file in the diff, `report_missing_gated` cannot fire and `intersect_diff_with_coverage` cannot produce an uncovered line — but it would also suppress the `not gated` report, and printing that report instead of passing silently is the entire subject of [ADR-0088](0088-sim-coverage-gate-scope-report-ungated-additions.md).
+Trading ADR-0088's guarantee for one run in ten is a bad trade; revisit only if that ratio moves.
 
 ## Decision
 
@@ -60,17 +79,30 @@ Enforce the uncovered-line verdict, and give the gate a per-PR home. Both in thi
 - **`SIM_COVERAGE_ENFORCES_UNCOVERED = true`** in `xtask/src/main.rs`.
   An added line inside the reported scope that the sim run never executed fails `check-sim-coverage`.
 - **`.github/workflows/ci.yml` gains a `check-sim-coverage` job on `pull_request`**, copied step for step from the `sim-coverage` job in `xtask-gates.yml`: `fetch-depth: 0` plus the explicit `git fetch origin main` so the merge base resolves, the free-disk-space step, `clang llvm libclang-dev libkrb5-dev`, `llvm-tools-preview`, and `cargo-llvm-cov`.
-  It **blocks merge**.
   `timeout-minutes: 180`, matching the comparable `--all-features` jobs rather than the 90 the scheduled copy budgets — that 90 only ever bound a dispatched run, whereas a cold-cache cancel here is a false red on a contributor's PR.
+  It runs on every pull request; on what makes it actually _block_ one, see § Required check below.
 - **The job passes `--enforce` explicitly.**
   It is redundant against the flipped constant — `enforcing = enforce || SIM_COVERAGE_ENFORCES_UNCOVERED` — and is passed so the workflow states its own intent and keeps gating if the constant is ever flipped back.
 - **`--enforce` is retained rather than removed.**
   Existing invocations keep working, and it stays the one explicit way to ask for the verdict should the constant be reverted.
-- **A `const` assertion pins the constant.**
-  `sim_coverage_enforces_uncovered_by_default` wraps `assert!(SIM_COVERAGE_ENFORCES_UNCOVERED)` in a `const` block, so reverting the flip fails to **compile** rather than waiting for the test to be run; the same test also holds both arms of `report_uncovered` to what their messages claim.
-  This is not ceremony: because the CI job passes `--enforce`, CI would stay green straight through a silent revert of this ADR while every _other_ caller — the local validation chain, the scheduled job — quietly stopped failing. That is precisely the fail-open shape ADR-0088 exists to prevent, so it gets a tripwire rather than a comment.
-  The `const` form is also what `clippy::assertions_on_constants` demands, and the lint is right that it is the stronger one.
+- **Two tripwires, guarding two different regressions.** Both are needed, and it is worth being exact about which catches what, because the obvious assumption is wrong.
+
+  1. _Flipping the constant back._ `sim_coverage_enforces_uncovered_by_default` wraps `assert!(SIM_COVERAGE_ENFORCES_UNCOVERED)` in a `const` block, so a revert fails to **compile** rather than waiting for the test to be run. Verified by doing it: `error[E0080]: evaluation panicked: ADR-0092 enforces uncovered added lines; …`. The `const` form is also what `clippy::assertions_on_constants` demands, and the lint is right that it is the stronger one.
+  2. _Cutting the call site._ Rewriting `check_sim_coverage` to `let enforcing = enforce;` leaves the constant untouched, so tripwire 1 stays green — **and so does the whole test**, verified 2026-08-01. What catches it is `dead_code` under `-D warnings`: both `SIM_COVERAGE_ENFORCES_UNCOVERED` and `sim_coverage_enforcing` become unreachable from production code, and `cargo clippy -p xtask -- -D warnings` fails with `constant … is never used` / `function … is never used`. Hence the extraction of `sim_coverage_enforcing` as a named `const fn` with exactly one production call site: it gives the concept a name, gives the test something to assert about its semantics, and keeps the `dead_code` tripwire armed.
+
+  Neither is ceremony. Because the `ci.yml` job passes `--enforce`, CI would stay green straight through a silent revert of this ADR while every _other_ caller — the local validation chain, the scheduled `xtask-gates.yml` job — quietly stopped failing. That is precisely the fail-open shape ADR-0088 exists to prevent.
+
 - **The scheduled copy in `xtask-gates.yml` stays**, for dispatching against a branch with no PR open and as a daily proof that the gate still builds.
+
+### Required check
+
+**A workflow job going red does not block a merge on its own.** That takes a branch-protection rule naming it a required status check, and branch protection lives in repository settings, not in this tree — `.github/` holds only `dependabot.yml` and the four workflows.
+
+Measured 2026-08-01: `GET /repos/CleverCloud/magnetar/branches/main/protection` returns `404 Branch not protected`. So `main` today has no required checks at all, and neither this job nor any existing one gates a merge.
+
+This is the same failure this ADR exists to fix, one level up: ADR-0090 flipped nothing because the gate had no per-PR home, and a per-PR home blocks nothing without a required-check rule. Naming it here so the gap is recorded rather than assumed away.
+
+**Manual step, outside this changeset**, to be applied by someone with repository admin: add `check-sim-coverage (patch coverage, sim-instrumented crates)` to `main`'s required status checks. Until that is done, the job is an enforcing _signal_ on every pull request — its verdict is real and its exit code is real — and merging past a red one takes only a human choosing to.
 
 What does **not** change:
 
@@ -89,7 +121,7 @@ What does **not** change:
 
 **Incompatible with macOS.** `check-sim-coverage` is Linux-only in practice: the gate pins `CC`/`CXX`/`ASM` to clang plus `AR`/`RANLIB` to the LLVM binutils (`force_clang_toolchain`), because `aws-lc-fips-sys`'s `delocate` pass rejects the `.data.rel.ro.local` sections gcc emits — at any gcc version, reproduced on gcc 14.4.0, not the "gcc 16+" threshold once assumed. This mattered less while the gate was a local courtesy; it is worth stating plainly now that it sits on every pull request.
 
-**Reversal.** Flipping the constant back is one line, and the advisory arm of `report_uncovered` is kept working and tested so that it stays one line. It also stops `xtask` compiling until `sim_coverage_enforces_uncovered_by_default`'s `const` assertion is deleted, and that assertion's message names the ADR that would have to supersede this one — the compile error is the tripwire that forces the second step to be deliberate.
+**Reversal.** Flipping the constant back is one line, and the advisory arm of `report_uncovered` is kept working and tested so that it stays one line. It also stops the `xtask` **test** build compiling until `sim_coverage_enforces_uncovered_by_default`'s `const` assertion is deleted — the assertion sits in a `#[cfg(test)]` module, so `cargo build --workspace` still succeeds while `cargo test --workspace --all-features` and `cargo clippy --workspace --all-targets` (both in `ci.yml`) fail — and that assertion's message names the ADR that would have to supersede this one — the compile error is the tripwire that forces the second step to be deliberate.
 
 ## References
 
