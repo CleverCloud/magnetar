@@ -112,6 +112,14 @@ async fn start_broker(
 > {
     init_tracing();
 
+    // Readiness is polled below rather than matched on a startup log line.
+    // `apachepulsar/pulsar:5.0.0-M1` does not print 4.x's "Created namespace
+    // public/default", so a log-string wait times out with `StartupTimeout` and
+    // says nothing about why — measured on CI run 30843979377. Waiting on the
+    // container being up and then asking the broker itself keeps the fixture
+    // working across broker versions and makes a genuine startup failure
+    // report the broker's own logs instead of an opaque timeout.
+    //
     // The two arms are spelled out rather than assembled conditionally so each
     // keeps `PULSAR_MEM` and `.start()` on one chain — `cargo run -p xtask --
     // check-e2e-container-memory` can only verify the cap when it can see both
@@ -120,9 +128,7 @@ async fn start_broker(
         GenericImage::new(IMAGE_REPO, tag)
             .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
             .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-            .with_wait_for(WaitFor::message_on_stdout(
-                "Created namespace public/default",
-            ))
+            .with_wait_for(WaitFor::Nothing)
             .with_startup_timeout(Duration::from_mins(3))
             .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
             // Defaults to `true` in 5.0.0-M1's ServiceConfiguration; set
@@ -145,9 +151,7 @@ async fn start_broker(
         GenericImage::new(IMAGE_REPO, tag)
             .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
             .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-            .with_wait_for(WaitFor::message_on_stdout(
-                "Created namespace public/default",
-            ))
+            .with_wait_for(WaitFor::Nothing)
             .with_startup_timeout(Duration::from_mins(3))
             .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
             .with_cmd(vec![
@@ -160,6 +164,8 @@ async fn start_broker(
             .await?
     };
 
+    await_broker_ready(&container).await?;
+
     let host = container.get_host().await?;
     let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
@@ -168,6 +174,34 @@ async fn start_broker(
         format!("http://{host}:{http_port}"),
         container,
     ))
+}
+
+/// Poll the broker's own health endpoint until it answers, then confirm the
+/// bootstrap namespace exists.
+///
+/// On timeout this returns the broker's last log lines, so a startup failure is
+/// diagnosable from the CI log rather than surfacing as a bare timeout.
+async fn await_broker_ready(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(4);
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        // `brokers healthcheck` exits non-zero until the broker serves; the
+        // namespace probe additionally proves standalone finished bootstrapping,
+        // which is what the topic-create calls below depend on.
+        last = pulsar_admin(container, &["namespaces", "list", "public"]).await?;
+        if last.contains("public/default") {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let logs = String::from_utf8_lossy(&container.stdout_to_vec().await?).into_owned();
+    let tail: String = logs.lines().rev().take(40).collect::<Vec<_>>().join("\n");
+    Err(format!(
+        "broker did not become ready within 4 min.\n--- last pulsar-admin output ---\n{last}\n--- broker log tail ---\n{tail}"
+    )
+    .into())
 }
 
 /// Run `pulsar-admin` inside the container and return its combined output.
