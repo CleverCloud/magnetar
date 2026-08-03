@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-03
+
 ### Added
 
 - **`magnetar_proto::broker_authority` centralizes broker authority normalization with an optional scheme-less default port:** callers now share one sans-io implementation for ASCII-case-insensitive Pulsar scheme recognition, path trimming, explicit-port precedence, bracketed IPv6 handling, and structural rejection.
@@ -56,11 +58,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The consequence under simulation was worse than noise: virtual time outruns host time in `SimProviders`, so `elapsed()` saturated to `0` on essentially every sample and the receive/send-latency percentiles were the one part of `ConsumerStats` / `ProducerStats` carrying no signal at all — three test files had grown explicit workarounds for it, including a `seed_deterministic_latency` helper in the differential suite that overwrote each histogram with a synthetic distribution before comparing.
   `ConsumerState::pop_message`, `Connection::pop_message`, and `ProducerState::apply_receipt` now take `now: Instant` and derive the sample with `saturating_duration_since` (never the `Sub` impl, which panics on underflow); the engines snapshot at the call boundary before taking the connection mutex, tokio via `Instant::now()` and moonpool via its injected `now_instant_provider`.
   `cargo run -p xtask -- check-no-internal-clock` now also rejects `.elapsed()` and no longer carries a file allowlist — `magnetar-proto/src/producer.rs` had been whole-file-skipped on a `uuid` rationale the gate never scanned for, which is why one of the two leaks was doubly invisible.
+  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): `ConsumerState::pop_message`, `Connection::pop_message`, and `ProducerState::apply_receipt` take an additional `now: Instant` parameter, passed last — any direct caller of these sans-io APIs (outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines, which are updated in this changeset) must pass the instant snapshotted at its call site.
+  The ergonomic façade surface is unchanged: `Consumer::{receive, receive_batch, drain_messages}`, `Producer::send`, `ConsumerApi`, `ProducerApi`, `aggregate_stats`, `receive_latency_histogram`, and `send_latency_histogram` all keep their signatures.
   (docs/follow-ups.md §3; ADR-0086, amends ADR-0011)
-
-BREAKING CHANGE: `ConsumerState::pop_message`, `Connection::pop_message`, and `ProducerState::apply_receipt` (`magnetar-proto`, re-exported as `magnetar::proto`) take an additional `now: Instant` parameter, passed last.
-Any direct caller of these sans-io APIs outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines — both updated in this changeset — must pass the instant snapshotted at its call site.
-The ergonomic façade surface is unchanged: `Consumer::{receive, receive_batch, drain_messages}`, `Producer::send`, `ConsumerApi`, `ProducerApi`, `aggregate_stats`, `receive_latency_histogram`, and `send_latency_histogram` all keep their signatures.
 
 - **Admin REST paths now percent-encode to RFC 3986 `pchar`, so `|` in a subscription or topic name no longer 400s:** `AdminClient::url_for` built paths with `Url::path_segments_mut().push()`, whose WHATWG encode set is laxer than RFC 3986 and leaves `[`, `]`, `^` and `|` raw.
   All four are illegal in a URI path, and Pulsar's Jetty front end rejects them at URI-parse time with `400 Illegal Path Character` — before routing, so the response carried no broker `reason` and the failure read as an unexplained empty-bodied 400.
@@ -86,6 +86,25 @@ The ergonomic façade surface is unchanged: `Consumer::{receive, receive_batch, 
   Expiry is treated as an I/O failure routed through the same `mark_disconnected()` path every other write error already takes, so the auto-reconnect supervisor redials exactly as it does for any other write failure, instead of the connection wedging as still-connected forever.
   (#370; ADR-0083, amends ADR-0070 and ADR-0074)
 
+- **PIP-74 `Auto` receiver-queue scaling never armed on a connection with continuous inbound traffic:** the `Auto` adjust schedule had no bootstrap trigger.
+  `ConsumerState::arm_adjust_clock` had exactly one caller — the `None =>` fallback arm inside `Connection::handle_timeout` — so the first arm required a `poll_timeout()` deadline to elapse, and for a fresh `Auto` consumer whose adjust deadline is still `None` the only deadline `poll_timeout()` can return is the keepalive one.
+  Every decoded inbound frame refreshes `last_activity` (ADR-0058's single refresh site), so a connection carrying message deliveries — or the `CommandAckResponse` stream produced by a consumer that awaits each individual ack — deferred the keepalive deadline indefinitely: `handle_timeout` never ran, the schedule never armed, and `Auto` never scaled, regardless of the configured `keepalive_interval`.
+  The schedule was parasitic on whichever unrelated deadline fired first, and a busy connection has none.
+  `Connection::initial_flow` now arms the schedule at initial-flow time, so the bootstrap no longer depends on an unrelated timer.
+  The production impact is measured, not inferred: with the fix reverted, `e2e_auto_adjust_arms_under_continuous_ack_response_traffic` against a real Pulsar 4.0.4 broker leaves the auto-tuned target pinned at its floor of 20 for the whole 300-message drain, so an individually-awaited-ack receive loop — a common pattern — disabled PIP-74 auto-scaling outright.
+  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): `Connection::initial_flow` and `Connection::abandon_consumer_subscribe_waiter` each gain a `now: Instant` parameter — any direct caller of these sans-io APIs (outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines, which are updated in this changeset) must pass the current instant at the call site.
+  The façade and both engines' `Consumer` surfaces are unaffected.
+  (docs/follow-ups.md §4; ADR-0084, amends ADR-0071's arming premise)
+
+- **A dial whose handshake completed too quickly hung for the full `operation_timeout` instead of returning:** `ConnectedFut` — the future behind `wait_connected`, which every bootstrap and every pool dial parks on until the broker answers CONNECT — enrolled for the driver's wakeup from a _spawned helper task_.
+  The driver announces handshake completion with `notify_waiters()`, which stores no permit (ARCHITECTURE.md § "Enroll-before-drain wakeup discipline"), so the helper only enrolled once the runtime scheduled it and a pulse that landed first was lost outright.
+  A freshly dialled connection is silent after CONNECTED, so nothing ever pulsed again and the wait burned the whole 30 s `operation_timeout`, surfacing at the caller as `Other("open_producer: timed out: producer target resolution exceeded operation_timeout")`.
+  Losing the race needs CPU contention, which is why it reproduced on 4-vCPU CI runners and not on an idle dev box: it hit 5 of the 10 dependabot runs off base `5d6c39f` on 2026-07-22, each in a different, unrelated e2e test.
+  `ConnectedFut` now owns an `OwnedNotified` on `event_waker` and polls it BEFORE inspecting connection state, exactly like its sibling `EventWaitFut` and the same discipline already applied to `await_reconnect_or_terminal`, the PIP-33 marker accessor, and the subscribe-readiness waiter; the event drain also narrows to `poll_event_if(Connected | Closed)` so unrelated events stay queued for their own waiter.
+  Signal coverage is unchanged — `event_waker` is pulsed at every site that pulses `driver_waker`.
+  The moonpool engine was structurally immune: `handshake_plain` completes the handshake inline, before the driver task is spawned.
+  (#372)
+
 ### Changed
 
 - **The moonpool engine's broker-URL rejection message now names the accepted shapes instead of asserting an unrecognised scheme.** `proxy_broker_authority` / `direct_broker_authority` previously emitted `broker-advertised URL '<url>' carries an unrecognised scheme (expected 'pulsar://' or 'pulsar+ssl://'); refusing to derive a proxy authority from it` for their single rejection case.
@@ -93,6 +112,25 @@ The ergonomic façade surface is unchanged: `Consumer::{receive, receive_batch, 
   The message is now `broker-advertised URL '<url>' is not a usable authority (expected 'pulsar://host[:port]', 'pulsar+ssl://host[:port]', or a bare 'host:port'); refusing to derive a proxy authority from it`.
   The error type is unchanged (`ClientError::Other`), so only log-scraping on the old string is affected; the tokio engine's own `parse_direct_broker_url` message is untouched.
   (ADR-0087)
+
+- **The moonpool sim-coverage gate now measures a real scope, enforces its verdict, and runs on every pull request.** Three changes compose, and only the third makes the gate bite.
+  Its LCOV report was widened from a narrow slice to the whole closure the sim run compiles — six crates, 63 `SF:` records measured 2026-07-31 (`magnetar-proto` 28, `magnetar-runtime-tokio` 12, `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5, `magnetar-differential` 4, `magnetar-auth-sasl` 2) — so a `magnetar-proto` addition is now measured where before it was invisible.
+  Execution is unchanged and still runs only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries, so a `magnetar-proto` or `magnetar-runtime-tokio` line counts as covered only when a sim test reaches it transitively; those crates' own unit tests never run under the gate and can never satisfy it.
+  `SIM_COVERAGE_ENFORCES_UNCOVERED` then flipped to `true`, so an uncovered added line inside the reported scope is printed in full with a count and **fails** the check rather than being advisory.
+  The flip alone would have changed nothing — the gate diffs against `main`, so its scheduled `main` run compares `main` against itself and short-circuits with "nothing to verify" — so the same changeset gave it a per-PR home: `.github/workflows/ci.yml` runs `check-sim-coverage --enforce` on every `pull_request`.
+  `--enforce` is now redundant (it only ORs into the constant) and is retained so existing invocations keep working.
+  Additions the run never compiles — the `magnetar` façade above all, plus the generated `crates/magnetar-proto/src/pb/` — still print as advisory `not gated` and do not fail the check: that report is a scope limit, not a verdict, and the four-layer ADR-0024 test policy is what carries the requirement there.
+  `main` carries no branch protection as of 2026-08-01, so a red job does not yet mechanically block a merge; ADR-0092 records the admin step that would.
+  (#385, #388; ADR-0092, ADR-0090, ADR-0088, refining ADR-0024)
+
+- **New `cargo run -p xtask -- check-e2e-container-memory` gate.** Every `pulsar standalone` container the e2e suite starts is supposed to carry `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g` (docs/testing.md § "e2e container memory budget"), but nothing enforced it.
+  The e2e helpers are copy-paste duplicated across 52 files, so a new `e2e_*.rs` cloned from a pre-cap template — or a chain that drops the `.with_env_var` call — silently reintroduced a ~2.3 GiB stock-heap container, whose failure mode is a flaky timeout in whichever unrelated test happens to be running: expensive to diagnose, cheap to misread as "just a flake".
+  The gate resolves the image rather than matching text.
+  (#379)
+
+- **Dependency refresh.** `tokio` `^1.52.3` → `^1.53.1`, `tokio-util` `^0.7.18` → `^0.7.19`, `futures` / `futures-util` `^0.3.32` → `^0.3.33`, `serde` `^1.0.228` → `^1.0.229`, `serde_json` `^1.0.150` → `^1.0.151`, `schemars` `^1.2.1` → `^1.2.2`, `aws-lc-rs` `^1.17.1` → `^1.17.3`, `rustls-pki-types` `^1.15.0` → `^1.15.1`, `clap` `^4.6.2` → `^4.6.4`, `anyhow` `^1.0.103` → `^1.0.104`, and `base64` `^0.22.1` → `^0.23.0`.
+  `base64` is the only semver-major move, and it reaches no public signature: it is a `[dev-dependencies]` entry in the `magnetar` façade and an optional dependency of `magnetar-auth-athenz` used only inside function bodies, so no downstream code can observe the bump.
+  (#371)
 
 ## [1.2.3] - 2026-07-20
 
@@ -373,6 +411,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.3.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.3.0
 [1.2.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.3
 [1.2.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.2
 [1.2.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.1
