@@ -1680,9 +1680,14 @@ impl Client {
                     });
                 }
                 Some(crate::ScalableEvent::DagWatchClosed { reason, .. }) => {
-                    return Err(ClientError::Other(reason.unwrap_or_else(|| {
-                        "scalable-topic session closed before it resolved".to_owned()
-                    })));
+                    // Always formatted rather than defaulted: every producer of
+                    // `DagWatchClosed` sets a reason, so a fallback branch would
+                    // be unreachable, and naming the session makes the error
+                    // useful when several are open on one connection.
+                    return Err(ClientError::Other(format!(
+                        "scalable-topic session {session_id} closed before it resolved: {}",
+                        reason.unwrap_or_default()
+                    )));
                 }
                 _ => {}
             }

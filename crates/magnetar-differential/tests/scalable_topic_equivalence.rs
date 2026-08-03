@@ -1012,3 +1012,174 @@ fn tc_update_frame(watch_id: u64, parallelism: u32) -> BytesMut {
     magnetar_proto::encode_command(&mut buf, &cmd).expect("encode tc update");
     buf
 }
+
+/// Rejection paths on the two watch families, plus the malformed-frame guards
+/// on the dispatch arms.
+///
+/// A broker that refuses a namespace watch or a coordinator-discovery watch
+/// must close that watch and say why, not leave the caller holding an empty set
+/// it will read as "no matching topics". The dispatch guards cover the
+/// complementary case: a frame whose type says one thing and whose payload is
+/// absent must be refused rather than unwrapped.
+#[test]
+fn scalable_watch_rejections_and_malformed_frames() {
+    for wall_clock in [tokio_wall_clock(), moonpool_wall_clock()] {
+        let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+        connected(&mut conn);
+
+        // A rejected namespace watch closes it and carries the broker's reason.
+        let watch_id = conn
+            .watch_scalable_topics("public/default", vec![])
+            .expect("watch opens");
+        let _ = conn.poll_transmit();
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchScalableTopicsUpdate as i32,
+            watch_scalable_topics_update: Some(pb::CommandWatchScalableTopicsUpdate {
+                watch_id,
+                error: Some(pb::ServerError::AuthorizationError as i32),
+                message: Some("not permitted on this namespace".to_owned()),
+                event: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        magnetar_proto::encode_command(&mut buf, &cmd).expect("encode watch rejection");
+        conn.handle_bytes(Instant::now(), &buf).expect("rejection");
+
+        let tags = drain_event_tags(&mut conn);
+        assert_eq!(tags.len(), 1);
+        assert!(
+            tags[0].contains("not permitted on this namespace"),
+            "the broker's reason reaches the caller: {}",
+            tags[0]
+        );
+        assert!(
+            conn.scalable_topics_snapshot(watch_id).is_none(),
+            "a rejected watch is dropped, not left holding an empty set"
+        );
+
+        // A coordinator-discovery update carrying no snapshot closes that watch.
+        let tc_watch = conn.watch_tc_assignments().expect("tc watch opens");
+        let _ = conn.poll_transmit();
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+            watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+                watch_id: tc_watch,
+                snapshot: None,
+                error: Some(pb::ServerError::ServiceNotReady as i32),
+                message: Some("coordinators not assigned yet".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        magnetar_proto::encode_command(&mut buf, &cmd).expect("encode tc rejection");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("tc rejection");
+        let tags = drain_event_tags(&mut conn);
+        assert_eq!(tags.len(), 1);
+        assert!(
+            tags[0].contains("coordinators not assigned yet"),
+            "the broker's reason reaches the caller: {}",
+            tags[0]
+        );
+
+        // A bodyless coordinator update — neither snapshot nor error — also
+        // closes rather than being read as "zero coordinators".
+        let tc_watch = conn.watch_tc_assignments().expect("second tc watch opens");
+        let _ = conn.poll_transmit();
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+            watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+                watch_id: tc_watch,
+                snapshot: None,
+                error: None,
+                message: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        magnetar_proto::encode_command(&mut buf, &cmd).expect("encode bodyless tc");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("bodyless tc");
+        assert_eq!(drain_event_tags(&mut conn).len(), 1);
+
+        // Malformed frames: the type says a scalable command, the payload is
+        // absent. Each dispatch arm must refuse rather than unwrap.
+        for cmd_type in [
+            pb::base_command::Type::ScalableTopicUpdate,
+            pb::base_command::Type::ScalableTopicSubscribeResponse,
+            pb::base_command::Type::ScalableTopicAssignmentUpdate,
+            pb::base_command::Type::WatchScalableTopicsUpdate,
+            pb::base_command::Type::WatchTcAssignmentsUpdate,
+        ] {
+            let cmd = pb::BaseCommand {
+                r#type: cmd_type as i32,
+                ..Default::default()
+            };
+            let mut buf = BytesMut::new();
+            magnetar_proto::encode_command(&mut buf, &cmd).expect("encode payloadless");
+            let err = conn
+                .handle_bytes(Instant::now(), &buf)
+                .expect_err("a payloadless scalable frame is refused");
+            assert!(
+                matches!(err, magnetar_proto::ProtocolError::InvariantViolation(_)),
+                "{cmd_type:?} refused as an invariant violation, got {err:?}"
+            );
+        }
+    }
+}
+
+/// A consumer session refuses an assignment addressed to a different consumer,
+/// and a namespace watch refuses an update addressed to a different watch.
+#[test]
+fn scalable_session_and_watch_reject_foreign_updates() {
+    let mut session = magnetar_proto::ScalableConsumerSession::new(
+        7,
+        "topic://public/default/scaled".to_owned(),
+        "sub".to_owned(),
+        "consumer-a".to_owned(),
+        magnetar_proto::ScalableConsumerType::Stream,
+    );
+    let err = session
+        .handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 999,
+            assignment: consumer_assignment(1, &[1]),
+        })
+        .expect_err("assignment for another consumer refused");
+    assert_eq!(
+        err,
+        magnetar_proto::AssignmentError::ConsumerMismatch {
+            got: 999,
+            expected: 7
+        }
+    );
+
+    let mut watch = magnetar_proto::ScalableTopicsWatch::new(3, "public/default".to_owned());
+    let err = watch
+        .handle_update(&pb::CommandWatchScalableTopicsUpdate {
+            watch_id: 99,
+            error: None,
+            message: None,
+            event: None,
+        })
+        .expect_err("update for another watch refused");
+    assert_eq!(
+        err,
+        magnetar_proto::TopicsWatchError::WatchMismatch {
+            got: 99,
+            expected: 3
+        }
+    );
+
+    // A bodyless update for the right watch is refused too, rather than read as
+    // an empty matching set.
+    let err = watch
+        .handle_update(&pb::CommandWatchScalableTopicsUpdate {
+            watch_id: 3,
+            error: None,
+            message: None,
+            event: None,
+        })
+        .expect_err("bodyless watch update refused");
+    assert_eq!(err, magnetar_proto::TopicsWatchError::Empty { watch_id: 3 });
+}

@@ -729,3 +729,118 @@ async fn scalable_lookup_rejection_without_message_still_reports() {
 
     broker.shutdown().await;
 }
+
+/// (d) — a refused namespace watch and a refused coordinator-discovery watch
+/// both reach the caller as close events on either engine.
+///
+/// These are the only two driver arms a happy-path transcript never runs, and
+/// they are exactly the ones a caller depends on to tell "refused" from "no
+/// matching topics" / "no coordinators".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_watch_refusals_reach_the_client() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_seen = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        // watch_id 1 — the scripted refusal for a `-deny` namespace.
+        client
+            .watch_scalable_topics("public/default-deny", vec![])
+            .expect("watch opens");
+        // watch_id 2 — even, so the scripted TC refusal fires.
+        client.watch_tc_assignments().expect("tc watch opens");
+        drain_refusals_tokio(&client).await
+    };
+
+    let moonpool_seen = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        client
+            .watch_scalable_topics("public/default-deny", vec![])
+            .expect("watch opens");
+        client.watch_tc_assignments().expect("tc watch opens");
+        drain_refusals_moonpool(&client).await
+    };
+
+    assert_eq!(
+        tokio_seen, moonpool_seen,
+        "engine watch-refusal observations diverged"
+    );
+    let (topics_reason, tc_reason) = tokio_seen;
+    assert!(
+        topics_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("namespace watch refused")),
+        "the namespace-watch refusal names its reason: {topics_reason:?}"
+    );
+    assert!(
+        tc_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("coordinators unavailable")),
+        "the coordinator-watch refusal names its reason: {tc_reason:?}"
+    );
+
+    broker.shutdown().await;
+}
+
+/// Drain until both refusals have been seen, returning their reasons.
+async fn drain_refusals_tokio(client: &TokioClient) -> (Option<String>, Option<String>) {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    let (mut topics, mut tc) = (None, None);
+    while tokio::time::Instant::now() < deadline && (topics.is_none() || tc.is_none()) {
+        let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+        else {
+            continue;
+        };
+        match ev {
+            magnetar_runtime_tokio::ScalableEvent::TopicsWatchClosed { reason, .. } => {
+                topics = reason;
+            }
+            magnetar_runtime_tokio::ScalableEvent::TcAssignmentsWatchClosed { reason, .. } => {
+                tc = reason;
+            }
+            _ => {}
+        }
+    }
+    (topics, tc)
+}
+
+async fn drain_refusals_moonpool<P>(client: &MoonpoolClient<P>) -> (Option<String>, Option<String>)
+where
+    P: moonpool_core::Providers + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    let (mut topics, mut tc) = (None, None);
+    while tokio::time::Instant::now() < deadline && (topics.is_none() || tc.is_none()) {
+        let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+        else {
+            continue;
+        };
+        match ev {
+            magnetar_runtime_moonpool::ScalableEvent::TopicsWatchClosed { reason, .. } => {
+                topics = reason;
+            }
+            magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsWatchClosed {
+                reason, ..
+            } => {
+                tc = reason;
+            }
+            _ => {}
+        }
+    }
+    (topics, tc)
+}

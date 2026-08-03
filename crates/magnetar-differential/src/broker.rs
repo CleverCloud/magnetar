@@ -896,13 +896,26 @@ fn handle_frame(
         }
         pb::base_command::Type::WatchScalableTopics => {
             if let Some(w) = &frame.command.watch_scalable_topics {
-                emit_scalable_topics_snapshot(out, w.watch_id);
-                emit_scalable_topics_diff(out, w.watch_id);
+                // A namespace ending `-deny` is the scripted refusal, so the
+                // watch-closed path runs end to end through the driver.
+                if w.namespace.ends_with("-deny") {
+                    emit_scalable_topics_rejection(out, w.watch_id);
+                } else {
+                    emit_scalable_topics_snapshot(out, w.watch_id);
+                    emit_scalable_topics_diff(out, w.watch_id);
+                }
             }
         }
         pb::base_command::Type::WatchTcAssignments => {
             if let Some(w) = &frame.command.watch_tc_assignments {
-                emit_tc_assignments(out, w.watch_id);
+                // An even watch id is the scripted refusal. The client allocates
+                // watch ids sequentially from 1 across both watch families, so a
+                // test opens one watch to reach an even id deterministically.
+                if w.watch_id % 2 == 0 {
+                    emit_tc_rejection(out, w.watch_id);
+                } else {
+                    emit_tc_assignments(out, w.watch_id);
+                }
             }
         }
         pb::base_command::Type::Lookup => {
@@ -1506,6 +1519,36 @@ fn emit_scalable_topics_update(
             error: None,
             message: None,
             event: Some(event),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a refused namespace watch: an error and no event.
+fn emit_scalable_topics_rejection(out: &mut BytesMut, watch_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchScalableTopicsUpdate as i32,
+        watch_scalable_topics_update: Some(pb::CommandWatchScalableTopicsUpdate {
+            watch_id,
+            error: Some(pb::ServerError::AuthorizationError as i32),
+            message: Some("scripted: namespace watch refused".to_owned()),
+            event: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a refused coordinator-discovery watch: an error and no snapshot.
+fn emit_tc_rejection(out: &mut BytesMut, watch_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+        watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+            watch_id,
+            snapshot: None,
+            error: Some(pb::ServerError::ServiceNotReady as i32),
+            message: Some("scripted: coordinators unavailable".to_owned()),
         }),
         ..Default::default()
     };
