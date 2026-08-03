@@ -24,7 +24,7 @@
 
 use magnetar_differential::HANG_GUARD;
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_proto::{ConnectionConfig, ScalableConsumerType, SegmentId};
+use magnetar_proto::{ConnectionConfig, ScalableConsumerType};
 use magnetar_runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
 use magnetar_runtime_tokio::Client as TokioClient;
 use moonpool_core::TokioProviders;
@@ -330,25 +330,31 @@ async fn scalable_assignment_rebalance_parity() {
     broker.shutdown().await;
 }
 
-/// Poll the client's assignment until the scripted rebalance lands, returning
-/// `(layout_epoch, gained_ids, lost_ids)` derived from the held assignment.
+/// Drain the client's scalable events until the scripted rebalance lands,
+/// returning `(layout_epoch, gained_ids, lost_ids)` **read off the event**.
+///
+/// Reading `lost` from the delta rather than hardcoding it is the point: the
+/// held assignment only shows what the consumer ends up with, so a `lost` list
+/// asserted from the test's own expectations would pass even if the client
+/// computed it wrongly.
 async fn wait_for_rebalance_tokio(client: &TokioClient) -> Option<(u64, Vec<u64>, Vec<u64>)> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
-    loop {
-        if let Some(a) = client.scalable_consumer_assignment(42)
-            && a.layout_epoch == 2
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_tokio::ScalableEvent::AssignmentChanged { delta, .. } = ev
         {
             return Some((
-                a.layout_epoch,
-                a.segments.iter().map(|s| s.segment_id.0).collect(),
-                vec![SegmentId(1).0],
+                delta.layout_epoch,
+                delta.gained.iter().map(|s| s.segment_id.0).collect(),
+                delta.lost.iter().map(|s| s.0).collect(),
             ));
         }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    None
 }
 
 async fn wait_for_rebalance_moonpool<P>(
@@ -358,21 +364,22 @@ where
     P: moonpool_core::Providers + Send + Sync + 'static,
 {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
-    loop {
-        if let Some(a) = client.scalable_consumer_assignment(42)
-            && a.layout_epoch == 2
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_moonpool::ScalableEvent::AssignmentChanged { delta, .. } = ev
         {
             return Some((
-                a.layout_epoch,
-                a.segments.iter().map(|s| s.segment_id.0).collect(),
-                vec![SegmentId(1).0],
+                delta.layout_epoch,
+                delta.gained.iter().map(|s| s.segment_id.0).collect(),
+                delta.lost.iter().map(|s| s.0).collect(),
             ));
         }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    None
 }
 
 /// (d) — a **rejected** registration surfaces identically on both engines, and
