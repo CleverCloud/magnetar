@@ -18,8 +18,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
 
-## [1.3.0] - 2026-08-03
-
 ### Added
 
 - **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
@@ -31,6 +29,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
   Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
   (ADR-0093 §D5)
+
+## [1.3.0] - 2026-08-03
+
+### Added
 
 - **`magnetar_proto::broker_authority` centralizes broker authority normalization with an optional scheme-less default port:** callers now share one sans-io implementation for ASCII-case-insensitive Pulsar scheme recognition, path trimming, explicit-port precedence, bracketed IPv6 handling, and structural rejection.
   The additive `broker_endpoint_scheme` and `BrokerEndpointScheme` API lets runtime adapters preserve that same canonical scheme classification.
