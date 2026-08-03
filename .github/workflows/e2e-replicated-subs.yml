@@ -64,6 +64,23 @@ jobs:
             done
           done
 
+      # Runs BEFORE configure_replicated_subs.sh on purpose: that script
+      # registers the clusters itself, so asserting afterwards would prove
+      # nothing about `pulsar-init`. Both clusters can only be present at
+      # this point if the init service did its job. It had not since the
+      # fixture was written — a YAML folded-scalar bug fed
+      # `initialize-cluster-metadata` an empty argument list and `|| true`
+      # reported `Exited (0)` (issue #389).
+      - name: Assert pulsar-init registered both clusters (regression guard, issue #389)
+        run: |
+          set -euo pipefail
+          for url in http://localhost:18080 http://localhost:18081; do
+            clusters=$(curl -sf "$url/admin/v2/clusters")
+            echo "$url -> $clusters"
+            echo "$clusters" | grep -q '"cluster-a"'
+            echo "$clusters" | grep -q '"cluster-b"'
+          done
+
       - name: Configure peer clusters + replicated subscription status
         working-directory: crates/magnetar/tests/fixtures
         run: ./configure_replicated_subs.sh

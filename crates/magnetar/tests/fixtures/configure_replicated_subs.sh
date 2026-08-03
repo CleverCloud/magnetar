@@ -54,10 +54,15 @@ docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_B_HOST
 docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_B_HOST}" clusters create cluster-b \
   --url "http://localhost:18081" --broker-url pulsar://localhost:16651 || true
 
-# Pulsar in full-cluster mode (vs. `standalone`) does NOT auto-bootstrap
-# the `public` tenant or the `public/default` namespace — that's a
-# standalone-mode convenience. Create both explicitly so the rest of the
-# script (and the e2e test) finds them.
+# `initialize-cluster-metadata` — the `pulsar-init` service in
+# docker-compose.replicated-subs.yml — already creates the `public` tenant
+# and the `public/default` namespace, so these two calls are idempotent
+# no-ops on a fixture brought up normally. They are kept as a safety net,
+# not because Pulsar skips them: an earlier comment here claimed
+# full-cluster mode does not bootstrap them and that standalone mode does.
+# That was a misreading of a broken fixture. `pulsar-init` had never run
+# successfully (issue #389), so the tenant and namespace really were
+# absent — but the cause was the init service, not Pulsar.
 echo "[pip-33] creating public tenant + public/default namespace"
 docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" tenants create public \
   --allowed-clusters cluster-a,cluster-b --admin-roles '' || true
