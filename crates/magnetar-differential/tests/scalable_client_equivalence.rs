@@ -844,3 +844,117 @@ where
     }
     (topics, tc)
 }
+
+/// (d) — a subscribe on a connection that dies mid-wait returns an error rather
+/// than waiting for an assignment that can never come.
+///
+/// `ScriptedBroker::shutdown` stops accepting but leaves established sessions
+/// serving, so this uses a socket that completes the handshake and then hangs
+/// up — the shape a broker crash presents to a client that has already
+/// negotiated the capability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_subscribe_errors_when_the_connection_closes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        // Read the client's CommandConnect, answer it advertising the PIP-460
+        // capability, then hang up.
+        let mut buf = [0_u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Connected as i32,
+            connected: Some(magnetar_proto::pb::CommandConnected {
+                server_version: "closing-broker".to_owned(),
+                protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(magnetar_proto::pb::FeatureFlags {
+                    supports_scalable_topics: Some(true),
+                    ..magnetar_proto::pb::FeatureFlags::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut out = bytes::BytesMut::new();
+        magnetar_proto::encode_command(&mut out, &cmd).expect("encode Connected");
+        let _ = sock.write_all(&out).await;
+        let _ = sock.flush().await;
+        // Drop closes the socket.
+    });
+
+    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
+        .await
+        .expect("handshake completes before the hang-up");
+
+    let err = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            77,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("subscribe returned rather than hanging")
+    .expect_err("a dead connection cannot assign");
+    assert!(
+        !err.to_string().is_empty(),
+        "the failure names a reason: {err}"
+    );
+}
+
+/// The scripted broker tolerates a scalable command frame whose payload is
+/// absent — the `None` arm of each of its four dispatch branches.
+///
+/// A real broker will never send one, but the fake is shared test
+/// infrastructure: if it panicked on a malformed frame, every differential test
+/// would fail with the fake's stack rather than the client's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_broker_tolerates_payloadless_scalable_frames() {
+    use tokio::io::AsyncWriteExt;
+
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let mut sock = tokio::net::TcpStream::connect(broker.host_port())
+        .await
+        .expect("raw connect");
+
+    for cmd_type in [
+        magnetar_proto::pb::base_command::Type::ScalableTopicLookup,
+        magnetar_proto::pb::base_command::Type::ScalableTopicSubscribe,
+        magnetar_proto::pb::base_command::Type::WatchScalableTopics,
+        magnetar_proto::pb::base_command::Type::WatchTcAssignments,
+    ] {
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: cmd_type as i32,
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        magnetar_proto::encode_command(&mut buf, &cmd).expect("encode payloadless");
+        sock.write_all(&buf).await.expect("write payloadless frame");
+    }
+    sock.flush().await.expect("flush");
+
+    // The broker must still be serving: a fresh client completes a handshake and
+    // a lookup after the malformed traffic.
+    let client = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
+        .await
+        .expect("broker still accepts connections");
+    let lookup = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_lookup("topic://public/default/scaled"),
+    )
+    .await
+    .expect("lookup did not hang")
+    .expect("lookup resolves after the malformed frames");
+    assert_eq!(lookup.epoch, 1);
+
+    broker.shutdown().await;
+}

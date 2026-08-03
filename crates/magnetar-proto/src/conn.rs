@@ -6731,10 +6731,14 @@ impl Connection {
         resp: pb::CommandScalableTopicSubscribeResponse,
     ) {
         let request_id = RequestId(resp.request_id);
-        let Some(consumer_id) = self.scalable_subscribe_requests.remove(&request_id) else {
-            return;
-        };
-        let Some(session) = self.scalable_consumers.get_mut(&consumer_id) else {
+        // One guard, not two: `scalable_topic_subscribe` writes both maps
+        // together and a rejection clears both, so a known request id always has
+        // its session. Splitting them left a branch nothing could reach.
+        let Some((consumer_id, session)) = self
+            .scalable_subscribe_requests
+            .remove(&request_id)
+            .and_then(|id| self.scalable_consumers.get_mut(&id).map(|s| (id, s)))
+        else {
             return;
         };
         match session.handle_subscribe_response(&resp) {
