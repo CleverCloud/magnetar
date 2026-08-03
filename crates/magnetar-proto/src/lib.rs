@@ -95,6 +95,10 @@ pub mod markers;
 pub mod operation_retry;
 pub mod producer;
 pub mod receiver_queue;
+/// PIP-460 scalable-consumer registration + namespace-watch state machines
+/// (experimental, ADR-0093).
+#[cfg(feature = "scalable-topics")]
+pub mod scalable_consumer;
 pub mod schema;
 pub mod service_url;
 pub mod supervisor;
@@ -164,6 +168,11 @@ pub use crate::producer::{ProducerIdentity, ProducerSlot, ProducerStats};
 pub use crate::receiver_queue::{
     Auto, DEFAULT_RECEIVER_QUEUE_SIZE, Fixed, FlowStats, ReceiverQueuePolicy, default_policy, fixed,
 };
+#[cfg(feature = "scalable-topics")]
+pub use crate::scalable_consumer::{
+    AssignedSegment, AssignmentDelta, AssignmentError, ConsumerAssignment, ScalableConsumerSession,
+    ScalableConsumerType, ScalableTopicsWatch, TopicsChange, TopicsWatchError,
+};
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
 };
@@ -172,4 +181,4 @@ pub use crate::transmit::{Transmit, TransmitOwned};
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
 #[cfg(feature = "scalable-topics")]
-pub use crate::types::{KeyRange, SegmentDescriptor, SegmentId, SegmentState};
+pub use crate::types::{KeyRange, SegmentDescriptor, SegmentId, SegmentState, TcAssignment};

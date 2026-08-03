@@ -174,6 +174,61 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsA
         magnetar_runtime_moonpool::Client::close_scalable_topic_session(self, session_id);
     }
 
+    fn scalable_topic_subscribe<'a>(
+        &'a self,
+        topic: &'a str,
+        subscription: &'a str,
+        consumer_name: &'a str,
+        consumer_id: u64,
+        consumer_type: magnetar_proto::ScalableConsumerType,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<magnetar_proto::ConsumerAssignment, Self::Error>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::Client::scalable_topic_subscribe(
+                self,
+                topic,
+                subscription,
+                consumer_name,
+                consumer_id,
+                consumer_type,
+            )
+            .await
+        })
+    }
+
+    fn watch_scalable_topics(
+        &self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, Self::Error> {
+        magnetar_runtime_moonpool::Client::watch_scalable_topics(self, namespace, property_filters)
+    }
+
+    fn close_scalable_topics_watch(&self, watch_id: u64) {
+        magnetar_runtime_moonpool::Client::close_scalable_topics_watch(self, watch_id);
+    }
+
+    fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>> {
+        magnetar_runtime_moonpool::Client::scalable_topics_snapshot(self, watch_id)
+    }
+
+    fn broker_supports_tc_metadata_discovery(&self) -> bool {
+        magnetar_runtime_moonpool::Client::broker_supports_tc_metadata_discovery(self)
+    }
+
+    fn watch_tc_assignments(&self) -> Result<u64, Self::Error> {
+        magnetar_runtime_moonpool::Client::watch_tc_assignments(self)
+    }
+
+    fn close_tc_assignments_watch(&self, watch_id: u64) {
+        magnetar_runtime_moonpool::Client::close_tc_assignments_watch(self, watch_id);
+    }
+
     fn next_scalable_event(
         &self,
     ) -> Pin<Box<dyn Future<Output = Option<super::ScalableEvent>> + Send + '_>> {
@@ -211,6 +266,41 @@ fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::Sc
         } => super::ScalableEvent::DagChangedDuringConsume { session_id, reason },
         magnetar_runtime_moonpool::ScalableEvent::DagWatchClosed { session_id, reason } => {
             super::ScalableEvent::DagWatchClosed { session_id, reason }
+        }
+        magnetar_runtime_moonpool::ScalableEvent::ConsumerAssigned {
+            consumer_id,
+            assignment,
+        } => super::ScalableEvent::ConsumerAssigned {
+            consumer_id,
+            assignment,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::AssignmentChanged { consumer_id, delta } => {
+            super::ScalableEvent::AssignmentChanged { consumer_id, delta }
+        }
+        magnetar_runtime_moonpool::ScalableEvent::ConsumerRejected {
+            consumer_id,
+            reason,
+        } => super::ScalableEvent::ConsumerRejected {
+            consumer_id,
+            reason,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::TopicsChanged { watch_id, change } => {
+            super::ScalableEvent::TopicsChanged { watch_id, change }
+        }
+        magnetar_runtime_moonpool::ScalableEvent::TopicsWatchClosed { watch_id, reason } => {
+            super::ScalableEvent::TopicsWatchClosed { watch_id, reason }
+        }
+        magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsChanged {
+            watch_id,
+            parallelism,
+            assignments,
+        } => super::ScalableEvent::TcAssignmentsChanged {
+            watch_id,
+            parallelism,
+            assignments,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason } => {
+            super::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason }
         }
     }
 }

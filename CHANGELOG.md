@@ -22,6 +22,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
+  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
+  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
+  An assignment whose `layout_epoch` does not advance is rejected rather than applied: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
+  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
+  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
+  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
+  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
+  (ADR-0093 §D5)
+
 - **`magnetar_proto::broker_authority` centralizes broker authority normalization with an optional scheme-less default port:** callers now share one sans-io implementation for ASCII-case-insensitive Pulsar scheme recognition, path trimming, explicit-port precedence, bracketed IPv6 handling, and structural rejection.
   The additive `broker_endpoint_scheme` and `BrokerEndpointScheme` API lets runtime adapters preserve that same canonical scheme classification.
   `probe_authority` remains the unchanged no-fallback wrapper, while DIRECT-routing clients can supply the bootstrap protocol default.

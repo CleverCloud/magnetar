@@ -17,9 +17,14 @@
 //! A golden trace lives at `tests/golden/scalable_topic_drop_on_split.json` —
 //! human-reviewable, regenerated via `MAGNETAR_REGENERATE_GOLDEN=1`.
 //!
-//! Two tests, mirroring the `(d)` plan in the proposal:
-//! 1. `scalable_topic_lookup_event_stream_parity`
-//! 2. `dag_change_event_stream_parity`
+//! Mirrors the `(d)` plan in the proposal, with one transcript per
+//! client-visible outcome: the initial layout, a split, a merge, a broker
+//! rejection, a bodyless update, a legacy (unmigrated-topic) layout, the
+//! consumer registration and its rebalance, and the namespace watch.
+//!
+//! The rejection and merge transcripts matter as much as the happy path: both
+//! close the session or reclassify the topology on **both** engines, and a
+//! divergence there would surface to the caller as a different `ConsumerEvent`.
 
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
@@ -56,6 +61,7 @@ fn connected(conn: &mut Connection) {
             max_message_size: Some(5 * 1024 * 1024),
             feature_flags: Some(pb::FeatureFlags {
                 supports_scalable_topics: Some(true),
+                supports_tc_metadata_discovery: Some(true),
                 ..pb::FeatureFlags::default()
             }),
         }),
@@ -194,6 +200,33 @@ fn drain_event_tags(conn: &mut Connection) -> Vec<String> {
             ConnectionEvent::DagWatchClosed { reason, .. } => {
                 format!("DagWatchClosed({reason:?})")
             }
+            ConnectionEvent::ScalableConsumerAssigned {
+                consumer_id,
+                assignment,
+            } => format!(
+                "ConsumerAssigned(id={consumer_id},epoch={},topics={})",
+                assignment.layout_epoch,
+                assignment.segment_topics().join("|")
+            ),
+            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => format!(
+                "AssignmentChanged(id={consumer_id},epoch={},gained={},lost={})",
+                delta.layout_epoch,
+                delta.gained.len(),
+                delta.lost.len()
+            ),
+            ConnectionEvent::ScalableTopicsChanged { watch_id, change } => match change {
+                magnetar_proto::TopicsChange::Snapshot { topics } => {
+                    format!(
+                        "TopicsSnapshot(watch={watch_id},topics={})",
+                        topics.join("|")
+                    )
+                }
+                magnetar_proto::TopicsChange::Diff { added, removed } => format!(
+                    "TopicsDiff(watch={watch_id},added={},removed={})",
+                    added.join("|"),
+                    removed.join("|")
+                ),
+            },
             other => format!("Other({other:?})"),
         };
         tags.push(tag);
@@ -251,4 +284,491 @@ fn dag_change_event_stream_parity() {
             "DagChanged(Split)".to_owned(),
         ]
     );
+}
+
+/// Encode a `CommandScalableTopicSubscribeResponse` frame.
+fn subscribe_response_frame(request_id: u64, epoch: u64, segs: &[u64]) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+        scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+            request_id,
+            error: None,
+            message: None,
+            assignment: Some(consumer_assignment(epoch, segs)),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode subscribe response");
+    buf
+}
+
+/// Encode a `CommandScalableTopicAssignmentUpdate` frame.
+fn assignment_update_frame(consumer_id: u64, epoch: u64, segs: &[u64]) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+        scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id,
+            assignment: consumer_assignment(epoch, segs),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode assignment update");
+    buf
+}
+
+fn consumer_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignment {
+    pb::ScalableConsumerAssignment {
+        layout_epoch: epoch,
+        segments: segs
+            .iter()
+            .map(|&id| pb::ScalableAssignedSegment {
+                segment_id: id,
+                hash_start: 0,
+                hash_end: 32_768,
+                segment_topic: format!("segment://public/default/scaled/{id}"),
+            })
+            .collect(),
+    }
+}
+
+/// Encode a namespace-watch update carrying `event`.
+fn topics_update_frame(
+    watch_id: u64,
+    event: pb::command_watch_scalable_topics_update::Event,
+) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchScalableTopicsUpdate as i32,
+        watch_scalable_topics_update: Some(pb::CommandWatchScalableTopicsUpdate {
+            watch_id,
+            error: None,
+            message: None,
+            event: Some(event),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode topics update");
+    buf
+}
+
+/// Drive a `Connection` through the scripted consumer-registration transcript.
+fn run_assignment_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let request_id = conn
+        .scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            42,
+            magnetar_proto::ScalableConsumerType::Stream,
+        )
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(
+        Instant::now(),
+        &subscribe_response_frame(request_id.0, 1, &[1]),
+    )
+    .expect("subscribe response");
+    conn.handle_bytes(Instant::now(), &assignment_update_frame(42, 2, &[2]))
+        .expect("rebalance");
+    drain_event_tags(&mut conn)
+}
+
+/// Drive a `Connection` through the scripted namespace-watch transcript.
+fn run_topics_watch_transcript(
+    wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let watch_id = conn
+        .watch_scalable_topics("public/default", vec![])
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(
+        Instant::now(),
+        &topics_update_frame(
+            watch_id,
+            pb::command_watch_scalable_topics_update::Event::Snapshot(pb::ScalableTopicsSnapshot {
+                topics: vec!["topic://public/default/a".to_owned()],
+            }),
+        ),
+    )
+    .expect("snapshot");
+    conn.handle_bytes(
+        Instant::now(),
+        &topics_update_frame(
+            watch_id,
+            pb::command_watch_scalable_topics_update::Event::Diff(pb::ScalableTopicsDiff {
+                added: vec!["topic://public/default/c".to_owned()],
+                removed: vec!["topic://public/default/a".to_owned()],
+            }),
+        ),
+    )
+    .expect("diff");
+    drain_event_tags(&mut conn)
+}
+
+#[test]
+fn consumer_assignment_event_stream_parity() {
+    let tokio_tags = run_assignment_transcript(tokio_wall_clock());
+    let moonpool_tags = run_assignment_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the consumer-registration transcript"
+    );
+    assert_eq!(
+        tokio_tags,
+        vec![
+            "ConsumerAssigned(id=42,epoch=1,topics=segment://public/default/scaled/1)".to_owned(),
+            "AssignmentChanged(id=42,epoch=2,gained=1,lost=1)".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn namespace_topics_watch_event_stream_parity() {
+    let tokio_tags = run_topics_watch_transcript(tokio_wall_clock());
+    let moonpool_tags = run_topics_watch_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the namespace-watch transcript"
+    );
+    assert_eq!(
+        tokio_tags,
+        vec![
+            "TopicsSnapshot(watch=1,topics=topic://public/default/a)".to_owned(),
+            "TopicsDiff(watch=1,added=topic://public/default/c,removed=topic://public/default/a)"
+                .to_owned(),
+        ]
+    );
+}
+
+/// Drive a `Connection` through a **merge** transcript: two segments fold into
+/// one child that names both in its `parent_ids`.
+fn run_merge_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(
+            session_id,
+            1,
+            vec![seg(5, 0, 32_768, &[]), seg(6, 32_768, 65_536, &[])],
+        ),
+    )
+    .expect("initial layout");
+    while conn.poll_event().is_some() {}
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 2, vec![seg(7, 0, 65_536, &[5, 6])]),
+    )
+    .expect("merge layout");
+    drain_event_tags(&mut conn)
+}
+
+/// Encode a `CommandScalableTopicUpdate` carrying an error instead of a layout.
+fn error_update_frame(session_id: u64, code: i32, message: &str) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: None,
+            error: Some(code),
+            message: Some(message.to_owned()),
+            resolved_topic_name: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode error update");
+    buf
+}
+
+/// Encode a `CommandScalableTopicUpdate` carrying neither a layout nor an error.
+fn bodyless_update_frame(session_id: u64) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: None,
+            error: None,
+            message: None,
+            resolved_topic_name: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode bodyless update");
+    buf
+}
+
+/// Drive a `Connection` through a broker-rejection transcript.
+fn run_rejection_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/missing")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(
+        Instant::now(),
+        &error_update_frame(
+            session_id,
+            pb::ServerError::TopicNotFound as i32,
+            "no such topic",
+        ),
+    )
+    .expect("rejection");
+    drain_event_tags(&mut conn)
+}
+
+/// Drive a `Connection` through a bodyless-update transcript — a protocol-shape
+/// surprise the session refuses rather than treating as an empty layout.
+fn run_bodyless_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(Instant::now(), &bodyless_update_frame(session_id))
+        .expect("bodyless update");
+    drain_event_tags(&mut conn)
+}
+
+/// Drive a `Connection` through the broker's **synthetic** layout for a regular,
+/// unmigrated topic: one sealed legacy segment wrapping a `persistent://` name.
+fn run_legacy_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let session_id = conn
+        .open_scalable_topic_session("persistent://public/default/plain")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    let mut legacy = seg(0, 0, 65_536, &[]);
+    legacy.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
+    legacy.state = pb::SegmentState::Sealed as i32;
+    conn.handle_bytes(Instant::now(), &layout_frame(session_id, 0, vec![legacy]))
+        .expect("legacy layout");
+    let tags = drain_event_tags(&mut conn);
+    // The legacy marker and the sealed state must survive the decode, or a
+    // consumer would look for a `segment://` topic that does not exist.
+    let snap = conn.dag_snapshot(session_id).expect("session open");
+    assert!(snap[0].is_legacy(), "legacy marker survives decode");
+    assert_eq!(snap[0].state, magnetar_proto::SegmentState::Sealed);
+    tags
+}
+
+#[test]
+fn merge_event_stream_parity() {
+    let tokio_tags = run_merge_transcript(tokio_wall_clock());
+    let moonpool_tags = run_merge_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the merge transcript"
+    );
+    assert_eq!(
+        tokio_tags,
+        vec![
+            "DagUpdated(epoch=2,added=1,removed=2,splits=0,merges=1)".to_owned(),
+            "DagChanged(Merge)".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn broker_rejection_event_stream_parity() {
+    let tokio_tags = run_rejection_transcript(tokio_wall_clock());
+    let moonpool_tags = run_rejection_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the rejection transcript"
+    );
+    assert_eq!(tokio_tags.len(), 1);
+    assert!(
+        tokio_tags[0].starts_with("DagWatchClosed("),
+        "a rejected session closes: {}",
+        tokio_tags[0]
+    );
+    assert!(
+        tokio_tags[0].contains("no such topic"),
+        "the broker's message reaches the caller: {}",
+        tokio_tags[0]
+    );
+}
+
+#[test]
+fn bodyless_update_event_stream_parity() {
+    let tokio_tags = run_bodyless_transcript(tokio_wall_clock());
+    let moonpool_tags = run_bodyless_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the bodyless-update transcript"
+    );
+    assert_eq!(tokio_tags.len(), 1);
+    assert!(
+        tokio_tags[0].contains("carried neither a DAG nor an error"),
+        "a bodyless update is refused, not treated as an empty layout: {}",
+        tokio_tags[0]
+    );
+}
+
+#[test]
+fn legacy_layout_event_stream_parity() {
+    let tokio_tags = run_legacy_transcript(tokio_wall_clock());
+    let moonpool_tags = run_legacy_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the legacy-layout transcript"
+    );
+    assert_eq!(
+        tokio_tags,
+        vec![
+            "LookupResolved(url=pulsar://controller:6650,resolved=topic://public/default/scaled,epoch=0,segs=1)"
+                .to_owned()
+        ]
+    );
+}
+
+/// The descriptor and assignment encode sides round-trip. Both engines hand
+/// these to the broker fakes and to the CLI, so a lossy encode would diverge
+/// the two legs the moment either replays a layout it decoded.
+#[test]
+fn scalable_wire_types_roundtrip() {
+    let mut info = seg(3, 16_384, 32_768, &[1, 2]);
+    info.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
+    info.sealed_at_epoch = Some(4);
+    info.state = pb::SegmentState::Sealed as i32;
+    let address = pb::SegmentBrokerAddress {
+        segment_id: 3,
+        broker_url: "pulsar://seg3:6650".to_owned(),
+        broker_url_tls: Some("pulsar+ssl://seg3:6651".to_owned()),
+    };
+
+    let descriptor = magnetar_proto::SegmentDescriptor::from_pb(&info, Some(&address));
+    let (back_info, back_address) = descriptor.to_pb();
+    assert_eq!(back_info.segment_id, info.segment_id);
+    assert_eq!(back_info.hash_start, info.hash_start);
+    assert_eq!(back_info.hash_end, info.hash_end);
+    assert_eq!(back_info.state, info.state);
+    assert_eq!(back_info.parent_ids, info.parent_ids);
+    assert_eq!(back_info.child_ids, info.child_ids);
+    assert_eq!(back_info.sealed_at_epoch, info.sealed_at_epoch);
+    assert_eq!(back_info.legacy_topic_name, info.legacy_topic_name);
+    assert_eq!(back_address, Some(address));
+
+    // A descriptor with no placement encodes no address half — a sealed segment
+    // the broker no longer serves has none.
+    let placeless = magnetar_proto::SegmentDescriptor::from_pb(&info, None);
+    assert_eq!(placeless.to_pb().1, None);
+
+    // Segment state and consumer type survive the enum round-trip.
+    assert_eq!(
+        magnetar_proto::SegmentState::from_pb_i32(magnetar_proto::SegmentState::Sealed.to_pb_i32()),
+        magnetar_proto::SegmentState::Sealed
+    );
+    assert_eq!(
+        magnetar_proto::SegmentState::from_pb_i32(magnetar_proto::SegmentState::Active.to_pb_i32()),
+        magnetar_proto::SegmentState::Active
+    );
+    assert_eq!(
+        magnetar_proto::SegmentState::from_pb_i32(99),
+        magnetar_proto::SegmentState::Active,
+        "an unknown wire state saturates rather than breaking the decode"
+    );
+
+    let assignment = magnetar_proto::ConsumerAssignment::from_pb(&consumer_assignment(7, &[2, 1]));
+    assert_eq!(assignment.layout_epoch, 7);
+    let back = assignment.to_pb();
+    assert_eq!(back.layout_epoch, 7);
+    assert_eq!(back.segments.len(), 2);
+    assert_eq!(
+        back.segments[0].segment_id, 1,
+        "segments are ordered by id so the two engines compare equal"
+    );
+    assert_eq!(
+        magnetar_proto::ScalableConsumerType::from_pb_i32(
+            magnetar_proto::ScalableConsumerType::Checkpoint.to_pb_i32()
+        ),
+        magnetar_proto::ScalableConsumerType::Checkpoint
+    );
+}
+
+/// The session's own guards — mismatched session id, non-advancing epoch — and
+/// its accessors behave identically whichever engine's clock is installed.
+/// A mismatched or replayed frame must close the session, never mutate it.
+#[test]
+fn session_guards_and_accessors_parity() {
+    for wall_clock in [tokio_wall_clock(), moonpool_wall_clock()] {
+        let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+        connected(&mut conn);
+        // The negotiated flags are readable, and carry what the broker sent.
+        assert!(
+            conn.feature_flags()
+                .supports_scalable_topics
+                .unwrap_or(false)
+        );
+
+        let session_id = conn
+            .open_scalable_topic_session("topic://public/default/scaled")
+            .expect("broker supports scalable topics");
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(
+            Instant::now(),
+            &layout_frame(session_id, 5, vec![seg(1, 0, 65_536, &[])]),
+        )
+        .expect("initial layout");
+        while conn.poll_event().is_some() {}
+
+        // A replayed layout at the same epoch closes the session rather than
+        // being applied — the broker's ordering guarantee, enforced client-side.
+        conn.handle_bytes(
+            Instant::now(),
+            &layout_frame(session_id, 5, vec![seg(9, 0, 65_536, &[])]),
+        )
+        .expect("stale layout");
+        let tags = drain_event_tags(&mut conn);
+        assert_eq!(tags.len(), 1);
+        assert!(
+            tags[0].contains("non-monotonic layout epoch"),
+            "a replayed layout closes the session: {}",
+            tags[0]
+        );
+        assert!(
+            conn.dag_snapshot(session_id).is_none(),
+            "the session is dropped, not left holding a stale layout"
+        );
+
+        // Closing an already-closed session writes nothing.
+        conn.close_scalable_topic_session(session_id);
+        assert!(conn.poll_transmit().is_empty());
+
+        // An update naming a session this connection does not track is ignored.
+        let mut session = magnetar_proto::DagWatchSession::new(1234);
+        assert_eq!(session.session_id(), 1234);
+        assert_eq!(session.epoch(), None);
+        let err = session
+            .handle_update(&pb::CommandScalableTopicUpdate {
+                session_id: 4321,
+                dag: None,
+                error: None,
+                message: None,
+                resolved_topic_name: None,
+            })
+            .expect_err("session mismatch rejected");
+        assert_eq!(
+            err,
+            magnetar_proto::DagError::SessionMismatch {
+                got: 4321,
+                expected: 1234
+            }
+        );
+    }
 }

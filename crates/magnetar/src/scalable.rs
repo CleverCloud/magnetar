@@ -38,6 +38,13 @@ use std::marker::PhantomData;
 /// [`StreamConsumer`]. Re-exported from the proto layer so callers match on a
 /// single canonical type.
 pub use magnetar_proto::DagChangeReason;
+/// **Experimental** (PIP-460). The controller leader's answer to a consumer
+/// registration: which `segment://` topics this consumer owns. Re-exported from
+/// the proto layer.
+pub use magnetar_proto::{
+    AssignedSegment, AssignmentDelta, ConsumerAssignment, ScalableConsumerType, TcAssignment,
+    TopicsChange,
+};
 /// **Experimental** (PIP-460). One node of a scalable topic's segment
 /// DAG. Re-exported from the proto layer.
 pub use magnetar_proto::{KeyRange, SegmentDescriptor, SegmentId, SegmentState};
@@ -270,6 +277,137 @@ where
             dropped: false,
             _payload: PhantomData,
         })
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Register as a scalable consumer
+    /// with the controller leader and await the initial assignment.
+    ///
+    /// This is the command that grants a **share** of a scalable topic: the
+    /// returned [`ConsumerAssignment`] names the `segment://` topics this
+    /// consumer owns. [`Self::scalable_stream_consumer`] resolves a topic's
+    /// layout, which is a different thing — a layout says what segments exist,
+    /// an assignment says which of them are yours.
+    ///
+    /// A `QueueConsumer` never registers (it attaches to every active and
+    /// sealed segment topic directly), which is why [`ScalableConsumerType`]
+    /// offers only `Stream` and `Checkpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime client error when the broker did not advertise
+    /// `supports_scalable_topics`, when it rejects the registration, or when
+    /// the connection closes first.
+    pub async fn scalable_topic_subscribe(
+        &self,
+        topic: &str,
+        subscription: &str,
+        consumer_name: &str,
+        consumer_id: u64,
+        consumer_type: ScalableConsumerType,
+    ) -> Result<ConsumerAssignment, <E::ClientState as ScalableTopicsApi>::Error> {
+        self.inner
+            .scalable_topic_subscribe(
+                topic,
+                subscription,
+                consumer_name,
+                consumer_id,
+                consumer_type,
+            )
+            .await
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
+    /// event drained by the runtime — layout updates, drop-on-change, consumer
+    /// assignments, namespace-watch membership and coordinator discovery all
+    /// arrive here.
+    ///
+    /// Resolves `None` once the connection closes. Cancel-safe: dropping the
+    /// future without polling does not lose buffered events.
+    pub async fn next_scalable_event(&self) -> Option<ScalableEvent> {
+        self.inner.next_scalable_event().await
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Close a scalable-topic layout
+    /// session opened by [`Self::lookup_scalable_topic`].
+    ///
+    /// The lookup leaves the session open — upstream folds the subscribe into
+    /// it — so a caller that only wanted a one-shot view must close it, or the
+    /// broker keeps pushing layouts at a client that stopped listening.
+    pub fn close_scalable_topic_session(&self, session_id: u64) {
+        self.inner.close_scalable_topic_session(session_id);
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Whether the connected broker
+    /// advertised the PIP-460 capability.
+    ///
+    /// `false` against a Pulsar 4.x peer, and against a 5.x one started with
+    /// `scalableTopicsEnabled=false`. Every scalable-topic call is gated on
+    /// this, so it is the one check worth making before reaching for the rest
+    /// of the surface.
+    #[must_use]
+    pub fn broker_supports_scalable_topics(&self) -> bool {
+        self.inner.broker_supports_scalable_topics()
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Open a namespace-level watch over
+    /// the scalable topics matching `property_filters` (empty matches every
+    /// scalable topic in the namespace).
+    ///
+    /// Membership changes arrive as `ScalableEvent::TopicsChanged`; the current
+    /// set is available from [`Self::scalable_topics_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime client error when the broker did not advertise
+    /// `supports_scalable_topics`.
+    pub fn watch_scalable_topics(
+        &self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, <E::ClientState as ScalableTopicsApi>::Error> {
+        self.inner
+            .watch_scalable_topics(namespace, property_filters)
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Close a namespace-level watch.
+    pub fn close_scalable_topics_watch(&self, watch_id: u64) {
+        self.inner.close_scalable_topics_watch(watch_id);
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). The current matching topic set for
+    /// a namespace watch, or `None` for an unknown id.
+    #[must_use]
+    pub fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>> {
+        self.inner.scalable_topics_snapshot(watch_id)
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Whether the broker
+    /// advertised metadata-driven transaction-coordinator discovery.
+    ///
+    /// Upstream advertises this independently of `supports_scalable_topics`, so
+    /// a broker may serve scalable topics without it.
+    #[must_use]
+    pub fn broker_supports_tc_metadata_discovery(&self) -> bool {
+        self.inner.broker_supports_tc_metadata_discovery()
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Open a
+    /// transaction-coordinator discovery watch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime client error when the broker did not advertise
+    /// `supports_tc_metadata_discovery`.
+    pub fn watch_tc_assignments(
+        &self,
+    ) -> Result<u64, <E::ClientState as ScalableTopicsApi>::Error> {
+        self.inner.watch_tc_assignments()
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Close a
+    /// transaction-coordinator discovery watch.
+    pub fn close_tc_assignments_watch(&self, watch_id: u64) {
+        self.inner.close_tc_assignments_watch(watch_id);
     }
 
     /// **Experimental** (PIP-460, ADR-0093). Resolve a `topic://...`

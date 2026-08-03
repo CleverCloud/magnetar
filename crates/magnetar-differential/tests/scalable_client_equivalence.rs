@@ -1,0 +1,500 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! PIP-460 / ADR-0093 differential equivalence at the **client** surface.
+//!
+//! **Experimental.** The sibling `scalable_topic_equivalence.rs` drives the
+//! sans-io `Connection` directly; this file drives each engine's real `Client`
+//! over a real socket against the shared
+//! [`ScriptedBroker`](magnetar_differential::broker::ScriptedBroker), so the
+//! whole path is exercised — connection negotiation, the driver's event drain,
+//! the per-client buffer, and the async client API — and both engines must
+//! observe the same thing.
+//!
+//! That matters beyond parity: the layout session, the consumer registration
+//! and the namespace watch each cross three layers before reaching the caller,
+//! and only a client-level test proves the driver actually forwards them.
+//!
+//! The scripted broker advertises `supports_scalable_topics` and
+//! `supports_tc_metadata_discovery`, without which the client refuses to emit
+//! any of these commands at all (the v4-compatibility gate, ADR-0093 §D3).
+
+#![cfg(feature = "scalable-topics")]
+#![allow(clippy::expect_used)]
+#![allow(clippy::doc_markdown)]
+
+use magnetar_differential::HANG_GUARD;
+use magnetar_differential::broker::ScriptedBroker;
+use magnetar_proto::{ConnectionConfig, ScalableConsumerType, SegmentId};
+use magnetar_runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
+use magnetar_runtime_tokio::Client as TokioClient;
+use moonpool_core::TokioProviders;
+
+/// A normalised, engine-independent description of one scalable exchange.
+/// Compared across engines rather than the raw types, so a difference reads as
+/// a diff of what the caller actually observes.
+#[derive(Debug, PartialEq, Eq)]
+struct Observed {
+    resolved_topic_name: Option<String>,
+    controller_broker_url: Option<String>,
+    layout_epoch: u64,
+    segments: Vec<(u64, u32, u32, Option<String>)>,
+    assignment_epoch: u64,
+    assignment_topics: Vec<String>,
+    topics_watch: Vec<String>,
+    broker_supports_scalable: bool,
+    broker_supports_tc_discovery: bool,
+}
+
+/// Drive the tokio engine's `Client` through the scalable flow.
+async fn observe_tokio(url: &str) -> Observed {
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(url, ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("tokio connect succeeded");
+
+    let lookup = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_lookup("topic://public/default/scaled"),
+    )
+    .await
+    .expect("tokio lookup did not time out")
+    .expect("tokio lookup resolved");
+
+    let assignment = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            42,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("tokio subscribe did not time out")
+    .expect("tokio subscribe resolved");
+
+    let watch_id = client
+        .watch_scalable_topics("public/default", vec![])
+        .expect("tokio namespace watch opened");
+    // Drain until the watch has applied both scripted updates (snapshot then
+    // diff), so the observed set is the post-diff one on both engines.
+    let topics = drain_topics_tokio(&client, watch_id).await;
+
+    let observed = Observed {
+        resolved_topic_name: lookup.resolved_topic_name.clone(),
+        controller_broker_url: lookup.controller_broker_url.clone(),
+        layout_epoch: lookup.epoch,
+        segments: lookup
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.segment_id.0,
+                    s.key_range.start,
+                    s.key_range.end,
+                    s.broker_url.clone(),
+                )
+            })
+            .collect(),
+        assignment_epoch: assignment.layout_epoch,
+        assignment_topics: assignment
+            .segment_topics()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        topics_watch: topics,
+        broker_supports_scalable: client.broker_supports_scalable_topics(),
+        broker_supports_tc_discovery: client.broker_supports_tc_metadata_discovery(),
+    };
+
+    client.close_scalable_topics_watch(watch_id);
+    client.close_scalable_topic_session(lookup.session_id);
+    observed
+}
+
+/// Drive the moonpool engine's `Client` through the identical flow.
+async fn observe_moonpool(host_port: &str) -> Observed {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, host_port, ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool connect succeeded");
+
+    let lookup = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_lookup("topic://public/default/scaled"),
+    )
+    .await
+    .expect("moonpool lookup did not time out")
+    .expect("moonpool lookup resolved");
+
+    let assignment = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            42,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("moonpool subscribe did not time out")
+    .expect("moonpool subscribe resolved");
+
+    let watch_id = client
+        .watch_scalable_topics("public/default", vec![])
+        .expect("moonpool namespace watch opened");
+    let topics = drain_topics_moonpool(&client, watch_id).await;
+
+    let observed = Observed {
+        resolved_topic_name: lookup.resolved_topic_name.clone(),
+        controller_broker_url: lookup.controller_broker_url.clone(),
+        layout_epoch: lookup.epoch,
+        segments: lookup
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.segment_id.0,
+                    s.key_range.start,
+                    s.key_range.end,
+                    s.broker_url.clone(),
+                )
+            })
+            .collect(),
+        assignment_epoch: assignment.layout_epoch,
+        assignment_topics: assignment
+            .segment_topics()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        topics_watch: topics,
+        broker_supports_scalable: client.broker_supports_scalable_topics(),
+        broker_supports_tc_discovery: client.broker_supports_tc_metadata_discovery(),
+    };
+
+    client.close_scalable_topics_watch(watch_id);
+    client.close_scalable_topic_session(lookup.session_id);
+    observed
+}
+
+/// Wait until the namespace watch has applied the scripted diff, so both
+/// engines are compared at the same point in the transcript rather than
+/// whichever snapshot each happened to reach first.
+async fn drain_topics_tokio(client: &TokioClient, watch_id: u64) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(topics) = client.scalable_topics_snapshot(watch_id)
+            && topics == vec!["topic://public/default/c".to_owned()]
+        {
+            return topics;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return client
+                .scalable_topics_snapshot(watch_id)
+                .unwrap_or_default();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn drain_topics_moonpool<P>(client: &MoonpoolClient<P>, watch_id: u64) -> Vec<String>
+where
+    P: moonpool_core::Providers + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(topics) = client.scalable_topics_snapshot(watch_id)
+            && topics == vec!["topic://public/default/c".to_owned()]
+        {
+            return topics;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return client
+                .scalable_topics_snapshot(watch_id)
+                .unwrap_or_default();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// (d) — the two engines' `Client`s observe an identical scalable exchange:
+/// the resolved layout, the consumer's assignment, and the namespace-watch set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_client_surface_parity() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_observed = observe_tokio(&url).await;
+    let moonpool_observed = observe_moonpool(&host_port).await;
+
+    assert_eq!(
+        tokio_observed, moonpool_observed,
+        "engine client surfaces diverged on the scalable exchange"
+    );
+
+    // Pin the exchange itself, so a broker-script change cannot make both
+    // engines agree on nothing.
+    assert_eq!(
+        tokio_observed.resolved_topic_name.as_deref(),
+        Some("topic://public/default/scaled")
+    );
+    assert_eq!(
+        tokio_observed.controller_broker_url.as_deref(),
+        Some("pulsar://controller:6650")
+    );
+    assert_eq!(tokio_observed.layout_epoch, 1);
+    assert_eq!(
+        tokio_observed.segments,
+        vec![
+            (1, 0, 32_768, Some("pulsar://seg1:6650".to_owned())),
+            (2, 32_768, 65_536, Some("pulsar://seg2:6650".to_owned())),
+        ]
+    );
+    assert_eq!(tokio_observed.assignment_epoch, 1);
+    assert_eq!(
+        tokio_observed.assignment_topics,
+        vec!["segment://public/default/scaled/1".to_owned()]
+    );
+    assert_eq!(
+        tokio_observed.topics_watch,
+        vec!["topic://public/default/c".to_owned()],
+        "the diff removed `a` and added `c`"
+    );
+    assert!(tokio_observed.broker_supports_scalable);
+    assert!(tokio_observed.broker_supports_tc_discovery);
+
+    broker.shutdown().await;
+}
+
+/// (d) — the rebalance the broker pushes right after the registration reaches
+/// both engines' event streams identically, naming what to attach and detach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_assignment_rebalance_parity() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_delta = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "sub",
+                "consumer-a",
+                42,
+                ScalableConsumerType::Stream,
+            )
+            .await
+            .expect("tokio subscribe");
+        wait_for_rebalance_tokio(&client).await
+    };
+
+    let moonpool_delta = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "sub",
+                "consumer-a",
+                42,
+                ScalableConsumerType::Stream,
+            )
+            .await
+            .expect("moonpool subscribe");
+        wait_for_rebalance_moonpool(&client).await
+    };
+
+    assert_eq!(
+        tokio_delta, moonpool_delta,
+        "engine rebalance observations diverged"
+    );
+    // Segment 1 is replaced by segment 2 at epoch 2.
+    assert_eq!(tokio_delta, Some((2, vec![2_u64], vec![1_u64])));
+
+    broker.shutdown().await;
+}
+
+/// Poll the client's assignment until the scripted rebalance lands, returning
+/// `(layout_epoch, gained_ids, lost_ids)` derived from the held assignment.
+async fn wait_for_rebalance_tokio(client: &TokioClient) -> Option<(u64, Vec<u64>, Vec<u64>)> {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(a) = client.scalable_consumer_assignment(42)
+            && a.layout_epoch == 2
+        {
+            return Some((
+                a.layout_epoch,
+                a.segments.iter().map(|s| s.segment_id.0).collect(),
+                vec![SegmentId(1).0],
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_rebalance_moonpool<P>(
+    client: &MoonpoolClient<P>,
+) -> Option<(u64, Vec<u64>, Vec<u64>)>
+where
+    P: moonpool_core::Providers + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(a) = client.scalable_consumer_assignment(42)
+            && a.layout_epoch == 2
+        {
+            return Some((
+                a.layout_epoch,
+                a.segments.iter().map(|s| s.segment_id.0).collect(),
+                vec![SegmentId(1).0],
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// (d) — a **rejected** registration surfaces identically on both engines, and
+/// the TC-assignment discovery watch delivers the same coordinator set.
+///
+/// Both paths cross the driver's event drain, so this is the only place the
+/// rejection and TC arms are exercised end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_rejection_and_tc_discovery_parity() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    // Consumer id 99 is the scripted rejection.
+    let tokio_outcome = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        let rejected = client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "sub",
+                "consumer-denied",
+                99,
+                ScalableConsumerType::Checkpoint,
+            )
+            .await
+            .expect_err("tokio registration rejected")
+            .to_string();
+        let watch_id = client
+            .watch_tc_assignments()
+            .expect("tokio TC discovery opened");
+        let tc = wait_for_tc_tokio(&client).await;
+        client.close_tc_assignments_watch(watch_id);
+        (rejected, tc)
+    };
+
+    let moonpool_outcome = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        let rejected = client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "sub",
+                "consumer-denied",
+                99,
+                ScalableConsumerType::Checkpoint,
+            )
+            .await
+            .expect_err("moonpool registration rejected")
+            .to_string();
+        let watch_id = client
+            .watch_tc_assignments()
+            .expect("moonpool TC discovery opened");
+        let tc = wait_for_tc_moonpool(&client).await;
+        client.close_tc_assignments_watch(watch_id);
+        (rejected, tc)
+    };
+
+    assert_eq!(
+        tokio_outcome, moonpool_outcome,
+        "engine rejection / TC-discovery observations diverged"
+    );
+    assert!(
+        tokio_outcome
+            .0
+            .contains("not permitted on this subscription"),
+        "the broker's rejection message reaches the caller: {}",
+        tokio_outcome.0
+    );
+    assert_eq!(
+        tokio_outcome.1,
+        Some((2_u32, vec![0_u64, 1_u64])),
+        "both coordinators are discovered"
+    );
+
+    broker.shutdown().await;
+}
+
+/// Drain the client's scalable events until the TC-assignment snapshot lands.
+async fn wait_for_tc_tokio(client: &TokioClient) -> Option<(u32, Vec<u64>)> {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_tokio::ScalableEvent::TcAssignmentsChanged {
+                parallelism,
+                assignments,
+                ..
+            } = ev
+        {
+            return Some((parallelism, assignments.iter().map(|a| a.tc_id).collect()));
+        }
+    }
+    None
+}
+
+async fn wait_for_tc_moonpool<P>(client: &MoonpoolClient<P>) -> Option<(u32, Vec<u64>)>
+where
+    P: moonpool_core::Providers + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsChanged {
+                parallelism,
+                assignments,
+                ..
+            } = ev
+        {
+            return Some((parallelism, assignments.iter().map(|a| a.tc_id).collect()));
+        }
+    }
+    None
+}

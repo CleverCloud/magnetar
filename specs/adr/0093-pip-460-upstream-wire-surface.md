@@ -73,6 +73,14 @@ The fabricated `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS = 22` is deleted: cla
 The generated `pb/pulsar.proto.rs` is not feature-gated, so the PIP-460 messages are now always compiled.
 The feature gates the **client surface** — session state, connection entries, engine and façade API — and nothing else. A default build's public API is unchanged.
 
+### D5 — The rest of the V5 surface lands with it
+
+Reading a layout is not the same as owning a share of it, so the client also implements the upstream commands that grant one:
+
+- **Consumer registration.** `CommandScalableTopicSubscribe` → `…SubscribeResponse` carries the initial `ConsumerAssignment` (a `layout_epoch` plus the `segment://` topics this consumer owns), and `…AssignmentUpdate` pushes a fresh one after every rebalance, surfaced as an `AssignmentDelta` naming exactly what to attach to and detach from. An assignment whose `layout_epoch` does not advance is **rejected**, the same guard the layout session applies: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist. `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
+- **Namespace watch.** `CommandWatchScalableTopics` delivers a snapshot then incremental diffs of the matching topic set. A diff applies `removed` **before** `added`, per upstream's own note; the reverse order drops a topic named in both lists.
+- **Transaction-coordinator discovery** (PIP-473). `CommandWatchTcAssignments` is negotiated on its **own** flag, `supports_tc_metadata_discovery`, not on `supports_scalable_topics` — upstream advertises them independently, so a broker may serve scalable topics without it. PIP-473's `scalable` routing bit on the PIP-31 transaction commands is sent absent, selecting the legacy coordinator this client speaks today.
+
 ## Consequences
 
 **Breaking.** The `magnetar::proto` surface changes shape: `SegmentDescriptor` gains fields and its `broker_url` becomes `Option`, `SegmentState` loses two variants, `DagDelta` gains `epoch`, `SplitEvent` / `MergeEvent` lose their `*_at_entry` fields, `DagError` swaps `UnknownSegment` for `Broker` / `Empty`, and every `watch_session_id` becomes `session_id`. Engine and façade surfaces follow. Carried with a `BREAKING CHANGE:` footer and a `CHANGELOG.md` entry per the API-stability stance in `docs/follow-ups.md`.
@@ -83,7 +91,7 @@ The feature gates the **client surface** — session state, connection entries, 
 
 **Still out of scope**, unchanged from ADR-0031: transparent segment failover, in-place repartition under load, and controller-election awareness. Drop-on-change remains the contract.
 
-**Upstream surface not yet implemented** and tracked as follow-up work: the consumer-registration protocol (`CommandScalableTopicSubscribe` / `ScalableConsumerAssignment` / `…AssignmentUpdate`, with `ScalableConsumerType::{STREAM, CHECKPOINT}`), the namespace-level `CommandWatchScalableTopics`, and PIP-473's `scalable` routing bit on the transaction commands (sent absent, selecting the legacy coordinator).
+**Still not implemented** and left as follow-up work: `QueueConsumer` and `CheckpointConsumer` surfaces on the façade (the wire type exists, the consumer does not), and the per-segment consumer fan-out that would let `StreamConsumer` actually receive messages from its assigned segments rather than only observe the assignment.
 
 **`MessageIdData` was not extended.** ADR-0031 projected an `Option<SegmentId>` on `MessageId`; M1's `MessageIdData` carries no segment field. Segment identity travels in the `segment://` topic name instead, so no `MessageId` change is needed and none was made.
 

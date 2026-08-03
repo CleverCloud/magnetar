@@ -158,6 +158,13 @@ fn handle_pending_events(
                     | ConnectionEvent::SegmentDagUpdated { .. }
                     | ConnectionEvent::DagChangedDuringConsume { .. }
                     | ConnectionEvent::DagWatchClosed { .. }
+                    | ConnectionEvent::ScalableConsumerAssigned { .. }
+                    | ConnectionEvent::ScalableAssignmentChanged { .. }
+                    | ConnectionEvent::ScalableConsumerRejected { .. }
+                    | ConnectionEvent::ScalableTopicsChanged { .. }
+                    | ConnectionEvent::ScalableTopicsWatchClosed { .. }
+                    | ConnectionEvent::TcAssignmentsChanged { .. }
+                    | ConnectionEvent::TcAssignmentsWatchClosed { .. }
             ) {
                 return true;
             }
@@ -302,6 +309,81 @@ fn handle_pending_events(
             }
             // PIP-460 (ADR-0031): mirror the tokio driver's scalable-event
             // drain into the per-client buffer + wake `next_scalable_event`.
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableConsumerAssigned {
+                consumer_id,
+                assignment,
+            } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::ConsumerAssigned {
+                        consumer_id,
+                        assignment,
+                    });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::AssignmentChanged { consumer_id, delta });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableConsumerRejected {
+                consumer_id,
+                reason,
+            } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::ConsumerRejected {
+                        consumer_id,
+                        reason,
+                    });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableTopicsChanged { watch_id, change } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::TopicsChanged { watch_id, change });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableTopicsWatchClosed { watch_id, reason } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::TopicsWatchClosed { watch_id, reason });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::TcAssignmentsChanged {
+                watch_id,
+                parallelism,
+                assignments,
+            } => {
+                shared.scalable_events.lock().push_back(
+                    crate::ScalableEvent::TcAssignmentsChanged {
+                        watch_id,
+                        parallelism,
+                        assignments,
+                    },
+                );
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::TcAssignmentsWatchClosed { watch_id, reason } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason });
+                shared.scalable_notify.notify_waiters();
+            }
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableTopicLookupResolved {
                 session_id,

@@ -249,6 +249,23 @@ impl SegmentDescriptor {
     }
 }
 
+/// PIP-473 transaction-coordinator assignment — which broker serves one
+/// coordinator partition.
+///
+/// **Experimental** (PIP-460 / PIP-473, ADR-0093). Delivered by the
+/// metadata-driven coordinator-discovery watch, which replaces resolving the
+/// coordinator topic through an ordinary lookup.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcAssignment {
+    /// Transaction-coordinator partition id.
+    pub tc_id: u64,
+    /// Plaintext broker URL serving this coordinator, when advertised.
+    pub broker_service_url: Option<String>,
+    /// TLS broker URL serving this coordinator, when advertised.
+    pub broker_service_url_tls: Option<String>,
+}
+
 /// A logical message identifier (ledger / entry / batch / partition).
 ///
 /// Mirrors the Java `MessageId` interface. `partition` defaults to `-1` for non-partitioned

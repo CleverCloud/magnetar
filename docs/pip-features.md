@@ -653,7 +653,35 @@ A bounded, experimental **StreamConsumer** surface with **drop-on-DAG-change** s
 - **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types. `SegmentState` is `Active` or `Sealed` — upstream has no split/merge _state_, only topology edges. `broker_url` is optional: placement arrives in a parallel `SegmentBrokerAddress` list and a sealed segment may carry none. `MessageId` is **not** extended — Pulsar 5.0.0-M1's `MessageIdData` has no segment field, and segment identity travels in the `segment://` topic name.
 - **`DagWatchSession`** — a sans-io state machine that tracks the current layout, enforces a **monotonic layout `epoch`**, replaces the layout wholesale on each update, and derives split / merge from the incoming segments' `parent_ids` / `child_ids` edges.
 - **`scalable::StreamConsumer<T, E>`** on the façade, generic over the engine via the `ScalableTopicsApi` extension trait (`where E::ClientState: ScalableTopicsApi`), available on **both** the tokio and moonpool engines.
-- A **`magnetar topic-info topic://...`** CLI subcommand that prints the current segment DAG.
+- **Consumer registration with the controller leader** — `CommandScalableTopicSubscribe` / `…SubscribeResponse` / `…AssignmentUpdate`, which is what grants a consumer its share of the topic's segments. See below.
+- **A namespace-level topic watch** — `CommandWatchScalableTopics`, delivering snapshot + diff membership updates for the scalable topics matching a property filter.
+- **Transaction-coordinator discovery** (PIP-473) — `CommandWatchTcAssignments`, negotiated on its own feature flag.
+- A **`magnetarctl topic-info topic://...`** CLI subcommand that prints the current segment DAG.
+
+### Scalable topics consumer registration
+
+A layout says what segments exist; an **assignment** says which of them are yours.
+Resolving a topic does not grant a share of it — that comes from registering with the controller leader:
+
+1. `PulsarClient::scalable_topic_subscribe(topic, subscription, consumer_name, consumer_id, type)` emits `CommandScalableTopicSubscribe`.
+2. The controller leader persists the registration and answers with the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://...` topics this consumer owns.
+3. After every rebalance (a peer joining or leaving the subscription, or a segment split / merge) the broker pushes `CommandScalableTopicAssignmentUpdate`, surfaced as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
+
+An assignment whose `layout_epoch` does not advance is **rejected, not applied**: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
+
+`ScalableConsumerType` offers `Stream` and `Checkpoint`. A `QueueConsumer` never registers — it attaches to every active and sealed segment topic directly — which is why it has no variant, mirroring upstream.
+
+### Scalable topics namespace watch
+
+`PulsarClient::watch_scalable_topics(namespace, property_filters)` opens a watch over the set of scalable topics in a namespace matching a (possibly empty) set of AND property filters.
+The broker answers with a full snapshot and then pushes incremental diffs.
+A diff applies `removed` **before** `added`, which is the order upstream specifies: applying them the other way round would drop a topic named in both lists.
+
+### Transaction-coordinator discovery
+
+PIP-473 lets a v5 client discover which broker serves each transaction-coordinator partition through `CommandWatchTcAssignments`, instead of resolving the coordinator topic by lookup.
+It is negotiated on its **own** feature flag, `supports_tc_metadata_discovery` — a broker may serve scalable topics without it, so `supports_scalable_topics` alone does not unlock the watch.
+The `scalable` routing bit PIP-473 adds to the PIP-31 transaction commands is sent **absent**, which selects the legacy coordinator this client speaks today.
 
 ### Scalable topics drop-on-DAG-change semantics
 

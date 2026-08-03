@@ -1057,6 +1057,47 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// `false` against a Pulsar 4.x peer.
     fn broker_supports_scalable_topics(&self) -> bool;
 
+    /// Register as a scalable consumer with the controller leader and await the
+    /// initial assignment — the `segment://` topics this consumer owns.
+    fn scalable_topic_subscribe<'a>(
+        &'a self,
+        topic: &'a str,
+        subscription: &'a str,
+        consumer_name: &'a str,
+        consumer_id: u64,
+        consumer_type: magnetar_proto::ScalableConsumerType,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<magnetar_proto::ConsumerAssignment, Self::Error>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Open a namespace-level watch over the scalable topics matching
+    /// `property_filters` (empty = every scalable topic in the namespace).
+    fn watch_scalable_topics(
+        &self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, Self::Error>;
+
+    /// Close a namespace-level scalable-topics watch.
+    fn close_scalable_topics_watch(&self, watch_id: u64);
+
+    /// The current matching topic set for a namespace watch.
+    fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>>;
+
+    /// Whether the broker advertised metadata-driven transaction-coordinator
+    /// discovery. Independent of `supports_scalable_topics` upstream.
+    fn broker_supports_tc_metadata_discovery(&self) -> bool;
+
+    /// Open a transaction-coordinator discovery watch.
+    fn watch_tc_assignments(&self) -> Result<u64, Self::Error>;
+
+    /// Close a transaction-coordinator discovery watch.
+    fn close_tc_assignments_watch(&self, watch_id: u64);
+
     /// Close a scalable-topic session.
     fn close_scalable_topic_session(&self, session_id: u64);
 
@@ -1122,6 +1163,57 @@ pub enum ScalableEvent {
     DagWatchClosed {
         /// Session id that closed.
         session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// A scalable consumer's registration resolved with its initial share.
+    ConsumerAssigned {
+        /// Consumer id that registered.
+        consumer_id: u64,
+        /// The `segment://` topics this consumer owns.
+        assignment: magnetar_proto::ConsumerAssignment,
+    },
+    /// The controller leader rebalanced a registered consumer's share.
+    AssignmentChanged {
+        /// Consumer id whose share changed.
+        consumer_id: u64,
+        /// What to attach to and detach from.
+        delta: magnetar_proto::AssignmentDelta,
+    },
+    /// A scalable consumer's registration was rejected.
+    ConsumerRejected {
+        /// Consumer id whose registration failed.
+        consumer_id: u64,
+        /// Why the broker rejected it.
+        reason: String,
+    },
+    /// A namespace-level scalable-topics watch delivered a snapshot or a diff.
+    TopicsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// The snapshot or diff the broker sent.
+        change: magnetar_proto::TopicsChange,
+    },
+    /// A namespace-level scalable-topics watch ended.
+    TopicsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// The metadata-driven transaction-coordinator assignment set changed.
+    TcAssignmentsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// Number of transaction-coordinator partitions.
+        parallelism: u32,
+        /// Which broker serves each coordinator.
+        assignments: Vec<magnetar_proto::TcAssignment>,
+    },
+    /// A transaction-coordinator discovery watch ended.
+    TcAssignmentsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
         /// Optional close reason.
         reason: Option<String>,
     },

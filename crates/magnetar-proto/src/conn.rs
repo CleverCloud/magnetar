@@ -212,6 +212,26 @@ pub struct Connection {
     /// PIP-460 (ADR-0093) next client-allocated scalable-topic session id.
     #[cfg(feature = "scalable-topics")]
     next_scalable_session_id: u64,
+    /// PIP-460 (ADR-0093) consumer registrations with the controller leader,
+    /// keyed by `consumer_id`. See [`crate::scalable_consumer::ScalableConsumerSession`].
+    #[cfg(feature = "scalable-topics")]
+    scalable_consumers: HashMap<u64, crate::scalable_consumer::ScalableConsumerSession>,
+    /// PIP-460 (ADR-0093) in-flight `CommandScalableTopicSubscribe` request id →
+    /// consumer id, so the response can find its registration.
+    #[cfg(feature = "scalable-topics")]
+    scalable_subscribe_requests: HashMap<RequestId, u64>,
+    /// PIP-460 (ADR-0093) namespace-level topic watches, keyed by `watch_id`.
+    #[cfg(feature = "scalable-topics")]
+    scalable_topic_watches: HashMap<u64, crate::scalable_consumer::ScalableTopicsWatch>,
+    /// PIP-460 (ADR-0093) next client-allocated scalable watch id. Shared by the
+    /// namespace watch and the transaction-coordinator discovery watch, which
+    /// are separate command families with separate id spaces upstream; one
+    /// counter keeps both unique within this connection.
+    #[cfg(feature = "scalable-topics")]
+    next_scalable_watch_id: u64,
+    /// PIP-460 (ADR-0093) open transaction-coordinator discovery watches.
+    #[cfg(feature = "scalable-topics")]
+    tc_assignment_watches: std::collections::HashSet<u64>,
     /// FoundationDB-style buggify fault-injection helper (ADR-0048).
     /// Default state is [`crate::Buggify::disabled`] — every choice
     /// point's `should_fire` call returns `false` and the buggified
@@ -445,6 +465,16 @@ impl Connection {
             scalable_sessions: HashMap::new(),
             #[cfg(feature = "scalable-topics")]
             next_scalable_session_id: 1,
+            #[cfg(feature = "scalable-topics")]
+            scalable_consumers: HashMap::new(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_subscribe_requests: HashMap::new(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_topic_watches: HashMap::new(),
+            #[cfg(feature = "scalable-topics")]
+            next_scalable_watch_id: 1,
+            #[cfg(feature = "scalable-topics")]
+            tc_assignment_watches: std::collections::HashSet::new(),
             buggify: crate::Buggify::disabled(),
         }
     }
@@ -3496,6 +3526,38 @@ impl Connection {
                         ))?;
                 self.handle_scalable_topic_update(upd);
             }
+            #[cfg(feature = "scalable-topics")]
+            pb::base_command::Type::ScalableTopicSubscribeResponse => {
+                let resp = command.scalable_topic_subscribe_response.ok_or(
+                    ProtocolError::InvariantViolation(
+                        "missing CommandScalableTopicSubscribeResponse",
+                    ),
+                )?;
+                self.handle_scalable_subscribe_response(resp);
+            }
+            #[cfg(feature = "scalable-topics")]
+            pb::base_command::Type::ScalableTopicAssignmentUpdate => {
+                let upd = command.scalable_topic_assignment_update.ok_or(
+                    ProtocolError::InvariantViolation(
+                        "missing CommandScalableTopicAssignmentUpdate",
+                    ),
+                )?;
+                self.handle_scalable_assignment_update(upd);
+            }
+            #[cfg(feature = "scalable-topics")]
+            pb::base_command::Type::WatchScalableTopicsUpdate => {
+                let upd = command.watch_scalable_topics_update.ok_or(
+                    ProtocolError::InvariantViolation("missing CommandWatchScalableTopicsUpdate"),
+                )?;
+                self.handle_scalable_topics_watch_update(upd);
+            }
+            #[cfg(feature = "scalable-topics")]
+            pb::base_command::Type::WatchTcAssignmentsUpdate => {
+                let upd = command.watch_tc_assignments_update.ok_or(
+                    ProtocolError::InvariantViolation("missing CommandWatchTcAssignmentsUpdate"),
+                )?;
+                self.handle_tc_assignments_update(upd);
+            }
             _ => {
                 // Unhandled command — we tolerate them silently for forward compatibility, but
                 // we DO push an event for the driver to log.
@@ -6466,6 +6528,318 @@ impl Connection {
         self.scalable_sessions
             .get(&session_id)
             .and_then(crate::dag_watch::DagWatchSession::resolved_topic_name)
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Register as a scalable consumer
+    /// with the controller leader, emitting `CommandScalableTopicSubscribe`.
+    ///
+    /// This is what obtains a **share** of a scalable topic: the broker replies
+    /// with the initial [`ConsumerAssignment`](crate::scalable_consumer::ConsumerAssignment)
+    /// naming the `segment://` topics this consumer owns, then pushes a fresh
+    /// one after every rebalance. Reading a topic's layout via
+    /// [`Self::open_scalable_topic_session`] does not grant one.
+    ///
+    /// A `QueueConsumer` never registers — it attaches to every active and
+    /// sealed segment topic directly — which is why
+    /// [`ScalableConsumerType`](crate::scalable_consumer::ScalableConsumerType)
+    /// has no variant for it.
+    ///
+    /// # Errors
+    ///
+    /// [`ScalableTopicError::BrokerUnsupported`](crate::dag_watch::ScalableTopicError::BrokerUnsupported)
+    /// when the peer did not advertise `supports_scalable_topics`; nothing is
+    /// written to the outbound buffer in that case.
+    #[cfg(feature = "scalable-topics")]
+    pub fn scalable_topic_subscribe(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        consumer_name: &str,
+        consumer_id: u64,
+        consumer_type: crate::scalable_consumer::ScalableConsumerType,
+    ) -> Result<RequestId, crate::dag_watch::ScalableTopicError> {
+        if !self.broker_supports_scalable_topics() {
+            return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
+        }
+        let request_id = self.alloc_request_id();
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribe as i32,
+            scalable_topic_subscribe: Some(pb::CommandScalableTopicSubscribe {
+                request_id: request_id.0,
+                topic: topic.to_owned(),
+                subscription: subscription.to_owned(),
+                consumer_name: consumer_name.to_owned(),
+                consumer_id,
+                consumer_type: consumer_type.to_pb_i32(),
+            }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&cmd);
+        self.scalable_consumers.insert(
+            consumer_id,
+            crate::scalable_consumer::ScalableConsumerSession::new(
+                consumer_id,
+                topic.to_owned(),
+                subscription.to_owned(),
+                consumer_name.to_owned(),
+                consumer_type,
+            ),
+        );
+        self.scalable_subscribe_requests
+            .insert(request_id, consumer_id);
+        Ok(request_id)
+    }
+
+    /// The current assignment for a registered scalable consumer, or `None`
+    /// when the id is unknown or the subscribe has not resolved yet.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn scalable_consumer_assignment(
+        &self,
+        consumer_id: u64,
+    ) -> Option<&crate::scalable_consumer::ConsumerAssignment> {
+        self.scalable_consumers
+            .get(&consumer_id)
+            .and_then(crate::scalable_consumer::ScalableConsumerSession::assignment)
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Open a namespace-level watch over
+    /// the scalable topics matching `property_filters` (empty = every scalable
+    /// topic in the namespace), emitting `CommandWatchScalableTopics`.
+    ///
+    /// Returns the client-allocated watch id.
+    ///
+    /// # Errors
+    ///
+    /// [`ScalableTopicError::BrokerUnsupported`](crate::dag_watch::ScalableTopicError::BrokerUnsupported)
+    /// when the peer did not advertise `supports_scalable_topics`.
+    #[cfg(feature = "scalable-topics")]
+    pub fn watch_scalable_topics(
+        &mut self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, crate::dag_watch::ScalableTopicError> {
+        if !self.broker_supports_scalable_topics() {
+            return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
+        }
+        let watch_id = self.next_scalable_watch_id;
+        self.next_scalable_watch_id = self.next_scalable_watch_id.wrapping_add(1);
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchScalableTopics as i32,
+            watch_scalable_topics: Some(pb::CommandWatchScalableTopics {
+                watch_id,
+                namespace: namespace.to_owned(),
+                property_filters: property_filters
+                    .into_iter()
+                    .map(|(key, value)| pb::KeyValue { key, value })
+                    .collect(),
+                // No `current_hash`: this is a fresh subscribe, not a reconnect
+                // resync, so the broker must send the initial snapshot.
+                current_hash: None,
+            }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&cmd);
+        self.scalable_topic_watches.insert(
+            watch_id,
+            crate::scalable_consumer::ScalableTopicsWatch::new(watch_id, namespace.to_owned()),
+        );
+        Ok(watch_id)
+    }
+
+    /// Close a namespace-level scalable-topics watch. A no-op for an unknown id.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_scalable_topics_watch(&mut self, watch_id: u64) {
+        if self.scalable_topic_watches.remove(&watch_id).is_none() {
+            return;
+        }
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchScalableTopicsClose as i32,
+            watch_scalable_topics_close: Some(pb::CommandWatchScalableTopicsClose { watch_id }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&cmd);
+    }
+
+    /// The current matching topic set for a namespace watch, or `None` for an
+    /// unknown id.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>> {
+        self.scalable_topic_watches
+            .get(&watch_id)
+            .map(crate::scalable_consumer::ScalableTopicsWatch::topics)
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Whether the connected
+    /// broker advertised `supports_tc_metadata_discovery`.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn broker_supports_tc_metadata_discovery(&self) -> bool {
+        self.feature_flags
+            .supports_tc_metadata_discovery
+            .unwrap_or(false)
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Open a
+    /// transaction-coordinator discovery watch, emitting
+    /// `CommandWatchTcAssignments`. Returns the client-allocated watch id.
+    ///
+    /// Gated on its **own** feature flag, not on `supports_scalable_topics`:
+    /// upstream advertises the two independently, so a broker may serve
+    /// scalable topics without metadata-driven TC discovery.
+    ///
+    /// # Errors
+    ///
+    /// [`ScalableTopicError::BrokerUnsupported`](crate::dag_watch::ScalableTopicError::BrokerUnsupported)
+    /// when the peer did not advertise `supports_tc_metadata_discovery`.
+    #[cfg(feature = "scalable-topics")]
+    pub fn watch_tc_assignments(&mut self) -> Result<u64, crate::dag_watch::ScalableTopicError> {
+        if !self.broker_supports_tc_metadata_discovery() {
+            return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
+        }
+        let watch_id = self.next_scalable_watch_id;
+        self.next_scalable_watch_id = self.next_scalable_watch_id.wrapping_add(1);
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTcAssignments as i32,
+            watch_tc_assignments: Some(pb::CommandWatchTcAssignments { watch_id }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&cmd);
+        self.tc_assignment_watches.insert(watch_id);
+        Ok(watch_id)
+    }
+
+    /// Close a transaction-coordinator discovery watch. A no-op for an unknown id.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_tc_assignments_watch(&mut self, watch_id: u64) {
+        if !self.tc_assignment_watches.remove(&watch_id) {
+            return;
+        }
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTcAssignmentsClose as i32,
+            watch_tc_assignments_close: Some(pb::CommandWatchTcAssignmentsClose { watch_id }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&cmd);
+    }
+
+    /// Apply a `CommandScalableTopicSubscribeResponse` to its registration.
+    #[cfg(feature = "scalable-topics")]
+    fn handle_scalable_subscribe_response(
+        &mut self,
+        resp: pb::CommandScalableTopicSubscribeResponse,
+    ) {
+        let request_id = RequestId(resp.request_id);
+        let Some(consumer_id) = self.scalable_subscribe_requests.remove(&request_id) else {
+            return;
+        };
+        let Some(session) = self.scalable_consumers.get_mut(&consumer_id) else {
+            return;
+        };
+        match session.handle_subscribe_response(&resp) {
+            Ok(assignment) => {
+                self.events
+                    .push_back(ConnectionEvent::ScalableConsumerAssigned {
+                        consumer_id,
+                        assignment,
+                    });
+            }
+            Err(err) => {
+                self.scalable_consumers.remove(&consumer_id);
+                self.events
+                    .push_back(ConnectionEvent::ScalableConsumerRejected {
+                        consumer_id,
+                        reason: err.to_string(),
+                    });
+            }
+        }
+    }
+
+    /// Apply a pushed `CommandScalableTopicAssignmentUpdate`.
+    #[cfg(feature = "scalable-topics")]
+    fn handle_scalable_assignment_update(&mut self, upd: pb::CommandScalableTopicAssignmentUpdate) {
+        let consumer_id = upd.consumer_id;
+        let Some(session) = self.scalable_consumers.get_mut(&consumer_id) else {
+            return;
+        };
+        match session.handle_assignment_update(&upd) {
+            Ok(delta) => {
+                self.events
+                    .push_back(ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta });
+            }
+            Err(err) => {
+                // A stale or mismatched push is dropped, not applied; the
+                // session keeps the assignment it already holds.
+                tracing::debug!(
+                    target: "magnetar_proto",
+                    consumer_id,
+                    error = %err,
+                    "scalable assignment update rejected"
+                );
+            }
+        }
+    }
+
+    /// Apply a `CommandWatchScalableTopicsUpdate` to its watch.
+    #[cfg(feature = "scalable-topics")]
+    fn handle_scalable_topics_watch_update(&mut self, upd: pb::CommandWatchScalableTopicsUpdate) {
+        let watch_id = upd.watch_id;
+        let Some(watch) = self.scalable_topic_watches.get_mut(&watch_id) else {
+            return;
+        };
+        match watch.handle_update(&upd) {
+            Ok(change) => {
+                self.events
+                    .push_back(ConnectionEvent::ScalableTopicsChanged { watch_id, change });
+            }
+            Err(err) => {
+                self.scalable_topic_watches.remove(&watch_id);
+                self.events
+                    .push_back(ConnectionEvent::ScalableTopicsWatchClosed {
+                        watch_id,
+                        reason: Some(err.to_string()),
+                    });
+            }
+        }
+    }
+
+    /// Apply a `CommandWatchTcAssignmentsUpdate` to its watch.
+    #[cfg(feature = "scalable-topics")]
+    fn handle_tc_assignments_update(&mut self, upd: pb::CommandWatchTcAssignmentsUpdate) {
+        let watch_id = upd.watch_id;
+        if !self.tc_assignment_watches.contains(&watch_id) {
+            return;
+        }
+        let Some(snapshot) = upd.snapshot else {
+            self.tc_assignment_watches.remove(&watch_id);
+            self.events
+                .push_back(ConnectionEvent::TcAssignmentsWatchClosed {
+                    watch_id,
+                    reason: Some(match upd.error {
+                        Some(code) => format!(
+                            "broker rejected the TC-assignment watch (code {code}): {}",
+                            upd.message.unwrap_or_default()
+                        ),
+                        None => "TC-assignment update carried no snapshot".to_owned(),
+                    }),
+                });
+            return;
+        };
+        self.events
+            .push_back(ConnectionEvent::TcAssignmentsChanged {
+                watch_id,
+                parallelism: snapshot.parallelism,
+                assignments: snapshot
+                    .assignments
+                    .into_iter()
+                    .map(|a| crate::TcAssignment {
+                        tc_id: a.tc_id,
+                        broker_service_url: a.broker_service_url,
+                        broker_service_url_tls: a.broker_service_url_tls,
+                    })
+                    .collect(),
+            });
     }
 
     /// Apply one inbound `CommandScalableTopicUpdate` to its session.

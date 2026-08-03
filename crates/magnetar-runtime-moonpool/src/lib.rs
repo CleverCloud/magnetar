@@ -904,6 +904,57 @@ pub enum ScalableEvent {
         /// Optional close reason.
         reason: Option<String>,
     },
+    /// A scalable consumer's registration resolved with its initial share.
+    ConsumerAssigned {
+        /// Consumer id that registered.
+        consumer_id: u64,
+        /// The `segment://` topics this consumer owns.
+        assignment: magnetar_proto::ConsumerAssignment,
+    },
+    /// The controller leader rebalanced a registered consumer's share.
+    AssignmentChanged {
+        /// Consumer id whose share changed.
+        consumer_id: u64,
+        /// What to attach to and detach from.
+        delta: magnetar_proto::AssignmentDelta,
+    },
+    /// A scalable consumer's registration was rejected.
+    ConsumerRejected {
+        /// Consumer id whose registration failed.
+        consumer_id: u64,
+        /// Why the broker rejected it.
+        reason: String,
+    },
+    /// A namespace-level scalable-topics watch delivered a snapshot or a diff.
+    TopicsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// The snapshot or diff the broker sent.
+        change: magnetar_proto::TopicsChange,
+    },
+    /// A namespace-level scalable-topics watch ended.
+    TopicsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// The metadata-driven transaction-coordinator assignment set changed.
+    TcAssignmentsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// Number of transaction-coordinator partitions.
+        parallelism: u32,
+        /// Which broker serves each coordinator.
+        assignments: Vec<magnetar_proto::TcAssignment>,
+    },
+    /// A transaction-coordinator discovery watch ended.
+    TcAssignmentsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
 }
 
 /// Errors surfaced by the moonpool engine.
