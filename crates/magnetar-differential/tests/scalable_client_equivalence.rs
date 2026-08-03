@@ -845,13 +845,23 @@ where
     (topics, tc)
 }
 
-/// (d) — a subscribe on a connection that dies mid-wait returns an error rather
-/// than waiting for an assignment that can never come.
+/// (b) — a subscribe on a tokio connection that dies mid-wait returns an error
+/// rather than waiting for an assignment that can never come.
 ///
 /// `ScriptedBroker::shutdown` stops accepting but leaves established sessions
 /// serving, so this uses a socket that completes the handshake and then hangs
 /// up — the shape a broker crash presents to a client that has already
 /// negotiated the capability.
+///
+/// **Tokio only, deliberately.** The moonpool mirror of this loop has the same
+/// `is_closed()` guard, but an unsupervised moonpool connection does not
+/// surface a peer hang-up as *closed* to a waiting caller, so the moonpool
+/// subscribe waits where the tokio one errors — measured 2026-08-03, the
+/// moonpool leg timed out on the full 60 s `HANG_GUARD`. That is a pre-existing
+/// engine difference this PR surfaced rather than introduced (every `next_*`
+/// wait loop on that engine has the same shape); it is tracked in
+/// `docs/follow-ups.md` rather than papered over with a test that asserts the
+/// divergence is fine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_subscribe_errors_when_the_connection_closes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
