@@ -633,15 +633,15 @@ This keeps the production tokio engine and the deterministic moonpool simulation
 
 ## Scalable topics (PIP-460) — experimental
 
-> **⚠️ EXPERIMENTAL — scaffold only.** This surface lives behind the default-off `scalable-topics` feature.
-> Upstream [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md) is **`Draft`** and **no released Apache Pulsar broker speaks the scalable-topic wire protocol today** (it targets Pulsar 5.0 LTS, ~Oct 2026, with a phased rollout).
-> Magnetar provides the **client-side scaffold** — the wire commands, the segment-DAG state machine, the `StreamConsumer` surface, and the four-layer in-process test coverage — so the surface is ready the day a broker ships it.
-> End-to-end against a live broker is **blocked until upstream cuts a Pulsar 5.0 RC**. See [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
+> **⚠️ EXPERIMENTAL.** This surface lives behind the default-off `scalable-topics` feature.
+> It speaks the wire protocol vendored from Apache Pulsar **5.0.0-M1**, the first published release carrying [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md). M1 is a milestone, not a GA release, so the surface may still move before Pulsar 5.0 final.
+> Against a **Pulsar 4.x** broker the client negotiates the capability away and refuses to emit a scalable-topic command — see [Broker compatibility](#scalable-topics-broker-compatibility) below.
+> See [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which supersedes [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
 
 ### What PIP-460 is
 
 PIP-460 introduces a third topic shape alongside non-partitioned and partitioned topics: a **scalable topic**, addressed by a new `topic://...` URL scheme.
-A scalable topic is backed by a **segment DAG** — a set of hash-key-ranged segments that the broker can **split** (one segment fans out into children) and **merge** (children fold back) at runtime, each served by its own segment-leader broker and coordinated by an elected **controller broker**. Clients open a **DAG-watch session** against the controller broker to observe the live segment layout.
+A scalable topic is backed by a **segment DAG** — a set of hash-key-ranged segments that the broker can **split** (one segment fans out into children) and **merge** (children fold back) at runtime, each served by its own segment-leader broker and coordinated by an elected **controller broker**. Clients open a **layout session** against the controller broker to observe the live segment layout: the lookup command carries a client-allocated session id and doubles as the subscribe, after which the broker keeps pushing whole layouts on that session.
 
 ### What the scaffold provides
 
@@ -649,9 +649,9 @@ A bounded, experimental **StreamConsumer** surface with **drop-on-DAG-change** s
 
 - **`topic://...` URL scheme** recognition (`is_scalable_topic_url`), routed to the scalable lookup path.
   The `persistent://` / `non-persistent://` paths are untouched.
-- **Three new wire commands** (hand-encoded behind the feature, see below): `CommandScalableTopicLookup` + response, `CommandSegmentDagWatch` + response, `CommandSegmentDagUpdate`, plus `CommandCloseSegmentDagWatch`.
-- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types and an additive, default-`None` `MessageId::segment_id` field (the wire layout stays byte-identical when `None` — pre-existing producers / consumers round-trip bit-for-bit).
-- **`DagWatchSession`** — a sans-io state machine that tracks the current DAG, enforces a **monotonic `update_seq`**, and applies add / remove / split / merge deltas.
+- **Three wire commands**, vendored from upstream and encoded as ordinary `BaseCommand` frames: `CommandScalableTopicLookup` (which is also the subscribe), `CommandScalableTopicUpdate` (the initial layout and every pushed one), and `CommandScalableTopicClose`.
+- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types. `SegmentState` is `Active` or `Sealed` — upstream has no split/merge _state_, only topology edges. `broker_url` is optional: placement arrives in a parallel `SegmentBrokerAddress` list and a sealed segment may carry none. `MessageId` is **not** extended — Pulsar 5.0.0-M1's `MessageIdData` has no segment field, and segment identity travels in the `segment://` topic name.
+- **`DagWatchSession`** — a sans-io state machine that tracks the current layout, enforces a **monotonic layout `epoch`**, replaces the layout wholesale on each update, and derives split / merge from the incoming segments' `parent_ids` / `child_ids` edges.
 - **`scalable::StreamConsumer<T, E>`** on the façade, generic over the engine via the `ScalableTopicsApi` extension trait (`where E::ClientState: ScalableTopicsApi`), available on **both** the tokio and moonpool engines.
 - A **`magnetar topic-info topic://...`** CLI subcommand that prints the current segment DAG.
 
@@ -660,7 +660,7 @@ A bounded, experimental **StreamConsumer** surface with **drop-on-DAG-change** s
 The current behaviour is **observation + drop-on-change**, not transparent failover.
 When the controller broker pushes a segment **split**, **merge**, or **removal** while a `StreamConsumer` is active:
 
-1. The proto `DagWatchSession` applies the delta and emits `SegmentDagUpdated { delta }`.
+1. The proto `DagWatchSession` replaces the layout, computes the delta against the previous one, and emits `SegmentDagUpdated { delta }`.
 2. Because the delta is _consume-affecting_, the connection also emits `DagChangedDuringConsume { reason }`.
 3. The runtime drains those into the per-client scalable-event buffer; the façade `StreamConsumer::next_event` surfaces `ConsumerEvent::DagChanged { reason }` and flips `is_dropped()`.
 4. The caller **re-resolves** (`scalable_stream_consumer(...)` again) and re-subscribes to continue.
@@ -674,18 +674,34 @@ If the controller-broker connection closes, the surface emits `ConsumerEvent::Cl
 `QueueConsumer`, `CheckpointConsumer`, controller-election awareness, transparent segment failover during consume, in-place key-range repartition, and segment-aware sticky-key dispatch (Key_Shared across the full DAG) are all explicit follow-ups for when the broker side stabilises.
 The current `KeyRange` is **observation-only**.
 
-### Scalable topics hand-encoded wire commands
+### Scalable topics broker compatibility
 
-Because no released broker speaks PIP-460 and the upstream field numbers are still provisional, magnetar does **not** vendor the commands into the generated `crates/magnetar-proto/src/pb/pulsar.proto.rs`.
-Instead they live in a hand-maintained, feature-gated module (`crates/magnetar-proto/src/pb/scalable_topics.rs`) as `#[derive(prost::Message)]` structs that ride the standard Pulsar command frame via a hand-built `ScalableBaseCommand` envelope (sharing the `type` field-1 tag, so a pre-PIP-460 peer skips the additive 80-85 fields).
-The **authoritative** proto bump lands when upstream tags a Pulsar 5.0 RC — at that point a dedicated `cargo run -p xtask -- vendor-proto --rev <sha>` commit ([ADR-0026 §D4](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)) replaces the hand-encoded module and reconciles the field numbers.
+The surface is negotiated **per connection**, in both directions:
+
+1. A client compiled with `scalable-topics` sets `CommandConnect.feature_flags.supports_scalable_topics = true`.
+2. The broker answers on `CommandConnected.feature_flags`.
+3. Every scalable-topic command is gated on that answer. Against a peer that did not advertise support, opening a session returns `ScalableTopicError::BrokerUnsupported` and **writes nothing to the wire**.
+
+That covers a **Pulsar 4.x** broker, which has no PIP-460 surface at all, and a **5.x** broker started with `scalableTopicsEnabled=false`.
+The capability is a feature flag, not a protocol-version bump: upstream's `ProtocolVersion` still tops at `v21` in 5.0.0-M1, and the client advertises exactly that.
+
+There is also a wire-level compatibility path in the other direction. For a regular, unmigrated topic the broker answers with a **synthetic single-segment layout** whose segment carries `legacy_topic_name`, wrapping the ordinary `persistent://...` topic; `SegmentDescriptor::is_legacy()` surfaces it.
+
+### Scalable topics vendored wire commands
+
+The commands are vendored, not hand-written: `crates/magnetar-proto/proto/PulsarApi.proto` is pinned at `apache/pulsar` `8dae0236` (`v5.0.0-M1`) and `pb/pulsar.proto.rs` is generated from it, so there is no separate module and no bespoke envelope — a scalable-topic frame is an ordinary `BaseCommand` frame.
+Refreshing it is a dedicated `cargo run -p xtask -- vendor-proto --rev <sha>` commit per [ADR-0026 §D4](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
+
+Before [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) these commands lived in a hand-maintained `pb/scalable_topics.rs` written against the then-`Draft` proposal.
+Every field number, message shape, and lifecycle assumption in it turned out to differ from what upstream shipped, and because the test fakes implemented the same projection the whole suite was green against bytes no broker could parse.
+That module is deleted; ADR-0093 records the divergence.
 
 ### Scalable topics feature flag
 
-`scalable-topics` on the `magnetar` crate, **default off**. Compiling without it leaves the non-scalable surface bit-for-bit unchanged on the wire (proved by the `scalable_topics_feature_off_does_not_export` test on both runtime engines).
+`scalable-topics` on the `magnetar` crate, **default off**. Compiling without it leaves the non-scalable surface bit-for-bit unchanged on the wire The feature gates the **client surface** only — the generated wire types are always compiled, since `pb/pulsar.proto.rs` is not feature-gated.
 The CLI picks it up via `--features magnetarctl/scalable-topics`.
 
-### Scalable topics example (against a future Pulsar 5.0 broker)
+### Scalable topics example
 
 ```rust,no_run
 # #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
@@ -726,7 +742,8 @@ while let Some(event) = consumer.next_event().await {
 
 ### Scalable topics references
 
-- [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) — scope.
+- [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the upstream wire surface and per-connection negotiation (supersedes ADR-0031).
+- [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) — original scope. Its scope decisions stand; its wire-surface description is historical.
 - [Proposal](../specs/proposals/pip-460-scalable-topics.md) — full wire delta + test plan.
 - [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) — the four-layer test plan.
 - Upstream [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md).

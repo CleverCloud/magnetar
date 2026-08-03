@@ -611,12 +611,18 @@ impl ConnectionShared {
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub struct ScalableLookup {
-    /// Controller broker to open the DagWatch session against.
-    pub controller_broker_url: String,
-    /// Current DAG snapshot for the topic.
+    /// Client-allocated session id. The session stays open and keeps receiving
+    /// layout updates until it is closed; pass this to
+    /// `close_scalable_topic_session`.
+    pub session_id: u64,
+    /// Canonical `topic://...` identity the broker resolved the request to.
+    pub resolved_topic_name: Option<String>,
+    /// Controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url: Option<String>,
+    /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
-    /// Monotonic lookup token, echoed into the DagWatch subscribe.
-    pub lookup_token: u64,
+    /// Layout epoch the snapshot was stamped with.
+    pub epoch: u64,
 }
 
 /// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
@@ -626,35 +632,37 @@ pub struct ScalableLookup {
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub enum ScalableEvent {
-    /// A `CommandScalableTopicLookup` resolved into the current segment DAG.
+    /// A scalable-topic session resolved: its first layout landed.
     LookupResolved {
-        /// Request id of the originating lookup.
-        request_id: magnetar_proto::RequestId,
-        /// Controller broker to open the DagWatch session against.
-        controller_broker_url: String,
-        /// Current DAG snapshot for the topic.
+        /// Client-allocated session id of the originating lookup.
+        session_id: u64,
+        /// Canonical `topic://...` identity the broker resolved the request to.
+        resolved_topic_name: Option<String>,
+        /// Controller broker serving this topic's layout, when advertised.
+        controller_broker_url: Option<String>,
+        /// Initial DAG snapshot for the topic.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
-        /// Monotonic lookup token, echoed into the DagWatch subscribe.
-        lookup_token: u64,
+        /// Layout epoch the snapshot was stamped with.
+        epoch: u64,
     },
-    /// A DAG-watch session received and applied an update.
+    /// An open session applied a subsequent layout.
     DagUpdated {
-        /// Watch session id the update belongs to.
-        watch_session_id: u64,
+        /// Session id the update belongs to.
+        session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
-        /// Watch session id whose DAG changed.
-        watch_session_id: u64,
+        /// Session id whose DAG changed.
+        session_id: u64,
         /// Why the DAG changed.
         reason: magnetar_proto::DagChangeReason,
     },
-    /// The DAG-watch session closed.
+    /// The scalable-topic session closed.
     DagWatchClosed {
-        /// Watch session id that closed.
-        watch_session_id: u64,
+        /// Session id that closed.
+        session_id: u64,
         /// Optional close reason.
         reason: Option<String>,
     },

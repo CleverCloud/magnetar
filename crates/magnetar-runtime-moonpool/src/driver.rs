@@ -304,61 +304,45 @@ fn handle_pending_events(
             // drain into the per-client buffer + wake `next_scalable_event`.
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableTopicLookupResolved {
-                request_id,
+                session_id,
+                resolved_topic_name,
                 controller_broker_url,
                 segments,
-                lookup_token,
+                epoch,
             } => {
                 shared
                     .scalable_events
                     .lock()
                     .push_back(crate::ScalableEvent::LookupResolved {
-                        request_id,
+                        session_id,
+                        resolved_topic_name,
                         controller_broker_url,
                         segments,
-                        lookup_token,
+                        epoch,
                     });
                 shared.scalable_notify.notify_waiters();
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::SegmentDagUpdated {
-                watch_session_id,
-                delta,
-            } => {
+            ConnectionEvent::SegmentDagUpdated { session_id, delta } => {
                 shared
                     .scalable_events
                     .lock()
-                    .push_back(crate::ScalableEvent::DagUpdated {
-                        watch_session_id,
-                        delta,
-                    });
+                    .push_back(crate::ScalableEvent::DagUpdated { session_id, delta });
                 shared.scalable_notify.notify_waiters();
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::DagChangedDuringConsume {
-                watch_session_id,
-                reason,
-            } => {
+            ConnectionEvent::DagChangedDuringConsume { session_id, reason } => {
                 shared.scalable_events.lock().push_back(
-                    crate::ScalableEvent::DagChangedDuringConsume {
-                        watch_session_id,
-                        reason,
-                    },
+                    crate::ScalableEvent::DagChangedDuringConsume { session_id, reason },
                 );
                 shared.scalable_notify.notify_waiters();
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::DagWatchClosed {
-                watch_session_id,
-                reason,
-            } => {
+            ConnectionEvent::DagWatchClosed { session_id, reason } => {
                 shared
                     .scalable_events
                     .lock()
-                    .push_back(crate::ScalableEvent::DagWatchClosed {
-                        watch_session_id,
-                        reason,
-                    });
+                    .push_back(crate::ScalableEvent::DagWatchClosed { session_id, reason });
                 shared.scalable_notify.notify_waiters();
             }
             // Diagnostic events consumed SILENTLY — single-owner rule

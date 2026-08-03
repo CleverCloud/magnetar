@@ -1167,40 +1167,58 @@ impl<P: Providers> Client<P> {
     // pattern as the PIP-145 topic-list deltas. No channels.
     // -------------------------------------------------------------------
 
-    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...` scalable
-    /// topic. Mirrors the tokio engine's `Client::scalable_topic_lookup`.
+    /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic session for
+    /// `topic` and await its first layout.
+    ///
+    /// Upstream folds lookup and DAG-watch subscribe into one command, so this
+    /// both resolves the topic **and** leaves the session open: subsequent
+    /// layouts arrive through [`Self::next_scalable_event`] until
+    /// [`Self::close_scalable_topic_session`]. `topic` may be a `topic://`, a
+    /// `persistent://`, or a short name — the broker returns the canonical
+    /// identity in [`crate::ScalableLookup::resolved_topic_name`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_scalable_topics` — a
+    /// Pulsar 4.x peer, or a 5.x one started with `scalableTopicsEnabled=false`
+    /// — and when the connection closes before the first layout lands.
     #[cfg(feature = "scalable-topics")]
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
     ) -> Result<crate::ScalableLookup, ClientError> {
-        let request_id = {
+        let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.send_scalable_topic_lookup(topic, false)
+            conn.open_scalable_topic_session(topic)
+                .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();
         loop {
+            // Drain any matching resolved event for our session id.
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
                     matches!(
                         ev,
-                        crate::ScalableEvent::LookupResolved { request_id: r, .. } if *r == request_id
+                        crate::ScalableEvent::LookupResolved { session_id: s, .. } if *s == session_id
                     )
                 });
                 pos.and_then(|p| buf.remove(p))
             };
             if let Some(crate::ScalableEvent::LookupResolved {
+                resolved_topic_name,
                 controller_broker_url,
                 segments,
-                lookup_token,
+                epoch,
                 ..
             }) = drained
             {
                 return Ok(crate::ScalableLookup {
+                    session_id,
+                    resolved_topic_name,
                     controller_broker_url,
                     segments,
-                    lookup_token,
+                    epoch,
                 });
             }
             if self.shared.inner.lock().is_closed() {
@@ -1212,34 +1230,25 @@ impl<P: Providers> Client<P> {
         }
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Open a DAG-watch session.
-    /// Mirrors the tokio engine's `Client::open_scalable_dag_watch`.
+    /// **Experimental** (PIP-460, ADR-0093). Whether the connected broker
+    /// advertised the PIP-460 capability. `false` against a Pulsar 4.x peer.
     #[cfg(feature = "scalable-topics")]
-    pub fn open_scalable_dag_watch(
-        &self,
-        topic: &str,
-        lookup_token: u64,
-        segments: Vec<magnetar_proto::SegmentDescriptor>,
-    ) -> u64 {
-        let sid = {
-            let mut conn = self.shared.inner.lock();
-            conn.open_dag_watch(topic, lookup_token, segments)
-        };
-        self.shared.driver_waker.notify_one();
-        sid
+    #[must_use]
+    pub fn broker_supports_scalable_topics(&self) -> bool {
+        self.shared.inner.lock().broker_supports_scalable_topics()
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Close a DAG-watch session.
+    /// **Experimental** (PIP-460, ADR-0093). Close a scalable-topic session.
     #[cfg(feature = "scalable-topics")]
-    pub fn close_scalable_dag_watch(&self, watch_session_id: u64) {
+    pub fn close_scalable_topic_session(&self, session_id: u64) {
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_dag_watch(watch_session_id);
+            conn.close_scalable_topic_session(session_id);
         }
         self.shared.driver_waker.notify_one();
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Await the next scalable-topic
+    /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
     /// event. Mirrors the tokio engine's `Client::next_scalable_event`.
     #[cfg(feature = "scalable-topics")]
     pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {

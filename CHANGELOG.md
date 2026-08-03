@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.**
+  The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
+  Every consumer instead spoke `pb/scalable_topics.rs`, a hand-encoded projection written while PIP-460 was upstream `Draft`, and nothing in it matched: `BaseCommand` types 80-85 against upstream's 70-78, a `CommandScalableTopicLookupResponse` that does not exist, a separate DAG-watch handshake keyed by a `lookup_token` that does not exist, `SplitEvent` / `MergeEvent` delta frames that do not exist, four segment states against upstream's two, and a fabricated `ProtocolVersion = 22` where upstream gates the feature on `FeatureFlags.supports_scalable_topics` and still tops at `v21`.
+  `magnetar-fakes` implemented the same projection, so all four ADR-0024 test layers plus the golden trace were green against bytes no Pulsar broker at any version could parse.
+  The vendored proto moves to `v5.0.0-M1` (`8dae0236`), the hand-encoded module is deleted along with the `PB_HAND_MAINTAINED_FILES` carve-out that hid it from `codegen --check`, and the state machine follows the upstream shape: the lookup **is** the watch subscribe, keyed by a client-allocated `session_id`; `CommandScalableTopicUpdate` carries both the initial layout and every pushed one; layouts are whole snapshots ordered by a monotonic `epoch`, with split and merge derived from the `parent_ids` / `child_ids` edges rather than read from event frames; and segment placement is an optional join from the parallel `SegmentBrokerAddress` list.
+  **Pulsar 4.x compatibility is preserved and is now explicit**: the client advertises `supports_scalable_topics` on `CommandConnect` and refuses to write any scalable-topic command to a peer that did not answer in kind, returning `ScalableTopicError::BrokerUnsupported` with an empty outbound buffer — which also covers a 5.x broker started with `scalableTopicsEnabled=false`.
+  Surface changes, all behind the default-off `scalable-topics` feature: `SegmentDescriptor::broker_url` becomes `Option<String>` and the type gains `broker_url_tls`, `parent_ids`, `child_ids`, `created_at_epoch`, `sealed_at_epoch` and `legacy_topic_name`; `SegmentState` loses `Splitting` and `Merging`; `DagDelta` gains `epoch`; `SplitEvent` / `MergeEvent` lose their `*_at_entry` fields; `DagError` swaps `UnknownSegment` for `Broker` and `Empty`; `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS` and the whole `pb::scalable_topics` module are removed; `Connection::{send_scalable_topic_lookup, open_dag_watch, close_dag_watch}` become `{open_scalable_topic_session, close_scalable_topic_session}`; and every `watch_session_id` field is now `session_id`.
+  A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
+  (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
+
 ## [1.3.0] - 2026-08-03
 
 ### Added

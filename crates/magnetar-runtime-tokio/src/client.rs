@@ -1619,44 +1619,58 @@ impl Client {
     // PIP-145 topic-list deltas. No channels.
     // -------------------------------------------------------------------
 
-    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...` scalable
-    /// topic: issue a `CommandScalableTopicLookup` and await the broker's
-    /// `CommandScalableTopicLookupResponse`. Returns the controller-broker URL,
-    /// the current segment DAG, and the monotonic lookup token to thread into
-    /// [`Self::open_scalable_dag_watch`].
+    /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic session for
+    /// `topic` and await its first layout.
+    ///
+    /// Upstream folds lookup and DAG-watch subscribe into one command, so this
+    /// both resolves the topic **and** leaves the session open: subsequent
+    /// layouts arrive through [`Self::next_scalable_event`] until
+    /// [`Self::close_scalable_topic_session`]. `topic` may be a `topic://`, a
+    /// `persistent://`, or a short name — the broker returns the canonical
+    /// identity in [`crate::ScalableLookup::resolved_topic_name`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_scalable_topics` — a
+    /// Pulsar 4.x peer, or a 5.x one started with `scalableTopicsEnabled=false`
+    /// — and when the connection closes before the first layout lands.
     #[cfg(feature = "scalable-topics")]
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
     ) -> Result<crate::ScalableLookup, ClientError> {
-        let request_id = {
+        let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.send_scalable_topic_lookup(topic, false)
+            conn.open_scalable_topic_session(topic)
+                .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();
         loop {
-            // Drain any matching resolved event for our request id.
+            // Drain any matching resolved event for our session id.
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
                     matches!(
                         ev,
-                        crate::ScalableEvent::LookupResolved { request_id: r, .. } if *r == request_id
+                        crate::ScalableEvent::LookupResolved { session_id: s, .. } if *s == session_id
                     )
                 });
                 pos.and_then(|p| buf.remove(p))
             };
             if let Some(crate::ScalableEvent::LookupResolved {
+                resolved_topic_name,
                 controller_broker_url,
                 segments,
-                lookup_token,
+                epoch,
                 ..
             }) = drained
             {
                 return Ok(crate::ScalableLookup {
+                    session_id,
+                    resolved_topic_name,
                     controller_broker_url,
                     segments,
-                    lookup_token,
+                    epoch,
                 });
             }
             if self.shared.inner.lock().is_closed() {
@@ -1668,36 +1682,25 @@ impl Client {
         }
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Open a DAG-watch session for
-    /// `topic`, seeded with the lookup `segments` snapshot + `lookup_token`.
-    /// Returns the client-allocated watch session id. The caller drives
-    /// updates via [`Self::next_scalable_event`].
+    /// **Experimental** (PIP-460, ADR-0093). Whether the connected broker
+    /// advertised the PIP-460 capability. `false` against a Pulsar 4.x peer.
     #[cfg(feature = "scalable-topics")]
-    pub fn open_scalable_dag_watch(
-        &self,
-        topic: &str,
-        lookup_token: u64,
-        segments: Vec<magnetar_proto::SegmentDescriptor>,
-    ) -> u64 {
-        let sid = {
-            let mut conn = self.shared.inner.lock();
-            conn.open_dag_watch(topic, lookup_token, segments)
-        };
-        self.shared.driver_waker.notify_one();
-        sid
+    #[must_use]
+    pub fn broker_supports_scalable_topics(&self) -> bool {
+        self.shared.inner.lock().broker_supports_scalable_topics()
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Close a DAG-watch session.
+    /// **Experimental** (PIP-460, ADR-0093). Close a scalable-topic session.
     #[cfg(feature = "scalable-topics")]
-    pub fn close_scalable_dag_watch(&self, watch_session_id: u64) {
+    pub fn close_scalable_topic_session(&self, session_id: u64) {
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_dag_watch(watch_session_id);
+            conn.close_scalable_topic_session(session_id);
         }
         self.shared.driver_waker.notify_one();
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Await the next scalable-topic
+    /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
     /// event (DAG update / drop-on-change / close) drained by the driver.
     /// Returns `None` once the connection closes. Cancel-safe: dropping the
     /// future without polling does not lose buffered events.

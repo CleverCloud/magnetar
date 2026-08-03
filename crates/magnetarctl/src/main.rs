@@ -2592,17 +2592,25 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
         .await
         .map_err(|e| CliError::BadArg(format!("scalable lookup failed: {e}")))?;
     println!("topic: {topic}");
-    println!("controller-broker: {}", lookup.controller_broker_url);
-    println!("lookup-token: {}", lookup.lookup_token);
+    if let Some(resolved) = lookup.resolved_topic_name.as_deref() {
+        println!("resolved: {resolved}");
+    }
+    println!(
+        "controller-broker: {}",
+        lookup.controller_broker_url.as_deref().unwrap_or("-")
+    );
+    println!("layout-epoch: {}", lookup.epoch);
     println!(
         "{:<10} {:<18} {:<10} BROKER",
         "SEGMENT", "KEY-RANGE", "STATE"
     );
     for seg in &lookup.segments {
         let state = format!("{:?}", seg.state);
+        // A sealed segment the broker no longer serves carries no placement.
+        let broker = seg.broker_url.as_deref().unwrap_or("-");
         println!(
-            "{:<10} [{:>5},{:>5}) {state:<10} {}",
-            seg.segment_id.0, seg.key_range.start, seg.key_range.end, seg.broker_url,
+            "{:<10} [{:>5},{:>5}) {state:<10} {broker}",
+            seg.segment_id.0, seg.key_range.start, seg.key_range.end,
         );
     }
     println!("({} segment(s))", lookup.segments.len());

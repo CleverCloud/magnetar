@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! **Experimental** (PIP-460, ADR-0031) — scalable-topic `StreamConsumer`.
+//! **Experimental** (PIP-460, ADR-0093) — scalable-topic `StreamConsumer`.
 //!
 //! PIP-460 introduces a `topic://<...>` URL scheme backed by a controller
 //! broker and a segment DAG. magnetar currently ships **only** the
@@ -57,30 +57,32 @@ pub enum ConsumerEvent {
     /// merge landed). The current snapshot is available via
     /// [`StreamConsumer::dag`].
     DagUpdated {
-        /// Watch session id the update belongs to.
-        watch_session_id: u64,
+        /// Session id the update belongs to.
+        session_id: u64,
+        /// Layout epoch the update moved the session to.
+        epoch: u64,
     },
     /// The segment DAG changed while consuming (split / merge / removal). The
     /// `StreamConsumer` has closed its per-segment consumers; re-resolve and
     /// re-subscribe to continue. This is the "drop-on-change"
     /// guarantee.
     DagChanged {
-        /// Watch session id whose DAG changed.
-        watch_session_id: u64,
+        /// Session id whose DAG changed.
+        session_id: u64,
         /// Why the DAG changed.
         reason: DagChangeReason,
     },
-    /// The DAG-watch session closed (controller-broker disconnect or client
-    /// close). No automatic re-lookup.
+    /// The scalable-topic session closed (broker rejection or client close).
+    /// No automatic re-lookup.
     Closed {
-        /// Watch session id that closed.
-        watch_session_id: u64,
+        /// Session id that closed.
+        session_id: u64,
         /// Optional close reason.
         reason: Option<String>,
     },
 }
 
-/// **Experimental** (PIP-460, ADR-0031). StreamConsumer over a scalable
+/// **Experimental** (PIP-460, ADR-0093). StreamConsumer over a scalable
 /// topic. Holds an open DAG-watch session against the controller broker and
 /// surfaces [`ConsumerEvent`]s. **Drops on DAG change** — no transparent
 /// segment failover.
@@ -95,7 +97,11 @@ where
 {
     client: crate::PulsarClient<E>,
     topic: String,
-    watch_session_id: u64,
+    session_id: u64,
+    /// Canonical `topic://...` identity the broker resolved to.
+    resolved_topic_name: Option<String>,
+    /// Layout epoch of the current snapshot.
+    epoch: u64,
     /// Current segment DAG snapshot, kept in sync with the watch session.
     dag: Vec<SegmentDescriptor>,
     /// `true` once a DAG change dropped the per-segment consumers.
@@ -112,7 +118,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamConsumer")
             .field("topic", &self.topic)
-            .field("watch_session_id", &self.watch_session_id)
+            .field("session_id", &self.session_id)
             .field("dag_segments", &self.dag.len())
             .field("dropped", &self.dropped)
             .finish_non_exhaustive()
@@ -129,10 +135,24 @@ where
         &self.topic
     }
 
-    /// The watch session id backing this StreamConsumer.
+    /// The scalable-topic session id backing this StreamConsumer.
     #[must_use]
-    pub fn watch_session_id(&self) -> u64 {
-        self.watch_session_id
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// The canonical `topic://...` identity the broker resolved to, when it
+    /// supplied one. Differs from [`Self::topic`] when the caller passed a
+    /// `persistent://` or short-form name.
+    #[must_use]
+    pub fn resolved_topic_name(&self) -> Option<&str> {
+        self.resolved_topic_name.as_deref()
+    }
+
+    /// The layout epoch of the current DAG snapshot.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The current segment DAG snapshot.
@@ -156,46 +176,44 @@ where
         loop {
             let ev = self.client.inner.next_scalable_event().await?;
             match ev {
-                ScalableEvent::DagUpdated {
-                    watch_session_id,
-                    delta,
-                } if watch_session_id == self.watch_session_id => {
-                    // Apply the delta to the local snapshot.
+                ScalableEvent::DagUpdated { session_id, delta }
+                    if session_id == self.session_id =>
+                {
+                    // Upstream pushes whole layouts, so the local snapshot is
+                    // replaced rather than patched: apply the removals, then the
+                    // additions the delta reported against the previous layout.
+                    self.dag.retain(|d| !delta.removed.contains(&d.segment_id));
                     for seg in &delta.added {
                         if !self.dag.iter().any(|d| d.segment_id == seg.segment_id) {
                             self.dag.push(seg.clone());
                         }
                     }
-                    self.dag.retain(|d| !delta.removed.contains(&d.segment_id));
+                    self.dag.sort_by_key(|d| d.segment_id);
+                    self.epoch = delta.epoch;
                     if delta.is_consume_affecting() {
                         // Drop-on-change: close per-segment consumers (none yet
                         // in the scaffold) and surface DagChanged.
                         self.dropped = true;
                         return Some(ConsumerEvent::DagChanged {
-                            watch_session_id,
+                            session_id,
                             reason: delta.change_reason(),
                         });
                     }
-                    return Some(ConsumerEvent::DagUpdated { watch_session_id });
+                    return Some(ConsumerEvent::DagUpdated {
+                        session_id,
+                        epoch: delta.epoch,
+                    });
                 }
-                ScalableEvent::DagChangedDuringConsume {
-                    watch_session_id,
-                    reason,
-                } if watch_session_id == self.watch_session_id => {
+                ScalableEvent::DagChangedDuringConsume { session_id, reason }
+                    if session_id == self.session_id =>
+                {
                     self.dropped = true;
-                    return Some(ConsumerEvent::DagChanged {
-                        watch_session_id,
-                        reason,
-                    });
+                    return Some(ConsumerEvent::DagChanged { session_id, reason });
                 }
-                ScalableEvent::DagWatchClosed {
-                    watch_session_id,
-                    reason,
-                } if watch_session_id == self.watch_session_id => {
-                    return Some(ConsumerEvent::Closed {
-                        watch_session_id,
-                        reason,
-                    });
+                ScalableEvent::DagWatchClosed { session_id, reason }
+                    if session_id == self.session_id =>
+                {
+                    return Some(ConsumerEvent::Closed { session_id, reason });
                 }
                 // Events for other sessions / stray lookup-resolveds — skip
                 // and keep waiting for the next one.
@@ -204,9 +222,11 @@ where
         }
     }
 
-    /// Close the DAG-watch session and tear down the StreamConsumer.
+    /// Close the scalable-topic session and tear down the StreamConsumer.
     pub fn close(self) {
-        self.client.inner.close_dag_watch(self.watch_session_id);
+        self.client
+            .inner
+            .close_scalable_topic_session(self.session_id);
     }
 }
 
@@ -214,16 +234,18 @@ impl<E: Engine> crate::PulsarClient<E>
 where
     E::ClientState: ScalableTopicsApi,
 {
-    /// **Experimental** (PIP-460, ADR-0031). Open a scalable-topic
+    /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic
     /// [`StreamConsumer`] for a `topic://...` URL. Resolves the topic against
-    /// the controller broker, opens a DAG-watch session seeded with the
-    /// current segment DAG, and returns a consumer that surfaces
-    /// [`ConsumerEvent`]s (drop-on-change).
+    /// the controller broker, which opens the layout session in the same
+    /// round-trip, and returns a consumer that surfaces
+    /// [`ConsumerEvent`]s (drop-on-change). The session opened by the lookup
+    /// stays open and keeps delivering layouts — there is no second subscribe.
     ///
     /// # Errors
     ///
-    /// Returns the runtime client error if the scalable lookup fails (e.g. the
-    /// broker does not support PIP-460, or the topic is not a scalable topic).
+    /// Returns the runtime client error if the scalable lookup fails — most
+    /// notably when the broker did not advertise `supports_scalable_topics`
+    /// (a Pulsar 4.x peer), or when the topic is not a scalable topic.
     pub async fn scalable_stream_consumer<T>(
         &self,
         topic: impl Into<String>,
@@ -232,24 +254,25 @@ where
         E::ClientState: Clone,
     {
         let topic = topic.into();
+        // The lookup opens the session and leaves it open — upstream has no
+        // separate watch subscribe, so there is no second round-trip here.
         let lookup = self.inner.scalable_topic_lookup(&topic).await?;
-        let watch_session_id =
-            self.inner
-                .open_dag_watch(&topic, lookup.lookup_token, lookup.segments.clone());
         Ok(StreamConsumer {
             client: crate::PulsarClient {
                 inner: self.inner.clone(),
                 memory_limit: self.memory_limit,
             },
             topic,
-            watch_session_id,
+            session_id: lookup.session_id,
+            resolved_topic_name: lookup.resolved_topic_name,
+            epoch: lookup.epoch,
             dag: lookup.segments,
             dropped: false,
             _payload: PhantomData,
         })
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...`
+    /// **Experimental** (PIP-460, ADR-0093). Resolve a `topic://...`
     /// scalable topic without opening a consumer — returns the current segment
     /// DAG + controller broker. Powers the CLI `topic-info` subcommand.
     ///

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PIP-460 / ADR-0031 differential equivalence — the tokio and moonpool
+//! PIP-460 / ADR-0093 differential equivalence — the tokio and moonpool
 //! engines MUST produce identical `ConnectionEvent` streams for the
 //! scalable-topic surface.
 //!
 //! **Experimental.** The scalable-topic state machine lives entirely in the
-//! shared sans-io `magnetar_proto::Connection` (lookup registry, `DagWatch`
-//! session, event emission). Both engines drive the *same* `Connection`; the
+//! shared sans-io `magnetar_proto::Connection` (session registry, layout-epoch
+//! tracking, event emission). Both engines drive the *same* `Connection`; the
 //! only engine-varying input is the injected wall-clock provider (tokio plugs
 //! in host `SystemTime::now`; moonpool plugs in a fixed-base atomic clock).
 //! These tests run the identical scripted-broker transcript through a
@@ -30,8 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use bytes::BytesMut;
-use magnetar_proto::pb::scalable_topics as st;
-use magnetar_proto::{Connection, ConnectionConfig, ConnectionEvent};
+use magnetar_proto::{Connection, ConnectionConfig, ConnectionEvent, pb};
 
 /// A tokio-engine-shaped wall clock (host `SystemTime::now`).
 fn tokio_wall_clock() -> Arc<dyn Fn() -> SystemTime + Send + Sync> {
@@ -53,9 +52,12 @@ fn connected(conn: &mut Connection) {
         r#type: magnetar_proto::pb::base_command::Type::Connected as i32,
         connected: Some(magnetar_proto::pb::CommandConnected {
             server_version: "magnetar-test".to_owned(),
-            protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS),
+            protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION),
             max_message_size: Some(5 * 1024 * 1024),
-            feature_flags: Some(magnetar_proto::pb::FeatureFlags::default()),
+            feature_flags: Some(pb::FeatureFlags {
+                supports_scalable_topics: Some(true),
+                ..pb::FeatureFlags::default()
+            }),
         }),
         ..Default::default()
     };
@@ -65,15 +67,52 @@ fn connected(conn: &mut Connection) {
     while conn.poll_event().is_some() {}
 }
 
-fn seg(id: u64, start: u32, end: u32) -> st::SegmentDescriptor {
-    st::SegmentDescriptor {
+fn seg(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
+    pb::SegmentInfoProto {
         segment_id: id,
-        broker_url: format!("pulsar://seg{id}:6650"),
-        broker_url_tls: None,
-        key_range_start: start,
-        key_range_end: end,
-        state: st::SegmentStatePb::Active as i32,
+        hash_start: start,
+        hash_end: end,
+        state: pb::SegmentState::Active as i32,
+        parent_ids: parents.to_vec(),
+        child_ids: Vec::new(),
+        created_at_epoch: 0,
+        sealed_at_epoch: None,
+        created_at_ms: 0,
+        sealed_at_ms: None,
+        legacy_topic_name: None,
     }
+}
+
+/// Encode a broker→client `CommandScalableTopicUpdate` carrying a whole layout.
+fn layout_frame(session_id: u64, epoch: u64, segments: Vec<pb::SegmentInfoProto>) -> BytesMut {
+    let segment_brokers = segments
+        .iter()
+        .map(|s| pb::SegmentBrokerAddress {
+            segment_id: s.segment_id,
+            broker_url: format!("pulsar://seg{}:6650", s.segment_id),
+            broker_url_tls: None,
+        })
+        .collect();
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: Some(pb::ScalableTopicDag {
+                epoch,
+                segments,
+                segment_brokers,
+                controller_broker_url: Some("pulsar://controller:6650".to_owned()),
+                controller_broker_url_tls: None,
+            }),
+            error: None,
+            message: None,
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode update");
+    buf
 }
 
 /// Drive a `Connection` (built with the given wall clock) through the scripted
@@ -81,21 +120,16 @@ fn seg(id: u64, start: u32, end: u32) -> st::SegmentDescriptor {
 fn run_lookup_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
-    let rid = conn.send_scalable_topic_lookup("topic://public/default/scaled", false);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
-    let resp = st::CommandScalableTopicLookupResponse {
-        request_id: rid.0,
-        response: st::scalable_lookup_response::LookupType::Connect as i32,
-        controller_broker_url: Some("pulsar://controller:6650".to_owned()),
-        controller_broker_url_tls: None,
-        segments: vec![seg(1, 0, 32_768), seg(2, 32_768, 65_536)],
-        lookup_token: Some(42),
-        error: None,
-        message: None,
-    };
-    let mut buf = BytesMut::new();
-    st::encode(&mut buf, &st::ScalableBaseCommand::lookup_response(resp)).expect("encode");
-    conn.handle_bytes(Instant::now(), &buf).expect("resp");
+    let buf = layout_frame(
+        session_id,
+        1,
+        vec![seg(1, 0, 32_768, &[]), seg(2, 32_768, 65_536, &[])],
+    );
+    conn.handle_bytes(Instant::now(), &buf).expect("layout");
     drain_event_tags(&mut conn)
 }
 
@@ -103,26 +137,28 @@ fn run_lookup_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) 
 fn run_split_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
-    let initial = vec![magnetar_proto::SegmentDescriptor::from_pb(&seg(
-        1, 0, 65_536,
-    ))];
-    let sid = conn.open_dag_watch("topic://public/default/scaled", 42, initial);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
-    let upd = st::CommandSegmentDagUpdate {
-        watch_session_id: sid,
-        update_seq: 1,
-        added: vec![seg(3, 0, 32_768), seg(4, 32_768, 65_536)],
-        removed: vec![],
-        split_events: vec![st::SplitEvent {
-            parent_segment_id: 1,
-            child_segment_ids: vec![3, 4],
-            split_at_entry: 1000,
-        }],
-        merge_events: vec![],
-    };
-    let mut buf = BytesMut::new();
-    st::encode(&mut buf, &st::ScalableBaseCommand::dag_update(upd)).expect("encode");
-    conn.handle_bytes(Instant::now(), &buf).expect("update");
+    // First layout resolves the session; drop its events so the transcript
+    // records only the split.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+    )
+    .expect("initial layout");
+    while conn.poll_event().is_some() {}
+    // Second layout splits segment 1 into 3 + 4.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(
+            session_id,
+            2,
+            vec![seg(3, 0, 32_768, &[1]), seg(4, 32_768, 65_536, &[1])],
+        ),
+    )
+    .expect("split layout");
     drain_event_tags(&mut conn)
 }
 
@@ -134,15 +170,19 @@ fn drain_event_tags(conn: &mut Connection) -> Vec<String> {
         let tag = match ev {
             ConnectionEvent::ScalableTopicLookupResolved {
                 segments,
-                lookup_token,
                 controller_broker_url,
+                resolved_topic_name,
+                epoch,
                 ..
             } => format!(
-                "LookupResolved(url={controller_broker_url},token={lookup_token},segs={})",
+                "LookupResolved(url={},resolved={},epoch={epoch},segs={})",
+                controller_broker_url.unwrap_or_default(),
+                resolved_topic_name.unwrap_or_default(),
                 segments.len()
             ),
             ConnectionEvent::SegmentDagUpdated { delta, .. } => format!(
-                "DagUpdated(added={},removed={},splits={},merges={})",
+                "DagUpdated(epoch={},added={},removed={},splits={},merges={})",
+                delta.epoch,
                 delta.added.len(),
                 delta.removed.len(),
                 delta.split_events.len(),
@@ -172,7 +212,7 @@ fn scalable_topic_lookup_event_stream_parity() {
     assert_eq!(tokio_tags.len(), 1);
     assert_eq!(
         tokio_tags[0],
-        "LookupResolved(url=pulsar://controller:6650,token=42,segs=2)"
+        "LookupResolved(url=pulsar://controller:6650,resolved=topic://public/default/scaled,epoch=1,segs=2)"
     );
 }
 
@@ -189,7 +229,7 @@ fn dag_change_event_stream_parity() {
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/scalable_topic_drop_on_split.json");
     let expected = "[\
-\n  \"DagUpdated(added=2,removed=1,splits=1,merges=0)\",\
+\n  \"DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)\",\
 \n  \"DagChanged(Split)\"\
 \n]\n";
     if std::env::var_os("MAGNETAR_REGENERATE_GOLDEN").is_some() {
@@ -207,7 +247,7 @@ fn dag_change_event_stream_parity() {
     assert_eq!(
         tokio_tags,
         vec![
-            "DagUpdated(added=2,removed=1,splits=1,merges=0)".to_owned(),
+            "DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)".to_owned(),
             "DagChanged(Split)".to_owned(),
         ]
     );

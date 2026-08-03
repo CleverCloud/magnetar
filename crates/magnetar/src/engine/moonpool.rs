@@ -157,29 +157,21 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsA
         Box::pin(async move {
             let l = magnetar_runtime_moonpool::Client::scalable_topic_lookup(self, topic).await?;
             Ok(super::ScalableLookup {
+                session_id: l.session_id,
+                resolved_topic_name: l.resolved_topic_name,
                 controller_broker_url: l.controller_broker_url,
                 segments: l.segments,
-                lookup_token: l.lookup_token,
+                epoch: l.epoch,
             })
         })
     }
 
-    fn open_dag_watch(
-        &self,
-        topic: &str,
-        lookup_token: u64,
-        segments: Vec<magnetar_proto::SegmentDescriptor>,
-    ) -> u64 {
-        magnetar_runtime_moonpool::Client::open_scalable_dag_watch(
-            self,
-            topic,
-            lookup_token,
-            segments,
-        )
+    fn broker_supports_scalable_topics(&self) -> bool {
+        magnetar_runtime_moonpool::Client::broker_supports_scalable_topics(self)
     }
 
-    fn close_dag_watch(&self, watch_session_id: u64) {
-        magnetar_runtime_moonpool::Client::close_scalable_dag_watch(self, watch_session_id);
+    fn close_scalable_topic_session(&self, session_id: u64) {
+        magnetar_runtime_moonpool::Client::close_scalable_topic_session(self, session_id);
     }
 
     fn next_scalable_event(
@@ -198,36 +190,28 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsA
 fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::ScalableEvent {
     match ev {
         magnetar_runtime_moonpool::ScalableEvent::LookupResolved {
+            session_id,
+            resolved_topic_name,
             controller_broker_url,
             segments,
-            lookup_token,
-            ..
+            epoch,
         } => super::ScalableEvent::LookupResolved {
+            session_id,
+            resolved_topic_name,
             controller_broker_url,
             segments,
-            lookup_token,
+            epoch,
         },
-        magnetar_runtime_moonpool::ScalableEvent::DagUpdated {
-            watch_session_id,
-            delta,
-        } => super::ScalableEvent::DagUpdated {
-            watch_session_id,
-            delta,
-        },
+        magnetar_runtime_moonpool::ScalableEvent::DagUpdated { session_id, delta } => {
+            super::ScalableEvent::DagUpdated { session_id, delta }
+        }
         magnetar_runtime_moonpool::ScalableEvent::DagChangedDuringConsume {
-            watch_session_id,
+            session_id,
             reason,
-        } => super::ScalableEvent::DagChangedDuringConsume {
-            watch_session_id,
-            reason,
-        },
-        magnetar_runtime_moonpool::ScalableEvent::DagWatchClosed {
-            watch_session_id,
-            reason,
-        } => super::ScalableEvent::DagWatchClosed {
-            watch_session_id,
-            reason,
-        },
+        } => super::ScalableEvent::DagChangedDuringConsume { session_id, reason },
+        magnetar_runtime_moonpool::ScalableEvent::DagWatchClosed { session_id, reason } => {
+            super::ScalableEvent::DagWatchClosed { session_id, reason }
+        }
     }
 }
 
