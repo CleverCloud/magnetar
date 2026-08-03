@@ -863,9 +863,19 @@ fn handle_frame(
                 // rejection: the broker answers with an error and no layout, so
                 // both engines exercise the lookup-refused path.
                 if l.topic.ends_with("-missing") {
-                    emit_scalable_layout_rejection(out, l.session_id);
+                    emit_scalable_layout_rejection(out, l.session_id, true);
+                } else if l.topic.ends_with("-terse") {
+                    // Rejection with no `message`, so the client's fallback
+                    // wording is the one the caller sees.
+                    emit_scalable_layout_rejection(out, l.session_id, false);
                 } else {
                     emit_scalable_layout(out, l.session_id);
+                    if l.topic.ends_with("-split") {
+                        // A second layout on the same session: segment 1 splits
+                        // into 3 + 4, so the client's pushed-update and
+                        // drop-on-change paths run end to end.
+                        emit_scalable_split_layout(out, l.session_id);
+                    }
                 }
             }
         }
@@ -1342,14 +1352,14 @@ fn scalable_segment(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::Segme
 }
 
 /// Emit a rejected scalable-topic session: an error and no layout.
-fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64) {
+fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64, with_message: bool) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
         scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
             session_id,
             dag: None,
             error: Some(pb::ServerError::TopicNotFound as i32),
-            message: Some("scripted: topic does not exist".to_owned()),
+            message: with_message.then(|| "scripted: topic does not exist".to_owned()),
             resolved_topic_name: None,
         }),
         ..Default::default()
@@ -1377,6 +1387,41 @@ fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
             session_id,
             dag: Some(pb::ScalableTopicDag {
                 epoch: 1,
+                segments,
+                segment_brokers,
+                controller_broker_url: Some("pulsar://controller:6650".to_owned()),
+                controller_broker_url_tls: None,
+            }),
+            error: None,
+            message: None,
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a second layout in which segment 1 splits into 3 + 4.
+fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
+    let segments = vec![
+        scalable_segment(2, 32_768, 65_536, &[]),
+        scalable_segment(3, 0, 16_384, &[1]),
+        scalable_segment(4, 16_384, 32_768, &[1]),
+    ];
+    let segment_brokers = segments
+        .iter()
+        .map(|s| pb::SegmentBrokerAddress {
+            segment_id: s.segment_id,
+            broker_url: format!("pulsar://seg{}:6650", s.segment_id),
+            broker_url_tls: None,
+        })
+        .collect();
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: Some(pb::ScalableTopicDag {
+                epoch: 2,
                 segments,
                 segment_brokers,
                 controller_broker_url: Some("pulsar://controller:6650".to_owned()),

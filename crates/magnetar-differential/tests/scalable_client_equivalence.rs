@@ -561,3 +561,171 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
 
     broker.shutdown().await;
 }
+
+/// (d) — a **pushed layout** on an open session reaches the caller identically
+/// on both engines: the update event, the drop-on-change signal, and the
+/// assignment the client holds.
+///
+/// The other client tests only ever see a session's *first* layout, so without
+/// this the driver's `SegmentDagUpdated` / `DagChangedDuringConsume` forwarding
+/// is never exercised end to end — only the sans-io half is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_pushed_layout_reaches_the_client() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_seen = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        client
+            .scalable_topic_lookup("topic://public/default/scaled-split")
+            .await
+            .expect("tokio lookup resolves");
+        // The registration is what makes `scalable_consumer_assignment`
+        // meaningful; assert through it as well as through the event.
+        client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled-split",
+                "sub",
+                "consumer-a",
+                42,
+                ScalableConsumerType::Stream,
+            )
+            .await
+            .expect("tokio subscribe");
+        // The scripted broker follows every subscribe with a rebalance, so the
+        // held epoch races that push — assert the assignment is readable and
+        // non-empty, and leave the epoch to `scalable_assignment_rebalance_parity`.
+        let held = client
+            .scalable_consumer_assignment(42)
+            .map(|a| !a.segments.is_empty());
+        (wait_for_split_tokio(&client).await, held)
+    };
+
+    let moonpool_seen = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        client
+            .scalable_topic_lookup("topic://public/default/scaled-split")
+            .await
+            .expect("moonpool lookup resolves");
+        client
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled-split",
+                "sub",
+                "consumer-a",
+                42,
+                ScalableConsumerType::Stream,
+            )
+            .await
+            .expect("moonpool subscribe");
+        let held = client
+            .scalable_consumer_assignment(42)
+            .map(|a| !a.segments.is_empty());
+        (wait_for_split_moonpool(&client).await, held)
+    };
+
+    assert_eq!(
+        tokio_seen, moonpool_seen,
+        "engine pushed-layout observations diverged"
+    );
+    // epoch 2, one split, parent 1 removed.
+    assert_eq!(tokio_seen.0, Some((2, 1, vec![1_u64])));
+    assert_eq!(
+        tokio_seen.1,
+        Some(true),
+        "the held assignment is readable and non-empty"
+    );
+
+    broker.shutdown().await;
+}
+
+/// Drain until the pushed split lands, returning
+/// `(epoch, split_count, removed_ids)` read off the delta.
+async fn wait_for_split_tokio(client: &TokioClient) -> Option<(u64, usize, Vec<u64>)> {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_tokio::ScalableEvent::DagUpdated { delta, .. } = ev
+        {
+            return Some((
+                delta.epoch,
+                delta.split_events.len(),
+                delta.removed.iter().map(|s| s.0).collect(),
+            ));
+        }
+    }
+    None
+}
+
+async fn wait_for_split_moonpool<P>(client: &MoonpoolClient<P>) -> Option<(u64, usize, Vec<u64>)>
+where
+    P: moonpool_core::Providers + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar_runtime_moonpool::ScalableEvent::DagUpdated { delta, .. } = ev
+        {
+            return Some((
+                delta.epoch,
+                delta.split_events.len(),
+                delta.removed.iter().map(|s| s.0).collect(),
+            ));
+        }
+    }
+    None
+}
+
+/// A rejection carrying no `message` still surfaces a reason — the client's own
+/// fallback wording — rather than an empty error string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_lookup_rejection_without_message_still_reports() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_err = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        client
+            .scalable_topic_lookup("topic://public/default/e2e-terse")
+            .await
+            .expect_err("terse rejection is an error")
+            .to_string()
+    };
+    let moonpool_err = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        client
+            .scalable_topic_lookup("topic://public/default/e2e-terse")
+            .await
+            .expect_err("terse rejection is an error")
+            .to_string()
+    };
+
+    assert_eq!(tokio_err, moonpool_err);
+    assert!(
+        !tokio_err.is_empty(),
+        "a message-less rejection still names a reason: {tokio_err}"
+    );
+
+    broker.shutdown().await;
+}

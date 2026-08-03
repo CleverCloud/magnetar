@@ -772,3 +772,243 @@ fn session_guards_and_accessors_parity() {
         );
     }
 }
+
+/// Stale-frame guards and read-only accessors, driven from the differential
+/// layer because `magnetar-proto`'s own unit tests never run under the
+/// sim-coverage runner (ADR-0024 execution scope).
+///
+/// Every arm here is a *drop* path: a frame naming a session, consumer or watch
+/// this connection does not track must be ignored rather than acted on. Those
+/// arrive routinely — a broker push racing a client-side close — so a
+/// regression would surface as a panic or a spurious event on a live consumer,
+/// not as a test failure elsewhere.
+#[test]
+fn scalable_stale_frames_are_dropped_and_accessors_read() {
+    for wall_clock in [tokio_wall_clock(), moonpool_wall_clock()] {
+        let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+        connected(&mut conn);
+
+        let session_id = conn
+            .open_scalable_topic_session("persistent://public/default/scaled")
+            .expect("broker supports scalable topics");
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.scalable_resolved_topic_name(session_id),
+            None,
+            "no canonical identity before the first layout"
+        );
+        conn.handle_bytes(
+            Instant::now(),
+            &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+        )
+        .expect("initial layout");
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            conn.scalable_resolved_topic_name(session_id),
+            Some("topic://public/default/scaled"),
+            "the broker's canonical identity is readable off the session"
+        );
+        assert_eq!(conn.scalable_resolved_topic_name(9_999), None);
+
+        // A layout for a session this connection never opened is dropped.
+        conn.handle_bytes(
+            Instant::now(),
+            &layout_frame(9_999, 1, vec![seg(1, 0, 65_536, &[])]),
+        )
+        .expect("stale layout tolerated");
+        assert!(
+            conn.poll_event().is_none(),
+            "a layout for an unknown session emits nothing"
+        );
+        assert!(conn.dag_snapshot(9_999).is_none());
+
+        // A subscribe response for a request this connection never issued.
+        conn.handle_bytes(Instant::now(), &subscribe_response_frame(4_242, 1, &[1]))
+            .expect("stale subscribe response tolerated");
+        assert!(conn.poll_event().is_none());
+
+        // An assignment update for a consumer that never registered.
+        conn.handle_bytes(Instant::now(), &assignment_update_frame(4_242, 2, &[1]))
+            .expect("stale assignment tolerated");
+        assert!(conn.poll_event().is_none());
+        assert!(conn.scalable_consumer_assignment(4_242).is_none());
+
+        // A namespace-watch update for a watch that was never opened.
+        conn.handle_bytes(
+            Instant::now(),
+            &topics_update_frame(
+                7_777,
+                pb::command_watch_scalable_topics_update::Event::Snapshot(
+                    pb::ScalableTopicsSnapshot {
+                        topics: vec!["topic://public/default/x".to_owned()],
+                    },
+                ),
+            ),
+        )
+        .expect("stale watch update tolerated");
+        assert!(conn.poll_event().is_none());
+        assert!(conn.scalable_topics_snapshot(7_777).is_none());
+
+        // A TC-assignment update for a watch that was never opened.
+        conn.handle_bytes(Instant::now(), &tc_update_frame(7_777, 2))
+            .expect("stale tc update tolerated");
+        assert!(conn.poll_event().is_none());
+
+        // Closing ids this connection does not track writes nothing.
+        conn.close_scalable_topic_session(9_999);
+        conn.close_scalable_topics_watch(7_777);
+        conn.close_tc_assignments_watch(7_777);
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "closing an untracked id emits no frame"
+        );
+
+        // Opening a TC watch without the broker flag is refused; the scripted
+        // handshake advertises it, so this one succeeds and then closes.
+        assert!(conn.broker_supports_tc_metadata_discovery());
+        let tc_watch = conn.watch_tc_assignments().expect("tc watch opens");
+        let _ = conn.poll_transmit();
+        conn.close_tc_assignments_watch(tc_watch);
+        assert!(
+            !conn.poll_transmit().is_empty(),
+            "the close reaches the wire"
+        );
+    }
+}
+
+/// The sans-io session and watch types expose read-only state the engines and
+/// the CLI surface; exercised here for the same execution-scope reason.
+#[test]
+fn scalable_consumer_session_and_watch_accessors() {
+    let mut session = magnetar_proto::ScalableConsumerSession::new(
+        7,
+        "topic://public/default/scaled".to_owned(),
+        "sub".to_owned(),
+        "consumer-a".to_owned(),
+        magnetar_proto::ScalableConsumerType::Stream,
+    );
+    assert_eq!(session.consumer_id(), 7);
+    assert_eq!(session.topic(), "topic://public/default/scaled");
+    assert_eq!(session.subscription(), "sub");
+    assert_eq!(session.consumer_name(), "consumer-a");
+    assert_eq!(
+        session.consumer_type(),
+        magnetar_proto::ScalableConsumerType::Stream
+    );
+    assert!(!session.is_registered());
+    assert!(session.assignment().is_none());
+
+    let assignment = session
+        .handle_subscribe_response(&pb::CommandScalableTopicSubscribeResponse {
+            request_id: 1,
+            error: None,
+            message: None,
+            assignment: Some(consumer_assignment(3, &[1])),
+        })
+        .expect("subscribe resolves");
+    assert!(session.is_registered());
+    assert_eq!(session.assignment().map(|a| a.layout_epoch), Some(3));
+    assert_eq!(
+        assignment.segment_topics(),
+        vec!["segment://public/default/scaled/1"]
+    );
+
+    // A success response carrying no assignment is refused rather than read as
+    // an empty share.
+    let mut empty = magnetar_proto::ScalableConsumerSession::new(
+        8,
+        "t".to_owned(),
+        "s".to_owned(),
+        "c".to_owned(),
+        magnetar_proto::ScalableConsumerType::Checkpoint,
+    );
+    assert_eq!(
+        empty.consumer_type(),
+        magnetar_proto::ScalableConsumerType::Checkpoint
+    );
+    let err = empty
+        .handle_subscribe_response(&pb::CommandScalableTopicSubscribeResponse {
+            request_id: 9,
+            error: None,
+            message: None,
+            assignment: None,
+        })
+        .expect_err("bodyless subscribe response refused");
+    assert_eq!(
+        err,
+        magnetar_proto::AssignmentError::Empty { request_id: 9 }
+    );
+
+    // `Stream` is the saturating default for an unrecognised wire value, and
+    // the round-trip holds for the variant the enum defaults to.
+    assert_eq!(
+        magnetar_proto::ScalableConsumerType::from_pb_i32(
+            magnetar_proto::ScalableConsumerType::Stream.to_pb_i32()
+        ),
+        magnetar_proto::ScalableConsumerType::Stream
+    );
+
+    let mut watch = magnetar_proto::ScalableTopicsWatch::new(3, "public/default".to_owned());
+    assert_eq!(watch.watch_id(), 3);
+    assert_eq!(watch.namespace(), "public/default");
+    assert!(!watch.is_resolved());
+    assert!(watch.topics().is_empty());
+    watch
+        .handle_update(&pb::CommandWatchScalableTopicsUpdate {
+            watch_id: 3,
+            error: None,
+            message: None,
+            event: Some(pb::command_watch_scalable_topics_update::Event::Snapshot(
+                pb::ScalableTopicsSnapshot {
+                    topics: vec!["topic://public/default/a".to_owned()],
+                },
+            )),
+        })
+        .expect("snapshot applies");
+    assert!(watch.is_resolved());
+    assert_eq!(watch.topics(), vec!["topic://public/default/a".to_owned()]);
+
+    // An assignment round-trips through the wire pair, and the assigned-segment
+    // encode side is what the fakes hand back.
+    let seg = magnetar_proto::AssignedSegment::from_pb(&pb::ScalableAssignedSegment {
+        segment_id: 4,
+        hash_start: 0,
+        hash_end: 128,
+        segment_topic: "segment://public/default/scaled/4".to_owned(),
+    });
+    assert_eq!(seg.to_pb().segment_id, 4);
+    assert!(
+        magnetar_proto::AssignmentDelta {
+            layout_epoch: 1,
+            gained: vec![],
+            lost: vec![],
+        }
+        .is_empty()
+    );
+}
+
+/// Encode a `CommandWatchTcAssignmentsUpdate` carrying `parallelism` coordinators.
+fn tc_update_frame(watch_id: u64, parallelism: u32) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+        watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+            watch_id,
+            snapshot: Some(pb::TcAssignmentsSnapshot {
+                parallelism,
+                assignments: (0..u64::from(parallelism))
+                    .map(|tc_id| pb::TcAssignment {
+                        tc_id,
+                        broker_service_url: Some(format!("pulsar://tc{tc_id}:6650")),
+                        broker_service_url_tls: None,
+                    })
+                    .collect(),
+            }),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &cmd).expect("encode tc update");
+    buf
+}
