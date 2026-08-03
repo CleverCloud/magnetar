@@ -6095,6 +6095,8 @@ impl Connection {
             tc_client_connect_request: Some(pb::CommandTcClientConnectRequest {
                 request_id: request_id.0,
                 tc_id,
+                // PIP-473 scalable transaction coordinator. Absent = the legacy coordinator.
+                scalable: None,
             }),
             ..Default::default()
         };

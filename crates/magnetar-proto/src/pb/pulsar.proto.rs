@@ -299,6 +299,8 @@ pub struct FeatureFlags {
     pub supports_topic_watcher_reconcile: ::core::option::Option<bool>,
     #[prost(bool, optional, tag = "8", default = "false")]
     pub supports_scalable_topics: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "9", default = "false")]
+    pub supports_tc_metadata_discovery: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandConnected {
@@ -1197,6 +1199,8 @@ pub struct SegmentInfoProto {
     pub created_at_ms: u64,
     #[prost(uint64, optional, tag = "10")]
     pub sealed_at_ms: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "11")]
+    pub legacy_topic_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SegmentBrokerAddress {
@@ -1239,6 +1243,8 @@ pub struct CommandScalableTopicUpdate {
     pub error: ::core::option::Option<i32>,
     #[prost(string, optional, tag = "4")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub resolved_topic_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandScalableTopicClose {
@@ -1345,6 +1351,43 @@ pub struct CommandWatchScalableTopicsClose {
     #[prost(uint64, required, tag = "1")]
     pub watch_id: u64,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommandWatchTcAssignments {
+    #[prost(uint64, required, tag = "1")]
+    pub watch_id: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TcAssignment {
+    #[prost(uint64, required, tag = "1")]
+    pub tc_id: u64,
+    #[prost(string, optional, tag = "2")]
+    pub broker_service_url: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub broker_service_url_tls: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TcAssignmentsSnapshot {
+    #[prost(uint32, required, tag = "1")]
+    pub parallelism: u32,
+    #[prost(message, repeated, tag = "2")]
+    pub assignments: ::prost::alloc::vec::Vec<TcAssignment>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommandWatchTcAssignmentsUpdate {
+    #[prost(uint64, required, tag = "1")]
+    pub watch_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub snapshot: ::core::option::Option<TcAssignmentsSnapshot>,
+    #[prost(enumeration = "ServerError", optional, tag = "3")]
+    pub error: ::core::option::Option<i32>,
+    #[prost(string, optional, tag = "4")]
+    pub message: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommandWatchTcAssignmentsClose {
+    #[prost(uint64, required, tag = "1")]
+    pub watch_id: u64,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandGetSchema {
     #[prost(uint64, required, tag = "1")]
@@ -1395,6 +1438,8 @@ pub struct CommandTcClientConnectRequest {
     pub request_id: u64,
     #[prost(uint64, required, tag = "2", default = "0")]
     pub tc_id: u64,
+    #[prost(bool, optional, tag = "3", default = "false")]
+    pub scalable: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandTcClientConnectResponse {
@@ -1410,9 +1455,11 @@ pub struct CommandNewTxn {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
     #[prost(uint64, optional, tag = "2", default = "0")]
-    pub txn_ttl_seconds: ::core::option::Option<u64>,
+    pub txn_ttl_millis: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "3", default = "0")]
     pub tc_id: ::core::option::Option<u64>,
+    #[prost(bool, optional, tag = "4", default = "false")]
+    pub scalable: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandNewTxnResponse {
@@ -1437,6 +1484,8 @@ pub struct CommandAddPartitionToTxn {
     pub txnid_most_bits: ::core::option::Option<u64>,
     #[prost(string, repeated, tag = "4")]
     pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5", default = "false")]
+    pub scalable: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAddPartitionToTxnResponse {
@@ -1468,6 +1517,8 @@ pub struct CommandAddSubscriptionToTxn {
     pub txnid_most_bits: ::core::option::Option<u64>,
     #[prost(message, repeated, tag = "4")]
     pub subscription: ::prost::alloc::vec::Vec<Subscription>,
+    #[prost(bool, optional, tag = "5", default = "false")]
+    pub scalable: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAddSubscriptionToTxnResponse {
@@ -1492,6 +1543,8 @@ pub struct CommandEndTxn {
     pub txnid_most_bits: ::core::option::Option<u64>,
     #[prost(enumeration = "TxnAction", optional, tag = "4")]
     pub txn_action: ::core::option::Option<i32>,
+    #[prost(bool, optional, tag = "5", default = "false")]
+    pub scalable: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnResponse {
@@ -1728,6 +1781,16 @@ pub struct BaseCommand {
     pub watch_scalable_topics_close: ::core::option::Option<
         CommandWatchScalableTopicsClose,
     >,
+    #[prost(message, optional, tag = "79")]
+    pub watch_tc_assignments: ::core::option::Option<CommandWatchTcAssignments>,
+    #[prost(message, optional, tag = "80")]
+    pub watch_tc_assignments_update: ::core::option::Option<
+        CommandWatchTcAssignmentsUpdate,
+    >,
+    #[prost(message, optional, tag = "81")]
+    pub watch_tc_assignments_close: ::core::option::Option<
+        CommandWatchTcAssignmentsClose,
+    >,
 }
 /// Nested message and enum types in `BaseCommand`.
 pub mod base_command {
@@ -1811,6 +1874,9 @@ pub mod base_command {
         WatchScalableTopics = 76,
         WatchScalableTopicsUpdate = 77,
         WatchScalableTopicsClose = 78,
+        WatchTcAssignments = 79,
+        WatchTcAssignmentsUpdate = 80,
+        WatchTcAssignmentsClose = 81,
     }
     impl Type {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -1890,6 +1956,9 @@ pub mod base_command {
                 Self::WatchScalableTopics => "WATCH_SCALABLE_TOPICS",
                 Self::WatchScalableTopicsUpdate => "WATCH_SCALABLE_TOPICS_UPDATE",
                 Self::WatchScalableTopicsClose => "WATCH_SCALABLE_TOPICS_CLOSE",
+                Self::WatchTcAssignments => "WATCH_TC_ASSIGNMENTS",
+                Self::WatchTcAssignmentsUpdate => "WATCH_TC_ASSIGNMENTS_UPDATE",
+                Self::WatchTcAssignmentsClose => "WATCH_TC_ASSIGNMENTS_CLOSE",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1976,6 +2045,9 @@ pub mod base_command {
                 "WATCH_SCALABLE_TOPICS" => Some(Self::WatchScalableTopics),
                 "WATCH_SCALABLE_TOPICS_UPDATE" => Some(Self::WatchScalableTopicsUpdate),
                 "WATCH_SCALABLE_TOPICS_CLOSE" => Some(Self::WatchScalableTopicsClose),
+                "WATCH_TC_ASSIGNMENTS" => Some(Self::WatchTcAssignments),
+                "WATCH_TC_ASSIGNMENTS_UPDATE" => Some(Self::WatchTcAssignmentsUpdate),
+                "WATCH_TC_ASSIGNMENTS_CLOSE" => Some(Self::WatchTcAssignmentsClose),
                 _ => None,
             }
         }
