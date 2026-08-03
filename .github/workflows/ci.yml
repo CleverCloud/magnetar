@@ -180,14 +180,29 @@ jobs:
       # fixture was written — a YAML folded-scalar bug fed
       # `initialize-cluster-metadata` an empty argument list and `|| true`
       # reported `Exited (0)` (issue #389).
+      # Retries rather than asserting once: the wait above polls only
+      # /admin/v2/brokers/health, and configure_replicated_subs.sh already
+      # records that broker health goes green before the metadata cache
+      # warms, which is why its wait_for_admin_ready() polls this very
+      # endpoint. A bounded retry keeps the assertion exactly as strong —
+      # a cluster that never appears still fails the job — while not
+      # turning a warm-up window into a per-PR flake.
       - name: Assert pulsar-init registered both clusters (regression guard, issue #389)
         run: |
           set -euo pipefail
           for url in http://localhost:18080 http://localhost:18081; do
-            clusters=$(curl -sf "$url/admin/v2/clusters")
+            attempts=30
+            until clusters=$(curl -sf "$url/admin/v2/clusters") \
+              && grep -q '"cluster-a"' <<<"$clusters" \
+              && grep -q '"cluster-b"' <<<"$clusters"; do
+              attempts=$((attempts - 1))
+              if [ "$attempts" -le 0 ]; then
+                echo "pulsar-init did not register both clusters at $url: ${clusters:-<no response>}"
+                exit 1
+              fi
+              sleep 2
+            done
             echo "$url -> $clusters"
-            echo "$clusters" | grep -q '"cluster-a"'
-            echo "$clusters" | grep -q '"cluster-b"'
           done
       - name: Configure peer clusters + replicated subscription status
         working-directory: crates/magnetar/tests/fixtures
