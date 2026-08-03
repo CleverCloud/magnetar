@@ -726,7 +726,8 @@ That module is deleted; ADR-0093 records the divergence.
 
 ### Scalable topics feature flag
 
-`scalable-topics` on the `magnetar` crate, **default off**. Compiling without it leaves the non-scalable surface bit-for-bit unchanged on the wire The feature gates the **client surface** only — the generated wire types are always compiled, since `pb/pulsar.proto.rs` is not feature-gated.
+`scalable-topics` on the `magnetar` crate, **default off**. Compiling without it leaves the non-scalable surface bit-for-bit unchanged on the wire.
+The feature gates the **client surface** only — the generated wire types are always compiled, since `pb/pulsar.proto.rs` is not feature-gated.
 The CLI picks it up via `--features magnetarctl/scalable-topics`.
 
 ### Scalable topics example

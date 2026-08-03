@@ -29,11 +29,11 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 
 ## 11. `scalable_stream_consumer` is uncallable on the tokio engine
 
-**Gap.** `PulsarClient::scalable_stream_consumer` is bound `where E::ClientState: Clone`, and `magnetar_runtime_tokio::Client` does not implement `Clone`.
-The method therefore does not resolve on the default engine — `PulsarClient<TokioEngine>` — and no caller has ever constructed a `StreamConsumer` there.
+**Gap.** `PulsarClient::scalable_stream_consumer` is bound `where E::ClientState: Clone`, and **neither** engine's client implements `Clone` — not `magnetar_runtime_tokio::Client`, nor `magnetar_runtime_moonpool::Client<P>`.
+The method therefore resolves on no engine at all, and no caller has ever constructed a `StreamConsumer`.
 It went unnoticed because the four in-process test layers drive `magnetar_proto::Connection` directly and the e2e bodies were stubs until [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md); the e2e written against a real broker is what surfaced it.
 
-**Why it stays open.** The fix is a small API decision rather than a bug fix: either make the tokio `Client` cheap-clone (it is already `Arc`-backed internally, so this is mostly a `derive`), or drop the `Clone` bound and have `StreamConsumer` hold a borrow or an `Arc` of the client. Both change a published signature, so it wants a deliberate choice rather than the first thing that compiles.
+**Why it stays open.** The fix is a small API decision rather than a bug fix: either make both clients cheap-clone (each is already `Arc`-backed internally, so this is close to a `derive`), or drop the `Clone` bound and have `StreamConsumer` hold a borrow or an `Arc` of the client. Both change a published signature, so it wants a deliberate choice rather than the first thing that compiles.
 
 **Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same wire path `StreamConsumer` wraps. `crates/magnetar/tests/e2e_scalable_topic.rs` uses exactly that.
 

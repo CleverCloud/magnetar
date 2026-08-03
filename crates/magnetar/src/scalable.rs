@@ -186,9 +186,14 @@ where
                 ScalableEvent::DagUpdated { session_id, delta }
                     if session_id == self.session_id =>
                 {
-                    // Upstream pushes whole layouts, so the local snapshot is
-                    // replaced rather than patched: apply the removals, then the
-                    // additions the delta reported against the previous layout.
+                    // The broker pushes whole layouts, but the event carries the
+                    // *delta* the session computed against the layout this cache
+                    // already holds, so patching is equivalent to replacing —
+                    // strictly while every `DagUpdated` for this session is
+                    // observed in order. `next_event` consumes them one at a
+                    // time from a per-client FIFO and skips only other sessions'
+                    // events, which is what makes that hold. Removals first, so
+                    // a segment id reused across the two lists survives.
                     self.dag.retain(|d| !delta.removed.contains(&d.segment_id));
                     for seg in &delta.added {
                         if !self.dag.iter().any(|d| d.segment_id == seg.segment_id) {

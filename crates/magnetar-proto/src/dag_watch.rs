@@ -372,12 +372,17 @@ fn derive_topology_changes(
     let mut merges: Vec<MergeEvent> = Vec::new();
 
     for child in added {
-        let known_parents: Vec<SegmentId> = child
+        // Sorted, not merely filtered: `MergeEvent::parent_segment_ids` is
+        // documented ascending, and nothing in the .proto requires the broker
+        // to send `parent_ids` in order. Without this, two engines observing
+        // the same merge could produce `MergeEvent`s that compare unequal.
+        let mut known_parents: Vec<SegmentId> = child
             .parent_ids
             .iter()
             .copied()
             .filter(|p| before.contains(p))
             .collect();
+        known_parents.sort_unstable();
         match known_parents.len() {
             0 => {}
             1 => splits
@@ -408,6 +413,10 @@ mod tests {
     use crate::types::{KeyRange, SegmentState};
 
     /// Build a `SegmentInfoProto` with the given topology edges.
+    fn seg_info(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
+        info(id, start, end, parents, &[])
+    }
+
     fn info(
         id: u64,
         start: u32,
@@ -580,6 +589,35 @@ mod tests {
         assert_eq!(delta.merge_events[0].child_segment_id, SegmentId(7));
         assert_eq!(delta.removed.len(), 2);
         assert_eq!(s.snapshot().len(), 1);
+    }
+
+    /// A merge whose wire `parent_ids` arrive out of order still reports them
+    /// ascending, as `MergeEvent` documents. Nothing in the .proto requires the
+    /// broker to sort them, and two engines observing the same merge must not
+    /// produce `MergeEvent`s that compare unequal.
+    #[test]
+    fn scalable_session_merge_parents_are_sorted() {
+        let mut s = DagWatchSession::new(7);
+        s.handle_update(&update(
+            7,
+            1,
+            vec![
+                seg_info(5, 0, 32_768, &[]),
+                seg_info(6, 32_768, 65_536, &[]),
+            ],
+        ))
+        .expect("initial layout");
+
+        // Descending on the wire.
+        let delta = s
+            .handle_update(&update(7, 2, vec![seg_info(7, 0, 65_536, &[6, 5])]))
+            .expect("merge layout applies");
+
+        assert_eq!(
+            delta.merge_events[0].parent_segment_ids,
+            vec![SegmentId(5), SegmentId(6)],
+            "parent ids are reported ascending regardless of wire order"
+        );
     }
 
     /// An update targeting a different session is rejected.

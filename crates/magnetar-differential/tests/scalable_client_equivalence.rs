@@ -498,3 +498,59 @@ where
     }
     None
 }
+
+/// (d) — a **rejected lookup** must surface as an error on both engines, not
+/// hang the caller.
+///
+/// The session ends as `DagWatchClosed`, not `LookupResolved`; a wait loop that
+/// only recognises the success variant blocks until the connection closes.
+/// `scalable_topic_subscribe` had always raced its two outcomes — this pins the
+/// same contract for the lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_lookup_rejection_errors_rather_than_hangs() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_err = {
+        let client = TokioClient::connect(&url, ConnectionConfig::default())
+            .await
+            .expect("tokio connect");
+        // The timeout is the assertion: before the fix this call never returned.
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-missing"),
+        )
+        .await
+        .expect("tokio lookup returned rather than hanging")
+        .expect_err("a rejected lookup is an error")
+        .to_string()
+    };
+
+    let moonpool_err = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-missing"),
+        )
+        .await
+        .expect("moonpool lookup returned rather than hanging")
+        .expect_err("a rejected lookup is an error")
+        .to_string()
+    };
+
+    assert_eq!(
+        tokio_err, moonpool_err,
+        "engine lookup-rejection observations diverged"
+    );
+    assert!(
+        tokio_err.contains("scripted: topic does not exist"),
+        "the broker's reason reaches the caller: {tokio_err}"
+    );
+
+    broker.shutdown().await;
+}

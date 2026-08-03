@@ -1194,32 +1194,45 @@ impl<P: Providers> Client<P> {
         };
         self.shared.driver_waker.notify_one();
         loop {
-            // Drain any matching resolved event for our session id.
+            // Drain the first terminal event for our session id. A rejected
+            // session ends as `DagWatchClosed`, not `LookupResolved` — waiting
+            // only for the success variant would hang the caller until the
+            // connection closed, which is exactly the shape
+            // `scalable_topic_subscribe` avoids by racing its two outcomes.
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
                     matches!(
                         ev,
-                        crate::ScalableEvent::LookupResolved { session_id: s, .. } if *s == session_id
+                        crate::ScalableEvent::LookupResolved { session_id: s, .. }
+                            | crate::ScalableEvent::DagWatchClosed { session_id: s, .. }
+                            if *s == session_id
                     )
                 });
                 pos.and_then(|p| buf.remove(p))
             };
-            if let Some(crate::ScalableEvent::LookupResolved {
-                resolved_topic_name,
-                controller_broker_url,
-                segments,
-                epoch,
-                ..
-            }) = drained
-            {
-                return Ok(crate::ScalableLookup {
-                    session_id,
+            match drained {
+                Some(crate::ScalableEvent::LookupResolved {
                     resolved_topic_name,
                     controller_broker_url,
                     segments,
                     epoch,
-                });
+                    ..
+                }) => {
+                    return Ok(crate::ScalableLookup {
+                        session_id,
+                        resolved_topic_name,
+                        controller_broker_url,
+                        segments,
+                        epoch,
+                    });
+                }
+                Some(crate::ScalableEvent::DagWatchClosed { reason, .. }) => {
+                    return Err(ClientError::Other(reason.unwrap_or_else(|| {
+                        "scalable-topic session closed before it resolved".to_owned()
+                    })));
+                }
+                _ => {}
             }
             if self.shared.inner.lock().is_closed() {
                 return Err(ClientError::Other(

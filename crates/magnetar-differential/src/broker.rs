@@ -859,7 +859,14 @@ fn handle_frame(
         // open. Two segments at epoch 1, each with a placement entry.
         pb::base_command::Type::ScalableTopicLookup => {
             if let Some(l) = &frame.command.scalable_topic_lookup {
-                emit_scalable_layout(out, l.session_id);
+                // A topic whose name ends in `-missing` is the scripted
+                // rejection: the broker answers with an error and no layout, so
+                // both engines exercise the lookup-refused path.
+                if l.topic.ends_with("-missing") {
+                    emit_scalable_layout_rejection(out, l.session_id);
+                } else {
+                    emit_scalable_layout(out, l.session_id);
+                }
             }
         }
         pb::base_command::Type::ScalableTopicSubscribe => {
@@ -1332,6 +1339,22 @@ fn scalable_segment(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::Segme
         sealed_at_ms: None,
         legacy_topic_name: None,
     }
+}
+
+/// Emit a rejected scalable-topic session: an error and no layout.
+fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: None,
+            error: Some(pb::ServerError::TopicNotFound as i32),
+            message: Some("scripted: topic does not exist".to_owned()),
+            resolved_topic_name: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
 }
 
 /// Emit the initial two-segment layout for a scalable-topic session.

@@ -69,6 +69,18 @@ enum RetryRequest {
     Consumer(ConsumerHandle, RequestId),
 }
 
+/// Push one scalable-topic event into the per-client buffer and wake
+/// `next_scalable_event`.
+///
+/// Every scalable arm in [`handle_pending_events`] ends this way; keeping the
+/// lock and the wake in one place is what stops an arm from pushing without
+/// notifying, which would strand a caller until the next unrelated event.
+#[cfg(feature = "scalable-topics")]
+fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
+    shared.scalable_events.lock().push_back(event);
+    shared.scalable_notify.notify_waiters();
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (e.g. `ProducerReady`,
 /// `SubscribeAcked`, `Connected`) in the queue for user-facing futures to
@@ -281,81 +293,65 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             }
             // PIP-460 (ADR-0031): drain scalable-topic events off the proto
             // queue into the per-client buffer + wake `next_scalable_event`.
+            // PIP-460 (ADR-0093). Every scalable event lands in the per-client
+            // buffer the same way, so the arms only translate the payload and
+            // `emit_scalable` owns the lock + wake. Eleven inline copies of the
+            // triple is where a missed `notify_waiters` hides.
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerAssigned {
                 consumer_id,
                 assignment,
-            } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::ConsumerAssigned {
-                        consumer_id,
-                        assignment,
-                    });
-                shared.scalable_notify.notify_waiters();
-            }
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::ConsumerAssigned {
+                    consumer_id,
+                    assignment,
+                },
+            ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::AssignmentChanged { consumer_id, delta });
-                shared.scalable_notify.notify_waiters();
-            }
+            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => emit_scalable(
+                shared,
+                crate::ScalableEvent::AssignmentChanged { consumer_id, delta },
+            ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerRejected {
                 consumer_id,
                 reason,
-            } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::ConsumerRejected {
-                        consumer_id,
-                        reason,
-                    });
-                shared.scalable_notify.notify_waiters();
-            }
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::ConsumerRejected {
+                    consumer_id,
+                    reason,
+                },
+            ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::ScalableTopicsChanged { watch_id, change } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::TopicsChanged { watch_id, change });
-                shared.scalable_notify.notify_waiters();
-            }
+            ConnectionEvent::ScalableTopicsChanged { watch_id, change } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TopicsChanged { watch_id, change },
+            ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::ScalableTopicsWatchClosed { watch_id, reason } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::TopicsWatchClosed { watch_id, reason });
-                shared.scalable_notify.notify_waiters();
-            }
+            ConnectionEvent::ScalableTopicsWatchClosed { watch_id, reason } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TopicsWatchClosed { watch_id, reason },
+            ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::TcAssignmentsChanged {
                 watch_id,
                 parallelism,
                 assignments,
-            } => {
-                shared.scalable_events.lock().push_back(
-                    crate::ScalableEvent::TcAssignmentsChanged {
-                        watch_id,
-                        parallelism,
-                        assignments,
-                    },
-                );
-                shared.scalable_notify.notify_waiters();
-            }
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TcAssignmentsChanged {
+                    watch_id,
+                    parallelism,
+                    assignments,
+                },
+            ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::TcAssignmentsWatchClosed { watch_id, reason } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason });
-                shared.scalable_notify.notify_waiters();
-            }
+            ConnectionEvent::TcAssignmentsWatchClosed { watch_id, reason } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason },
+            ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableTopicLookupResolved {
                 session_id,
@@ -364,40 +360,37 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 segments,
                 epoch,
             } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::LookupResolved {
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::LookupResolved {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
                         segments,
                         epoch,
-                    });
-                shared.scalable_notify.notify_waiters();
+                    },
+                );
             }
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::SegmentDagUpdated { session_id, delta } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::DagUpdated { session_id, delta });
-                shared.scalable_notify.notify_waiters();
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::DagUpdated { session_id, delta },
+                );
             }
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::DagChangedDuringConsume { session_id, reason } => {
-                shared.scalable_events.lock().push_back(
+                emit_scalable(
+                    shared,
                     crate::ScalableEvent::DagChangedDuringConsume { session_id, reason },
                 );
-                shared.scalable_notify.notify_waiters();
             }
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::DagWatchClosed { session_id, reason } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::DagWatchClosed { session_id, reason });
-                shared.scalable_notify.notify_waiters();
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::DagWatchClosed { session_id, reason },
+                );
             }
             // Diagnostic events consumed SILENTLY — single-owner rule
             // (ADR-0054, decision Q1): `magnetar-proto` owns the
