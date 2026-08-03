@@ -10,8 +10,21 @@
 # broker-b and no cross-cluster replication (PIP-33 markers) ever happens.
 # PIP-33 requires the clusters to know about each other via `pulsar-admin
 # clusters create` and the consumer to subscribe with
-# `replicate_subscription_state(true)`. See
-# fixtures/configure_replicated_subs.sh for the post-up setup.
+# `replicate_subscription_state(true)`.
+#
+# SETUP splits in two, and both halves are required:
+#   1. `pulsar-init` bootstraps the cluster metadata of each cluster
+#      (`initialize-cluster-metadata`): the BookKeeper /ledgers root, the
+#      dlog namespace metadata, the cluster entry with its service URLs,
+#      the `public` and `pulsar` tenants, `public/default`,
+#      `pulsar/system`, and the transaction-coordinator assign topic. The
+#      bookies and brokers gate on it via `service_completed_successfully`.
+#   2. fixtures/configure_replicated_subs.sh runs AFTER the brokers are
+#      healthy and does what step 1 cannot: register each cluster as the
+#      other's PEER in both admin stores and widen `public/default`'s
+#      replication clusters to both. That is the cross-cluster wiring
+#      PIP-33 needs, and no compose service can do it before the brokers
+#      answer on their admin ports.
 #
 # NETWORKING: every service runs with `network_mode: host` and the brokers
 # advertise `localhost` on their (distinct) host ports. A bridge network
@@ -49,10 +62,14 @@ services:
     network_mode: host
     environment:
       - PULSAR_MEM=-Xms256m -Xmx512m
-    command: >
-      bash -c "bin/apply-config-from-env.py conf/zookeeper.conf &&
-               bin/generate-zookeeper-config.sh conf/zookeeper.conf &&
-               exec bin/pulsar zookeeper"
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/apply-config-from-env.py conf/zookeeper.conf
+        bin/generate-zookeeper-config.sh conf/zookeeper.conf
+        exec bin/pulsar zookeeper
     healthcheck:
       test: ["CMD", "bin/pulsar-zookeeper-ruok.sh"]
       interval: 5s
@@ -66,19 +83,51 @@ services:
     depends_on:
       zookeeper:
         condition: service_healthy
-    command: >
-      bash -c "bin/pulsar initialize-cluster-metadata
-                 --cluster cluster-a
-                 --zookeeper localhost:2181/cluster-a
-                 --configuration-store localhost:2181/config-store
-                 --web-service-url http://localhost:18080
-                 --broker-service-url pulsar://localhost:16650 &&
-               bin/pulsar initialize-cluster-metadata
-                 --cluster cluster-b
-                 --zookeeper localhost:2181/cluster-b
-                 --configuration-store localhost:2181/config-store
-                 --web-service-url http://localhost:18081
-                 --broker-service-url pulsar://localhost:16651 || true"
+    environment:
+      # `initialize-cluster-metadata` starts a JVM like every other service
+      # here. It never allocated before — it died on the argument parse —
+      # so the missing cap went unnoticed; without it the image default
+      # (-Xms2g -Xmx2g) applies. See docs/testing.md § "e2e container
+      # memory budget".
+      - PULSAR_MEM=-Xms256m -Xmx512m
+    # A literal block (`|`) with explicit backslash continuations, NOT a
+    # folded scalar (`>`): in a folded scalar a line indented MORE than the
+    # first content line keeps its newline instead of folding to a space, so
+    # the option lines below used to reach `bash -c` as separate commands.
+    # `initialize-cluster-metadata` then ran with no options at all
+    # (picocli MissingParameterException), each `--flag` line ran as its own
+    # command (`--cluster: command not found`), and a trailing `|| true`
+    # reported the whole thing as `Exited (0)` — so this service registered
+    # no cluster from the day it was written, and the bookkeeper/broker
+    # `service_completed_successfully` conditions below were satisfied
+    # anyway. Both clusters were in fact created by the post-up
+    # configure_replicated_subs.sh, which is why nothing looked wrong.
+    # See https://github.com/CleverCloud/magnetar/issues/389.
+    #
+    # There is deliberately no `|| true` now. `initialize-cluster-metadata`
+    # is idempotent by construction — PulsarClusterMetadataSetup guards
+    # cluster, tenant and namespace creation with existence checks, ignores
+    # BadVersionException on node creation, and formats the BookKeeper
+    # /ledgers root only when it is absent — so re-running it against
+    # initialized metadata already exits 0. Swallowing the exit code buys
+    # nothing and costs the only signal this service can give.
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/pulsar initialize-cluster-metadata \
+          --cluster cluster-a \
+          --zookeeper localhost:2181/cluster-a \
+          --configuration-store localhost:2181/config-store \
+          --web-service-url http://localhost:18080 \
+          --broker-service-url pulsar://localhost:16650
+        bin/pulsar initialize-cluster-metadata \
+          --cluster cluster-b \
+          --zookeeper localhost:2181/cluster-b \
+          --configuration-store localhost:2181/config-store \
+          --web-service-url http://localhost:18081 \
+          --broker-service-url pulsar://localhost:16651
 
   bookkeeper-a:
     image: apachepulsar/pulsar:latest
@@ -99,10 +148,20 @@ services:
       - prometheusStatsHttpPort=3191
       - advertisedAddress=127.0.0.1
       - PULSAR_MEM=-Xms256m -Xmx512m
-    command: >
-      bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
-               bin/bookkeeper shell metaformat -nonInteractive -force || true &&
-               exec bin/pulsar bookie"
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/apply-config-from-env.py conf/bookkeeper.conf
+        # `metaformat` fails once the cookie exists; that is the ONE
+        # tolerated failure here. The previous `A && B || true && C` form
+        # parsed as `((A && B) || true) && C` — `&&` and `||` share a
+        # precedence and associate left — so a failure of
+        # apply-config-from-env.py was swallowed with it and the bookie
+        # started with NONE of the environment above applied.
+        bin/bookkeeper shell metaformat -nonInteractive -force || true
+        exec bin/pulsar bookie
 
   bookkeeper-b:
     image: apachepulsar/pulsar:latest
@@ -120,10 +179,20 @@ services:
       - prometheusStatsHttpPort=3192
       - advertisedAddress=127.0.0.1
       - PULSAR_MEM=-Xms256m -Xmx512m
-    command: >
-      bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
-               bin/bookkeeper shell metaformat -nonInteractive -force || true &&
-               exec bin/pulsar bookie"
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/apply-config-from-env.py conf/bookkeeper.conf
+        # `metaformat` fails once the cookie exists; that is the ONE
+        # tolerated failure here. The previous `A && B || true && C` form
+        # parsed as `((A && B) || true) && C` — `&&` and `||` share a
+        # precedence and associate left — so a failure of
+        # apply-config-from-env.py was swallowed with it and the bookie
+        # started with NONE of the environment above applied.
+        bin/bookkeeper shell metaformat -nonInteractive -force || true
+        exec bin/pulsar bookie
 
   broker-a:
     image: apachepulsar/pulsar:latest
@@ -149,9 +218,13 @@ services:
       # tolerance assertion is deterministic.
       - replicatedSubscriptionsSnapshotFrequencyMillis=1000
       - PULSAR_MEM=-Xms512m -Xmx1g
-    command: >
-      bash -c "bin/apply-config-from-env.py conf/broker.conf &&
-               exec bin/pulsar broker"
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/apply-config-from-env.py conf/broker.conf
+        exec bin/pulsar broker
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18080/admin/v2/brokers/health"]
       interval: 5s
@@ -178,9 +251,13 @@ services:
       - managedLedgerDefaultAckQuorum=1
       - replicatedSubscriptionsSnapshotFrequencyMillis=1000
       - PULSAR_MEM=-Xms512m -Xmx1g
-    command: >
-      bash -c "bin/apply-config-from-env.py conf/broker.conf &&
-               exec bin/pulsar broker"
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        bin/apply-config-from-env.py conf/broker.conf
+        exec bin/pulsar broker
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18081/admin/v2/brokers/health"]
       interval: 5s

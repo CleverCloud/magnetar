@@ -173,6 +173,8 @@ cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR
 Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).
 The local run still needs Docker + `apachepulsar/pulsar:4.0.4` reachable.
 The PIP-33 two-cluster tests additionally require the `crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml` fixture to be up before `cargo test` — CI brings it up automatically.
+Locally that is **two** steps, not one: `docker compose -f docker-compose.replicated-subs.yml up -d` **and then** `./configure_replicated_subs.sh`.
+`up -d` alone leaves both brokers healthy but not registered as each other's peers, and the replicated-subscription tests then have nothing to replicate between.
 
 The auto-format hook handles `cargo fmt` / `gofmt` / `ruff format` on edited files; lints and tests stay manual.
 

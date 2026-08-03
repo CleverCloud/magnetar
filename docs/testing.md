@@ -189,6 +189,21 @@ Suites cover:
 | [`e2e_replicated_subscriptions.rs`](../crates/magnetar/tests/e2e_replicated_subscriptions.rs)   | PIP-33 cursor-resume across two clusters. Runs on every PR per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md). The `test` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) brings up the two-cluster docker-compose fixture (`fixtures/docker-compose.replicated-subs.yml`) before `cargo test`. |
 | [`e2e_driver_mid_session_reject.rs`](../crates/magnetar/tests/e2e_driver_mid_session_reject.rs) | Driver recovery plus ADR-0080 operation retry: a frame-aware gate rejects the first provisional producer-open with `ProducerBusy`, then verifies that the configured retry reaches a real broker and creates the producer.                                                                                                                       |
 
+### Running the PIP-33 two-cluster fixture locally
+
+`e2e_replicated_subscriptions.rs` is the one e2e test whose broker topology `testcontainers` does not spawn.
+CI brings the fixture up for you; locally it takes **two** steps, not one:
+
+```bash
+cd crates/magnetar/tests/fixtures
+docker compose -f docker-compose.replicated-subs.yml up -d
+./configure_replicated_subs.sh
+```
+
+`up -d` bootstraps each cluster's own metadata (the `pulsar-init` service) and leaves both brokers healthy, but it cannot register the two clusters as each other's peers — that needs the admin REST endpoints, which only answer once the brokers are up.
+Skip `configure_replicated_subs.sh` and the replicated-subscription tests have nothing to replicate between.
+Tear down with `docker compose -f docker-compose.replicated-subs.yml down -v`.
+
 ## The `#[ignore]` policy
 
 Per [ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md): `#[ignore]` is reserved for environment dependencies the build host cannot satisfy.
