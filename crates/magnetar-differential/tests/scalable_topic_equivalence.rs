@@ -286,6 +286,69 @@ fn dag_change_event_stream_parity() {
     );
 }
 
+/// Transcript: the broker re-sends the layout it already sent, at the same
+/// epoch, and only then advances.
+///
+/// Pulsar 5.0.0-M1 does exactly this — it answers the lookup with the current
+/// layout and then pushes that same layout again on the watch the lookup
+/// opened. The duplicate must contribute no event and must not close the
+/// session, so the recorded transcript is the later split alone. Every other
+/// transcript in this file advances the epoch on every frame, which is why
+/// none of them caught it.
+fn run_duplicate_epoch_transcript(
+    wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+) -> Vec<String> {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+    )
+    .expect("initial layout");
+    while conn.poll_event().is_some() {}
+    // The duplicate the real broker sends.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+    )
+    .expect("duplicate layout");
+    // The genuine advance the duplicate used to cost us.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(
+            session_id,
+            2,
+            vec![seg(3, 0, 32_768, &[1]), seg(4, 32_768, 65_536, &[1])],
+        ),
+    )
+    .expect("split layout");
+    drain_event_tags(&mut conn)
+}
+
+/// Layer (d): both engines ignore a duplicate layout epoch identically, and
+/// both still observe the split that follows it.
+#[test]
+fn duplicate_layout_epoch_event_stream_parity() {
+    let tokio_tags = run_duplicate_epoch_transcript(tokio_wall_clock());
+    let moonpool_tags = run_duplicate_epoch_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_tags, moonpool_tags,
+        "engine event streams diverged for the duplicate-epoch transcript"
+    );
+    assert_eq!(
+        tokio_tags,
+        vec![
+            "DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)".to_owned(),
+            "DagChanged(Split)".to_owned(),
+        ],
+        "the duplicate contributes no event and leaves the session open"
+    );
+}
+
 /// Encode a `CommandScalableTopicSubscribeResponse` frame.
 fn subscribe_response_frame(request_id: u64, epoch: u64, segs: &[u64]) -> BytesMut {
     let cmd = pb::BaseCommand {
@@ -727,28 +790,42 @@ fn session_guards_and_accessors_parity() {
         .expect("initial layout");
         while conn.poll_event().is_some() {}
 
-        // A replayed layout at the same epoch closes the session rather than
-        // being applied — the broker's ordering guarantee, enforced client-side.
+        // A replayed layout at the same epoch is ignored, not applied and not
+        // fatal: the broker is free to re-send a snapshot the session already
+        // holds, and Pulsar 5.0.0-M1 routinely does. Closing here is what blinded
+        // the client to every later epoch against a real broker.
         conn.handle_bytes(
             Instant::now(),
             &layout_frame(session_id, 5, vec![seg(9, 0, 65_536, &[])]),
         )
         .expect("stale layout");
         let tags = drain_event_tags(&mut conn);
-        assert_eq!(tags.len(), 1);
         assert!(
-            tags[0].contains("non-monotonic layout epoch"),
-            "a replayed layout closes the session: {}",
-            tags[0]
+            tags.is_empty(),
+            "a replayed layout emits nothing, got {tags:?}"
         );
+        let snap = conn
+            .dag_snapshot(session_id)
+            .expect("the session survives a replayed layout");
         assert!(
-            conn.dag_snapshot(session_id).is_none(),
-            "the session is dropped, not left holding a stale layout"
+            snap.iter().any(|d| d.segment_id.0 == 1),
+            "the held layout is untouched — segment 1 kept, segment 9 never landed"
         );
+        assert!(!snap.iter().any(|d| d.segment_id.0 == 9));
 
-        // Closing an already-closed session writes nothing.
+        // Closing a live session writes the close frame; closing it a second
+        // time writes nothing. The first close used to be the no-op here,
+        // because the replayed layout above had already dropped the session.
         conn.close_scalable_topic_session(session_id);
-        assert!(conn.poll_transmit().is_empty());
+        assert!(
+            !conn.poll_transmit().is_empty(),
+            "closing the surviving session emits CommandScalableTopicClose"
+        );
+        conn.close_scalable_topic_session(session_id);
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "closing an already-closed session writes nothing"
+        );
 
         // An update naming a session this connection does not track is ignored.
         let mut session = magnetar_proto::DagWatchSession::new(1234);

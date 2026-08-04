@@ -6862,7 +6862,13 @@ impl Connection {
         };
         let first_layout = !session.is_resolved();
         match session.handle_update(&upd) {
-            Ok(delta) => {
+            // The broker re-sent a layout this session already holds — Pulsar
+            // 5.0.0-M1 answers the lookup and then pushes the same epoch again
+            // on the watch it just opened. Nothing changed, so nothing is
+            // emitted and the session stays open. Closing here left the client
+            // blind to every later epoch, the split among them.
+            Ok(None) => {}
+            Ok(Some(delta)) => {
                 if first_layout {
                     let segments = session.snapshot();
                     let controller_broker_url =

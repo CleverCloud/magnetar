@@ -26,8 +26,10 @@
 //! monotonic `epoch`; there are no split / merge event frames on the wire. The
 //! session replaces its layout wholesale and derives what changed by diffing
 //! the old and new segment sets, reading split / merge structure off the
-//! `parent_ids` / `child_ids` edges of the incoming layout. A stale or
-//! replayed frame is rejected by the epoch guard, never applied.
+//! `parent_ids` / `child_ids` edges of the incoming layout. A frame whose
+//! epoch does not advance is **ignored** — it is a re-sent snapshot the
+//! session already holds, and Pulsar 5.0.0-M1 sends one routinely — so it
+//! neither mutates state nor ends the session.
 //!
 //! # Drop-on-change
 //!
@@ -134,17 +136,13 @@ pub enum DagChangeReason {
 /// Errors raised while applying a `CommandScalableTopicUpdate`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DagError {
-    /// The update's layout `epoch` did not strictly advance the session's
-    /// monotonic counter. Mirrors the broker's per-session ordering guarantee
-    /// — a stale or replayed frame must be rejected, never applied.
-    #[error("non-monotonic layout epoch: got {got} expected > {prev}")]
-    NonMonotonic {
-        /// The `epoch` the broker sent.
-        got: u64,
-        /// The highest `epoch` already applied to this session.
-        prev: u64,
-    },
-
+    // NOTE: there is deliberately no `NonMonotonic` variant. A layout `epoch`
+    // that does not advance means the broker re-sent a snapshot this session
+    // already holds, which is idempotent rather than illegal —
+    // `ScalableTopicSession::handle_update` returns `Ok(None)` and leaves the
+    // state untouched. It was an error until 2026-08-04, and because the error
+    // path closes the session, Pulsar 5.0.0-M1's duplicate initial snapshot
+    // silently blinded the client to every subsequent layout change.
     /// The update belonged to a different watch session than this one.
     #[error("update for watch session {got} does not match this session {expected}")]
     SessionMismatch {
@@ -257,19 +255,30 @@ impl DagWatchSession {
     /// Apply a `CommandScalableTopicUpdate`, replacing the layout and
     /// returning the [`DagDelta`] for the runtime to translate into events.
     ///
+    /// Returns `Ok(None)` when the update's layout `epoch` does not advance the
+    /// session's counter. That is a **duplicate or stale snapshot, not an
+    /// error**: the epoch is monotonic but nothing forbids the broker from
+    /// re-sending the layout it already sent, and Pulsar 5.0.0-M1 does exactly
+    /// that — it answers the lookup with the current layout and then pushes the
+    /// same layout again at the same epoch on the newly-opened watch. The state
+    /// is left untouched and the caller emits no event.
+    ///
+    /// Treating that as fatal is what made `e2e_scalable_topic_drops_on_broker_split`
+    /// fail against a real broker: the duplicate closed the session, and the
+    /// client never saw the epochs that carried the actual split.
+    ///
     /// # Errors
     ///
     /// - [`DagError::SessionMismatch`] if the update targets a different session.
     /// - [`DagError::Broker`] if the update carries a `ServerError` instead of a layout.
     /// - [`DagError::Empty`] if it carries neither.
-    /// - [`DagError::NonMonotonic`] if the layout `epoch` does not strictly advance.
     ///
     /// On any error the session state is left **unchanged** — the update is
     /// validated fully before any mutation lands.
     pub fn handle_update(
         &mut self,
         upd: &pb::CommandScalableTopicUpdate,
-    ) -> Result<DagDelta, DagError> {
+    ) -> Result<Option<DagDelta>, DagError> {
         if upd.session_id != self.session_id {
             return Err(DagError::SessionMismatch {
                 got: upd.session_id,
@@ -291,13 +300,13 @@ impl DagWatchSession {
             });
         };
 
+        // Not an error: a re-sent or reordered snapshot carries a layout this
+        // session has already applied, so there is nothing to do and nothing to
+        // report. Only a *forward* epoch changes state.
         if let Some(prev) = self.epoch
             && dag.epoch <= prev
         {
-            return Err(DagError::NonMonotonic {
-                got: dag.epoch,
-                prev,
-            });
+            return Ok(None);
         }
 
         // Placement is a parallel list keyed by segment id; index it once.
@@ -335,13 +344,13 @@ impl DagWatchSession {
         }
         self.controller_broker_url = dag.controller_broker_url.clone();
 
-        Ok(DagDelta {
+        Ok(Some(DagDelta {
             epoch: dag.epoch,
             added,
             removed,
             split_events,
             merge_events,
-        })
+        }))
     }
 }
 
@@ -460,7 +469,8 @@ mod tests {
     fn resolved_session() -> DagWatchSession {
         let mut s = DagWatchSession::new(7);
         s.handle_update(&update(7, 1, vec![info(1, 0, 65_536, &[], &[])]))
-            .expect("initial layout applies");
+            .expect("initial layout applies")
+            .expect("the first layout yields a delta");
         s
     }
 
@@ -480,7 +490,8 @@ mod tests {
                     info(2, 32_768, 65_536, &[], &[]),
                 ],
             ))
-            .expect("layout applies");
+            .expect("layout applies")
+            .expect("the first layout yields a delta");
 
         assert!(s.is_resolved());
         assert_eq!(delta.epoch, 4);
@@ -502,20 +513,47 @@ mod tests {
         );
     }
 
-    /// Layer (a) test: a non-advancing layout epoch is rejected and the session
-    /// is left untouched.
+    /// Layer (a) test: a non-advancing layout epoch is ignored — no delta, no
+    /// state change, and crucially the session survives.
+    ///
+    /// Pulsar 5.0.0-M1 answers the lookup with the current layout and then
+    /// pushes that same layout again at the same epoch on the watch it just
+    /// opened. This was `DagError::NonMonotonic` until 2026-08-04, and since
+    /// the caller closes the session on any error, that duplicate blinded the
+    /// client to every later epoch — including the one carrying a split.
     #[test]
-    fn scalable_session_monotonic_epoch() {
+    fn scalable_session_ignores_non_advancing_epoch_and_survives() {
         let mut s = resolved_session();
         assert!(s.is_resolved());
 
-        let stale = update(7, 1, vec![info(9, 0, 65_536, &[], &[])]);
-        let err = s.handle_update(&stale).expect_err("stale layout rejected");
-        assert_eq!(err, DagError::NonMonotonic { got: 1, prev: 1 });
+        // Equal epoch: the duplicate a real broker sends.
+        let duplicate = update(7, 1, vec![info(9, 0, 65_536, &[], &[])]);
+        assert_eq!(
+            s.handle_update(&duplicate),
+            Ok(None),
+            "a re-sent snapshot is idempotent, not an error"
+        );
+        // Strictly older: a reordered frame, treated the same way.
+        let stale = update(7, 0, vec![info(9, 0, 65_536, &[], &[])]);
+        assert_eq!(
+            s.handle_update(&stale),
+            Ok(None),
+            "a stale frame is ignored"
+        );
+
         // Session unchanged — segment 9 never landed, segment 1 still there.
         assert!(!s.contains(SegmentId(9)));
         assert!(s.contains(SegmentId(1)));
         assert!(s.is_resolved());
+
+        // And the session still accepts the next real advance.
+        let advance = update(7, 2, vec![info(9, 0, 65_536, &[], &[])]);
+        let delta = s
+            .handle_update(&advance)
+            .expect("a forward epoch applies")
+            .expect("a forward epoch yields a delta");
+        assert_eq!(delta.epoch, 2);
+        assert!(s.contains(SegmentId(9)));
     }
 
     /// Layer (a) test: a split is derived from the children's `parent_ids`
@@ -532,7 +570,8 @@ mod tests {
                     info(3, 32_768, 65_536, &[1], &[]),
                 ],
             ))
-            .expect("split layout applies");
+            .expect("split layout applies")
+            .expect("a split yields a delta");
 
         assert!(delta.is_consume_affecting());
         assert_eq!(delta.change_reason(), DagChangeReason::Split);
@@ -559,11 +598,13 @@ mod tests {
                 info(6, 32_768, 65_536, &[], &[]),
             ],
         ))
-        .expect("initial layout");
+        .expect("initial layout")
+        .expect("the first layout yields a delta");
 
         let delta = s
             .handle_update(&update(7, 2, vec![info(7, 0, 65_536, &[5, 6], &[])]))
-            .expect("merge layout applies");
+            .expect("merge layout applies")
+            .expect("a merge yields a delta");
 
         assert!(delta.is_consume_affecting());
         assert_eq!(delta.change_reason(), DagChangeReason::Merge);
@@ -592,12 +633,14 @@ mod tests {
                 seg_info(6, 32_768, 65_536, &[]),
             ],
         ))
-        .expect("initial layout");
+        .expect("initial layout")
+        .expect("the first layout yields a delta");
 
         // Descending on the wire.
         let delta = s
             .handle_update(&update(7, 2, vec![seg_info(7, 0, 65_536, &[6, 5])]))
-            .expect("merge layout applies");
+            .expect("merge layout applies")
+            .expect("a merge yields a delta");
 
         assert_eq!(
             delta.merge_events[0].parent_segment_ids,
@@ -678,7 +721,8 @@ mod tests {
                     info(2, 65_536, 131_072, &[], &[]),
                 ],
             ))
-            .expect("add applies");
+            .expect("add applies")
+            .expect("an add yields a delta");
         assert!(!delta.is_consume_affecting(), "pure add does not drop");
         assert_eq!(delta.change_reason(), DagChangeReason::Unknown);
         assert!(s.contains(SegmentId(1)) && s.contains(SegmentId(2)));
@@ -693,7 +737,8 @@ mod tests {
         let mut legacy = info(0, 0, 65_536, &[], &[]);
         legacy.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
         s.handle_update(&update(7, 0, vec![legacy]))
-            .expect("legacy layout applies");
+            .expect("legacy layout applies")
+            .expect("the legacy layout yields a delta");
 
         let snap = s.snapshot();
         assert_eq!(snap.len(), 1);

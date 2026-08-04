@@ -236,6 +236,77 @@ fn stream_consumer_drops_on_dag_change() {
     assert_eq!(snap.len(), 2, "two children present");
 }
 
+/// A re-sent layout at the epoch already applied is ignored, and the session
+/// **survives** it.
+///
+/// Pulsar 5.0.0-M1 answers the lookup with the current layout and then pushes
+/// that same layout again, at the same epoch, on the watch the lookup opened.
+/// Until 2026-08-04 that was `DagError::NonMonotonic`, and since any error
+/// closes the session, the duplicate blinded the client to every later epoch —
+/// including the one carrying the split. Observed only against a real broker:
+/// every scripted test here advanced the epoch on each frame, so none of them
+/// ever sent the duplicate.
+#[test]
+fn duplicate_layout_epoch_is_ignored_and_session_survives() {
+    let mut conn = connected_conn();
+    let session_id = conn
+        .open_scalable_topic_session("topic://public/default/scaled")
+        .expect("broker supports scalable topics");
+    let _ = conn.poll_transmit();
+
+    // First layout resolves the session at epoch 1.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+    )
+    .expect("initial layout");
+    while conn.poll_event().is_some() {}
+
+    // The broker re-sends the very same epoch.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+    )
+    .expect("a duplicate layout is accepted at the frame level");
+    let mut emitted = 0;
+    while let Some(ev) = conn.poll_event() {
+        assert!(
+            !matches!(ev, ConnectionEvent::DagWatchClosed { .. }),
+            "a duplicate epoch must not close the session"
+        );
+        emitted += 1;
+    }
+    assert_eq!(
+        emitted, 0,
+        "a duplicate epoch changes nothing and says nothing"
+    );
+    assert!(
+        conn.dag_snapshot(session_id).is_some(),
+        "the session is still open after the duplicate"
+    );
+
+    // The next genuine advance still lands, which is what the duplicate used to
+    // cost us.
+    conn.handle_bytes(
+        Instant::now(),
+        &layout_frame(
+            session_id,
+            2,
+            vec![seg(3, 0, 32_768, &[1]), seg(4, 32_768, 65_536, &[1])],
+        ),
+    )
+    .expect("split layout");
+    let mut saw_split = false;
+    while let Some(ev) = conn.poll_event() {
+        if let ConnectionEvent::SegmentDagUpdated { delta, .. } = ev {
+            assert_eq!(delta.epoch, 2);
+            assert_eq!(delta.split_events.len(), 1);
+            saw_split = true;
+        }
+    }
+    assert!(saw_split, "the advance after a duplicate is applied");
+}
+
 /// (b) #4 — **v4 compatibility**. A broker that did not advertise
 /// `supports_scalable_topics` gets no scalable-topic command at all: the client
 /// refuses locally and the outbound buffer stays empty. This is what keeps a

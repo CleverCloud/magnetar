@@ -26,6 +26,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
   (ADR-0093)
 
+- **A scalable-topic watch no longer dies on the broker's own duplicate layout.**
+  `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
+  Pulsar 5.0.0-M1 answers `CommandScalableTopicLookup` with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup opened — so the very first thing a real broker sends after resolving tore the session down, and the client never saw another epoch, the split among them.
+  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open. Only a session mismatch, a broker-side error, or a bodyless update ends a session.
+  `DagError::NonMonotonic` is removed and `handle_update` returns `Result<Option<DagDelta>, DagError>`; both are behind the default-off `scalable-topics` feature.
+  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it. All four now cover the duplicate.
+  (ADR-0093)
+
 - **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
   The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
   `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
