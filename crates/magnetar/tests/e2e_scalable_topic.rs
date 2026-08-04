@@ -269,6 +269,29 @@ async fn pulsar_admin(
     }
 }
 
+/// Render a resolved layout for a failure message.
+///
+/// Prints each segment's `parent_ids` / `child_ids` edges and state, because
+/// those edges are exactly what the split derivation reads: a layout that
+/// advanced its epoch but carries no edges tells a different story from one
+/// the broker never changed at all.
+fn describe_layout(epoch: u64, segments: &[magnetar::scalable::SegmentDescriptor]) -> String {
+    let rendered = segments
+        .iter()
+        .map(|s| {
+            format!(
+                "{}(parents={:?}, children={:?}, state={:?})",
+                s.segment_id.0,
+                s.parent_ids.iter().map(|p| p.0).collect::<Vec<_>>(),
+                s.child_ids.iter().map(|c| c.0).collect::<Vec<_>>(),
+                s.state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("epoch={epoch}, segments=[{rendered}]")
+}
+
 /// Create a scalable topic with `segments` initial segments.
 async fn create_scalable_topic(
     container: &testcontainers::ContainerAsync<GenericImage>,
@@ -508,9 +531,17 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
 
     // The broker pushes the new layout on the still-open session. Drain until
     // the drop-on-change event lands rather than asserting on a timing window.
+    //
+    // Every event is recorded, because three very different failures otherwise
+    // produce the same bare assertion message and none of them is reproducible
+    // without a container runtime: the broker never split; it split but pushed
+    // nothing on the open session; or it pushed a layout whose `parent_ids` /
+    // `child_ids` edges our derivation did not classify as a split. The
+    // post-loop re-lookup separates the first from the other two.
     let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     let mut saw_split = false;
     let mut new_epoch = epoch_before;
+    let mut observed: Vec<String> = Vec::new();
     while tokio::time::Instant::now() < deadline && !saw_split {
         let Ok(Some(ev)) =
             tokio::time::timeout(Duration::from_secs(5), client.next_scalable_event()).await
@@ -520,6 +551,14 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
         match ev {
             magnetar::scalable::ScalableEvent::DagUpdated { delta, .. } => {
                 new_epoch = delta.epoch;
+                observed.push(format!(
+                    "DagUpdated{{epoch={}, added={}, removed={}, splits={}, merges={}}}",
+                    delta.epoch,
+                    delta.added.len(),
+                    delta.removed.len(),
+                    delta.split_events.len(),
+                    delta.merge_events.len()
+                ));
                 if !delta.split_events.is_empty() {
                     assert_eq!(
                         delta.split_events[0].parent_segment_id.0, segment_to_split,
@@ -529,6 +568,7 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
                 }
             }
             magnetar::scalable::ScalableEvent::DagChangedDuringConsume { reason, .. } => {
+                observed.push(format!("DagChangedDuringConsume{{reason={reason:?}}}"));
                 assert_eq!(
                     reason,
                     magnetar::scalable::DagChangeReason::Split,
@@ -536,13 +576,29 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
                 );
                 saw_split = true;
             }
-            _ => {}
+            other => observed.push(format!("{other:?}")),
         }
     }
 
+    // Ground truth from the broker, independent of what it pushed.
+    let broker_view = match client.lookup_scalable_topic(&topic).await {
+        Ok(l) => describe_layout(l.epoch, &l.segments),
+        Err(err) => format!("re-lookup failed: {err}"),
+    };
+
     assert!(
         saw_split,
-        "the broker-driven split reached the client as a drop-on-change event"
+        "the broker-driven split reached the client as a drop-on-change event.\n\
+         split segment id: {segment_to_split}\n\
+         epoch before: {epoch_before}, last pushed epoch: {new_epoch}\n\
+         events observed in 60s ({}): {}\n\
+         broker layout on re-lookup: {broker_view}",
+        observed.len(),
+        if observed.is_empty() {
+            "none".to_owned()
+        } else {
+            observed.join(" | ")
+        }
     );
     assert!(
         new_epoch > epoch_before,
