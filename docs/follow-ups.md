@@ -62,9 +62,13 @@ Failing that, `cargo llvm-cov clean --workspace` before the execution step, whic
 
 ## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
 
-**Gap.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bound-the-driver-write-on-operation-timeout.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
+**Observed.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bounded-cancellable-driver-write.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
 
-**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so the 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. Under `start_paused` tokio auto-advances the clock whenever no task is ready, so a deterministic test should resolve the driver's own 30 s `operation_timeout` long before the 90 s margin. That it does not, and that it depends on host load, means something on the driver's stalled-write path leaves the virtual clock's control — a real thread, a `spawn_blocking`, or a lock held across an await. That is worth knowing independently of the test.
+**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so its 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. A paused-clock test on a single thread should be deterministic, and this one is not: it depends on host load.
+
+**Hypothesis, not conclusion — clock-domain mismatch.** The driver computes its write deadline on the **real** clock: `use std::time::Instant` (`driver.rs:51`), `write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout)` (`driver.rs:1394`), `deadline.saturating_duration_since(Instant::now())` (`driver.rs:1682`). `tokio::time::pause()` advances tokio's timer clock; it does not advance `std::time::Instant`. So the harness measures its margin in virtual time while the code under test measures its deadline in real time, and the two can be raced against each other by host load. That is consistent with every observation above and it is what should be investigated first.
+
+It is **not proven**. This entry previously asserted "a real thread, a `spawn_blocking`, or a lock held across an await"; none of those was verified, and the mixed clock domains are a better-supported explanation. Whoever picks this up should confirm the mechanism before fixing it, not inherit this paragraph as fact.
 
 **Measured 2026-08-04**, on `feat/pip-460-upstream-wire`:
 
@@ -74,7 +78,7 @@ Failing that, `cargo llvm-cov clean --workspace` before the execution step, whic
 | 3 isolated runs, load average still ~13                                                                      | 1 FAILED, 2 ok |
 | 30 isolated runs of the test binary at idle                                                                  | 0/30 failed    |
 
-**Not caused by the PIP-460 work.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin; every change to `driver.rs` on that branch is a `#[cfg(feature = "scalable-topics")]` addition. CI has not reproduced it.
+**Ancestry: inferred, not measured.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin, and the three deadline lines above are byte-identical to `origin/main`; every change `feat/pip-460-upstream-wire` makes to `driver.rs` is a `#[cfg(feature = "scalable-topics")]` addition. So both the test and the suspected mechanism predate that branch. It has **not** been reproduced on `origin/main` under equivalent load, which is what would actually establish "pre-existing" — until someone does that, this is a well-supported inference and no more. CI has not reproduced it on either branch.
 
 **Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
 
