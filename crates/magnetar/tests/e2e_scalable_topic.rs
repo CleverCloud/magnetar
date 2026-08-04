@@ -204,7 +204,13 @@ async fn await_broker_ready(
     .into())
 }
 
-/// Run `pulsar-admin` inside the container and return its combined output.
+/// Run `pulsar-admin` inside the container, asserting it exited zero.
+///
+/// The exit code is the check, not a substring scan of the output. An earlier
+/// version sniffed for the word "error" and so silently tolerated picocli's
+/// usage message when `split-segment` was called with the segment id
+/// positionally instead of behind `--segment-id`: the split never happened and
+/// the test spent 60 s waiting for a layout change that was never coming.
 async fn pulsar_admin(
     container: &testcontainers::ContainerAsync<GenericImage>,
     args: &[&str],
@@ -214,7 +220,13 @@ async fn pulsar_admin(
     let mut out = container.exec(ExecCommand::new(command)).await?;
     let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
-    Ok(format!("{stdout}{stderr}"))
+    let combined = format!("{stdout}{stderr}");
+    match out.exit_code().await? {
+        Some(0) | None => Ok(combined),
+        Some(code) => {
+            Err(format!("pulsar-admin {} exited {code}:\n{combined}", args.join(" ")).into())
+        }
+    }
 }
 
 /// Create a scalable topic with `segments` initial segments.
@@ -230,8 +242,8 @@ async fn create_scalable_topic(
     )
     .await?;
     assert!(
-        !out.to_lowercase().contains("error"),
-        "pulsar-admin scalable-topics create failed: {out}"
+        out.contains("Created scalable topic"),
+        "pulsar-admin scalable-topics create did not confirm: {out}"
     );
     Ok(())
 }
@@ -438,20 +450,23 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
         .0;
 
     // Trigger the split on the broker.
+    // `--segment-id` is an option, not a positional: `SplitSegmentCmd` in
+    // upstream's `CmdScalableTopics.java` declares only the topic positionally.
     let out = pulsar_admin(
         &container,
         &[
             "scalable-topics",
             "split-segment",
             &topic,
+            "--segment-id",
             &segment_to_split.to_string(),
         ],
     )
     .await
     .expect("split-segment runs");
     assert!(
-        !out.to_lowercase().contains("error"),
-        "pulsar-admin scalable-topics split-segment failed: {out}"
+        out.contains("Split segment"),
+        "pulsar-admin scalable-topics split-segment did not confirm: {out}"
     );
 
     // The broker pushes the new layout on the still-open session. Drain until
