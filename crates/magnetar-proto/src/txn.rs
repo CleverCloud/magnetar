@@ -336,13 +336,14 @@ impl TxnClient {
     /// the connection's outbound buffer. The transaction-id and `Open` state are only recorded
     /// once the matching response is consumed via [`Self::handle_new_txn_response`].
     ///
-    /// The protobuf field is named `txn_ttl_seconds` but the broker treats the value as
-    /// **milliseconds** — `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills,
-    /// owner)` is called with `command.getTxnTtlSeconds()` directly, no unit conversion. The
-    /// Java client mirrors this by passing `unit.toMillis(timeout)` into the field
+    /// The TTL field carries **milliseconds** — `TransactionMetadataStoreService.newTransaction(
+    /// tcId, timeoutInMills, owner)` consumes it directly, with no unit conversion. The Java
+    /// client mirrors this by passing `unit.toMillis(timeout)` into the field
     /// (`TransactionMetaStoreHandler.newTxnAsync` → `Commands.newTxn`). Sending seconds here
     /// (e.g. `30`) makes the broker interpret the txn as having a 30 ms TTL and abort it before
-    /// the next round-trip lands.
+    /// the next round-trip lands. Upstream renamed the field `txn_ttl_seconds` →
+    /// `txn_ttl_millis` in Pulsar 5.0.0-M1 to match; field number 2 and the wire value are
+    /// unchanged, so this is a rename only.
     pub fn new_txn(&mut self, request_id: u64, timeout_ms: u64) -> pb::CommandNewTxn {
         let waker_key = self.pending_new_txn.insert(noop_waker());
         let pending = PendingNewTxn {
@@ -353,8 +354,11 @@ impl TxnClient {
             .insert(RequestId(request_id), pending);
         pb::CommandNewTxn {
             request_id,
-            txn_ttl_seconds: Some(timeout_ms),
+            txn_ttl_millis: Some(timeout_ms),
             tc_id: Some(self.coordinator_id),
+            // PIP-473 scalable transaction coordinator. Absent = the legacy coordinator, which
+            // is what a v4 client sends and what this client speaks today.
+            scalable: None,
         }
     }
 
@@ -418,6 +422,8 @@ impl TxnClient {
             txnid_least_bits: Some(txn.least_sig_bits),
             txnid_most_bits: Some(txn.most_sig_bits),
             partitions: vec![topic],
+            // PIP-473 scalable transaction coordinator. Absent = the legacy coordinator.
+            scalable: None,
         }
     }
 
@@ -483,6 +489,8 @@ impl TxnClient {
                 topic,
                 subscription,
             }],
+            // PIP-473 scalable transaction coordinator. Absent = the legacy coordinator.
+            scalable: None,
         }
     }
 
@@ -548,6 +556,8 @@ impl TxnClient {
             txnid_least_bits: Some(txn.least_sig_bits),
             txnid_most_bits: Some(txn.most_sig_bits),
             txn_action: Some(action.to_pb() as i32),
+            // PIP-473 scalable transaction coordinator. Absent = the legacy coordinator.
+            scalable: None,
         }
     }
 
@@ -635,7 +645,7 @@ mod tests {
         // `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills, owner)` in
         // pulsar-broker/src/main/java/org/apache/pulsar/broker/TransactionMetadataStoreService.
         // java). Java client sends `unit.toMillis(timeout)` here, so we mirror that.
-        assert_eq!(cmd.txn_ttl_seconds, Some(30_000));
+        assert_eq!(cmd.txn_ttl_millis, Some(30_000));
 
         let id = client
             .handle_new_txn_response(ok_new_txn_response(1, 99, 42))

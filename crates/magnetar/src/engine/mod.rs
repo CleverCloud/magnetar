@@ -1021,7 +1021,7 @@ pub trait MessageDecryptorApi {
 }
 
 // ---------------------------------------------------------------------------
-// PIP-460 scalable topics (ADR-0031, experimental). The `ScalableTopicsApi`
+// PIP-460 scalable topics (ADR-0093, experimental). The `ScalableTopicsApi`
 // extension trait follows the same ADR-0026 §D1 pattern as `TransactionApi`:
 // defined here, implemented by each runtime on its `Client` type (which is the
 // engine's `ClientState`), dispatched through
@@ -1029,7 +1029,7 @@ pub trait MessageDecryptorApi {
 // Gated on `feature = "scalable-topics"` so the default surface is unchanged.
 // ---------------------------------------------------------------------------
 
-/// **Experimental** (PIP-460, ADR-0031). Engine-side scalable-topic hooks —
+/// **Experimental** (PIP-460, ADR-0093). Engine-side scalable-topic hooks —
 /// implemented by each runtime on its `Client` type. The façade's
 /// [`crate::scalable::StreamConsumer`] dispatches through this trait once
 /// [`crate::PulsarClient<E>`] carries the
@@ -1037,31 +1037,69 @@ pub trait MessageDecryptorApi {
 ///
 /// **Sans-io.** Async methods return `Pin<Box<dyn Future + Send + '_>>`; no
 /// tokio / mio / socket types appear in the surface. Each impl drives the
-/// [`magnetar_proto::Connection`] scalable entries (`send_scalable_topic_lookup`,
-/// `open_dag_watch`, `close_dag_watch`) and reads the driver-drained events.
+/// [`magnetar_proto::Connection`] scalable entries
+/// (`open_scalable_topic_session`, `close_scalable_topic_session`) and reads the
+/// driver-drained events.
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// Per-runtime client error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Resolve a `topic://...` scalable topic: lookup → segment DAG snapshot +
-    /// controller broker + lookup token.
+    /// Open a scalable-topic session and await its first layout. The session
+    /// stays open, pushing later layouts through
+    /// [`Self::next_scalable_event`], until it is closed.
     fn scalable_topic_lookup<'a>(
         &'a self,
         topic: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ScalableLookup, Self::Error>> + Send + 'a>>;
 
-    /// Open a DAG-watch session, seeded with the lookup snapshot + token.
-    /// Returns the client-allocated watch session id.
-    fn open_dag_watch(
-        &self,
-        topic: &str,
-        lookup_token: u64,
-        segments: Vec<magnetar_proto::SegmentDescriptor>,
-    ) -> u64;
+    /// Whether the connected broker advertised the PIP-460 capability.
+    /// `false` against a Pulsar 4.x peer.
+    fn broker_supports_scalable_topics(&self) -> bool;
 
-    /// Close a DAG-watch session.
-    fn close_dag_watch(&self, watch_session_id: u64);
+    /// Register as a scalable consumer with the controller leader and await the
+    /// initial assignment — the `segment://` topics this consumer owns.
+    fn scalable_topic_subscribe<'a>(
+        &'a self,
+        topic: &'a str,
+        subscription: &'a str,
+        consumer_name: &'a str,
+        consumer_id: u64,
+        consumer_type: magnetar_proto::ScalableConsumerType,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<magnetar_proto::ConsumerAssignment, Self::Error>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Open a namespace-level watch over the scalable topics matching
+    /// `property_filters` (empty = every scalable topic in the namespace).
+    fn watch_scalable_topics(
+        &self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, Self::Error>;
+
+    /// Close a namespace-level scalable-topics watch.
+    fn close_scalable_topics_watch(&self, watch_id: u64);
+
+    /// The current matching topic set for a namespace watch.
+    fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>>;
+
+    /// Whether the broker advertised metadata-driven transaction-coordinator
+    /// discovery. Independent of `supports_scalable_topics` upstream.
+    fn broker_supports_tc_metadata_discovery(&self) -> bool;
+
+    /// Open a transaction-coordinator discovery watch.
+    fn watch_tc_assignments(&self) -> Result<u64, Self::Error>;
+
+    /// Close a transaction-coordinator discovery watch.
+    fn close_tc_assignments_watch(&self, watch_id: u64);
+
+    /// Close a scalable-topic session.
+    fn close_scalable_topic_session(&self, session_id: u64);
 
     /// Await the next scalable-topic event (DAG update / drop-on-change /
     /// close). Resolves `None` once the connection closes.
@@ -1070,53 +1108,112 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<ScalableEvent>> + Send + '_>>;
 }
 
-/// **Experimental** (PIP-460, ADR-0031). Engine-agnostic resolved
+/// **Experimental** (PIP-460, ADR-0093). Engine-agnostic resolved
 /// scalable-topic lookup surfaced through [`ScalableTopicsApi`]. Façade-side
 /// analogue of each runtime's `ScalableLookup`.
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 #[derive(Debug, Clone)]
 pub struct ScalableLookup {
-    /// Controller broker to open the DAG-watch session against.
-    pub controller_broker_url: String,
-    /// Current DAG snapshot for the topic.
+    /// Client-allocated session id; the session stays open until closed.
+    pub session_id: u64,
+    /// Canonical `topic://...` identity the broker resolved the request to.
+    pub resolved_topic_name: Option<String>,
+    /// Controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url: Option<String>,
+    /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
-    /// Monotonic lookup token, echoed into the DAG-watch subscribe.
-    pub lookup_token: u64,
+    /// Layout epoch the snapshot was stamped with.
+    pub epoch: u64,
 }
 
-/// **Experimental** (PIP-460, ADR-0031). Engine-agnostic scalable-topic event
+/// **Experimental** (PIP-460, ADR-0093). Engine-agnostic scalable-topic event
 /// surfaced through [`ScalableTopicsApi::next_scalable_event`]. Façade-side
 /// analogue of each runtime's `ScalableEvent`.
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 #[derive(Debug, Clone)]
 pub enum ScalableEvent {
-    /// A scalable-topic lookup resolved into the current DAG.
+    /// A scalable-topic session resolved: its first layout landed.
     LookupResolved {
-        /// Controller broker to open the DAG-watch session against.
-        controller_broker_url: String,
-        /// Current DAG snapshot.
+        /// Client-allocated session id.
+        session_id: u64,
+        /// Canonical `topic://...` identity the broker resolved to.
+        resolved_topic_name: Option<String>,
+        /// Controller broker serving this topic's layout, when advertised.
+        controller_broker_url: Option<String>,
+        /// Initial DAG snapshot.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
-        /// Monotonic lookup token.
-        lookup_token: u64,
+        /// Layout epoch the snapshot was stamped with.
+        epoch: u64,
     },
-    /// A DAG-watch session received and applied an update.
+    /// An open session applied a subsequent layout.
     DagUpdated {
-        /// Watch session id.
-        watch_session_id: u64,
+        /// Session id.
+        session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
-        /// Watch session id whose DAG changed.
-        watch_session_id: u64,
+        /// Session id whose DAG changed.
+        session_id: u64,
         /// Why the DAG changed.
         reason: magnetar_proto::DagChangeReason,
     },
-    /// The DAG-watch session closed.
+    /// The scalable-topic session closed.
     DagWatchClosed {
-        /// Watch session id that closed.
-        watch_session_id: u64,
+        /// Session id that closed.
+        session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// A scalable consumer's registration resolved with its initial share.
+    ConsumerAssigned {
+        /// Consumer id that registered.
+        consumer_id: u64,
+        /// The `segment://` topics this consumer owns.
+        assignment: magnetar_proto::ConsumerAssignment,
+    },
+    /// The controller leader rebalanced a registered consumer's share.
+    AssignmentChanged {
+        /// Consumer id whose share changed.
+        consumer_id: u64,
+        /// What to attach to and detach from.
+        delta: magnetar_proto::AssignmentDelta,
+    },
+    /// A scalable consumer's registration was rejected.
+    ConsumerRejected {
+        /// Consumer id whose registration failed.
+        consumer_id: u64,
+        /// Why the broker rejected it.
+        reason: String,
+    },
+    /// A namespace-level scalable-topics watch delivered a snapshot or a diff.
+    TopicsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// The snapshot or diff the broker sent.
+        change: magnetar_proto::TopicsChange,
+    },
+    /// A namespace-level scalable-topics watch ended.
+    TopicsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// The metadata-driven transaction-coordinator assignment set changed.
+    TcAssignmentsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// Number of transaction-coordinator partitions.
+        parallelism: u32,
+        /// Which broker serves each coordinator.
+        assignments: Vec<magnetar_proto::TcAssignment>,
+    },
+    /// A transaction-coordinator discovery watch ended.
+    TcAssignmentsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
         /// Optional close reason.
         reason: Option<String>,
     },

@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.**
+  The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
+  Every consumer instead spoke `pb/scalable_topics.rs`, a hand-encoded projection written while PIP-460 was upstream `Draft`, and nothing in it matched: `BaseCommand` types 80-85 against upstream's 70-78, a `CommandScalableTopicLookupResponse` that does not exist, a separate DAG-watch handshake keyed by a `lookup_token` that does not exist, `SplitEvent` / `MergeEvent` delta frames that do not exist, four segment states against upstream's two, and a fabricated `ProtocolVersion = 22` where upstream gates the feature on `FeatureFlags.supports_scalable_topics` and still tops at `v21`.
+  `magnetar-fakes` implemented the same projection, so all four ADR-0024 test layers plus the golden trace were green against bytes no Pulsar broker at any version could parse.
+  The vendored proto moves to `v5.0.0-M1` (`8dae0236`), the hand-encoded module is deleted along with the `PB_HAND_MAINTAINED_FILES` carve-out that hid it from `codegen --check`, and the state machine follows the upstream shape: the lookup **is** the watch subscribe, keyed by a client-allocated `session_id`; `CommandScalableTopicUpdate` carries both the initial layout and every pushed one; layouts are whole snapshots ordered by a monotonic `epoch`, with split and merge derived from the `parent_ids` / `child_ids` edges rather than read from event frames; and segment placement is an optional join from the parallel `SegmentBrokerAddress` list.
+  **Pulsar 4.x compatibility is preserved and is now explicit**: the client advertises `supports_scalable_topics` on `CommandConnect` and refuses to write any scalable-topic command to a peer that did not answer in kind, returning `ScalableTopicError::BrokerUnsupported` with an empty outbound buffer — which also covers a 5.x broker started with `scalableTopicsEnabled=false`.
+  Surface changes, all behind the default-off `scalable-topics` feature: `SegmentDescriptor::broker_url` becomes `Option<String>` and the type gains `broker_url_tls`, `parent_ids`, `child_ids`, `created_at_epoch`, `sealed_at_epoch` and `legacy_topic_name`; `SegmentState` loses `Splitting` and `Merging`; `DagDelta` gains `epoch`; `SplitEvent` / `MergeEvent` lose their `*_at_entry` fields; `DagError` swaps `UnknownSegment` for `Broker` and `Empty`; `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS` and the whole `pb::scalable_topics` module are removed; `Connection::{send_scalable_topic_lookup, open_dag_watch, close_dag_watch}` become `{open_scalable_topic_session, close_scalable_topic_session}`; and every `watch_session_id` field is now `session_id`.
+  A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
+  (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
+
+### Fixed
+
+- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.**
+  `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
+  Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.
+  The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
+  (ADR-0093)
+
+- **A scalable-topic watch no longer dies on the broker's own duplicate layout.**
+  `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
+  Pulsar 5.0.0-M1 answers `CommandScalableTopicLookup` with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup opened — so the very first thing a real broker sends after resolving tore the session down, and the client never saw another epoch, the split among them.
+  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open. Only a session mismatch, a broker-side error, or a bodyless update ends a session.
+  `DagError::NonMonotonic` is removed and `handle_update` returns `Result<Option<DagDelta>, DagError>`; both are behind the default-off `scalable-topics` feature.
+  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it. All four now cover the duplicate.
+  (ADR-0095, amending ADR-0093 § D2)
+
+- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
+  The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
+  `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
+  The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
+  It also failed **open**, crediting a line that never ran when the neighbour it was folded into did, which is the half that matters for a gate whose job is proving patch coverage.
+  The measurement now runs at `opt-level = 0` via `CARGO_PROFILE_TEST_OPT_LEVEL` on both the execution and re-export commands — a `[profile.test]` override rather than a `RUSTFLAGS` entry, since `cargo-llvm-cov` owns `RUSTFLAGS` for `-C instrument-coverage`.
+  Ordinary `cargo test` keeps `opt-level = 1`.
+  Toolchain skew and stale object files were both tested and refuted first.
+  (ADR-0094)
+
+### Added
+
+- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
+  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
+  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
+  An assignment whose `layout_epoch` does not advance is rejected rather than applied: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
+  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
+  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
+  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
+  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
+  (ADR-0093 §D5)
+
 ## [1.3.0] - 2026-08-03
 
 ### Added

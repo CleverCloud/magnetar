@@ -1781,6 +1781,7 @@ dependencies = [
  "moonpool-core",
  "parking_lot",
  "prost",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

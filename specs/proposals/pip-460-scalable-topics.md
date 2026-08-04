@@ -1,13 +1,17 @@
 # PIP-460 — Scalable topics / DAG-watch consumer (experimental)
 
-- **Status**: Accepted (scaffold landed 2026-05-28; ADR-0031 Accepted)
-- **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md)
+- **Status**: Historical — implemented, then superseded by [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) (2026-08-03)
+- **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md), superseded by [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md)
 - **Date**: 2026-05-26
 - **Owner**: Florentin Dubois
 - **Upstream**: [pip/pip-460.md](https://github.com/apache/pulsar/blob/master/pip/pip-460.md)
-- **Upstream readiness**: 🔴 **NOT LIVE.** Upstream PIP is `Draft`, targeting Pulsar 5.0 LTS (Oct 2026) with phased rollout via 4.3.0 / 4.4.0.
-  No released Pulsar broker ships PIP-460 wire surface today. 4-layer tests can land against in-process fakes; e2e is gated on upstream cutting a 5.0 RC.
-- **Broker baseline shift**: requires `apachepulsar/pulsar:5.0.0+`; the client compiled without `feature = "scalable-topics"` stays Pulsar-4.0+ compatible per [ADR-0009](../adr/0009-pulsar-4-minimum.md).
+- **Broker baseline shift**: requires `apachepulsar/pulsar:5.0.0-M1+`; the client negotiates the capability per connection and stays Pulsar-4.0+ compatible either way per [ADR-0009](../adr/0009-pulsar-4-minimum.md).
+
+> **⚠️ The wire-protocol sections below describe a projection, not the protocol upstream shipped.**
+> This proposal was written on 2026-05-26 while PIP-460 was upstream `Draft`, and it guessed the command set, field numbers, `BaseCommand.Type` discriminators (80-85 vs upstream's 70-78), segment lifecycle (four states vs two), and capability gate (a `ProtocolVersion` bump vs `FeatureFlags.supports_scalable_topics`).
+> Every one of those guesses turned out to be wrong.
+> The client migrated onto the vendored Pulsar 5.0.0-M1 surface under [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md), which records the measured divergence; read §1-§3 here as design history.
+> The scope decisions (StreamConsumer-only, drop-on-change, default-off feature) survive unchanged.
 
 ## TL;DR
 

@@ -140,6 +140,16 @@ jobs:
       # doesn't pay the pull cost inside the test wall budget. ADR-0046.
       - name: Pre-pull Pulsar broker image
         run: docker pull apachepulsar/pulsar:latest
+      # The PIP-460 e2e suite pins two further tags: 5.0.0-M1 is the first
+      # published release carrying the scalable-topic wire surface, and 4.0.4
+      # is the v4 broker the negotiation-refusal test needs to prove the
+      # capability is negotiated away rather than emitted blindly (ADR-0093
+      # §D3). Pre-pulled for the same reason as the tag above — testcontainers
+      # would otherwise pay the pull inside the test wall budget.
+      - name: Pre-pull PIP-460 broker images (Pulsar 5.0.0-M1 + 4.0.4)
+        run: |
+          docker pull apachepulsar/pulsar:5.0.0-M1
+          docker pull apachepulsar/pulsar:4.0.4
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
         run: docker pull gcavalcante8808/krb5-server:latest || true
       # Bring up the PIP-33 two-cluster docker-compose fixture. ADR-0046

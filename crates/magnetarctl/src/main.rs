@@ -215,7 +215,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: ContextCmd,
     },
-    /// **Experimental** (PIP-460 / ADR-0031). Print a scalable topic's current
+    /// **Experimental** (PIP-460 / ADR-0093). Print a scalable topic's current
     /// segment DAG. Resolves a `topic://...` URL against the controller broker
     /// and prints each segment's id, key range, state, and broker URL.
     /// Requires a Pulsar 5.0+ broker with PIP-460 enabled (no broker ships it
@@ -2573,7 +2573,7 @@ fn print_context_table(cfg: &config::PulsarConfig) {
     }
 }
 
-/// **Experimental** (PIP-460 / ADR-0031). Resolve a scalable topic's segment
+/// **Experimental** (PIP-460 / ADR-0093). Resolve a scalable topic's segment
 /// DAG and print it as a table. Wraps
 /// [`magnetar::PulsarClient::lookup_scalable_topic`].
 // Width-formatted string-literal column headers are the idiomatic CLI table
@@ -2592,17 +2592,25 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
         .await
         .map_err(|e| CliError::BadArg(format!("scalable lookup failed: {e}")))?;
     println!("topic: {topic}");
-    println!("controller-broker: {}", lookup.controller_broker_url);
-    println!("lookup-token: {}", lookup.lookup_token);
+    if let Some(resolved) = lookup.resolved_topic_name.as_deref() {
+        println!("resolved: {resolved}");
+    }
+    println!(
+        "controller-broker: {}",
+        lookup.controller_broker_url.as_deref().unwrap_or("-")
+    );
+    println!("layout-epoch: {}", lookup.epoch);
     println!(
         "{:<10} {:<18} {:<10} BROKER",
         "SEGMENT", "KEY-RANGE", "STATE"
     );
     for seg in &lookup.segments {
         let state = format!("{:?}", seg.state);
+        // A sealed segment the broker no longer serves carries no placement.
+        let broker = seg.broker_url.as_deref().unwrap_or("-");
         println!(
-            "{:<10} [{:>5},{:>5}) {state:<10} {}",
-            seg.segment_id.0, seg.key_range.start, seg.key_range.end, seg.broker_url,
+            "{:<10} [{:>5},{:>5}) {state:<10} {broker}",
+            seg.segment_id.0, seg.key_range.start, seg.key_range.end,
         );
     }
     println!("({} segment(s))", lookup.segments.len());

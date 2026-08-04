@@ -238,193 +238,169 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// PIP-460 scalable topics (ADR-0031, experimental). Scripted controller-broker
-// fake — replies to `CommandScalableTopicLookup` with a fixed DAG, acks a
-// `CommandSegmentDagWatch`, and emits a scripted sequence of
-// `CommandSegmentDagUpdate` frames (one split + one merge), then closes.
+// PIP-460 scalable topics (ADR-0093, experimental). Scripted controller-broker
+// fake — replies to `CommandScalableTopicLookup` with the initial layout, then
+// emits a scripted sequence of `CommandScalableTopicUpdate` frames (one split
+// layout + one merge layout) on the same session.
 // ---------------------------------------------------------------------------
 
-/// **Experimental** (PIP-460). Scripted controller-broker fake for the
-/// scalable-topic surface. Drives the client end-to-end through the real
-/// `pb::scalable_topics` wire commands: feed the client's outbound bytes via
+/// **Experimental** (PIP-460, ADR-0093). Scripted controller-broker fake for
+/// the scalable-topic surface. Drives the client end-to-end through the real
+/// upstream wire commands — ordinary `BaseCommand` frames, same framing as
+/// every other command: feed the client's outbound bytes via
 /// [`Self::on_client_bytes`], collect the broker's reply bytes, and pull the
-/// scripted DAG updates via [`Self::split_update`] / [`Self::merge_update`].
+/// scripted layouts via [`Self::split_update`] / [`Self::merge_update`].
+///
+/// Upstream pushes **whole layouts** stamped with a monotonic epoch rather than
+/// split / merge deltas, so each scripted update here is a complete
+/// `ScalableTopicDag` whose segments carry the `parent_ids` edges the client
+/// reads the topology change off.
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub struct ScriptedScalableBroker {
     controller_broker_url: String,
-    lookup_token: u64,
-    initial_dag: Vec<magnetar_proto::pb::scalable_topics::SegmentDescriptor>,
-    /// Watch session id observed from the client's subscribe (filled on watch).
-    watch_session_id: Option<u64>,
-    /// Next `update_seq` the broker will stamp.
-    next_update_seq: u64,
+    initial_dag: Vec<magnetar_proto::pb::SegmentInfoProto>,
+    /// Session id observed from the client's lookup (filled on lookup).
+    session_id: Option<u64>,
+    /// Next layout epoch the broker will stamp.
+    next_epoch: u64,
 }
 
 #[cfg(feature = "scalable-topics")]
 impl ScriptedScalableBroker {
-    /// Construct a broker with a two-segment initial DAG (`[0,32768)` /
-    /// `[32768,65536)`), a fixed controller URL, and `lookup_token = 42`.
+    /// Construct a broker with a two-segment initial layout (`[0,32768)` /
+    /// `[32768,65536)`) and a fixed controller URL.
     #[must_use]
     pub fn two_segment() -> Self {
-        use magnetar_proto::pb::scalable_topics::{SegmentDescriptor, SegmentStatePb};
         Self {
             controller_broker_url: "pulsar://controller:6650".to_owned(),
-            lookup_token: 42,
             initial_dag: vec![
-                SegmentDescriptor {
-                    segment_id: 1,
-                    broker_url: "pulsar://seg1:6650".to_owned(),
-                    broker_url_tls: None,
-                    key_range_start: 0,
-                    key_range_end: 32_768,
-                    state: SegmentStatePb::Active as i32,
-                },
-                SegmentDescriptor {
-                    segment_id: 2,
-                    broker_url: "pulsar://seg2:6650".to_owned(),
-                    broker_url_tls: None,
-                    key_range_start: 32_768,
-                    key_range_end: 65_536,
-                    state: SegmentStatePb::Active as i32,
-                },
+                Self::segment(1, 0, 32_768, &[]),
+                Self::segment(2, 32_768, 65_536, &[]),
             ],
-            watch_session_id: None,
-            next_update_seq: 1,
+            session_id: None,
+            next_epoch: 1,
         }
     }
 
-    /// The controller-broker URL this fake advertises in lookup responses.
+    /// Build a `SegmentInfoProto` with the given hash range and parent edges.
+    fn segment(
+        id: u64,
+        start: u32,
+        end: u32,
+        parents: &[u64],
+    ) -> magnetar_proto::pb::SegmentInfoProto {
+        magnetar_proto::pb::SegmentInfoProto {
+            segment_id: id,
+            hash_start: start,
+            hash_end: end,
+            state: magnetar_proto::pb::SegmentState::Active as i32,
+            parent_ids: parents.to_vec(),
+            child_ids: Vec::new(),
+            created_at_epoch: 0,
+            sealed_at_epoch: None,
+            created_at_ms: 0,
+            sealed_at_ms: None,
+            legacy_topic_name: None,
+        }
+    }
+
+    /// The controller-broker URL this fake advertises in its layouts.
     #[must_use]
     pub fn controller_broker_url(&self) -> &str {
         &self.controller_broker_url
     }
 
-    /// The lookup token this fake mints.
-    #[must_use]
-    pub fn lookup_token(&self) -> u64 {
-        self.lookup_token
-    }
-
     /// The initial DAG snapshot.
     #[must_use]
-    pub fn initial_dag(&self) -> &[magnetar_proto::pb::scalable_topics::SegmentDescriptor] {
+    pub fn initial_dag(&self) -> &[magnetar_proto::pb::SegmentInfoProto] {
         &self.initial_dag
     }
 
-    /// The watch session id the client allocated (after a subscribe was seen).
+    /// The session id the client allocated (after a lookup was seen).
     #[must_use]
-    pub fn watch_session_id(&self) -> Option<u64> {
-        self.watch_session_id
+    pub fn session_id(&self) -> Option<u64> {
+        self.session_id
+    }
+
+    /// Encode a `CommandScalableTopicUpdate` carrying `segments` as the whole
+    /// layout at the next epoch.
+    fn layout_update(
+        &mut self,
+        segments: Vec<magnetar_proto::pb::SegmentInfoProto>,
+    ) -> Option<bytes::BytesMut> {
+        let session_id = self.session_id?;
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        let segment_brokers = segments
+            .iter()
+            .map(|s| magnetar_proto::pb::SegmentBrokerAddress {
+                segment_id: s.segment_id,
+                broker_url: format!("pulsar://seg{}:6650", s.segment_id),
+                broker_url_tls: None,
+            })
+            .collect();
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::ScalableTopicUpdate as i32,
+            scalable_topic_update: Some(magnetar_proto::pb::CommandScalableTopicUpdate {
+                session_id,
+                dag: Some(magnetar_proto::pb::ScalableTopicDag {
+                    epoch,
+                    segments,
+                    segment_brokers,
+                    controller_broker_url: Some(self.controller_broker_url.clone()),
+                    controller_broker_url_tls: None,
+                }),
+                error: None,
+                message: None,
+                resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut out = bytes::BytesMut::new();
+        magnetar_proto::frame::encode_command(&mut out, &cmd).ok()?;
+        Some(out)
     }
 
     /// Feed one frame of the client's outbound bytes. Returns the broker's
-    /// reply bytes (a lookup response, a watch ack, or empty for frames that
-    /// need no immediate reply). Records the watch session id on a subscribe.
+    /// reply bytes — the initial layout for a lookup, empty for anything else.
+    /// Records the session id on a lookup.
     #[must_use]
-    pub fn on_client_bytes(&mut self, frame_bytes: &mut bytes::BytesMut) -> bytes::BytesMut {
-        use magnetar_proto::pb::scalable_topics as st;
-        let mut out = bytes::BytesMut::new();
-        let Ok(Some(scmd)) = st::decode(frame_bytes) else {
+    pub fn on_client_bytes(&mut self, frame_bytes: &mut bytes::Bytes) -> bytes::BytesMut {
+        let out = bytes::BytesMut::new();
+        let Ok(frame) = magnetar_proto::frame::decode_one(frame_bytes) else {
             return out;
         };
-        if let Some(lookup) = scmd.scalable_topic_lookup {
-            let resp = st::CommandScalableTopicLookupResponse {
-                request_id: lookup.request_id,
-                response: st::scalable_lookup_response::LookupType::Connect as i32,
-                controller_broker_url: Some(self.controller_broker_url.clone()),
-                controller_broker_url_tls: None,
-                segments: self.initial_dag.clone(),
-                lookup_token: Some(self.lookup_token),
-                error: None,
-                message: None,
-            };
-            let _ = st::encode(&mut out, &st::ScalableBaseCommand::lookup_response(resp));
-        } else if let Some(watch) = scmd.segment_dag_watch {
-            self.watch_session_id = Some(watch.watch_session_id);
-            let resp = st::CommandSegmentDagWatchResponse {
-                watch_session_id: watch.watch_session_id,
-                request_id: watch.request_id,
-                error: None,
-                message: None,
-            };
-            let _ = st::encode(&mut out, &st::ScalableBaseCommand::dag_watch_response(resp));
-        }
-        // Close frames need no reply.
-        out
+        let Some(lookup) = frame.command.scalable_topic_lookup else {
+            // Close frames need no reply, and neither does anything else.
+            return out;
+        };
+        self.session_id = Some(lookup.session_id);
+        let segments = self.initial_dag.clone();
+        self.layout_update(segments).unwrap_or_default()
     }
 
-    /// Produce the scripted **split** update for the current watch session: the
-    /// initial segment `1` splits into children `3` + `4`. Returns the encoded
-    /// `CommandSegmentDagUpdate` frame bytes, or `None` if no watch is open.
+    /// Produce the scripted **split** layout for the current session: the
+    /// initial segment `1` splits into children `3` + `4`, which name it in
+    /// their `parent_ids`. Segment `2` is carried through untouched. Returns
+    /// the encoded frame, or `None` if no session is open.
     #[must_use]
     pub fn split_update(&mut self) -> Option<bytes::BytesMut> {
-        use magnetar_proto::pb::scalable_topics as st;
-        let sid = self.watch_session_id?;
-        let upd = st::CommandSegmentDagUpdate {
-            watch_session_id: sid,
-            update_seq: self.next_update_seq,
-            added: vec![
-                st::SegmentDescriptor {
-                    segment_id: 3,
-                    broker_url: "pulsar://seg3:6650".to_owned(),
-                    broker_url_tls: None,
-                    key_range_start: 0,
-                    key_range_end: 16_384,
-                    state: st::SegmentStatePb::Active as i32,
-                },
-                st::SegmentDescriptor {
-                    segment_id: 4,
-                    broker_url: "pulsar://seg4:6650".to_owned(),
-                    broker_url_tls: None,
-                    key_range_start: 16_384,
-                    key_range_end: 32_768,
-                    state: st::SegmentStatePb::Active as i32,
-                },
-            ],
-            removed: vec![],
-            split_events: vec![st::SplitEvent {
-                parent_segment_id: 1,
-                child_segment_ids: vec![3, 4],
-                split_at_entry: 1000,
-            }],
-            merge_events: vec![],
-        };
-        self.next_update_seq += 1;
-        let mut out = bytes::BytesMut::new();
-        st::encode(&mut out, &st::ScalableBaseCommand::dag_update(upd)).ok()?;
-        Some(out)
+        self.layout_update(vec![
+            Self::segment(2, 32_768, 65_536, &[]),
+            Self::segment(3, 0, 16_384, &[1]),
+            Self::segment(4, 16_384, 32_768, &[1]),
+        ])
     }
 
-    /// Produce the scripted **merge** update: segments `3` + `4` merge into a
-    /// single child `5`. Returns the encoded frame, or `None` if no watch is
-    /// open.
+    /// Produce the scripted **merge** layout: segments `3` + `4` fold into a
+    /// single child `5`, which names both in its `parent_ids`. Returns the
+    /// encoded frame, or `None` if no session is open.
     #[must_use]
     pub fn merge_update(&mut self) -> Option<bytes::BytesMut> {
-        use magnetar_proto::pb::scalable_topics as st;
-        let sid = self.watch_session_id?;
-        let upd = st::CommandSegmentDagUpdate {
-            watch_session_id: sid,
-            update_seq: self.next_update_seq,
-            added: vec![st::SegmentDescriptor {
-                segment_id: 5,
-                broker_url: "pulsar://seg5:6650".to_owned(),
-                broker_url_tls: None,
-                key_range_start: 0,
-                key_range_end: 32_768,
-                state: st::SegmentStatePb::Active as i32,
-            }],
-            removed: vec![],
-            split_events: vec![],
-            merge_events: vec![st::MergeEvent {
-                parent_segment_ids: vec![3, 4],
-                child_segment_id: 5,
-                merge_at_entry: 2000,
-            }],
-        };
-        self.next_update_seq += 1;
-        let mut out = bytes::BytesMut::new();
-        st::encode(&mut out, &st::ScalableBaseCommand::dag_update(upd)).ok()?;
-        Some(out)
+        self.layout_update(vec![
+            Self::segment(2, 32_768, 65_536, &[]),
+            Self::segment(5, 0, 32_768, &[3, 4]),
+        ])
     }
 }

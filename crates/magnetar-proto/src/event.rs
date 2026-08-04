@@ -436,55 +436,135 @@ pub enum ConnectionEvent {
     /// [`Connection::record_first_op_success`](crate::Connection::record_first_op_success).
     AntiThrashCleared,
 
-    /// **Experimental** (PIP-460, ADR-0031). A `CommandScalableTopicLookup`
-    /// resolved into the topic's current segment DAG plus the controller
-    /// broker the client must open a [`crate::dag_watch::DagWatchSession`]
-    /// against. The runtime opens a connection to `controller_broker_url`
-    /// and issues `open_dag_watch` carrying `lookup_token`.
+    /// **Experimental** (PIP-460, ADR-0093). A `CommandScalableTopicLookup`
+    /// resolved: the session's first `CommandScalableTopicUpdate` landed,
+    /// carrying the topic's initial segment layout.
+    ///
+    /// Upstream folds lookup and watch-subscribe into one command, so the same
+    /// session keeps delivering [`Self::SegmentDagUpdated`] afterwards — the
+    /// runtime does not open a second session against the controller.
     #[cfg(feature = "scalable-topics")]
     ScalableTopicLookupResolved {
-        /// Request id of the originating `CommandScalableTopicLookup`.
-        request_id: RequestId,
-        /// Controller broker to open the DagWatch session against.
-        controller_broker_url: String,
-        /// Current DAG snapshot for the topic.
+        /// Client-allocated session id of the originating lookup.
+        session_id: u64,
+        /// Canonical `topic://...` identity the broker resolved the request to.
+        resolved_topic_name: Option<String>,
+        /// Controller broker serving this topic's layout, when advertised.
+        controller_broker_url: Option<String>,
+        /// Initial DAG snapshot for the topic.
         segments: Vec<crate::types::SegmentDescriptor>,
-        /// Monotonic lookup token, echoed into the DagWatch subscribe.
-        lookup_token: u64,
+        /// Layout epoch the snapshot was stamped with.
+        epoch: u64,
     },
 
-    /// **Experimental** (PIP-460, ADR-0031). A DAG-watch session received and
-    /// applied a `CommandSegmentDagUpdate`. Carries the [`crate::DagDelta`]
+    /// **Experimental** (PIP-460, ADR-0093). An open session applied a
+    /// subsequent `CommandScalableTopicUpdate`. Carries the [`crate::DagDelta`]
     /// so the runtime can reconcile its per-segment consumers.
     #[cfg(feature = "scalable-topics")]
     SegmentDagUpdated {
-        /// Watch session id the update belongs to.
-        watch_session_id: u64,
-        /// The applied delta (added / removed / split / merge).
+        /// Session id the update belongs to.
+        session_id: u64,
+        /// The applied delta (epoch, added / removed, derived split / merge).
         delta: crate::dag_watch::DagDelta,
     },
 
-    /// **Experimental** (PIP-460, ADR-0031). The segment DAG changed
+    /// **Experimental** (PIP-460, ADR-0093). The segment DAG changed
     /// (split / merge / removal) while a `StreamConsumer` was actively
     /// consuming. This is the "drop-on-change" guarantee — the
     /// runtime closes all per-segment v4 consumers and the caller must
     /// re-resolve + re-subscribe. No transparent failover.
     #[cfg(feature = "scalable-topics")]
     DagChangedDuringConsume {
-        /// Watch session id whose DAG changed.
-        watch_session_id: u64,
+        /// Session id whose DAG changed.
+        session_id: u64,
         /// Why the DAG changed (split / merge / removal).
         reason: crate::dag_watch::DagChangeReason,
     },
 
-    /// **Experimental** (PIP-460, ADR-0031). The controller-broker connection
-    /// backing a DAG-watch session closed. This surfaces it for the
-    /// caller to decide (no automatic re-lookup — controller-election
-    /// awareness is future work per ADR-0031).
+    /// **Experimental** (PIP-460, ADR-0093). A scalable consumer's registration
+    /// with the controller leader resolved, carrying its initial share of the
+    /// topic's segments.
+    #[cfg(feature = "scalable-topics")]
+    ScalableConsumerAssigned {
+        /// Consumer id that registered.
+        consumer_id: u64,
+        /// The `segment://` topics this consumer owns.
+        assignment: crate::scalable_consumer::ConsumerAssignment,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0093). The controller leader rebalanced a
+    /// registered consumer's share. The consumer attaches to
+    /// [`delta.gained`](crate::scalable_consumer::AssignmentDelta::gained) and
+    /// detaches from
+    /// [`delta.lost`](crate::scalable_consumer::AssignmentDelta::lost).
+    #[cfg(feature = "scalable-topics")]
+    ScalableAssignmentChanged {
+        /// Consumer id whose share changed.
+        consumer_id: u64,
+        /// What to attach to and detach from.
+        delta: crate::scalable_consumer::AssignmentDelta,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0093). A scalable consumer's registration
+    /// was rejected by the broker; the session is dropped.
+    #[cfg(feature = "scalable-topics")]
+    ScalableConsumerRejected {
+        /// Consumer id whose registration failed.
+        consumer_id: u64,
+        /// Why the broker rejected it.
+        reason: String,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0093). A namespace-level scalable-topics
+    /// watch delivered a snapshot or an incremental membership change.
+    #[cfg(feature = "scalable-topics")]
+    ScalableTopicsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// The snapshot or diff the broker sent.
+        change: crate::scalable_consumer::TopicsChange,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0093). A namespace-level scalable-topics
+    /// watch ended — closed by the client, or dropped on a broker rejection.
+    #[cfg(feature = "scalable-topics")]
+    ScalableTopicsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). The metadata-driven
+    /// transaction-coordinator assignment set changed.
+    #[cfg(feature = "scalable-topics")]
+    TcAssignmentsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// Number of transaction-coordinator partitions in the cluster.
+        parallelism: u32,
+        /// Which broker serves each coordinator.
+        assignments: Vec<crate::TcAssignment>,
+    },
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). A transaction-coordinator
+    /// discovery watch ended.
+    #[cfg(feature = "scalable-topics")]
+    TcAssignmentsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0093). A scalable-topic session ended —
+    /// closed by the client, or dropped because the broker rejected an update.
+    /// This surfaces it for the caller to decide (no automatic re-lookup —
+    /// controller-election awareness is future work per ADR-0093).
     #[cfg(feature = "scalable-topics")]
     DagWatchClosed {
-        /// Watch session id that closed.
-        watch_session_id: u64,
+        /// Session id that closed.
+        session_id: u64,
         /// Optional close reason for diagnostics.
         reason: Option<String>,
     },

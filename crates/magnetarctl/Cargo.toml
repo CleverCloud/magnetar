@@ -28,7 +28,7 @@ workspace = true
 [features]
 default = ["crypto-aws-lc-rs"]
 
-# PIP-460 scalable topics (ADR-0031). Default OFF. Adds the `topic-info`
+# PIP-460 scalable topics (ADR-0093). Default OFF. Adds the `topic-info`
 # subcommand (prints a scalable topic's segment DAG). Propagates the façade's
 # experimental scalable surface.
 scalable-topics = ["magnetar-driver/scalable-topics", "magnetar-admin/scalable-topics"]

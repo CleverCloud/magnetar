@@ -190,7 +190,7 @@ pub(crate) fn inject_otel_context(properties: &mut Vec<(String, String)>) {
 #[cfg(feature = "experimental-v5-client")]
 pub mod v5;
 
-/// **Experimental** — PIP-460 scalable-topic surface (ADR-0031). Behind
+/// **Experimental** — PIP-460 scalable-topic surface (ADR-0093). Behind
 /// `feature = "scalable-topics"` (default off). Exposes the
 /// [`scalable::ScalableTopicsApi`] engine hook and the
 /// [`scalable::StreamConsumer`] (StreamConsumer-only, drops on DAG change).

@@ -854,6 +854,70 @@ fn handle_frame(
             }
         }
         pb::base_command::Type::Ping => emit_pong(out),
+        // PIP-460 (ADR-0093). The lookup doubles as the layout subscribe, so a
+        // single `CommandScalableTopicUpdate` answers it and the session stays
+        // open. Two segments at epoch 1, each with a placement entry.
+        pb::base_command::Type::ScalableTopicLookup => {
+            if let Some(l) = &frame.command.scalable_topic_lookup {
+                // A topic whose name ends in `-missing` is the scripted
+                // rejection: the broker answers with an error and no layout, so
+                // both engines exercise the lookup-refused path.
+                if l.topic.ends_with("-missing") {
+                    emit_scalable_layout_rejection(out, l.session_id, true);
+                } else if l.topic.ends_with("-terse") {
+                    // Rejection with no `message`, so the client's fallback
+                    // wording is the one the caller sees.
+                    emit_scalable_layout_rejection(out, l.session_id, false);
+                } else {
+                    emit_scalable_layout(out, l.session_id);
+                    if l.topic.ends_with("-split") {
+                        // A second layout on the same session: segment 1 splits
+                        // into 3 + 4, so the client's pushed-update and
+                        // drop-on-change paths run end to end.
+                        emit_scalable_split_layout(out, l.session_id);
+                    }
+                }
+            }
+        }
+        pb::base_command::Type::ScalableTopicSubscribe => {
+            if let Some(sub) = &frame.command.scalable_topic_subscribe {
+                // Consumer id 99 is the scripted rejection: the broker answers
+                // with an authorization error and no assignment, so both engines
+                // exercise the registration-refused path.
+                if sub.consumer_id == 99 {
+                    emit_scalable_subscribe_rejection(out, sub.request_id);
+                } else {
+                    emit_scalable_subscribe_response(out, sub.request_id);
+                    // Follow the registration with one rebalance so the
+                    // assignment delta path is exercised on both engines.
+                    emit_scalable_assignment_update(out, sub.consumer_id);
+                }
+            }
+        }
+        pb::base_command::Type::WatchScalableTopics => {
+            if let Some(w) = &frame.command.watch_scalable_topics {
+                // A namespace ending `-deny` is the scripted refusal, so the
+                // watch-closed path runs end to end through the driver.
+                if w.namespace.ends_with("-deny") {
+                    emit_scalable_topics_rejection(out, w.watch_id);
+                } else {
+                    emit_scalable_topics_snapshot(out, w.watch_id);
+                    emit_scalable_topics_diff(out, w.watch_id);
+                }
+            }
+        }
+        pb::base_command::Type::WatchTcAssignments => {
+            if let Some(w) = &frame.command.watch_tc_assignments {
+                // An even watch id is the scripted refusal. The client allocates
+                // watch ids sequentially from 1 across both watch families, so a
+                // test opens one watch to reach an even id deterministically.
+                if w.watch_id % 2 == 0 {
+                    emit_tc_rejection(out, w.watch_id);
+                } else {
+                    emit_tc_assignments(out, w.watch_id);
+                }
+            }
+        }
         pb::base_command::Type::Lookup => {
             if let Some(l) = &frame.command.lookup_topic {
                 emit_lookup_response(out, l.request_id);
@@ -1283,6 +1347,261 @@ fn push_pending(
     }
 }
 
+/// Build a `SegmentInfoProto` with the given hash range and parent edges.
+fn scalable_segment(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
+    pb::SegmentInfoProto {
+        segment_id: id,
+        hash_start: start,
+        hash_end: end,
+        state: pb::SegmentState::Active as i32,
+        parent_ids: parents.to_vec(),
+        child_ids: Vec::new(),
+        created_at_epoch: 0,
+        sealed_at_epoch: None,
+        created_at_ms: 0,
+        sealed_at_ms: None,
+        legacy_topic_name: None,
+    }
+}
+
+/// Emit a rejected scalable-topic session: an error and no layout.
+fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64, with_message: bool) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: None,
+            error: Some(pb::ServerError::TopicNotFound as i32),
+            message: with_message.then(|| "scripted: topic does not exist".to_owned()),
+            resolved_topic_name: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit the initial two-segment layout for a scalable-topic session.
+fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
+    let segments = vec![
+        scalable_segment(1, 0, 32_768, &[]),
+        scalable_segment(2, 32_768, 65_536, &[]),
+    ];
+    let segment_brokers = segments
+        .iter()
+        .map(|s| pb::SegmentBrokerAddress {
+            segment_id: s.segment_id,
+            broker_url: format!("pulsar://seg{}:6650", s.segment_id),
+            broker_url_tls: None,
+        })
+        .collect();
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: Some(pb::ScalableTopicDag {
+                epoch: 1,
+                segments,
+                segment_brokers,
+                controller_broker_url: Some("pulsar://controller:6650".to_owned()),
+                controller_broker_url_tls: None,
+            }),
+            error: None,
+            message: None,
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a second layout in which segment 1 splits into 3 + 4.
+fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
+    let segments = vec![
+        scalable_segment(2, 32_768, 65_536, &[]),
+        scalable_segment(3, 0, 16_384, &[1]),
+        scalable_segment(4, 16_384, 32_768, &[1]),
+    ];
+    let segment_brokers = segments
+        .iter()
+        .map(|s| pb::SegmentBrokerAddress {
+            segment_id: s.segment_id,
+            broker_url: format!("pulsar://seg{}:6650", s.segment_id),
+            broker_url_tls: None,
+        })
+        .collect();
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUpdate as i32,
+        scalable_topic_update: Some(pb::CommandScalableTopicUpdate {
+            session_id,
+            dag: Some(pb::ScalableTopicDag {
+                epoch: 2,
+                segments,
+                segment_brokers,
+                controller_broker_url: Some("pulsar://controller:6650".to_owned()),
+                controller_broker_url_tls: None,
+            }),
+            error: None,
+            message: None,
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn scalable_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignment {
+    pb::ScalableConsumerAssignment {
+        layout_epoch: epoch,
+        segments: segs
+            .iter()
+            .map(|&id| pb::ScalableAssignedSegment {
+                segment_id: id,
+                hash_start: 0,
+                hash_end: 32_768,
+                segment_topic: format!("segment://public/default/scaled/{id}"),
+            })
+            .collect(),
+    }
+}
+
+/// Emit the response that resolves a consumer registration.
+fn emit_scalable_subscribe_response(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+        scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+            request_id,
+            error: None,
+            message: None,
+            assignment: Some(scalable_assignment(1, &[1])),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a rejected consumer registration: an error and no assignment.
+fn emit_scalable_subscribe_rejection(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+        scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+            request_id,
+            error: Some(pb::ServerError::AuthorizationError as i32),
+            message: Some("not permitted on this subscription".to_owned()),
+            assignment: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit one rebalance: segment 1 is replaced by segment 2 at epoch 2.
+fn emit_scalable_assignment_update(out: &mut BytesMut, consumer_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+        scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id,
+            assignment: scalable_assignment(2, &[2]),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_scalable_topics_update(
+    out: &mut BytesMut,
+    watch_id: u64,
+    event: pb::command_watch_scalable_topics_update::Event,
+) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchScalableTopicsUpdate as i32,
+        watch_scalable_topics_update: Some(pb::CommandWatchScalableTopicsUpdate {
+            watch_id,
+            error: None,
+            message: None,
+            event: Some(event),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a refused namespace watch: an error and no event.
+fn emit_scalable_topics_rejection(out: &mut BytesMut, watch_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchScalableTopicsUpdate as i32,
+        watch_scalable_topics_update: Some(pb::CommandWatchScalableTopicsUpdate {
+            watch_id,
+            error: Some(pb::ServerError::AuthorizationError as i32),
+            message: Some("scripted: namespace watch refused".to_owned()),
+            event: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit a refused coordinator-discovery watch: an error and no snapshot.
+fn emit_tc_rejection(out: &mut BytesMut, watch_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+        watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+            watch_id,
+            snapshot: None,
+            error: Some(pb::ServerError::ServiceNotReady as i32),
+            message: Some("scripted: coordinators unavailable".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit the initial namespace-watch snapshot.
+fn emit_scalable_topics_snapshot(out: &mut BytesMut, watch_id: u64) {
+    emit_scalable_topics_update(
+        out,
+        watch_id,
+        pb::command_watch_scalable_topics_update::Event::Snapshot(pb::ScalableTopicsSnapshot {
+            topics: vec!["topic://public/default/a".to_owned()],
+        }),
+    );
+}
+
+/// Emit an incremental namespace-watch diff.
+fn emit_scalable_topics_diff(out: &mut BytesMut, watch_id: u64) {
+    emit_scalable_topics_update(
+        out,
+        watch_id,
+        pb::command_watch_scalable_topics_update::Event::Diff(pb::ScalableTopicsDiff {
+            added: vec!["topic://public/default/c".to_owned()],
+            removed: vec!["topic://public/default/a".to_owned()],
+        }),
+    );
+}
+
+/// Emit a two-coordinator transaction-coordinator assignment snapshot.
+fn emit_tc_assignments(out: &mut BytesMut, watch_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchTcAssignmentsUpdate as i32,
+        watch_tc_assignments_update: Some(pb::CommandWatchTcAssignmentsUpdate {
+            watch_id,
+            snapshot: Some(pb::TcAssignmentsSnapshot {
+                parallelism: 2,
+                assignments: (0..2)
+                    .map(|tc_id| pb::TcAssignment {
+                        tc_id,
+                        broker_service_url: Some(format!("pulsar://tc{tc_id}:6650")),
+                        broker_service_url_tls: None,
+                    })
+                    .collect(),
+            }),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
 fn emit_connected(out: &mut BytesMut) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Connected as i32,
@@ -1290,7 +1609,15 @@ fn emit_connected(out: &mut BytesMut) {
             server_version: "magnetar-differential-broker".to_owned(),
             protocol_version: Some(21),
             max_message_size: Some(5 * 1024 * 1024),
-            feature_flags: Some(pb::FeatureFlags::default()),
+            // PIP-460 / PIP-473 (ADR-0093): the client refuses to emit any
+            // scalable-topic command unless the broker advertises the
+            // capability, so the scripted broker must claim both for the
+            // scalable transcripts to reach the wire at all.
+            feature_flags: Some(pb::FeatureFlags {
+                supports_scalable_topics: Some(true),
+                supports_tc_metadata_discovery: Some(true),
+                ..pb::FeatureFlags::default()
+            }),
         }),
         ..Default::default()
     };

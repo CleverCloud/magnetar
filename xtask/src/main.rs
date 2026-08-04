@@ -325,18 +325,8 @@ fn tempdir(base: &Path) -> Result<PathBuf> {
     Ok(base.to_path_buf())
 }
 
-/// Hand-maintained files that live in `pb/` but are NOT produced by codegen,
-/// so the drift check must ignore them. PIP-460's `scalable_topics.rs` is
-/// hand-encoded behind `feature = "scalable-topics"` until upstream cuts a
-/// Pulsar 5.0 RC including PIP-460 — at which point a dedicated
-/// `vendor-proto` commit (ADR-0026 §D4) replaces it and this carve-out is
-/// removed. See `crates/magnetar-proto/src/pb/scalable_topics.rs` and
-/// ADR-0031.
-const PB_HAND_MAINTAINED_FILES: &[&str] = &["scalable_topics.rs"];
-
 /// Compare files in `lhs` against `rhs`. Returns a list of human-readable
 /// difference descriptions. An empty Vec means the two trees are identical.
-/// Files in [`PB_HAND_MAINTAINED_FILES`] are skipped on both sides.
 fn diff_dirs(lhs: &Path, rhs: &Path) -> Result<Vec<String>> {
     use std::collections::BTreeMap;
 
@@ -354,9 +344,6 @@ fn diff_dirs(lhs: &Path, rhs: &Path) -> Result<Vec<String>> {
                 .to_str()
                 .ok_or_else(|| anyhow!("non-utf8 filename in {}", dir.display()))?
                 .to_owned();
-            if PB_HAND_MAINTAINED_FILES.contains(&name.as_str()) {
-                continue;
-            }
             let bytes = fs::read(entry.path())?;
             into.insert(name, bytes);
         }
@@ -1955,6 +1942,41 @@ const SIM_COVERAGE_REPORT_PACKAGES: &[&str] = &[
     "magnetar-auth-sasl",
 ];
 
+/// Optimization level the coverage build runs at, overriding the workspace's
+/// `[profile.test] opt-level = 1` for the duration of the measurement.
+///
+/// At `opt-level >= 1` rustc enables MIR inlining, and an inlined callee's
+/// coverage counter never fires: the call site is attributed, the callee reads
+/// zero. The gate then calls a line uncovered that a passing test provably
+/// executes. Measured 2026-08-04 on `magnetar-proto/src/scalable_consumer.rs`,
+/// whose `consumer_type()` is called twice from the synchronous
+/// `scalable_consumer_session_and_watch_accessors` test in
+/// `magnetar-differential`:
+///
+/// | `[profile.test] opt-level` | `DA:271` | verdict |
+/// | --- | --- | --- |
+/// | `1` (workspace default) | `0` | uncovered, gate fails |
+/// | `0` (this constant) | `2` — exactly the two call sites | gate passes |
+///
+/// The failure is not stable either, because whether a given function is
+/// inlined depends on codegen-unit partitioning: the same tree measured warm,
+/// cold, and on CI produced three different reports (63, 70 and 81 `SF:`
+/// records) and three different uncovered sets. CI blamed five signature lines
+/// of the `async fn` `magnetar-runtime-tokio::Client::scalable_topic_subscribe`
+/// — the outer future constructor, inlined away, while the coroutine body it
+/// builds cannot be inlined and reported hits throughout. That is the same
+/// mechanism seen from the other side.
+///
+/// It cuts both ways and the fail-open direction is the dangerous one: a line
+/// genuinely never executed can be credited because a neighbour it was folded
+/// into was. Coverage must therefore be measured against the source structure
+/// it reports on, which means unoptimized.
+///
+/// This is a `[profile.test]` override rather than a `RUSTFLAGS` entry because
+/// `cargo-llvm-cov` owns `RUSTFLAGS` — it appends `-C instrument-coverage`
+/// there — and a second writer would clobber it.
+const SIM_COVERAGE_OPT_LEVEL: &str = "0";
+
 /// Greppable tag stamped on every line `check-sim-coverage` emits when it was
 /// handed `--reuse-lcov`.
 ///
@@ -1976,6 +1998,12 @@ const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMEN
 /// 2. **Re-export** — `cargo llvm-cov report` over the same artifacts with
 ///    [`SIM_COVERAGE_REPORT_PACKAGES`], writing `target/sim-coverage.lcov`. No clean, no build, no
 ///    test run: it is a second `llvm-cov export` against files already on disk.
+///
+/// Both steps run at [`SIM_COVERAGE_OPT_LEVEL`], which overrides the
+/// workspace's `[profile.test] opt-level = 1`. Above zero the MIR inliner
+/// silences an inlined callee's counter, and the gate reports lines a passing
+/// test provably executed — non-deterministically, since inlining follows
+/// codegen-unit partitioning. See that constant for the measurement.
 ///
 /// The second step is what closes ADR-0088's scope gap, and it is nearly free
 /// because instrumentation was never the limit. `cargo-llvm-cov`'s `RUSTC_WRAPPER`
@@ -2076,6 +2104,9 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     // — see [`force_clang_toolchain`]. Without this the gate is unrunnable on
     // a bare Linux checkout, which is how it shipped until 2026-07-31.
     force_clang_toolchain(&mut exec);
+    // Measure at `opt-level = 0`, overriding the workspace's
+    // `[profile.test] opt-level = 1`. See [`SIM_COVERAGE_OPT_LEVEL`].
+    exec.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
     let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
     if !status.success() {
         bail!("`cargo llvm-cov` exited with status {status}");
@@ -2096,6 +2127,9 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     // (`SIM_COVERAGE_EXCLUDE_PREFIXES`); dropping it here too keeps the report
     // from carrying tens of thousands of prost-generated lines.
     report.args(["--ignore-filename-regex", "crates/magnetar-proto/src/pb/"]);
+    // Same override as step 1 so this re-export resolves the artifacts step 1
+    // just built rather than a differently-profiled set beside them.
+    report.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
     let status = report
         .status()
         .context("failed to invoke `cargo llvm-cov report`")?;

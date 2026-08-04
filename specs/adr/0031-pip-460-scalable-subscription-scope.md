@@ -1,6 +1,6 @@
 # ADR-0031 — PIP-460 scalable-topic / subscription scope
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR-0093](0093-pip-460-upstream-wire-surface.md)
 - **Date**: 2026-05-26 (accepted 2026-05-28)
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, segments, scope, experimental
@@ -78,9 +78,15 @@ The full DAG-aware split/merge surface, checkpoint consumer, and controller-brok
 
 ## Status
 
-Accepted (2026-05-28).
-The scaffold landed per the scope locked above: proto wire commands (hand-encoded behind `feature = "scalable-topics"` until the Pulsar 5.0 RC vendor bump), the `DagWatchSession` state machine, the `MessageId.segment_id` extension, both-engine `ScalableTopicsApi` impls, the `magnetar::scalable::StreamConsumer` surface (drop-on-DAG-change), the CLI `topic-info` subcommand, and the four-layer test set (proto unit + tokio + moonpool 1:1 + differential equivalence with a golden trace).
-E2E is `#[ignore]`'d behind `feature = "e2e,scalable-topics"` and remains deferred until upstream cuts a Pulsar 5.0 RC shipping PIP-460.
+Superseded by [ADR-0093](0093-pip-460-upstream-wire-surface.md) (2026-08-03).
+
+Accepted 2026-05-28; the scaffold landed per the scope locked above.
+**The wire-surface half of the decision above described a projection, not the protocol upstream shipped**, and every field number, message shape, and lifecycle assumption in it turned out to be wrong — see ADR-0093 for the measured divergence and the migration onto the vendored Pulsar 5.0.0-M1 surface.
+Read the wire-protocol paragraphs of this ADR as historical.
+
+What survives ADR-0093 unchanged: the StreamConsumer-only MVP, drop-on-DAG-change (no transparent failover), the default-off `scalable-topics` feature with its experimental banner, and the out-of-scope list (controller-election awareness, in-place repartition, Queue/Checkpoint consumers).
+The `MessageId.segment_id` extension named above was also part of the projection: Pulsar 5.0.0-M1's `MessageIdData` carries no segment field, and segment identity travels in the `segment://` topic name instead.
+E2E was `#[ignore]`'d here, then made a regular test by [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) with stub bodies, and is fleshed out against a real broker under ADR-0093.
 See [`docs/pip-features.md#scalable-topics-pip-460--experimental`](../../docs/pip-features.md#scalable-topics-pip-460--experimental) and the implementation in `git log`.
 
 ## References

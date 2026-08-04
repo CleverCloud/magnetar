@@ -67,7 +67,7 @@ impl ParsedUrl {
     }
 }
 
-/// **Experimental** (PIP-460, ADR-0031). `true` when `topic` uses the
+/// **Experimental** (PIP-460, ADR-0093). `true` when `topic` uses the
 /// scalable-topic `topic://...` URL scheme (as opposed to the v4
 /// `persistent://` / `non-persistent://` schemes). The builder routes a
 /// `topic://` URL to the scalable lookup path

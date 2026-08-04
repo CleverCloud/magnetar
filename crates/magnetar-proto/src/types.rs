@@ -63,7 +63,7 @@ impl fmt::Display for SequenceId {
 
 /// PIP-460 segment identifier — unique within a scalable topic's segment DAG.
 ///
-/// **Experimental** (PIP-460, ADR-0031). Only meaningful under
+/// **Experimental** (PIP-460, ADR-0093). Only meaningful under
 /// `feature = "scalable-topics"`; carried on [`MessageId::segment_id`] for
 /// messages read from a scalable topic.
 #[cfg(feature = "scalable-topics")]
@@ -79,7 +79,7 @@ impl fmt::Display for SegmentId {
 
 /// PIP-460 hash key range `[start, end)` a segment is responsible for.
 ///
-/// **Experimental** (PIP-460, ADR-0031). Surfaces the key range for
+/// **Experimental** (PIP-460, ADR-0093). Surfaces the key range for
 /// observation only — segment-aware sticky-key dispatch (Key_Shared across
 /// the full DAG) is out of scope (future work).
 #[cfg(feature = "scalable-topics")]
@@ -93,8 +93,14 @@ pub struct KeyRange {
 
 /// PIP-460 segment lifecycle state.
 ///
-/// **Experimental** (PIP-460, ADR-0031). `#[non_exhaustive]` so a future
-/// broker enum value cannot break a `match` on this type downstream.
+/// **Experimental** (PIP-460, ADR-0093). Mirrors the upstream wire enum
+/// [`pb::SegmentState`], which has exactly two members — a segment is either
+/// serving writes or sealed. `#[non_exhaustive]` so a future broker enum value
+/// cannot break a `match` on this type downstream.
+///
+/// A split or merge is **not** a segment state upstream: it is a DAG-topology
+/// change, read off the `parent_ids` / `child_ids` edges of a new layout and
+/// stamped by a fresh [`ScalableTopicDag`](crate::pb::ScalableTopicDag) epoch.
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
@@ -102,25 +108,19 @@ pub enum SegmentState {
     /// Segment is live and serving reads/writes.
     #[default]
     Active,
-    /// Segment is splitting into children.
-    Splitting,
-    /// Segment is merging into a child.
-    Merging,
     /// Segment is sealed (no more writes); reads drain then it is removed.
     Sealed,
 }
 
 #[cfg(feature = "scalable-topics")]
 impl SegmentState {
-    /// Convert from the wire enum integer, saturating unknown values to
+    /// Convert from the wire enum integer, saturating an unrecognised value to
     /// [`Self::Active`] (forward-compatibility with a future broker enum).
     #[must_use]
     pub fn from_pb_i32(value: i32) -> Self {
-        match crate::pb::scalable_topics::SegmentStatePb::from_i32(value) {
-            crate::pb::scalable_topics::SegmentStatePb::Active => Self::Active,
-            crate::pb::scalable_topics::SegmentStatePb::Splitting => Self::Splitting,
-            crate::pb::scalable_topics::SegmentStatePb::Merging => Self::Merging,
-            crate::pb::scalable_topics::SegmentStatePb::Sealed => Self::Sealed,
+        match crate::pb::SegmentState::try_from(value) {
+            Ok(crate::pb::SegmentState::Sealed) => Self::Sealed,
+            Ok(crate::pb::SegmentState::Active) | Err(_) => Self::Active,
         }
     }
 
@@ -128,19 +128,23 @@ impl SegmentState {
     #[must_use]
     pub fn to_pb_i32(self) -> i32 {
         match self {
-            Self::Active => crate::pb::scalable_topics::SegmentStatePb::Active as i32,
-            Self::Splitting => crate::pb::scalable_topics::SegmentStatePb::Splitting as i32,
-            Self::Merging => crate::pb::scalable_topics::SegmentStatePb::Merging as i32,
-            Self::Sealed => crate::pb::scalable_topics::SegmentStatePb::Sealed as i32,
+            Self::Sealed => crate::pb::SegmentState::Sealed as i32,
+            Self::Active => crate::pb::SegmentState::Active as i32,
         }
     }
 }
 
 /// PIP-460 segment descriptor — one node of a scalable topic's segment DAG.
 ///
-/// **Experimental** (PIP-460, ADR-0031). Returned by the scalable-topic
-/// lookup and carried in DAG-watch updates. `broker_url` is the segment
-/// leader's plaintext URL.
+/// **Experimental** (PIP-460, ADR-0093). Assembled from the upstream wire pair
+/// [`pb::SegmentInfoProto`] (topology + lifecycle) and [`pb::SegmentBrokerAddress`]
+/// (placement), which [`pb::ScalableTopicDag`] carries as two parallel lists keyed
+/// by `segment_id`. Placement is therefore **optional**: a sealed segment the
+/// broker no longer serves has no address entry, and `broker_url` is `None` for it.
+///
+/// `parent_ids` / `child_ids` are the DAG edges. They are what identifies a split
+/// (one parent, several children) or a merge (several parents, one child) — see
+/// [`DagDelta`](crate::dag_watch::DagDelta).
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentDescriptor {
@@ -148,40 +152,118 @@ pub struct SegmentDescriptor {
     pub segment_id: SegmentId,
     /// Hash key range this segment serves.
     pub key_range: KeyRange,
-    /// Plaintext broker URL serving this segment.
-    pub broker_url: String,
+    /// Plaintext broker URL serving this segment, when the DAG carries a
+    /// placement entry for it.
+    pub broker_url: Option<String>,
+    /// TLS broker URL serving this segment, when advertised.
+    pub broker_url_tls: Option<String>,
     /// Lifecycle state.
     pub state: SegmentState,
+    /// Ids of the segments this one descends from (empty for an original segment).
+    pub parent_ids: Vec<SegmentId>,
+    /// Ids of the segments that descend from this one (empty for a leaf).
+    pub child_ids: Vec<SegmentId>,
+    /// DAG generation at which the segment was created. This is a layout epoch,
+    /// not a clock.
+    pub created_at_epoch: u64,
+    /// DAG generation at which the segment was sealed, when it is sealed.
+    pub sealed_at_epoch: Option<u64>,
+    /// Legacy-segment marker. When set, the segment is not managed by the
+    /// scalable-topic controller and wraps this externally-managed
+    /// `persistent://...` topic instead of a `segment://...` one. The broker sets
+    /// it on the synthetic single-segment layout it returns for a regular topic
+    /// that has not been migrated to a scalable topic.
+    pub legacy_topic_name: Option<String>,
 }
 
 #[cfg(feature = "scalable-topics")]
 impl SegmentDescriptor {
-    /// Decode from the wire [`crate::pb::scalable_topics::SegmentDescriptor`].
+    /// Assemble from the wire pair. `broker` is the [`pb::SegmentBrokerAddress`]
+    /// whose `segment_id` matches `info`, when the DAG carries one.
     #[must_use]
-    pub fn from_pb(pb: &crate::pb::scalable_topics::SegmentDescriptor) -> Self {
+    pub fn from_pb(
+        info: &crate::pb::SegmentInfoProto,
+        broker: Option<&crate::pb::SegmentBrokerAddress>,
+    ) -> Self {
         Self {
-            segment_id: SegmentId(pb.segment_id),
+            segment_id: SegmentId(info.segment_id),
             key_range: KeyRange {
-                start: pb.key_range_start,
-                end: pb.key_range_end,
+                start: info.hash_start,
+                end: info.hash_end,
             },
-            broker_url: pb.broker_url.clone(),
-            state: SegmentState::from_pb_i32(pb.state),
+            broker_url: broker.map(|b| b.broker_url.clone()),
+            broker_url_tls: broker.and_then(|b| b.broker_url_tls.clone()),
+            state: SegmentState::from_pb_i32(info.state),
+            parent_ids: info.parent_ids.iter().copied().map(SegmentId).collect(),
+            child_ids: info.child_ids.iter().copied().map(SegmentId).collect(),
+            created_at_epoch: info.created_at_epoch,
+            sealed_at_epoch: info.sealed_at_epoch,
+            legacy_topic_name: info.legacy_topic_name.clone(),
         }
     }
 
-    /// Encode into the wire [`crate::pb::scalable_topics::SegmentDescriptor`].
+    /// Split back into the wire pair. The address half is `None` when the
+    /// descriptor carries no placement.
+    ///
+    /// `created_at_ms` / `sealed_at_ms` are broker-authored wall-clock stamps that
+    /// this client only ever reads, so the encode side emits `0` / `None` for them
+    /// rather than inventing a clock — `magnetar-proto` holds no clock at all
+    /// (ADR-0011). Round-tripping a decoded descriptor therefore does not preserve
+    /// them; nothing in the client reads them back.
     #[must_use]
-    pub fn to_pb(&self) -> crate::pb::scalable_topics::SegmentDescriptor {
-        crate::pb::scalable_topics::SegmentDescriptor {
+    pub fn to_pb(
+        &self,
+    ) -> (
+        crate::pb::SegmentInfoProto,
+        Option<crate::pb::SegmentBrokerAddress>,
+    ) {
+        let info = crate::pb::SegmentInfoProto {
             segment_id: self.segment_id.0,
-            broker_url: self.broker_url.clone(),
-            broker_url_tls: None,
-            key_range_start: self.key_range.start,
-            key_range_end: self.key_range.end,
+            hash_start: self.key_range.start,
+            hash_end: self.key_range.end,
             state: self.state.to_pb_i32(),
-        }
+            parent_ids: self.parent_ids.iter().map(|s| s.0).collect(),
+            child_ids: self.child_ids.iter().map(|s| s.0).collect(),
+            created_at_epoch: self.created_at_epoch,
+            sealed_at_epoch: self.sealed_at_epoch,
+            created_at_ms: 0,
+            sealed_at_ms: None,
+            legacy_topic_name: self.legacy_topic_name.clone(),
+        };
+        let address = self
+            .broker_url
+            .as_ref()
+            .map(|url| crate::pb::SegmentBrokerAddress {
+                segment_id: self.segment_id.0,
+                broker_url: url.clone(),
+                broker_url_tls: self.broker_url_tls.clone(),
+            });
+        (info, address)
     }
+
+    /// `true` when this descriptor is the broker's synthetic wrapper around a
+    /// regular, unmigrated topic rather than a controller-managed segment.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.legacy_topic_name.is_some()
+    }
+}
+
+/// PIP-473 transaction-coordinator assignment — which broker serves one
+/// coordinator partition.
+///
+/// **Experimental** (PIP-460 / PIP-473, ADR-0093). Delivered by the
+/// metadata-driven coordinator-discovery watch, which replaces resolving the
+/// coordinator topic through an ordinary lookup.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcAssignment {
+    /// Transaction-coordinator partition id.
+    pub tc_id: u64,
+    /// Plaintext broker URL serving this coordinator, when advertised.
+    pub broker_service_url: Option<String>,
+    /// TLS broker URL serving this coordinator, when advertised.
+    pub broker_service_url_tls: Option<String>,
 }
 
 /// A logical message identifier (ledger / entry / batch / partition).
@@ -202,7 +284,7 @@ impl SegmentDescriptor {
 ///
 /// Under `feature = "scalable-topics"` the id carries an optional
 /// `segment_id` field. The derived `PartialEq` / `Ord` / `Hash`
-/// give exactly the cross-mode contract ADR-0031 specifies: two v4 ids both
+/// give exactly the cross-mode contract ADR-0093 specifies: two v4 ids both
 /// carry `None`, so the segment field is a tie and the v4 invariant is
 /// preserved bit-for-bit; a scalable id (`Some(_)`) never compares equal to a
 /// v4 id (`None`) — so callers can't accidentally deduplicate across the
@@ -408,7 +490,7 @@ mod tests {
     /// through [`MessageId::with_segment`] / [`MessageId::segment`], and the
     /// v4-shape (`segment_id: None`) `to_bytes` is **byte-identical** to a
     /// plain v4 id — the wire `MessageIdData` carries no segment field, so a
-    /// legacy producer / consumer round-trips bit-for-bit (ADR-0031 §2.1).
+    /// legacy producer / consumer round-trips bit-for-bit (ADR-0093 §2.1).
     #[cfg(feature = "scalable-topics")]
     #[test]
     fn message_id_with_segment_roundtrip() {

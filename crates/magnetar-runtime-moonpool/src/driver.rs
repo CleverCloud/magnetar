@@ -93,6 +93,18 @@ enum RetryRequest {
     Consumer(ConsumerHandle, RequestId),
 }
 
+/// Push one scalable-topic event into the per-client buffer and wake
+/// `next_scalable_event`.
+///
+/// Every scalable arm in [`handle_pending_events`] ends this way; keeping the
+/// lock and the wake in one place is what stops an arm from pushing without
+/// notifying, which would strand a caller until the next unrelated event.
+#[cfg(feature = "scalable-topics")]
+fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
+    shared.scalable_events.lock().push_back(event);
+    shared.scalable_notify.notify_waiters();
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (`Connected`, `SendReceipt`,
 /// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
@@ -158,6 +170,13 @@ fn handle_pending_events(
                     | ConnectionEvent::SegmentDagUpdated { .. }
                     | ConnectionEvent::DagChangedDuringConsume { .. }
                     | ConnectionEvent::DagWatchClosed { .. }
+                    | ConnectionEvent::ScalableConsumerAssigned { .. }
+                    | ConnectionEvent::ScalableAssignmentChanged { .. }
+                    | ConnectionEvent::ScalableConsumerRejected { .. }
+                    | ConnectionEvent::ScalableTopicsChanged { .. }
+                    | ConnectionEvent::ScalableTopicsWatchClosed { .. }
+                    | ConnectionEvent::TcAssignmentsChanged { .. }
+                    | ConnectionEvent::TcAssignmentsWatchClosed { .. }
             ) {
                 return true;
             }
@@ -300,66 +319,106 @@ fn handle_pending_events(
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
             }
-            // PIP-460 (ADR-0031): mirror the tokio driver's scalable-event
+            // PIP-460 (ADR-0093): mirror the tokio driver's scalable-event
             // drain into the per-client buffer + wake `next_scalable_event`.
+            // PIP-460 (ADR-0093). Every scalable event lands in the per-client
+            // buffer the same way, so the arms only translate the payload and
+            // `emit_scalable` owns the lock + wake. Eleven inline copies of the
+            // triple is where a missed `notify_waiters` hides.
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableConsumerAssigned {
+                consumer_id,
+                assignment,
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::ConsumerAssigned {
+                    consumer_id,
+                    assignment,
+                },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => emit_scalable(
+                shared,
+                crate::ScalableEvent::AssignmentChanged { consumer_id, delta },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableConsumerRejected {
+                consumer_id,
+                reason,
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::ConsumerRejected {
+                    consumer_id,
+                    reason,
+                },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableTopicsChanged { watch_id, change } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TopicsChanged { watch_id, change },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableTopicsWatchClosed { watch_id, reason } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TopicsWatchClosed { watch_id, reason },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::TcAssignmentsChanged {
+                watch_id,
+                parallelism,
+                assignments,
+            } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TcAssignmentsChanged {
+                    watch_id,
+                    parallelism,
+                    assignments,
+                },
+            ),
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::TcAssignmentsWatchClosed { watch_id, reason } => emit_scalable(
+                shared,
+                crate::ScalableEvent::TcAssignmentsWatchClosed { watch_id, reason },
+            ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableTopicLookupResolved {
-                request_id,
+                session_id,
+                resolved_topic_name,
                 controller_broker_url,
                 segments,
-                lookup_token,
+                epoch,
             } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::LookupResolved {
-                        request_id,
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::LookupResolved {
+                        session_id,
+                        resolved_topic_name,
                         controller_broker_url,
                         segments,
-                        lookup_token,
-                    });
-                shared.scalable_notify.notify_waiters();
-            }
-            #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::SegmentDagUpdated {
-                watch_session_id,
-                delta,
-            } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::DagUpdated {
-                        watch_session_id,
-                        delta,
-                    });
-                shared.scalable_notify.notify_waiters();
-            }
-            #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::DagChangedDuringConsume {
-                watch_session_id,
-                reason,
-            } => {
-                shared.scalable_events.lock().push_back(
-                    crate::ScalableEvent::DagChangedDuringConsume {
-                        watch_session_id,
-                        reason,
+                        epoch,
                     },
                 );
-                shared.scalable_notify.notify_waiters();
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::DagWatchClosed {
-                watch_session_id,
-                reason,
-            } => {
-                shared
-                    .scalable_events
-                    .lock()
-                    .push_back(crate::ScalableEvent::DagWatchClosed {
-                        watch_session_id,
-                        reason,
-                    });
-                shared.scalable_notify.notify_waiters();
+            ConnectionEvent::SegmentDagUpdated { session_id, delta } => {
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::DagUpdated { session_id, delta },
+                );
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::DagChangedDuringConsume { session_id, reason } => {
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::DagChangedDuringConsume { session_id, reason },
+                );
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::DagWatchClosed { session_id, reason } => {
+                emit_scalable(
+                    shared,
+                    crate::ScalableEvent::DagWatchClosed { session_id, reason },
+                );
             }
             // Diagnostic events consumed SILENTLY — single-owner rule
             // (ADR-0054, decision Q1): `magnetar-proto` owns the
@@ -1527,6 +1586,11 @@ where
                     Ok(n) => n,
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         return Err(err.into());
                     }
                 };
@@ -1538,6 +1602,11 @@ where
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1584,6 +1653,11 @@ where
                 let handle_result = shared.inner.lock().handle_bytes_owned(now, chunk);
                 if let Err(err) = handle_result {
                     shared.inner.lock().mark_disconnected();
+                    // Wake anything parked on a scalable wait loop: those only
+                    // re-check `is_closed()` when a scalable event arrives, so a
+                    // dead connection would park them forever.
+                    #[cfg(feature = "scalable-topics")]
+                    shared.scalable_notify.notify_waiters();
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1692,6 +1766,11 @@ where
                     }
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         return Err(err.into());
                     }
                 }

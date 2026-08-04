@@ -356,7 +356,7 @@ pub struct ConnectionShared {
     ///
     /// [`TimeProvider`]: moonpool_core::TimeProvider
     pub now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync>,
-    /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
+    /// PIP-460 (ADR-0093) scalable-topic events the driver drained off the
     /// proto queue. Mirrors the tokio engine's identically-named buffer.
     /// Surface via [`Client::next_scalable_event`].
     #[cfg(feature = "scalable-topics")]
@@ -641,7 +641,7 @@ impl ConnectionShared {
         shared
     }
 
-    // PIP-460 (ADR-0031) types mirror the tokio engine's
+    // PIP-460 (ADR-0093) types mirror the tokio engine's
     // `ScalableLookup` / `ScalableEvent` (see `magnetar_runtime_tokio`).
 
     /// Try to reserve `bytes` against the configured memory budget.
@@ -819,7 +819,7 @@ pub struct ObservedReplicatedSubscriptionMarker {
     pub marker: magnetar_proto::ReplicatedSubscriptionMarker,
 }
 
-/// **Experimental** (PIP-460, ADR-0031). `true` when `topic` uses the
+/// **Experimental** (PIP-460, ADR-0093). `true` when `topic` uses the
 /// scalable-topic `topic://...` URL scheme. 1:1 with the tokio engine's
 /// `is_scalable_topic_url` (proposal §3.2 — `topic://` URL parser parity).
 #[cfg(feature = "scalable-topics")]
@@ -845,54 +845,113 @@ mod scalable_url_tests {
     }
 }
 
-/// PIP-460 (ADR-0031) resolved scalable-topic lookup. Mirrors the tokio
+/// PIP-460 (ADR-0093) resolved scalable-topic lookup. Mirrors the tokio
 /// engine's `ScalableLookup`. **Experimental.**
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub struct ScalableLookup {
-    /// Controller broker to open the DagWatch session against.
-    pub controller_broker_url: String,
-    /// Current DAG snapshot for the topic.
+    /// Client-allocated session id. The session stays open and keeps receiving
+    /// layout updates until it is closed; pass this to
+    /// `close_scalable_topic_session`.
+    pub session_id: u64,
+    /// Canonical `topic://...` identity the broker resolved the request to.
+    pub resolved_topic_name: Option<String>,
+    /// Controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url: Option<String>,
+    /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
-    /// Monotonic lookup token, echoed into the DagWatch subscribe.
-    pub lookup_token: u64,
+    /// Layout epoch the snapshot was stamped with.
+    pub epoch: u64,
 }
 
-/// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
+/// PIP-460 (ADR-0093) scalable-topic event surfaced from the driver to the
 /// user-facing [`Client`]. Mirrors the tokio engine's `ScalableEvent`.
 /// **Experimental.**
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub enum ScalableEvent {
-    /// A `CommandScalableTopicLookup` resolved into the current segment DAG.
+    /// A scalable-topic session resolved: its first layout landed.
     LookupResolved {
-        /// Request id of the originating lookup.
-        request_id: magnetar_proto::RequestId,
-        /// Controller broker to open the DagWatch session against.
-        controller_broker_url: String,
-        /// Current DAG snapshot for the topic.
+        /// Client-allocated session id of the originating lookup.
+        session_id: u64,
+        /// Canonical `topic://...` identity the broker resolved the request to.
+        resolved_topic_name: Option<String>,
+        /// Controller broker serving this topic's layout, when advertised.
+        controller_broker_url: Option<String>,
+        /// Initial DAG snapshot for the topic.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
-        /// Monotonic lookup token.
-        lookup_token: u64,
+        /// Layout epoch the snapshot was stamped with.
+        epoch: u64,
     },
-    /// A DAG-watch session received and applied an update.
+    /// An open session applied a subsequent layout.
     DagUpdated {
-        /// Watch session id the update belongs to.
-        watch_session_id: u64,
+        /// Session id the update belongs to.
+        session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
-        /// Watch session id whose DAG changed.
-        watch_session_id: u64,
+        /// Session id whose DAG changed.
+        session_id: u64,
         /// Why the DAG changed.
         reason: magnetar_proto::DagChangeReason,
     },
-    /// The DAG-watch session closed.
+    /// The scalable-topic session closed.
     DagWatchClosed {
-        /// Watch session id that closed.
-        watch_session_id: u64,
+        /// Session id that closed.
+        session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// A scalable consumer's registration resolved with its initial share.
+    ConsumerAssigned {
+        /// Consumer id that registered.
+        consumer_id: u64,
+        /// The `segment://` topics this consumer owns.
+        assignment: magnetar_proto::ConsumerAssignment,
+    },
+    /// The controller leader rebalanced a registered consumer's share.
+    AssignmentChanged {
+        /// Consumer id whose share changed.
+        consumer_id: u64,
+        /// What to attach to and detach from.
+        delta: magnetar_proto::AssignmentDelta,
+    },
+    /// A scalable consumer's registration was rejected.
+    ConsumerRejected {
+        /// Consumer id whose registration failed.
+        consumer_id: u64,
+        /// Why the broker rejected it.
+        reason: String,
+    },
+    /// A namespace-level scalable-topics watch delivered a snapshot or a diff.
+    TopicsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// The snapshot or diff the broker sent.
+        change: magnetar_proto::TopicsChange,
+    },
+    /// A namespace-level scalable-topics watch ended.
+    TopicsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+    /// The metadata-driven transaction-coordinator assignment set changed.
+    TcAssignmentsChanged {
+        /// Watch id the update belongs to.
+        watch_id: u64,
+        /// Number of transaction-coordinator partitions.
+        parallelism: u32,
+        /// Which broker serves each coordinator.
+        assignments: Vec<magnetar_proto::TcAssignment>,
+    },
+    /// A transaction-coordinator discovery watch ended.
+    TcAssignmentsWatchClosed {
+        /// Watch id that closed.
+        watch_id: u64,
         /// Optional close reason.
         reason: Option<String>,
     },

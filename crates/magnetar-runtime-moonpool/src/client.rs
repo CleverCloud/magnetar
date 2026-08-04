@@ -1161,47 +1161,83 @@ impl<P: Providers> Client<P> {
     }
 
     // -------------------------------------------------------------------
-    // PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
+    // PIP-460 scalable topics (ADR-0093, experimental). 1:1 with the tokio
     // engine's `Client` methods — drives the proto `Connection` scalable
     // entries + reads driver-drained events via the same buffer + Notify
     // pattern as the PIP-145 topic-list deltas. No channels.
     // -------------------------------------------------------------------
 
-    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...` scalable
-    /// topic. Mirrors the tokio engine's `Client::scalable_topic_lookup`.
+    /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic session for
+    /// `topic` and await its first layout.
+    ///
+    /// Upstream folds lookup and DAG-watch subscribe into one command, so this
+    /// both resolves the topic **and** leaves the session open: subsequent
+    /// layouts arrive through [`Self::next_scalable_event`] until
+    /// [`Self::close_scalable_topic_session`]. `topic` may be a `topic://`, a
+    /// `persistent://`, or a short name — the broker returns the canonical
+    /// identity in [`crate::ScalableLookup::resolved_topic_name`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_scalable_topics` — a
+    /// Pulsar 4.x peer, or a 5.x one started with `scalableTopicsEnabled=false`
+    /// — and when the connection closes before the first layout lands.
     #[cfg(feature = "scalable-topics")]
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
     ) -> Result<crate::ScalableLookup, ClientError> {
-        let request_id = {
+        let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.send_scalable_topic_lookup(topic, false)
+            conn.open_scalable_topic_session(topic)
+                .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();
         loop {
+            // Drain the first terminal event for our session id. A rejected
+            // session ends as `DagWatchClosed`, not `LookupResolved` — waiting
+            // only for the success variant would hang the caller until the
+            // connection closed, which is exactly the shape
+            // `scalable_topic_subscribe` avoids by racing its two outcomes.
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
                     matches!(
                         ev,
-                        crate::ScalableEvent::LookupResolved { request_id: r, .. } if *r == request_id
+                        crate::ScalableEvent::LookupResolved { session_id: s, .. }
+                            | crate::ScalableEvent::DagWatchClosed { session_id: s, .. }
+                            if *s == session_id
                     )
                 });
                 pos.and_then(|p| buf.remove(p))
             };
-            if let Some(crate::ScalableEvent::LookupResolved {
-                controller_broker_url,
-                segments,
-                lookup_token,
-                ..
-            }) = drained
-            {
-                return Ok(crate::ScalableLookup {
+            match drained {
+                Some(crate::ScalableEvent::LookupResolved {
+                    resolved_topic_name,
                     controller_broker_url,
                     segments,
-                    lookup_token,
-                });
+                    epoch,
+                    ..
+                }) => {
+                    return Ok(crate::ScalableLookup {
+                        session_id,
+                        resolved_topic_name,
+                        controller_broker_url,
+                        segments,
+                        epoch,
+                    });
+                }
+                Some(crate::ScalableEvent::DagWatchClosed { reason, .. }) => {
+                    // Always formatted rather than defaulted: every producer of
+                    // `DagWatchClosed` sets a reason, so a fallback branch would
+                    // be unreachable, and naming the session makes the error
+                    // useful when several are open on one connection.
+                    return Err(ClientError::Other(format!(
+                        "scalable-topic session {session_id} closed before it resolved: {}",
+                        reason.unwrap_or_default()
+                    )));
+                }
+                _ => {}
             }
             if self.shared.inner.lock().is_closed() {
                 return Err(ClientError::Other(
@@ -1212,34 +1248,184 @@ impl<P: Providers> Client<P> {
         }
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Open a DAG-watch session.
-    /// Mirrors the tokio engine's `Client::open_scalable_dag_watch`.
+    /// **Experimental** (PIP-460, ADR-0093). Whether the connected broker
+    /// advertised the PIP-460 capability. `false` against a Pulsar 4.x peer.
     #[cfg(feature = "scalable-topics")]
-    pub fn open_scalable_dag_watch(
-        &self,
-        topic: &str,
-        lookup_token: u64,
-        segments: Vec<magnetar_proto::SegmentDescriptor>,
-    ) -> u64 {
-        let sid = {
-            let mut conn = self.shared.inner.lock();
-            conn.open_dag_watch(topic, lookup_token, segments)
-        };
-        self.shared.driver_waker.notify_one();
-        sid
+    #[must_use]
+    pub fn broker_supports_scalable_topics(&self) -> bool {
+        self.shared.inner.lock().broker_supports_scalable_topics()
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Close a DAG-watch session.
+    /// **Experimental** (PIP-460, ADR-0093). Register as a scalable consumer
+    /// with the controller leader and await the initial assignment.
+    ///
+    /// This is what obtains a **share** of a scalable topic — the
+    /// `segment://` topics this consumer owns. Resolving the layout with
+    /// [`Self::scalable_topic_lookup`] does not grant one. Rebalances arrive
+    /// afterwards as [`crate::ScalableEvent::AssignmentChanged`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_scalable_topics`, when
+    /// the broker rejects the registration, and when the connection closes
+    /// before the assignment lands.
     #[cfg(feature = "scalable-topics")]
-    pub fn close_scalable_dag_watch(&self, watch_session_id: u64) {
+    pub async fn scalable_topic_subscribe(
+        &self,
+        topic: &str,
+        subscription: &str,
+        consumer_name: &str,
+        consumer_id: u64,
+        consumer_type: magnetar_proto::ScalableConsumerType,
+    ) -> Result<magnetar_proto::ConsumerAssignment, ClientError> {
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_dag_watch(watch_session_id);
+            conn.scalable_topic_subscribe(
+                topic,
+                subscription,
+                consumer_name,
+                consumer_id,
+                consumer_type,
+            )
+            .map_err(|err| ClientError::Other(err.to_string()))?;
+        }
+        self.shared.driver_waker.notify_one();
+        loop {
+            let drained = {
+                let mut buf = self.shared.scalable_events.lock();
+                let pos = buf.iter().position(|ev| {
+                    matches!(
+                        ev,
+                        crate::ScalableEvent::ConsumerAssigned { consumer_id: c, .. }
+                            | crate::ScalableEvent::ConsumerRejected { consumer_id: c, .. }
+                            if *c == consumer_id
+                    )
+                });
+                pos.and_then(|p| buf.remove(p))
+            };
+            match drained {
+                Some(crate::ScalableEvent::ConsumerAssigned { assignment, .. }) => {
+                    return Ok(assignment);
+                }
+                Some(crate::ScalableEvent::ConsumerRejected { reason, .. }) => {
+                    return Err(ClientError::Other(reason));
+                }
+                _ => {}
+            }
+            if self.shared.inner.lock().is_closed() {
+                return Err(ClientError::Other(
+                    "connection closed before the scalable assignment landed".to_owned(),
+                ));
+            }
+            self.shared.scalable_notify.notified().await;
+        }
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). The current assignment for a
+    /// registered scalable consumer, or `None` before it resolves.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn scalable_consumer_assignment(
+        &self,
+        consumer_id: u64,
+    ) -> Option<magnetar_proto::ConsumerAssignment> {
+        self.shared
+            .inner
+            .lock()
+            .scalable_consumer_assignment(consumer_id)
+            .cloned()
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Open a namespace-level watch over
+    /// the scalable topics matching `property_filters` (empty = all).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_scalable_topics`.
+    #[cfg(feature = "scalable-topics")]
+    pub fn watch_scalable_topics(
+        &self,
+        namespace: &str,
+        property_filters: Vec<(String, String)>,
+    ) -> Result<u64, ClientError> {
+        let watch_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.watch_scalable_topics(namespace, property_filters)
+                .map_err(|err| ClientError::Other(err.to_string()))?
+        };
+        self.shared.driver_waker.notify_one();
+        Ok(watch_id)
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Close a namespace-level watch.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_scalable_topics_watch(&self, watch_id: u64) {
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.close_scalable_topics_watch(watch_id);
         }
         self.shared.driver_waker.notify_one();
     }
 
-    /// **Experimental** (PIP-460, ADR-0031). Await the next scalable-topic
+    /// **Experimental** (PIP-460, ADR-0093). The current matching topic set for
+    /// a namespace watch, or `None` for an unknown id.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn scalable_topics_snapshot(&self, watch_id: u64) -> Option<Vec<String>> {
+        self.shared.inner.lock().scalable_topics_snapshot(watch_id)
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Whether the broker
+    /// advertised metadata-driven transaction-coordinator discovery. Gated on
+    /// its own feature flag, independent of `supports_scalable_topics`.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn broker_supports_tc_metadata_discovery(&self) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .broker_supports_tc_metadata_discovery()
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Open a
+    /// transaction-coordinator discovery watch.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the broker did not advertise `supports_tc_metadata_discovery`.
+    #[cfg(feature = "scalable-topics")]
+    pub fn watch_tc_assignments(&self) -> Result<u64, ClientError> {
+        let watch_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.watch_tc_assignments()
+                .map_err(|err| ClientError::Other(err.to_string()))?
+        };
+        self.shared.driver_waker.notify_one();
+        Ok(watch_id)
+    }
+
+    /// **Experimental** (PIP-460 / PIP-473, ADR-0093). Close a
+    /// transaction-coordinator discovery watch.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_tc_assignments_watch(&self, watch_id: u64) {
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.close_tc_assignments_watch(watch_id);
+        }
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Close a scalable-topic session.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_scalable_topic_session(&self, session_id: u64) {
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.close_scalable_topic_session(session_id);
+        }
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
     /// event. Mirrors the tokio engine's `Client::next_scalable_event`.
     #[cfg(feature = "scalable-topics")]
     pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {
