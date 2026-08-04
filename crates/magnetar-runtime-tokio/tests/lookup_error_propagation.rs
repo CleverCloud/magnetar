@@ -348,8 +348,22 @@ async fn tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue
         attempts: attempts.clone(),
     })
     .await;
+    // The invariant is an ordering — the operation deadline expires while the
+    // retry is still sleeping — not a pair of durations. Encoding it as 5 ms
+    // against a 50 ms backoff *also* required the first lookup's real TCP
+    // round-trip to land inside 5 ms, which the invariant never claimed and
+    // which is false on a loaded machine: the deadline then fires before the
+    // broker's `ServiceNotReady` arrives, and the assertion below sees a
+    // timeout error instead of the preserved broker error. Observed twice
+    // under a full `--all-features` run, green 3/3 in isolation both times.
+    //
+    // The constants below keep the same ordering with the margin on the
+    // robust side: round-trip (~1 ms on loopback) << deadline << backoff.
+    // The moonpool mirror deliberately keeps 5 ms / 50 ms — its clock is
+    // virtual, so the ordering there is exact and no round-trip competes
+    // with it.
     let config = ConnectionConfig {
-        operation_timeout: Duration::from_millis(5),
+        operation_timeout: Duration::from_millis(500),
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
@@ -357,8 +371,8 @@ async fn tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue
         .expect("connect did not time out")
         .expect("connect ok")
         .with_operation_retry(OperationRetryConfig {
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_millis(50),
+            initial_backoff: Duration::from_secs(30),
+            max_backoff: Duration::from_secs(30),
             max_retries: Some(1),
         });
 
