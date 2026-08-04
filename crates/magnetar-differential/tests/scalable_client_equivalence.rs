@@ -1026,3 +1026,106 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 
     broker.shutdown().await;
 }
+
+/// (d) — a connection **reset** (RST) mid-wait errors the same way a clean
+/// hang-up does, on both engines.
+///
+/// The drivers take a different branch for each: a clean close returns
+/// `Ok(0)`, a reset returns `Err(ECONNRESET)`. Both must mark the connection
+/// disconnected *and* wake the scalable waiters, or the caller parks forever on
+/// whichever branch was missed — which is precisely the bug the sibling
+/// hang-up test caught on the `Ok(0)` side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_subscribe_errors_when_the_connection_resets() {
+    let addr = spawn_resetting_broker().await;
+    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
+        .await
+        .expect("handshake completes before the reset");
+    let err = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            88,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("tokio subscribe returned rather than hanging")
+    .expect_err("a reset connection cannot assign");
+    assert!(
+        !err.to_string().is_empty(),
+        "the failure names a reason: {err}"
+    );
+
+    let addr = spawn_resetting_broker().await;
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let mp_client =
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
+            .await
+            .expect("moonpool handshake completes before the reset");
+    let mp_err = tokio::time::timeout(
+        HANG_GUARD,
+        mp_client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            88,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("moonpool subscribe returned rather than hanging")
+    .expect_err("a reset connection cannot assign");
+    assert!(
+        !mp_err.to_string().is_empty(),
+        "the failure names a reason: {mp_err}"
+    );
+}
+
+/// Bind a socket that completes one Pulsar handshake and then **resets** the
+/// connection, so the client's read fails rather than seeing a clean EOF.
+///
+/// `SO_LINGER = 0` makes `close(2)` emit RST instead of FIN.
+async fn spawn_resetting_broker() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Connected as i32,
+            connected: Some(magnetar_proto::pb::CommandConnected {
+                server_version: "resetting-broker".to_owned(),
+                protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(magnetar_proto::pb::FeatureFlags {
+                    supports_scalable_topics: Some(true),
+                    ..magnetar_proto::pb::FeatureFlags::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut out = bytes::BytesMut::new();
+        magnetar_proto::encode_command(&mut out, &cmd).expect("encode Connected");
+        let _ = sock.write_all(&out).await;
+        let _ = sock.flush().await;
+        // Give the client time to consume CONNECTED, then reset rather than
+        // closing cleanly. `SO_LINGER = 0` makes close(2) emit RST instead of
+        // FIN; tokio's own `set_linger` is deprecated (it blocks the thread on
+        // drop), so this goes through socket2 on the borrowed fd.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sock2 = socket2::SockRef::from(&sock);
+        let _ = sock2.set_linger(Some(std::time::Duration::ZERO));
+        drop(sock);
+    });
+    addr
+}

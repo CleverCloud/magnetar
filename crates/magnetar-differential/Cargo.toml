@@ -55,6 +55,10 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-u
 # directly to keep the cross-engine comparison reproducible — see that file's
 # module doc. No new crate enters the dependency graph.
 hdrhistogram = { workspace = true }
+# `tests/scalable_client_equivalence.rs` resets a connection with
+# `SO_LINGER = 0` so the drivers' read-error disconnect branch runs, not only
+# their clean-EOF one. Already in the graph via tokio; dev-only.
+socket2 = { workspace = true }
 # `tests/sasl_kerberos_equivalence.rs` proves the GSSAPI initiate loop
 # emits byte-identical `CommandAuthResponse` bytes under both engines
 # (per ADR-0024 layer 4). Provider lives in `magnetar-auth-sasl`; we
