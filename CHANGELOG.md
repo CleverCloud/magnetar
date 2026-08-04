@@ -18,6 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
 
+### Fixed
+
+- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.**
+  `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
+  Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.
+  The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
+  (ADR-0093)
+
 ### Added
 
 - **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).

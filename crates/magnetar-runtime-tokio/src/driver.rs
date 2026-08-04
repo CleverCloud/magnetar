@@ -1448,6 +1448,11 @@ where
                     Ok(n) => n,
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         return Err(err.into());
                     }
                 };
@@ -1462,6 +1467,11 @@ where
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1503,6 +1513,11 @@ where
                 let handle_result = shared.inner.lock().handle_bytes_owned(now, chunk);
                 if let Err(err) = handle_result {
                     shared.inner.lock().mark_disconnected();
+                    // Wake anything parked on a scalable wait loop: those only
+                    // re-check `is_closed()` when a scalable event arrives, so a
+                    // dead connection would park them forever.
+                    #[cfg(feature = "scalable-topics")]
+                    shared.scalable_notify.notify_waiters();
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1602,6 +1617,11 @@ where
                     }
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
+                        // Wake anything parked on a scalable wait loop: those only
+                        // re-check `is_closed()` when a scalable event arrives, so a
+                        // dead connection would park them forever.
+                        #[cfg(feature = "scalable-topics")]
+                        shared.scalable_notify.notify_waiters();
                         return Err(err.into());
                     }
                 }

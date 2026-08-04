@@ -37,16 +37,6 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 
 **Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same wire path `StreamConsumer` wraps. `crates/magnetar/tests/e2e_scalable_topic.rs` uses exactly that.
 
-## 13. An unsupervised moonpool connection does not surface a peer hang-up as closed
-
-**Gap.** Every `Client` wait loop on both engines guards on `is_closed()` so a caller does not wait for a reply that can never come. On tokio that guard fires when the peer hangs up. On an **unsupervised** moonpool connection (`Client::connect_plain`) it does not: the driver never marks the connection closed, so the caller waits indefinitely.
-
-Measured 2026-08-03 with a socket that completes the Pulsar handshake and then closes: the tokio leg of `scalable_topic_subscribe` returned an error immediately; the moonpool leg timed out on the full 60 s `HANG_GUARD`.
-
-**Why it stays open.** It is pre-existing and not specific to the scalable surface — `next_scalable_event`, the topic-list waiters and every other `next_*` loop on that engine share the shape. Fixing it means making the moonpool driver mark the connection closed on EOF, which changes behaviour for every waiter at once and wants its own differential transcript per surface rather than a spot fix.
-
-**Consequence today.** `crates/magnetar-differential/tests/scalable_client_equivalence.rs::scalable_subscribe_errors_when_the_connection_closes` covers the tokio leg only, and the moonpool `is_closed()` guard is consequently unreachable from a test — it is the one place `check-sim-coverage` cannot reach on this branch. The guard is kept because it is correct; it fires on an explicit `close()`.
-
 ## 12. PIP-460 per-segment consumer fan-out
 
 **Gap.** A registered scalable consumer receives its [`ConsumerAssignment`](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the `segment://` topics it owns — and the client surfaces every rebalance, but nothing attaches an ordinary consumer to those segment topics and merges their streams.

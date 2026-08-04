@@ -845,7 +845,7 @@ where
     (topics, tc)
 }
 
-/// (b) — a subscribe on a tokio connection that dies mid-wait returns an error
+/// (d) — a subscribe on a connection that dies mid-wait returns an error
 /// rather than waiting for an assignment that can never come.
 ///
 /// `ScriptedBroker::shutdown` stops accepting but leaves established sessions
@@ -853,15 +853,11 @@ where
 /// up — the shape a broker crash presents to a client that has already
 /// negotiated the capability.
 ///
-/// **Tokio only, deliberately.** The moonpool mirror of this loop has the same
-/// `is_closed()` guard, but an unsupervised moonpool connection does not
-/// surface a peer hang-up as *closed* to a waiting caller, so the moonpool
-/// subscribe waits where the tokio one errors — measured 2026-08-03, the
-/// moonpool leg timed out on the full 60 s `HANG_GUARD`. That is a pre-existing
-/// engine difference this PR surfaced rather than introduced (every `next_*`
-/// wait loop on that engine has the same shape); it is tracked in
-/// `docs/follow-ups.md` rather than papered over with a test that asserts the
-/// divergence is fine.
+/// Both engines are asserted. Until the driver woke scalable waiters on
+/// disconnect this only passed by luck: the loops re-check `is_closed()` when a
+/// scalable event arrives, and a dying connection sends none, so whether the
+/// guard ran at all depended on winning a race against EOF. It passed locally
+/// and timed out on CI for exactly that reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_subscribe_errors_when_the_connection_closes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -919,6 +915,68 @@ async fn scalable_subscribe_errors_when_the_connection_closes() {
         !err.to_string().is_empty(),
         "the failure names a reason: {err}"
     );
+
+    // Same contract on the moonpool engine, against a second hang-up socket.
+    let addr = spawn_hangup_broker().await;
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let mp_client =
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
+            .await
+            .expect("moonpool handshake completes before the hang-up");
+
+    let mp_err = tokio::time::timeout(
+        HANG_GUARD,
+        mp_client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "sub",
+            "consumer-a",
+            77,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("moonpool subscribe returned rather than hanging")
+    .expect_err("a dead connection cannot assign");
+    assert!(
+        !mp_err.to_string().is_empty(),
+        "the failure names a reason: {mp_err}"
+    );
+}
+
+/// Bind a socket that completes one Pulsar handshake — advertising the PIP-460
+/// capability — and then hangs up. Models a broker crash after negotiation.
+async fn spawn_hangup_broker() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Connected as i32,
+            connected: Some(magnetar_proto::pb::CommandConnected {
+                server_version: "closing-broker".to_owned(),
+                protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(magnetar_proto::pb::FeatureFlags {
+                    supports_scalable_topics: Some(true),
+                    ..magnetar_proto::pb::FeatureFlags::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut out = bytes::BytesMut::new();
+        magnetar_proto::encode_command(&mut out, &cmd).expect("encode Connected");
+        let _ = sock.write_all(&out).await;
+        let _ = sock.flush().await;
+    });
+    addr
 }
 
 /// The scripted broker tolerates a scalable command frame whose payload is
