@@ -26,6 +26,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
   (ADR-0093)
 
+- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
+  The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
+  `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
+  The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
+  It also failed **open**, crediting a line that never ran when the neighbour it was folded into did, which is the half that matters for a gate whose job is proving patch coverage.
+  The measurement now runs at `opt-level = 0` via `CARGO_PROFILE_TEST_OPT_LEVEL` on both the execution and re-export commands — a `[profile.test]` override rather than a `RUSTFLAGS` entry, since `cargo-llvm-cov` owns `RUSTFLAGS` for `-C instrument-coverage`.
+  Ordinary `cargo test` keeps `opt-level = 1`.
+  Toolchain skew and stale object files were both tested and refuted first.
+  (ADR-0094)
+
 ### Added
 
 - **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
