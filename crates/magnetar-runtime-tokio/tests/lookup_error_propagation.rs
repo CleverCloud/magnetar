@@ -41,8 +41,8 @@ use magnetar_proto::{
     encode_command, pb,
 };
 use magnetar_runtime_tokio::{Client, ClientError};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 mod common;
 use common::HANG_GUARD;
 
@@ -109,7 +109,15 @@ async fn spawn_lookup_broker(mut behavior: LookupBehavior) -> String {
 
 /// Per-session script: complete the handshake, then answer LOOKUPs per
 /// `behavior`. Service `PING` → `PONG` so the connection stays live.
-async fn handle_session(mut stream: TcpStream, behavior: LookupBehavior) -> std::io::Result<()> {
+///
+/// Generic over the transport so the deadline test can drive it across a
+/// `tokio::io::duplex` pair under a paused clock, exactly as the moonpool
+/// mirror's `handle_session<S>` does. Every other test here still hands it a
+/// real `TcpStream` from the loopback listener.
+async fn handle_session<S>(mut stream: S, behavior: LookupBehavior) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut out_buf = BytesMut::with_capacity(64 * 1024);
     loop {
@@ -341,38 +349,44 @@ async fn tokio_expired_deadline_does_not_enqueue_lookup() {
 
 /// The total operation deadline wins while the retry is sleeping: no second
 /// lookup reaches the wire, and the last broker error is preserved.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// The invariant here is an **ordering** — the operation deadline expires while
+/// the retry is still sleeping — not a pair of durations. Expressed over a real
+/// socket on a multi-threaded runtime, 5 ms against a 50 ms backoff *also*
+/// silently required the first lookup's TCP round-trip to land inside 5 ms,
+/// which the invariant never claimed. Under load it does not, the deadline
+/// fires before the broker's `ServiceNotReady` arrives, and the assertion below
+/// sees `Timeout` instead of the preserved broker error — reproduced on the
+/// first iteration under 48-way CPU load on 16 cores.
+///
+/// So the wall clock is removed rather than widened: a `tokio::io::duplex` pair
+/// carries the frames in memory, and `start_paused` makes the runtime advance
+/// virtual time only once every task is idle. The broker's reply therefore
+/// costs zero virtual time, and the clock reaches 5 ms — the deadline — while
+/// the 50 ms retry is still sleeping, deterministically and on every run. The
+/// constants stay identical to the moonpool mirror's for the same reason they
+/// work there.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue() {
     let attempts = Arc::new(AtomicUsize::new(0));
-    let url = spawn_lookup_broker(LookupBehavior::AlwaysRetryableLookup {
+    let (client_io, broker_io) = tokio::io::duplex(64 * 1024);
+    let behavior = LookupBehavior::AlwaysRetryableLookup {
         attempts: attempts.clone(),
-    })
-    .await;
-    // The invariant is an ordering — the operation deadline expires while the
-    // retry is still sleeping — not a pair of durations. Encoding it as 5 ms
-    // against a 50 ms backoff *also* required the first lookup's real TCP
-    // round-trip to land inside 5 ms, which the invariant never claimed and
-    // which is false on a loaded machine: the deadline then fires before the
-    // broker's `ServiceNotReady` arrives, and the assertion below sees a
-    // timeout error instead of the preserved broker error. Observed twice
-    // under a full `--all-features` run, green 3/3 in isolation both times.
-    //
-    // The constants below keep the same ordering with the margin on the
-    // robust side: round-trip (~1 ms on loopback) << deadline << backoff.
-    // The moonpool mirror deliberately keeps 5 ms / 50 ms — its clock is
-    // virtual, so the ordering there is exact and no round-trip competes
-    // with it.
+    };
+    tokio::spawn(async move {
+        let _ = handle_session(broker_io, behavior).await;
+    });
+
     let config = ConnectionConfig {
-        operation_timeout: Duration::from_millis(500),
+        operation_timeout: Duration::from_millis(5),
         ..ConnectionConfig::default()
     };
-    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::from_socket(client_io, config))
         .await
         .expect("connect did not time out")
         .expect("connect ok")
         .with_operation_retry(OperationRetryConfig {
-            initial_backoff: Duration::from_secs(30),
-            max_backoff: Duration::from_secs(30),
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(50),
             max_retries: Some(1),
         });
 

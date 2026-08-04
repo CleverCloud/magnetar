@@ -872,12 +872,13 @@ fn lookup_deadline_during_backoff_returns_last_error_without_reissue() {
         .workload(LookupBroker::new(LookupBehavior::AlwaysRetryableLookup {
             attempts: attempts.clone(),
         }))
-        // 5 ms / 50 ms is exact here and stays: the simulation clock is
-        // virtual, so "the deadline expires during the backoff" is decided by
-        // the scheduler rather than raced against a real TCP round-trip. The
-        // tokio mirror had to widen both constants for that reason — see the
-        // comment on `tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue`.
-        // Do not harmonize the two back together.
+        // 5 ms / 50 ms is exact here: the simulation clock is virtual, so "the
+        // deadline expires during the backoff" is decided by the scheduler
+        // rather than raced against a real TCP round-trip. The tokio mirror
+        // carries the same pair and gets the same guarantee from
+        // `start_paused` over a `tokio::io::duplex` transport — see the comment
+        // on `tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue`.
+        // Neither side may be re-expressed over a real socket and a real clock.
         .workload(LookupDeadlineClient {
             captured_error: captured.clone(),
             operation_timeout: Duration::from_millis(5),
