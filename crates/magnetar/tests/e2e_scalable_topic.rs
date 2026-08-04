@@ -187,10 +187,14 @@ async fn await_broker_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_mins(4);
     let mut last = String::new();
     while tokio::time::Instant::now() < deadline {
-        // `brokers healthcheck` exits non-zero until the broker serves; the
-        // namespace probe additionally proves standalone finished bootstrapping,
-        // which is what the topic-create calls below depend on.
-        last = pulsar_admin(container, &["namespaces", "list", "public"]).await?;
+        // `pulsar-admin` exits non-zero until the broker serves; the namespace
+        // probe additionally proves standalone finished bootstrapping, which is
+        // what the topic-create calls below depend on. A non-zero exit is the
+        // normal state of this loop, not a failure, so the raw form is used and
+        // the code deliberately ignored — the loop's own deadline is the failure
+        // condition, and `last` carries the final output into its message.
+        let (_code, out) = pulsar_admin_raw(container, &["namespaces", "list", "public"]).await?;
+        last = out;
         if last.contains("public/default") {
             return Ok(());
         }
@@ -204,6 +208,28 @@ async fn await_broker_ready(
     .into())
 }
 
+/// Run `pulsar-admin` inside the container, returning its exit code alongside
+/// the combined output.
+///
+/// Separate from [`pulsar_admin`] because the readiness poll needs a non-zero
+/// exit to mean "the broker is not serving yet, poll again" rather than "give
+/// up". `pulsar-admin` exits 1 with `Connection refused: localhost/127.0.0.1:8080`
+/// for the whole of standalone's startup, so propagating that aborts the wait on
+/// its first iteration — which is how a correct exit-code check took all four
+/// e2e tests red at once.
+async fn pulsar_admin_raw(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    args: &[&str],
+) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
+    let mut command = vec!["bin/pulsar-admin".to_owned()];
+    command.extend(args.iter().map(|a| (*a).to_owned()));
+    let mut out = container.exec(ExecCommand::new(command)).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
+    let combined = format!("{stdout}{stderr}");
+    Ok((out.exit_code().await?, combined))
+}
+
 /// Run `pulsar-admin` inside the container, asserting it exited zero.
 ///
 /// The exit code is the check, not a substring scan of the output. An earlier
@@ -211,17 +237,17 @@ async fn await_broker_ready(
 /// usage message when `split-segment` was called with the segment id
 /// positionally instead of behind `--segment-id`: the split never happened and
 /// the test spent 60 s waiting for a layout change that was never coming.
+///
+/// It is deliberately the *only* success check on a command. Upstream's success
+/// banners — "Created scalable topic", "Split segment" — are not part of any
+/// contract this repository can verify, and asserting on one is a guess about
+/// another project's stdout. Callers assert the observable *effect* instead.
 async fn pulsar_admin(
     container: &testcontainers::ContainerAsync<GenericImage>,
     args: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut command = vec!["bin/pulsar-admin".to_owned()];
-    command.extend(args.iter().map(|a| (*a).to_owned()));
-    let mut out = container.exec(ExecCommand::new(command)).await?;
-    let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
-    let combined = format!("{stdout}{stderr}");
-    match out.exit_code().await? {
+    let (code, combined) = pulsar_admin_raw(container, args).await?;
+    match code {
         Some(0) | None => Ok(combined),
         Some(code) => {
             Err(format!("pulsar-admin {} exited {code}:\n{combined}", args.join(" ")).into())
@@ -236,15 +262,14 @@ async fn create_scalable_topic(
     segments: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let segments = segments.to_string();
-    let out = pulsar_admin(
+    // A non-zero exit fails the call inside `pulsar_admin`; the topic's actual
+    // existence is proven by the lookup every caller performs against it, which
+    // is a stronger check than any success banner.
+    pulsar_admin(
         container,
         &["scalable-topics", "create", topic, "--segments", &segments],
     )
     .await?;
-    assert!(
-        out.contains("Created scalable topic"),
-        "pulsar-admin scalable-topics create did not confirm: {out}"
-    );
     Ok(())
 }
 
@@ -452,7 +477,9 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
     // Trigger the split on the broker.
     // `--segment-id` is an option, not a positional: `SplitSegmentCmd` in
     // upstream's `CmdScalableTopics.java` declares only the topic positionally.
-    let out = pulsar_admin(
+    // The exit code is the check; the split's real proof is the layout change
+    // the loop below drains for.
+    pulsar_admin(
         &container,
         &[
             "scalable-topics",
@@ -464,10 +491,6 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
     )
     .await
     .expect("split-segment runs");
-    assert!(
-        out.contains("Split segment"),
-        "pulsar-admin scalable-topics split-segment did not confirm: {out}"
-    );
 
     // The broker pushes the new layout on the still-open session. Drain until
     // the drop-on-change event lands rather than asserting on a timing window.
