@@ -766,7 +766,10 @@ fn scalable_wire_types_roundtrip() {
 
 /// The session's own guards — mismatched session id, non-advancing epoch — and
 /// its accessors behave identically whichever engine's clock is installed.
-/// A mismatched or replayed frame must close the session, never mutate it.
+///
+/// The two guards differ in kind, which is the point of this test: a mismatched
+/// session id closes the session, while a replayed layout epoch is ignored and
+/// leaves it open (ADR-0095). Neither ever mutates the held layout.
 #[test]
 fn session_guards_and_accessors_parity() {
     for wall_clock in [tokio_wall_clock(), moonpool_wall_clock()] {

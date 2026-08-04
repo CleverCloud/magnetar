@@ -560,7 +560,7 @@ pub enum ConnectionEvent {
     /// **Experimental** (PIP-460, ADR-0093). A scalable-topic session ended —
     /// closed by the client, or dropped because the broker rejected an update.
     /// This surfaces it for the caller to decide (no automatic re-lookup —
-    /// controller-election awareness is future work per ADR-0031).
+    /// controller-election awareness is future work per ADR-0093).
     #[cfg(feature = "scalable-topics")]
     DagWatchClosed {
         /// Session id that closed.

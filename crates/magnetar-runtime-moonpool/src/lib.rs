@@ -356,7 +356,7 @@ pub struct ConnectionShared {
     ///
     /// [`TimeProvider`]: moonpool_core::TimeProvider
     pub now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync>,
-    /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
+    /// PIP-460 (ADR-0093) scalable-topic events the driver drained off the
     /// proto queue. Mirrors the tokio engine's identically-named buffer.
     /// Surface via [`Client::next_scalable_event`].
     #[cfg(feature = "scalable-topics")]
@@ -641,7 +641,7 @@ impl ConnectionShared {
         shared
     }
 
-    // PIP-460 (ADR-0031) types mirror the tokio engine's
+    // PIP-460 (ADR-0093) types mirror the tokio engine's
     // `ScalableLookup` / `ScalableEvent` (see `magnetar_runtime_tokio`).
 
     /// Try to reserve `bytes` against the configured memory budget.
@@ -819,7 +819,7 @@ pub struct ObservedReplicatedSubscriptionMarker {
     pub marker: magnetar_proto::ReplicatedSubscriptionMarker,
 }
 
-/// **Experimental** (PIP-460, ADR-0031). `true` when `topic` uses the
+/// **Experimental** (PIP-460, ADR-0093). `true` when `topic` uses the
 /// scalable-topic `topic://...` URL scheme. 1:1 with the tokio engine's
 /// `is_scalable_topic_url` (proposal §3.2 — `topic://` URL parser parity).
 #[cfg(feature = "scalable-topics")]
@@ -845,7 +845,7 @@ mod scalable_url_tests {
     }
 }
 
-/// PIP-460 (ADR-0031) resolved scalable-topic lookup. Mirrors the tokio
+/// PIP-460 (ADR-0093) resolved scalable-topic lookup. Mirrors the tokio
 /// engine's `ScalableLookup`. **Experimental.**
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
@@ -864,7 +864,7 @@ pub struct ScalableLookup {
     pub epoch: u64,
 }
 
-/// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
+/// PIP-460 (ADR-0093) scalable-topic event surfaced from the driver to the
 /// user-facing [`Client`]. Mirrors the tokio engine's `ScalableEvent`.
 /// **Experimental.**
 #[cfg(feature = "scalable-topics")]

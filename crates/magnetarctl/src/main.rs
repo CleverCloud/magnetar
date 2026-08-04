@@ -215,7 +215,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: ContextCmd,
     },
-    /// **Experimental** (PIP-460 / ADR-0031). Print a scalable topic's current
+    /// **Experimental** (PIP-460 / ADR-0093). Print a scalable topic's current
     /// segment DAG. Resolves a `topic://...` URL against the controller broker
     /// and prints each segment's id, key range, state, and broker URL.
     /// Requires a Pulsar 5.0+ broker with PIP-460 enabled (no broker ships it
@@ -2573,7 +2573,7 @@ fn print_context_table(cfg: &config::PulsarConfig) {
     }
 }
 
-/// **Experimental** (PIP-460 / ADR-0031). Resolve a scalable topic's segment
+/// **Experimental** (PIP-460 / ADR-0093). Resolve a scalable topic's segment
 /// DAG and print it as a table. Wraps
 /// [`magnetar::PulsarClient::lookup_scalable_topic`].
 // Width-formatted string-literal column headers are the idiomatic CLI table

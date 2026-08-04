@@ -33,7 +33,7 @@
 //!
 //! # Drop-on-change
 //!
-//! Per ADR-0031, carried forward by ADR-0093, the surface is **observation +
+//! Per ADR-0093, carried forward by ADR-0093, the surface is **observation +
 //! drop-on-change**: the session records the layout, applies updates, and
 //! reports what changed, but does not perform transparent segment failover.
 //! The runtime closes the per-segment consumers and surfaces a

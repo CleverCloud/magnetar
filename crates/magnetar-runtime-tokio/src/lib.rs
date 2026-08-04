@@ -246,7 +246,7 @@ pub struct ConnectionShared {
     /// flips this flag, and subsequent calls skip the bootstrap. Persists across reconnects
     /// (broker keeps the TC store loaded on disk).
     pub txn_bootstrapped: AtomicBool,
-    /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
+    /// PIP-460 (ADR-0093) scalable-topic events the driver drained off the
     /// proto queue (`ScalableTopicLookupResolved`, `SegmentDagUpdated`,
     /// `DagChangedDuringConsume`, `DagWatchClosed`). Surface via
     /// [`Client::next_scalable_event`]. Not a channel — a `VecDeque` behind
@@ -606,7 +606,7 @@ impl ConnectionShared {
     }
 }
 
-/// PIP-460 (ADR-0031) resolved scalable-topic lookup. Returned by
+/// PIP-460 (ADR-0093) resolved scalable-topic lookup. Returned by
 /// [`Client::scalable_topic_lookup`]. **Experimental.**
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
@@ -625,7 +625,7 @@ pub struct ScalableLookup {
     pub epoch: u64,
 }
 
-/// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
+/// PIP-460 (ADR-0093) scalable-topic event surfaced from the driver to the
 /// user-facing [`Client`]. Owned snapshot of the relevant
 /// [`magnetar_proto::ConnectionEvent`] variants so callers can hold them
 /// across `.await` boundaries. **Experimental.**

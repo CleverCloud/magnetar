@@ -1161,7 +1161,7 @@ impl<P: Providers> Client<P> {
     }
 
     // -------------------------------------------------------------------
-    // PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
+    // PIP-460 scalable topics (ADR-0093, experimental). 1:1 with the tokio
     // engine's `Client` methods — drives the proto `Connection` scalable
     // entries + reads driver-drained events via the same buffer + Notify
     // pattern as the PIP-145 topic-list deltas. No channels.

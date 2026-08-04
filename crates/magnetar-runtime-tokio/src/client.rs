@@ -1613,7 +1613,7 @@ impl Client {
     }
 
     // -------------------------------------------------------------------
-    // PIP-460 scalable topics (ADR-0031, experimental). Drives the proto
+    // PIP-460 scalable topics (ADR-0093, experimental). Drives the proto
     // `Connection` scalable entries + reads the driver-drained events from
     // `shared.scalable_events` via the same buffer + Notify pattern as the
     // PIP-145 topic-list deltas. No channels.

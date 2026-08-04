@@ -339,7 +339,7 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
     }
 }
 
-// PIP-460 scalable topics (ADR-0031, experimental). Maps the façade's
+// PIP-460 scalable topics (ADR-0093, experimental). Maps the façade's
 // engine-agnostic `ScalableLookup` / `ScalableEvent` onto the tokio runtime's
 // identically-shaped types.
 #[cfg(feature = "scalable-topics")]

@@ -319,7 +319,7 @@ fn handle_pending_events(
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
             }
-            // PIP-460 (ADR-0031): mirror the tokio driver's scalable-event
+            // PIP-460 (ADR-0093): mirror the tokio driver's scalable-event
             // drain into the per-client buffer + wake `next_scalable_event`.
             // PIP-460 (ADR-0093). Every scalable event lands in the per-client
             // buffer the same way, so the arms only translate the payload and

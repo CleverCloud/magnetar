@@ -141,7 +141,7 @@ impl<P: moonpool_core::Providers> MessageDecryptorApi for MoonpoolEngine<P> {
     type Decryptor = std::sync::Arc<dyn magnetar_runtime_moonpool::MessageDecryptor>;
 }
 
-// PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
+// PIP-460 scalable topics (ADR-0093, experimental). 1:1 with the tokio
 // engine's `ScalableTopicsApi` impl — maps the façade's engine-agnostic
 // `ScalableLookup` / `ScalableEvent` onto the moonpool runtime's types.
 #[cfg(feature = "scalable-topics")]

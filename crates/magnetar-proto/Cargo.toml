@@ -16,15 +16,15 @@ categories    = { workspace = true }
 workspace = true
 
 [features]
-# PIP-460 scalable topics (ADR-0031). Default OFF — until upstream cuts a
-# Pulsar 5.0 RC that includes PIP-460, the new wire commands are
-# hand-encoded as `#[derive(prost::Message)]` structs in
-# `src/pb/scalable_topics.rs` rather than vendored into the generated
-# `pb/pulsar.proto.rs`. Enabling the feature compiles the
-# `pb::scalable_topics` module, the `dag_watch` state machine, the new
-# `Conn` entries, the new `ConnectionEvent` variants, and the
-# `MessageId.segment_id` extension. No new dependency — `prost` is already
-# in the dependency set.
+# PIP-460 scalable topics (ADR-0093, amended by ADR-0095). Default OFF.
+# The wire types are vendored from Apache Pulsar 5.0.0-M1 and generated
+# unconditionally into `pb/pulsar.proto.rs`, so this flag gates **client
+# logic only**: the `dag_watch` and `scalable_consumer` state machines, the
+# `Conn` entries, and the new `ConnectionEvent` variants. The hand-encoded
+# `src/pb/scalable_topics.rs` module it used to gate is deleted — it was a
+# projection of a Draft proposal that matched no broker. `MessageId` is not
+# extended: M1 carries no segment field on `MessageIdData`. No new
+# dependency — `prost` is already in the dependency set.
 default          = []
 scalable-topics  = []
 # FoundationDB-style buggify fault-injection points (ADR-0048). Default

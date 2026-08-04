@@ -291,7 +291,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
             }
-            // PIP-460 (ADR-0031): drain scalable-topic events off the proto
+            // PIP-460 (ADR-0093): drain scalable-topic events off the proto
             // queue into the per-client buffer + wake `next_scalable_event`.
             // PIP-460 (ADR-0093). Every scalable event lands in the per-client
             // buffer the same way, so the arms only translate the payload and

@@ -1021,7 +1021,7 @@ pub trait MessageDecryptorApi {
 }
 
 // ---------------------------------------------------------------------------
-// PIP-460 scalable topics (ADR-0031, experimental). The `ScalableTopicsApi`
+// PIP-460 scalable topics (ADR-0093, experimental). The `ScalableTopicsApi`
 // extension trait follows the same ADR-0026 §D1 pattern as `TransactionApi`:
 // defined here, implemented by each runtime on its `Client` type (which is the
 // engine's `ClientState`), dispatched through

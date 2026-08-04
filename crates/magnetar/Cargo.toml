@@ -59,16 +59,17 @@ opentelemetry = ["dep:opentelemetry"]
 # delegate to the tokio Producer / Consumer surface).
 experimental-v5-client = ["tokio"]
 
-# PIP-460 scalable topics (ADR-0031) — experimental StreamConsumer surface.
+# PIP-460 scalable topics (ADR-0093, amended by ADR-0095) — experimental
+# StreamConsumer surface.
 # Default OFF. Compiling without this flag leaves the baseline surface
 # bit-for-bit unchanged (proved by the `scalable_topics_feature_off_does_not_export`
 # compile-fail test). The `magnetar::scalable` module, the `ScalableTopicsApi`
 # extension trait, and the `topic://` URL parser branch only exist when the
 # flag is on. Propagates to the proto wire surface and to whichever engine(s)
 # are enabled. The e2e tests in `tests/e2e_scalable_topic.rs` are gated on
-# `scalable-topics` alone (no `e2e` flag — see ADR-0046) and have stub bodies
-# that trivially pass until a Pulsar 5.0 RC carries PIP-460 (see
-# `docs/follow-ups.md §1`). Does NOT block release.
+# `scalable-topics` alone (no `e2e` flag — see ADR-0046) and run against a
+# real `apachepulsar/pulsar:5.0.0-M1` broker, plus a `:4.0.4` broker for the
+# negotiated-refusal case, on every push. Does NOT block release.
 scalable-topics = [
     "magnetar-proto/scalable-topics",
     "magnetar-runtime-tokio?/scalable-topics",

@@ -82,7 +82,7 @@ pub mod conn;
 pub(crate) mod conn_types;
 pub mod consumer;
 pub mod crypto;
-/// PIP-460 segment-DAG-watch session state machine (experimental, ADR-0031).
+/// PIP-460 segment-DAG-watch session state machine (experimental, ADR-0093).
 #[cfg(feature = "scalable-topics")]
 pub mod dag_watch;
 pub mod error;

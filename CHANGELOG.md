@@ -32,7 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open. Only a session mismatch, a broker-side error, or a bodyless update ends a session.
   `DagError::NonMonotonic` is removed and `handle_update` returns `Result<Option<DagDelta>, DagError>`; both are behind the default-off `scalable-topics` feature.
   Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it. All four now cover the duplicate.
-  (ADR-0093)
+  (ADR-0095, amending ADR-0093 § D2)
 
 - **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
   The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.

@@ -6,7 +6,7 @@
 //! broker and a segment DAG. magnetar currently ships **only** the
 //! `StreamConsumer` happy path, behind the default-off `scalable-topics`
 //! feature, with **drop-on-DAG-change** semantics (no transparent segment
-//! failover). See [ADR-0031](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0031-pip-460-scalable-subscription-scope.md)
+//! failover). See [ADR-0093](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0093-pip-460-upstream-wire-surface.md)
 //! and the [proposal](https://github.com/CleverCloud/magnetar/blob/main/specs/proposals/pip-460-scalable-topics.md).
 //!
 //! # Surface
@@ -25,7 +25,7 @@
 //! `ConsumerEvent::DagChanged`; the caller must re-resolve and re-subscribe.
 //! Transparent failover, in-place repartition, `QueueConsumer`,
 //! `CheckpointConsumer`, and controller-election awareness are explicit
-//! future work (out of scope, ADR-0031).
+//! future work (out of scope, ADR-0093).
 
 // The PIP-460 surface doc-comments thread bare type names (`StreamConsumer`,
 // `DagWatch`, …) through prose where backticking every occurrence hurts
@@ -94,10 +94,12 @@ pub enum ConsumerEvent {
 /// surfaces [`ConsumerEvent`]s. **Drops on DAG change** — no transparent
 /// segment failover.
 ///
-/// `T` is the (future) per-message payload type; in the current scaffold the
-/// surface is DAG-watch-centric (the per-segment v4 consumer fan-out and typed
-/// receive land once a Pulsar 5.0 broker ships the wire surface — see ADR-0031
-/// §"Out of scope"). Construct via [`crate::PulsarClient::scalable_stream_consumer`].
+/// `T` is the (future) per-message payload type; the surface is currently
+/// DAG-watch-centric. The wire surface itself ships — the client speaks the
+/// one Apache Pulsar 5.0.0-M1 implements (ADR-0093) — but the per-segment v4
+/// consumer fan-out and typed receive are still ours to write, and are held
+/// on a design decision recorded in `docs/follow-ups.md` §12.
+/// Construct via [`crate::PulsarClient::scalable_stream_consumer`].
 pub struct StreamConsumer<T, E: Engine>
 where
     E::ClientState: ScalableTopicsApi,

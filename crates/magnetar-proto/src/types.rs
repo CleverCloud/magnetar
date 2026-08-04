@@ -63,7 +63,7 @@ impl fmt::Display for SequenceId {
 
 /// PIP-460 segment identifier — unique within a scalable topic's segment DAG.
 ///
-/// **Experimental** (PIP-460, ADR-0031). Only meaningful under
+/// **Experimental** (PIP-460, ADR-0093). Only meaningful under
 /// `feature = "scalable-topics"`; carried on [`MessageId::segment_id`] for
 /// messages read from a scalable topic.
 #[cfg(feature = "scalable-topics")]
@@ -79,7 +79,7 @@ impl fmt::Display for SegmentId {
 
 /// PIP-460 hash key range `[start, end)` a segment is responsible for.
 ///
-/// **Experimental** (PIP-460, ADR-0031). Surfaces the key range for
+/// **Experimental** (PIP-460, ADR-0093). Surfaces the key range for
 /// observation only — segment-aware sticky-key dispatch (Key_Shared across
 /// the full DAG) is out of scope (future work).
 #[cfg(feature = "scalable-topics")]
@@ -284,7 +284,7 @@ pub struct TcAssignment {
 ///
 /// Under `feature = "scalable-topics"` the id carries an optional
 /// `segment_id` field. The derived `PartialEq` / `Ord` / `Hash`
-/// give exactly the cross-mode contract ADR-0031 specifies: two v4 ids both
+/// give exactly the cross-mode contract ADR-0093 specifies: two v4 ids both
 /// carry `None`, so the segment field is a tie and the v4 invariant is
 /// preserved bit-for-bit; a scalable id (`Some(_)`) never compares equal to a
 /// v4 id (`None`) — so callers can't accidentally deduplicate across the
@@ -490,7 +490,7 @@ mod tests {
     /// through [`MessageId::with_segment`] / [`MessageId::segment`], and the
     /// v4-shape (`segment_id: None`) `to_bytes` is **byte-identical** to a
     /// plain v4 id — the wire `MessageIdData` carries no segment field, so a
-    /// legacy producer / consumer round-trips bit-for-bit (ADR-0031 §2.1).
+    /// legacy producer / consumer round-trips bit-for-bit (ADR-0093 §2.1).
     #[cfg(feature = "scalable-topics")]
     #[test]
     fn message_id_with_segment_roundtrip() {
