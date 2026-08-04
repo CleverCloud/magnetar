@@ -418,7 +418,6 @@ pub struct ScalableTopicsWatch {
     namespace: String,
     /// Current matching set, kept sorted and deduplicated.
     topics: BTreeSet<String>,
-    resolved: bool,
 }
 
 impl ScalableTopicsWatch {
@@ -429,7 +428,6 @@ impl ScalableTopicsWatch {
             watch_id,
             namespace,
             topics: BTreeSet::new(),
-            resolved: false,
         }
     }
 
@@ -437,12 +435,6 @@ impl ScalableTopicsWatch {
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.namespace
-    }
-
-    /// `true` once the first update has landed.
-    #[must_use]
-    pub fn is_resolved(&self) -> bool {
-        self.resolved
     }
 
     /// The current matching topic set, sorted.
@@ -484,7 +476,6 @@ impl ScalableTopicsWatch {
             });
         };
 
-        self.resolved = true;
         match event {
             pb::command_watch_scalable_topics_update::Event::Snapshot(snap) => {
                 self.topics = snap.topics.iter().cloned().collect();
@@ -677,7 +668,10 @@ mod tests {
     #[test]
     fn topics_watch_snapshot_replaces_set() {
         let mut w = ScalableTopicsWatch::new(3, "public/default".to_owned());
-        assert!(!w.is_resolved());
+        assert!(
+            w.topics().is_empty(),
+            "no matching set before the first update"
+        );
         let change = w
             .handle_update(&pb::CommandWatchScalableTopicsUpdate {
                 watch_id: 3,
@@ -693,7 +687,6 @@ mod tests {
                 )),
             })
             .expect("snapshot applies");
-        assert!(w.is_resolved());
         assert_eq!(
             change,
             TopicsChange::Snapshot {
@@ -799,7 +792,10 @@ mod tests {
                 message: "nope".to_owned(),
             }
         );
-        assert!(!w.is_resolved());
+        assert!(
+            w.topics().is_empty(),
+            "no matching set before the first update"
+        );
         assert!(w.topics().is_empty());
     }
 

@@ -948,7 +948,10 @@ fn scalable_consumer_session_and_watch_accessors() {
 
     let mut watch = magnetar_proto::ScalableTopicsWatch::new(3, "public/default".to_owned());
     assert_eq!(watch.namespace(), "public/default");
-    assert!(!watch.is_resolved());
+    assert!(
+        watch.topics().is_empty(),
+        "no matching set before the first update"
+    );
     assert!(watch.topics().is_empty());
     watch
         .handle_update(&pb::CommandWatchScalableTopicsUpdate {
@@ -962,7 +965,6 @@ fn scalable_consumer_session_and_watch_accessors() {
             )),
         })
         .expect("snapshot applies");
-    assert!(watch.is_resolved());
     assert_eq!(watch.topics(), vec!["topic://public/default/a".to_owned()]);
 
     // An assignment round-trips through the wire pair, and the assigned-segment

@@ -470,7 +470,6 @@ mod tests {
     fn scalable_session_first_update_resolves_layout() {
         let mut s = DagWatchSession::new(7);
         assert!(!s.is_resolved());
-        assert!(!s.is_resolved());
 
         let delta = s
             .handle_update(&update(
@@ -483,7 +482,6 @@ mod tests {
             ))
             .expect("layout applies");
 
-        assert!(s.is_resolved());
         assert!(s.is_resolved());
         assert_eq!(delta.epoch, 4);
         assert_eq!(delta.added.len(), 2);
