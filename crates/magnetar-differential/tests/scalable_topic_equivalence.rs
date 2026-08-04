@@ -752,8 +752,7 @@ fn session_guards_and_accessors_parity() {
 
         // An update naming a session this connection does not track is ignored.
         let mut session = magnetar_proto::DagWatchSession::new(1234);
-        assert_eq!(session.session_id(), 1234);
-        assert_eq!(session.epoch(), None);
+        assert!(!session.is_resolved(), "a fresh session holds no layout");
         let err = session
             .handle_update(&pb::CommandScalableTopicUpdate {
                 session_id: 4321,
@@ -887,7 +886,6 @@ fn scalable_consumer_session_and_watch_accessors() {
         "consumer-a".to_owned(),
         magnetar_proto::ScalableConsumerType::Stream,
     );
-    assert_eq!(session.consumer_id(), 7);
     assert_eq!(session.topic(), "topic://public/default/scaled");
     assert_eq!(session.subscription(), "sub");
     assert_eq!(session.consumer_name(), "consumer-a");
@@ -949,7 +947,6 @@ fn scalable_consumer_session_and_watch_accessors() {
     );
 
     let mut watch = magnetar_proto::ScalableTopicsWatch::new(3, "public/default".to_owned());
-    assert_eq!(watch.watch_id(), 3);
     assert_eq!(watch.namespace(), "public/default");
     assert!(!watch.is_resolved());
     assert!(watch.topics().is_empty());

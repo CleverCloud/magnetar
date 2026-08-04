@@ -224,18 +224,6 @@ impl DagWatchSession {
         }
     }
 
-    /// This session's id.
-    #[must_use]
-    pub fn session_id(&self) -> u64 {
-        self.session_id
-    }
-
-    /// The highest layout epoch applied so far, or `None` before any update.
-    #[must_use]
-    pub fn epoch(&self) -> Option<u64> {
-        self.epoch
-    }
-
     /// `true` once a layout has landed.
     #[must_use]
     pub fn is_resolved(&self) -> bool {
@@ -482,7 +470,7 @@ mod tests {
     fn scalable_session_first_update_resolves_layout() {
         let mut s = DagWatchSession::new(7);
         assert!(!s.is_resolved());
-        assert_eq!(s.epoch(), None);
+        assert!(!s.is_resolved());
 
         let delta = s
             .handle_update(&update(
@@ -496,7 +484,7 @@ mod tests {
             .expect("layout applies");
 
         assert!(s.is_resolved());
-        assert_eq!(s.epoch(), Some(4));
+        assert!(s.is_resolved());
         assert_eq!(delta.epoch, 4);
         assert_eq!(delta.added.len(), 2);
         assert!(delta.removed.is_empty());
@@ -521,7 +509,7 @@ mod tests {
     #[test]
     fn scalable_session_monotonic_epoch() {
         let mut s = resolved_session();
-        assert_eq!(s.epoch(), Some(1));
+        assert!(s.is_resolved());
 
         let stale = update(7, 1, vec![info(9, 0, 65_536, &[], &[])]);
         let err = s.handle_update(&stale).expect_err("stale layout rejected");
@@ -529,7 +517,7 @@ mod tests {
         // Session unchanged — segment 9 never landed, segment 1 still there.
         assert!(!s.contains(SegmentId(9)));
         assert!(s.contains(SegmentId(1)));
-        assert_eq!(s.epoch(), Some(1));
+        assert!(s.is_resolved());
     }
 
     /// Layer (a) test: a split is derived from the children's `parent_ids`
@@ -718,7 +706,7 @@ mod tests {
         );
         // Epoch 0 is a legitimate first layout — the guard only rejects
         // non-advancing epochs *after* one has landed.
-        assert_eq!(s.epoch(), Some(0));
+        assert!(s.is_resolved(), "epoch 0 is a legitimate first layout");
         assert_eq!(snap[0].state, SegmentState::Active);
         assert_eq!(
             snap[0].key_range,

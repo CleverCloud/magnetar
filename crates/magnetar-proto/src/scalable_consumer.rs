@@ -248,12 +248,6 @@ impl ScalableConsumerSession {
         }
     }
 
-    /// This session's consumer id.
-    #[must_use]
-    pub fn consumer_id(&self) -> u64 {
-        self.consumer_id
-    }
-
     /// The topic this consumer registered against.
     #[must_use]
     pub fn topic(&self) -> &str {
@@ -437,12 +431,6 @@ impl ScalableTopicsWatch {
             topics: BTreeSet::new(),
             resolved: false,
         }
-    }
-
-    /// This watch's id.
-    #[must_use]
-    pub fn watch_id(&self) -> u64 {
-        self.watch_id
     }
 
     /// The namespace being watched.
