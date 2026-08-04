@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use magnetar::PulsarClient;
 use magnetar::scalable::ScalableConsumerType;
-use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
+use testcontainers::core::{CmdWaitFor, ContainerPort, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
@@ -223,7 +223,13 @@ async fn pulsar_admin_raw(
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let mut command = vec!["bin/pulsar-admin".to_owned()];
     command.extend(args.iter().map(|a| (*a).to_owned()));
-    let mut out = container.exec(ExecCommand::new(command)).await?;
+    // `CmdWaitFor::exit()` so the exec is only read back once the process has
+    // terminated. Without it `exit_code()` is free to answer `None`, which
+    // testcontainers documents as "the command has not yet exited" — not as
+    // success.
+    let mut out = container
+        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
+        .await?;
     let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
     let combined = format!("{stdout}{stderr}");
@@ -248,10 +254,18 @@ async fn pulsar_admin(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let (code, combined) = pulsar_admin_raw(container, args).await?;
     match code {
-        Some(0) | None => Ok(combined),
+        Some(0) => Ok(combined),
         Some(code) => {
             Err(format!("pulsar-admin {} exited {code}:\n{combined}", args.join(" ")).into())
         }
+        // `None` is "has not yet exited", never success. Treating it as success
+        // would restore, in a subtler form, exactly the fail-open the exit-code
+        // check exists to remove.
+        None => Err(format!(
+            "pulsar-admin {} did not exit; no status to check:\n{combined}",
+            args.join(" ")
+        )
+        .into()),
     }
 }
 
