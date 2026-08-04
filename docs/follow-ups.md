@@ -20,11 +20,12 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                 | Status                   |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)       | ⚡ ready to dispatch     |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                     | 🧠 needs design decision |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build) | ⚡ ready to dispatch     |
+| #   | Item                                                                                                                                     | Status                   |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)           | ⚡ ready to dispatch     |
+| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                         | 🧠 needs design decision |
+| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)     | ⚡ ready to dispatch     |
+| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load) | ⚡ ready to dispatch     |
 
 ---
 
@@ -58,6 +59,26 @@ So this is a latent integrity gap with no demonstrated failure behind it, which 
 
 **Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
 Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
+
+## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
+
+**Gap.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bound-the-driver-write-on-operation-timeout.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
+
+**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so the 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. Under `start_paused` tokio auto-advances the clock whenever no task is ready, so a deterministic test should resolve the driver's own 30 s `operation_timeout` long before the 90 s margin. That it does not, and that it depends on host load, means something on the driver's stalled-write path leaves the virtual clock's control — a real thread, a `spawn_blocking`, or a lock held across an await. That is worth knowing independently of the test.
+
+**Measured 2026-08-04**, on `feat/pip-460-upstream-wire`:
+
+| condition                                                                                                    | result         |
+| ------------------------------------------------------------------------------------------------------------ | -------------- |
+| inside `cargo test --workspace --all-features` while a full instrumented coverage rebuild saturated 16 cores | FAILED         |
+| 3 isolated runs, load average still ~13                                                                      | 1 FAILED, 2 ok |
+| 30 isolated runs of the test binary at idle                                                                  | 0/30 failed    |
+
+**Not caused by the PIP-460 work.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin; every change to `driver.rs` on that branch is a `#[cfg(feature = "scalable-topics")]` addition. CI has not reproduced it.
+
+**Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
+
+**Do not** fix this by widening the 90-second margin. The margin is virtual; widening it makes the race less likely to be observed without changing anything real, which is the failure mode [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) and the `lookup_error_propagation` correction both exist to avoid.
 
 ## Notes on this file
 
