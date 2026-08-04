@@ -20,10 +20,11 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                           | Status                   |
-| --- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine) | ⚡ ready to dispatch     |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                               | 🧠 needs design decision |
+| #   | Item                                                                                                                                 | Status                   |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)       | ⚡ ready to dispatch     |
+| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                     | 🧠 needs design decision |
+| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build) | ⚡ ready to dispatch     |
 
 ---
 
@@ -44,6 +45,20 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 
 **Why it stays open.** Needs a design decision on ordering across segments, on how per-segment cursors interact with the single subscription name, and on what happens to in-flight messages at a rebalance. `QueueConsumer` and `CheckpointConsumer` sit behind the same decision, and ADR-0093 deliberately left all three out of scope.
 
+## 14. `check-sim-coverage` can report over artifacts it did not build
+
+**Gap.** [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) split the gate into an execution step and a re-export step with **different scopes**.
+Execution passes `-p magnetar-runtime-moonpool -p magnetar-differential`, and `cargo llvm-cov`'s `-p` also selects which packages get _cleaned_.
+The report then covers all six of `SIM_COVERAGE_REPORT_PACKAGES`, so `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-auth-athenz` and `magnetar-auth-sasl` are re-exported from object files no step in the current pass is guaranteed to have produced.
+CI compounds it: `Swatinem/rust-cache@v2` in the `check-sim-coverage` job runs unconfigured, so it archives `target/` — including `target/llvm-cov-target`, which its workspace-artifact pruning does not know about.
+
+**Why it stays open.** It was investigated as the suspected cause of the PR #391 false red and **refuted**: `cargo llvm-cov clean --workspace` followed by a cold `CARGO_INCREMENTAL=0` run reproduced the failing report exactly (81 `SF:` records, `DA:271,0`).
+The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
+So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
+
+**Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
+Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.
@@ -53,5 +68,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md) and §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md). §11 and §12 were both surfaced by that work: the first is dispatch-ready, the second needs a design decision.
+§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md) and §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md). §11 and §12 were both surfaced by that work: the first is dispatch-ready, the second needs a design decision. §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines; its number is retired, which is why the entry added here is §14.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.
