@@ -20,6 +20,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Tokio driver-write deadlines now use Tokio's clock end to end.** ADR-0083 retained one fixed deadline across `select!` reconstruction, but anchored it with `std::time::Instant` and scheduled each expiry with a relative Tokio timer; under paused time the harness clock advanced while the deadline source did not, so a cancelled and reconstructed write could receive almost a fresh budget and the 90-second virtual guard could win under host load.
+  The write-local anchor is now `tokio::time::Instant`, and every reconstructed arm races against that same absolute instant with `tokio::time::timeout_at`.
+  The regression test forces a higher-priority arm to cancel the first stalled write, observes its reconstruction, advances beyond the original deadline but not a fresh one, and requires `Io(TimedOut)` plus disconnection; it passed 128 consecutive repetitions.
+  Proto-facing `std::time::Instant` values and Moonpool's injected clock are unchanged.
+  (ADR-0097; closes `docs/follow-ups.md` §15)
+
 - **`check-sim-coverage` now reports only over artifacts built by its current pass.** The execution phase runs two packages while the report re-exports six, and cargo-llvm-cov 0.8.7's `--no-report` path does not clean first-party objects; a warm local target or restored CI target could therefore contribute stale profiles or objects to an enforcing verdict.
   Both phases now share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem.
   Broker-independent artifact injection through LLVM coverage/profdata flag variables is rejected, locked metadata cannot rewrite `Cargo.lock`, final-component symlinks and mount roots fail safely, and the scratch directory is removed on every catchable outcome without masking a primary error.
