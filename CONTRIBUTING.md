@@ -48,6 +48,8 @@ A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`
 That bail is keyed on those exclusions and not on the gated crates, so a PR touching only the façade, `magnetar-admin` or `magnetarctl` does pay the full build before printing them as `not gated`.
 It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
 On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
+Execution and report use one locked, invocation-owned target outside cached Cargo storage, so restored or locally stale first-party objects cannot affect the verdict; `target/sim-coverage.lcov` is only the final output ([ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md)).
+Do not set LLVM coverage/profdata flag variables around this command: the gate rejects non-empty values because cargo-llvm-cov would otherwise append arbitrary artifact paths to its tool invocations.
 
 Moonpool seed sweep: CI runs a daily 128-random-seed job per [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md); locally you can reproduce a flaky run with:
 
