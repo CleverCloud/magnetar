@@ -35,6 +35,7 @@
 //! the generated Rust into `crates/magnetar-proto/src/pb/`, and (with `--check`)
 //! diffs the generated output against what is committed so CI catches drift.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use std::time::SystemTime;
@@ -1987,14 +1988,357 @@ const SIM_COVERAGE_OPT_LEVEL: &str = "0";
 /// exposure is exactly that: a transcript that overstates what ran.
 const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMENT]";
 
+/// cargo-llvm-cov appends these values directly to `llvm-cov` or
+/// `llvm-profdata`, so any one can select an artifact outside the isolated
+/// current-pass root.
+const SIM_COVERAGE_ARTIFACT_FLAG_ENV: &[&str] = &[
+    "LLVM_COV_FLAGS",
+    "LLVM_PROFDATA_FLAGS",
+    "CARGO_LLVM_COV_FLAGS",
+    "CARGO_LLVM_PROFDATA_FLAGS",
+];
+
+fn validate_sim_coverage_flag_environment(
+    mut value_of: impl FnMut(&str) -> Option<OsString>,
+) -> Result<()> {
+    let non_empty: Vec<&str> = SIM_COVERAGE_ARTIFACT_FLAG_ENV
+        .iter()
+        .copied()
+        .filter(|name| value_of(name).is_some_and(|value| !value.is_empty()))
+        .collect();
+    if non_empty.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "sim-coverage refuses non-empty artifact-injection environment variable(s): {}. These \
+         values are appended directly to llvm-cov/llvm-profdata and can select cached objects or \
+         profiles outside the invocation-owned target; unset them before retrying.",
+        non_empty.join(", ")
+    );
+}
+
+fn clear_sim_coverage_artifact_flags(command: &mut StdCommand) {
+    for name in SIM_COVERAGE_ARTIFACT_FLAG_ENV {
+        command.env_remove(name);
+    }
+}
+
+fn parse_json_hex_quad(bytes: &[u8], start: usize) -> Option<u16> {
+    bytes
+        .get(start..start.saturating_add(4))?
+        .iter()
+        .try_fold(0_u16, |value, byte| {
+            let digit = match byte {
+                b'0'..=b'9' => u16::from(byte - b'0'),
+                b'a'..=b'f' => u16::from(byte - b'a') + 10,
+                b'A'..=b'F' => u16::from(byte - b'A') + 10,
+                _ => return None,
+            };
+            Some((value << 4) | digit)
+        })
+}
+
+/// Parse one JSON string and return its decoded value plus the first byte after
+/// the closing quote. This keeps Cargo metadata parsing dependency-free while
+/// still handling Windows separators and Unicode paths correctly.
+fn parse_json_string(json: &str, start: usize) -> Result<(String, usize)> {
+    let bytes = json.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        bail!("expected JSON string");
+    }
+
+    let mut out = String::new();
+    let mut segment = start.saturating_add(1);
+    let mut cursor = segment;
+    while let Some(&byte) = bytes.get(cursor) {
+        match byte {
+            b'"' => {
+                out.push_str(&json[segment..cursor]);
+                return Ok((out, cursor.saturating_add(1)));
+            }
+            b'\\' => {
+                out.push_str(&json[segment..cursor]);
+                cursor = cursor.saturating_add(1);
+                let escape = *bytes
+                    .get(cursor)
+                    .ok_or_else(|| anyhow!("unterminated JSON escape"))?;
+                match escape {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let first = parse_json_hex_quad(bytes, cursor.saturating_add(1))
+                            .ok_or_else(|| anyhow!("invalid JSON Unicode escape"))?;
+                        cursor = cursor.saturating_add(5);
+                        let scalar = if (0xd800..=0xdbff).contains(&first) {
+                            if bytes.get(cursor..cursor.saturating_add(2)) != Some(b"\\u") {
+                                bail!("JSON high surrogate has no low surrogate");
+                            }
+                            let second = parse_json_hex_quad(bytes, cursor.saturating_add(2))
+                                .ok_or_else(|| anyhow!("invalid JSON low surrogate"))?;
+                            if !(0xdc00..=0xdfff).contains(&second) {
+                                bail!("invalid JSON low surrogate");
+                            }
+                            cursor = cursor.saturating_add(6);
+                            0x1_0000
+                                + ((u32::from(first) - 0xd800) << 10)
+                                + (u32::from(second) - 0xdc00)
+                        } else {
+                            if (0xdc00..=0xdfff).contains(&first) {
+                                bail!("JSON low surrogate has no high surrogate");
+                            }
+                            u32::from(first)
+                        };
+                        out.push(
+                            char::from_u32(scalar)
+                                .ok_or_else(|| anyhow!("invalid JSON Unicode scalar"))?,
+                        );
+                        segment = cursor;
+                        continue;
+                    }
+                    _ => bail!("invalid JSON escape"),
+                }
+                cursor = cursor.saturating_add(1);
+                segment = cursor;
+            }
+            0x00..=0x1f => bail!("unescaped control byte in JSON string"),
+            _ => cursor = cursor.saturating_add(1),
+        }
+    }
+    bail!("unterminated JSON string");
+}
+
+fn top_level_json_string(json: &str, field: &str) -> Result<Option<String>> {
+    let bytes = json.as_bytes();
+    let mut object_depth = 0_usize;
+    let mut cursor = 0_usize;
+    while let Some(&byte) = bytes.get(cursor) {
+        match byte {
+            b'{' => {
+                object_depth = object_depth.saturating_add(1);
+                cursor = cursor.saturating_add(1);
+            }
+            b'}' => {
+                object_depth = object_depth.saturating_sub(1);
+                cursor = cursor.saturating_add(1);
+            }
+            b'"' => {
+                let (name, after_name) = parse_json_string(json, cursor)?;
+                cursor = after_name;
+                if object_depth != 1 || name != field {
+                    continue;
+                }
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor = cursor.saturating_add(1);
+                }
+                if bytes.get(cursor) != Some(&b':') {
+                    continue;
+                }
+                cursor = cursor.saturating_add(1);
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor = cursor.saturating_add(1);
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    bail!("Cargo metadata field `{field}` is not a string");
+                }
+                return parse_json_string(json, cursor).map(|(value, _)| Some(value));
+            }
+            _ => cursor = cursor.saturating_add(1),
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoStorage {
+    target_directory: PathBuf,
+    build_directory: PathBuf,
+    build_directory_supported: bool,
+}
+
+fn apply_command_environment(command: &mut StdCommand, values: &[(&str, Option<&OsStr>)]) {
+    for (name, value) in values {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// Resolve every existing component, including a final-component symlink,
+/// without creating a configured target/build path that does not exist yet.
+fn resolve_storage_path(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    anyhow!(
+                        "Cargo storage path {} has no existing ancestor",
+                        path.display()
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                if !ancestor.pop() {
+                    bail!(
+                        "Cargo storage path {} has no existing ancestor",
+                        path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspecting Cargo storage path {}", ancestor.display())
+                });
+            }
+        }
+    }
+
+    let mut resolved = fs::canonicalize(&ancestor)
+        .with_context(|| format!("resolving Cargo storage ancestor {}", ancestor.display()))?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn resolve_cargo_storage(
+    cargo: &OsStr,
+    workspace_root: &Path,
+    command_environment: &[(&str, Option<&OsStr>)],
+) -> Result<CargoStorage> {
+    let manifest_path = workspace_root.join("Cargo.toml");
+    let mut command = StdCommand::new(cargo);
+    command
+        .current_dir(workspace_root)
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--locked",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path);
+    apply_command_environment(&mut command, command_environment);
+    clear_sim_coverage_artifact_flags(&mut command);
+    let output = command
+        .output()
+        .context("failed to invoke `cargo metadata`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`cargo metadata` exited with status {}:\n{stderr}",
+            output.status
+        );
+    }
+    let metadata = String::from_utf8(output.stdout).context("cargo metadata produced non-UTF-8")?;
+    let target_directory = top_level_json_string(&metadata, "target_directory")?
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cargo metadata omitted `target_directory`"))?;
+    let build_directory = top_level_json_string(&metadata, "build_directory")?.map(PathBuf::from);
+    if !target_directory.is_absolute()
+        || build_directory
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        bail!("cargo metadata returned a non-absolute target/build directory");
+    }
+    let target_directory = resolve_storage_path(&target_directory)?;
+    let build_directory_supported = build_directory.is_some();
+    let build_directory = build_directory
+        .map(|path| resolve_storage_path(&path))
+        .transpose()?
+        .unwrap_or_else(|| target_directory.clone());
+    Ok(CargoStorage {
+        target_directory,
+        build_directory,
+        build_directory_supported,
+    })
+}
+
+#[cfg(unix)]
+fn ensure_scratch_parent_filesystem(anchor: &Path, parent: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if anchor.exists() {
+        let anchor_device = fs::metadata(anchor)
+            .with_context(|| format!("reading Cargo storage metadata for {}", anchor.display()))?
+            .dev();
+        let parent_device = fs::metadata(parent)
+            .with_context(|| format!("reading scratch-parent metadata for {}", parent.display()))?
+            .dev();
+        if anchor_device != parent_device {
+            bail!(
+                "Cargo storage {} is a filesystem root; no outside-cache sibling exists on its build volume",
+                anchor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_scratch_parent_filesystem(_anchor: &Path, _parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn create_sim_coverage_target(storage: &CargoStorage) -> Result<tempfile::TempDir> {
+    // If one cache root contains the other, use the outer root as the anchor so
+    // the scratch sibling is outside both trees. Otherwise prefer Cargo's build
+    // storage, where the cold all-feature object set belongs.
+    let anchor = if storage
+        .build_directory
+        .starts_with(&storage.target_directory)
+    {
+        &storage.target_directory
+    } else {
+        &storage.build_directory
+    };
+    let parent = anchor.parent().ok_or_else(|| {
+        anyhow!(
+            "Cargo target/build storage {} has no parent for an isolated sibling",
+            anchor.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating Cargo build-storage parent {}", parent.display()))?;
+    ensure_scratch_parent_filesystem(anchor, parent)?;
+    let parent = fs::canonicalize(parent)
+        .with_context(|| format!("resolving Cargo build-storage parent {}", parent.display()))?;
+    let target = tempfile::Builder::new()
+        .prefix(".sim-coverage-target-")
+        .tempdir_in(&parent)
+        .with_context(|| {
+            format!(
+                "creating isolated sim-coverage target beside Cargo storage {}",
+                anchor.display()
+            )
+        })?;
+    let path = target.path().to_path_buf();
+    if path.starts_with(&storage.target_directory) || path.starts_with(&storage.build_directory) {
+        let primary = Err(anyhow!(
+            "isolated sim-coverage target {} landed inside cached Cargo storage",
+            path.display()
+        ));
+        return finish_sim_coverage_run(primary, target.close(), &path);
+    }
+    Ok(target)
+}
+
 /// Produce the sim-coverage LCOV report and return it as a string.
 ///
 /// Two steps, because execution scope and report scope are different questions:
 ///
-/// 1. **Execute** — `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential
-///    --all-features --locked`, writing `target/sim-coverage-exec.lcov`. This builds, runs the
-///    tests, and leaves the merged profile data plus the object files on disk. Its own LCOV output
-///    is a by-product we never read.
+/// 1. **Execute** — `cargo llvm-cov --no-report -p magnetar-runtime-moonpool -p
+///    magnetar-differential --all-features --locked`. This builds and runs the tests, leaving raw
+///    profiles plus object files in an invocation-owned coverage target.
 /// 2. **Re-export** — `cargo llvm-cov report` over the same artifacts with
 ///    [`SIM_COVERAGE_REPORT_PACKAGES`], writing `target/sim-coverage.lcov`. No clean, no build, no
 ///    test run: it is a second `llvm-cov export` against files already on disk.
@@ -2005,18 +2349,26 @@ const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMEN
 /// test provably executed — non-deterministically, since inlining follows
 /// codegen-unit partitioning. See that constant for the measurement.
 ///
-/// The second step is what closes ADR-0088's scope gap, and it is nearly free
-/// because instrumentation was never the limit. `cargo-llvm-cov`'s `RUSTC_WRAPPER`
-/// builds its instrumentation list from every workspace member and ignores `-p`
-/// entirely; `-p` only selects which test binaries run, which packages get
-/// cleaned, and the `-ignore-filename-regex` handed to `llvm-cov export`
-/// (verified against cargo-llvm-cov 0.8.7: `src/wrapper.rs`, `src/report.rs`).
-/// So `magnetar-proto`'s counters were always in the profile data — the report
-/// filter was hiding them.
+/// The second step is what closes ADR-0088's scope gap, and it is nearly free because
+/// instrumentation was never the limit. `cargo-llvm-cov`'s `RUSTC_WRAPPER` builds its
+/// instrumentation list from every workspace member and ignores `-p` entirely; `-p` only selects
+/// which test binaries run and the `-ignore-filename-regex` handed to `llvm-cov export` (verified
+/// against cargo-llvm-cov 0.8.7: `src/wrapper.rs`, `src/report.rs`). So `magnetar-proto`'s counters
+/// were always in the profile data — the report filter was hiding them.
 ///
-/// The `--no-report` + `report` stitch is NOT usable here: `--no-report` implies
-/// `--no-clean`, so stale `*.profraw` from an earlier run would merge in and
-/// could report an uncovered line as covered.
+/// `--no-report` implies `--no-clean`, so locked Cargo metadata first resolves the effective
+/// target/build storage and an empty scratch sibling is created on that filesystem. The preflight
+/// resolves dependencies because Cargo's `--no-deps` metadata mode bypasses lock validation even
+/// when paired with `--locked`. Both phases point
+/// `CARGO_TARGET_DIR`, `CARGO_LLVM_COV_TARGET_DIR`, `CARGO_LLVM_COV_BUILD_DIR`, and supported
+/// `CARGO_BUILD_BUILD_DIR` at that one absolute root. Overriding Cargo's own metadata target is
+/// required because cargo-llvm-cov 0.8.7 otherwise scans `ui_test` and trybuild objects under the
+/// original cached target. The directory stays alive through report generation and LCOV reading,
+/// then is removed on every result path.
+///
+/// Non-empty LLVM coverage/profdata flag variables are rejected before metadata or coverage runs:
+/// cargo-llvm-cov appends them directly to its tool commands, where they can name arbitrary cached
+/// inputs. The children also remove all four variables so empty inherited values cannot drift.
 ///
 /// The final artifact stays at `target/sim-coverage.lcov`, so the reproduction
 /// command in the ADRs is unchanged: `rg -o '^SF:.*' target/sim-coverage.lcov`.
@@ -2039,6 +2391,49 @@ const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMEN
 /// reused report is indistinguishable from a fresh one in every other respect
 /// (see [`SIM_COVERAGE_REUSE_MARKER`]).
 fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    run_sim_lcov_with_cargo(workspace_root, reuse_lcov, &cargo)
+}
+
+/// Report cleanup failure without replacing an earlier coverage failure.
+fn finish_sim_coverage_run<T>(
+    result: Result<T>,
+    cleanup: std::io::Result<()>,
+    coverage_target: &Path,
+) -> Result<T> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(cleanup).with_context(|| {
+            format!(
+                "removing isolated sim-coverage target {}",
+                coverage_target.display()
+            )
+        }),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) => Err(primary.context(format!(
+            "sim-coverage run failed; additionally failed to remove isolated target {}: \
+             {cleanup}",
+            coverage_target.display()
+        ))),
+    }
+}
+
+fn run_sim_lcov_with_cargo(
+    workspace_root: &Path,
+    reuse_lcov: bool,
+    cargo: &OsStr,
+) -> Result<String> {
+    run_sim_lcov_with_cargo_environment(workspace_root, reuse_lcov, cargo, &[])
+}
+
+fn run_sim_lcov_with_cargo_environment(
+    workspace_root: &Path,
+    reuse_lcov: bool,
+    cargo: &OsStr,
+    command_environment: &[(&str, Option<&OsStr>)],
+) -> Result<String> {
+    let workspace_root = fs::canonicalize(workspace_root)
+        .with_context(|| format!("resolving workspace root {}", workspace_root.display()))?;
     let lcov_path = workspace_root.join("target/sim-coverage.lcov");
     if reuse_lcov {
         if !lcov_path.is_file() {
@@ -2073,24 +2468,44 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
             .with_context(|| format!("reading {}", lcov_path.display()));
     }
 
-    let exec_lcov_path = workspace_root.join("target/sim-coverage-exec.lcov");
+    validate_sim_coverage_flag_environment(|name| env::var_os(name))?;
+    let storage = resolve_cargo_storage(cargo, &workspace_root, command_environment)?;
+
     if let Some(parent) = lcov_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
-    // Step 1 — execution. `-p` is a cargo flag, not a test-runner flag. Putting
-    // it after `--` routes it to libtest, which rejects it ("Unrecognized
-    // option: 'p'") and aborts the whole coverage run. Here it picks the test
-    // binaries to run (and `--workspace`, mutually exclusive with it, would drag
-    // in the façade's Docker-bound e2e suite). It does NOT restrict
-    // instrumentation: cargo-llvm-cov instruments every workspace member
-    // regardless, which is exactly why step 2 can widen the report for free.
-    let mut exec = StdCommand::new(&cargo);
-    exec.current_dir(workspace_root)
-        .args(["llvm-cov", "--lcov", "--output-path"])
-        .arg(&exec_lcov_path)
-        .args([
+    // Keep the cold all-feature build on Cargo's configured storage filesystem,
+    // but in a fresh sibling the cache never restores or saves.
+    let coverage_target = create_sim_coverage_target(&storage)?;
+    let coverage_target_path = coverage_target.path().to_path_buf();
+
+    let result = (|| -> Result<String> {
+        let apply_coverage_target = |command: &mut StdCommand| {
+            command
+                .env("CARGO_LLVM_COV_TARGET_DIR", &coverage_target_path)
+                .env("CARGO_LLVM_COV_BUILD_DIR", &coverage_target_path)
+                .env("CARGO_TARGET_DIR", &coverage_target_path)
+                .env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
+            if storage.build_directory_supported {
+                command.env("CARGO_BUILD_BUILD_DIR", &coverage_target_path);
+            } else {
+                command.env_remove("CARGO_BUILD_BUILD_DIR");
+            }
+            clear_sim_coverage_artifact_flags(command);
+        };
+
+        // Step 1 — execution. `-p` is a cargo flag, not a test-runner flag. Putting
+        // it after `--` routes it to libtest, which rejects it ("Unrecognized
+        // option: 'p'") and aborts the whole coverage run. Here it picks the test
+        // binaries to run (and `--workspace`, mutually exclusive with it, would drag
+        // in the façade's Docker-bound e2e suite). It does NOT restrict
+        // instrumentation: cargo-llvm-cov instruments every workspace member
+        // regardless, which is exactly why step 2 can widen the report for free.
+        let mut exec = StdCommand::new(cargo);
+        exec.current_dir(&workspace_root).args([
+            "llvm-cov",
+            "--no-report",
             "-p",
             "magnetar-runtime-moonpool",
             "-p",
@@ -2099,45 +2514,49 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
             "--locked",
             "--quiet",
         ]);
-    // `--all-features` reaches `crypto-fips`, so this build compiles
-    // `aws-lc-fips-sys`. On Linux that needs clang or it dies in `delocate`
-    // — see [`force_clang_toolchain`]. Without this the gate is unrunnable on
-    // a bare Linux checkout, which is how it shipped until 2026-07-31.
-    force_clang_toolchain(&mut exec);
-    // Measure at `opt-level = 0`, overriding the workspace's
-    // `[profile.test] opt-level = 1`. See [`SIM_COVERAGE_OPT_LEVEL`].
-    exec.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
-    let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
-    if !status.success() {
-        bail!("`cargo llvm-cov` exited with status {status}");
-    }
+        // `--all-features` reaches `crypto-fips`, so this build compiles
+        // `aws-lc-fips-sys`. On Linux that needs clang or it dies in `delocate`
+        // — see [`force_clang_toolchain`]. Without this the gate is unrunnable on
+        // a bare Linux checkout, which is how it shipped until 2026-07-31.
+        force_clang_toolchain(&mut exec);
+        // Measure at `opt-level = 0`, overriding the workspace's
+        // `[profile.test] opt-level = 1`. See [`SIM_COVERAGE_OPT_LEVEL`].
+        apply_coverage_target(&mut exec);
+        let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
+        if !status.success() {
+            bail!("`cargo llvm-cov` exited with status {status}");
+        }
 
-    // Step 2 — re-export the same profdata + object files over the wider
-    // package set. `cargo llvm-cov report` accepts `-p` only; `--workspace`,
-    // `--exclude-from-report` and `--exclude-from-test` are all rejected on it.
-    let mut report = StdCommand::new(&cargo);
-    report
-        .current_dir(workspace_root)
-        .args(["llvm-cov", "report", "--lcov", "--output-path"])
-        .arg(&lcov_path);
-    for package in SIM_COVERAGE_REPORT_PACKAGES {
-        report.args(["-p", package]);
-    }
-    // Generated proto is excluded from the gate diff-side already
-    // (`SIM_COVERAGE_EXCLUDE_PREFIXES`); dropping it here too keeps the report
-    // from carrying tens of thousands of prost-generated lines.
-    report.args(["--ignore-filename-regex", "crates/magnetar-proto/src/pb/"]);
-    // Same override as step 1 so this re-export resolves the artifacts step 1
-    // just built rather than a differently-profiled set beside them.
-    report.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
-    let status = report
-        .status()
-        .context("failed to invoke `cargo llvm-cov report`")?;
-    if !status.success() {
-        bail!("`cargo llvm-cov report` exited with status {status}");
-    }
+        // Step 2 — re-export the same profdata + object files over the wider
+        // package set. `cargo llvm-cov report` accepts `-p` only; `--workspace`,
+        // `--exclude-from-report` and `--exclude-from-test` are all rejected on it.
+        let mut report = StdCommand::new(cargo);
+        report
+            .current_dir(&workspace_root)
+            .args(["llvm-cov", "report", "--lcov", "--output-path"])
+            .arg(&lcov_path);
+        for package in SIM_COVERAGE_REPORT_PACKAGES {
+            report.args(["-p", package]);
+        }
+        // Generated proto is excluded from the gate diff-side already
+        // (`SIM_COVERAGE_EXCLUDE_PREFIXES`); dropping it here too keeps the report
+        // from carrying tens of thousands of prost-generated lines.
+        report.args(["--ignore-filename-regex", "crates/magnetar-proto/src/pb/"]);
+        // The same target and profile override make this report consume only
+        // the profiles and objects the execution phase just produced.
+        apply_coverage_target(&mut report);
+        let status = report
+            .status()
+            .context("failed to invoke `cargo llvm-cov report`")?;
+        if !status.success() {
+            bail!("`cargo llvm-cov report` exited with status {status}");
+        }
 
-    fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
+        fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
+    })();
+
+    let cleanup = coverage_target.close();
+    finish_sim_coverage_run(result, cleanup, &coverage_target_path)
 }
 
 /// Intersect the per-file added-line sets from the diff with the executable
@@ -3599,6 +4018,808 @@ fn pop(now: Instant) {
             .iter()
             .map(|(relpath, lines)| ((*relpath).to_owned(), lines.iter().copied().collect()))
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn fake_coverage_cargo(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cargo = root.join("fake-cargo");
+        fs::write(
+            &cargo,
+            r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "metadata" ]; then
+    printf 'metadata\t%s\n' "$*" >> "$PWD/fake-cargo.log"
+    workspace_parent="${PWD%/*}"
+    if [ -f "$PWD/metadata-symlink-storage" ]; then
+        metadata_target="$PWD/configured-target"
+        metadata_build="$PWD/configured-build"
+    else
+        metadata_target="$PWD/target"
+        metadata_build="$workspace_parent/build-storage/cached-build"
+    fi
+    if [ -f "$PWD/metadata-without-build-directory" ]; then
+        printf '{"packages":[{"metadata":{"target_directory":"/nested-poison"}}],"target_directory":"%s"}\n' "$metadata_target"
+    else
+        printf '{"packages":[{"metadata":{"target_directory":"/nested-poison"}}],"target_directory":"%s","build_directory":"%s"}\n' "$metadata_target" "$metadata_build"
+    fi
+    exit 0
+fi
+
+phase="${2:-missing}"
+coverage_target="${CARGO_LLVM_COV_TARGET_DIR:-$PWD/target/llvm-cov-target}"
+build_target="${CARGO_LLVM_COV_BUILD_DIR:-$coverage_target}"
+cargo_target="${CARGO_TARGET_DIR:-unset}"
+cargo_build="${CARGO_BUILD_BUILD_DIR:-unset}"
+artifact_flags="${LLVM_COV_FLAGS+set}${LLVM_PROFDATA_FLAGS+set}${CARGO_LLVM_COV_FLAGS+set}${CARGO_LLVM_PROFDATA_FLAGS+set}"
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$phase" "$coverage_target" "$build_target" "$cargo_target" "$cargo_build" "$artifact_flags" >> "$PWD/fake-cargo.log"
+
+[ "$coverage_target" = "$build_target" ] || exit 77
+[ "$coverage_target" = "$cargo_target" ] || exit 78
+if [ -f "$PWD/metadata-without-build-directory" ]; then
+    [ "$cargo_build" = "unset" ] || exit 79
+else
+    [ "$coverage_target" = "$cargo_build" ] || exit 80
+fi
+[ -z "$artifact_flags" ] || exit 81
+
+case "$phase" in
+    --no-report)
+        [ -d "$coverage_target" ] || exit 70
+        [ -z "$(find "$coverage_target" -mindepth 1 -print -quit)" ] || exit 71
+        mkdir -p "$coverage_target/debug/deps"
+        : > "$coverage_target/current.profraw"
+        : > "$coverage_target/debug/deps/current-object"
+        [ ! -f "$PWD/fail-execution" ] || exit 17
+        ;;
+    report)
+        [ -f "$coverage_target/current.profraw" ] || exit 72
+        [ -f "$coverage_target/debug/deps/current-object" ] || exit 73
+        [ ! -e "$coverage_target/stale.profraw" ] || exit 74
+        [ ! -e "$coverage_target/debug/deps/stale-object" ] || exit 75
+        [ ! -f "$PWD/fail-report" ] || exit 18
+
+        output_path=
+        previous=
+        for argument in "$@"; do
+            if [ "$previous" = "--output-path" ]; then
+                output_path="$argument"
+                break
+            fi
+            previous="$argument"
+        done
+        [ -n "$output_path" ] || exit 76
+        printf 'TN:current-pass\n' > "$output_path"
+        ;;
+    *)
+        exit 19
+        ;;
+esac
+"#,
+        )
+        .expect("write fake cargo");
+        let mut permissions = fs::metadata(&cargo)
+            .expect("read fake cargo metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&cargo, permissions).expect("make fake cargo executable");
+        cargo
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct FakeCoverageInvocation {
+        phase: String,
+        llvm_target: PathBuf,
+        llvm_build: PathBuf,
+        cargo_target: PathBuf,
+        cargo_build: Option<PathBuf>,
+        artifact_flags: String,
+    }
+
+    #[cfg(unix)]
+    fn fake_coverage_invocations(root: &Path) -> Vec<FakeCoverageInvocation> {
+        fs::read_to_string(root.join("fake-cargo.log"))
+            .expect("read fake cargo log")
+            .lines()
+            .filter(|line| !line.starts_with("metadata\t"))
+            .map(|line| {
+                let mut fields = line.split('\t');
+                let phase = fields.next().expect("phase field").to_owned();
+                let llvm_target = PathBuf::from(fields.next().expect("coverage target field"));
+                let llvm_build = PathBuf::from(fields.next().expect("build target field"));
+                let cargo_target = PathBuf::from(fields.next().expect("Cargo target field"));
+                let cargo_build = match fields.next().expect("Cargo build field") {
+                    "unset" => None,
+                    path => Some(PathBuf::from(path)),
+                };
+                let artifact_flags = fields.next().expect("artifact flags field").to_owned();
+                assert!(fields.next().is_none(), "unexpected fake cargo log field");
+                FakeCoverageInvocation {
+                    phase,
+                    llvm_target,
+                    llvm_build,
+                    cargo_target,
+                    cargo_build,
+                    artifact_flags,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn fake_metadata_invocation(root: &Path) -> String {
+        fs::read_to_string(root.join("fake-cargo.log"))
+            .expect("read fake cargo log")
+            .lines()
+            .find_map(|line| line.strip_prefix("metadata\t").map(str::to_owned))
+            .expect("cargo metadata invocation")
+    }
+
+    #[cfg(unix)]
+    fn assert_fake_coverage_contract(
+        root: &Path,
+        expected_scratch_parent: &Path,
+        case: &str,
+    ) -> PathBuf {
+        let invocations = fake_coverage_invocations(root);
+        assert_eq!(invocations.len(), 2, "{case}: execute + report");
+        assert_eq!(invocations[0].phase, "--no-report", "{case}: execute phase");
+        assert_eq!(invocations[1].phase, "report", "{case}: report phase");
+        assert_eq!(
+            fake_metadata_invocation(root),
+            format!(
+                "metadata --format-version=1 --locked --manifest-path {}",
+                root.join("Cargo.toml").display()
+            ),
+            "{case}: resolve effective Cargo storage before isolation"
+        );
+        let isolated_target = invocations[0].llvm_target.clone();
+        assert!(isolated_target.is_absolute(), "{case}: target is absolute");
+        for invocation in invocations {
+            assert_eq!(
+                invocation.llvm_target, isolated_target,
+                "{case}: both phases must share the llvm-cov target"
+            );
+            assert_eq!(
+                invocation.llvm_build, isolated_target,
+                "{case}: llvm-cov objects must share the isolated target"
+            );
+            assert_eq!(
+                invocation.cargo_target, isolated_target,
+                "{case}: Cargo metadata and auxiliary targets must be isolated"
+            );
+            assert_eq!(
+                invocation.cargo_build.as_ref(),
+                Some(&isolated_target),
+                "{case}: supported Cargo build storage must be isolated"
+            );
+            assert!(
+                invocation.artifact_flags.is_empty(),
+                "{case}: artifact-injection flags must be cleared"
+            );
+        }
+        assert_eq!(
+            isolated_target.parent(),
+            Some(expected_scratch_parent),
+            "{case}: cold build must use a scratch sibling on the build filesystem"
+        );
+        isolated_target
+    }
+
+    #[test]
+    fn sim_coverage_metadata_parser_uses_top_level_decoded_paths() {
+        let metadata = r#"{
+            "packages": [{"metadata": {"target_directory": "/nested-poison"}}],
+            "target_directory": "/cache/target\\with-escape",
+            "build_directory": "/cache/build-\u03bb"
+        }"#;
+
+        assert_eq!(
+            top_level_json_string(metadata, "target_directory").expect("parse target directory"),
+            Some("/cache/target\\with-escape".to_owned())
+        );
+        assert_eq!(
+            top_level_json_string(metadata, "build_directory").expect("parse build directory"),
+            Some("/cache/build-λ".to_owned())
+        );
+        assert_eq!(
+            top_level_json_string(metadata, "missing").expect("parse absent field"),
+            None
+        );
+    }
+
+    #[test]
+    fn sim_coverage_metadata_preflight_locked_preserves_missing_and_stale_lock() {
+        let tmp = tempfile::tempdir().expect("create lock preflight fixture");
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(root.join("src")).expect("create fixture source directory");
+        fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").expect("write fixture source");
+        let initial_manifest = concat!(
+            "[package]\nname = \"lock-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+            "\n[dependencies]\nlock-dependency = { path = \"dependency\" }\n",
+        );
+        fs::write(root.join("Cargo.toml"), initial_manifest).expect("write fixture manifest");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(dependency.join("src")).expect("create path dependency");
+        fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname = \"lock-dependency\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write dependency manifest");
+        fs::write(dependency.join("src/lib.rs"), "pub fn dependency() {}\n")
+            .expect("write dependency source");
+
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let cached_target = tmp.path().join("cached-target");
+        let command_environment = [
+            ("CARGO_TARGET_DIR", Some(cached_target.as_os_str())),
+            ("CARGO_BUILD_BUILD_DIR", None),
+        ];
+        let missing = resolve_cargo_storage(&cargo, &root, &command_environment)
+            .expect_err("missing lockfile must fail the locked metadata preflight");
+        assert!(
+            format!("{missing:#}").contains("--locked"),
+            "Cargo must explain the immutable lock failure: {missing:#}"
+        );
+        assert!(
+            !root.join("Cargo.lock").exists(),
+            "locked metadata must not create a missing lockfile"
+        );
+
+        let mut generate = StdCommand::new(&cargo);
+        generate.current_dir(&root).arg("generate-lockfile");
+        apply_command_environment(&mut generate, &command_environment);
+        clear_sim_coverage_artifact_flags(&mut generate);
+        assert!(generate.status().expect("generate baseline lock").success());
+        let lock_before = fs::read(root.join("Cargo.lock")).expect("read baseline lock");
+
+        let dependency_two = root.join("dependency-two");
+        fs::create_dir_all(dependency_two.join("src")).expect("create second path dependency");
+        fs::write(
+            dependency_two.join("Cargo.toml"),
+            "[package]\nname = \"lock-dependency-two\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write second dependency manifest");
+        fs::write(
+            dependency_two.join("src/lib.rs"),
+            "pub fn dependency_two() {}\n",
+        )
+        .expect("write second dependency source");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("{initial_manifest}lock-dependency-two = {{ path = \"dependency-two\" }}\n"),
+        )
+        .expect("make fixture lock stale");
+
+        resolve_cargo_storage(&cargo, &root, &command_environment)
+            .expect_err("stale lockfile must fail the locked metadata preflight");
+        assert_eq!(
+            fs::read(root.join("Cargo.lock")).expect("read lock after failed preflight"),
+            lock_before,
+            "locked metadata must not rewrite a stale lockfile"
+        );
+    }
+
+    #[test]
+    fn sim_coverage_rejects_every_non_empty_artifact_flag_without_printing_values() {
+        for rejected in SIM_COVERAGE_ARTIFACT_FLAG_ENV {
+            let err = validate_sim_coverage_flag_environment(|name| {
+                (name == *rejected).then(|| OsString::from("--object /secret/cached-object"))
+            })
+            .expect_err("non-empty artifact flag must be rejected");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(rejected),
+                "diagnostic must name the rejected variable: {rendered}"
+            );
+            assert!(
+                !rendered.contains("/secret/cached-object"),
+                "diagnostic must not print the injected value: {rendered}"
+            );
+        }
+
+        validate_sim_coverage_flag_environment(|_| Some(OsString::new()))
+            .expect("empty artifact flags are harmless and are cleared on children");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_isolated_target_omits_unsupported_cargo_build_directory() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(&root).expect("create fake workspace");
+        fs::write(root.join("metadata-without-build-directory"), "old Cargo")
+            .expect("select old Cargo metadata fixture");
+        let cargo = fake_coverage_cargo(&root);
+
+        run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+            .expect("old Cargo metadata fixture should pass");
+        let invocations = fake_coverage_invocations(&root);
+        assert_eq!(invocations.len(), 2);
+        let isolated_target = invocations[0].llvm_target.clone();
+        for invocation in invocations {
+            assert_eq!(invocation.llvm_target, isolated_target);
+            assert_eq!(invocation.llvm_build, isolated_target);
+            assert_eq!(invocation.cargo_target, isolated_target);
+            assert_eq!(invocation.cargo_build, None);
+            assert!(invocation.artifact_flags.is_empty());
+        }
+        assert!(
+            !isolated_target.exists(),
+            "old-Cargo success must still remove the isolated target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_storage_resolves_final_component_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create symlink storage fixture");
+        let root = tmp.path().join("workspace");
+        let real_storage = tmp.path().join("real-storage");
+        let real_target = real_storage.join("cached-target");
+        let real_build = real_storage.join("cached-build");
+        fs::create_dir_all(&root).expect("create fake workspace");
+        fs::create_dir_all(&real_target).expect("create real target storage");
+        fs::create_dir_all(&real_build).expect("create real build storage");
+        let configured_target = root.join("configured-target");
+        let configured_build = root.join("configured-build");
+        symlink(&real_target, &configured_target).expect("symlink final target component");
+        symlink(&real_build, &configured_build).expect("symlink final build component");
+        fs::write(root.join("metadata-symlink-storage"), "symlink storage")
+            .expect("select symlink metadata fixture");
+        let cargo = fake_coverage_cargo(&root);
+
+        run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+            .expect("final-component symlink fixture should pass");
+        let isolated_target = assert_fake_coverage_contract(
+            &root,
+            &fs::canonicalize(&real_storage).expect("resolve real storage"),
+            "final-component symlink",
+        );
+        assert!(
+            !isolated_target.exists(),
+            "symlink fixture must clean scratch"
+        );
+        assert!(
+            !isolated_target.starts_with(&real_target) && !isolated_target.starts_with(&real_build),
+            "scratch must be outside both resolved cache trees"
+        );
+        assert_eq!(
+            resolve_storage_path(&configured_target.join("future/nested"))
+                .expect("resolve nearest existing symlink ancestor"),
+            real_target.join("future/nested"),
+            "missing suffixes must be replayed after resolving their nearest existing ancestor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sim_coverage_rejects_a_mount_root_without_an_outside_cache_sibling() {
+        let err = ensure_scratch_parent_filesystem(Path::new("/proc"), Path::new("/"))
+            .expect_err("a mount root and its parent are on different filesystems");
+        assert!(
+            format!("{err:#}").contains("no outside-cache sibling exists"),
+            "diagnostic must explain why hermetic scratch placement is impossible: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_isolated_target_ignores_every_default_artifact_poison() {
+        let poison_cases = [
+            ("profile-only", true, false),
+            ("object-only", false, true),
+            ("combined", true, true),
+        ];
+
+        for (case, poison_profile, poison_object) in poison_cases {
+            let tmp = tempfile::tempdir().expect("create temp dir");
+            let root = tmp.path().join("workspace");
+            let default_target = root.join("target/llvm-cov-target");
+            let ui_test_target = root.join("target/ui");
+            let trybuild_target = root.join("target/tests/trybuild/debug");
+            let trybuild_fallback_target = root.join("target/tests/target/debug");
+            fs::create_dir_all(default_target.join("debug/deps"))
+                .expect("create poisoned default coverage target");
+            for auxiliary in [&ui_test_target, &trybuild_target, &trybuild_fallback_target] {
+                fs::create_dir_all(auxiliary).expect("create poisoned auxiliary target");
+                fs::write(auxiliary.join("stale-object"), "stale auxiliary object")
+                    .expect("poison metadata-derived auxiliary target");
+            }
+            if poison_profile {
+                fs::write(default_target.join("stale.profraw"), "stale profile")
+                    .expect("poison default coverage profile");
+            }
+            if poison_object {
+                fs::write(
+                    default_target.join("debug/deps/stale-object"),
+                    "stale object",
+                )
+                .expect("poison default coverage object");
+            }
+            let cargo = fake_coverage_cargo(&root);
+
+            let lcov = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+                .unwrap_or_else(|err| panic!("{case} poison selected: {err:#}"));
+            assert_eq!(lcov, "TN:current-pass\n", "{case}");
+            assert_eq!(
+                fs::read_to_string(root.join("target/sim-coverage.lcov")).expect("read final LCOV"),
+                lcov,
+                "{case}: final LCOV must stay at target/sim-coverage.lcov"
+            );
+
+            let isolated_target =
+                assert_fake_coverage_contract(&root, &tmp.path().join("build-storage"), case);
+            assert!(
+                !isolated_target.starts_with(root.join("target")),
+                "{case}: isolated target must sit outside cached target/"
+            );
+            assert!(
+                !isolated_target.exists(),
+                "{case}: successful run must remove its isolated target"
+            );
+            assert_eq!(
+                default_target.join("stale.profraw").exists(),
+                poison_profile,
+                "{case}: default profile poison must remain untouched"
+            );
+            assert_eq!(
+                default_target.join("debug/deps/stale-object").exists(),
+                poison_object,
+                "{case}: default object poison must remain untouched"
+            );
+            for auxiliary in [ui_test_target, trybuild_target, trybuild_fallback_target] {
+                assert!(
+                    auxiliary.join("stale-object").is_file(),
+                    "{case}: metadata-derived poison must remain untouched"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_isolated_target_is_removed_after_each_child_failure() {
+        let failure_cases = [
+            ("execution", "fail-execution", 1_usize, "`cargo llvm-cov`"),
+            ("report", "fail-report", 2_usize, "`cargo llvm-cov report`"),
+        ];
+
+        for (case, failure_marker, expected_invocations, expected_error) in failure_cases {
+            let tmp = tempfile::tempdir().expect("create temp dir");
+            let root = tmp.path().join("workspace");
+            fs::create_dir_all(&root).expect("create fake workspace");
+            fs::write(root.join(failure_marker), "fail").expect("write failure marker");
+            let cargo = fake_coverage_cargo(&root);
+
+            let err = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+                .expect_err("fake cargo failure must propagate");
+            assert!(
+                format!("{err:#}").contains(expected_error),
+                "{case}: child failure must remain the primary error: {err:#}"
+            );
+
+            let invocations = fake_coverage_invocations(&root);
+            assert_eq!(invocations.len(), expected_invocations, "{case}");
+            let isolated_target = &invocations[0].llvm_target;
+            assert!(
+                invocations.iter().all(|invocation| {
+                    invocation.llvm_target == *isolated_target
+                        && invocation.llvm_build == *isolated_target
+                        && invocation.cargo_target == *isolated_target
+                        && invocation.cargo_build.as_ref() == Some(isolated_target)
+                        && invocation.artifact_flags.is_empty()
+                }),
+                "{case}: every reached child must share one isolated target"
+            );
+            assert!(
+                !isolated_target.exists(),
+                "{case}: failed run must remove its isolated target"
+            );
+        }
+    }
+
+    #[test]
+    fn sim_coverage_isolated_target_cleanup_error_preserves_the_primary_failure() {
+        let primary = anyhow!("execution failed first");
+        let cleanup = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cleanup failed second",
+        );
+        let err = finish_sim_coverage_run::<()>(
+            Err(primary),
+            Err(cleanup),
+            Path::new("/tmp/coverage-target"),
+        )
+        .expect_err("combined failure must remain an error");
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("execution failed first"),
+            "primary child failure must remain in the error chain: {rendered}"
+        );
+        assert!(
+            rendered.contains("cleanup failed second"),
+            "cleanup failure must be reported beside it: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_real_coverage_fixture(root: &Path) {
+        let packages = [
+            "magnetar-proto",
+            "magnetar-runtime-tokio",
+            "magnetar-runtime-moonpool",
+            "magnetar-differential",
+            "magnetar-auth-athenz",
+            "magnetar-auth-sasl",
+        ];
+        let members = packages
+            .iter()
+            .map(|package| format!("    \"crates/{package}\","))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::create_dir_all(root).expect("create real-tool fixture root");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\nresolver = \"2\"\nmembers = [\n{members}\n]\n"),
+        )
+        .expect("write real-tool workspace manifest");
+
+        for package in packages {
+            let package_root = root.join("crates").join(package);
+            fs::create_dir_all(package_root.join("src")).expect("create fixture package");
+            let dependencies = match package {
+                "magnetar-runtime-tokio" => "magnetar-proto = { path = \"../magnetar-proto\" }\n",
+                "magnetar-runtime-moonpool" => concat!(
+                    "magnetar-proto = { path = \"../magnetar-proto\" }\n",
+                    "magnetar-runtime-tokio = { path = \"../magnetar-runtime-tokio\" }\n",
+                    "magnetar-auth-athenz = { path = \"../magnetar-auth-athenz\" }\n",
+                    "magnetar-auth-sasl = { path = \"../magnetar-auth-sasl\" }\n",
+                ),
+                "magnetar-differential" => concat!(
+                    "magnetar-proto = { path = \"../magnetar-proto\" }\n",
+                    "magnetar-runtime-tokio = { path = \"../magnetar-runtime-tokio\" }\n",
+                    "magnetar-runtime-moonpool = { path = \"../magnetar-runtime-moonpool\" }\n",
+                    "magnetar-auth-athenz = { path = \"../magnetar-auth-athenz\" }\n",
+                    "magnetar-auth-sasl = { path = \"../magnetar-auth-sasl\" }\n",
+                ),
+                _ => "",
+            };
+            fs::write(
+                package_root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \
+                     \"2024\"\n\n[dependencies]\n{dependencies}"
+                ),
+            )
+            .expect("write fixture package manifest");
+            let source = match package {
+                "magnetar-proto" => "pub fn value() -> u32 { 1 }\n",
+                "magnetar-runtime-tokio" => {
+                    "pub fn value() -> u32 { magnetar_proto::value() + 1 }\n"
+                }
+                "magnetar-auth-athenz" => "pub fn value() -> u32 { 2 }\n",
+                "magnetar-auth-sasl" => "pub fn value() -> u32 { 3 }\n",
+                "magnetar-runtime-moonpool" => concat!(
+                    "pub fn value() -> u32 {\n",
+                    "    magnetar_proto::value() + magnetar_runtime_tokio::value()\n",
+                    "        + magnetar_auth_athenz::value() + magnetar_auth_sasl::value()\n",
+                    "}\n",
+                    "#[cfg(test)]\n",
+                    "mod tests {\n",
+                    "    #[test]\n",
+                    "    fn reaches_the_dependency_closure() { assert_eq!(super::value(), 8); }\n",
+                    "}\n",
+                ),
+                "magnetar-differential" => concat!(
+                    "pub fn value() -> u32 {\n",
+                    "    magnetar_runtime_moonpool::value() + magnetar_runtime_tokio::value()\n",
+                    "        + magnetar_proto::value() + magnetar_auth_athenz::value()\n",
+                    "        + magnetar_auth_sasl::value()\n",
+                    "}\n",
+                    "#[cfg(test)]\n",
+                    "mod tests {\n",
+                    "    #[test]\n",
+                    "    fn reaches_both_runners() { assert_eq!(super::value(), 16); }\n",
+                    "}\n",
+                ),
+                _ => unreachable!(),
+            };
+            fs::write(package_root.join("src/lib.rs"), source).expect("write fixture source");
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_coverage_poison(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path.parent().expect("poison parent")).expect("create poison parent");
+        fs::write(path, "not an LLVM coverage object\n").expect("write poison object");
+        let mut permissions = fs::metadata(path)
+            .expect("read poison metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).expect("make poison executable");
+    }
+
+    #[cfg(unix)]
+    fn clear_coverage_environment(command: &mut StdCommand) {
+        clear_sim_coverage_artifact_flags(command);
+        command
+            .env_remove("CARGO_LLVM_COV_TARGET_DIR")
+            .env_remove("CARGO_LLVM_COV_BUILD_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR");
+    }
+
+    #[cfg(unix)]
+    fn assert_no_real_fixture_scratch(parent: &Path) {
+        let leftovers: Vec<_> = fs::read_dir(parent)
+            .expect("read scratch parent")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sim-coverage-target-")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "real-tool invocation leaked scratch targets: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_real_cargo_llvm_cov_version(cargo: &OsStr) {
+        let mut version = StdCommand::new(cargo);
+        version.args(["llvm-cov", "--version"]);
+        clear_coverage_environment(&mut version);
+        let version = version.output().expect("invoke cargo-llvm-cov --version");
+        assert!(version.status.success(), "cargo-llvm-cov must be installed");
+        assert_eq!(
+            String::from_utf8(version.stdout)
+                .expect("cargo-llvm-cov version is UTF-8")
+                .trim(),
+            "cargo-llvm-cov 0.8.7",
+            "the fixture pins the reviewed object-discovery implementation"
+        );
+    }
+
+    #[cfg(unix)]
+    fn generate_real_fixture_lock(
+        cargo: &OsStr,
+        root: &Path,
+        metadata_environment: &[(&str, Option<&OsStr>)],
+    ) {
+        let mut lock = StdCommand::new(cargo);
+        lock.current_dir(root).arg("generate-lockfile");
+        apply_command_environment(&mut lock, metadata_environment);
+        clear_coverage_environment(&mut lock);
+        assert!(lock.status().expect("generate fixture lockfile").success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sim_coverage_real_tool_excludes_cold_and_warm_metadata_artifact_poison() {
+        const ENABLE: &str = "MAGNETAR_RUN_CARGO_LLVM_COV_INTEGRATION";
+        if env::var_os(ENABLE).as_deref() != Some(OsStr::new("1")) {
+            eprintln!(
+                "skipping real cargo-llvm-cov fixture; run with {ENABLE}=1 to exercise 0.8.7"
+            );
+            return;
+        }
+
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        assert_real_cargo_llvm_cov_version(&cargo);
+
+        let tmp = tempfile::tempdir().expect("create real-tool fixture temp dir");
+        let root = tmp.path().join("workspace");
+        let cached_target = tmp.path().join("cached-target");
+        write_real_coverage_fixture(&root);
+        let metadata_environment = [
+            ("CARGO_TARGET_DIR", Some(cached_target.as_os_str())),
+            ("CARGO_BUILD_BUILD_DIR", None),
+        ];
+
+        generate_real_fixture_lock(&cargo, &root, &metadata_environment);
+
+        let primary = cached_target.join("llvm-cov-target");
+        fs::create_dir_all(primary.join("debug")).expect("create primary poison target");
+        fs::write(primary.join("stale.profraw"), "invalid raw profile")
+            .expect("poison primary profile");
+        write_executable_coverage_poison(&primary.join("debug/magnetar_proto-deadbeef"));
+        let ui_poison = cached_target.join("ui/stale-ui-object");
+        write_executable_coverage_poison(&ui_poison);
+        let trybuild_root = cached_target.join("tests/trybuild");
+        let trybuild_package = trybuild_root.join("poison-package");
+        fs::create_dir_all(trybuild_package.join("src")).expect("create trybuild poison package");
+        fs::write(
+            trybuild_package.join("Cargo.toml"),
+            "[package]\nname = \"poison-trybuild\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write trybuild poison manifest");
+        fs::write(trybuild_package.join("src/lib.rs"), "pub fn poison() {}\n")
+            .expect("write trybuild poison source");
+        let trybuild_poison = trybuild_root.join("debug/stale-trybuild-object");
+        write_executable_coverage_poison(&trybuild_poison);
+
+        let run = || {
+            let lcov = run_sim_lcov_with_cargo_environment(
+                &root,
+                false,
+                cargo.as_os_str(),
+                &metadata_environment,
+            )
+            .expect("isolated real-tool coverage run");
+            assert!(
+                lcov.contains("SF:"),
+                "fixture must produce a real LCOV report"
+            );
+            assert!(
+                lcov.contains("magnetar-proto/src/lib.rs"),
+                "dependency coverage must survive isolation"
+            );
+            assert_no_real_fixture_scratch(tmp.path());
+        };
+
+        // Cold current-pass build against a default target containing only poison.
+        run();
+
+        // Populate the default llvm-cov target with real warm objects/profiles;
+        // the invalid primary and metadata-derived artifacts remain beside them.
+        let mut warm = StdCommand::new(&cargo);
+        warm.current_dir(&root).args([
+            "llvm-cov",
+            "--no-report",
+            "--workspace",
+            "--locked",
+            "--quiet",
+        ]);
+        warm.env("CARGO_TARGET_DIR", &cached_target);
+        clear_coverage_environment(&mut warm);
+        assert!(
+            warm.status()
+                .expect("warm default coverage target")
+                .success()
+        );
+        assert!(
+            fs::read_dir(&primary)
+                .expect("read warmed profile target")
+                .filter_map(std::result::Result::ok)
+                .any(|entry| {
+                    entry.path().extension() == Some(OsStr::new("profraw"))
+                        && entry.file_name() != OsStr::new("stale.profraw")
+                }),
+            "warm fixture must contain a real current profile beside the poison"
+        );
+        assert!(
+            primary.join("debug/deps").is_dir(),
+            "warm fixture must contain real compiled objects"
+        );
+
+        // Two consecutive invocations prove a warm cached tree and a prior
+        // isolated pass cannot become inputs to the next current-pass report.
+        run();
+        run();
+
+        for poison in [
+            primary.join("stale.profraw"),
+            primary.join("debug/magnetar_proto-deadbeef"),
+            ui_poison,
+            trybuild_poison,
+        ] {
+            assert!(
+                poison.is_file(),
+                "fixture poison was unexpectedly consumed: {poison:?}"
+            );
+        }
     }
 
     /// The defect this reporting exists for: `run_sim_lcov`'s report step

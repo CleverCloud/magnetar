@@ -20,6 +20,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`check-sim-coverage` now reports only over artifacts built by its current pass.** The execution phase runs two packages while the report re-exports six, and cargo-llvm-cov 0.8.7's `--no-report` path does not clean first-party objects; a warm local target or restored CI target could therefore contribute stale profiles or objects to an enforcing verdict.
+  Both phases now share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem.
+  Broker-independent artifact injection through LLVM coverage/profdata flag variables is rejected, locked metadata cannot rewrite `Cargo.lock`, final-component symlinks and mount roots fail safely, and the scratch directory is removed on every catchable outcome without masking a primary error.
+  The report remains at `target/sim-coverage.lcov`, but that path is output-only.
+  Cold, back-to-back warm, profile-only, object-only, `ui_test`, and trybuild poison cases prove cached inputs cannot affect the result.
+  (ADR-0096; closes `docs/follow-ups.md` §14)
+
 - **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.**
   `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
   Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.

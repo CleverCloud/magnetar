@@ -119,6 +119,7 @@ Any change that alters runtime behavior, public API, wire format, or touches `ma
 
 **Sim coverage** — every line the diff (`merge-base origin/main HEAD`) adds inside the gate's reported scope must be executed by the moonpool run: **100% line coverage on the diff**.
 Measured by `cargo run -p xtask -- check-sim-coverage`, which drives `cargo llvm-cov` to the LCOV report `target/sim-coverage.lcov` and intersects it with the merge-base diff.
+Execution and report share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem; `target/sim-coverage.lcov` is output-only, and no profile or object input is reused across passes ([ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md)).
 The requirement on the author is hard, and since [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) the gate's enforcement of it is too — see **Enforcing landing** below.
 
 Execution scope and report scope are two different sets, and the distinction is binding:
@@ -128,6 +129,7 @@ Execution scope and report scope are two different sets, and the distinction is 
   A `magnetar-proto` unit test never satisfies this gate.
 - **Reported** — `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl` (measured 2026-07-31: 63 `SF:` records, against 16 before).
   Instrumentation is workspace-wide regardless of `-p`, so the wider report is a second `cargo llvm-cov report` pass over artifacts already on disk — no extra compilation and no second test run.
+  Those artifacts are from this invocation's execution phase only: locked metadata resolves build storage, both phases receive the same isolated target variables, injected LLVM artifact flags are rejected, and cleanup runs after LCOV reading.
   Generated code under `crates/magnetar-proto/src/pb/` stays excluded, as is every line inside a `#[cfg(test)]` span — span membership via the shared `cfg_test_line_flags`, the same scanner `check-no-internal-clock` and `check-log-fields` use.
   Until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) this gate instead cut at a file's **first** `#[cfg(test)]` line and dropped everything below it; because that line is usually a gated `use` or helper rather than the bottom `mod tests`, it exempted 48% of all gated lines and 71% of those added over the preceding ten merged PRs. Do not reintroduce a line-cut heuristic here.
 

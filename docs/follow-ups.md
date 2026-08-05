@@ -24,7 +24,6 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                          | ⚡ ready to dispatch   |
 | 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                                        | ⚡ ready to dispatch   |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)                    | ⚡ ready to dispatch   |
 | 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)                | ⚡ ready to dispatch   |
 | 16  | [PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts](#16-pip-460-upstream-assignment-lifecycle-dag-ordering-and-proxy-contracts) | 🔗 blocked on upstream |
 
@@ -48,19 +47,6 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 
 **Selected design.** The [M1-hardened StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) freezes assignment-driven `Exclusive` child consumers, strict locally provable DAG ordering by default, explicit broker-managed cross-member compatibility, one aggregate receive budget, source-qualified position vectors, transaction-aware acknowledgement, and an unbounded observable handoff drain.
 `QueueConsumer` and `CheckpointConsumer` remain out of scope.
-
-## 14. `check-sim-coverage` can report over artifacts it did not build
-
-**Gap.** [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) split the gate into an execution step and a re-export step with **different scopes**. Execution passes `-p magnetar-runtime-moonpool -p magnetar-differential`, and `cargo llvm-cov`'s `-p` also selects which packages get _cleaned_. The report then covers all six of `SIM_COVERAGE_REPORT_PACKAGES`, so `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-auth-athenz` and `magnetar-auth-sasl` are re-exported from object files no step in the current pass is guaranteed to have produced.
-CI restores the root `target/` through `Swatinem/rust-cache@v2`; the action currently prunes recognized workspace artifacts recursively, but a mutable cache action and its implementation details cannot be the coverage gate's provenance boundary.
-
-**Why it stays open.** It was investigated as the suspected cause of the PR #391 false red and **refuted**: `cargo llvm-cov clean --workspace` followed by a cold `CARGO_INCREMENTAL=0` run reproduced the failing report exactly (81 `SF:` records, `DA:271,0`).
-The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
-So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
-
-**Selected fix.** Use one invocation-owned, initially empty llvm-cov target outside the cached workspace `target/`, and point both the execution and report phases at it.
-Poisoned profile-only, object-only, and combined artifacts in the default target must then be unable to affect the report.
-A missing per-file `SF:` record is not sufficient because LLVM legitimately emits none for functionless module/export/constant files; the existing record-less-_crate_ failure remains.
 
 ## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
 
@@ -121,5 +107,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md) and §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md). §11 and §12 were both surfaced by that work and became dispatch-ready once the M1-hardened StreamConsumer proposal froze their shared design. §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines; its number is retired, which is why the entry added here is §14.
+§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), and §14 with [ADR-0096](../specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md). §11 and §12 were both surfaced by that work and became dispatch-ready once the M1-hardened StreamConsumer proposal froze their shared design. §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.
