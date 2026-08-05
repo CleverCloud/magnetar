@@ -1305,22 +1305,22 @@ where
     let mut pending_write = PendingDriverWrite::new();
     let mut close_after_write = false;
     // ADR-0083: the write's `operation_timeout` deadline, anchored to a
-    // fixed `Instant` set the moment a logical write FIRST has work and
-    // cleared once it fully drains — NOT recomputed fresh every loop
-    // iteration. `select!`'s write arm is a per-iteration expression
+    // fixed `tokio::time::Instant` set the moment a logical write FIRST has
+    // work and cleared once it fully drains — NOT recomputed fresh every
+    // loop iteration. `select!`'s write arm is a per-iteration expression
     // (`write_one_budget(...)`), so a naive `tokio::time::timeout(operation_timeout,
     // ...)` inside it would silently re-arm a brand-new full budget every
     // time ANY other arm (read, waker, or an unrelated timer tick such as
     // the keepalive interval) wins a round and the outer `loop` restarts —
     // an in-flight stalled write would never actually accumulate 30s of
-    // real elapsed time toward its own deadline. Anchoring the deadline
+    // runtime-clock time toward its own deadline. Anchoring the deadline
     // instant here, outside the `select!`, closes that hole: the remaining
     // budget only ever shrinks across iterations, regardless of which arm
     // wins any given round. (Mirrors the moonpool engine's identical
     // `write_deadline` variable — see its driver loop for the fuller
     // rationale, discovered empirically while proving this fix out under
     // deterministic simulation.)
-    let mut write_deadline: Option<Instant> = None;
+    let mut write_deadline: Option<tokio::time::Instant> = None;
     // Set while a TLS flush may be outstanding; see `write_one_budget`. Lives
     // outside the loop for the same reason `write_deadline` does — a
     // cancelled flush must survive into the next iteration to re-arm the arm.
@@ -1391,7 +1391,7 @@ where
         // untouched while work continues across iterations; clear it once
         // drained so the NEXT logical write gets a fresh full budget.
         write_deadline = if write_has_work {
-            Some(write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout))
+            Some(write_deadline.unwrap_or_else(|| tokio::time::Instant::now() + operation_timeout))
         } else {
             None
         };
@@ -1606,7 +1606,8 @@ where
                 &mut flush_pending,
                 // `write_deadline` is `Some` whenever `write_has_work` is —
                 // see where it's armed above.
-                write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout),
+                write_deadline
+                    .unwrap_or_else(|| tokio::time::Instant::now() + operation_timeout),
             ), if write_has_work => {
                 match write_result {
                     Ok(()) => {
@@ -1642,8 +1643,8 @@ where
 
 /// Run ONE bounded batch of [`PendingDriverWrite::write_budgeted`] (capped at
 /// [`DRIVER_WRITE_BUDGET_BYTES`]) plus an optional trailing flush, itself
-/// bounded by `deadline` — a FIXED `Instant` computed once by the caller
-/// when a logical write first has work (ADR-0083), not a fresh
+/// bounded by `deadline` — a FIXED `tokio::time::Instant` computed once by
+/// the caller when a logical write first has work (ADR-0083), not a fresh
 /// `operation_timeout` duration re-armed on every call: the caller
 /// (`driver_loop_inner`) reconstructs this future's expression fresh on
 /// every `select!` round, so timing out off a relative duration here would
@@ -1674,13 +1675,13 @@ async fn write_one_budget<S>(
     write_half: &mut tokio::io::WriteHalf<S>,
     flush_after_write: bool,
     flush_pending: &mut bool,
-    deadline: Instant,
+    deadline: tokio::time::Instant,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite,
 {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let outcome = tokio::time::timeout(remaining, async {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let outcome = tokio::time::timeout_at(deadline, async {
         // Set before the first `.await`, so every cancellation point below
         // leaves the flag set for the caller to re-arm on.
         if flush_after_write {
@@ -1916,31 +1917,26 @@ mod tests {
         assert!(conn.consumer_handle_is_terminal(consumer));
     }
 
-    /// Issue #370 / ADR-0083 regression test. A peer that accepts the TCP
-    /// connection then stops draining its receive window parks the driver's
-    /// write. Before the fix, `write_budgeted().await` ran UNCONDITIONALLY
-    /// at the top of every `driver_loop_inner` iteration, before the
-    /// `select!` that would otherwise let the read arm, the `driver_waker`
-    /// arm and the timer arm run — a write that never resolved therefore
-    /// starved all three and the loop never resolved (RED evidence: with
-    /// this exact double and these exact assertions, pre-fix the outer
-    /// `tokio::time::timeout` guard trips because `driver_loop_inner` itself
-    /// never returns). After the fix, the write is its own bounded,
-    /// cancel-safe `select!` arm: it is capped by both
-    /// `DRIVER_WRITE_BUDGET_BYTES` and `Connection::operation_timeout()`, so
-    /// a permanently-parked write surfaces as an `io::ErrorKind::TimedOut`
-    /// error within one `operation_timeout` window, routes through the same
-    /// `mark_disconnected()` branch every other write error takes, and
-    /// `is_connected()` flips `false`.
-    ///
-    /// The outer `tokio::time::timeout` is a harness safety margin, not the
-    /// mechanism under test — under `start_paused = true` tokio auto-advances
-    /// the virtual clock to the next pending timer once every task is
-    /// otherwise idle, so this resolves without any real wall-clock delay
-    /// whether the loop is stuck (pre-fix) or bounded (post-fix).
+    /// Issue #370 / ADR-0083 / follow-up 15 regression test. A logical write's
+    /// deadline must survive cancellation of its `select!` future. The double
+    /// reports every write poll and then remains pending forever. After the
+    /// first poll, the test advances to one second before the original
+    /// deadline and wakes the higher-priority driver-waker arm, forcing the
+    /// write future to be dropped and reconstructed. It then observes the
+    /// second write poll and advances past the original deadline, then awaits
+    /// the driver under an absolute guard strictly before a fresh timeout
+    /// started at reconstruction. The driver must report `TimedOut` and
+    /// disconnect before that guard.
     #[tokio::test(start_paused = true)]
     async fn stalled_write_is_bounded_by_operation_timeout() {
-        struct PendingForeverStream;
+        struct WritePollState {
+            count: AtomicUsize,
+            notified: tokio::sync::Notify,
+        }
+
+        struct PendingForeverStream {
+            write_polls: Arc<WritePollState>,
+        }
 
         impl AsyncRead for PendingForeverStream {
             fn poll_read(
@@ -1948,8 +1944,7 @@ mod tests {
                 _cx: &mut std::task::Context<'_>,
                 _buf: &mut tokio::io::ReadBuf<'_>,
             ) -> Poll<std::io::Result<()>> {
-                // Never resolves either, but irrelevant: the write parks
-                // first and this arm is never reached pre-fix.
+                // No inbound traffic can win ahead of the write arm.
                 Poll::Pending
             }
         }
@@ -1960,6 +1955,9 @@ mod tests {
                 _cx: &mut std::task::Context<'_>,
                 _buf: &[u8],
             ) -> Poll<std::io::Result<usize>> {
+                let write_polls = &self.get_mut().write_polls;
+                write_polls.count.fetch_add(1, Ordering::SeqCst);
+                write_polls.notified.notify_one();
                 // Deliberately never registers `_cx.waker()` — models a
                 // send-buffer-full peer whose readiness is driven only by
                 // the peer eventually draining, which never happens here.
@@ -1981,7 +1979,12 @@ mod tests {
             }
         }
 
-        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let operation_timeout = Duration::from_secs(30);
+        let config = ConnectionConfig {
+            operation_timeout,
+            ..Default::default()
+        };
+        let shared = ConnectionShared::new(config);
         {
             let mut conn = shared.inner.lock();
             conn.begin_handshake().expect("begin handshake");
@@ -2023,9 +2026,8 @@ mod tests {
                 .expect("establish producer");
             while conn.poll_event().is_some() {}
 
-            // Enqueue a transmit so the very first loop iteration has a
-            // non-empty `pending_write` and attempts the doomed write before
-            // ever reaching the `select!`.
+            // Enqueue a transmit so the first select iteration polls the
+            // doomed write.
             conn.send(
                 producer,
                 magnetar_proto::producer::OutgoingMessage {
@@ -2044,17 +2046,64 @@ mod tests {
 
         assert!(shared.inner.lock().is_connected(), "must start connected");
 
+        let write_polls = Arc::new(WritePollState {
+            count: AtomicUsize::new(0),
+            notified: tokio::sync::Notify::new(),
+        });
+        let original_deadline = tokio::time::Instant::now() + operation_timeout;
         let loop_shared = shared.clone();
+        let socket_write_polls = write_polls.clone();
         let handle: JoinHandle<Result<(), super::ClientError>> = tokio::spawn(async move {
-            let mut socket = PendingForeverStream;
+            let mut socket = PendingForeverStream {
+                write_polls: socket_write_polls,
+            };
             super::driver_loop_inner(&loop_shared, &mut socket, false).await
         });
 
-        // Harness safety margin: comfortably more than one `operation_timeout`
-        // (30s default) so a correctly-bounded write has room to trip its own
-        // deadline, but small enough that a regression back to "never
-        // resolves" fails loudly instead of hanging the suite.
-        let outcome = tokio::time::timeout(Duration::from_secs(90), handle).await;
+        // The 90-second timeout remains only a harness margin around the
+        // deterministic virtual-time choreography below.
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            while write_polls.count.load(Ordering::SeqCst) < 1 {
+                write_polls.notified.notified().await;
+            }
+
+            tokio::time::advance(
+                operation_timeout
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("operation timeout must exceed one second"),
+            )
+            .await;
+            assert!(tokio::time::Instant::now() < original_deadline);
+
+            // The driver-waker arm precedes the write arm in the biased
+            // select, so this drops the first pending write future.
+            shared.driver_waker.notify_one();
+            while write_polls.count.load(Ordering::SeqCst) < 2 {
+                write_polls.notified.notified().await;
+            }
+            let reconstructed_at = tokio::time::Instant::now();
+            let fresh_deadline = reconstructed_at + operation_timeout;
+            let guard_deadline = fresh_deadline
+                .checked_sub(Duration::from_secs(1))
+                .expect("fresh deadline must exceed the guard margin");
+            assert!(guard_deadline < fresh_deadline);
+
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let now = tokio::time::Instant::now();
+            assert!(now > original_deadline);
+            assert!(
+                now < guard_deadline,
+                "the absolute guard must remain ahead of now and strictly before the fresh \
+                 reconstructed deadline"
+            );
+            tokio::time::timeout_at(guard_deadline, handle)
+                .await
+                .expect(
+                    "the stalled write must expire at its original absolute deadline, not a fresh \
+                 timeout armed when the select arm was reconstructed",
+                )
+        })
+        .await;
 
         let join_result = outcome.expect(
             "issue #370 / ADR-0083: driver_loop_inner must resolve within one \
@@ -2062,11 +2111,14 @@ mod tests {
              hanging past the harness's 90s safety margin",
         );
         let loop_result = join_result.expect("driver task must not panic");
-        assert!(
-            loop_result.is_err(),
-            "a write that never drains must surface as an I/O error (mapped \
-             from the write-deadline timeout), not resolve Ok(())"
-        );
+        match loop_result {
+            Err(super::ClientError::Io(err)) => assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut,
+                "the logical write deadline must surface as TimedOut"
+            ),
+            other => panic!("a stalled logical write must return Io(TimedOut), got {other:?}"),
+        }
         assert!(
             !shared.inner.lock().is_connected(),
             "the write-deadline error must route through the same \
@@ -2817,7 +2869,7 @@ mod tests {
         let mut flush_pending = false;
         // Far enough out that the deadline cannot be what makes the future
         // suspend — the stalled flush must be.
-        let deadline = Instant::now() + Duration::from_mins(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
 
         {
             let mut fut = std::pin::pin!(write_one_budget(

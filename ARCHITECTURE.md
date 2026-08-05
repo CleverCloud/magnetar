@@ -620,7 +620,7 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
 
 `read_half` / `write_half` are produced ONCE, at loop entry, by splitting the connected socket (`tokio::io::split` on tokio; `Transport::into_split` on moonpool — see "TLS byte-pipe" below for why moonpool's split needs a shared adapter) and held as separate local bindings for the life of the loop — not re-split per iteration.
 
-### Read fairness and the write deadline (ADR-0070, ADR-0074, ADR-0083)
+### Read fairness and the write deadline (ADR-0070, ADR-0074, ADR-0083, ADR-0097)
 
 The tokio driver uses `tokio::select!`; the Moonpool driver uses `moonpool_core::select!`, whose fair branch offset is derived from the simulation seed.
 Both keep `biased;` because ADR-0070 requires a fixed **inbound-read-first** priority before the `driver_waker` arm.
@@ -634,7 +634,8 @@ Issue #370 showed that premise fails against a peer that accepts the connection 
 
 **ADR-0083** (amends ADR-0070 and ADR-0074) makes the write its own `select!` arm — third in order, after read and the waker, before the timer — gated by `write_has_work` so an idle connection never polls it.
 Two independent bounds keep it from starving anything: `DRIVER_WRITE_BUDGET_BYTES` (256 KiB, unchanged from ADR-0074) caps how much one arm win writes before yielding back to read, and `Connection::operation_timeout()` (30 s default — **not** `keepalive_interval`, which only detects read-side silence and would never trip against a peer that keeps ACKing pings while refusing to drain writes) caps how long a single win may block on a peer that never drains.
-The deadline is anchored to a fixed `Instant` computed once, outside the `select!`, when a logical write first has work, and held fixed while it continues across iterations — re-arming it fresh inside the per-iteration arm expression would silently reset to a full budget every time an unrelated arm won a round, so a stalled write racing ordinary background traffic on the same connection would never accumulate real elapsed time toward its own deadline.
+The deadline is anchored to a fixed engine-local instant computed once, outside the `select!`, when a logical write first has work, and held fixed while it continues across iterations — re-arming it fresh inside the per-iteration arm expression would silently reset to a full budget every time an unrelated arm won a round, so a stalled write racing ordinary background traffic on the same connection would never accumulate elapsed time toward its own deadline.
+Tokio stores a `tokio::time::Instant` and calls `timeout_at`, keeping production and paused-test scheduling in one clock domain; Moonpool retains the injected provider clock, and proto-facing `std::time::Instant` values are unaffected (ADR-0097).
 Expiry maps to `io::ErrorKind::TimedOut` and routes through the exact same `mark_disconnected()` + `Err` branch every other write failure already takes, so the supervisor redials unchanged.
 
 Making the write cancellable (droppable mid-poll, routine once it races other arms) required a prerequisite rewrite: both engines' `write_budgeted` now issue single-poll writes and commit `front_offset` synchronously right after each `Ready(n)`, before any further `.await`, so a cancelled write never re-sends bytes the kernel already accepted nor silently drops bytes that were popped out of the queue ahead of the actual I/O (moonpool's old eager `pop_budgeted` detach did exactly that).
