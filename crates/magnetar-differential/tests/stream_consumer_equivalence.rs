@@ -1970,6 +1970,52 @@ where
         })
         .await;
 
+    let rejecting_batch_consumer = client
+        .scalable_stream_consumer("topic://public/default/scaled", Arc::new(RejectingSchema))
+        .subscription("surface-rejecting-batch-schema-sub")
+        .consumer_name("surface-rejecting-batch-schema-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe rejecting batch-schema aggregate");
+    cluster
+        .wait_for("rejecting batch-schema children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&rejecting_batch_consumer).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"reject-batch-one")))
+        .expect("enqueue first rejecting batch message");
+    cluster
+        .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"reject-batch-two")))
+        .expect("enqueue second rejecting batch message");
+    cluster
+        .wait_for("rejecting batch-schema deliveries", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
+    assert!(matches!(
+        rejecting_batch_consumer
+            .receive_batch(
+                BatchReceivePolicy::messages(2, Duration::from_secs(1))
+                    .expect("valid rejecting batch policy"),
+            )
+            .await
+            .expect_err("batch schema rejection reaches the caller"),
+        magnetar::scalable::StreamConsumerError::Schema(SchemaError::Decoding(_))
+    ));
+    rejecting_batch_consumer
+        .close()
+        .await
+        .expect("close rejecting batch-schema aggregate");
+    cluster
+        .wait_for("rejecting batch-schema cleanup", |fake| {
+            fake.resource_counts().child_consumers == 0
+        })
+        .await;
+
     let dropped_consumer = client
         .scalable_stream_consumer(
             "topic://public/default/scaled",
