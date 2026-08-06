@@ -164,8 +164,6 @@ fn cumulative_only_acking_keeps_batch_ack_tracker_bounded() {
                         partition: -1,
                         batch_index: -1,
                         batch_size: 0,
-                        #[cfg(feature = "scalable-topics")]
-                        segment_id: None,
                     }],
                     ack_type: pb::command_ack::AckType::Cumulative,
                     properties: Vec::new(),

@@ -451,10 +451,10 @@ pub enum ConnectionEvent {
         resolved_topic_name: Option<String>,
         /// Controller broker serving this topic's layout, when advertised.
         controller_broker_url: Option<String>,
-        /// Initial DAG snapshot for the topic.
-        segments: Vec<crate::types::SegmentDescriptor>,
-        /// Layout epoch the snapshot was stamped with.
-        epoch: u64,
+        /// TLS controller broker serving this topic's layout, when advertised.
+        controller_broker_url_tls: Option<String>,
+        /// Complete validated initial DAG snapshot.
+        snapshot: crate::dag_watch::DagSnapshot,
     },
 
     /// **Experimental** (PIP-460, ADR-0093). An open session applied a
@@ -466,6 +466,8 @@ pub enum ConnectionEvent {
         session_id: u64,
         /// The applied delta (epoch, added / removed, derived split / merge).
         delta: crate::dag_watch::DagDelta,
+        /// Complete validated replacement DAG snapshot.
+        snapshot: crate::dag_watch::DagSnapshot,
     },
 
     /// **Experimental** (PIP-460, ADR-0093). The segment DAG changed
@@ -488,6 +490,8 @@ pub enum ConnectionEvent {
     ScalableConsumerAssigned {
         /// Consumer id that registered.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the baseline.
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
         /// The `segment://` topics this consumer owns.
         assignment: crate::scalable_consumer::ConsumerAssignment,
     },
@@ -501,6 +505,10 @@ pub enum ConnectionEvent {
     ScalableAssignmentChanged {
         /// Consumer id whose share changed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the update.
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
+        /// Complete authoritative assignment after applying the update.
+        assignment: crate::scalable_consumer::ConsumerAssignment,
         /// What to attach to and detach from.
         delta: crate::scalable_consumer::AssignmentDelta,
     },
@@ -511,6 +519,8 @@ pub enum ConnectionEvent {
     ScalableConsumerRejected {
         /// Consumer id whose registration failed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the rejection.
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
         /// Why the broker rejected it.
         reason: String,
     },
@@ -657,4 +667,47 @@ pub struct IncomingMessage {
     /// `ConsumerStatsRecorder` p50/p99/max. Under the moonpool engine both instants come from
     /// the virtual clock, so the resulting sample reproduces bit-for-bit for a given seed.
     pub arrived_at: std::time::Instant,
+}
+
+/// One broker entry deferred to the scalable aggregate before payload
+/// transformation, chunk reassembly, or batch expansion.
+///
+/// This sidecar deliberately keeps the complete ordinary protobuf id without
+/// adding scalable-only fields to [`IncomingMessage`].
+#[cfg(feature = "scalable-topics")]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct DeferredIncomingMessage {
+    /// Raw broker entry represented with the existing message container.
+    pub message: IncomingMessage,
+    /// Complete broker-authored ordinary id, including chunk and ack fields.
+    pub message_id_data: pb::MessageIdData,
+    /// Broker-authored partial-batch delivery mask from `CommandMessage`.
+    /// This field is distinct from `MessageIdData.ack_set` on the wire.
+    pub ack_set: Vec<i64>,
+    /// Broker dispatch permits consumed by this entry. Batches consume one
+    /// permit per delivered logical member even though they share one frame.
+    pub dispatch_permits: u32,
+}
+
+impl IncomingMessage {
+    /// Conservative retained-byte charge for aggregate receive accounting.
+    /// Dynamic protobuf content is charged by canonical encoded length and
+    /// fixed Rust handles are covered by the enclosing struct size.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(self.payload.len())
+            .saturating_add(prost::Message::encoded_len(self.metadata.as_ref()))
+            .saturating_add(
+                self.single_metadata
+                    .as_ref()
+                    .map_or(0, prost::Message::encoded_len),
+            )
+            .saturating_add(
+                self.broker_entry_metadata
+                    .as_deref()
+                    .map_or(0, prost::Message::encoded_len),
+            )
+    }
 }

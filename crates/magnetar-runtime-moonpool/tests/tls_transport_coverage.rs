@@ -42,6 +42,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -53,6 +54,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 mod common;
@@ -233,6 +235,121 @@ async fn spawn_pulsar_connected_fixture() -> TlsFixture {
     .await
 }
 
+struct ReconnectingTlsFixture {
+    addr: String,
+    client_config: Arc<ClientConfig>,
+    connections: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+    disconnect_first: Arc<Notify>,
+    server_handle: JoinHandle<()>,
+}
+
+impl ReconnectingTlsFixture {
+    async fn wait_for_connections(&self, expected: usize) {
+        tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.connections.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("supervised TLS reconnect did not reach the fixture");
+    }
+
+    fn disconnect_first(&self) {
+        self.disconnect_first.notify_one();
+    }
+}
+
+impl Drop for ReconnectingTlsFixture {
+    fn drop(&mut self) {
+        self.server_handle.abort();
+    }
+}
+
+async fn spawn_reconnecting_pulsar_fixture() -> ReconnectingTlsFixture {
+    let (server_config, client_config) = build_tls_material();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let acceptor = TlsAcceptor::from(server_config);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(Notify::new());
+    let disconnect_first = Arc::new(Notify::new());
+    let task_connections = connections.clone();
+    let task_changed = changed.clone();
+    let task_disconnect_first = disconnect_first.clone();
+    let server_handle = tokio::spawn(async move {
+        for connection_index in 0..2 {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut read_buf = BytesMut::with_capacity(8 * 1024);
+            loop {
+                let mut framed = read_buf.clone().freeze();
+                match decode_one(&mut framed) {
+                    Ok(_) => break,
+                    Err(FrameError::Incomplete { .. }) => {}
+                    Err(_) => return,
+                }
+                match tls.read_buf(&mut read_buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+            let command = pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "magnetar-reconnecting-tls-fixture".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            };
+            let mut output = BytesMut::new();
+            encode_command(&mut output, &command).expect("encode reconnect CONNECTED");
+            if tls.write_all(&output).await.is_err() || tls.flush().await.is_err() {
+                return;
+            }
+            task_connections.fetch_add(1, Ordering::Release);
+            task_changed.notify_waiters();
+            if connection_index == 0 {
+                task_disconnect_first.notified().await;
+                let ping = pb::BaseCommand {
+                    r#type: pb::base_command::Type::Ping as i32,
+                    ping: Some(pb::CommandPing {}),
+                    ..Default::default()
+                };
+                let mut output = BytesMut::new();
+                encode_command(&mut output, &ping).expect("encode reconnect PING");
+                let _ = tls.write_all(&output).await;
+                let _ = tls.flush().await;
+                drop(tls);
+            } else {
+                let mut sink = [0_u8; 64];
+                let _ = tls.read(&mut sink).await;
+            }
+        }
+    });
+
+    ReconnectingTlsFixture {
+        addr,
+        client_config,
+        connections,
+        changed,
+        disconnect_first,
+        server_handle,
+    }
+}
+
 /// Spawn a TLS fixture whose server-side handler completes the TLS
 /// handshake and then immediately drops the connection — driving the
 /// "peer closed mid-application-handshake" branch in
@@ -297,6 +414,64 @@ async fn connect_tls_completes_handshake_then_drives_pulsar_connected() {
             // `DriverHandle::drop` (see `driver.rs`).
             drop(driver);
             drop(shared);
+            drop(fixture);
+
+            let fixture = spawn_pulsar_connected_fixture().await;
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                magnetar_runtime_moonpool::Client::connect_tls_supervised(
+                    &engine,
+                    &fixture.addr,
+                    FIXTURE_HOSTNAME,
+                    fixture.client_config.clone(),
+                    ConnectionConfig::default(),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("client connect_tls_supervised did not complete within 5s")
+            .expect("client connect_tls_supervised must succeed against the fixture");
+            assert!(client.is_connected());
+            client.close().await;
+            drop(fixture);
+
+            let fixture = spawn_reconnecting_pulsar_fixture().await;
+            let reconnect_config = ConnectionConfig {
+                supervisor: Some(magnetar_proto::SupervisorConfig {
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(10),
+                    mandatory_stop: Duration::from_secs(1),
+                    max_attempts: Some(4),
+                    ..magnetar_proto::SupervisorConfig::default()
+                }),
+                ..ConnectionConfig::default()
+            };
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                magnetar_runtime_moonpool::Client::connect_tls_supervised(
+                    &engine,
+                    &fixture.addr,
+                    FIXTURE_HOSTNAME,
+                    fixture.client_config.clone(),
+                    reconnect_config,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("supervised TLS client did not complete its initial handshake")
+            .expect("supervised TLS client initial handshake succeeds");
+            fixture.disconnect_first();
+            fixture.wait_for_connections(2).await;
+            tokio::time::timeout(HANG_GUARD, async {
+                while !client.is_connected() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("supervised TLS client did not complete its reconnect handshake");
+            client.close().await;
             drop(fixture);
         })
         .await;

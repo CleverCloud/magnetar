@@ -76,6 +76,9 @@ pub(crate) struct ConnectionFactory<P: Providers> {
     /// supervised driver. `Providers` is `Clone` so a fresh snapshot per
     /// entry is cheap.
     pub(crate) providers: P,
+    /// Reused rustls configuration for TLS bootstrap, controller, and segment
+    /// entries. `None` means every pool transport is plaintext.
+    pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
     /// PIP-121 service-URL provider (cluster failover). Shared across pool
     /// entries — every supervised loop polls it on reconnect.
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
@@ -100,6 +103,7 @@ impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
                 &self.service_url_provider.is_some(),
             )
             .field("has_dns_resolver", &self.dns_resolver.is_some())
+            .field("tls", &self.tls_config.is_some())
             .field("schemeless_default_port", &self.schemeless_default_port)
             .finish_non_exhaustive()
     }
@@ -258,6 +262,30 @@ impl<P: Providers> ProxyConnectionPool<P> {
     /// Default port inherited by a scheme-less DIRECT broker authority.
     pub(crate) const fn schemeless_default_port(&self) -> u16 {
         self.factory.schemeless_default_port
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn scalable_url_allowed(&self, url: &str) -> bool {
+        self.factory
+            .bootstrap_config
+            .redirect_url_allow_list
+            .as_ref()
+            .is_none_or(|allow_list| allow_list.is_allowed(url))
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn bootstrap_uses_proxy_target(&self) -> bool {
+        self.factory.bootstrap_config.proxy_to_broker_url.is_some()
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn uses_tls(&self) -> bool {
+        self.factory.tls_config.is_some()
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn task_provider(&self) -> P::Task {
+        self.factory.providers.task().clone()
     }
 
     /// Number of currently-tracked entries (Ready + Pending). Used by tests
@@ -572,18 +600,29 @@ async fn build_entry_async<P: Providers>(
 
     let connect_timeout = cfg.connect_timeout;
     let operation_timeout = cfg.operation_timeout;
+    let tls_host = factory
+        .tls_config
+        .as_ref()
+        .map(|_| crate::transport::split_host_port(physical).map(|(host, _)| host.to_owned()))
+        .transpose()?;
     let mut transport = crate::dial_with_retry::<P, _, _>(
         factory.providers.time(),
         cfg.connect_max_retries,
         operation_timeout,
         || {
-            Transport::<P>::connect_with_resolver(
-                factory.providers.network(),
-                physical,
-                factory.dns_resolver.as_deref(),
-                factory.providers.time(),
-                connect_timeout,
-            )
+            let tls_config = factory.tls_config.clone();
+            let tls_host = tls_host.clone();
+            async move {
+                Transport::<P>::connect_selected(
+                    factory.providers.network(),
+                    physical,
+                    tls_host.as_deref().zip(tls_config),
+                    factory.dns_resolver.as_deref(),
+                    factory.providers.time(),
+                    connect_timeout,
+                )
+                .await
+            }
         },
     )
     .await?;
@@ -608,6 +647,8 @@ async fn build_entry_async<P: Providers>(
 
     let ctx = ReconnectContext {
         host_port: physical.to_owned(),
+        tls_config: factory.tls_config.clone(),
+        tls_server_name: None,
         service_url_provider: factory.service_url_provider.clone(),
         dns_resolver: factory.dns_resolver.clone(),
     };
@@ -663,6 +704,7 @@ mod tests {
             },
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             providers: TokioProviders::new(),
+            tls_config: None,
             service_url_provider: None,
             dns_resolver: None,
             schemeless_default_port: 6650,

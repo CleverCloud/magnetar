@@ -88,6 +88,9 @@ pub enum ClientError {
     /// The connection has been locally closed before the request completed.
     #[error("connection is closed")]
     Closed,
+    /// Internal scalable-child receive reached its broker terminal marker.
+    #[error("consumer reached end of topic")]
+    EndOfTopic,
     /// The peer closed the connection with no recovery path: a plain
     /// (non-supervised) driver hit a terminal drop and resolved every pending
     /// op with [`magnetar_proto::OpOutcome::Terminal`]. Mirrors the tokio
@@ -108,6 +111,34 @@ pub enum ClientError {
         /// The topic whose lookup triggered the proxy-routing requirement.
         topic: String,
     },
+
+    /// No controller authority matches the active bootstrap transport.
+    #[error("scalable-topic controller authority is unavailable for the active transport")]
+    ControllerUnavailable,
+
+    /// Direct controller routing cannot be represented by this client shape.
+    #[error("scalable-topic controller routing is unsupported: {reason}")]
+    ControllerRoutingUnsupported {
+        /// Stable, non-secret reason.
+        reason: &'static str,
+    },
+
+    /// The configured redirect allow-list rejected a broker-authored authority.
+    #[error("broker-authored scalable authority was rejected by the redirect allow-list")]
+    ScalableAuthorityRejected,
+
+    /// The controller rejected an assignment stream or registration baseline.
+    #[cfg(feature = "scalable-topics")]
+    #[error("scalable-topic assignment was rejected: {reason}")]
+    ScalableAssignmentRejected {
+        /// Stable controller/protocol rejection reason.
+        reason: String,
+    },
+
+    /// An owned scalable control-plane route failed or was fenced.
+    #[cfg(feature = "scalable-topics")]
+    #[error(transparent)]
+    ScalableRoute(#[from] crate::ScalableRouteError),
 
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]
@@ -290,6 +321,7 @@ impl<P: Providers> Client<P> {
             bootstrap_config: config,
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             providers: engine.providers().clone(),
+            tls_config: None,
             service_url_provider,
             dns_resolver,
             schemeless_default_port: 6650,
@@ -299,6 +331,45 @@ impl<P: Providers> Client<P> {
             shared,
             driver,
             Some(pool),
+            sleep_provider_from_time(engine.providers().time().clone()),
+        ))
+    }
+
+    /// Connect through the TLS-capable supervised pool. Controller and segment
+    /// entries reuse this rustls configuration and never downgrade to plaintext.
+    pub async fn connect_tls_supervised(
+        engine: &MoonpoolEngine<P>,
+        addr: &str,
+        host: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+        config: ConnectionConfig,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn crate::DnsResolver>>,
+    ) -> Result<Self, ClientError> {
+        let (shared, driver) = engine
+            .connect_tls_supervised(
+                addr,
+                host,
+                tls_config.clone(),
+                config.clone(),
+                service_url_provider.clone(),
+                dns_resolver.clone(),
+            )
+            .await?;
+        let factory = crate::pool::ConnectionFactory {
+            addr: addr.to_owned(),
+            bootstrap_config: config,
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            providers: engine.providers().clone(),
+            tls_config: Some(tls_config),
+            service_url_provider,
+            dns_resolver,
+            schemeless_default_port: 6651,
+        };
+        Ok(Self::assemble(
+            shared,
+            driver,
+            Some(ProxyConnectionPool::new(factory)),
             sleep_provider_from_time(engine.providers().time().clone()),
         ))
     }
@@ -380,6 +451,28 @@ impl<P: Providers> Client<P> {
         Box::pin(async move {
             let _ = sleep.await;
         })
+    }
+
+    /// Create the narrow owned capability used by an assignment-driven
+    /// scalable stream consumer. The public client itself remains non-Clone.
+    #[cfg(feature = "scalable-topics")]
+    pub fn segment_subscriber(&self) -> Result<crate::SegmentSubscriber<P>, ClientError>
+    where
+        P: Send + Sync,
+    {
+        let pool = self
+            .pool
+            .clone()
+            .ok_or(ClientError::ControllerRoutingUnsupported {
+                reason: "a supervised pool is required for direct controller routing",
+            })?;
+        let operation_timeout = self.shared.inner.lock().operation_timeout();
+        Ok(crate::SegmentSubscriber::new(
+            self.shared.clone(),
+            pool,
+            operation_timeout,
+            self.sleep_provider.clone(),
+        ))
     }
 
     /// `true` while the underlying broker connection is in
@@ -1215,6 +1308,8 @@ impl<P: Providers> Client<P> {
                 Some(crate::ScalableEvent::LookupResolved {
                     resolved_topic_name,
                     controller_broker_url,
+                    controller_broker_url_tls,
+                    snapshot,
                     segments,
                     epoch,
                     ..
@@ -1223,6 +1318,8 @@ impl<P: Providers> Client<P> {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
+                        controller_broker_url_tls,
+                        snapshot,
                         segments,
                         epoch,
                     });
@@ -1278,6 +1375,7 @@ impl<P: Providers> Client<P> {
         consumer_id: u64,
         consumer_type: magnetar_proto::ScalableConsumerType,
     ) -> Result<magnetar_proto::ConsumerAssignment, ClientError> {
+        let incarnation = self.shared.allocate_controller_incarnation()?;
         {
             let mut conn = self.shared.inner.lock();
             conn.scalable_topic_subscribe(
@@ -1286,6 +1384,7 @@ impl<P: Providers> Client<P> {
                 consumer_name,
                 consumer_id,
                 consumer_type,
+                incarnation,
             )
             .map_err(|err| ClientError::Other(err.to_string()))?;
         }
@@ -1304,10 +1403,18 @@ impl<P: Providers> Client<P> {
                 pos.and_then(|p| buf.remove(p))
             };
             match drained {
-                Some(crate::ScalableEvent::ConsumerAssigned { assignment, .. }) => {
+                Some(crate::ScalableEvent::ConsumerAssigned {
+                    incarnation: event_incarnation,
+                    assignment,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Ok(assignment);
                 }
-                Some(crate::ScalableEvent::ConsumerRejected { reason, .. }) => {
+                Some(crate::ScalableEvent::ConsumerRejected {
+                    incarnation: event_incarnation,
+                    reason,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Err(ClientError::Other(reason));
                 }
                 _ => {}
@@ -1611,7 +1718,9 @@ impl<P: Providers> Client<P> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.end_txn(txn, action)
+                .map_err(|err| ClientError::Other(format!("end_txn: {err}")))?
         };
+        let _waiter = EndTxnWaiterGuard::new(self.shared.clone(), txn, action);
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
@@ -1627,19 +1736,48 @@ impl<P: Providers> Client<P> {
     }
 }
 
+struct EndTxnWaiterGuard {
+    shared: Arc<ConnectionShared>,
+    txn: magnetar_proto::TxnId,
+    action: magnetar_proto::TxnAction,
+}
+
+impl EndTxnWaiterGuard {
+    fn new(
+        shared: Arc<ConnectionShared>,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Self {
+        Self {
+            shared,
+            txn,
+            action,
+        }
+    }
+}
+
+impl Drop for EndTxnWaiterGuard {
+    fn drop(&mut self) {
+        self.shared
+            .inner
+            .lock()
+            .release_end_txn_waiter(self.txn, self.action);
+    }
+}
+
 /// Future that resolves the [`OpOutcome`] correlated with a single
 /// `RequestId`. Mirrors the tokio engine's identically-named `RequestFut`:
 /// the canonical "wait for a request-id-correlated outcome" future, reused
 /// for lookup, partitioned metadata, watch-topic-list-snapshot, and the
 /// txn family.
-struct RequestFut {
+pub(crate) struct RequestFut {
     shared: Arc<ConnectionShared>,
     request_id: RequestId,
     cancel_on_drop: bool,
 }
 
 impl RequestFut {
-    fn new(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
+    pub(crate) fn new(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
         Self {
             shared,
             request_id,
@@ -1771,7 +1909,7 @@ fn unusable_broker_authority(input: &str) -> ClientError {
 /// hardening: tokio's PROXY-path `preferred_broker_url` still forwards an
 /// unrecognised scheme unchanged with a warning, relying on the downstream
 /// Pulsar Proxy's `validateBrokerTarget()` to reject it.
-fn direct_broker_authority(
+pub(crate) fn direct_broker_authority(
     input: &str,
     schemeless_default_port: u16,
 ) -> Result<String, ClientError> {

@@ -1,6 +1,6 @@
 # ADR-0093 — PIP-460 on the upstream wire surface, negotiated per connection
 
-- **Status**: Accepted (epoch handling amended by [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md))
+- **Status**: Accepted (layout-epoch handling amended by [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md); high-level data-plane scope and consumer-assignment epoch handling amended by [ADR-0098](0098-assignment-driven-m1-hardened-stream-consumer.md))
 - **Date**: 2026-08-03
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, segments, wire-format, vendored-proto, compatibility, experimental

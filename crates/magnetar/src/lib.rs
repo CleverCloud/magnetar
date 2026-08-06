@@ -190,15 +190,14 @@ pub(crate) fn inject_otel_context(properties: &mut Vec<(String, String)>) {
 #[cfg(feature = "experimental-v5-client")]
 pub mod v5;
 
-/// **Experimental** — PIP-460 scalable-topic surface (ADR-0093). Behind
-/// `feature = "scalable-topics"` (default off). Exposes the
-/// [`scalable::ScalableTopicsApi`] engine hook and the
-/// [`scalable::StreamConsumer`] (StreamConsumer-only, drops on DAG change).
-/// No broker ships PIP-460 today; e2e is gated on a Pulsar 5.0 RC.
+/// **Experimental** — PIP-460 scalable-topic surface. Behind
+/// `feature = "scalable-topics"` (default off). Exposes the raw lookup/watch
+/// hook plus the schema-generic, assignment-driven [`scalable::StreamConsumer`]
+/// aggregate. This is separate from the PIP-466 [`v5`] wrapper.
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 pub mod scalable;
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
-pub use engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi};
+pub use engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi, SegmentSubscriberApi};
 
 #[cfg(test)]
 mod tests {

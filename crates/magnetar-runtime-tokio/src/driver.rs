@@ -77,8 +77,16 @@ enum RetryRequest {
 /// notifying, which would strand a caller until the next unrelated event.
 #[cfg(feature = "scalable-topics")]
 fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
-    shared.scalable_events.lock().push_back(event);
+    if let Some(unclaimed) = shared.scalable_routes.publish(event) {
+        shared.scalable_events.lock().push_back(unclaimed);
+        shared.scalable_notify.notify_waiters();
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+fn notify_scalable_waiters(shared: &ConnectionShared) {
     shared.scalable_notify.notify_waiters();
+    shared.scalable_routes.notify_waiters();
 }
 
 /// Drain the connection's semantic event queue of events the *driver* must
@@ -300,27 +308,41 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerAssigned {
                 consumer_id,
+                incarnation,
                 assignment,
             } => emit_scalable(
                 shared,
                 crate::ScalableEvent::ConsumerAssigned {
                     consumer_id,
+                    incarnation,
                     assignment,
                 },
             ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => emit_scalable(
+            ConnectionEvent::ScalableAssignmentChanged {
+                consumer_id,
+                incarnation,
+                assignment,
+                delta,
+            } => emit_scalable(
                 shared,
-                crate::ScalableEvent::AssignmentChanged { consumer_id, delta },
+                crate::ScalableEvent::AssignmentChanged {
+                    consumer_id,
+                    incarnation,
+                    assignment,
+                    delta,
+                },
             ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerRejected {
                 consumer_id,
+                incarnation,
                 reason,
             } => emit_scalable(
                 shared,
                 crate::ScalableEvent::ConsumerRejected {
                     consumer_id,
+                    incarnation,
                     reason,
                 },
             ),
@@ -357,25 +379,37 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 session_id,
                 resolved_topic_name,
                 controller_broker_url,
-                segments,
-                epoch,
+                controller_broker_url_tls,
+                snapshot,
             } => {
+                let segments = snapshot.segments();
+                let epoch = snapshot.epoch();
                 emit_scalable(
                     shared,
                     crate::ScalableEvent::LookupResolved {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
+                        controller_broker_url_tls,
+                        snapshot,
                         segments,
                         epoch,
                     },
                 );
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::SegmentDagUpdated { session_id, delta } => {
+            ConnectionEvent::SegmentDagUpdated {
+                session_id,
+                delta,
+                snapshot,
+            } => {
                 emit_scalable(
                     shared,
-                    crate::ScalableEvent::DagUpdated { session_id, delta },
+                    crate::ScalableEvent::DagUpdated {
+                        session_id,
+                        delta,
+                        snapshot,
+                    },
                 );
             }
             #[cfg(feature = "scalable-topics")]
@@ -441,6 +475,11 @@ fn retry_request_topic(conn: &magnetar_proto::Connection, request: RetryRequest)
 pub(crate) fn notify_retry_generation_replaced(shared: &Arc<ConnectionShared>) {
     shared.operation_cancel_notify.notify_waiters();
     shared.driver_waker.notify_one();
+}
+
+#[cfg(feature = "scalable-topics")]
+pub(crate) fn notify_scalable_connection_replaced(shared: &Arc<ConnectionShared>) {
+    shared.scalable_routes.notify_waiters();
 }
 
 async fn wait_retry_delay(
@@ -758,6 +797,8 @@ where
         // AFTER `fail_all_pending` so the slot `closed` flags + terminal
         // outcomes are already in place when a fresh op observes the latch.
         shared.mark_no_driver();
+        #[cfg(feature = "scalable-topics")]
+        shared.scalable_routes.close_all();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker rather than the proto waker slab.
         shared.event_waker.notify_waiters();
@@ -800,6 +841,8 @@ pub(crate) fn spawn_supervised(
         // reconnect never reaches this point. New ops issued after this fast
         // fail at the entry-point guards. Set AFTER `fail_all_pending`.
         driver_shared.mark_no_driver();
+        #[cfg(feature = "scalable-topics")]
+        driver_shared.scalable_routes.close_all();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker rather than the proto waker slab.
         driver_shared.event_waker.notify_waiters();
@@ -1060,6 +1103,8 @@ async fn supervised_driver_loop(
         shared
             .pending_rebuild
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(feature = "scalable-topics")]
+        notify_scalable_connection_replaced(&shared);
         notify_retry_generation_replaced(&shared);
 
         socket = new_socket;
@@ -1452,7 +1497,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(shared);
                         return Err(err.into());
                     }
                 };
@@ -1471,7 +1516,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(shared);
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1517,7 +1562,7 @@ where
                     // re-check `is_closed()` when a scalable event arrives, so a
                     // dead connection would park them forever.
                     #[cfg(feature = "scalable-topics")]
-                    shared.scalable_notify.notify_waiters();
+                    notify_scalable_waiters(shared);
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1622,7 +1667,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(shared);
                         return Err(err.into());
                     }
                 }

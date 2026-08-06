@@ -17,19 +17,229 @@
 //!   opens it and `…Update` delivers either a full snapshot or an incremental diff of the matching
 //!   topic set.
 //!
-//! # Staleness
-//!
-//! Both sessions carry the layout epoch they were computed from.
-//! An assignment whose `layout_epoch` does not advance is **rejected**, not
-//! applied: the broker recomputes assignments per layout, so an out-of-order
-//! push would hand the consumer segments that no longer exist. The
-//! [`DagWatchSession`](crate::dag_watch::DagWatchSession) epoch guard and this
-//! one are the same rule applied to the two halves of the protocol.
+//! Assignment order is fenced by a caller-supplied controller incarnation.
+//! Within one incarnation a lower layout epoch is rejected, an exact duplicate
+//! is ignored, and a changed assignment at the current layout epoch is applied
+//! in receive order. The epoch versions the layout, not group membership.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::pb;
-use crate::types::{KeyRange, SegmentId};
+use crate::types::{KeyRange, KeyRangeError, SegmentId};
+
+/// Maximum assignment pushes retained while the subscribe response is pending.
+pub const MAX_BUFFERED_ASSIGNMENT_UPDATES: usize = 1_024;
+
+/// Local generation of the physical controller connection carrying an
+/// assignment stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ControllerIncarnation(pub u64);
+
+impl core::fmt::Display for ControllerIncarnation {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Invalid canonical scalable-topic or segment attachment identity.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SegmentTopicError {
+    /// A parent must be a fully-qualified `topic://tenant/namespace/name`.
+    #[error("invalid canonical scalable topic {topic:?}")]
+    InvalidParent {
+        /// Rejected parent identity.
+        topic: String,
+    },
+    /// A segment URI did not have the M1 canonical shape.
+    #[error("invalid canonical segment topic {topic:?}")]
+    InvalidSegment {
+        /// Rejected segment identity.
+        topic: String,
+    },
+    /// The URI was parseable but not byte-for-byte canonical.
+    #[error("non-canonical segment topic {got:?}; expected {expected:?}")]
+    NonCanonical {
+        /// Canonical identity.
+        expected: String,
+        /// Wire identity.
+        got: String,
+    },
+    /// The source wrapper and URI descriptor name different segments.
+    #[error("segment topic names id {topic_id}, not {segment_id}")]
+    SegmentIdMismatch {
+        /// Explicit segment id.
+        segment_id: SegmentId,
+        /// Id parsed from the topic descriptor.
+        topic_id: SegmentId,
+    },
+    /// The descriptor's inclusive range is invalid.
+    #[error("invalid segment topic range: {0}")]
+    InvalidRange(#[from] KeyRangeError),
+}
+
+/// Canonical, source-qualified segment identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SegmentSource {
+    segment_id: SegmentId,
+    topic: String,
+    key_range: KeyRange,
+}
+
+impl SegmentSource {
+    /// Validate a canonical M1 `segment://` URI and its explicit id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentTopicError`] for malformed, non-canonical, or
+    /// mismatched identities.
+    pub fn new(segment_id: SegmentId, topic: String) -> Result<Self, SegmentTopicError> {
+        let (_, key_range, topic_id) = parse_segment_topic(&topic)?;
+        if topic_id != segment_id {
+            return Err(SegmentTopicError::SegmentIdMismatch {
+                segment_id,
+                topic_id,
+            });
+        }
+        Ok(Self {
+            segment_id,
+            topic,
+            key_range,
+        })
+    }
+
+    /// Segment id encoded by this source.
+    #[must_use]
+    pub const fn segment_id(&self) -> SegmentId {
+        self.segment_id
+    }
+
+    /// Canonical `segment://` topic.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Inclusive range encoded in the topic descriptor.
+    #[must_use]
+    pub const fn key_range(&self) -> KeyRange {
+        self.key_range
+    }
+
+    /// Canonical parent `topic://` identity.
+    #[must_use]
+    pub fn parent_topic(&self) -> String {
+        let descriptor_len = self
+            .topic
+            .rsplit_once('/')
+            .map_or(0, |(_, descriptor)| descriptor.len() + 1);
+        let parent_path = self
+            .topic
+            .strip_prefix("segment://")
+            .and_then(|rest| rest.get(..rest.len().saturating_sub(descriptor_len)))
+            .unwrap_or_default();
+        format!("topic://{parent_path}")
+    }
+}
+
+/// Construct the canonical M1 segment identity for a parent, range, and id.
+///
+/// # Errors
+///
+/// Returns [`SegmentTopicError::InvalidParent`] unless `parent_topic` is a
+/// canonical, fully-qualified scalable topic.
+pub fn canonical_segment_topic(
+    parent_topic: &str,
+    key_range: KeyRange,
+    segment_id: SegmentId,
+) -> Result<String, SegmentTopicError> {
+    let parent_path = canonical_parent_path(parent_topic)?;
+    Ok(format!(
+        "segment://{parent_path}/{}-{}",
+        key_range.to_hex_string(),
+        segment_id.0
+    ))
+}
+
+fn canonical_parent_path(parent_topic: &str) -> Result<&str, SegmentTopicError> {
+    let Some(path) = parent_topic.strip_prefix("topic://") else {
+        return Err(SegmentTopicError::InvalidParent {
+            topic: parent_topic.to_owned(),
+        });
+    };
+    let mut parts = path.splitn(3, '/');
+    let valid = parts.next().is_some_and(|part| !part.is_empty())
+        && parts.next().is_some_and(|part| !part.is_empty())
+        && parts.next().is_some_and(|part| {
+            !part.is_empty() && !part.ends_with('/') && !part.contains(['?', '#'])
+        });
+    if !valid {
+        return Err(SegmentTopicError::InvalidParent {
+            topic: parent_topic.to_owned(),
+        });
+    }
+    Ok(path)
+}
+
+fn parse_segment_topic(topic: &str) -> Result<(String, KeyRange, SegmentId), SegmentTopicError> {
+    let Some(path) = topic.strip_prefix("segment://") else {
+        return Err(SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        });
+    };
+    let Some((parent_path, descriptor)) = path.rsplit_once('/') else {
+        return Err(SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        });
+    };
+    let parent = format!("topic://{parent_path}");
+    canonical_parent_path(&parent)?;
+
+    let mut descriptor_parts = descriptor.split('-');
+    let (Some(start), Some(end), Some(id), None) = (
+        descriptor_parts.next(),
+        descriptor_parts.next(),
+        descriptor_parts.next(),
+        descriptor_parts.next(),
+    ) else {
+        return Err(SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        });
+    };
+    let (Some(start), Some(end)) = (
+        parse_canonical_hex_word(start),
+        parse_canonical_hex_word(end),
+    ) else {
+        return Err(SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        });
+    };
+    if !is_canonical_decimal(id) {
+        return Err(SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        });
+    }
+    let id = id
+        .parse::<u64>()
+        .map_err(|_| SegmentTopicError::InvalidSegment {
+            topic: topic.to_owned(),
+        })?;
+    Ok((parent, KeyRange::new(start, end)?, SegmentId(id)))
+}
+
+fn parse_canonical_hex_word(value: &str) -> Option<u32> {
+    (value.len() == 4
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| u32::from_str_radix(value, 16).ok())
+    .flatten()
+}
+
+fn is_canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
 
 /// Which kind of scalable consumer registers with the controller leader.
 ///
@@ -72,24 +282,67 @@ impl ScalableConsumerType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedSegment {
     /// Segment id within the topic's DAG.
-    pub segment_id: SegmentId,
+    segment_id: SegmentId,
     /// Hash key range this segment serves.
-    pub key_range: KeyRange,
+    key_range: KeyRange,
     /// Fully-qualified `segment://...` topic the consumer attaches to.
-    pub segment_topic: String,
+    segment_topic: String,
 }
 
 impl AssignedSegment {
-    /// Decode from the wire message.
-    #[must_use]
-    pub fn from_pb(pb: &pb::ScalableAssignedSegment) -> Self {
-        Self {
-            segment_id: SegmentId(pb.segment_id),
-            key_range: KeyRange {
-                start: pb.hash_start,
-                end: pb.hash_end,
-            },
+    /// Strictly decode and validate one wire assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssignmentError`] when the range or canonical attachment
+    /// identity is invalid.
+    pub fn try_from_pb(
+        pb: &pb::ScalableAssignedSegment,
+        parent_topic: &str,
+    ) -> Result<Self, AssignmentError> {
+        let segment_id = SegmentId(pb.segment_id);
+        let key_range = KeyRange::new(pb.hash_start, pb.hash_end)
+            .map_err(|source| AssignmentError::InvalidRange { segment_id, source })?;
+        let expected = canonical_segment_topic(parent_topic, key_range, segment_id)?;
+        if pb.segment_topic != expected {
+            return Err(AssignmentError::AttachmentMismatch {
+                segment_id,
+                expected,
+                got: pb.segment_topic.clone(),
+            });
+        }
+        Ok(Self {
+            segment_id,
+            key_range,
             segment_topic: pb.segment_topic.clone(),
+        })
+    }
+
+    /// Segment id.
+    #[must_use]
+    pub const fn segment_id(&self) -> SegmentId {
+        self.segment_id
+    }
+
+    /// Inclusive M1 range.
+    #[must_use]
+    pub const fn key_range(&self) -> KeyRange {
+        self.key_range
+    }
+
+    /// Canonical attachment topic.
+    #[must_use]
+    pub fn segment_topic(&self) -> &str {
+        &self.segment_topic
+    }
+
+    /// Source-qualified identity for message delivery.
+    #[must_use]
+    pub fn source(&self) -> SegmentSource {
+        SegmentSource {
+            segment_id: self.segment_id,
+            topic: self.segment_topic.clone(),
+            key_range: self.key_range,
         }
     }
 
@@ -98,8 +351,8 @@ impl AssignedSegment {
     pub fn to_pb(&self) -> pb::ScalableAssignedSegment {
         pb::ScalableAssignedSegment {
             segment_id: self.segment_id.0,
-            hash_start: self.key_range.start,
-            hash_end: self.key_range.end,
+            hash_start: self.key_range.start(),
+            hash_end: self.key_range.end(),
             segment_topic: self.segment_topic.clone(),
         }
     }
@@ -110,23 +363,50 @@ impl AssignedSegment {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConsumerAssignment {
     /// Layout epoch this assignment was computed against.
-    pub layout_epoch: u64,
+    layout_epoch: u64,
     /// Segments assigned to this consumer, ordered by segment id.
-    pub segments: Vec<AssignedSegment>,
+    segments: Vec<AssignedSegment>,
 }
 
 impl ConsumerAssignment {
-    /// Decode from the wire message, ordering segments by id so two engines
-    /// observing the same assignment compare equal regardless of wire order.
-    #[must_use]
-    pub fn from_pb(pb: &pb::ScalableConsumerAssignment) -> Self {
-        let mut segments: Vec<AssignedSegment> =
-            pb.segments.iter().map(AssignedSegment::from_pb).collect();
+    /// Strictly decode, validate, and normalize a wire assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssignmentError`] for an invalid range, attachment, or
+    /// duplicate segment id.
+    pub fn try_from_pb(
+        pb: &pb::ScalableConsumerAssignment,
+        parent_topic: &str,
+    ) -> Result<Self, AssignmentError> {
+        let mut segments = Vec::with_capacity(pb.segments.len());
+        let mut ids = BTreeSet::new();
+        for segment in &pb.segments {
+            let segment = AssignedSegment::try_from_pb(segment, parent_topic)?;
+            if !ids.insert(segment.segment_id) {
+                return Err(AssignmentError::DuplicateSegment {
+                    segment_id: segment.segment_id,
+                });
+            }
+            segments.push(segment);
+        }
         segments.sort_by_key(|s| s.segment_id);
-        Self {
+        Ok(Self {
             layout_epoch: pb.layout_epoch,
             segments,
-        }
+        })
+    }
+
+    /// Layout epoch this assignment was computed against.
+    #[must_use]
+    pub const fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
+    }
+
+    /// Normalized segments, ordered by id.
+    #[must_use]
+    pub fn segments(&self) -> &[AssignedSegment] {
+        &self.segments
     }
 
     /// Encode into the wire message.
@@ -182,16 +462,88 @@ pub enum AssignmentError {
         expected: u64,
     },
 
-    /// The assignment's `layout_epoch` did not strictly advance. The broker
-    /// recomputes assignments per layout, so a stale push would hand the
-    /// consumer segments that no longer exist.
-    #[error("non-monotonic assignment layout epoch: got {got} expected > {prev}")]
+    /// The assignment's `layout_epoch` regressed within one connection
+    /// incarnation.
+    #[error("assignment layout epoch regressed: got {got} below {prev}")]
     StaleEpoch {
         /// The `layout_epoch` the broker sent.
         got: u64,
         /// The highest `layout_epoch` already applied.
         prev: u64,
     },
+
+    /// A delayed callback belongs to another controller connection.
+    #[error("assignment incarnation {got} does not match current incarnation {expected}")]
+    IncarnationMismatch {
+        /// Callback incarnation.
+        got: ControllerIncarnation,
+        /// Installed incarnation.
+        expected: ControllerIncarnation,
+    },
+
+    /// Controller incarnations must advance when a replacement is installed.
+    #[error("controller incarnation {got} did not advance beyond {prev}")]
+    NonAdvancingIncarnation {
+        /// Requested replacement incarnation.
+        got: ControllerIncarnation,
+        /// Current incarnation.
+        prev: ControllerIncarnation,
+    },
+
+    /// A replacement connection cannot accept a layout older than any layout
+    /// already accepted by this logical registration.
+    #[error("assignment layout epoch {got} is below reconnect floor {floor}")]
+    CrossIncarnationEpochRegression {
+        /// Replacement baseline or push epoch.
+        got: u64,
+        /// Highest epoch accepted before reconnect.
+        floor: u64,
+    },
+
+    /// A controller sent too many pushes before its subscribe response.
+    #[error("pre-baseline assignment buffer reached its maximum of {max} updates")]
+    PreBaselineBufferFull {
+        /// Fixed queue bound.
+        max: usize,
+    },
+
+    /// A reconnect attempted to reuse a consumer id for another registration.
+    #[error("consumer {consumer_id} reconnect changed its registration identity")]
+    RegistrationMismatch {
+        /// Stable consumer id.
+        consumer_id: u64,
+    },
+
+    /// The assignment repeated a segment id.
+    #[error("assignment repeats segment {segment_id}")]
+    DuplicateSegment {
+        /// Repeated id.
+        segment_id: SegmentId,
+    },
+
+    /// The assigned inclusive M1 range is invalid.
+    #[error("assignment segment {segment_id} has an invalid range: {source}")]
+    InvalidRange {
+        /// Segment whose range was invalid.
+        segment_id: SegmentId,
+        /// Range validation failure.
+        source: KeyRangeError,
+    },
+
+    /// The broker-authored attachment does not match the parent, range, and id.
+    #[error("assignment segment {segment_id} names {got:?}; expected {expected:?}")]
+    AttachmentMismatch {
+        /// Segment id.
+        segment_id: SegmentId,
+        /// Canonical expected topic.
+        expected: String,
+        /// Broker-authored topic.
+        got: String,
+    },
+
+    /// The parent or segment identity is malformed.
+    #[error(transparent)]
+    SegmentTopic(#[from] SegmentTopicError),
 
     /// The broker rejected the registration.
     #[error("broker rejected the scalable subscribe (code {code}): {message}")]
@@ -212,6 +564,15 @@ pub enum AssignmentError {
     },
 }
 
+/// One changed assignment replayed after the subscribe-response baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentReplay {
+    /// Complete authoritative assignment after applying this push.
+    pub assignment: ConsumerAssignment,
+    /// Delta from the preceding baseline or push.
+    pub delta: AssignmentDelta,
+}
+
 /// A consumer's registration with the scalable-topic controller leader.
 ///
 /// Created by `Connection::scalable_topic_subscribe`, resolved by the
@@ -224,8 +585,16 @@ pub struct ScalableConsumerSession {
     subscription: String,
     consumer_name: String,
     consumer_type: ScalableConsumerType,
+    incarnation: ControllerIncarnation,
     /// `None` until the subscribe response lands.
     assignment: Option<ConsumerAssignment>,
+    /// Highest layout epoch accepted by this logical registration, retained
+    /// across physical controller incarnations.
+    epoch_floor: Option<u64>,
+    /// Validated pushes received before the subscribe response, in wire order.
+    buffered_updates: VecDeque<ConsumerAssignment>,
+    /// Changed pushes applied immediately after the latest response baseline.
+    replayed_updates: Vec<AssignmentReplay>,
 }
 
 impl ScalableConsumerSession {
@@ -237,6 +606,7 @@ impl ScalableConsumerSession {
         subscription: String,
         consumer_name: String,
         consumer_type: ScalableConsumerType,
+        incarnation: ControllerIncarnation,
     ) -> Self {
         Self {
             consumer_id,
@@ -244,7 +614,11 @@ impl ScalableConsumerSession {
             subscription,
             consumer_name,
             consumer_type,
+            incarnation,
             assignment: None,
+            epoch_floor: None,
+            buffered_updates: VecDeque::new(),
+            replayed_updates: Vec::new(),
         }
     }
 
@@ -278,6 +652,64 @@ impl ScalableConsumerSession {
         self.assignment.as_ref()
     }
 
+    /// Current local controller-connection incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> ControllerIncarnation {
+        self.incarnation
+    }
+
+    /// Highest accepted layout epoch across every controller incarnation.
+    #[must_use]
+    pub const fn epoch_floor(&self) -> Option<u64> {
+        self.epoch_floor
+    }
+
+    /// Whether registration identity is unchanged for a reconnect attempt.
+    #[must_use]
+    pub fn matches_registration(
+        &self,
+        topic: &str,
+        subscription: &str,
+        consumer_name: &str,
+        consumer_type: ScalableConsumerType,
+    ) -> bool {
+        self.topic == topic
+            && self.subscription == subscription
+            && self.consumer_name == consumer_name
+            && self.consumer_type == consumer_type
+    }
+
+    /// Drain changed pushes replayed after the most recent response baseline.
+    pub fn take_replayed_updates(&mut self) -> Vec<AssignmentReplay> {
+        core::mem::take(&mut self.replayed_updates)
+    }
+
+    /// Fence the old connection and begin registration on a replacement.
+    ///
+    /// The replacement response becomes a fresh baseline, so the prior
+    /// assignment is deliberately cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssignmentError::NonAdvancingIncarnation`] unless the local
+    /// generation strictly advances.
+    pub fn begin_incarnation(
+        &mut self,
+        incarnation: ControllerIncarnation,
+    ) -> Result<(), AssignmentError> {
+        if incarnation <= self.incarnation {
+            return Err(AssignmentError::NonAdvancingIncarnation {
+                got: incarnation,
+                prev: self.incarnation,
+            });
+        }
+        self.incarnation = incarnation;
+        self.assignment = None;
+        self.buffered_updates.clear();
+        self.replayed_updates.clear();
+        Ok(())
+    }
+
     /// `true` once the broker has answered the subscribe.
     #[must_use]
     pub fn is_registered(&self) -> bool {
@@ -295,6 +727,21 @@ impl ScalableConsumerSession {
         &mut self,
         resp: &pb::CommandScalableTopicSubscribeResponse,
     ) -> Result<ConsumerAssignment, AssignmentError> {
+        self.handle_subscribe_response_for(self.incarnation, resp)
+    }
+
+    /// Incarnation-fenced form of [`Self::handle_subscribe_response`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssignmentError::IncarnationMismatch`] for a delayed response
+    /// from an old connection, in addition to response and validation errors.
+    pub fn handle_subscribe_response_for(
+        &mut self,
+        incarnation: ControllerIncarnation,
+        resp: &pb::CommandScalableTopicSubscribeResponse,
+    ) -> Result<ConsumerAssignment, AssignmentError> {
+        self.require_incarnation(incarnation)?;
         let Some(assignment) = resp.assignment.as_ref() else {
             if let Some(code) = resp.error {
                 return Err(AssignmentError::Broker {
@@ -306,9 +753,30 @@ impl ScalableConsumerSession {
                 request_id: resp.request_id,
             });
         };
-        let assignment = ConsumerAssignment::from_pb(assignment);
-        self.assignment = Some(assignment.clone());
-        Ok(assignment)
+        let baseline = ConsumerAssignment::try_from_pb(assignment, &self.topic)?;
+        self.enforce_epoch_floor(baseline.layout_epoch)?;
+
+        // Baseline plus every pre-response push is one atomic state change. A
+        // stale replay leaves the unresolved session and its queue untouched so
+        // the caller can fail and resynchronize the registration.
+        let mut staged = self.clone();
+        staged.assignment = Some(baseline.clone());
+        staged.epoch_floor = Some(staged.epoch_floor.map_or(baseline.layout_epoch, |floor| {
+            floor.max(baseline.layout_epoch)
+        }));
+        staged.replayed_updates.clear();
+        while let Some(incoming) = staged.buffered_updates.pop_front() {
+            if let Some(delta) = staged.apply_incoming(incoming)? {
+                let assignment = staged.assignment.clone().ok_or(AssignmentError::Empty {
+                    request_id: resp.request_id,
+                })?;
+                staged
+                    .replayed_updates
+                    .push(AssignmentReplay { assignment, delta });
+            }
+        }
+        *self = staged;
+        Ok(baseline)
     }
 
     /// Apply a pushed `CommandScalableTopicAssignmentUpdate`, returning what the
@@ -317,22 +785,53 @@ impl ScalableConsumerSession {
     /// # Errors
     ///
     /// - [`AssignmentError::ConsumerMismatch`] when the update targets another consumer.
-    /// - [`AssignmentError::StaleEpoch`] when `layout_epoch` does not strictly advance.
+    /// - [`AssignmentError::StaleEpoch`] when `layout_epoch` regresses.
     ///
     /// On either error the session is left **unchanged**.
     pub fn handle_assignment_update(
         &mut self,
         upd: &pb::CommandScalableTopicAssignmentUpdate,
-    ) -> Result<AssignmentDelta, AssignmentError> {
+    ) -> Result<Option<AssignmentDelta>, AssignmentError> {
+        self.handle_assignment_update_for(self.incarnation, upd)
+    }
+
+    /// Incarnation-fenced assignment update.
+    ///
+    /// `Ok(None)` is an exact duplicate. A changed assignment at the current
+    /// layout epoch is applied; only a lower epoch is stale.
+    pub fn handle_assignment_update_for(
+        &mut self,
+        incarnation: ControllerIncarnation,
+        upd: &pb::CommandScalableTopicAssignmentUpdate,
+    ) -> Result<Option<AssignmentDelta>, AssignmentError> {
+        self.require_incarnation(incarnation)?;
         if upd.consumer_id != self.consumer_id {
             return Err(AssignmentError::ConsumerMismatch {
                 got: upd.consumer_id,
                 expected: self.consumer_id,
             });
         }
-        let incoming = ConsumerAssignment::from_pb(&upd.assignment);
+        let incoming = ConsumerAssignment::try_from_pb(&upd.assignment, &self.topic)?;
+        if self.assignment.is_none() {
+            self.enforce_epoch_floor(incoming.layout_epoch)?;
+            if self.buffered_updates.len() == MAX_BUFFERED_ASSIGNMENT_UPDATES {
+                return Err(AssignmentError::PreBaselineBufferFull {
+                    max: MAX_BUFFERED_ASSIGNMENT_UPDATES,
+                });
+            }
+            self.buffered_updates.push_back(incoming);
+            return Ok(None);
+        }
+
+        self.apply_incoming(incoming)
+    }
+
+    fn apply_incoming(
+        &mut self,
+        incoming: ConsumerAssignment,
+    ) -> Result<Option<AssignmentDelta>, AssignmentError> {
         if let Some(prev) = self.assignment.as_ref()
-            && incoming.layout_epoch <= prev.layout_epoch
+            && incoming.layout_epoch < prev.layout_epoch
         {
             return Err(AssignmentError::StaleEpoch {
                 got: incoming.layout_epoch,
@@ -340,28 +839,66 @@ impl ScalableConsumerSession {
             });
         }
 
-        let before: BTreeSet<SegmentId> = self
+        if self.assignment.as_ref() == Some(&incoming) {
+            return Ok(None);
+        }
+
+        let before: BTreeMap<SegmentId, &AssignedSegment> = self
             .assignment
             .as_ref()
-            .map(|a| a.segments.iter().map(|s| s.segment_id).collect())
+            .map(|a| a.segments.iter().map(|s| (s.segment_id, s)).collect())
             .unwrap_or_default();
-        let after: BTreeSet<SegmentId> = incoming.segments.iter().map(|s| s.segment_id).collect();
+        let after: BTreeMap<SegmentId, &AssignedSegment> = incoming
+            .segments
+            .iter()
+            .map(|s| (s.segment_id, s))
+            .collect();
 
         let gained: Vec<AssignedSegment> = incoming
             .segments
             .iter()
-            .filter(|s| !before.contains(&s.segment_id))
+            .filter(|s| before.get(&s.segment_id).is_none_or(|before| *before != *s))
             .cloned()
             .collect();
-        let lost: Vec<SegmentId> = before.difference(&after).copied().collect();
+        let lost: Vec<SegmentId> = before
+            .iter()
+            .filter(|(id, before)| after.get(id).is_none_or(|after| *after != **before))
+            .map(|(id, _)| *id)
+            .collect();
         let layout_epoch = incoming.layout_epoch;
         self.assignment = Some(incoming);
+        self.epoch_floor = Some(
+            self.epoch_floor
+                .map_or(layout_epoch, |floor| floor.max(layout_epoch)),
+        );
 
-        Ok(AssignmentDelta {
+        Ok(Some(AssignmentDelta {
             layout_epoch,
             gained,
             lost,
-        })
+        }))
+    }
+
+    fn enforce_epoch_floor(&self, epoch: u64) -> Result<(), AssignmentError> {
+        if let Some(floor) = self.epoch_floor
+            && epoch < floor
+        {
+            return Err(AssignmentError::CrossIncarnationEpochRegression { got: epoch, floor });
+        }
+        Ok(())
+    }
+
+    fn require_incarnation(
+        &self,
+        incarnation: ControllerIncarnation,
+    ) -> Result<(), AssignmentError> {
+        if incarnation != self.incarnation {
+            return Err(AssignmentError::IncarnationMismatch {
+                got: incarnation,
+                expected: self.incarnation,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -510,11 +1047,17 @@ mod tests {
     use super::*;
 
     fn assigned(id: u64, start: u32, end: u32) -> pb::ScalableAssignedSegment {
+        let range = KeyRange::new(start, end).expect("valid test range");
         pb::ScalableAssignedSegment {
             segment_id: id,
             hash_start: start,
             hash_end: end,
-            segment_topic: format!("segment://public/default/scaled/{id}"),
+            segment_topic: canonical_segment_topic(
+                "topic://public/default/scaled",
+                range,
+                SegmentId(id),
+            )
+            .expect("canonical test segment"),
         }
     }
 
@@ -535,6 +1078,7 @@ mod tests {
             "sub".to_owned(),
             "consumer-a".to_owned(),
             ScalableConsumerType::Stream,
+            ControllerIncarnation(1),
         )
     }
 
@@ -544,7 +1088,7 @@ mod tests {
             request_id: 1,
             error: None,
             message: None,
-            assignment: Some(assignment(1, vec![assigned(1, 0, 32_768)])),
+            assignment: Some(assignment(1, vec![assigned(1, 0, 32_767)])),
         })
         .expect("subscribe resolves");
         s
@@ -563,7 +1107,7 @@ mod tests {
                 message: None,
                 assignment: Some(assignment(
                     3,
-                    vec![assigned(2, 32_768, 65_536), assigned(1, 0, 32_768)],
+                    vec![assigned(2, 32_768, 65_535), assigned(1, 0, 32_767)],
                 )),
             })
             .expect("subscribe resolves");
@@ -574,16 +1118,13 @@ mod tests {
         assert_eq!(
             a.segment_topics(),
             vec![
-                "segment://public/default/scaled/1",
-                "segment://public/default/scaled/2"
+                "segment://public/default/scaled/0000-7fff-1",
+                "segment://public/default/scaled/8000-ffff-2"
             ]
         );
         assert_eq!(
             a.segments[0].key_range,
-            KeyRange {
-                start: 0,
-                end: 32_768
-            }
+            KeyRange::new(0, 32_767).expect("valid inclusive range")
         );
     }
 
@@ -594,9 +1135,10 @@ mod tests {
         let delta = s
             .handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
                 consumer_id: 7,
-                assignment: assignment(2, vec![assigned(2, 32_768, 65_536)]),
+                assignment: assignment(2, vec![assigned(2, 32_768, 65_535)]),
             })
-            .expect("rebalance applies");
+            .expect("rebalance applies")
+            .expect("changed assignment");
         assert_eq!(delta.layout_epoch, 2);
         assert_eq!(delta.gained.len(), 1);
         assert_eq!(delta.gained[0].segment_id, SegmentId(2));
@@ -604,23 +1146,252 @@ mod tests {
         assert!(!delta.is_empty());
     }
 
-    /// A stale assignment is rejected and the session keeps the newer one — the
-    /// broker recomputes per layout, so applying it would hand the consumer
-    /// segments that no longer exist.
+    /// A lower assignment epoch is rejected and the session keeps the newer one.
     #[test]
     fn stale_assignment_rejected() {
         let mut s = registered_session();
         let err = s
             .handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
                 consumer_id: 7,
-                assignment: assignment(1, vec![assigned(9, 0, 65_536)]),
+                assignment: assignment(0, vec![assigned(9, 0, 65_535)]),
             })
             .expect_err("stale assignment rejected");
-        assert_eq!(err, AssignmentError::StaleEpoch { got: 1, prev: 1 });
+        assert_eq!(err, AssignmentError::StaleEpoch { got: 0, prev: 1 });
         assert_eq!(
             s.assignment().expect("still registered").segments[0].segment_id,
             SegmentId(1)
         );
+    }
+
+    #[test]
+    fn changed_equal_epoch_assignment_applies_and_exact_duplicate_is_ignored() {
+        let mut session = registered_session();
+        let changed = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(1, vec![assigned(2, 32_768, 65_535)]),
+        };
+        let delta = session
+            .handle_assignment_update(&changed)
+            .expect("equal layout epoch is valid")
+            .expect("membership changed");
+        assert_eq!(delta.layout_epoch, 1);
+        assert_eq!(delta.gained[0].segment_id(), SegmentId(2));
+        assert_eq!(delta.lost, vec![SegmentId(1)]);
+        assert_eq!(
+            session.handle_assignment_update(&changed),
+            Ok(None),
+            "exact re-delivery is idempotent"
+        );
+    }
+
+    #[test]
+    fn same_id_attachment_change_is_reported_as_lost_and_gained() {
+        let mut session = registered_session();
+        let changed = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(1, vec![assigned(1, 0, 65_535)]),
+        };
+        let delta = session
+            .handle_assignment_update(&changed)
+            .expect("valid update")
+            .expect("descriptor changed");
+        assert_eq!(delta.lost, vec![SegmentId(1)]);
+        assert_eq!(delta.gained[0].segment_id(), SegmentId(1));
+    }
+
+    #[test]
+    fn incarnation_fences_delayed_callbacks_and_replacement_resets_baseline() {
+        let mut session = registered_session();
+        session
+            .begin_incarnation(ControllerIncarnation(2))
+            .expect("advance incarnation");
+        assert!(!session.is_registered());
+        let update = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(2, vec![]),
+        };
+        assert_eq!(
+            session.handle_assignment_update_for(ControllerIncarnation(1), &update),
+            Err(AssignmentError::IncarnationMismatch {
+                got: ControllerIncarnation(1),
+                expected: ControllerIncarnation(2),
+            })
+        );
+        assert_eq!(
+            session.begin_incarnation(ControllerIncarnation(2)),
+            Err(AssignmentError::NonAdvancingIncarnation {
+                got: ControllerIncarnation(2),
+                prev: ControllerIncarnation(2),
+            })
+        );
+    }
+
+    #[test]
+    fn pre_response_pushes_replay_after_baseline_in_wire_order() {
+        let mut session = session();
+        let first_push = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(1, vec![assigned(2, 32_768, 65_535)]),
+        };
+        let second_push = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(2, vec![assigned(1, 0, 32_767), assigned(2, 32_768, 65_535)]),
+        };
+        assert_eq!(session.handle_assignment_update(&first_push), Ok(None));
+        assert_eq!(session.handle_assignment_update(&second_push), Ok(None));
+        assert!(
+            session.assignment().is_none(),
+            "pushes cannot become the baseline"
+        );
+
+        let baseline = session
+            .handle_subscribe_response(&pb::CommandScalableTopicSubscribeResponse {
+                request_id: 1,
+                error: None,
+                message: None,
+                assignment: Some(assignment(1, vec![assigned(1, 0, 32_767)])),
+            })
+            .expect("baseline and pushes apply atomically");
+        assert_eq!(baseline.segments()[0].segment_id(), SegmentId(1));
+        let replayed = session.take_replayed_updates();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].delta.lost, vec![SegmentId(1)]);
+        assert_eq!(replayed[0].delta.gained[0].segment_id(), SegmentId(2));
+        assert_eq!(replayed[1].delta.gained[0].segment_id(), SegmentId(1));
+        assert_eq!(replayed[1].assignment.layout_epoch(), 2);
+        assert_eq!(session.assignment(), Some(&replayed[1].assignment));
+        assert!(session.take_replayed_updates().is_empty());
+    }
+
+    #[test]
+    fn pre_response_push_queue_is_bounded_without_partial_enqueue() {
+        let mut session = session();
+        let update = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(1, vec![assigned(1, 0, 65_535)]),
+        };
+        for _ in 0..MAX_BUFFERED_ASSIGNMENT_UPDATES {
+            assert_eq!(session.handle_assignment_update(&update), Ok(None));
+        }
+        assert_eq!(
+            session.buffered_updates.len(),
+            MAX_BUFFERED_ASSIGNMENT_UPDATES
+        );
+        assert_eq!(
+            session.handle_assignment_update(&update),
+            Err(AssignmentError::PreBaselineBufferFull {
+                max: MAX_BUFFERED_ASSIGNMENT_UPDATES,
+            })
+        );
+        assert_eq!(
+            session.buffered_updates.len(),
+            MAX_BUFFERED_ASSIGNMENT_UPDATES
+        );
+        assert!(session.assignment().is_none());
+    }
+
+    #[test]
+    fn invalid_buffered_wire_order_rejects_baseline_atomically() {
+        let mut session = session();
+        for update in [
+            pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: assignment(2, vec![assigned(2, 32_768, 65_535)]),
+            },
+            pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: assignment(1, vec![assigned(1, 0, 32_767)]),
+            },
+        ] {
+            assert_eq!(session.handle_assignment_update(&update), Ok(None));
+        }
+
+        let response = pb::CommandScalableTopicSubscribeResponse {
+            request_id: 1,
+            error: None,
+            message: None,
+            assignment: Some(assignment(1, vec![assigned(1, 0, 32_767)])),
+        };
+        assert_eq!(
+            session.handle_subscribe_response(&response),
+            Err(AssignmentError::StaleEpoch { got: 1, prev: 2 })
+        );
+        assert!(session.assignment().is_none());
+        assert_eq!(session.epoch_floor(), None);
+        assert_eq!(session.buffered_updates.len(), 2);
+        assert!(session.take_replayed_updates().is_empty());
+    }
+
+    #[test]
+    fn reconnect_baseline_cannot_regress_below_retained_epoch_floor() {
+        let mut session = session();
+        session
+            .handle_subscribe_response(&pb::CommandScalableTopicSubscribeResponse {
+                request_id: 1,
+                error: None,
+                message: None,
+                assignment: Some(assignment(4, vec![assigned(1, 0, 32_767)])),
+            })
+            .expect("initial baseline");
+        session
+            .begin_incarnation(ControllerIncarnation(2))
+            .expect("replacement incarnation");
+        assert_eq!(session.epoch_floor(), Some(4));
+        assert_eq!(
+            session.handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: assignment(3, vec![assigned(1, 0, 32_767)]),
+            }),
+            Err(AssignmentError::CrossIncarnationEpochRegression { got: 3, floor: 4 })
+        );
+        assert!(session.buffered_updates.is_empty());
+        assert_eq!(
+            session.handle_subscribe_response(&pb::CommandScalableTopicSubscribeResponse {
+                request_id: 2,
+                error: None,
+                message: None,
+                assignment: Some(assignment(3, vec![assigned(1, 0, 32_767)])),
+            }),
+            Err(AssignmentError::CrossIncarnationEpochRegression { got: 3, floor: 4 })
+        );
+        assert!(session.assignment().is_none());
+        assert_eq!(session.epoch_floor(), Some(4));
+    }
+
+    #[test]
+    fn assignment_validation_rejects_duplicate_range_and_attachment_errors_atomically() {
+        let mut session = registered_session();
+        let before = session.assignment().cloned();
+
+        let duplicate = assignment(2, vec![assigned(1, 0, 32_767), assigned(1, 0, 32_767)]);
+        assert!(matches!(
+            session.handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: duplicate,
+            }),
+            Err(AssignmentError::DuplicateSegment { .. })
+        ));
+
+        let mut invalid_range = assigned(2, 32_768, 65_535);
+        invalid_range.hash_end = 65_536;
+        assert!(matches!(
+            session.handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: assignment(2, vec![invalid_range]),
+            }),
+            Err(AssignmentError::InvalidRange { .. })
+        ));
+
+        let mut invalid_topic = assigned(2, 32_768, 65_535);
+        invalid_topic.segment_topic = "segment://public/default/scaled/8000-ffff-02".to_owned();
+        assert!(matches!(
+            session.handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 7,
+                assignment: assignment(2, vec![invalid_topic]),
+            }),
+            Err(AssignmentError::AttachmentMismatch { .. })
+        ));
+        assert_eq!(session.assignment(), before.as_ref());
     }
 
     /// An update for another consumer is rejected.

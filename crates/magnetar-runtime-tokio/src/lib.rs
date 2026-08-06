@@ -77,6 +77,8 @@ mod error;
 mod log_fields;
 mod pool;
 mod producer;
+#[cfg(feature = "scalable-topics")]
+mod scalable;
 pub mod tls_crypto;
 pub mod tls_insecure;
 pub mod tls_no_hostname;
@@ -101,6 +103,13 @@ pub use crate::dns::{DnsResolveFuture, DnsResolver, TokioDnsResolver, arc_dns_re
 pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;
 pub use crate::producer::{Producer, SendFut};
+#[cfg(feature = "scalable-topics")]
+pub use crate::scalable::{
+    ControllerSession, DagSession, ScalableRoute, ScalableRouteError, ScalableRouteFamily,
+    ScalableRouteKey, ScalableTaskHandle, SegmentConsumerOptions, SegmentSubscriber,
+    StreamAckFailure, StreamConsumer, StreamConsumerError, StreamConsumerEvent,
+    StreamConsumerMessage, StreamConsumerOptions,
+};
 pub use crate::tls_insecure::insecure_tls_config;
 pub use crate::tls_no_hostname::tls_config_no_hostname;
 pub use crate::transport::default_tls_config;
@@ -258,6 +267,17 @@ pub struct ConnectionShared {
     /// `scalable_events`.
     #[cfg(feature = "scalable-topics")]
     pub scalable_notify: Notify,
+    /// Single-owner high-level scalable event routes.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) scalable_routes: Arc<crate::scalable::ScalableRouteRegistry>,
+    /// Monotonic local authority generation for scalable-controller
+    /// registrations issued on this physical connection.
+    #[cfg(feature = "scalable-topics")]
+    next_controller_incarnation: AtomicU64,
+    /// Runtime-owned scalable consumer ids occupy the upper half of the wire
+    /// id space so diagnostic callers using small explicit ids do not collide.
+    #[cfg(feature = "scalable-topics")]
+    next_scalable_consumer_id: AtomicU64,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -602,7 +622,34 @@ impl ConnectionShared {
             scalable_events: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "scalable-topics")]
             scalable_notify: Notify::new(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_routes: Arc::new(crate::scalable::ScalableRouteRegistry::default()),
+            #[cfg(feature = "scalable-topics")]
+            next_controller_incarnation: AtomicU64::new(1),
+            #[cfg(feature = "scalable-topics")]
+            next_scalable_consumer_id: AtomicU64::new(1 << 63),
         })
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_controller_incarnation(
+        &self,
+    ) -> Result<magnetar_proto::ControllerIncarnation, crate::ClientError> {
+        self.next_controller_incarnation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(magnetar_proto::ControllerIncarnation)
+            .map_err(|_| crate::ClientError::Other("controller incarnation exhausted".to_owned()))
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_scalable_consumer_id(&self) -> Result<u64, crate::ClientError> {
+        self.next_scalable_consumer_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| crate::ClientError::Other("scalable consumer id exhausted".to_owned()))
     }
 }
 
@@ -619,6 +666,10 @@ pub struct ScalableLookup {
     pub resolved_topic_name: Option<String>,
     /// Controller broker serving this topic's layout, when advertised.
     pub controller_broker_url: Option<String>,
+    /// TLS controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url_tls: Option<String>,
+    /// Complete validated initial DAG snapshot.
+    pub snapshot: magnetar_proto::DagSnapshot,
     /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
     /// Layout epoch the snapshot was stamped with.
@@ -640,6 +691,10 @@ pub enum ScalableEvent {
         resolved_topic_name: Option<String>,
         /// Controller broker serving this topic's layout, when advertised.
         controller_broker_url: Option<String>,
+        /// TLS controller broker serving this topic's layout, when advertised.
+        controller_broker_url_tls: Option<String>,
+        /// Complete validated initial DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
         /// Initial DAG snapshot for the topic.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
         /// Layout epoch the snapshot was stamped with.
@@ -651,6 +706,8 @@ pub enum ScalableEvent {
         session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
+        /// Complete validated replacement DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
@@ -670,6 +727,8 @@ pub enum ScalableEvent {
     ConsumerAssigned {
         /// Consumer id that registered.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the baseline.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// The `segment://` topics this consumer owns.
         assignment: magnetar_proto::ConsumerAssignment,
     },
@@ -677,6 +736,10 @@ pub enum ScalableEvent {
     AssignmentChanged {
         /// Consumer id whose share changed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the update.
+        incarnation: magnetar_proto::ControllerIncarnation,
+        /// Complete authoritative assignment after applying the update.
+        assignment: magnetar_proto::ConsumerAssignment,
         /// What to attach to and detach from.
         delta: magnetar_proto::AssignmentDelta,
     },
@@ -684,6 +747,8 @@ pub enum ScalableEvent {
     ConsumerRejected {
         /// Consumer id whose registration failed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the rejection.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// Why the broker rejected it.
         reason: String,
     },

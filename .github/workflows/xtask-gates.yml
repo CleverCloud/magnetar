@@ -31,18 +31,19 @@ name: xtask gates (scheduled)
 # differential test binaries, but it reports coverage over every crate that
 # run compiles — `magnetar-proto`, `magnetar-runtime-tokio`,
 # `magnetar-runtime-moonpool`, `magnetar-differential`,
-# `magnetar-auth-athenz` and `magnetar-auth-sasl`. An added line in one of
+# `magnetar-auth-athenz`, `magnetar-auth-sasl`, `magnetar-driver`, and
+# `magnetar-fakes`. An added line in one of
 # those that the sim run never executes is REPORTED with a count and FAILS
 # the job: ADR-0092 flipped `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true`,
 # superseding ADR-0090's advisory landing, so no flag is needed to get the
-# verdict. A second case fails too, and did so even while the verdict was
-# advisory — an added file whose whole gated crate emitted no coverage
-# records at all, which means the gate could not measure rather than that a
-# test is missing.
-# The `magnetar-driver` façade is deliberately not compiled here —
-# its e2e suite is Docker-bound (ADR-0046) — so façade additions still print
-# as advisory `not gated` lines and cannot fail the job. That is a scope
-# limit rather than a verdict, and no setting of the constant turns it fatal.
+# verdict. Record-less gated source also fails when the file contains a
+# non-test function body or when its whole crate emitted no coverage records;
+# either means the gate could not measure rather than that a test is merely
+# missing. Genuinely non-executable files remain advisory.
+# The façade and fake are reached through the differential public aggregate
+# suites; the façade's Docker-bound e2e targets still do not execute here.
+# Packages outside this eight-package compiled closure remain advisory
+# `not gated` scope rather than a coverage verdict.
 #
 # Security note: no `github.event.*` inputs are interpolated anywhere in
 # this workflow.
@@ -51,7 +52,7 @@ on:
   schedule:
     # 04:17 UTC daily. Off-the-hour, and offset from the 03:17 seed sweep to
     # avoid contention.
-    - cron: '17 4 * * *'
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -138,7 +139,7 @@ jobs:
     # Budget for one instrumented `--all-features` build of the moonpool +
     # differential test binaries and their dependency closure
     # (aws-lc-fips-sys included) plus the sim run itself. Widening the
-    # report to the six crates named in the header note cost no extra
+    # report to the eight crates named in the header note cost no extra
     # compilation — it is a second `cargo llvm-cov report` over artifacts
     # already on disk — so this number did not move with that change. It
     # only ever binds a `workflow_dispatch` run: the scheduled `main` run

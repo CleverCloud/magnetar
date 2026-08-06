@@ -443,6 +443,20 @@ impl ProxyConnectionPool {
     pub(crate) fn bootstrap_url(&self) -> ParsedUrl {
         self.factory.url.clone()
     }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn scalable_url_allowed(&self, url: &str) -> bool {
+        self.factory
+            .bootstrap_config
+            .redirect_url_allow_list
+            .as_ref()
+            .is_none_or(|allow_list| allow_list.is_allowed(url))
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn bootstrap_uses_proxy_target(&self) -> bool {
+        self.factory.bootstrap_config.proxy_to_broker_url.is_some()
+    }
 }
 
 #[cfg(test)]

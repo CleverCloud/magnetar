@@ -887,10 +887,10 @@ fn handle_frame(
                 if sub.consumer_id == 99 {
                     emit_scalable_subscribe_rejection(out, sub.request_id);
                 } else {
-                    emit_scalable_subscribe_response(out, sub.request_id);
+                    emit_scalable_subscribe_response(out, sub.request_id, &sub.topic);
                     // Follow the registration with one rebalance so the
                     // assignment delta path is exercised on both engines.
-                    emit_scalable_assignment_update(out, sub.consumer_id);
+                    emit_scalable_assignment_update(out, sub.consumer_id, &sub.topic);
                 }
             }
         }
@@ -1383,8 +1383,8 @@ fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64, with_mess
 /// Emit the initial two-segment layout for a scalable-topic session.
 fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
     let segments = vec![
-        scalable_segment(1, 0, 32_768, &[]),
-        scalable_segment(2, 32_768, 65_536, &[]),
+        scalable_segment(1, 0, 32_767, &[]),
+        scalable_segment(2, 32_768, 65_535, &[]),
     ];
     let segment_brokers = segments
         .iter()
@@ -1416,10 +1416,19 @@ fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
 
 /// Emit a second layout in which segment 1 splits into 3 + 4.
 fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
+    let mut parent = scalable_segment(1, 0, 32_767, &[]);
+    parent.state = pb::SegmentState::Sealed as i32;
+    parent.child_ids = vec![3, 4];
+    parent.sealed_at_epoch = Some(2);
+    let mut child_three = scalable_segment(3, 0, 16_383, &[1]);
+    child_three.created_at_epoch = 2;
+    let mut child_four = scalable_segment(4, 16_384, 32_767, &[1]);
+    child_four.created_at_epoch = 2;
     let segments = vec![
-        scalable_segment(2, 32_768, 65_536, &[]),
-        scalable_segment(3, 0, 16_384, &[1]),
-        scalable_segment(4, 16_384, 32_768, &[1]),
+        parent,
+        scalable_segment(2, 32_768, 65_535, &[]),
+        child_three,
+        child_four,
     ];
     let segment_brokers = segments
         .iter()
@@ -1449,30 +1458,47 @@ fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
-fn scalable_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignment {
+fn scalable_assignment(epoch: u64, segs: &[u64], topic: &str) -> pb::ScalableConsumerAssignment {
     pb::ScalableConsumerAssignment {
         layout_epoch: epoch,
         segments: segs
             .iter()
-            .map(|&id| pb::ScalableAssignedSegment {
-                segment_id: id,
-                hash_start: 0,
-                hash_end: 32_768,
-                segment_topic: format!("segment://public/default/scaled/{id}"),
+            .map(|&id| {
+                let (hash_start, hash_end) = match id {
+                    1 => (0, 32_767),
+                    2 => (32_768, 65_535),
+                    _ => panic!("unsupported scripted assignment segment {id}"),
+                };
+                pb::ScalableAssignedSegment {
+                    segment_id: id,
+                    hash_start,
+                    hash_end,
+                    segment_topic: format!(
+                        "{}/{hash_start:04x}-{hash_end:04x}-{id}",
+                        topic.replacen("topic://", "segment://", 1)
+                    ),
+                }
             })
             .collect(),
     }
 }
 
+#[cfg(all(test, feature = "scalable-topics"))]
+#[test]
+#[should_panic(expected = "unsupported scripted assignment segment 99")]
+fn scripted_assignment_rejects_unknown_segments() {
+    let _ = scalable_assignment(1, &[99], "topic://public/default/scaled");
+}
+
 /// Emit the response that resolves a consumer registration.
-fn emit_scalable_subscribe_response(out: &mut BytesMut, request_id: u64) {
+fn emit_scalable_subscribe_response(out: &mut BytesMut, request_id: u64, topic: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
         scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
             request_id,
             error: None,
             message: None,
-            assignment: Some(scalable_assignment(1, &[1])),
+            assignment: Some(scalable_assignment(1, &[1], topic)),
         }),
         ..Default::default()
     };
@@ -1495,12 +1521,12 @@ fn emit_scalable_subscribe_rejection(out: &mut BytesMut, request_id: u64) {
 }
 
 /// Emit one rebalance: segment 1 is replaced by segment 2 at epoch 2.
-fn emit_scalable_assignment_update(out: &mut BytesMut, consumer_id: u64) {
+fn emit_scalable_assignment_update(out: &mut BytesMut, consumer_id: u64, topic: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
         scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
             consumer_id,
-            assignment: scalable_assignment(2, &[2]),
+            assignment: scalable_assignment(2, &[2], topic),
         }),
         ..Default::default()
     };

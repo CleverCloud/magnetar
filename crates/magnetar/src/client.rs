@@ -35,6 +35,10 @@ pub enum PulsarError {
     /// Phase 4 of the D1 lift train (ADR-0026 §D1).
     #[error("engine error: {0}")]
     Other(String),
+    /// Typed PIP-460 aggregate or transaction-coordination failure.
+    #[cfg(feature = "scalable-topics")]
+    #[error(transparent)]
+    StreamConsumer(#[from] crate::scalable::StreamConsumerError),
 }
 
 /// Convenience alias for outgoing application messages.
@@ -791,6 +795,9 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
 pub struct PulsarClient<E: crate::Engine = crate::TokioEngine> {
     pub(crate) inner: E::ClientState,
     pub(crate) memory_limit: Option<MemoryLimit>,
+    /// Per-client aggregate transaction admission and participant registry.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) transactions: std::sync::Arc<crate::transaction::TransactionCoordinator>,
 }
 
 impl PulsarClient<crate::TokioEngine> {
@@ -1548,8 +1555,6 @@ mod outgoing_message_tests {
             partition: -1,
             batch_index: 3,
             batch_size: 10,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         assert!(batched.is_batched());
         assert!(!batched.is_partitioned());
@@ -1561,8 +1566,6 @@ mod outgoing_message_tests {
             partition: 4,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         assert!(!partitioned.is_batched());
         assert!(partitioned.is_partitioned());

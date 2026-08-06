@@ -140,9 +140,12 @@ enum Cmd {
     /// keeps; instrumentation itself is workspace-wide. The re-export
     /// therefore measures `magnetar-proto` and `magnetar-runtime-tokio`
     /// lines the sim reached transitively. Packages the run never compiles
-    /// (the `magnetar-driver` façade, `magnetarctl`, `xtask`, and everything
-    /// reachable only through them) still surface as `not gated` rather than
-    /// counting as covered — see ADR-0088.
+    /// (`magnetar-admin`, `magnetarctl`, `xtask`, and everything reachable only
+    /// through them) still surface as `not gated` rather than counting as
+    /// covered — see ADR-0088. The `magnetar-driver` façade and
+    /// `magnetar-fakes` are dev-dependencies of `magnetar-differential`, so
+    /// their libraries are compiled and reported without running façade e2e
+    /// targets.
     CheckSimCoverage {
         /// Base ref to diff against. Defaults to `origin/main`.
         #[arg(long, default_value = "origin/main")]
@@ -1040,70 +1043,373 @@ fn has_structured_field(args: &str) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfgTruth {
+    AlwaysFalse,
+    AlwaysTrue,
+    Either,
+}
+
+impl CfgTruth {
+    const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::AlwaysFalse, _) | (_, Self::AlwaysFalse) => Self::AlwaysFalse,
+            (Self::AlwaysTrue, Self::AlwaysTrue) => Self::AlwaysTrue,
+            _ => Self::Either,
+        }
+    }
+
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::AlwaysTrue, _) | (_, Self::AlwaysTrue) => Self::AlwaysTrue,
+            (Self::AlwaysFalse, Self::AlwaysFalse) => Self::AlwaysFalse,
+            _ => Self::Either,
+        }
+    }
+
+    const fn not(self) -> Self {
+        match self {
+            Self::AlwaysFalse => Self::AlwaysTrue,
+            Self::AlwaysTrue => Self::AlwaysFalse,
+            Self::Either => Self::Either,
+        }
+    }
+}
+
+/// Minimal parser for Rust's `cfg` predicate grammar.
+///
+/// Every predicate other than `test` is unknown rather than false. Evaluating
+/// with `test = false` therefore proves an item test-only only when no possible
+/// feature, target, or custom cfg value can make the expression true.
+struct CfgExprParser<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> CfgExprParser<'a> {
+    const fn new(input: &'a str) -> Self {
+        Self {
+            bytes: input.as_bytes(),
+            cursor: 0,
+        }
+    }
+
+    fn parse(mut self) -> Option<CfgTruth> {
+        let value = self.parse_expr()?;
+        self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+        (self.cursor == self.bytes.len()).then_some(value)
+    }
+
+    fn parse_expr(&mut self) -> Option<CfgTruth> {
+        self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+        let name_start = self.cursor;
+        while self
+            .bytes
+            .get(self.cursor)
+            .copied()
+            .is_some_and(is_ident_byte)
+        {
+            self.cursor += 1;
+        }
+        if self.cursor == name_start {
+            return None;
+        }
+        let name_end = self.cursor;
+        self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+
+        if self.bytes.get(self.cursor) == Some(&b'=') {
+            self.cursor += 1;
+            self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+            let value_start = self.cursor;
+            if let Some(next) = skip_inert_region(self.bytes, self.cursor) {
+                self.cursor = next;
+            } else {
+                while self
+                    .bytes
+                    .get(self.cursor)
+                    .copied()
+                    .is_some_and(|byte| is_ident_byte(byte) || byte == b'-' || byte == b'.')
+                {
+                    self.cursor += 1;
+                }
+            }
+            return (self.cursor > value_start).then_some(CfgTruth::Either);
+        }
+
+        if self.bytes.get(self.cursor) != Some(&b'(') {
+            return Some(if &self.bytes[name_start..name_end] == b"test" {
+                CfgTruth::AlwaysFalse
+            } else {
+                CfgTruth::Either
+            });
+        }
+
+        let name = &self.bytes[name_start..name_end];
+        if !matches!(name, b"all" | b"any" | b"not") {
+            let (_, after) = extract_balanced_parens(self.bytes, self.cursor)?;
+            self.cursor = after;
+            return Some(CfgTruth::Either);
+        }
+
+        self.cursor += 1;
+        let mut values = Vec::new();
+        loop {
+            self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+            if self.bytes.get(self.cursor) == Some(&b')') {
+                self.cursor += 1;
+                break;
+            }
+            values.push(self.parse_expr()?);
+            self.cursor = skip_cfg_trivia(self.bytes, self.cursor);
+            match self.bytes.get(self.cursor) {
+                Some(b',') => self.cursor += 1,
+                Some(b')') => {
+                    self.cursor += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+
+        match name {
+            b"all" => Some(values.into_iter().fold(CfgTruth::AlwaysTrue, CfgTruth::and)),
+            b"any" => Some(values.into_iter().fold(CfgTruth::AlwaysFalse, CfgTruth::or)),
+            b"not" => match values.as_slice() {
+                [value] => Some(value.not()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+fn skip_cfg_trivia(bytes: &[u8], mut cursor: usize) -> usize {
+    loop {
+        while bytes
+            .get(cursor)
+            .copied()
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if matches!(bytes.get(cursor..cursor + 2), Some(b"//" | b"/*"))
+            && let Some(next) = skip_inert_region(bytes, cursor)
+        {
+            cursor = next;
+            continue;
+        }
+        return cursor;
+    }
+}
+
+fn cfg_expression_is_test_only(expression: &str) -> bool {
+    CfgExprParser::new(expression).parse() == Some(CfgTruth::AlwaysFalse)
+}
+
+/// Parse one outer `#[cfg(...)]` attribute at `start`.
+fn cfg_attribute(bytes: &[u8], start: usize) -> Option<(bool, usize)> {
+    if bytes.get(start) != Some(&b'#') {
+        return None;
+    }
+    let mut cursor = skip_cfg_trivia(bytes, start + 1);
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    cursor = skip_cfg_trivia(bytes, cursor + 1);
+    if bytes.get(cursor..cursor + 3) != Some(b"cfg")
+        || bytes.get(cursor + 3).copied().is_some_and(is_ident_byte)
+    {
+        return None;
+    }
+    cursor = skip_cfg_trivia(bytes, cursor + 3);
+    if bytes.get(cursor) != Some(&b'(') {
+        return None;
+    }
+    let (expression, after_expression) = extract_balanced_parens(bytes, cursor)?;
+    cursor = skip_cfg_trivia(bytes, after_expression);
+    if bytes.get(cursor) != Some(&b']') {
+        return None;
+    }
+    Some((cfg_expression_is_test_only(&expression), cursor + 1))
+}
+
+fn item_prefix_uses_semicolon(bytes: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut has_fn = false;
+    let mut semicolon_item = false;
+    let mut value_or_type_started = false;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, cursor) {
+            cursor = next.max(cursor + 1);
+            continue;
+        }
+        match bytes[cursor] {
+            b'[' => {
+                bracket_depth += 1;
+                cursor += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                cursor += 1;
+            }
+            byte if bracket_depth == 0 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                let start = cursor;
+                cursor += 1;
+                while bytes.get(cursor).copied().is_some_and(is_ident_byte) {
+                    cursor += 1;
+                }
+                match &bytes[start..cursor] {
+                    b"fn" if !value_or_type_started => has_fn = true,
+                    b"use" | b"type" | b"const" | b"static" | b"let" => {
+                        semicolon_item = true;
+                    }
+                    _ => {}
+                }
+            }
+            b':' | b'=' if bracket_depth == 0 => {
+                value_or_type_started = true;
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    semicolon_item && !has_fn
+}
+
+/// Find the end of the item or statement governed by an outer cfg attribute.
+///
+/// The scanner is deliberately conservative: failure to identify an end means
+/// no exclusion. Strings, chars, raw strings, and comments are skipped before
+/// examining delimiters, so inert braces cannot extend a test-only span over
+/// later production code.
+fn cfg_attributed_item_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut semicolon_item = None;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, cursor) {
+            cursor = next.max(cursor + 1);
+            continue;
+        }
+        match bytes[cursor] {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' if paren_depth == 0 && bracket_depth == 0 => {
+                let uses_semicolon = *semicolon_item
+                    .get_or_insert_with(|| item_prefix_uses_semicolon(&bytes[start..cursor]));
+                if !uses_semicolon {
+                    let (_, after) = extract_balanced(bytes, cursor, b'{', b'}')?;
+                    return Some(after);
+                }
+                brace_depth += 1;
+            }
+            b'}' if paren_depth == 0 && bracket_depth == 0 && brace_depth > 0 => {
+                brace_depth -= 1;
+            }
+            b';' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                return Some(cursor + 1);
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn cfg_test_spans(contents: &str) -> Vec<(usize, usize)> {
+    let bytes = contents.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, cursor) {
+            cursor = next.max(cursor + 1);
+            continue;
+        }
+        let Some((test_only, after_attribute)) = cfg_attribute(bytes, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if test_only && let Some(item_end) = cfg_attributed_item_end(bytes, after_attribute) {
+            spans.push((cursor, item_end));
+            cursor = item_end;
+        } else {
+            cursor = after_attribute;
+        }
+    }
+    spans
+}
+
+fn line_has_code_outside_test_spans(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    spans: &[(usize, usize)],
+) -> bool {
+    let mut cursor = start;
+    while cursor < end {
+        if let Some((_, span_end)) = spans
+            .iter()
+            .find(|(span_start, span_end)| *span_start <= cursor && cursor < *span_end)
+        {
+            cursor = (*span_end).min(end);
+            continue;
+        }
+        if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if matches!(bytes.get(cursor..cursor + 2), Some(b"//" | b"/*"))
+            && let Some(next) = skip_inert_region(bytes, cursor)
+        {
+            cursor = next.min(end);
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// Per-line `#[cfg(test)]`-membership flags for `contents` (1 entry per
 /// line, 1-indexed lines map to `flags[line - 1]`).
 ///
-/// Same line-based brace-tracking heuristic as [`check_no_internal_clock`]:
-/// a `#[cfg(…test…)]` attribute arms a pending state; the next `{` opens
-/// the excluded span, which closes when the brace depth returns to zero. A
-/// braceless `;` declaration (`#[cfg(test)] mod tests;`) excludes only its
-/// own lines.
+/// A line is excluded only when an actual cfg predicate cannot be true with
+/// `test = false` and no production token shares that source line. This keeps
+/// `not(test)`, `any(test, feature = "...")`, and unrelated names containing
+/// `test` in the production surface while still recognizing `all(test, ...)`.
 fn cfg_test_line_flags(contents: &str) -> Vec<bool> {
-    let mut flags = Vec::new();
-    let mut in_cfg_test = false;
-    let mut pending = false;
-    let mut depth: i32 = 0;
-    for line in contents.lines() {
-        let trimmed = line.trim_start();
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
-
-        if !in_cfg_test && !pending && trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
-            flags.push(true);
-            if opens > 0 {
-                // Single-line gated item: `#[cfg(test)] mod tests { … }`.
-                in_cfg_test = true;
-                depth = opens - closes;
-                if depth <= 0 {
-                    in_cfg_test = false;
-                    depth = 0;
-                }
-            } else if !trimmed.ends_with(';') {
-                pending = true;
-            }
-            continue;
+    let bytes = contents.as_bytes();
+    let spans = cfg_test_spans(contents);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            ranges.push((start, index));
+            start = index + 1;
         }
-
-        if pending {
-            flags.push(true);
-            if opens > 0 {
-                pending = false;
-                in_cfg_test = true;
-                depth = opens - closes;
-                if depth <= 0 {
-                    in_cfg_test = false;
-                    depth = 0;
-                }
-            } else if trimmed.ends_with(';') {
-                // `#[cfg(test)]` + `mod tests;` — gated declaration, no block.
-                pending = false;
-            }
-            continue;
-        }
-
-        if in_cfg_test {
-            flags.push(true);
-            depth += opens - closes;
-            if depth <= 0 {
-                in_cfg_test = false;
-                depth = 0;
-            }
-            continue;
-        }
-
-        flags.push(false);
     }
-    flags
+    if start < bytes.len() {
+        ranges.push((start, bytes.len()));
+    }
+
+    ranges
+        .into_iter()
+        .map(|(line_start, line_end)| {
+            let touches_test_span = spans.iter().any(|(span_start, span_end)| {
+                if line_start == line_end {
+                    *span_start <= line_start && line_start < *span_end
+                } else {
+                    *span_start < line_end && line_start < *span_end
+                }
+            });
+            touches_test_span
+                && !line_has_code_outside_test_spans(bytes, line_start, line_end, &spans)
+        })
+        .collect()
 }
 
 /// Scan one file's contents for `error!` / `warn!` / `info!` invocations
@@ -1294,8 +1600,11 @@ fn zero_arg_fn_bodies(contents: &str) -> Vec<(&str, String)> {
             continue;
         }
         if !bytes[i..].starts_with(b"fn")
-            || (i > 0 && is_ident_byte(bytes[i - 1]))
-            || bytes.get(i + 2).copied().is_some_and(is_ident_byte)
+            || (i > 0 && (is_ident_byte(bytes[i - 1]) || !bytes[i - 1].is_ascii()))
+            || bytes
+                .get(i + 2)
+                .copied()
+                .is_some_and(|byte| is_ident_byte(byte) || !byte.is_ascii())
         {
             i += 1;
             continue;
@@ -1639,8 +1948,8 @@ const SIM_COVERAGE_EXCLUDE_PREFIXES: &[&str] = &[
 /// File-name fragments excluded from sim-coverage (test files and benches).
 const SIM_COVERAGE_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/examples/"];
 
-/// Source trees whose total absence from the sim-coverage report is a hard
-/// failure rather than an advisory `not gated` line.
+/// Source trees whose record-less executable files are hard failures rather
+/// than advisory `not gated` lines.
 ///
 /// Every crate here is compiled and linked into the moonpool + differential
 /// test binaries, so [`run_sim_lcov`]'s re-export must emit `SF:` records for
@@ -1651,20 +1960,18 @@ const SIM_COVERAGE_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/exam
 /// "not executable" and pass — the exact fail-open hole ADR-0088 documented.
 /// Failing loudly is the only honest answer.
 ///
-/// **The check is per-CRATE, never per-FILE.** LLVM builds its coverage mapping
-/// from per-function `covfun` records, so a source file holding only `pub mod`
-/// / `pub use` / `pub const` / attributes emits no `SF:` record at all even
-/// when its crate is fully instrumented. `crates/magnetar-proto/src/lib.rs`,
+/// The check distinguishes executable and non-executable files inside those
+/// crates. LLVM builds its coverage mapping from per-function `covfun` records,
+/// so a source file holding only `pub mod` / `pub use` / `pub const` /
+/// attributes or bodyless declarations emits no `SF:` record even when its
+/// crate is fully instrumented. `crates/magnetar-proto/src/lib.rs`,
 /// `crates/magnetar-proto/src/trackers/mod.rs`,
 /// `crates/magnetar-differential/src/lib.rs`,
 /// `crates/magnetar-runtime-moonpool/src/crypto.rs` and
-/// `crates/magnetar-runtime-tokio/src/crypto.rs` are all in that shape today —
-/// none of them declares a single `fn`. Adding a module to `magnetar-proto`
-/// requires a `pub mod foo;` line in `src/lib.rs`, and a per-file rule would
-/// hard-fail that routine diff with no possible remedy: the added line is not
-/// executable, so no test could ever cover it. The residual gap is deliberate
-/// and documented — a record-less file inside a crate that DID emit records
-/// stays on the advisory path.
+/// `crates/magnetar-runtime-tokio/src/crypto.rs` are all in that shape today.
+/// They stay advisory because no test could create a mapping for them. A file
+/// with a non-test function body must emit its own `SF:` record; sibling records
+/// cannot make it measurable, so [`classify_uninstrumented`] fails it.
 ///
 /// Entries are exactly the crates the executed closure compiles:
 /// `magnetar-runtime-moonpool` and `magnetar-differential` are step 1's `-p`
@@ -1672,10 +1979,12 @@ const SIM_COVERAGE_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/exam
 /// of them, and `magnetar-auth-sasl` / `magnetar-auth-athenz` are dev-
 /// dependencies of both runners — visible as
 /// `--extern magnetar_auth_sasl=…rlib --extern magnetar_auth_athenz=…rlib` on
-/// the rustc invocation for `crates/magnetar-runtime-moonpool/tests/*`. Every
-/// other workspace member is reachable only through `magnetar-driver` /
-/// `magnetarctl`, which step 1 never compiles, so it can never emit a record
-/// and must not be listed here.
+/// the rustc invocation for `crates/magnetar-runtime-moonpool/tests/*`.
+/// `magnetar-driver` (whose source directory is `crates/magnetar`) and
+/// `magnetar-fakes` are dev-dependencies of `magnetar-differential`, whose
+/// public aggregate tests exercise both. Every other workspace member is
+/// unselected or reachable only through `magnetarctl`, so it cannot emit a
+/// record and must not be listed here.
 const SIM_COVERAGE_GATED_CRATE_PREFIXES: &[&str] = &[
     "crates/magnetar-proto/src/",
     "crates/magnetar-runtime-tokio/src/",
@@ -1683,6 +1992,8 @@ const SIM_COVERAGE_GATED_CRATE_PREFIXES: &[&str] = &[
     "crates/magnetar-differential/src/",
     "crates/magnetar-auth-sasl/src/",
     "crates/magnetar-auth-athenz/src/",
+    "crates/magnetar/src/",
+    "crates/magnetar-fakes/src/",
 ];
 
 /// Returns true if `relpath` (workspace-relative, forward slashes) is excluded
@@ -1921,16 +2232,16 @@ fn parse_lcov_coverage(
 /// so a package cargo never compiled has no coverage mapping and cannot be
 /// conjured back by naming it here.
 ///
-/// That rules out `magnetar-driver`, `magnetarctl` and `xtask`, and equally
-/// `magnetar-admin`, `magnetar-auth-oauth2`, `magnetar-fakes` and
-/// `magnetar-messagecrypto`: no `crates/*/Cargo.toml` outside
-/// `crates/magnetar` (the façade) and `crates/magnetarctl` names any of the
-/// four, and neither of those is in step 1's `-p` set. Listing them would not
-/// add a single record, but [`report_ungated`] prints this list as "the
-/// reported closure", so a record-less file in one of them would be told it
-/// sits outside a closure that names its own crate. `magnetar-auth-athenz` and
-/// `magnetar-auth-sasl` stay because they ARE compiled — both are dev-
-/// dependencies of `magnetar-runtime-moonpool` and `magnetar-differential`.
+/// That rules out `magnetarctl`, `xtask`, `magnetar-admin`,
+/// `magnetar-auth-oauth2` and `magnetar-messagecrypto`: none is selected by the
+/// two execution roots. Listing one would not add a single record, but
+/// [`report_ungated`] prints this list as "the reported closure", so a
+/// record-less file in one would be told it sits outside a closure that names
+/// its own crate. `magnetar-auth-athenz` and `magnetar-auth-sasl` stay because
+/// they are compiled dev-dependencies of the runners. `magnetar-driver` and
+/// `magnetar-fakes` now stay for the same reason: `magnetar-differential` uses
+/// both from its public aggregate tests. Compiling the façade library as a
+/// dev-dependency does not run its Docker-bound e2e test targets.
 ///
 /// Only the report step consumes this; the execution step keeps its own two
 /// `-p` flags, because those decide which test binaries actually run.
@@ -1941,6 +2252,8 @@ const SIM_COVERAGE_REPORT_PACKAGES: &[&str] = &[
     "magnetar-differential",
     "magnetar-auth-athenz",
     "magnetar-auth-sasl",
+    "magnetar-driver",
+    "magnetar-fakes",
 ];
 
 /// Optimization level the coverage build runs at, overriding the workspace's
@@ -2372,18 +2685,21 @@ fn create_sim_coverage_target(storage: &CargoStorage) -> Result<tempfile::TempDi
 ///
 /// The final artifact stays at `target/sim-coverage.lcov`, so the reproduction
 /// command in the ADRs is unchanged: `rg -o '^SF:.*' target/sim-coverage.lcov`.
-/// Measured 2026-07-31, the widened report carries 63 `SF:` records against 16
-/// before: `magnetar-proto` 28, `magnetar-runtime-tokio` 12,
+/// Measured 2026-07-31, the original widened report carried 63 `SF:` records
+/// against 16 before: `magnetar-proto` 28, `magnetar-runtime-tokio` 12,
 /// `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5,
-/// `magnetar-differential` 4, `magnetar-auth-sasl` 2 — the six packages of
-/// [`SIM_COVERAGE_REPORT_PACKAGES`] and nothing else, which is what pins that
-/// constant to the executed closure.
+/// `magnetar-differential` 4, `magnetar-auth-sasl` 2. ADR-0098 amends that
+/// historical six-package closure to eight after `magnetar-differential`
+/// gained public aggregate tests through `magnetar-driver` and
+/// `magnetar-fakes`; no later `SF:` total is assumed here.
 ///
 /// A crate under [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] that emits no record at
-/// all is a hard failure ([`report_missing_gated`]); anything else the report
-/// does not mention — including a function-less file inside a crate that did
-/// emit records — is reported as `not gated` rather than silently passed
-/// (ADR-0088).
+/// all is a hard failure ([`report_missing_gated`]). A record-less file in a
+/// gated crate also fails when it contains a non-test function body: sibling
+/// records prove the crate reached the report, but do not make that executable
+/// file measurable. A genuinely non-executable module/export/constant or
+/// bodyless-declaration file remains advisory rather than silently passed
+/// (ADR-0088, ADR-0098).
 ///
 /// With `reuse_lcov`, both commands are skipped and the existing
 /// `target/sim-coverage.lcov` is read as-is — sizing and debugging only. That
@@ -2499,7 +2815,9 @@ fn run_sim_lcov_with_cargo_environment(
         // it after `--` routes it to libtest, which rejects it ("Unrecognized
         // option: 'p'") and aborts the whole coverage run. Here it picks the test
         // binaries to run (and `--workspace`, mutually exclusive with it, would drag
-        // in the façade's Docker-bound e2e suite). It does NOT restrict
+        // in every workspace test target, including the façade's Docker-bound
+        // e2e suite). The differential dev-dependency still compiles the façade
+        // library without running those targets. `-p` does NOT restrict
         // instrumentation: cargo-llvm-cov instruments every workspace member
         // regardless, which is exactly why step 2 can widen the report for free.
         let mut exec = StdCommand::new(cargo);
@@ -2596,7 +2914,7 @@ fn intersect_diff_with_coverage(
 /// Partition off the tracked files that LCOV never mentions at all.
 ///
 /// [`run_sim_lcov`]'s report covers [`SIM_COVERAGE_REPORT_PACKAGES`]; a file
-/// outside them — in the `magnetar-driver` façade, `magnetarctl` or `xtask` —
+/// outside them — in `magnetar-admin`, `magnetarctl` or `xtask`, for example —
 /// emits no `DA:` records at all, so every added line in it reads as "not
 /// executable" to [`intersect_diff_with_coverage`] and passes.
 ///
@@ -2632,11 +2950,12 @@ fn uninstrumented_files(
 /// The entries of [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] that contributed no
 /// `SF:` record whatsoever to `covered`.
 ///
-/// This — not a per-file record miss — is the "the run is broken" signal. A
-/// gated crate is compiled and linked into the sim test binaries, so its object
-/// files carry a coverage mapping and `llvm-cov export` must emit records for
-/// it. Zero records for the entire crate means nothing linked it or the
-/// re-export produced nothing, and `llvm-cov` reports neither.
+/// This is the crate-wide "the run is broken" signal. A gated crate is compiled
+/// and linked into the sim test binaries, so its object files carry a coverage
+/// mapping and `llvm-cov export` must emit records for it. Zero records for the
+/// entire crate means nothing linked it or the re-export produced nothing, and
+/// `llvm-cov` reports neither. [`classify_uninstrumented`] separately catches a
+/// per-file miss when that file contains a non-test function body.
 ///
 /// `covered` is keyed on canonicalized absolute paths ([`coverage_key`]) while
 /// the prefixes are workspace-relative, so the match is a substring test rather
@@ -2659,19 +2978,195 @@ fn silent_gated_prefixes(
         .collect()
 }
 
+fn closure_prefix_allows(bytes: &[u8], pipe: usize) -> bool {
+    let mut cursor = 0usize;
+    let mut allowed = false;
+    while cursor < pipe {
+        if let Some(next) = skip_inert_region(bytes, cursor) {
+            cursor = next.min(pipe).max(cursor + 1);
+            continue;
+        }
+        if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < pipe && is_ident_byte(bytes[cursor]) {
+                cursor += 1;
+            }
+            allowed = matches!(&bytes[start..cursor], b"move" | b"async" | b"return");
+            continue;
+        }
+        allowed = matches!(
+            bytes[cursor],
+            b'=' | b'(' | b'[' | b'{' | b',' | b':' | b';'
+        ) || (bytes[cursor] == b'>' && cursor > 0 && bytes[cursor - 1] == b'=');
+        cursor += 1;
+    }
+    allowed
+}
+
+fn closure_body_start(bytes: &[u8], pipe: usize) -> Option<usize> {
+    let mut cursor = pipe + 1;
+    if bytes.get(cursor) == Some(&b'|') {
+        cursor += 1;
+    } else {
+        loop {
+            if cursor >= bytes.len() {
+                return None;
+            }
+            if let Some(next) = skip_inert_region(bytes, cursor) {
+                cursor = next.max(cursor + 1);
+                continue;
+            }
+            if bytes[cursor] == b'|' {
+                cursor += 1;
+                break;
+            }
+            if bytes[cursor] == b';' {
+                return None;
+            }
+            cursor += 1;
+        }
+    }
+    cursor = skip_cfg_trivia(bytes, cursor);
+    bytes.get(cursor).map(|_| cursor)
+}
+
+fn has_non_test_closure_body(contents: &str, in_cfg_test: &[bool]) -> bool {
+    let bytes = contents.as_bytes();
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .map(|(index, _)| index + 1),
+    );
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, cursor) {
+            cursor = next.max(cursor + 1);
+            continue;
+        }
+        if bytes[cursor] != b'|' || !closure_prefix_allows(bytes, cursor) {
+            cursor += 1;
+            continue;
+        }
+        let line = line_starts.partition_point(|&start| start <= cursor);
+        if !in_cfg_test.get(line - 1).copied().unwrap_or(false)
+            && closure_body_start(bytes, cursor).is_some()
+        {
+            return true;
+        }
+        cursor += 1;
+    }
+    false
+}
+
+/// Whether a Rust source file contains a named or closure function body outside
+/// `#[cfg(test)]`.
+///
+/// LCOV derives `SF:` entries from function coverage mappings. A record-less
+/// gated file containing a production function body is therefore unmeasured,
+/// even when a sibling proves that the crate reached the report. This includes
+/// closures stored in a `const`, `static`, or lazy initializer; a bare function
+/// pointer value remains data-only. Module/export/data-constant-only files and
+/// bodyless trait or extern declarations legitimately have no mapping and stay
+/// advisory.
+///
+/// This is deliberately lexical rather than a Rust parser: comments and
+/// literals are skipped by [`skip_inert_region`], test spans by
+/// [`cfg_test_line_flags`], and a declaration counts only when `fn` is followed
+/// by a name and [`find_plain_brace`] reaches `{` before `;` or `}`. Requiring a
+/// name also excludes function-pointer types such as `const HANDLER: fn() = …`.
+fn has_non_test_function_body(contents: &str) -> bool {
+    let in_cfg_test = cfg_test_line_flags(contents);
+    let bytes = contents.as_bytes();
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .map(|(index, _)| index + 1),
+    );
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        if !bytes[i..].starts_with(b"fn")
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+            || bytes.get(i + 2).copied().is_some_and(is_ident_byte)
+        {
+            i += 1;
+            continue;
+        }
+
+        let line = line_starts.partition_point(|&start| start <= i);
+        let mut j = i + 2;
+        loop {
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if matches!(bytes.get(j..j + 2), Some(b"//" | b"/*"))
+                && let Some(next) = skip_inert_region(bytes, j)
+            {
+                j = next;
+                continue;
+            }
+            break;
+        }
+        if in_cfg_test.get(line - 1).copied().unwrap_or(false) {
+            i = j.max(i + 1);
+            continue;
+        }
+
+        // Raw identifiers are valid function names (`fn r#type() { … }`).
+        if bytes.get(j) == Some(&b'r') && bytes.get(j + 1) == Some(&b'#') {
+            j += 2;
+        }
+        let name_start = j;
+        if !bytes
+            .get(j)
+            .copied()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii())
+        {
+            i = j.max(i + 1);
+            continue;
+        }
+        j += 1;
+        while bytes
+            .get(j)
+            .copied()
+            .is_some_and(|byte| is_ident_byte(byte) || !byte.is_ascii())
+        {
+            j += 1;
+        }
+        if j > name_start && find_plain_brace(bytes, j).is_some() {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    has_non_test_closure_body(contents, &in_cfg_test)
+}
+
 /// `(missing_gated, ungated)` — the two record-less buckets.
 type UninstrumentedSplit = (Vec<(String, usize)>, Vec<(String, usize)>);
 
-/// Split [`uninstrumented_files`] into the files that prove a broken run and
-/// the files that merely sit outside the report's reach.
+/// Split [`uninstrumented_files`] into hard failures and advisory files.
 ///
-/// A record-less file hard-fails only when its own gated crate produced no
-/// records at all ([`silent_gated_prefixes`]). Inside a crate that *did* emit
-/// records the miss is expected: LLVM derives its coverage mapping from
-/// per-function records, so `pub mod` / `pub use` / `pub const`-only files
-/// legitimately have no `SF:` entry and nothing a test could ever cover. See
-/// [`SIM_COVERAGE_GATED_CRATE_PREFIXES`] for why that distinction is
-/// load-bearing rather than a convenience.
+/// A record-less gated file hard-fails when its crate produced no records at
+/// all ([`silent_gated_prefixes`]) or when the file contains a non-test function
+/// body ([`has_non_test_function_body`]). Inside a crate that did emit records,
+/// a genuinely non-executable file remains advisory because LLVM derives its
+/// coverage mapping from functions and nothing a test could cover can create an
+/// `SF:` entry for it. Files outside the reported closure remain advisory too.
 ///
 /// `check_sim_coverage` and its unit tests both call this, so the classification
 /// has exactly one implementation and cannot drift from what the check does.
@@ -2689,25 +3184,36 @@ fn classify_uninstrumented(
     let silent = silent_gated_prefixes(covered);
     uninstrumented_files(workspace_root, tracked, covered)
         .into_iter()
-        .partition(|(relpath, _)| silent.iter().any(|prefix| relpath.starts_with(prefix)))
+        .partition(|(relpath, _)| {
+            let Some(prefix) = SIM_COVERAGE_GATED_CRATE_PREFIXES
+                .iter()
+                .find(|prefix| relpath.starts_with(**prefix))
+            else {
+                return false;
+            };
+            silent.contains(prefix)
+                || fs::read_to_string(workspace_root.join(relpath))
+                    .map_or(true, |contents| has_non_test_function_body(&contents))
+        })
 }
 
-/// Print the files ADR-0024's patch-coverage gate could not measure.
+/// Print record-less files that do not prove an unmeasured executable surface.
 ///
-/// Deliberately does NOT fail the check: these live outside
-/// [`SIM_COVERAGE_REPORT_PACKAGES`], and pulling the `magnetar-driver` façade
-/// into the run would drag its Docker-dependent e2e suite (ADR-0046: no feature
-/// gate, no `#[ignore]`) along with it. Reporting keeps the limit visible
-/// instead of silent — see ADR-0088.
+/// Deliberately does NOT fail the check. Most live outside
+/// [`SIM_COVERAGE_REPORT_PACKAGES`]; a gated file can also land here when it has
+/// no non-test function body and therefore no executable coverage mapping.
+/// Reporting both keeps the scope limit visible instead of silent — see
+/// ADR-0088 and ADR-0098.
 fn report_ungated(ungated: &[(String, usize)]) {
     for (path, count) in ungated {
-        eprintln!("not gated (outside the sim-coverage report): {path}: {count} added line(s)");
+        eprintln!("not gated (no executable LCOV file record): {path}: {count} added line(s)");
     }
     eprintln!(
-        "xtask check-sim-coverage: {} file(s) above sit outside the reported \
-         closure ({}), so ADR-0024 patch coverage was NOT enforced on them \
-         (ADR-0088). Cover them from a moonpool or differential test if the \
-         added code is engine-visible.",
+        "xtask check-sim-coverage: {} record-less file(s) above are advisory. \
+         A file outside the reported closure ({}) is not gated; a file inside \
+         it reached this path only because it has no non-test function body. \
+         ADR-0024 patch coverage was NOT enforced on their added lines \
+         (ADR-0088, ADR-0098).",
         ungated.len(),
         SIM_COVERAGE_REPORT_PACKAGES.join(", ")
     );
@@ -2716,27 +3222,23 @@ fn report_ungated(ungated: &[(String, usize)]) {
 /// Print the added lines that landed in a gated crate the report never
 /// mentioned, then bail. Always returns `Err` — the caller relies on `?`.
 ///
-/// Reaching this means [`classify_uninstrumented`] found the file's entire
-/// crate absent from `target/sim-coverage.lcov`, not merely the file. Those
-/// crates ARE compiled and linked into the sim binaries, so either the link
-/// never happened or the re-export produced nothing. `llvm-cov` reports neither
-/// case, and both make every added line in the crate read as "not executable"
-/// and pass. Treating that as an advisory would be a fail-open hole exactly
-/// where the gate is supposed to bite hardest.
+/// Reaching this means [`classify_uninstrumented`] found either a whole gated
+/// crate absent from `target/sim-coverage.lcov` or a record-less gated file with
+/// a non-test function body. Both make executable additions read as "not
+/// executable" and pass. Treating either as advisory would be a fail-open hole
+/// exactly where the gate is supposed to bite hardest.
 fn report_missing_gated(missing: &[(String, usize)]) -> Result<()> {
     for (path, count) in missing {
-        eprintln!("no coverage records (gated crate): {path}: {count} added line(s)");
+        eprintln!("no coverage records (gated executable source): {path}: {count} added line(s)");
     }
     bail!(
-        "xtask check-sim-coverage: {} file(s) above sit in a gated crate that \
-         emitted no coverage records at all — not one file of it reached the \
-         report. Either nothing links that crate into the moonpool / \
-         differential test binaries, or the report step produced nothing for \
-         it; `llvm-cov` reports neither, so this cannot be treated as covered. \
-         Inspect `target/sim-coverage.lcov` \
-         (`rg -o '^SF:.*' target/sim-coverage.lcov`); if the crate legitimately \
-         emits no records at all, reconcile SIM_COVERAGE_GATED_CRATE_PREFIXES \
-         against that measurement.",
+        "xtask check-sim-coverage: {} record-less file(s) above cannot be \
+         treated as covered. Each contains a non-test function body, belongs \
+         to a gated crate that emitted no records at all, or could not be read \
+         for classification. Inspect `target/sim-coverage.lcov` \
+         (`rg -o '^SF:.*' target/sim-coverage.lcov`) and the file; executable \
+         gated source must emit an `SF:` record, while only genuinely \
+         non-executable files may remain advisory.",
         missing.len()
     );
 }
@@ -2893,9 +3395,9 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     if !reuse_lcov {
         ensure_cargo_llvm_cov()?;
     }
-    // The record-less-gated-crate bail is NOT governed by this, because that
-    // signals a broken or misconfigured gate rather than a missing test, and a
-    // gate that cannot measure must never report success.
+    // Record-less executable gated source is NOT governed by this. It signals
+    // a broken or incomplete measurement rather than an uncovered-line
+    // verdict, and a gate that cannot measure must never report success.
     let enforcing = sim_coverage_enforcing(enforce);
 
     let workspace_root = workspace_root()?;
@@ -2985,8 +3487,9 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     //     measured and found wanting. Both were silently identical before —
     //     an uninstrumented file has no `DA:` records, so every added line in
     //     it looked "not executable" and passed (ADR-0088). Split the
-    //     record-less files again: a gated crate that reached the report not at
-    //     all is a broken run and must fail, everything else is a scope limit.
+    //     record-less files again: a silent gated crate or a gated file with a
+    //     non-test function body is unmeasured executable source and must fail;
+    //     everything else is an advisory scope limit.
     //     `report_record_less` owns the ordering (advisory first, so it survives
     //     the bail) and the `?`.
     let record_less = classify_uninstrumented(&workspace_root, &tracked, &covered);
@@ -2997,9 +3500,9 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
         report_uncovered(&workspace_root, &uncovered, enforcing)?;
     }
 
-    // Three buckets now: measured-and-clean, ungated, missing-gated. The last
-    // is empty here (it bails above), but subtract it anyway so the count stays
-    // right if the ordering ever changes.
+    // Three buckets now: measured-and-clean, advisory record-less, and missing
+    // gated executable source. The last is empty here (it bails above), but
+    // subtract it anyway so the count stays right if the ordering ever changes.
     let gated = tracked
         .len()
         .saturating_sub(ungated.len())
@@ -3018,16 +3521,16 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
     // never measured. Keep the two cases textually distinct.
     if uncovered.is_empty() {
         eprintln!(
-            "xtask check-sim-coverage: all added lines across {gated} file(s) are \
-             covered by the moonpool runner ({} file(s) outside the reported \
-             closure).{reuse_suffix}",
+            "xtask check-sim-coverage: all executable added lines across \
+             {gated} LCOV-recorded file(s) are covered by the moonpool runner \
+             ({} advisory record-less file(s)).{reuse_suffix}",
             ungated.len()
         );
     } else {
         eprintln!(
             "xtask check-sim-coverage: exiting 0 with {} uncovered added line(s) \
-             still outstanding across {gated} measured file(s) ({} file(s) \
-             outside the reported closure). This is NOT a pass — see the \
+             still outstanding across {gated} measured file(s) ({} advisory \
+             record-less file(s)). This is NOT a pass — see the \
              ADVISORY line above.{reuse_suffix}",
             uncovered.len(),
             ungated.len()
@@ -4823,22 +5326,22 @@ esac
     }
 
     /// The defect this reporting exists for: `run_sim_lcov`'s report step
-    /// covers `SIM_COVERAGE_REPORT_PACKAGES`, which deliberately omits the
-    /// `magnetar-driver` façade, so façade files emit no LCOV records at all.
-    /// Before ADR-0088 those lines were indistinguishable from non-executable
-    /// ones and passed silently.
+    /// covers `SIM_COVERAGE_REPORT_PACKAGES`, which deliberately omits
+    /// `magnetar-admin`, so its files emit no LCOV records at all. Before
+    /// ADR-0088 those lines were indistinguishable from non-executable ones and
+    /// passed silently.
     #[test]
-    fn sim_coverage_reports_a_facade_file_the_runner_never_instrumented() {
+    fn sim_coverage_reports_an_admin_file_the_runner_never_instrumented() {
         let root = Path::new("/ws");
         let tracked = tracked_of(&[
-            ("crates/magnetar/src/pattern_consumer.rs", &[10, 11, 12]),
+            ("crates/magnetar-admin/src/lib.rs", &[10, 11, 12]),
             ("crates/magnetar-proto/src/conn.rs", &[40]),
         ]);
         let covered = coverage_of(root, &[("crates/magnetar-proto/src/conn.rs", &[40], &[40])]);
 
         assert_eq!(
             uninstrumented_files(root, &tracked, &covered),
-            vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 3)],
+            vec![("crates/magnetar-admin/src/lib.rs".to_owned(), 3)],
             "a file with no LCOV entry must be reported as ungated, not counted as covered"
         );
         assert!(
@@ -4874,7 +5377,7 @@ esac
     fn sim_coverage_separates_ungated_files_from_uncovered_lines() {
         let root = Path::new("/ws");
         let tracked = tracked_of(&[
-            ("crates/magnetar/src/multi_topics.rs", &[7]),
+            ("crates/magnetar-admin/src/lib.rs", &[7]),
             ("crates/magnetar-runtime-moonpool/src/driver.rs", &[80, 81]),
         ]);
         let covered = coverage_of(
@@ -4888,7 +5391,7 @@ esac
 
         assert_eq!(
             uninstrumented_files(root, &tracked, &covered),
-            vec![("crates/magnetar/src/multi_topics.rs".to_owned(), 1)]
+            vec![("crates/magnetar-admin/src/lib.rs".to_owned(), 1)]
         );
         assert_eq!(
             intersect_diff_with_coverage(root, &tracked, &covered),
@@ -4935,44 +5438,143 @@ esac
         );
     }
 
-    /// The counterpart, and the reason the hard failure is per-CRATE rather
-    /// than per-FILE: LLVM derives its coverage mapping from per-function
-    /// records, so a file declaring no `fn` at all emits no `SF:` record even
-    /// though its crate is fully instrumented. `crates/magnetar-proto/src/lib.rs`
-    /// is exactly that file — and adding a module to `magnetar-proto` means
-    /// adding a `pub mod` line to it. A per-file rule would hard-fail that diff
-    /// with no possible remedy, since the added line is not executable and no
-    /// test could ever cover it.
+    /// A sibling `SF:` record proves only that the crate reached the report.
+    /// It must not let a function-bearing file pass as advisory: that file has
+    /// executable source but no coverage mapping, so the gate cannot measure
+    /// its additions.
     #[test]
-    fn sim_coverage_keeps_a_function_less_file_advisory_when_its_crate_reported() {
-        let root = Path::new("/ws");
-        let tracked = tracked_of(&[("crates/magnetar-proto/src/lib.rs", &[42])]);
+    fn sim_coverage_fails_a_function_bearing_file_omitted_from_a_reported_crate() {
+        let tmp = tempfile::tempdir().expect("create fixture root");
+        let root = tmp.path();
+        let src = root.join("crates/magnetar-proto/src");
+        fs::create_dir_all(&src).expect("create fixture source directory");
+        fs::write(
+            src.join("omitted.rs"),
+            "// fn in_a_comment() {}\n\
+             const TEXT: &str = \"fn in_a_string() {}\";\n\
+             #[cfg(test)]\n\
+             fn test_helper() {}\n\
+             pub fn production() -> u8 { 1 }\n",
+        )
+        .expect("write executable fixture");
+        fs::write(src.join("sibling.rs"), "pub fn covered() {}\n").expect("write covered sibling");
+
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/omitted.rs", &[5])]);
+        let covered = coverage_of(
+            root,
+            &[("crates/magnetar-proto/src/sibling.rs", &[1], &[1])],
+        );
+
+        assert!(has_non_test_function_body(
+            &fs::read_to_string(src.join("omitted.rs")).expect("read executable fixture")
+        ));
+        let (missing_gated, advisory) = classify_uninstrumented(root, &tracked, &covered);
+        assert_eq!(
+            missing_gated,
+            vec![("crates/magnetar-proto/src/omitted.rs".to_owned(), 1)],
+            "a production function without an SF: record is unmeasured, even when its crate reported"
+        );
+        assert!(advisory.is_empty());
+        assert!(report_missing_gated(&missing_gated).is_err());
+    }
+
+    /// Anonymous functions receive coverage mappings too. A record-less file
+    /// whose only executable item is a closure-backed static must not be
+    /// mistaken for a data-only constants module.
+    #[test]
+    fn sim_coverage_fails_a_closure_bearing_static_omitted_from_a_reported_crate() {
+        let tmp = tempfile::tempdir().expect("create fixture root");
+        let root = tmp.path();
+        let src = root.join("crates/magnetar-proto/src");
+        fs::create_dir_all(&src).expect("create fixture source directory");
+        fs::write(
+            src.join("callback.rs"),
+            "pub const HANDLER: fn() = || {};\n",
+        )
+        .expect("write closure fixture");
+        fs::write(src.join("sibling.rs"), "pub fn covered() {}\n").expect("write covered sibling");
+
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/callback.rs", &[1])]);
+        let covered = coverage_of(
+            root,
+            &[("crates/magnetar-proto/src/sibling.rs", &[1], &[1])],
+        );
+
+        assert!(has_non_test_function_body(
+            &fs::read_to_string(src.join("callback.rs")).expect("read closure fixture")
+        ));
+        let (missing_gated, advisory) = classify_uninstrumented(root, &tracked, &covered);
+        assert_eq!(
+            missing_gated,
+            vec![("crates/magnetar-proto/src/callback.rs".to_owned(), 1)]
+        );
+        assert!(advisory.is_empty());
+    }
+
+    /// LLVM derives its coverage mapping from per-function records, so a file
+    /// containing only modules, exports, constants, and bodyless declarations
+    /// emits no `SF:` record even though its crate is fully instrumented. A
+    /// per-file rule that ignores executability would hard-fail that diff with
+    /// no possible remedy.
+    #[test]
+    fn sim_coverage_keeps_a_non_executable_file_advisory_when_its_crate_reported() {
+        let tmp = tempfile::tempdir().expect("create fixture root");
+        let root = tmp.path();
+        let src = root.join("crates/magnetar-proto/src");
+        fs::create_dir_all(&src).expect("create fixture source directory");
+        fs::write(
+            src.join("surface.rs"),
+            "pub mod child;\n\
+             pub use child::Thing;\n\
+             pub const LIMIT: usize = 1;\n\
+             pub const HANDLER: fn() = callback;\n\
+             pub const MASK: u8 = LEFT | RIGHT;\n\
+             pub trait Contract { fn required(&self); }\n\
+             unsafe extern \"C\" { fn foreign(); }\n\
+             #[cfg(test)]\n\
+             fn test_helper() {}\n\
+             #[cfg(test)]\n\
+             pub const TEST_HANDLER: fn() = || {};\n",
+        )
+        .expect("write non-executable fixture");
+        fs::write(src.join("sibling.rs"), "pub fn covered() {}\n").expect("write covered sibling");
+
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/surface.rs", &[1, 2, 3])]);
         // A covered sibling in the SAME crate: the crate did reach the report.
-        let covered = coverage_of(root, &[("crates/magnetar-proto/src/conn.rs", &[40], &[40])]);
+        let covered = coverage_of(
+            root,
+            &[("crates/magnetar-proto/src/sibling.rs", &[1], &[1])],
+        );
 
         assert!(
             !silent_gated_prefixes(&covered).contains(&"crates/magnetar-proto/src/"),
             "the crate emitted records, so it is not the broken-run signal"
         );
+        assert!(
+            !has_non_test_function_body(
+                &fs::read_to_string(src.join("surface.rs")).expect("read non-executable fixture")
+            ),
+            "data-only constants, bodyless declarations, and test-only closures are not executable production functions"
+        );
         let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
         assert!(
             missing_gated.is_empty(),
-            "a `pub mod`-only file must not hard-fail — nothing there is executable"
+            "a genuinely non-executable file must not hard-fail"
         );
         assert_eq!(
             ungated,
-            vec![("crates/magnetar-proto/src/lib.rs".to_owned(), 1)],
+            vec![("crates/magnetar-proto/src/surface.rs".to_owned(), 3)],
             "it stays visible on the advisory path"
         );
     }
 
     /// The five function-less files that exist in the gated crates today. Each
-    /// is a real path in this workspace with zero `fn` declarations, so each
-    /// legitimately emits no `SF:` record — pinned here so a future per-file
-    /// tightening trips this test instead of a routine commit.
+    /// is a real path in this workspace with no non-test function body, so each
+    /// legitimately emits no `SF:` record — pinned here so a future scanner
+    /// regression trips this test instead of a routine commit.
     #[test]
     fn sim_coverage_never_hard_fails_the_known_function_less_files() {
-        let root = Path::new("/ws");
+        let root = workspace_root().expect("resolve workspace root");
         let function_less = [
             "crates/magnetar-proto/src/lib.rs",
             "crates/magnetar-proto/src/trackers/mod.rs",
@@ -4983,7 +5585,7 @@ esac
         // Every gated crate reported at least one file, which is the state a
         // healthy run is in.
         let covered = coverage_of(
-            root,
+            &root,
             &[
                 ("crates/magnetar-proto/src/conn.rs", &[1], &[1]),
                 ("crates/magnetar-runtime-tokio/src/client.rs", &[1], &[1]),
@@ -4991,6 +5593,8 @@ esac
                 ("crates/magnetar-differential/src/trace.rs", &[1], &[1]),
                 ("crates/magnetar-auth-sasl/src/lib.rs", &[1], &[1]),
                 ("crates/magnetar-auth-athenz/src/lib.rs", &[1], &[1]),
+                ("crates/magnetar/src/scalable.rs", &[1], &[1]),
+                ("crates/magnetar-fakes/src/m1.rs", &[1], &[1]),
             ],
         );
         assert!(
@@ -5000,11 +5604,11 @@ esac
 
         for path in function_less {
             let tracked = tracked_of(&[(path, &[1])]);
-            let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
+            let (missing_gated, ungated) = classify_uninstrumented(&root, &tracked, &covered);
             assert!(
                 missing_gated.is_empty(),
-                "{path} declares no `fn`, so it can never emit an SF: record — \
-                 hard-failing it would block a routine diff forever"
+                "{path} has no non-test function body, so it can never emit an \
+                 SF: record — hard-failing it would block a routine diff forever"
             );
             assert_eq!(ungated, vec![(path.to_owned(), 1)]);
         }
@@ -5017,7 +5621,7 @@ esac
     /// must still fail — the advisory does not absorb it.
     #[test]
     fn sim_coverage_record_less_report_fails_only_on_the_gated_bucket() {
-        let advisory = vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 3)];
+        let advisory = vec![("crates/magnetar-admin/src/lib.rs".to_owned(), 3)];
         let gated = vec![("crates/magnetar-proto/src/producer.rs".to_owned(), 2)];
 
         assert!(
@@ -5039,10 +5643,12 @@ esac
     }
 
     /// Split one crate manifest's `magnetar-*` dependency entries into
-    /// `(normal, dev)`. `[dependencies]` and `[build-dependencies]` are
-    /// compiled for every node of the closure; `[dev-dependencies]` only for
-    /// the packages whose test targets are actually built. Feature strings such
-    /// as `scalable-topics = ["magnetar-proto/scalable-topics"]` live under
+    /// `(normal, dev)`. Non-optional `[dependencies]` and
+    /// `[build-dependencies]` are compiled for every node of the closure;
+    /// `[dev-dependencies]` only for the packages whose test targets are
+    /// actually built. An unselected `optional = true` declaration is not a
+    /// closure edge. Feature strings such as
+    /// `scalable-topics = ["magnetar-proto/scalable-topics"]` live under
     /// `[features]` and are ignored by the section match.
     fn manifest_magnetar_deps(manifest: &str) -> (Vec<String>, Vec<String>) {
         let mut normal = Vec::new();
@@ -5054,7 +5660,7 @@ esac
                 section = trimmed.to_owned();
                 continue;
             }
-            let Some((name, _)) = trimmed.split_once('=') else {
+            let Some((name, value)) = trimmed.split_once('=') else {
                 continue;
             };
             let name = name.trim();
@@ -5062,7 +5668,9 @@ esac
                 continue;
             }
             match section.as_str() {
-                "[dependencies]" | "[build-dependencies]" => normal.push(name.to_owned()),
+                "[dependencies]" | "[build-dependencies]" if !value.contains("optional = true") => {
+                    normal.push(name.to_owned());
+                }
                 "[dev-dependencies]" => dev.push(name.to_owned()),
                 _ => {}
             }
@@ -5080,13 +5688,20 @@ esac
     /// So the constant must equal the closure step 1 really builds: the two
     /// `-p` roots, their dev-dependencies (their test targets are what runs),
     /// and the normal dependencies reachable from there. Computed from the
-    /// manifests rather than restated, so adding `magnetar-admin` back — it is
-    /// reachable only through `magnetar-driver` / `magnetarctl` — trips here.
+    /// manifests rather than restated, so adding `magnetar-admin` as a selected
+    /// runner dependency trips here while its unselected optional declaration
+    /// on the façade does not.
     #[test]
     fn sim_coverage_report_packages_are_exactly_the_compiled_closure() {
         let root = workspace_root().expect("resolve workspace root");
         let manifest_of = |package: &str| {
-            let path = root.join("crates").join(package).join("Cargo.toml");
+            // The published package is `magnetar-driver`, but its workspace
+            // directory and library/import name remain `magnetar`.
+            let directory = match package {
+                "magnetar-driver" => "magnetar",
+                package => package,
+            };
+            let path = root.join("crates").join(directory).join("Cargo.toml");
             fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
         };
@@ -5120,25 +5735,39 @@ esac
              compiles — a package cargo never built emits no records however it \
              is named on `cargo llvm-cov report`"
         );
+        assert!(declared.contains("magnetar-driver"));
+        assert!(declared.contains("magnetar-fakes"));
+        assert!(!declared.contains("magnetar-admin"));
     }
 
-    /// Every gated prefix must name a crate the executed closure actually
-    /// compiles, otherwise the hard failure fires on a scope limit. The closure
-    /// is step 1's `-p` set plus its transitive normal and dev dependencies,
-    /// which is precisely `SIM_COVERAGE_REPORT_PACKAGES`.
+    /// The hard-gated source prefixes must name exactly the reported package
+    /// closure. Omitting a reported package would silently make its record-less
+    /// files advisory; adding an uncompiled package would hard-fail a scope
+    /// limit. The façade's package/directory alias is resolved explicitly.
     #[test]
-    fn sim_coverage_gated_prefixes_are_all_reported_packages() {
-        for prefix in SIM_COVERAGE_GATED_CRATE_PREFIXES {
-            let package = prefix
-                .strip_prefix("crates/")
-                .and_then(|rest| rest.strip_suffix("/src/"))
-                .unwrap_or_else(|| panic!("gated prefix `{prefix}` is not `crates/<pkg>/src/`"));
-            assert!(
-                SIM_COVERAGE_REPORT_PACKAGES.contains(&package),
-                "`{package}` is hard-gated but absent from SIM_COVERAGE_REPORT_PACKAGES, \
-                 so the report filters its sources out and every added line in it fails"
-            );
-        }
+    fn sim_coverage_gated_prefixes_are_exactly_the_reported_packages() {
+        let gated: std::collections::BTreeSet<&str> = SIM_COVERAGE_GATED_CRATE_PREFIXES
+            .iter()
+            .map(|prefix| {
+                let directory = prefix
+                    .strip_prefix("crates/")
+                    .and_then(|rest| rest.strip_suffix("/src/"))
+                    .unwrap_or_else(|| {
+                        panic!("gated prefix `{prefix}` is not `crates/<pkg>/src/`")
+                    });
+                match directory {
+                    "magnetar" => "magnetar-driver",
+                    package => package,
+                }
+            })
+            .collect();
+        let reported: std::collections::BTreeSet<&str> =
+            SIM_COVERAGE_REPORT_PACKAGES.iter().copied().collect();
+
+        assert_eq!(gated, reported);
+        assert!(gated.contains("magnetar-driver"));
+        assert!(gated.contains("magnetar-fakes"));
+        assert!(!gated.contains("magnetar-admin"));
     }
 
     /// A `#[cfg(test)]` item near the top of a file must not exempt the
@@ -5151,6 +5780,100 @@ esac
     /// `magnetar-runtime-tokio/src/driver.rs`, where a `#[cfg(test)] use` on
     /// line 48 exempted the remaining 2781 of 2828 lines. The shape below is
     /// that file in miniature.
+    #[test]
+    fn cfg_test_semantics_are_shared_by_clock_log_and_coverage_scanners() {
+        let contents = r#"
+#[cfg(not(test))]
+fn production_not_test() {
+    let _ = Instant::now();
+    warn!("production not(test)");
+}
+
+#[cfg(feature = "contest")]
+fn production_contest_feature() {
+    let _ = Instant::now();
+    warn!("production contest feature");
+}
+
+#[cfg(any(test, feature = "contest"))]
+fn production_any_test_or_feature() {
+    let _ = Instant::now();
+    warn!("production any(test, feature)");
+}
+
+#[cfg(test)]
+fn exact_test_only() {
+    let _ = Instant::now();
+    warn!("test only");
+    let inert = "{";
+    // }
+}
+
+pub fn production_after_inert_braces() {
+    let _ = Instant::now();
+    warn!("production after inert braces");
+}
+
+#[cfg(all(
+    test,
+    feature = "fixture",
+))]
+fn all_test_only() {
+    let _ = Instant::now();
+    warn!("all(test, ...) only");
+}
+"#;
+        let line = |needle: &str| {
+            contents
+                .lines()
+                .position(|candidate| candidate.contains(needle))
+                .map_or_else(
+                    || panic!("fixture line `{needle}` exists"),
+                    |index| index + 1,
+                )
+        };
+        let production_log_lines: std::collections::BTreeSet<_> = [
+            line("production not(test)"),
+            line("production contest feature"),
+            line("production any(test, feature)"),
+            line("production after inert braces"),
+        ]
+        .into_iter()
+        .collect();
+        let production_clock_lines: std::collections::BTreeSet<_> =
+            production_log_lines.iter().map(|line| line - 1).collect();
+        let test_log_lines: std::collections::BTreeSet<_> =
+            [line("test only"), line("all(test, ...) only")]
+                .into_iter()
+                .collect();
+        let test_clock_lines: std::collections::BTreeSet<_> =
+            test_log_lines.iter().map(|line| line - 1).collect();
+
+        let flags = cfg_test_line_flags(contents);
+        let coverage_flags = sim_coverage_cfg_test_lines(contents);
+        for production_line in production_clock_lines.iter().chain(&production_log_lines) {
+            assert!(!flags[*production_line - 1]);
+            assert!(!coverage_flags.contains(&(*production_line as u32)));
+        }
+        for test_line in test_clock_lines.iter().chain(&test_log_lines) {
+            assert!(flags[*test_line - 1]);
+            assert!(coverage_flags.contains(&(*test_line as u32)));
+        }
+
+        let clock_lines: std::collections::BTreeSet<_> = scan_clock_violations(contents)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(clock_lines, production_clock_lines);
+
+        let log_lines: std::collections::BTreeSet<_> = scan_log_field_violations(contents)
+            .into_iter()
+            .map(|(line, _, _)| line)
+            .collect();
+        assert_eq!(log_lines, production_log_lines);
+        assert!(test_log_lines.is_disjoint(&log_lines));
+    }
+
     #[test]
     fn sim_coverage_cfg_test_import_does_not_exempt_the_rest_of_the_file() {
         let contents = "\
@@ -5262,23 +5985,25 @@ mod tests {
         );
     }
 
-    /// The façade is deliberately outside `SIM_COVERAGE_REPORT_PACKAGES` —
-    /// reaching it would drag its Docker-bound e2e suite into every run — so a
-    /// record-less façade file stays advisory and the check still exits 0.
+    /// `magnetar-admin` is deliberately outside
+    /// `SIM_COVERAGE_REPORT_PACKAGES`, so a record-less admin file stays
+    /// advisory and the check still exits 0. The façade and fakes are the
+    /// counterexample: differential public-aggregate tests now compile both and
+    /// their source prefixes are hard-gated.
     #[test]
-    fn sim_coverage_keeps_a_facade_file_with_no_records_advisory() {
+    fn sim_coverage_keeps_an_admin_file_with_no_records_advisory() {
         let root = Path::new("/ws");
-        let tracked = tracked_of(&[("crates/magnetar/src/pattern_consumer.rs", &[10])]);
+        let tracked = tracked_of(&[("crates/magnetar-admin/src/lib.rs", &[10])]);
         let covered = coverage_of(root, &[]);
 
         let (missing_gated, ungated) = classify_uninstrumented(root, &tracked, &covered);
         assert!(
             missing_gated.is_empty(),
-            "the façade is not a gated crate — it must not hard-fail"
+            "magnetar-admin is not a gated crate — it must not hard-fail"
         );
         assert_eq!(
             ungated,
-            vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 1)]
+            vec![("crates/magnetar-admin/src/lib.rs".to_owned(), 1)]
         );
         // `report_ungated` returns `()`: advisory only, the check exits 0.
         report_ungated(&ungated);

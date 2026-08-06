@@ -567,6 +567,8 @@ impl ClientBuilder {
         Ok(PulsarClient {
             inner,
             memory_limit: self.memory_limit,
+            #[cfg(feature = "scalable-topics")]
+            transactions: std::sync::Arc::new(crate::transaction::TransactionCoordinator::default()),
         })
     }
 }

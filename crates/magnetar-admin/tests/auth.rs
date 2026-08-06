@@ -103,6 +103,12 @@ async fn oauth2_auth_fetches_token_then_attaches_bearer() {
 /// HTTPS handshake test belongs to the e2e suite (it needs a cert fixture and
 /// a real TLS listener); here we assert the builder accepts and applies the
 /// options and the resulting client still works.
+#[cfg(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+))]
 #[tokio::test]
 async fn tls_builder_options_apply_cleanly() {
     let broker = MockServer::start().await;
@@ -129,9 +135,36 @@ async fn tls_builder_options_apply_cleanly() {
     assert!(clusters.is_empty());
 }
 
+#[cfg(not(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+)))]
+#[test]
+fn tls_builder_options_require_crypto_feature() {
+    let result = AdminClient::builder()
+        .service_url("http://localhost:8080".parse().unwrap())
+        .tls_allow_insecure(true)
+        .build();
+    let Err(err) = result else {
+        panic!("TLS options unexpectedly succeeded without a crypto feature");
+    };
+    assert!(
+        err.to_string()
+            .contains("TLS options (trust cert / allow-insecure) require a crypto-* feature")
+    );
+}
+
 /// A throwaway self-signed CA certificate (PEM). Generated for this test
 /// only; never trusted by any real deployment. Used solely to exercise
 /// reqwest's `Certificate::from_pem` parse path.
+#[cfg(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+))]
 const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
 MIIBjDCCATGgAwIBAgIUemNWluoHpjirTKja7Gw+wVFlFWIwCgYIKoZIzj0EAwIw
 GzEZMBcGA1UEAwwQbWFnbmV0YXItdGVzdC1jYTAeFw0yNjA2MTUyMDQ0MTNaFw0z

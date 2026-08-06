@@ -6,7 +6,7 @@ Each entry lists the gap, the reason it stays open, and (where actionable) a `/g
 For the public-facing parity status, see the [parity matrix in the README](../README.md#java-client-parity-matrix).
 
 This file is the **single source of truth** for what is intentionally deferred or blocked.
-Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
+Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
 When a PR closes an item, the entry is **removed** (git log + the ADR / docs file carry the post-implementation reference); partially-closed items are trimmed to their remaining open residual.
 
@@ -22,30 +22,9 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 
 | #   | Item                                                                                                                                                    | Status                 |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                          | ⚡ ready to dispatch   |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                                        | ⚡ ready to dispatch   |
 | 16  | [PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts](#16-pip-460-upstream-assignment-lifecycle-dag-ordering-and-proxy-contracts) | 🔗 blocked on upstream |
 
 ---
-
-## 11. `scalable_stream_consumer` is uncallable on the tokio engine
-
-**Gap.** `PulsarClient::scalable_stream_consumer` is bound `where E::ClientState: Clone`, and **neither** engine's client implements `Clone` — not `magnetar_runtime_tokio::Client`, nor `magnetar_runtime_moonpool::Client<P>`.
-The method therefore resolves on no engine at all, and no caller has ever constructed a `StreamConsumer`.
-It went unnoticed because the four in-process test layers drive `magnetar_proto::Connection` directly and the e2e bodies were stubs until [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md); the e2e written against a real broker is what surfaced it.
-
-**Selected design.** The [M1-hardened StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) keeps both public runtime clients non-`Clone`, gives each runtime an internal owned `SegmentSubscriber`, and makes the schema-generic aggregate consumer owned and cheap-clone over its own shared state.
-
-**Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same wire path `StreamConsumer` wraps.
-`crates/magnetar/tests/e2e_scalable_topic.rs` uses exactly that.
-
-## 12. PIP-460 per-segment consumer fan-out
-
-**Gap.** A registered scalable consumer receives its [`ConsumerAssignment`](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the `segment://` topics it owns — and the client surfaces every rebalance, but nothing attaches an ordinary consumer to those segment topics and merges their streams.
-`StreamConsumer` observes the layout; it does not yet deliver messages.
-
-**Selected design.** The [M1-hardened StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) freezes assignment-driven `Exclusive` child consumers, strict locally provable DAG ordering by default, explicit broker-managed cross-member compatibility, one aggregate receive budget, source-qualified position vectors, transaction-aware acknowledgement, and an unbounded observable handoff drain.
-`QueueConsumer` and `CheckpointConsumer` remain out of scope.
 
 ## 16. PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts
 
@@ -56,7 +35,7 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 3. The broker's assignment barrier gates active direct children but does not establish the complete PIP-460 ordering contract for sealed intermediate segments, deep DAGs, merge, or cursor rewind ([apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274)).
 4. Proxy-any-broker controller registration appears to select an arbitrary broker even though scalable consumer registration is leader-only, and the upstream proxy e2e exercises `QueueConsumer`, which never sends that command ([apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275)).
 
-**Interim Magnetar contract.** The [M1-hardened StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) fences callbacks with a local connection incarnation, defaults to a strict barrier where local ownership history can prove every ancestor complete, reports cross-member ancestry as unprovable, documents pooled close as local-only, and fails closed when controller authority cannot be routed directly.
+**Interim Magnetar contract.** [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) fences callbacks with a local connection incarnation, defaults to a strict barrier where local ownership history can prove every ancestor complete, reports cross-member ancestry as unprovable, documents pooled close as local-only, and fails closed when controller authority cannot be routed directly.
 An explicit broker-managed compatibility mode may rely on M1 for ancestry owned by another member, but it does not claim the stronger local ordering guarantee.
 It does not invent protocol fields or claim those local mechanisms settle the distributed contract.
 
@@ -72,5 +51,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §14 with [ADR-0096](../specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md), and §15 with [ADR-0097](../specs/adr/0097-use-tokio-time-for-driver-write-deadlines.md). §11 and §12 were both surfaced by that work and became dispatch-ready once the M1-hardened StreamConsumer proposal froze their shared design. §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
+§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §11 and §12 with [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), §14 with [ADR-0096](../specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md), and §15 with [ADR-0097](../specs/adr/0097-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

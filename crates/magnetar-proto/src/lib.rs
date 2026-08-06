@@ -101,6 +101,13 @@ pub mod receiver_queue;
 pub mod scalable_consumer;
 pub mod schema;
 pub mod service_url;
+/// Pure aggregate PIP-460 child lifecycle, budget, transaction, and delivery
+/// authority model.
+#[cfg(feature = "scalable-topics")]
+pub mod stream_consumer;
+/// Canonical Magnetar-owned scalable stream position values (`MSTR` v1).
+#[cfg(feature = "scalable-topics")]
+pub mod stream_position;
 pub mod supervisor;
 pub mod time;
 pub mod topic_watcher;
@@ -144,10 +151,14 @@ pub use crate::consumer::{ConsumerIdentity, ConsumerSlot, ConsumerStats, ShadowT
 pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 #[cfg(feature = "scalable-topics")]
 pub use crate::dag_watch::{
-    DagChangeReason, DagDelta, DagError, DagWatchSession, MergeEvent, ScalableTopicError,
-    SplitEvent,
+    AttachmentError, DagChangeReason, DagDelta, DagError, DagLimits, DagSnapshot,
+    DagValidationError, DagWatchSession, MergeEvent, OrderingEligibility, OrderingError,
+    OrderingMode, ScalableTopicError, SplitEvent,
 };
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
+#[cfg(feature = "scalable-topics")]
+#[doc(hidden)]
+pub use crate::event::DeferredIncomingMessage;
 pub use crate::event::{
     ConnectionEvent, DriverRetry, GetSchemaResult, IncomingMessage, LookupOutcome,
 };
@@ -170,15 +181,40 @@ pub use crate::receiver_queue::{
 };
 #[cfg(feature = "scalable-topics")]
 pub use crate::scalable_consumer::{
-    AssignedSegment, AssignmentDelta, AssignmentError, ConsumerAssignment, ScalableConsumerSession,
-    ScalableConsumerType, ScalableTopicsWatch, TopicsChange, TopicsWatchError,
+    AssignedSegment, AssignmentDelta, AssignmentError, AssignmentReplay, ConsumerAssignment,
+    ControllerIncarnation, MAX_BUFFERED_ASSIGNMENT_UPDATES, ScalableConsumerSession,
+    ScalableConsumerType, ScalableTopicsWatch, SegmentSource, SegmentTopicError, TopicsChange,
+    TopicsWatchError, canonical_segment_topic,
 };
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
+};
+#[cfg(feature = "scalable-topics")]
+pub use crate::stream_consumer::{
+    AcknowledgementAuthority, AcknowledgementComponent, AcknowledgementTransition,
+    AggregateGeneration, AggregatePhase, AggregateTransaction, AggregateTransactionError,
+    AggregateTransactionState, ArrivalFailureDisposition, ArrivalTransition,
+    BatchArrivalTransition, BudgetError, BudgetReservationId, BudgetReservationOwner, BudgetUse,
+    CONTROL_PLANE_CLEANUP_RESERVE, ChildGeneration, ChunkAssemblyTransition, ConsumerInstanceId,
+    DELIVERY_AUTHORITY_OVERHEAD, DeliveryEpoch, DeliveryToken, DequeueSequence, FlowBlock,
+    FlowPurpose, MIN_RETAINED_MESSAGE_RESERVATION, ReceiverBudget, ReceiverBudgetState,
+    SegmentPhase, StreamCompleteEntry, StreamConsumerAction, StreamConsumerModel,
+    StreamConsumerModelError, StreamConsumerStatusSnapshot, StreamEntryAcceptance,
+    StreamEntryTransition, StreamQueuedMessage, StreamReceiveState,
+    TransactionAcknowledgementAuthority, TransactionAcknowledgementOutcome,
+    TransactionAcknowledgementTransition, TransactionDecision, TransactionOperationId,
+};
+#[cfg(feature = "scalable-topics")]
+pub use crate::stream_position::{
+    MAX_ORDINARY_MESSAGE_ID_SIZE, MAX_POSITION_COMPONENTS, MAX_POSITION_TOPIC_SIZE,
+    MAX_STREAM_POSITION_SIZE, PositionVector, StreamMessageId, StreamPositionError,
 };
 pub use crate::supervisor::SupervisorConfig;
 pub use crate::transmit::{Transmit, TransmitOwned};
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
 #[cfg(feature = "scalable-topics")]
-pub use crate::types::{KeyRange, SegmentDescriptor, SegmentId, SegmentState, TcAssignment};
+pub use crate::types::{
+    KeyRange, KeyRangeError, MAX_HASH, MIN_HASH, SegmentDescriptor, SegmentDescriptorError,
+    SegmentId, SegmentState, TcAssignment,
+};
