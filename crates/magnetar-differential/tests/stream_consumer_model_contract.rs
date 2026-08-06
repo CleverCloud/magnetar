@@ -945,9 +945,19 @@ fn aggregate_model_orders_busy_children_and_fences_controller_replacement() {
         .apply_assignment(assignment(&[1]))
         .expect("replacement assignment");
     let old_generation = opened_generation(&open[0]);
-    replacement
+    let old_flow = replacement
         .child_opened(SegmentId(1), old_generation)
         .expect("old placement opens");
+    let (old_token, _) = issue_delivery(
+        &mut replacement,
+        1,
+        old_generation,
+        flow_reservation(&old_flow),
+        1,
+    );
+    replacement
+        .resolve_delivery(&old_token)
+        .expect("resolved delivery retains position metadata");
     assert!(matches!(
         replacement
             .apply_control_plane(
@@ -1011,6 +1021,27 @@ fn aggregate_model_orders_busy_children_and_fences_controller_replacement() {
         Err(StreamConsumerModelError::InvalidAggregatePhase { .. })
     ));
     assert_ne!(replacement_generation, old_generation);
+
+    let (mut unassigned_replacement, generation, _flow) = opened_one_child();
+    unassigned_replacement
+        .apply_assignment(assignment(&[]))
+        .expect("start an ordinary unassigned drain");
+    assert!(
+        unassigned_replacement
+            .apply_control_plane(
+                split_dag_at(2, "pulsar://unassigned-replacement:6650"),
+                assignment_at(2, &[]),
+            )
+            .expect("upgrade the unassigned retained child replacement")
+            .is_empty()
+    );
+    assert_eq!(
+        unassigned_replacement.segment_phase(SegmentId(1)),
+        Some(&SegmentPhase::Closing)
+    );
+    unassigned_replacement
+        .child_closed(SegmentId(1), generation)
+        .expect("unassigned replacement closes");
 }
 
 #[test]
@@ -1130,6 +1161,10 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
     let first_ack = live
         .admit_individual_acknowledgement(&token)
         .expect("admit first acknowledgement");
+    assert_eq!(
+        live.validate_delivery_restoration(&token),
+        Err(StreamConsumerModelError::DeliveryOperationPending)
+    );
     assert!(matches!(
         live.resolve_delivery(&token),
         Err(StreamConsumerModelError::DeliveryOperationPending)
@@ -1530,6 +1565,23 @@ fn aggregate_model_seek_and_position_edges_validate_current_sources() {
     source_fence
         .issue_delivery(SegmentId(1), generation, stream_id(1, 11), next.retained)
         .expect("second delivery updates retained position metadata");
+    let third_flow = flow_reservation(&next.actions);
+    let third = source_fence
+        .message_arrived(SegmentId(1), generation, third_flow, 128)
+        .expect("third source-fence arrival");
+    let non_advancing = source_fence
+        .issue_delivery(SegmentId(1), generation, stream_id(1, 10), third.retained)
+        .expect("older delivery does not replace the retained position");
+    assert_eq!(
+        non_advancing
+            .position_vector()
+            .iter()
+            .next()
+            .expect("one delivered position")
+            .1
+            .entry_id,
+        11
+    );
 }
 
 #[test]
@@ -1693,6 +1745,40 @@ fn receive_state_reassembles_chunks_and_expands_partial_batches() {
 
 #[test]
 fn receive_state_accounts_transform_work_and_discards_ordinary_and_chunk_entries() {
+    let (mut zstd_model, zstd_generation, zstd_flow) = opened_one_child();
+    let mut zstd_receive = StreamReceiveState::default();
+    let zstd = match zstd_receive
+        .accept_entry(
+            &mut zstd_model,
+            SegmentId(1),
+            zstd_generation,
+            zstd_flow,
+            deferred_entry(
+                0,
+                Bytes::from_static(b"zstd"),
+                pb::MessageMetadata {
+                    compression: Some(pb::CompressionType::Zstd as i32),
+                    uncompressed_size: Some(1_024),
+                    ..Default::default()
+                },
+                Vec::new(),
+                1,
+            ),
+        )
+        .expect("accept zstd frame")
+    {
+        StreamEntryAcceptance::Complete(entry) => entry,
+        other => panic!("expected complete zstd entry, got {other:?}"),
+    };
+    assert_eq!(
+        zstd.transform_reservation_bytes()
+            .expect("bounded zstd reservation"),
+        1_024
+            + DECOMPRESSION_VALIDATION_SLACK
+            + magnetar_proto::stream_consumer::ZSTD_DECOMPRESSION_CONTEXT_WORKSPACE
+            + magnetar_proto::frame::ZSTD_MIN_WINDOW_SIZE
+    );
+
     let (mut ordinary_model, generation, flow) = opened_one_child();
     let mut ordinary_receive = StreamReceiveState::default();
     let metadata = pb::MessageMetadata {
