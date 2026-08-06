@@ -1774,6 +1774,7 @@ dependencies = [
  "bytes",
  "flate2",
  "hdrhistogram",
+ "lz4_flex",
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-driver",
@@ -1784,10 +1785,12 @@ dependencies = [
  "moonpool-core",
  "parking_lot",
  "prost",
+ "snap",
  "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

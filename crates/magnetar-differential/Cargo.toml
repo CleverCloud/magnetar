@@ -77,6 +77,9 @@ async-trait = { workspace = true }
 # PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
 prost = { workspace = true }
 flate2 = { workspace = true }
+lz4_flex = { workspace = true }
+snap = { workspace = true }
+zstd = { workspace = true }
 # Capturing fmt subscriber for `tests/corrupted_frame_equivalence.rs` — the
 # proto point-of-detection `error!` is the witness that the injected
 # CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).
