@@ -7,8 +7,7 @@ Two policies ship; the choice is sticky for the lifetime of the connection.
 ## Surface
 
 ```rust
-use magnetar::PulsarClient;
-use magnetar_proto::MemoryLimitPolicy;
+use magnetar::{MemoryLimitPolicy, PulsarClient};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let client = PulsarClient::builder()
@@ -25,6 +24,7 @@ let client = PulsarClient::builder()
 | `ProducerBlock`   | Overflow parks the `SendFut` until enough budget frees up. The future is woken when another in-flight publish completes.             |
 
 A `memory_limit` of `0` means unlimited and bypasses both reservation paths entirely.
+`ClientBuilder::build` converts the public policy exhaustively into `magnetar_proto::ConnectionConfig::memory_limit_policy`; the façade getter and runtime policy therefore cannot diverge.
 
 ## FailImmediately — atomic CAS reservation
 

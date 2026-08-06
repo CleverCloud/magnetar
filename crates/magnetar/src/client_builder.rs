@@ -466,6 +466,7 @@ impl ClientBuilder {
             // (effectively impossible — magnetar requires 64-bit pointers — but cheap to
             // future-proof) stays correct.
             config.memory_limit_bytes = limit.bytes as u64;
+            config.memory_limit_policy = limit.policy.into();
         }
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;
@@ -577,7 +578,19 @@ mod tests {
     use magnetar_proto::{AuthError, AuthProvider, OperationRetryConfig};
 
     use super::ClientBuilder;
-    use crate::PulsarError;
+    use crate::{MemoryLimitPolicy, PulsarError};
+
+    #[test]
+    fn memory_limit_policy_converts_exhaustively_to_proto() {
+        assert_eq!(
+            magnetar_proto::MemoryLimitPolicy::from(MemoryLimitPolicy::FailImmediately),
+            magnetar_proto::MemoryLimitPolicy::FailImmediately,
+        );
+        assert_eq!(
+            magnetar_proto::MemoryLimitPolicy::from(MemoryLimitPolicy::ProducerBlock),
+            magnetar_proto::MemoryLimitPolicy::ProducerBlock,
+        );
+    }
 
     /// Stub provider whose `initial()` returns `Err(AuthError::Invalid)`.
     /// Models an unwarmed `OAuth2` cache, a missing token file, or any other

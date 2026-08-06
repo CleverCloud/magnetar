@@ -1130,13 +1130,20 @@ pub enum MemoryLimitPolicy {
     ProducerBlock,
 }
 
+impl From<MemoryLimitPolicy> for magnetar_proto::MemoryLimitPolicy {
+    fn from(policy: MemoryLimitPolicy) -> Self {
+        match policy {
+            MemoryLimitPolicy::FailImmediately => Self::FailImmediately,
+            MemoryLimitPolicy::ProducerBlock => Self::ProducerBlock,
+        }
+    }
+}
+
 /// Java parity: configured global publish memory budget. Stored verbatim on
 /// [`crate::ClientBuilder`] and exposed to consumers via [`PulsarClient::memory_limit`].
 ///
-/// **Note**: today this is configuration storage only — the actual enforcement
-/// (accounting against in-flight publish bytes per the policy) is a follow-up
-/// to land before the `0.1` release. The surface is shipped now so callers can
-/// migrate from Java without changing their builder chain.
+/// Both fields are copied into the runtime [`magnetar_proto::ConnectionConfig`]; the selected
+/// policy therefore controls whether an exhausted budget rejects or parks a send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryLimit {
     /// Upper bound in bytes. `0` disables the limit (matches Java default).

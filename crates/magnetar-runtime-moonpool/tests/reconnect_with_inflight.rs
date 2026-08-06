@@ -405,6 +405,67 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
     );
 }
 
+#[test]
+fn reset_fails_flushed_batch_instead_of_orphaning_sends() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+    let (handle, request_id) = {
+        let mut conn = shared.inner.lock();
+        let request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(magnetar_proto::CreateProducerRequest {
+            topic: "persistent://public/default/batch-reset".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        (handle, request_id)
+    };
+    ack_producer_open(&shared, request_id, t0);
+
+    let sequences = {
+        let mut conn = shared.inner.lock();
+        let mut sequences = Vec::new();
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            sequences.push(
+                conn.send(
+                    handle,
+                    OutgoingMessage {
+                        payload: Bytes::copy_from_slice(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 1,
+                        num_messages: 1,
+                        txn_id: None,
+                        source_message_id: None,
+                    },
+                    0,
+                    t0,
+                )
+                .expect("queue batch member"),
+            );
+        }
+        assert_eq!(conn.flush_producer(handle, 0, t0), 1);
+        let _ = conn.poll_transmit();
+        sequences
+    };
+
+    shared.inner.lock().reset();
+    let mut conn = shared.inner.lock();
+    for sequence_id in sequences {
+        match conn.take_outcome(PendingOpKey::Send(handle, sequence_id)) {
+            Some(OpOutcome::SendError { code, message, .. }) => {
+                assert_eq!(code, -1);
+                assert_eq!(
+                    message,
+                    "batched send cannot be replayed after connection reset"
+                );
+            }
+            other => panic!("expected terminal batch reset error, got {other:?}"),
+        }
+    }
+}
+
 /// `session_epoch` monotonicity across a double reset → rebuild cycle. Mirrors Java
 /// `ClientCnx#getEpoch` which is bumped exactly once per `connectionClosed`. The
 /// transparent-replay path must not double-bump or skip the counter, since callers

@@ -378,6 +378,24 @@ impl Default for ConnectionConfig {
 }
 
 #[cfg(test)]
+mod memory_limit_config_tests {
+    use super::{ConnectionConfig, MemoryLimitPolicy};
+
+    #[test]
+    fn producer_block_policy_survives_connection_config_clone() {
+        let config = ConnectionConfig {
+            memory_limit_bytes: 64,
+            memory_limit_policy: MemoryLimitPolicy::ProducerBlock,
+            ..ConnectionConfig::default()
+        };
+
+        let cloned = config.clone();
+        assert_eq!(cloned.memory_limit_bytes, 64);
+        assert_eq!(cloned.memory_limit_policy, MemoryLimitPolicy::ProducerBlock,);
+    }
+}
+
+#[cfg(test)]
 mod redirect_url_allow_list_tests {
     //! Unit tests for [`RedirectUrlAllowList`] — sans-io behaviour only.
     //! The runtime-side wiring is exercised in

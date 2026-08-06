@@ -8,8 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.**
-  The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
+- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.** The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
   Every consumer instead spoke `pb/scalable_topics.rs`, a hand-encoded projection written while PIP-460 was upstream `Draft`, and nothing in it matched: `BaseCommand` types 80-85 against upstream's 70-78, a `CommandScalableTopicLookupResponse` that does not exist, a separate DAG-watch handshake keyed by a `lookup_token` that does not exist, `SplitEvent` / `MergeEvent` delta frames that do not exist, four segment states against upstream's two, and a fabricated `ProtocolVersion = 22` where upstream gates the feature on `FeatureFlags.supports_scalable_topics` and still tops at `v21`.
   `magnetar-fakes` implemented the same projection, so all four ADR-0024 test layers plus the golden trace were green against bytes no Pulsar broker at any version could parse.
   The vendored proto moves to `v5.0.0-M1` (`8dae0236`), the hand-encoded module is deleted along with the `PB_HAND_MAINTAINED_FILES` carve-out that hid it from `codegen --check`, and the state machine follows the upstream shape: the lookup **is** the watch subscribe, keyed by a client-allocated `session_id`; `CommandScalableTopicUpdate` carries both the initial layout and every pushed one; layouts are whole snapshots ordered by a monotonic `epoch`, with split and merge derived from the `parent_ids` / `child_ids` edges rather than read from event frames; and segment placement is an optional join from the parallel `SegmentBrokerAddress` list.
@@ -20,22 +19,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.**
-  `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
+- **Reconnect no longer hangs batched sends or trusts unconfirmed consumer ack state.** Every batched `SendFut` cut before its receipt now resolves with a deterministic reset error instead of being orphaned outside replay and timeout tracking, including batches already flushed to the wire.
+  An individual PIP-54 ack after reset reconstructs an all-unacked bitset and clears only the requested index, so a missing tracker cannot silently acknowledge the whole producer-batched entry.
+  Established durable consumers omit the local highest-ack watermark on every reattach and defer to the broker's persisted cursor; fresh and non-durable start positions are unchanged.
+  (issues #395, #396, #398; ADR-0096)
+
+- **`ClientBuilder::memory_limit` now propagates `MemoryLimitPolicy::ProducerBlock`.** The builder previously copied only the byte limit into `ConnectionConfig`, leaving the runtime policy at its `FailImmediately` default while reporting the requested policy through the façade getter.
+  The public enum is now converted exhaustively into the proto configuration, so a saturated producer parks and progresses when budget is released.
+  (issue #397)
+
+- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.** `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
   Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.
   The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
   (ADR-0093)
 
-- **A scalable-topic watch no longer dies on the broker's own duplicate layout.**
-  `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
+- **A scalable-topic watch no longer dies on the broker's own duplicate layout.** `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
   Pulsar 5.0.0-M1 answers `CommandScalableTopicLookup` with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup opened — so the very first thing a real broker sends after resolving tore the session down, and the client never saw another epoch, the split among them.
-  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open. Only a session mismatch, a broker-side error, or a bodyless update ends a session.
+  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open.
+  Only a session mismatch, a broker-side error, or a bodyless update ends a session.
   `DagError::NonMonotonic` is removed and `handle_update` returns `Result<Option<DagDelta>, DagError>`; both are behind the default-off `scalable-topics` feature.
-  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it. All four now cover the duplicate.
+  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it.
+  All four now cover the duplicate.
   (ADR-0095, amending ADR-0093 § D2)
 
-- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
-  The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
+- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.** The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
   `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
   The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
   It also failed **open**, crediting a line that never ran when the neighbour it was folded into did, which is the half that matters for a gate whose job is proving patch coverage.
@@ -146,8 +153,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The façade and both engines' `Consumer` surfaces are unaffected.
   (docs/follow-ups.md §4; ADR-0084, amends ADR-0071's arming premise)
 
-- **A dial whose handshake completed too quickly hung for the full `operation_timeout` instead of returning:** `ConnectedFut` — the future behind `wait_connected`, which every bootstrap and every pool dial parks on until the broker answers CONNECT — enrolled for the driver's wakeup from a _spawned helper task_.
-  The driver announces handshake completion with `notify_waiters()`, which stores no permit (ARCHITECTURE.md § "Enroll-before-drain wakeup discipline"), so the helper only enrolled once the runtime scheduled it and a pulse that landed first was lost outright.
+- **A dial whose handshake completed too quickly hung for the full `operation_timeout` instead of returning:** `ConnectedFut` — the future behind `wait_connected`, which every bootstrap and every pool dial parks on until the broker answers CONNECT — enrolled for the driver's wakeup from a _spawned helper task_. The driver announces handshake completion with `notify_waiters()`, which stores no permit (ARCHITECTURE.md § "Enroll-before-drain wakeup discipline"), so the helper only enrolled once the runtime scheduled it and a pulse that landed first was lost outright.
   A freshly dialled connection is silent after CONNECTED, so nothing ever pulsed again and the wait burned the whole 30 s `operation_timeout`, surfacing at the caller as `Other("open_producer: timed out: producer target resolution exceeded operation_timeout")`.
   Losing the race needs CPU contention, which is why it reproduced on 4-vCPU CI runners and not on an idle dev box: it hit 5 of the 10 dependabot runs off base `5d6c39f` on 2026-07-22, each in a different, unrelated e2e test.
   `ConnectedFut` now owns an `OwnedNotified` on `event_waker` and polls it BEFORE inspecting connection state, exactly like its sibling `EventWaitFut` and the same discipline already applied to `await_reconnect_or_terminal`, the PIP-33 marker accessor, and the subscribe-readiness waiter; the event drain also narrows to `poll_event_if(Connected | Closed)` so unrelated events stay queued for their own waiter.

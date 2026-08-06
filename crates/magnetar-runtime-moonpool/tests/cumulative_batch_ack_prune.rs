@@ -34,7 +34,7 @@ use std::time::Instant;
 use bytes::BytesMut;
 use magnetar_proto::{
     AckRequest, Connection, ConnectionConfig, ConsumerHandle, MessageId, SubscribeRequest,
-    encode_command, encode_payload, pb,
+    decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_moonpool::ConnectionShared;
 
@@ -186,4 +186,52 @@ fn cumulative_only_acking_keeps_batch_ack_tracker_bounded() {
             );
         }
     }
+}
+
+#[test]
+fn individual_batch_ack_after_reset_keeps_siblings_unacked() {
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let mut conn = shared.inner.lock();
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    let handle = conn.subscribe(SubscribeRequest {
+        topic: "persistent://public/default/batch-ack-reset".to_owned(),
+        subscription: "magnetar-test-batch-ack-reset".to_owned(),
+        sub_type: pb::command_subscribe::SubType::Shared,
+        ..Default::default()
+    });
+    let _ = conn.poll_transmit();
+    deliver_batch(&mut conn, t0, handle, 11, 7);
+    assert_eq!(
+        conn.consumer_stats(handle)
+            .expect("consumer stats")
+            .pending_batch_acks,
+        1
+    );
+
+    conn.reset();
+    let _ = conn.ack(
+        handle,
+        AckRequest {
+            message_ids: vec![MessageId {
+                ledger_id: 11,
+                entry_id: 7,
+                partition: -1,
+                batch_index: 1,
+                batch_size: BATCH_SIZE,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            }],
+            ack_type: pb::command_ack::AckType::Individual,
+            properties: Vec::new(),
+            txn_id: None,
+        },
+        t0,
+    );
+    let mut wire = conn.poll_transmit();
+    let frame = decode_one(&mut wire).expect("CommandAck frame");
+    let ack = frame.command.ack.expect("CommandAck");
+    assert_eq!(ack.message_id[0].ack_set, vec![0b101]);
 }
