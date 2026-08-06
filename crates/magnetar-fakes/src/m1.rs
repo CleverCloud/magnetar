@@ -3332,6 +3332,16 @@ impl M1FakeCluster {
             )
         })?;
         let member = MemberId::new(connection, close.consumer_id);
+        if !self.child_consumers.contains_key(&member) {
+            let endpoint = self.connection_endpoint(connection)?;
+            if matches!(endpoint, Endpoint::Segment(_)) {
+                return self.queue_success(connection, close.request_id);
+            }
+            return Err(invalid(
+                pb::base_command::Type::CloseConsumer,
+                format!("unknown child consumer {}", close.consumer_id),
+            ));
+        }
         let endpoint = self.require_child_route(member, pb::base_command::Type::CloseConsumer)?;
         let fence = self.child_fence(member)?;
         if self

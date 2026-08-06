@@ -2983,6 +2983,13 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
             .success
             .is_some()
     );
+    send(&mut cluster, child, &close_command(7, 6)).expect("retry confirmed child close");
+    assert!(
+        take_frames(&mut cluster, child)[0]
+            .command
+            .success
+            .is_some()
+    );
     let counts = cluster.resource_counts();
     assert_eq!(counts.child_consumers, 0);
     assert_eq!(counts.permits, 0);
