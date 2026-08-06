@@ -666,9 +666,6 @@ struct GroupKey {
 }
 
 #[derive(Debug)]
-struct LayoutSession;
-
-#[derive(Debug)]
 struct Membership {
     group: GroupKey,
     consumer_name: String,
@@ -851,7 +848,7 @@ pub struct M1FakeCluster {
     segment_catalog: BTreeMap<u64, M1Segment>,
     connections: BTreeMap<ConnectionId, ConnectionState>,
     next_connection_id: u64,
-    layout_sessions: BTreeMap<(ConnectionId, u64), LayoutSession>,
+    layout_sessions: BTreeSet<(ConnectionId, u64)>,
     memberships: BTreeMap<MemberId, Membership>,
     baselines: BTreeMap<(GroupKey, String), Baseline>,
     assignment_contexts: BTreeMap<(GroupKey, u64), AssignmentContext>,
@@ -957,7 +954,7 @@ impl M1FakeCluster {
             segment_catalog,
             connections: BTreeMap::new(),
             next_connection_id: 1,
-            layout_sessions: BTreeMap::new(),
+            layout_sessions: BTreeSet::new(),
             memberships: BTreeMap::new(),
             baselines: BTreeMap::new(),
             assignment_contexts: BTreeMap::new(),
@@ -1000,7 +997,7 @@ impl M1FakeCluster {
     /// Open layout-watch session ids in deterministic connection/session order.
     #[must_use]
     pub fn layout_session_ids(&self) -> Vec<(ConnectionId, u64)> {
-        self.layout_sessions.keys().copied().collect()
+        self.layout_sessions.iter().copied().collect()
     }
 
     /// Current layout epoch.
@@ -1110,7 +1107,7 @@ impl M1FakeCluster {
         state.output.clear();
 
         self.layout_sessions
-            .retain(|(candidate, _), _| *candidate != connection);
+            .retain(|(candidate, _)| *candidate != connection);
 
         let pending_ids: Vec<_> = self
             .pending
@@ -1201,6 +1198,7 @@ impl M1FakeCluster {
     }
 
     /// Complete a delayed open, acknowledgement, or close.
+    #[allow(clippy::too_many_lines)]
     pub fn complete_pending(
         &mut self,
         id: PendingOperationId,
@@ -1259,7 +1257,7 @@ impl M1FakeCluster {
                 fence,
                 txn_id,
             } => self.complete_pending_ack(
-                id, info, member, ack_type, indices, request_id, fence, txn_id, completion,
+                id, &info, member, ack_type, &indices, request_id, &fence, txn_id, completion,
             ),
             PendingOperation::Seek {
                 info,
@@ -1303,7 +1301,7 @@ impl M1FakeCluster {
                 key,
                 request_id,
             } => self.complete_pending_transaction_registration(
-                info, txn_id, key, request_id, completion,
+                &info, txn_id, &key, request_id, completion,
             ),
             PendingOperation::EndTransaction {
                 info,
@@ -1324,22 +1322,23 @@ impl M1FakeCluster {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete_pending_ack(
         &mut self,
         id: PendingOperationId,
-        info: PendingOperationInfo,
+        info: &PendingOperationInfo,
         member: MemberId,
         ack_type: pb::command_ack::AckType,
-        indices: Vec<usize>,
+        indices: &[usize],
         request_id: Option<u64>,
-        fence: ChildFence,
+        fence: &ChildFence,
         txn_id: Option<magnetar_proto::TxnId>,
         completion: PendingCompletion,
     ) -> Result<(), M1FakeError> {
-        self.require_child_fence(id, member, &fence)?;
+        self.require_child_fence(id, member, fence)?;
         let result = match completion {
             PendingCompletion::Succeed => self
-                .apply_or_stage_ack(member, ack_type, &indices, &fence, txn_id)
+                .apply_or_stage_ack(member, ack_type, indices, fence, txn_id)
                 .and_then(|()| {
                     self.queue_ack_response(
                         info.connection,
@@ -1363,9 +1362,9 @@ impl M1FakeCluster {
 
     fn complete_pending_transaction_registration(
         &mut self,
-        info: PendingOperationInfo,
+        info: &PendingOperationInfo,
         txn_id: magnetar_proto::TxnId,
-        key: ChildSubscriptionKey,
+        key: &ChildSubscriptionKey,
         request_id: u64,
         completion: PendingCompletion,
     ) -> Result<(), M1FakeError> {
@@ -1413,7 +1412,7 @@ impl M1FakeCluster {
         let snapshot = LayoutSnapshot { epoch, segments };
         self.current_layout = snapshot.clone();
         self.layout_history.insert(epoch, snapshot.clone());
-        let sessions: Vec<_> = self.layout_sessions.keys().copied().collect();
+        let sessions: Vec<_> = self.layout_sessions.iter().copied().collect();
         for (connection, session_id) in sessions {
             self.queue_layout(connection, session_id, &snapshot)?;
         }
@@ -2006,7 +2005,7 @@ impl M1FakeCluster {
         let ledger = self.ledgers.entry(segment_id).or_default();
         let entry_id = ledger.len() as u64;
         if metadata.producer_name.is_empty() {
-            metadata.producer_name = "magnetar-m1-fake".to_owned();
+            "magnetar-m1-fake".clone_into(&mut metadata.producer_name);
         }
         metadata.sequence_id = entry_id;
         if metadata.publish_time == 0 {
@@ -2301,13 +2300,13 @@ impl M1FakeCluster {
             return self.queue_command(connection, &command);
         }
         let key = (connection, lookup.session_id);
-        if self.layout_sessions.contains_key(&key) {
+        if self.layout_sessions.contains(&key) {
             return Err(invalid(
                 pb::base_command::Type::ScalableTopicLookup,
                 format!("duplicate layout session {}", lookup.session_id),
             ));
         }
-        self.layout_sessions.insert(key, LayoutSession);
+        self.layout_sessions.insert(key);
         let snapshot = self.current_layout.clone();
         self.queue_layout(connection, lookup.session_id, &snapshot)?;
         // Pulsar 5.0.0-M1 answers the lookup, then re-sends the same baseline on
@@ -2698,7 +2697,7 @@ impl M1FakeCluster {
                 Ok(())
             }
             None => {
-                self.register_transaction_subscription(txn_id, key)?;
+                self.register_transaction_subscription(txn_id, &key)?;
                 self.queue_add_subscription_response(connection, request.request_id, txn_id, None)
             }
         }
@@ -3101,6 +3100,7 @@ impl M1FakeCluster {
         self.dispatch_consumer(member)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_ack(&mut self, connection: ConnectionId, frame: &Frame) -> Result<(), M1FakeError> {
         let ack = frame.command.ack.as_ref().ok_or_else(|| {
             invalid(
@@ -3968,7 +3968,7 @@ impl M1FakeCluster {
             Endpoint::Controller,
             pb::base_command::Type::ScalableTopicUpdate,
         )?;
-        if !self.layout_sessions.contains_key(&(connection, session_id)) {
+        if !self.layout_sessions.contains(&(connection, session_id)) {
             return Err(invalid(
                 pb::base_command::Type::ScalableTopicUpdate,
                 format!("unknown layout session {session_id}"),
@@ -4445,7 +4445,7 @@ impl M1FakeCluster {
     fn register_transaction_subscription(
         &mut self,
         txn_id: magnetar_proto::TxnId,
-        key: ChildSubscriptionKey,
+        key: &ChildSubscriptionKey,
     ) -> Result<(), M1FakeError> {
         self.require_open_transaction(txn_id, pb::base_command::Type::AddSubscriptionToTxn)?;
         self.transactions
@@ -7984,9 +7984,7 @@ mod tests {
             .expect("replacement keeps the stable consumer identity");
 
         assert_eq!(
-            cluster
-                .assignment_segment_ids(2, &group)
-                .expect("historical eligibility is retained"),
+            cluster.assignment_segment_ids(2, &group),
             BTreeSet::from([1, 2]),
             "later completion must not add children to an old assignment epoch"
         );

@@ -674,8 +674,12 @@ impl<P: Providers> Consumer<P> {
     }
 
     #[cfg(feature = "scalable-topics")]
-    pub(crate) fn flow_for_aggregate(&self, fresh: u32, debt: u32) {
+    pub(crate) fn flow_for_aggregate_with_debt(&self, fresh: u32, debt: Option<(u64, u32)>) {
         let mut conn = self.shared.inner.lock();
+        let session_epoch = conn.session_epoch();
+        let debt = debt
+            .filter(|(debt_epoch, _)| *debt_epoch == session_epoch)
+            .map_or(0, |(_, permits)| permits);
         conn.flow_for_aggregate(self.handle, fresh, debt);
         drop(conn);
         self.shared.driver_waker.notify_one();
@@ -706,7 +710,7 @@ impl<P: Providers> Consumer<P> {
     #[cfg(feature = "scalable-topics")]
     pub(crate) async fn receive_deferred_until_end(
         &self,
-    ) -> Result<Option<magnetar_proto::DeferredIncomingMessage>, ClientError> {
+    ) -> Result<Option<(u64, magnetar_proto::DeferredIncomingMessage)>, ClientError> {
         match (DeferredReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
@@ -1085,6 +1089,19 @@ impl<P: Providers> Consumer<P> {
             txn_id,
             Some(message_id_data),
         )
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn settle_transactional_acks(&self, txn_id: magnetar_proto::TxnId, committed: bool) {
+        self.shared
+            .inner
+            .lock()
+            .settle_transactional_acks(self.handle, txn_id, committed);
+    }
+
+    #[cfg(all(test, feature = "scalable-topics"))]
+    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
+        self.slot.state.lock().last_acked_message_id
     }
 
     fn ack_inner_with_message_id_data(
@@ -2072,44 +2089,41 @@ impl Drop for DeferredReceiveFut {
 
 #[cfg(feature = "scalable-topics")]
 impl Future for DeferredReceiveFut {
-    type Output = Result<magnetar_proto::DeferredIncomingMessage, ClientError>;
+    type Output = Result<(u64, magnetar_proto::DeferredIncomingMessage), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        loop {
-            let now = this.shared.now_instant();
-            let mut conn = this.shared.inner.lock();
-            if let Some(message) = conn.pop_deferred_message(this.handle, now) {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                drop(conn);
-                this.shared.driver_waker.notify_one();
-                return Poll::Ready(Ok(message));
-            }
-            if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                return Poll::Ready(Err(ClientError::Closed));
-            }
-            if this.stop_at_end && conn.consumer_reached_end_of_topic(this.handle) {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                return Poll::Ready(Err(ClientError::EndOfTopic));
-            }
+        let now = this.shared.now_instant();
+        let mut conn = this.shared.inner.lock();
+        if let Some(message) = conn.pop_deferred_message(this.handle, now) {
+            let session_epoch = conn.session_epoch();
             if let Some(key) = this.slab_key.take() {
                 conn.cancel_consumer_receive_waker(this.handle, key);
             }
-            let key = conn
-                .register_consumer_receive_waker(this.handle, cx.waker().clone())
-                .expect(
-                    "a non-terminal consumer remains registered while its connection is locked",
-                );
-            this.slab_key = Some(key);
-            return Poll::Pending;
+            drop(conn);
+            this.shared.driver_waker.notify_one();
+            return Poll::Ready(Ok((session_epoch, message)));
         }
+        if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        if this.stop_at_end && conn.consumer_reached_end_of_topic(this.handle) {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::EndOfTopic));
+        }
+        if let Some(key) = this.slab_key.take() {
+            conn.cancel_consumer_receive_waker(this.handle, key);
+        }
+        let key = conn
+            .register_consumer_receive_waker(this.handle, cx.waker().clone())
+            .expect("a non-terminal consumer remains registered while its connection is locked");
+        this.slab_key = Some(key);
+        Poll::Pending
     }
 }
 
@@ -3127,41 +3141,44 @@ mod tests {
         assert!(saw_flow);
         assert!(saw_redelivery);
 
-        let staged_seek = consumer.stage_seek_to_message_id_data(pb::MessageIdData {
-            ledger_id: 7,
-            entry_id: 12,
-            ..Default::default()
-        });
-        let seek_success = pb::BaseCommand {
-            r#type: pb::base_command::Type::Success as i32,
-            success: Some(pb::CommandSuccess {
-                request_id: staged_seek.request_id.0,
-                schema: None,
-            }),
-            ..Default::default()
-        };
-        let mut frame = BytesMut::new();
-        encode_command(&mut frame, &seek_success).expect("encode raced seek success");
+        #[cfg(feature = "scalable-topics")]
         {
-            let mut conn = shared.inner.lock();
-            conn.handle_bytes(Instant::now(), &frame)
-                .expect("handle raced seek success");
-            let _ = conn.unsubscribe(handle, false);
-        }
-        consumer
-            .complete_staged_seek(staged_seek)
-            .await
-            .expect("a concurrent unsubscribe suppresses seek reattachment");
-        let mut staged = shared.inner.lock().poll_transmit();
-        while !staged.is_empty() {
-            let command = decode_one(&mut staged)
-                .expect("decode raced seek frame")
-                .command;
-            assert_ne!(
-                command.r#type,
-                pb::base_command::Type::Subscribe as i32,
-                "unsubscribe must suppress seek reattachment"
-            );
+            let staged_seek = consumer.stage_seek_to_message_id_data(pb::MessageIdData {
+                ledger_id: 7,
+                entry_id: 12,
+                ..Default::default()
+            });
+            let seek_success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: staged_seek.request_id.0,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &seek_success).expect("encode raced seek success");
+            {
+                let mut conn = shared.inner.lock();
+                conn.handle_bytes(Instant::now(), &frame)
+                    .expect("handle raced seek success");
+                let _ = conn.unsubscribe(handle, false);
+            }
+            consumer
+                .complete_staged_seek(staged_seek)
+                .await
+                .expect("a concurrent unsubscribe suppresses seek reattachment");
+            let mut staged = shared.inner.lock().poll_transmit();
+            while !staged.is_empty() {
+                let command = decode_one(&mut staged)
+                    .expect("decode raced seek frame")
+                    .command;
+                assert_ne!(
+                    command.r#type,
+                    pb::base_command::Type::Subscribe as i32,
+                    "unsubscribe must suppress seek reattachment"
+                );
+            }
         }
     }
 
@@ -5304,11 +5321,14 @@ mod tests {
             Err(crate::client::ClientError::Closed) => {}
             other => panic!("expected Err(Closed) after local close, got {other:?}"),
         }
-        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
-        consumer.close_best_effort();
-        consumer.force_close_best_effort();
-        shared.mark_no_driver();
-        consumer.force_close_best_effort();
+        #[cfg(feature = "scalable-topics")]
+        {
+            let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+            consumer.close_best_effort();
+            consumer.force_close_best_effort();
+            shared.mark_no_driver();
+            consumer.force_close_best_effort();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5340,6 +5360,7 @@ mod tests {
             error,
             crate::compress::CompressionError::UncompressedSizeTooLarge { .. }
                 | crate::compress::CompressionError::SizeMismatch { .. }
+                | crate::compress::CompressionError::Zstd(_)
         ));
     }
 }

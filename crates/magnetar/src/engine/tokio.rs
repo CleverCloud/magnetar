@@ -528,6 +528,22 @@ impl super::StreamConsumerBackend for magnetar_runtime_tokio::StreamConsumer {
         })
     }
 
+    fn restore_messages(&self, messages: Vec<super::RawStreamMessage>) {
+        let result = magnetar_runtime_tokio::StreamConsumer::restore_deliveries(
+            self,
+            messages
+                .into_iter()
+                .map(|message| magnetar_runtime_tokio::StreamConsumerMessage {
+                    message: message.message,
+                    token: message.token,
+                })
+                .collect(),
+        );
+        if let Err(error) = result {
+            magnetar_runtime_tokio::StreamConsumer::delivery_restoration_failed(self, &error);
+        }
+    }
+
     fn get_schema<'a>(
         &'a self,
         source: &'a magnetar_proto::SegmentSource,

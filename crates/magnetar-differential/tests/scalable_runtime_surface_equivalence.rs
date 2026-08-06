@@ -4,6 +4,8 @@
 
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::too_many_lines)]
 
 #[allow(dead_code)]
 #[path = "stream_consumer_support/server.rs"]
@@ -1264,7 +1266,7 @@ async fn run_tokio_transactions(cluster: &M1SocketCluster) -> RuntimeTransaction
             subscription: "runtime-transaction-sub".to_owned(),
             consumer_name: "runtime-transaction-member".to_owned(),
             schema: magnetar_proto::pb::Schema::default(),
-            receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
+            receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
                 .expect("valid Tokio transaction-surface budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
         })
@@ -1513,7 +1515,7 @@ async fn run_moonpool_transactions(cluster: &M1SocketCluster) -> RuntimeTransact
             subscription: "runtime-transaction-sub".to_owned(),
             consumer_name: "runtime-transaction-member".to_owned(),
             schema: magnetar_proto::pb::Schema::default(),
-            receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
+            receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
                 .expect("valid Moonpool transaction-surface budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
         })

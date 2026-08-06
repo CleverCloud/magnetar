@@ -1309,6 +1309,8 @@ The raw API receives only events no owned route claimed.
 Registration installs the route before writing subscribe, buffers assignment pushes that precede the response, installs the validated response as that incarnation's baseline, then replays buffered and later pushes in wire order.
 Changed equal-epoch assignments are valid because `layout_epoch` versions topology rather than membership.
 Old-incarnation assignment, open, close, ack, reconnect, and callback results are discarded; lower-epoch or replacement-baseline regressions fail closed and resynchronize rather than mutating current ownership.
+Resynchronization publishes reconnect intent before old-child teardown, suppresses expected close failures from those obsolete child loops, and does not register a replacement baseline until confirmed children and in-flight child opens are gone.
+Replacement registration rejection retries on provider time because M1 may retain the old logical member until its physical controller connection disappears.
 
 ### DAG validation and ordering
 
@@ -1326,7 +1328,7 @@ Both modes preserve broker FIFO within one segment and define no total order bet
 ### Budget and receive linearization
 
 Every child is in manual-FLOW mode.
-One aggregate arbiter reserves `MAX_FRAME_SIZE` before granting one message permit and accounts for retained frames, decompression/chunk/batch work, ordering-barrier storage, delivery leases, retiring children, and source-qualified authority.
+One aggregate arbiter reserves `MAX_FRAME_SIZE` before granting one message permit and accounts for retained frames, decompression/chunk/batch work, queue and ledger nodes, canonical-id/source sidecars, position-map nodes, ordering-barrier storage, delivery leases, retiring children, and source-qualified authority.
 Adding segments redistributes capacity; it never multiplies the configured budget.
 Partial-batch dispatch charges only the logical members selected by the broker's `ack_set`; fresh grants remain replayable, while batch overshoot debt is repaid only on the current wire and is discarded with obsolete credit at seek.
 
@@ -1334,10 +1336,11 @@ The validated minimum is exactly:
 
 ```text
 MAX_FRAME_SIZE
-+ 3 * MAX_STREAM_POSITION_SIZE
++ 5 * MAX_STREAM_POSITION_SIZE
++ 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 8,454,272 bytes
+= 13,697,152 bytes
 ```
 
 The default is 16 MiB.
@@ -1345,7 +1348,8 @@ The bound includes allocations Magnetar controls or derives from the wire; arbit
 
 Concurrent `receive` and `receive_batch` calls reserve each delivery once under aggregate state.
 Reservation/dequeue order is linearized, future completion order and per-waiter FIFO are not promised, and a batch reserves its complete set atomically after its first-message wait.
-Cancellation before reservation consumes nothing; cancellation after reservation returns an owned delivery synchronously or restores the ordered reservation.
+Cancellation before reservation consumes nothing; cancellation after reservation returns an owned delivery synchronously or restores the same authority at its original dequeue sequence.
+If concurrent fencing prevents restoration, both runtimes request resynchronization rather than dropping the failure silently.
 
 ### Delivery authority, transactions, and seek
 
@@ -1357,13 +1361,14 @@ Individual, batch, cumulative-vector, restored-vector, negative, and transaction
 Partial-batch expansion preserves the broker's `ack_set` in every canonical delivery id, exposes only selected members, and keeps residual individual/cumulative masks from acknowledging later selected members in the same entry.
 Transaction admission registers each `(segment topic, subscription)`, commit closes admission and waits for every admitted operation, and any failed admitted operation poisons commit before `EndTxn(Commit)` can be emitted.
 Abort leaves cursors unchanged and permits redelivery; an unknown outcome fails participants closed.
-After the coordinator confirms an outcome, an owned completion task records it and continues unfinished local participant propagation independently of the caller that initiated `EndTxn`.
+After the coordinator confirms an outcome, an owned completion task records it and checkpoints each completed local participant action independently of the caller that initiated `EndTxn`; retry cannot replay an already-issued FLOW prefix.
 
 Vector seek requires the same layout epoch and exactly every currently owned attached active leaf.
 It rejects live receive/batch/delivery/transaction reservations, cannot cross a topology transition or target sealed/remote ancestry, and invalidates old tokens by advancing the delivery epoch.
 The wire projection follows M1's effective fields: chunk ids become their first-chunk ids, batch indexes become residual `ack_set` suffixes, and unsupported nested metadata is omitted.
 Both runtimes stage every eligible child seek before awaiting any child response, so child iteration order cannot prevent another current leaf from receiving its SEEK.
 A partial child failure makes the aggregate resynchronization-required.
+That failure fences child loops before awaiting their close confirmations, preventing teardown from recursively racing controller replacement.
 
 ### Handoff, routing, and close
 
@@ -1776,7 +1781,7 @@ High-level summary:
   Trackers ship 13 ported behavioral cases from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer ships 6 ported cases from `BatchMessageContainerImplTest`.
 - **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, the complete scalable aggregate over simulated controller and segment sockets, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
-  The stateful M1 fake drives 14 public aggregate scenarios, eight baseline and six advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.
+  The stateful M1 fake drives 22 public aggregate scenarios, nine baseline and thirteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.
 - **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no dedicated `e2e` feature and no `#[ignore]`; owning product features still gate feature-specific targets ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)), and Docker is the runtime prerequisite.
   Spins suite-specific Pulsar 4.x images for stable and compatibility coverage and `apachepulsar/pulsar:5.0.0-M1` for PIP-460 via `testcontainers`.
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover, and the hardened scalable aggregate contract.

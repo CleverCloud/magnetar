@@ -24,9 +24,9 @@ fn connection() -> Connection {
     Connection::new(ConnectionConfig::default(), Arc::new(SystemTime::now))
 }
 
-fn encode(command: pb::BaseCommand) -> BytesMut {
+fn encode(command: &pb::BaseCommand) -> BytesMut {
     let mut bytes = BytesMut::new();
-    encode_command(&mut bytes, &command).expect("encode broker command");
+    encode_command(&mut bytes, command).expect("encode broker command");
     bytes
 }
 
@@ -47,12 +47,14 @@ fn handshaked_scalable_connection() -> Connection {
     let mut connection = connection();
     connection.begin_handshake().expect("begin handshake");
     let _ = drain_commands(&mut connection);
-    let mut feature_flags = pb::FeatureFlags::default();
-    feature_flags.supports_scalable_topics = Some(true);
+    let feature_flags = pb::FeatureFlags {
+        supports_scalable_topics: Some(true),
+        ..Default::default()
+    };
     connection
         .handle_bytes(
             Instant::now(),
-            &encode(pb::BaseCommand {
+            &encode(&pb::BaseCommand {
                 r#type: pb::base_command::Type::Connected as i32,
                 connected: Some(pb::CommandConnected {
                     server_version: "contract-broker".to_owned(),
@@ -411,7 +413,7 @@ fn scalable_subscribe_replays_prebaseline_pushes_and_rejects_identity_drift() {
     connection
         .handle_bytes(
             Instant::now(),
-            &encode(pb::BaseCommand {
+            &encode(&pb::BaseCommand {
                 r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
                 scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
                     consumer_id: 7,
@@ -424,7 +426,7 @@ fn scalable_subscribe_replays_prebaseline_pushes_and_rejects_identity_drift() {
     connection
         .handle_bytes(
             Instant::now(),
-            &encode(pb::BaseCommand {
+            &encode(&pb::BaseCommand {
                 r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
                 scalable_topic_subscribe_response: Some(
                     pb::CommandScalableTopicSubscribeResponse {

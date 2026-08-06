@@ -458,10 +458,8 @@ jobs:
     # outside the eight-package closure — still pays the full instrumented
     # build and then prints those files as advisory `not gated`. The façade
     # and fakes are compiled and hard-gated through the differential aggregate
-    # suites. Measured over the last 40 merged PRs: 30%
-    # short-circuit, 60% build and can produce a verdict, 10% build for a
-    # verdict that is impossible. Keeping that 10% is deliberate — bailing
-    # early would suppress the `not gated` report ADR-0088 exists to print.
+    # suites. The older 30/60/10 measurement predates that closure expansion
+    # and is not used to characterize the current job.
     runs-on: ubuntu-latest
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled

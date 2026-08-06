@@ -17,13 +17,14 @@ use crate::consumer::MAX_CHUNK_TOTAL;
 use crate::dag_watch::{
     AttachmentError, DagSnapshot, OrderingEligibility, OrderingError, OrderingMode,
 };
-use crate::frame::MAX_FRAME_SIZE;
+use crate::frame::{DECOMPRESSION_VALIDATION_SLACK, MAX_FRAME_SIZE, ZSTD_MIN_WINDOW_SIZE};
 use crate::scalable_consumer::{
     AssignmentError, ConsumerAssignment, ControllerIncarnation, SegmentSource, SegmentTopicError,
     canonical_segment_topic,
 };
 use crate::stream_position::{
-    MAX_STREAM_POSITION_SIZE, PositionVector, StreamMessageId, StreamPositionError,
+    MAX_POSITION_COMPONENTS, MAX_STREAM_POSITION_SIZE, PositionVector, StreamMessageId,
+    StreamPositionError,
 };
 use crate::txn::TxnId;
 use crate::types::{KeyRange, SegmentId, SegmentState};
@@ -35,9 +36,16 @@ pub const CONTROL_PLANE_CLEANUP_RESERVE: usize = 64 * 1024;
 pub const MIN_RETAINED_MESSAGE_RESERVATION: usize = 64;
 /// Fixed per-allocation authority bookkeeping charged beside encoded position data.
 pub const DELIVERY_AUTHORITY_OVERHEAD: usize = 64;
+/// Conservative allocation charge for one `BTreeMap` position component node.
+pub const POSITION_COMPONENT_NODE_OVERHEAD: usize = 256;
+/// Conservative fixed workspace for zlib inflate state and its 32 KiB window.
+pub const ZLIB_DECOMPRESSION_WORKSPACE: usize = 96 * 1024;
+/// Conservative fixed zstd context workspace, excluding its bounded window.
+pub const ZSTD_DECOMPRESSION_CONTEXT_WORKSPACE: usize = 256 * 1024;
 /// Worst-case live and retained authority metadata kept beside one maximum frame.
-pub const RECEIVER_BUDGET_AUTHORITY_HEADROOM: usize =
-    3 * MAX_STREAM_POSITION_SIZE + 2 * DELIVERY_AUTHORITY_OVERHEAD;
+pub const RECEIVER_BUDGET_AUTHORITY_HEADROOM: usize = 5 * MAX_STREAM_POSITION_SIZE
+    + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
+    + 2 * DELIVERY_AUTHORITY_OVERHEAD;
 
 /// Process-local aggregate consumer identity supplied by the owning runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1275,6 +1283,86 @@ pub struct StreamQueuedMessage {
     pub reservation: BudgetReservationId,
 }
 
+// Covers the runtime VecDeque slot plus its reservation/live-delivery ledger
+// nodes. Dynamic payload, protobuf-id, and source storage are charged exactly
+// below. Keep this deliberately conservative across both runtime layouts.
+const STREAM_QUEUE_NODE_OVERHEAD: usize = 1024;
+
+fn message_id_data_heap_bytes(message_id: &crate::pb::MessageIdData) -> usize {
+    message_id
+        .ack_set
+        .capacity()
+        .saturating_mul(core::mem::size_of::<i64>())
+        .saturating_add(
+            message_id
+                .first_chunk_message_id
+                .as_ref()
+                .map_or(0, |first| {
+                    core::mem::size_of::<crate::pb::MessageIdData>()
+                        .saturating_add(message_id_data_heap_bytes(first))
+                }),
+        )
+}
+
+fn queued_message_retained_bytes(
+    message: &IncomingMessage,
+    message_id: &crate::pb::MessageIdData,
+    source: &SegmentSource,
+) -> Result<usize, StreamConsumerModelError> {
+    message
+        .retained_bytes()
+        .checked_add(STREAM_QUEUE_NODE_OVERHEAD)
+        .and_then(|bytes| bytes.checked_add(source.topic().len()))
+        .and_then(|bytes| bytes.checked_add(message_id_data_heap_bytes(message_id)))
+        .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)
+}
+
+fn prospective_position_heap_bytes(
+    delivered: &BTreeMap<SegmentSource, StreamMessageId>,
+    source: &SegmentSource,
+    message_id: &StreamMessageId,
+    replace: bool,
+) -> Result<(usize, usize), StreamConsumerModelError> {
+    let mut vector = 0usize;
+    let mut canonical = 0usize;
+    let mut found = false;
+    for (existing_source, existing_id) in delivered {
+        let selected = if existing_source == source && replace {
+            found = true;
+            message_id
+        } else {
+            if existing_source == source {
+                found = true;
+            }
+            existing_id
+        };
+        vector = vector
+            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
+            .and_then(|bytes| bytes.checked_add(existing_source.topic().len()))
+            .and_then(|bytes| bytes.checked_add(selected.ordinary_message_id_bytes().len()))
+            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+        canonical = canonical
+            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
+            .and_then(|bytes| bytes.checked_add(existing_source.topic().len()))
+            .and_then(|bytes| bytes.checked_add(selected.source().topic().len()))
+            .and_then(|bytes| bytes.checked_add(selected.ordinary_message_id_bytes().len()))
+            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+    }
+    if !found {
+        vector = vector
+            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
+            .and_then(|bytes| bytes.checked_add(source.topic().len()))
+            .and_then(|bytes| bytes.checked_add(message_id.ordinary_message_id_bytes().len()))
+            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+        canonical = canonical
+            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
+            .and_then(|bytes| bytes.checked_add(source.topic().len().saturating_mul(2)))
+            .and_then(|bytes| bytes.checked_add(message_id.ordinary_message_id_bytes().len()))
+            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+    }
+    Ok((vector, canonical))
+}
+
 /// Result of accepting one raw broker entry.
 #[derive(Debug)]
 pub enum StreamEntryAcceptance {
@@ -1328,12 +1416,34 @@ impl StreamCompleteEntry {
             .compression
             .and_then(|kind| crate::pb::CompressionType::try_from(kind).ok())
             .filter(|kind| *kind != crate::pb::CompressionType::None)
-            .map_or(0, |_| {
-                self.message
+            .map_or(Ok(0), |kind| {
+                let output = self
+                    .message
                     .metadata
                     .uncompressed_size
                     .map_or(self.message.payload.len(), |size| size as usize)
-            });
+                    .checked_add(DECOMPRESSION_VALIDATION_SLACK)
+                    .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+                let workspace = match kind {
+                    crate::pb::CompressionType::Zlib => ZLIB_DECOMPRESSION_WORKSPACE,
+                    crate::pb::CompressionType::Zstd => {
+                        let advertised = output.saturating_sub(DECOMPRESSION_VALIDATION_SLACK);
+                        let window = advertised
+                            .max(ZSTD_MIN_WINDOW_SIZE)
+                            .checked_next_power_of_two()
+                            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+                        ZSTD_DECOMPRESSION_CONTEXT_WORKSPACE
+                            .checked_add(window)
+                            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?
+                    }
+                    crate::pb::CompressionType::None
+                    | crate::pb::CompressionType::Lz4
+                    | crate::pb::CompressionType::Snappy => 0,
+                };
+                output
+                    .checked_add(workspace)
+                    .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)
+            })?;
         encrypted
             .checked_add(compressed)
             .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)
@@ -1600,6 +1710,7 @@ impl StreamReceiveState {
         entry: StreamCompleteEntry,
         transform_work: &[BudgetReservationId],
     ) -> Result<StreamEntryTransition, StreamConsumerModelError> {
+        let source = model.child(segment_id, generation)?.source.clone();
         let count = entry.message.metadata.num_messages_in_batch.unwrap_or(1);
         if count > 1 {
             let StreamEntryCompletion::Message { flow } = entry.completion else {
@@ -1609,17 +1720,37 @@ impl StreamReceiveState {
             };
             let count = usize::try_from(count)
                 .map_err(|_| StreamConsumerModelError::InvalidBatchFrame("negative batch size"))?;
+            let repeated_id_heap = message_id_data_heap_bytes(&entry.message_id_data)
+                .saturating_sub(
+                    entry
+                        .message_id_data
+                        .ack_set
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<i64>()),
+                )
+                .checked_add(
+                    entry
+                        .message_id_data
+                        .ack_set
+                        .capacity()
+                        .max(entry.ack_set.len())
+                        .checked_mul(core::mem::size_of::<i64>())
+                        .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?,
+                )
+                .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+            let per_member = core::mem::size_of::<IncomingMessage>()
+                .checked_add(core::mem::size_of::<crate::pb::SingleMessageMetadata>())
+                .and_then(|bytes| bytes.checked_add(STREAM_QUEUE_NODE_OVERHEAD))
+                .and_then(|bytes| bytes.checked_add(source.topic().len()))
+                .and_then(|bytes| bytes.checked_add(repeated_id_heap))
+                .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
             let structural = entry
                 .message
                 .payload
                 .len()
                 .checked_add(
                     count
-                        .checked_mul(
-                            core::mem::size_of::<IncomingMessage>()
-                                + core::mem::size_of::<crate::pb::SingleMessageMetadata>()
-                                + 64,
-                        )
+                        .checked_mul(per_member)
                         .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?,
                 )
                 .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
@@ -1629,8 +1760,10 @@ impl StreamReceiveState {
                 expand_batch(entry.message, entry.message_id_data, entry.ack_set, count)?;
             let retained_bytes: Vec<_> = messages
                 .iter()
-                .map(|(message, _)| message.retained_bytes())
-                .collect();
+                .map(|(message, message_id)| {
+                    queued_message_retained_bytes(message, message_id, &source)
+                })
+                .collect::<Result<_, _>>()?;
             let mut work = transform_work.to_vec();
             work.push(batch_work);
             if messages.is_empty() {
@@ -1674,7 +1807,8 @@ impl StreamReceiveState {
                 });
         }
 
-        let retained_bytes = entry.message.retained_bytes();
+        let retained_bytes =
+            queued_message_retained_bytes(&entry.message, &entry.message_id_data, &source)?;
         let mut staged = model.clone();
         let transition = match entry.completion {
             StreamEntryCompletion::Message { flow } => staged.message_arrived_preallocated(
@@ -1754,11 +1888,7 @@ fn expand_batch(
     let batch_size =
         i32::try_from(count).map_err(|_| StreamConsumerModelError::ReceiveSizeOverflow)?;
     let ack_state = crate::consumer::BatchAckEntry::from_ack_set(batch_size, &ack_set);
-    let effective_ack_set = if ack_set.is_empty() {
-        ack_state.ack_set_i64()
-    } else {
-        ack_set
-    };
+    let effective_ack_set = ack_state.ack_set_i64();
     for index in 0..count {
         if cursor.remaining() < 4 {
             return Err(StreamConsumerModelError::InvalidBatchFrame(
@@ -1786,21 +1916,22 @@ fn expand_batch(
             ));
         }
         let payload = cursor.split_to(payload_size);
-        let mut ordinary = message_id_data.clone();
-        ordinary.batch_index =
-            Some(i32::try_from(index).map_err(|_| StreamConsumerModelError::ReceiveSizeOverflow)?);
-        ordinary.batch_size = Some(batch_size);
-        ordinary.ack_set.clone_from(&effective_ack_set);
-        let incoming = IncomingMessage {
-            message_id: crate::MessageId::from_pb(&ordinary),
-            metadata: shared_metadata.clone(),
-            single_metadata: Some(single),
-            payload,
-            redelivery_count: message.redelivery_count,
-            broker_entry_metadata: shared_broker_metadata.clone(),
-            arrived_at: message.arrived_at,
-        };
         if ack_state.is_unacked(index) {
+            let mut ordinary = message_id_data.clone();
+            ordinary.batch_index = Some(
+                i32::try_from(index).map_err(|_| StreamConsumerModelError::ReceiveSizeOverflow)?,
+            );
+            ordinary.batch_size = Some(batch_size);
+            ordinary.ack_set.clone_from(&effective_ack_set);
+            let incoming = IncomingMessage {
+                message_id: crate::MessageId::from_pb(&ordinary),
+                metadata: shared_metadata.clone(),
+                single_metadata: Some(single),
+                payload: Bytes::copy_from_slice(&payload),
+                redelivery_count: message.redelivery_count,
+                broker_entry_metadata: shared_broker_metadata.clone(),
+                arrived_at: message.arrived_at,
+            };
             messages.push((incoming, ordinary));
         }
     }
@@ -2662,10 +2793,19 @@ impl StreamConsumerModel {
         let budget = self.budget.clone();
         let mut next_child_generation = self.next_child_generation;
         let mut actions = Vec::new();
-        for (lost, source) in before
+        let mut retiring: BTreeMap<SegmentId, SegmentSource> = before
             .iter()
             .filter(|(id, source)| replacements.contains(id) || after.get(id) != Some(*source))
-        {
+            .map(|(id, source)| (*id, source.clone()))
+            .collect();
+        for segment_id in replacements {
+            if let Some(child) = children.get(segment_id) {
+                retiring
+                    .entry(*segment_id)
+                    .or_insert_with(|| child.source.clone());
+            }
+        }
+        for (lost, source) in &retiring {
             pending_ownership.remove(lost);
             children
                 .get_mut(lost)
@@ -3510,28 +3650,36 @@ impl StreamConsumerModel {
         let reservation_state =
             self.budget
                 .owned(reservation, owner, BudgetUse::RetainedMessage)?;
-        let mut delivered_positions = self.delivered_positions.clone();
         let replace = self
             .delivered_positions
             .get(&source)
             .is_none_or(|current| current.ordinary_message_id() < message_id);
-        if replace {
-            delivered_positions.insert(source.clone(), stream_message_id.clone());
-        }
-        let position_vector =
-            PositionVector::from_canonical(self.dag.epoch(), &delivered_positions)?;
-        let position_vector_bytes = position_vector.encoded_len()?;
-        let authority_bytes = stream_message_id
-            .encoded_len()?
-            .checked_add(position_vector_bytes)
+        let (position_vector_heap, delivered_positions_heap) = prospective_position_heap_bytes(
+            &self.delivered_positions,
+            &source,
+            &stream_message_id,
+            replace,
+        )?;
+        let stream_message_id_bytes = stream_message_id.encoded_len()?;
+        let stream_message_id_heap = source
+            .topic()
+            .len()
+            .checked_add(stream_message_id.ordinary_message_id_bytes().len())
+            .ok_or(StreamPositionError::LengthOverflow)?;
+        let provisional_authority_bytes = stream_message_id_bytes
+            .checked_add(stream_message_id_heap)
+            .and_then(|bytes| bytes.checked_add(MAX_STREAM_POSITION_SIZE))
+            .and_then(|bytes| bytes.checked_add(position_vector_heap))
             .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
             .ok_or(StreamPositionError::LengthOverflow)?;
-        let lease_bytes = reservation_state
+        let provisional_lease_bytes = reservation_state
             .bytes
-            .checked_add(authority_bytes)
+            .checked_add(provisional_authority_bytes)
             .ok_or(StreamPositionError::LengthOverflow)?;
-        let delivered_positions_bytes = position_vector_bytes
-            .checked_add(DELIVERY_AUTHORITY_OVERHEAD)
+        let provisional_delivered_positions_bytes = MAX_STREAM_POSITION_SIZE
+            .checked_add(position_vector_heap)
+            .and_then(|bytes| bytes.checked_add(delivered_positions_heap))
+            .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
             .ok_or(StreamPositionError::LengthOverflow)?;
         let dequeue_sequence = DequeueSequence(self.next_dequeue_sequence);
         let next_dequeue_sequence = self
@@ -3540,14 +3688,14 @@ impl StreamConsumerModel {
             .ok_or(StreamConsumerModelError::DequeueSequenceExhausted)?;
 
         let mut budget = self.budget.clone();
-        budget
+        let delivered_positions_reservation = budget
             .transfer_owned_with_authority(
                 reservation,
                 owner,
                 BudgetUse::RetainedMessage,
                 BudgetUse::DeliveryLease,
-                lease_bytes,
-                authority_bytes,
+                provisional_lease_bytes,
+                provisional_authority_bytes,
             )
             .and_then(|()| match self.delivered_positions_reservation {
                 Some(metadata_reservation) => budget
@@ -3555,16 +3703,57 @@ impl StreamConsumerModel {
                         metadata_reservation,
                         BudgetUse::DeliveredPositionMetadata,
                         BudgetUse::DeliveredPositionMetadata,
-                        delivered_positions_bytes,
+                        provisional_delivered_positions_bytes,
                     )
                     .map(|()| metadata_reservation),
                 None => budget.reserve(
                     BudgetUse::DeliveredPositionMetadata,
-                    delivered_positions_bytes,
+                    provisional_delivered_positions_bytes,
                 ),
             })
+            .map_err(StreamConsumerModelError::from)?;
+
+        let mut delivered_positions = self.delivered_positions.clone();
+        if replace {
+            delivered_positions.insert(source.clone(), stream_message_id.clone());
+        }
+        let position_vector =
+            PositionVector::from_canonical(self.dag.epoch(), &delivered_positions)?;
+        let position_vector_bytes = position_vector.encoded_len()?;
+        let authority_bytes = stream_message_id_bytes
+            .checked_add(stream_message_id_heap)
+            .and_then(|bytes| bytes.checked_add(position_vector_bytes))
+            .and_then(|bytes| bytes.checked_add(position_vector_heap))
+            .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
+            .ok_or(StreamPositionError::LengthOverflow)?;
+        let lease_bytes = reservation_state
+            .bytes
+            .checked_add(authority_bytes)
+            .ok_or(StreamPositionError::LengthOverflow)?;
+        let delivered_positions_bytes = position_vector_bytes
+            .checked_add(position_vector_heap)
+            .and_then(|bytes| bytes.checked_add(delivered_positions_heap))
+            .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
+            .ok_or(StreamPositionError::LengthOverflow)?;
+        budget
+            .transfer_owned_with_authority(
+                reservation,
+                owner,
+                BudgetUse::DeliveryLease,
+                BudgetUse::DeliveryLease,
+                lease_bytes,
+                authority_bytes,
+            )
+            .and_then(|()| {
+                budget.transfer(
+                    delivered_positions_reservation,
+                    BudgetUse::DeliveredPositionMetadata,
+                    BudgetUse::DeliveredPositionMetadata,
+                    delivered_positions_bytes,
+                )
+            })
             .map_err(StreamConsumerModelError::from)
-            .and_then(|delivered_positions_reservation| {
+            .and_then(|()| {
                 let child = self.child_mut(segment_id, generation)?;
                 child.completion.deliveries = delivery_count;
                 child.completion.pre_terminal_reservations = pre_terminal_reservations;
@@ -3609,6 +3798,19 @@ impl StreamConsumerModel {
             return Err(StreamConsumerModelError::DeliveryOperationPending);
         }
         self.resolve_delivery_sequence(token.dequeue_sequence)
+    }
+
+    /// Validate that a cancelled receive may return this still-live delivery
+    /// to the local ordered queue without changing its authority or budget.
+    pub fn validate_delivery_restoration(
+        &self,
+        token: &DeliveryToken,
+    ) -> Result<ChildGeneration, StreamConsumerModelError> {
+        let validated = self.validate_delivery_token(token)?;
+        if self.delivery_operation_pending(token.dequeue_sequence) {
+            return Err(StreamConsumerModelError::DeliveryOperationPending);
+        }
+        Ok(validated.child_generation)
     }
 
     /// Atomically admit one individual acknowledgement for a live delivery.
@@ -4427,6 +4629,17 @@ impl StreamConsumerModel {
 
     fn refresh_delivered_position(&mut self) -> Result<(), StreamConsumerModelError> {
         let position = PositionVector::from_canonical(self.dag.epoch(), &self.delivered_positions)?;
+        let (position_heap, canonical_heap) = self.delivered_positions.first_key_value().map_or(
+            Ok((0, 0)),
+            |(source, message_id)| {
+                prospective_position_heap_bytes(
+                    &self.delivered_positions,
+                    source,
+                    message_id,
+                    false,
+                )
+            },
+        )?;
         self.delivered_positions_reservation
             .map_or(Ok(()), |reservation| {
                 position
@@ -4434,7 +4647,9 @@ impl StreamConsumerModel {
                     .map_err(StreamConsumerModelError::from)
                     .and_then(|bytes| {
                         bytes
-                            .checked_add(DELIVERY_AUTHORITY_OVERHEAD)
+                            .checked_add(position_heap)
+                            .and_then(|bytes| bytes.checked_add(canonical_heap))
+                            .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
                             .ok_or(StreamPositionError::LengthOverflow)
                             .map_err(StreamConsumerModelError::from)
                     })
@@ -5011,6 +5226,39 @@ mod tests {
             model.resolve_delivery(&token),
             Err(StreamConsumerModelError::StaleDeliveryToken)
         );
+    }
+
+    #[test]
+    fn delivery_restoration_validation_is_non_mutating_and_rejects_pending_operations() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+
+        assert_eq!(model.validate_delivery_restoration(&token), Ok(generation));
+        let acknowledgement = model
+            .admit_individual_acknowledgement(&token)
+            .expect("admit acknowledgement");
+        assert_eq!(
+            model.validate_delivery_restoration(&token),
+            Err(StreamConsumerModelError::DeliveryOperationPending)
+        );
+        model
+            .cancel_acknowledgement(&acknowledgement.authority)
+            .expect("cancel acknowledgement");
+        assert_eq!(model.validate_delivery_restoration(&token), Ok(generation));
+        model
+            .resolve_delivery(&token)
+            .expect("live token remains resolvable");
     }
 
     #[test]
@@ -5679,13 +5927,26 @@ mod tests {
             .position_vector()
             .encoded_len()
             .expect("vector length");
+        let source = token.stream_message_id().source();
+        let (vector_heap, canonical_heap) = prospective_position_heap_bytes(
+            &model.delivered_positions,
+            source,
+            token.stream_message_id(),
+            false,
+        )
+        .expect("position allocation accounting");
+        let stream_message_id_heap =
+            source.topic().len() + token.stream_message_id().ordinary_message_id_bytes().len();
         let authority_bytes = token
             .stream_message_id()
             .encoded_len()
             .expect("stream id length")
+            + stream_message_id_heap
             + vector_bytes
+            + vector_heap
             + DELIVERY_AUTHORITY_OVERHEAD;
-        let delivered_positions_bytes = vector_bytes + DELIVERY_AUTHORITY_OVERHEAD;
+        let delivered_positions_bytes =
+            vector_bytes + vector_heap + canonical_heap + DELIVERY_AUTHORITY_OVERHEAD;
         let delivered_positions_reservation = model
             .delivered_positions_reservation
             .expect("position metadata reservation");
@@ -6007,6 +6268,73 @@ mod tests {
         ));
         assert_eq!(model.dag().epoch(), 2, "failed replacement is atomic");
         assert_eq!(model.generation(), generation);
+    }
+
+    #[test]
+    fn descriptor_change_upgrades_an_already_draining_child_flow_fence() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("initial assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model
+            .child_opened(SegmentId(1), generation)
+            .expect("child open");
+        let arrival = model
+            .message_arrived(SegmentId(1), generation, flow_reservation(&flow), 128)
+            .expect("retain one delivery so ordinary handoff remains draining");
+        let stream_message_id = stream_id(&model, SegmentId(1), message_id(5));
+        let token = model
+            .issue_delivery(
+                SegmentId(1),
+                generation,
+                stream_message_id,
+                arrival.retained,
+            )
+            .expect("live delivery");
+        let flow = flow_reservation(&arrival.actions);
+
+        assert!(matches!(
+            model
+                .apply_assignment(assignment(1, &[]))
+                .expect("ordinary handoff drain")
+                .as_slice(),
+            [StreamConsumerAction::StopFlow { .. }]
+        ));
+        assert!(!model.children[&SegmentId(1)].wait_for_flow_drain);
+
+        let actions = model
+            .apply_control_plane_for(
+                ControllerIncarnation(3),
+                split_dag_at(2, "pulsar://replacement:6650"),
+                assignment(2, &[]),
+            )
+            .expect("descriptor replacement upgrades the retained drain");
+        assert!(actions.is_empty());
+        assert!(model.children[&SegmentId(1)].wait_for_flow_drain);
+        assert_eq!(model.budget().use_of(flow), Some(BudgetUse::FlowPermit));
+        assert!(
+            model
+                .resolve_delivery(&token)
+                .expect("delivery resolution waits for old descriptor flow")
+                .is_empty()
+        );
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::Draining)
+        );
+        assert!(matches!(
+            model
+                .observe_terminal(SegmentId(1), generation)
+                .expect("terminal fences the old descriptor flow")
+                .as_slice(),
+            [StreamConsumerAction::CloseChild { .. }]
+        ));
+        assert_eq!(model.budget().use_of(flow), None);
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::Closing)
+        );
     }
 
     #[test]
@@ -6650,6 +6978,8 @@ mod tests {
     fn budget_transfers_conserve_bytes_and_cleanup_is_independent() {
         let minimum =
             MAX_FRAME_SIZE + RECEIVER_BUDGET_AUTHORITY_HEADROOM + CONTROL_PLANE_CLEANUP_RESERVE;
+        assert_eq!(minimum, 13_697_152);
+        assert!(ReceiverBudget::bytes(16 * 1024 * 1024).is_ok());
         assert_eq!(
             ReceiverBudget::bytes(minimum - 1),
             Err(BudgetError::BudgetTooSmall {

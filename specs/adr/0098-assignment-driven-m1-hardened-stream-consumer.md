@@ -47,6 +47,8 @@ Exact duplicates are discarded, lower epochs fail closed, and callbacks, opens, 
 The low-level global scalable event API only receives events that no owned route claimed, so two aggregate consumers cannot steal or duplicate each other's events.
 Route retirement removes live ownership immediately and retains at most 256 logical tombstones, compacted to the newest consumer incarnation, so recent late events remain fenced without allowing abandoned route identities to grow memory without bound.
 Connection replacement and route overflow request resynchronization, while physical connection closure, explicit route closure, and peer closure fail the aggregate terminally instead of entering the reconnect loop again.
+Resynchronization marks reconnect intent before child teardown, suppresses expected close errors from obsolete child loops, and waits for confirmed children plus in-flight child opens to finish before registering a replacement controller baseline.
+Because M1 cannot unregister a scalable member logically, a broker rejection encountered during that replacement registration is retried on provider time until physical connection replacement releases the old member or the aggregate closes.
 
 Controller and segment authorities are taken from broker-authored direct URLs matching the bootstrap transport: plaintext uses plaintext authority and TLS uses TLS authority.
 Every authority passes the existing redirect allow-list before credentials are reused.
@@ -70,8 +72,9 @@ Layout visibility, assignment arrival, seal state, timeout, and queue emptiness 
 
 ### Aggregate receive budget and concurrency
 
-One aggregate budget covers Magnetar-controlled receive storage across all active and retiring children, including granted but unconsumed permits, retained encoded/decompressed payload, chunk and batch work, ordering barriers, delivery leases, and retained source-qualified authority.
-Both runtimes reserve output before decrypting and bounded-decompressing inbound broker payloads; Moonpool's producer-side refusal of non-`None` compression remains unchanged.
+One aggregate budget covers Magnetar-controlled receive storage across all active and retiring children, including granted but unconsumed permits, retained encoded/decompressed payload, chunk and batch work, queue and ledger nodes, canonical-id/source sidecars, position-map nodes, ordering barriers, delivery leases, and retained source-qualified authority.
+Selected batch members copy into right-sized payload buffers instead of each retaining the full batch backing allocation.
+Both runtimes reserve output plus one validation byte and codec workspace before decrypting and bounded-decompressing inbound broker payloads; zlib reads borrowed input into a bounded destination and zstd caps both destination and window, while Moonpool's producer-side refusal of non-`None` compression remains unchanged.
 Every child uses manual FLOW; initial, automatic, reconnect, and refill FLOW are disabled, and only the aggregate arbiter grants a permit after reserving one `MAX_FRAME_SIZE`.
 Adding segments redistributes the budget and never multiplies it.
 For a partial broker batch, only the logical members selected by `CommandMessage.ack_set` consume aggregate permits.
@@ -81,10 +84,11 @@ The exact minimum is:
 
 ```text
 MAX_FRAME_SIZE
-+ 3 * MAX_STREAM_POSITION_SIZE
++ 5 * MAX_STREAM_POSITION_SIZE
++ 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 8,454,272 bytes
+= 13,697,152 bytes
 ```
 
 The default and documentation examples use 16 MiB.
@@ -93,7 +97,8 @@ The bound covers allocations whose size Magnetar controls or derives from the wi
 `receive(&self)` and `receive_batch(&self, policy)` support concurrent callers without channels.
 Reservation/dequeue order is linearized under aggregate state, each message is reserved once, and future completion order and per-waiter FIFO are unspecified.
 After its first-message wait, a batch reserves and removes its complete bounded set atomically, so another receive cannot interleave inside that batch.
-Cancellation before reservation consumes nothing; cancellation after reservation either returns an owned delivery synchronously or restores the reservation to its ordered queue.
+Cancellation before reservation consumes nothing; cancellation after reservation either returns an owned delivery synchronously or restores the same live authority at its original dequeue sequence.
+If concurrent fencing prevents restoration, the aggregate requests resynchronization rather than silently discarding the delivery.
 
 ### Source-qualified delivery, acknowledgement, transactions, and seek
 
@@ -116,7 +121,7 @@ Commit waits for all admitted operations.
 Any admitted registration or acknowledgement failure permanently poisons commit, returns `TransactionPoisoned`, and emits no `EndTxn(Commit)`; abort remains available.
 Confirmed commit advances participating positions, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails participants closed and requires resynchronization.
 Only one caller may await `EndTxn` for a transaction at a time; cancellation releases that waiter lease while preserving the canonical request so a same-action retry resumes it without emitting a second wire command.
-Once the transaction coordinator confirms commit or abort, an owned runtime completion task records that terminal broker state before notifying local participants, removes each successfully notified participant, and survives caller cancellation so a retry observes or resumes only unfinished local propagation without reissuing `EndTxn`.
+Once the transaction coordinator confirms commit or abort, an owned runtime completion task records that terminal broker state before notifying local participants, checkpoints each successfully completed participant action, and survives caller cancellation so a retry resumes only unfinished local propagation without replaying FLOW or reissuing `EndTxn`.
 
 Vector seek is limited to the current layout epoch and exactly the currently owned, attached active leaves.
 Every eligible source must be represented.
@@ -124,6 +129,7 @@ Seek is rejected while receive, batch, delivery, or transactional-ack reservatio
 A canonical seek position is projected onto the fields M1 actually applies: chunked deliveries seek to `first_chunk_message_id`, batched deliveries encode the inclusive suffix as `ack_set`, and `batch_index`, `batch_size`, and nested chunk metadata are omitted from `CommandSeek`.
 Both runtimes synchronously stage every eligible child SEEK before awaiting any child response, preventing map iteration or one delayed child from suppressing another current leaf's command.
 A successful seek increments the delivery epoch, clears pre-seek buffers, and invalidates old tokens; a partial child failure leaves the aggregate failed and resynchronization-required.
+The failed seek publishes reconnect intent before awaiting confirmation-bearing child closes, so an old child cannot race teardown into a second resynchronization or replacement open.
 
 ### Ownership transfer and close
 
@@ -146,14 +152,14 @@ No existing close, unsubscribe, or layout-close command is repurposed as an unre
 `magnetar-fakes` supplies a stateful generated-M1 multi-endpoint cluster with controller and segment routes, assignments and equal-epoch rebalances, reconnect baselines, ordinary subscribe/FLOW/message/ack/seek/close behavior, delayed and failed operations, transaction state, drain eligibility, and resource counters.
 It validates commands and independent invariants rather than repeating the client state machine.
 
-The public aggregate has 14 differential scenarios across the baseline and advanced suites: eight baseline and six advanced.
+The public aggregate has 22 differential scenarios across the baseline and advanced suites: nine baseline and thirteen advanced.
 They cover typed delivery, concurrent receive and atomic batch, aggregate budget, same-epoch rebalance and drain, child reconnect, ack failure/retry, nack redelivery, close wakeup, strict split/merge barriers, the exact M1 sealed-assignment limitation, Strict versus BrokerManaged cross-member ancestry, vector seek/resync, transaction commit/abort/poison, and controller push/baseline/incarnation ordering.
 
 The Moonpool runtime additionally runs the complete aggregate over `SimProviders` controller and segment sockets for four schedules derived from `MOONPOOL_SEED`.
 That provider-native test covers two-source typed delivery, aggregate status and position, acknowledgement, and close without an ambient Tokio runtime.
 
 Focused code, fake, proto, runtime, façade, and differential suites passed for this implementation.
-A local worktree invocation of `check-runtime-test-parity` reported Tokio 400 / Moonpool 400.
+A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 
 The real `e2e_hardened_scalable_stream_consumer_contract` target compiles and is discovered when the default-off `scalable-topics` product feature is enabled; it has no `#[ignore]` or separate e2e feature.
 When Docker is available it must run against `apachepulsar/pulsar:5.0.0-M1` and prove the public `Arc<BytesSchema>` builder, multi-segment typed delivery, live and restored vector acknowledgement, broker-effective inclusive vector-seek replay, transaction commit and abort, single-member split progression in Strict mode, explicit BrokerManaged cross-member behavior, reachable broker-authored authority matching the bootstrap transport, and logical-close membership residue.
@@ -215,6 +221,6 @@ BrokerManaged mode and explicit aggregate close are the caller-selected escape h
 - [`crates/magnetar-proto/src/dag_watch.rs`](../../crates/magnetar-proto/src/dag_watch.rs) — complete DAG validation and ordering eligibility.
 - [`crates/magnetar-runtime-tokio/src/scalable.rs`](../../crates/magnetar-runtime-tokio/src/scalable.rs) and [`crates/magnetar-runtime-moonpool/src/scalable.rs`](../../crates/magnetar-runtime-moonpool/src/scalable.rs) — typed routes, direct controller routing, children, and provider-native operation.
 - [`crates/magnetar-fakes/src/m1.rs`](../../crates/magnetar-fakes/src/m1.rs) — stateful M1 fake cluster.
-- [`crates/magnetar-differential/tests/stream_consumer_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_equivalence.rs) and [`stream_consumer_advanced_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs) — 14 public aggregate parity scenarios: eight baseline and six advanced.
+- [`crates/magnetar-differential/tests/stream_consumer_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_equivalence.rs) and [`stream_consumer_advanced_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs) — 22 public aggregate parity scenarios: nine baseline and thirteen advanced.
 - [`crates/magnetar/tests/e2e_scalable_topic.rs`](../../crates/magnetar/tests/e2e_scalable_topic.rs) — real M1 compile/runtime contract.
 - [`xtask/src/main.rs`](../../xtask/src/main.rs) — exact eight-package sim-coverage closure and unchanged two-root execution.

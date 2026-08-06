@@ -201,37 +201,105 @@ fn validate_ordinary_id(
 fn encode_canonical_ordinary_id(
     message_id: &pb::MessageIdData,
 ) -> Result<Vec<u8>, StreamPositionError> {
-    let mut encoded = Vec::new();
-    encode_varint_field(&mut encoded, 1, message_id.ledger_id);
-    encode_varint_field(&mut encoded, 2, message_id.entry_id);
+    let encoded_len = canonical_ordinary_id_len(message_id)?;
+    let mut encoded = Vec::with_capacity(encoded_len);
+    encode_canonical_ordinary_id_into(&mut encoded, message_id)?;
+    Ok(encoded)
+}
+
+fn encode_canonical_ordinary_id_into(
+    encoded: &mut Vec<u8>,
+    message_id: &pb::MessageIdData,
+) -> Result<(), StreamPositionError> {
+    encode_varint_field(encoded, 1, message_id.ledger_id);
+    encode_varint_field(encoded, 2, message_id.entry_id);
     if let Some(partition) = message_id.partition {
-        encode_varint_field(&mut encoded, 3, signed_i32_varint(partition));
+        encode_varint_field(encoded, 3, signed_i32_varint(partition));
     }
     if let Some(batch_index) = message_id.batch_index {
-        encode_varint_field(&mut encoded, 4, signed_i32_varint(batch_index));
+        encode_varint_field(encoded, 4, signed_i32_varint(batch_index));
     }
     for ack_word in &message_id.ack_set {
-        encode_varint_field(&mut encoded, 5, *ack_word as u64);
+        encode_varint_field(encoded, 5, *ack_word as u64);
     }
     if let Some(batch_size) = message_id.batch_size {
-        encode_varint_field(&mut encoded, 6, signed_i32_varint(batch_size));
+        encode_varint_field(encoded, 6, signed_i32_varint(batch_size));
     }
     if let Some(first_chunk) = message_id.first_chunk_message_id.as_deref() {
-        let nested = encode_canonical_ordinary_id(first_chunk)?;
-        encode_varint(&mut encoded, (7 << 3) | 2);
+        let nested_len = canonical_ordinary_id_len(first_chunk)?;
+        encode_varint(encoded, (7 << 3) | 2);
         encode_varint(
-            &mut encoded,
-            u64::try_from(nested.len()).map_err(|_| StreamPositionError::LengthOverflow)?,
+            encoded,
+            u64::try_from(nested_len).map_err(|_| StreamPositionError::LengthOverflow)?,
         );
-        encoded.extend_from_slice(&nested);
+        encode_canonical_ordinary_id_into(encoded, first_chunk)?;
     }
-    if encoded.len() > MAX_ORDINARY_MESSAGE_ID_SIZE {
+    Ok(())
+}
+
+fn canonical_ordinary_id_len(message_id: &pb::MessageIdData) -> Result<usize, StreamPositionError> {
+    let mut length = varint_field_len(1, message_id.ledger_id)
+        .checked_add(varint_field_len(2, message_id.entry_id))
+        .ok_or(StreamPositionError::LengthOverflow)?;
+    for field_len in [
+        message_id
+            .partition
+            .map(|value| varint_field_len(3, signed_i32_varint(value))),
+        message_id
+            .batch_index
+            .map(|value| varint_field_len(4, signed_i32_varint(value))),
+        message_id
+            .batch_size
+            .map(|value| varint_field_len(6, signed_i32_varint(value))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        length = checked_ordinary_id_len_add(length, field_len)?;
+    }
+    for ack_word in &message_id.ack_set {
+        length = checked_ordinary_id_len_add(length, varint_field_len(5, *ack_word as u64))?;
+    }
+    if let Some(first_chunk) = message_id.first_chunk_message_id.as_deref() {
+        let nested_len = canonical_ordinary_id_len(first_chunk)?;
+        let field_len = varint_len((7 << 3) | 2)
+            .checked_add(varint_len(
+                u64::try_from(nested_len).map_err(|_| StreamPositionError::LengthOverflow)?,
+            ))
+            .and_then(|length| length.checked_add(nested_len))
+            .ok_or(StreamPositionError::LengthOverflow)?;
+        length = checked_ordinary_id_len_add(length, field_len)?;
+    }
+    Ok(length)
+}
+
+fn checked_ordinary_id_len_add(
+    length: usize,
+    additional: usize,
+) -> Result<usize, StreamPositionError> {
+    let actual = length
+        .checked_add(additional)
+        .ok_or(StreamPositionError::LengthOverflow)?;
+    if actual > MAX_ORDINARY_MESSAGE_ID_SIZE {
         return Err(StreamPositionError::OrdinaryIdTooLong {
-            actual: encoded.len(),
+            actual,
             max: MAX_ORDINARY_MESSAGE_ID_SIZE,
         });
     }
-    Ok(encoded)
+    Ok(actual)
+}
+
+fn varint_field_len(field_number: u64, value: u64) -> usize {
+    varint_len(field_number << 3) + varint_len(value)
+}
+
+fn varint_len(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 0x80 {
+        length += 1;
+        value >>= 7;
+    }
+    length
 }
 
 fn signed_i32_varint(value: i32) -> u64 {

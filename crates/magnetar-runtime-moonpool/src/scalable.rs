@@ -728,9 +728,10 @@ impl<P: Providers> std::fmt::Debug for ChildRuntime<P> {
 struct QueuedMessage {
     source: magnetar_proto::SegmentSource,
     generation: magnetar_proto::ChildGeneration,
-    reservation: magnetar_proto::BudgetReservationId,
+    reservation: Option<magnetar_proto::BudgetReservationId>,
     message: magnetar_proto::IncomingMessage,
     message_id_data: magnetar_proto::pb::MessageIdData,
+    token: Option<magnetar_proto::DeliveryToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -761,7 +762,15 @@ enum TransactionRegistration {
 struct TransactionOutcomeCompletion {
     outcome: magnetar_proto::TransactionAcknowledgementOutcome,
     result: Mutex<Option<Result<(), String>>>,
+    running: AtomicBool,
+    work: Mutex<Option<TransactionOutcomeWork>>,
     notify: Notify,
+}
+
+#[derive(Debug)]
+struct TransactionOutcomeWork {
+    actions: VecDeque<magnetar_proto::StreamConsumerAction>,
+    completions: VecDeque<(magnetar_proto::SegmentId, magnetar_proto::ChildGeneration)>,
 }
 
 impl TransactionOutcomeCompletion {
@@ -769,17 +778,37 @@ impl TransactionOutcomeCompletion {
         Self {
             outcome,
             result: Mutex::new(None),
+            running: AtomicBool::new(false),
+            work: Mutex::new(None),
             notify: Notify::new(),
         }
+    }
+
+    fn try_start(&self) -> bool {
+        if matches!(&*self.result.lock(), Some(Ok(()))) {
+            return false;
+        }
+        if self
+            .running
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if matches!(&*self.result.lock(), Some(Err(_))) {
+            *self.result.lock() = None;
+        }
+        true
     }
 
     fn finish(&self, result: Result<(), String>) {
         let mut current = self.result.lock();
         if current.is_none() {
             *current = Some(result);
-            drop(current);
-            self.notify.notify_waiters();
         }
+        drop(current);
+        self.running.store(false, AtomicOrdering::Release);
+        self.notify.notify_waiters();
     }
 
     async fn wait(&self) -> Result<(), String> {
@@ -838,7 +867,7 @@ struct AggregateState<P: Providers> {
         magnetar_proto::BudgetReservationId,
     >,
     dispatch_permit_debt:
-        BTreeMap<(magnetar_proto::SegmentId, magnetar_proto::ChildGeneration), u32>,
+        BTreeMap<(magnetar_proto::SegmentId, magnetar_proto::ChildGeneration), DispatchPermitDebt>,
     queue: VecDeque<QueuedMessage>,
     events: VecDeque<StreamConsumerEvent>,
     pending_transactions:
@@ -849,9 +878,16 @@ struct AggregateState<P: Providers> {
     controller_registration: Option<ControllerRegistration>,
     terminal_error: Option<String>,
     reconnect_requested: bool,
+    open_tasks: usize,
     close_state: AggregateCloseState,
     close_error: Option<String>,
     tasks: Vec<ScalableTaskHandle<P>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DispatchPermitDebt {
+    session_epoch: u64,
+    permits: u32,
 }
 
 struct AcknowledgementCancellation<'a, P: Providers> {
@@ -1104,6 +1140,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
                 }),
                 terminal_error: None,
                 reconnect_requested: false,
+                open_tasks: 0,
                 close_state: AggregateCloseState::Open,
                 close_error: None,
                 tasks: Vec::new(),
@@ -1124,6 +1161,21 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
     pub async fn receive(&self) -> Result<StreamConsumerMessage, StreamConsumerError> {
         let mut messages = self.inner.reserve_batch(1, usize::MAX).await?;
         messages.pop().ok_or(StreamConsumerError::Closed)
+    }
+
+    /// Restore cancelled schema/decode preparation to its original local order.
+    pub fn restore_deliveries(
+        &self,
+        messages: Vec<StreamConsumerMessage>,
+    ) -> Result<(), StreamConsumerError> {
+        self.inner.restore_deliveries(messages)
+    }
+
+    /// Fence and resynchronize when a facade cancellation races authority
+    /// invalidation and the original delivery can no longer be requeued.
+    pub fn delivery_restoration_failed(&self, error: &StreamConsumerError) {
+        self.inner
+            .request_resync(format!("delivery restoration failed: {error}"));
     }
 
     /// Await the first message up to `max_wait`, then atomically reserve a
@@ -1321,7 +1373,23 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
         &self,
         positions: &magnetar_proto::PositionVector,
     ) -> Result<(), StreamConsumerError> {
-        let actions = self.inner.state.lock().model.begin_seek(positions)?;
+        let actions = {
+            let mut state = self.inner.state.lock();
+            let actions = state.model.begin_seek(positions)?;
+            for action in &actions {
+                if let magnetar_proto::StreamConsumerAction::SeekChild {
+                    source,
+                    child_generation,
+                    ..
+                } = action
+                {
+                    let key = (source.segment_id(), *child_generation);
+                    state.flow_reservations.remove(&key);
+                    state.dispatch_permit_debt.remove(&key);
+                }
+            }
+            actions
+        };
         let mut cancellation = SeekCancellation::new(&self.inner);
         let result = self.inner.execute_actions(actions).await;
         cancellation.disarm();
@@ -1389,7 +1457,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         });
     }
 
-    fn push_phase_event(&self, source: magnetar_proto::SegmentSource) {
+    fn push_phase_event(&self, source: &magnetar_proto::SegmentSource) {
         let phase = self
             .state
             .lock()
@@ -1492,10 +1560,14 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 },
                 move || {
                     if let Some(inner) = completion_inner.upgrade() {
+                        let mut state = inner.state.lock();
+                        state.open_tasks = state.open_tasks.saturating_sub(1);
+                        drop(state);
                         inner.notify.notify_waiters();
                     }
                 },
             );
+            state.open_tasks = state.open_tasks.saturating_add(1);
             Self::track_task(&mut state, handle);
         }
     }
@@ -1651,7 +1723,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             .await;
                     };
                     self.spawn_child_task(source.clone(), child_generation, consumer);
-                    self.push_phase_event(source);
+                    self.push_phase_event(&source);
                     return self.execute_actions(actions).await;
                 }
                 Err(ClientError::Broker { code, .. })
@@ -1803,7 +1875,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                 }
                 magnetar_proto::StreamConsumerAction::StopFlow { source, .. } => {
-                    self.push_phase_event(source);
+                    self.push_phase_event(&source);
                 }
                 magnetar_proto::StreamConsumerAction::GrantFlow {
                     source,
@@ -1823,14 +1895,17 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             state.flow_reservations.insert(key, reservation);
                         }
                         consumer.map(|consumer| {
-                            let debt = state.dispatch_permit_debt.remove(&key).unwrap_or(0);
+                            let debt = state
+                                .dispatch_permit_debt
+                                .remove(&key)
+                                .map(|debt| (debt.session_epoch, debt.permits));
                             (consumer, debt)
                         })
                     };
                     if let Some((consumer, debt)) = consumer {
-                        consumer.flow_for_aggregate(1, debt);
+                        consumer.flow_for_aggregate_with_debt(1, debt);
                     }
-                    self.push_phase_event(source);
+                    self.push_phase_event(&source);
                 }
                 magnetar_proto::StreamConsumerAction::CloseChild {
                     source,
@@ -1852,13 +1927,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             queued.source.segment_id() != source.segment_id()
                                 || queued.generation != child_generation
                         });
-                        let current = state
+                        state
                             .children
                             .get(&source.segment_id())
-                            .is_some_and(|child| child.generation == child_generation);
-                        current
-                            .then(|| state.children.remove(&source.segment_id()))
-                            .flatten()
+                            .filter(|child| child.generation == child_generation)
+                            .cloned()
                     };
                     if let Some(child) = child {
                         let retry = child.consumer.clone();
@@ -1869,6 +1942,13 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                     let closed = {
                         let mut state = self.state.lock();
+                        if state
+                            .children
+                            .get(&source.segment_id())
+                            .is_some_and(|child| child.generation == child_generation)
+                        {
+                            state.children.remove(&source.segment_id());
+                        }
                         state
                             .model
                             .child_closed(source.segment_id(), child_generation)
@@ -1901,14 +1981,16 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         {
                             Ok(next) => actions.extend(next),
                             Err(error) => {
-                                let next = self.state.lock().model.seek_failed()?;
-                                actions = next.into();
+                                let next = self.seek_failed_actions()?;
+                                self.spawn_actions(next);
+                                actions.clear();
                                 execution_error = Some(error.into());
                             }
                         },
                         Err(error) => {
-                            let next = self.state.lock().model.seek_failed()?;
-                            actions = next.into();
+                            let next = self.seek_failed_actions()?;
+                            self.spawn_actions(next);
+                            actions.clear();
                             execution_error = Some(error);
                         }
                     }
@@ -1931,7 +2013,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             let shutdown = self.notify.notified();
             tokio::pin!(shutdown);
             shutdown.as_mut().enable();
-            if self.state.lock().close_state.is_closing() {
+            let should_stop = {
+                let state = self.state.lock();
+                state.close_state.is_closing() || state.reconnect_requested
+            };
+            if should_stop {
                 return;
             }
             let receive = consumer.receive_deferred_until_end();
@@ -1944,20 +2030,34 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             let current = {
                 let state = self.state.lock();
                 !state.close_state.is_closing()
+                    && !state.reconnect_requested
                     && state
                         .children
                         .get(&source.segment_id())
                         .is_some_and(|child| {
                             child.source == source && child.generation == generation
                         })
+                    && !matches!(
+                        state.model.segment_phase(source.segment_id()),
+                        Some(
+                            magnetar_proto::SegmentPhase::Closing
+                                | magnetar_proto::SegmentPhase::Failed
+                        )
+                    )
             };
             if !current {
                 return;
             }
             match result {
-                Ok(Some(message)) => {
+                Ok(Some((session_epoch, message))) => {
                     if let Err(error) = self
-                        .message_arrived(source.clone(), generation, &consumer, message)
+                        .message_arrived(
+                            source.clone(),
+                            generation,
+                            session_epoch,
+                            &consumer,
+                            message,
+                        )
                         .await
                     {
                         self.request_resync(error.to_string());
@@ -1990,6 +2090,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         self: &Arc<Self>,
         source: magnetar_proto::SegmentSource,
         generation: magnetar_proto::ChildGeneration,
+        session_epoch: u64,
         consumer: &crate::Consumer<P>,
         message: magnetar_proto::DeferredIncomingMessage,
     ) -> Result<(), StreamConsumerError> {
@@ -2071,17 +2172,28 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 state.queue.push_back(QueuedMessage {
                     source: source.clone(),
                     generation,
-                    reservation: queued.reservation,
+                    reservation: Some(queued.reservation),
                     message: queued.message,
                     message_id_data: queued.message_id_data,
+                    token: None,
                 });
             }
             if transition.permit_debt > 0 {
                 let debt = state
                     .dispatch_permit_debt
                     .entry((source.segment_id(), generation))
-                    .or_default();
-                *debt = debt.saturating_add(transition.permit_debt);
+                    .or_insert(DispatchPermitDebt {
+                        session_epoch,
+                        permits: 0,
+                    });
+                if debt.session_epoch == session_epoch {
+                    debt.permits = debt.permits.saturating_add(transition.permit_debt);
+                } else {
+                    *debt = DispatchPermitDebt {
+                        session_epoch,
+                        permits: transition.permit_debt,
+                    };
+                }
             }
             transition.actions
         };
@@ -2116,29 +2228,42 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         bytes = next;
                     }
                     let mut staged = state.model.clone();
-                    let mut tokens = Vec::with_capacity(count);
+                    let mut fresh_tokens = VecDeque::new();
                     for queued in state.queue.iter().take(count) {
+                        if queued.token.is_some() {
+                            continue;
+                        }
                         let stream_message_id =
                             magnetar_proto::StreamMessageId::from_message_id_data(
                                 queued.source.clone(),
                                 &queued.message_id_data,
                             )
                             .map_err(magnetar_proto::StreamConsumerModelError::from)?;
-                        tokens.push(staged.issue_delivery(
+                        fresh_tokens.push_back(staged.issue_delivery(
                             queued.source.segment_id(),
                             queued.generation,
                             stream_message_id,
-                            queued.reservation,
+                            queued.reservation.ok_or_else(|| {
+                                StreamConsumerError::Failed(
+                                    "fresh aggregate queue entry has no reservation".to_owned(),
+                                )
+                            })?,
                         )?);
                     }
                     state.model = staged;
                     let messages = state
                         .queue
                         .drain(..count)
-                        .zip(tokens)
-                        .map(|(queued, token)| StreamConsumerMessage {
-                            message: queued.message,
-                            token,
+                        .map(|queued| {
+                            let token = queued.token.unwrap_or_else(|| {
+                                fresh_tokens
+                                    .pop_front()
+                                    .expect("every fresh queue entry issued one token")
+                            });
+                            StreamConsumerMessage {
+                                message: queued.message,
+                                token,
+                            }
                         })
                         .collect();
                     Some(Ok(messages))
@@ -2155,6 +2280,77 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             }
             notified.await;
         }
+    }
+
+    fn restore_deliveries(
+        &self,
+        messages: Vec<StreamConsumerMessage>,
+    ) -> Result<(), StreamConsumerError> {
+        let mut state = self.state.lock();
+        if state.close_state.is_closing() {
+            return Err(StreamConsumerError::Closed);
+        }
+        let mut seen = BTreeSet::new();
+        for message in &messages {
+            let sequence = message.token.dequeue_sequence();
+            if !seen.insert(sequence)
+                || state.queue.iter().any(|queued| {
+                    queued
+                        .token
+                        .as_ref()
+                        .is_some_and(|token| token.dequeue_sequence() == sequence)
+                })
+            {
+                return Err(StreamConsumerError::Failed(
+                    "delivery is already queued for restoration".to_owned(),
+                ));
+            }
+        }
+        let mut restored = Vec::with_capacity(messages.len());
+        for message in messages {
+            let source = message.token.stream_message_id().source().clone();
+            let generation = state.model.validate_delivery_restoration(&message.token)?;
+            let message_id_data = message
+                .token
+                .stream_message_id()
+                .ordinary_message_id_data()
+                .map_err(magnetar_proto::StreamConsumerModelError::from)?;
+            restored.push(QueuedMessage {
+                source,
+                generation,
+                reservation: None,
+                message: message.message,
+                message_id_data,
+                token: Some(message.token),
+            });
+        }
+        restored.sort_by_key(|queued| {
+            queued
+                .token
+                .as_ref()
+                .map(magnetar_proto::DeliveryToken::dequeue_sequence)
+        });
+        for queued in restored {
+            let sequence = queued
+                .token
+                .as_ref()
+                .expect("restored queue entries retain their token")
+                .dequeue_sequence();
+            let index = state
+                .queue
+                .iter()
+                .position(|existing| {
+                    existing
+                        .token
+                        .as_ref()
+                        .is_none_or(|token| token.dequeue_sequence() > sequence)
+                })
+                .unwrap_or(state.queue.len());
+            state.queue.insert(index, queued);
+        }
+        drop(state);
+        self.notify.notify_waiters();
+        Ok(())
     }
 
     async fn execute_acknowledgement(
@@ -2380,13 +2576,13 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         txn_id: magnetar_proto::TxnId,
         outcome: magnetar_proto::TransactionAcknowledgementOutcome,
     ) -> Result<(), StreamConsumerError> {
-        let (completion, leader) = {
+        let completion = {
             let mut state = self.state.lock();
             if state.close_state.is_closing() {
                 return Err(StreamConsumerError::Closed);
             }
             match state.transaction_outcomes.get(&txn_id) {
-                Some(completion) if completion.outcome == outcome => (completion.clone(), false),
+                Some(completion) if completion.outcome == outcome => completion.clone(),
                 Some(completion) => {
                     return Err(StreamConsumerError::Failed(format!(
                         "transaction {txn_id:?} outcome changed from {:?} to {outcome:?}",
@@ -2398,11 +2594,17 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     state
                         .transaction_outcomes
                         .insert(txn_id, completion.clone());
-                    (completion, true)
+                    completion
                 }
             }
         };
+        let leader = completion.try_start();
         if leader {
+            let mut state = self.state.lock();
+            if state.close_state.is_closing() {
+                completion.finish(Err("stream consumer is closed".to_owned()));
+                return Err(StreamConsumerError::Closed);
+            }
             let inner = self.clone();
             let task_completion = completion.clone();
             let dropped_completion = completion.clone();
@@ -2410,10 +2612,9 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             let handle = self.subscriber.spawn_task_with_completion(
                 "scalable-transaction-outcome",
                 async move {
-                    let result = inner.propagate_transaction_outcome(txn_id, outcome).await;
-                    if let Err(error) = &result {
-                        inner.request_resync(error.to_string());
-                    }
+                    let result = inner
+                        .propagate_transaction_outcome(txn_id, outcome, &task_completion)
+                        .await;
                     task_completion.finish(result.map_err(|error| error.to_string()));
                 },
                 move || {
@@ -2425,7 +2626,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                 },
             );
-            Self::track_task(&mut self.state.lock(), handle);
+            Self::track_task(&mut state, handle);
         }
         completion.wait().await.map_err(StreamConsumerError::Failed)
     }
@@ -2434,48 +2635,99 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         self: &Arc<Self>,
         txn_id: magnetar_proto::TxnId,
         outcome: magnetar_proto::TransactionAcknowledgementOutcome,
+        completion: &TransactionOutcomeCompletion,
     ) -> Result<(), StreamConsumerError> {
-        let (actions, completions) = {
-            let mut state = self.state.lock();
-            state
-                .transaction_registrations
-                .retain(|(registered_txn, _), _| *registered_txn != txn_id);
-            let authorities = state
-                .pending_transactions
-                .remove(&txn_id)
-                .unwrap_or_default();
-            let actions = if outcome == magnetar_proto::TransactionAcknowledgementOutcome::Unknown {
-                state.pending_transactions.clear();
-                state.transaction_registrations.clear();
-                state.reconnect_requested = true;
-                state.model.require_resync()?
-            } else {
-                let mut actions = Vec::new();
-                for authority in authorities {
-                    actions.extend(
-                        state
-                            .model
-                            .settle_transactional_acknowledgement(&authority, outcome)?,
-                    );
-                }
-                actions
+        let work_installed = completion.work.lock().is_some();
+        if !work_installed {
+            let (work, consumers) = {
+                let mut state = self.state.lock();
+                state
+                    .transaction_registrations
+                    .retain(|(registered_txn, _), _| *registered_txn != txn_id);
+                let authorities = state
+                    .pending_transactions
+                    .remove(&txn_id)
+                    .unwrap_or_default();
+                let actions =
+                    if outcome == magnetar_proto::TransactionAcknowledgementOutcome::Unknown {
+                        state.pending_transactions.clear();
+                        state.transaction_registrations.clear();
+                        state.reconnect_requested = true;
+                        state.model.require_resync()?
+                    } else {
+                        let mut actions = Vec::new();
+                        for authority in authorities {
+                            actions.extend(
+                                state
+                                    .model
+                                    .settle_transactional_acknowledgement(&authority, outcome)?,
+                            );
+                        }
+                        actions
+                    };
+                let completions = state
+                    .children
+                    .values()
+                    .map(|child| (child.source.segment_id(), child.generation))
+                    .collect::<Vec<_>>();
+                let consumers = state
+                    .children
+                    .values()
+                    .map(|child| child.consumer.clone())
+                    .collect::<Vec<_>>();
+                (
+                    TransactionOutcomeWork {
+                        actions: actions.into(),
+                        completions: completions.into(),
+                    },
+                    consumers,
+                )
             };
-            let completions = state
-                .children
-                .values()
-                .map(|child| (child.source.segment_id(), child.generation))
-                .collect::<Vec<_>>();
-            (actions, completions)
-        };
+            let committed = outcome == magnetar_proto::TransactionAcknowledgementOutcome::Committed;
+            for consumer in consumers {
+                consumer.settle_transactional_acks(txn_id, committed);
+            }
+            *completion.work.lock() = Some(work);
+        }
         #[cfg(test)]
         if let Some(hook) = self.transaction_outcome_park_hook.clone() {
             hook.reached.notify_one();
             hook.release.notified().await;
         }
-        self.execute_actions(actions).await?;
+        loop {
+            let action = completion
+                .work
+                .lock()
+                .as_ref()
+                .and_then(|work| work.actions.front().cloned());
+            let Some(action) = action else { break };
+            self.execute_actions(vec![action]).await?;
+            completion
+                .work
+                .lock()
+                .as_mut()
+                .expect("transaction outcome work remains installed")
+                .actions
+                .pop_front();
+        }
         if outcome != magnetar_proto::TransactionAcknowledgementOutcome::Unknown {
-            for (segment_id, generation) in completions {
+            loop {
+                let component = completion
+                    .work
+                    .lock()
+                    .as_ref()
+                    .and_then(|work| work.completions.front().copied());
+                let Some((segment_id, generation)) = component else {
+                    break;
+                };
                 self.try_complete(segment_id, generation).await;
+                completion
+                    .work
+                    .lock()
+                    .as_mut()
+                    .expect("transaction outcome work remains installed")
+                    .completions
+                    .pop_front();
             }
         }
         self.push_event(StreamConsumerEvent::TransactionOutcome { txn_id, outcome });
@@ -2516,6 +2768,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 }
             }
         };
+        self.notify.notify_waiters();
         if let Some(actions) = actions
             && let Err(error) = self.execute_actions(actions).await
         {
@@ -2544,6 +2797,21 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         self.push_event(StreamConsumerEvent::ResyncRequired { reason });
         self.notify.notify_waiters();
         self.spawn_actions(actions);
+    }
+
+    fn seek_failed_actions(
+        &self,
+    ) -> Result<Vec<magnetar_proto::StreamConsumerAction>, StreamConsumerError> {
+        let actions = {
+            let mut state = self.state.lock();
+            state.reconnect_requested = true;
+            state.queue.clear();
+            state.receive = magnetar_proto::StreamReceiveState::default();
+            state.dispatch_permit_debt.clear();
+            state.model.seek_failed()?
+        };
+        self.notify.notify_waiters();
+        Ok(actions)
     }
 
     async fn apply_aligned_control_plane(
@@ -2592,7 +2860,18 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             if self.state.lock().close_state.is_closing() {
                 break;
             }
-            if self.state.lock().reconnect_requested {
+            let (reconnect_requested, children_fenced) = {
+                let state = self.state.lock();
+                (
+                    state.reconnect_requested,
+                    state.open_tasks == 0 && state.children.is_empty(),
+                )
+            };
+            if reconnect_requested && !children_fenced {
+                notified.await;
+                continue;
+            }
+            if reconnect_requested {
                 match self.reconnect_control_plane(dag, controller).await {
                     Some((new_dag, new_controller)) => {
                         dag = new_dag;
@@ -2696,12 +2975,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     self.push_event(StreamConsumerEvent::ResyncRequired {
                         reason: error.to_string(),
                     });
-                    if self
+                    if let Err(error) = self
                         .subscriber
                         .sleep(std::time::Duration::from_millis(100))
                         .await
-                        .is_err()
                     {
+                        self.fail_closed(error.to_string());
                         return None;
                     }
                     continue;
@@ -2742,12 +3021,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         self.push_event(StreamConsumerEvent::ResyncRequired {
                             reason: error.to_string(),
                         });
-                        if self
+                        if let Err(error) = self
                             .subscriber
                             .sleep(std::time::Duration::from_millis(100))
                             .await
-                            .is_err()
                         {
+                            self.fail_closed(error.to_string());
                             return None;
                         }
                         continue;
@@ -2799,8 +3078,15 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 }
                 Err(ClientError::ScalableAssignmentRejected { reason }) => {
                     opened_dag.close();
-                    self.fail_closed(reason);
-                    return None;
+                    self.push_event(StreamConsumerEvent::ResyncRequired { reason });
+                    if let Err(error) = self
+                        .subscriber
+                        .sleep(std::time::Duration::from_millis(100))
+                        .await
+                    {
+                        self.fail_closed(error.to_string());
+                        return None;
+                    }
                 }
                 Err(error) => {
                     opened_dag.close();
@@ -2811,12 +3097,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     self.push_event(StreamConsumerEvent::ResyncRequired {
                         reason: error.to_string(),
                     });
-                    if self
+                    if let Err(error) = self
                         .subscriber
                         .sleep(std::time::Duration::from_millis(100))
                         .await
-                        .is_err()
                     {
+                        self.fail_closed(error.to_string());
                         return None;
                     }
                 }
@@ -3386,22 +3672,21 @@ impl ScalableRouteRegistry {
         let route = {
             let state = self.state.lock();
             let active_key = state.active.get(&(family, id)).copied();
-            match active_key {
-                Some(key) => incarnation
+            if let Some(key) = active_key {
+                incarnation
                     .is_none_or(|value| value == key.incarnation)
                     .then(|| state.routes.get(&key).cloned())
-                    .flatten(),
-                None => {
-                    let retired = state
-                        .retired
-                        .iter()
-                        .rev()
-                        .any(|key| key.family == family && key.id == id);
-                    if retired {
-                        return None;
-                    }
-                    return Some(event);
+                    .flatten()
+            } else {
+                let retired = state
+                    .retired
+                    .iter()
+                    .rev()
+                    .any(|key| key.family == family && key.id == id);
+                if retired {
+                    return None;
                 }
+                return Some(event);
             }
         };
         if let Some(route) = route {
@@ -3826,9 +4111,10 @@ mod tests {
             queue.push_back(QueuedMessage {
                 source: source.clone(),
                 generation,
-                reservation: transition.retained,
+                reservation: Some(transition.retained),
                 message_id_data: message.message_id.to_pb(),
                 message,
+                token: None,
             });
             actions = transition.actions;
         }
@@ -3857,6 +4143,7 @@ mod tests {
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
+                open_tasks: 0,
                 close_state: AggregateCloseState::Open,
                 close_error: None,
                 tasks: Vec::new(),
@@ -3907,6 +4194,7 @@ mod tests {
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
+                open_tasks: 0,
                 close_state: AggregateCloseState::Open,
                 close_error: None,
                 tasks: Vec::new(),
@@ -4038,6 +4326,7 @@ mod tests {
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
+                open_tasks: 0,
                 close_state: AggregateCloseState::Open,
                 close_error: None,
                 tasks: Vec::new(),
@@ -4113,6 +4402,50 @@ mod tests {
         assert!(matches!(
             route.poll(),
             Err(ScalableRouteError::ConnectionReplaced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restored_delivery_precedes_later_fresh_delivery() {
+        let consumer = StreamConsumer {
+            inner: aggregate_inner_with_two_messages(),
+        };
+        let first = consumer.receive().await.expect("first delivery");
+        assert_eq!(first.message.message_id.entry_id, 1);
+
+        consumer
+            .restore_deliveries(vec![first])
+            .expect("restore cancelled delivery");
+
+        let restored = consumer.receive().await.expect("restored delivery");
+        let later = consumer.receive().await.expect("later delivery");
+        assert_eq!(restored.message.message_id.entry_id, 1);
+        assert_eq!(restored.token.dequeue_sequence().0, 0);
+        assert_eq!(later.message.message_id.entry_id, 2);
+        assert_eq!(later.token.dequeue_sequence().0, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_restoration_requests_resynchronization() {
+        let inner = empty_aggregate_inner();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+
+        consumer.delivery_restoration_failed(&StreamConsumerError::Failed(
+            "stale cancellation authority".to_owned(),
+        ));
+
+        let state = inner.state.lock();
+        assert_eq!(
+            state.model.phase(),
+            magnetar_proto::AggregatePhase::ResyncRequired
+        );
+        assert!(state.reconnect_requested);
+        assert!(matches!(
+            state.events.back(),
+            Some(StreamConsumerEvent::ResyncRequired { reason })
+                if reason.contains("delivery restoration failed")
         ));
     }
 
@@ -4670,10 +5003,12 @@ mod tests {
             2,
         );
 
+        let session_epoch = child_shared.inner.lock().session_epoch();
         inner
             .message_arrived(
                 child.source.clone(),
                 child.generation,
+                session_epoch,
                 &child.consumer,
                 message,
             )
@@ -4732,10 +5067,12 @@ mod tests {
         );
         message.ack_set = vec![0b101];
 
+        let session_epoch = child_shared.inner.lock().session_epoch();
         inner
             .message_arrived(
                 child.source.clone(),
                 child.generation,
+                session_epoch,
                 &child.consumer,
                 message,
             )
@@ -4772,6 +5109,31 @@ mod tests {
         assert_eq!(permits, vec![2]);
     }
 
+    #[test]
+    fn reconnect_drops_old_session_batch_debt_from_fresh_flow() {
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .consumer
+            .clone();
+        let old_epoch = child_shared.inner.lock().session_epoch();
+        child_shared.inner.lock().reset();
+
+        child.flow_for_aggregate_with_debt(1, Some((old_epoch, 3)));
+
+        let command = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode post-reconnect flow")
+            .command
+            .flow
+            .expect("CommandFlow");
+        assert_eq!(command.message_permits, 1);
+    }
+
     #[tokio::test]
     async fn chunk_continuation_reassembles_and_retains_first_chunk_id() {
         let (inner, child_shared) = aggregate_inner_with_child();
@@ -4791,20 +5153,24 @@ mod tests {
             ..Default::default()
         };
 
+        let session_epoch = child_shared.inner.lock().session_epoch();
         inner
             .message_arrived(
                 child.source.clone(),
                 child.generation,
+                session_epoch,
                 &child.consumer,
                 deferred_message(10, chunk_metadata(0), bytes::Bytes::from_static(b"ab"), 1),
             )
             .await
             .expect("buffer first chunk");
         let _ = child_shared.inner.lock().poll_transmit();
+        let session_epoch = child_shared.inner.lock().session_epoch();
         inner
             .message_arrived(
                 child.source.clone(),
                 child.generation,
+                session_epoch,
                 &child.consumer,
                 deferred_message(11, chunk_metadata(1), bytes::Bytes::from_static(b"cd"), 1),
             )
@@ -5016,6 +5382,18 @@ mod tests {
             .handle_bytes(std::time::Instant::now(), &frame)
             .expect("reject seek");
         tokio::task::yield_now().await;
+        assert!(
+            inner.state.lock().reconnect_requested,
+            "seek failure fences child loops before close confirmation"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed seek returns while owned teardown retains the child close");
+        assert_eq!(inner.state.lock().children.len(), 1);
 
         let close_request_id = {
             let mut staged = child_shared.inner.lock().poll_transmit();
@@ -5053,8 +5431,15 @@ mod tests {
                 code,
                 message,
             })) if code == magnetar_proto::pb::ServerError::MetadataError as i32
-                && message == "seek failed"
+                 && message == "seek failed"
         ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !inner.state.lock().children.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned seek teardown completes");
 
         let state = inner.state.lock();
         assert_eq!(
@@ -5129,6 +5514,15 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), hook.reached.notified())
             .await
             .expect("outcome worker reaches participant propagation");
+        assert!(
+            inner
+                .state
+                .lock()
+                .tasks
+                .iter()
+                .any(|task| !task.is_finished()),
+            "outcome work is tracked before it can race aggregate close"
+        );
         waiter.abort();
         assert!(waiter.await.expect_err("waiter cancelled").is_cancelled());
         hook.release.notify_one();
@@ -5162,6 +5556,233 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_controls_child_reconnect_ack_state() {
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("attached child")
+            .consumer
+            .clone();
+        let message_id = magnetar_proto::MessageId {
+            ledger_id: 31,
+            entry_id: 41,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let aborted = magnetar_proto::TxnId::new(19, 29);
+        let ack_child = child.clone();
+        let ack = tokio::spawn(async move {
+            ack_child
+                .ack_stream_component(
+                    vec![message_id],
+                    vec![message_id.to_pb()],
+                    magnetar_proto::pb::command_ack::AckType::Individual,
+                    Some(aborted),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let command = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode transactional acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: command.consumer_id,
+                txnid_least_bits: command.txnid_least_bits,
+                txnid_most_bits: command.txnid_most_bits,
+                error: None,
+                message: None,
+                request_id: command.request_id,
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&response))
+            .expect("accept transactional acknowledgement");
+        ack.await.expect("ack task").expect("ack accepted");
+        assert_eq!(child.last_acked_message_id_for_test(), None);
+
+        inner
+            .transaction_outcome(
+                aborted,
+                magnetar_proto::TransactionAcknowledgementOutcome::Aborted,
+            )
+            .await
+            .expect("abort propagation");
+        assert_eq!(child.last_acked_message_id_for_test(), None);
+
+        let committed = magnetar_proto::TxnId::new(20, 30);
+        let ack_child = child.clone();
+        let ack = tokio::spawn(async move {
+            ack_child
+                .ack_stream_component(
+                    vec![message_id],
+                    vec![message_id.to_pb()],
+                    magnetar_proto::pb::command_ack::AckType::Individual,
+                    Some(committed),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let command = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode committed acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: command.consumer_id,
+                txnid_least_bits: command.txnid_least_bits,
+                txnid_most_bits: command.txnid_most_bits,
+                error: None,
+                message: None,
+                request_id: command.request_id,
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&response))
+            .expect("accept committed acknowledgement");
+        ack.await.expect("ack task").expect("ack accepted");
+        assert_eq!(child.last_acked_message_id_for_test(), None);
+
+        inner
+            .transaction_outcome(
+                committed,
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await
+            .expect("commit propagation");
+        assert_eq!(child.last_acked_message_id_for_test(), Some(message_id));
+    }
+
+    #[tokio::test]
+    async fn interrupted_transaction_outcome_retries_retained_close_action() {
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let actions = {
+            let mut state = inner.state.lock();
+            let child = state.children.values().next().expect("attached child");
+            let key = (child.source.segment_id(), child.generation);
+            let flow = magnetar_proto::StreamConsumerAction::GrantFlow {
+                source: child.source.clone(),
+                controller_incarnation: state.model.controller_incarnation(),
+                child_generation: child.generation,
+                reservation: state.flow_reservations[&key],
+                purpose: magnetar_proto::FlowPurpose::Message,
+            };
+            let mut actions = state
+                .model
+                .require_resync()
+                .expect("produce confirmation-bearing close");
+            actions.insert(0, flow);
+            actions
+        };
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                magnetar_proto::StreamConsumerAction::GrantFlow { .. },
+                magnetar_proto::StreamConsumerAction::CloseChild { .. }
+            ]
+        ));
+        let completion = Arc::new(TransactionOutcomeCompletion::new(
+            magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+        ));
+        *completion.work.lock() = Some(TransactionOutcomeWork {
+            actions: actions.into(),
+            completions: VecDeque::new(),
+        });
+        let txn_id = magnetar_proto::TxnId::new(21, 31);
+        let mut first = Box::pin(inner.propagate_transaction_outcome(
+            txn_id,
+            magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            &completion,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(first.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        assert_eq!(inner.state.lock().children.len(), 1);
+        let mut first_staged = child_shared.inner.lock().poll_transmit();
+        let mut first_flows = 0;
+        while !first_staged.is_empty() {
+            if magnetar_proto::decode_one(&mut first_staged)
+                .expect("decode first outcome work")
+                .command
+                .flow
+                .is_some()
+            {
+                first_flows += 1;
+            }
+        }
+        assert_eq!(first_flows, 1);
+
+        let mut retry = Box::pin(inner.propagate_transaction_outcome(
+            txn_id,
+            magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            &completion,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(retry.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let close_request_id = {
+            let mut staged = child_shared.inner.lock().poll_transmit();
+            let mut request_id = None;
+            let mut retried_flows = 0;
+            while !staged.is_empty() {
+                let command = magnetar_proto::decode_one(&mut staged)
+                    .expect("decode child close")
+                    .command;
+                if let Some(close) = command.close_consumer {
+                    request_id = Some(close.request_id);
+                }
+                if command.flow.is_some() {
+                    retried_flows += 1;
+                }
+            }
+            assert_eq!(retried_flows, 0, "completed FLOW prefix is not replayed");
+            request_id.expect("retry owns a confirmation-bearing close")
+        };
+        let success = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&success))
+            .expect("confirm retried close");
+        retry.await.expect("retained action completes");
+        assert!(inner.state.lock().children.is_empty());
     }
 
     #[test]

@@ -727,12 +727,14 @@ Each layout is accepted atomically only after complete identity, placement, life
 Explicit `BrokerManaged` applies every locally provable barrier but delegates cross-member ancestry to M1 and promises no total order between independent branches.
 
 One manual-FLOW budget covers all active and retiring children rather than multiplying by segment count.
-The exact minimum is `MAX_FRAME_SIZE + 3 * MAX_STREAM_POSITION_SIZE + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 8,454,272 bytes`; examples and the default use 16 MiB.
+It charges queue/ledger nodes, every retained source and canonical ordinary-id allocation, position-vector map nodes, decompression output plus validation slack/workspace, and right-sized selected batch payloads instead of retaining a whole batch backing buffer per member.
+The exact minimum is `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 13,697,152 bytes`; examples and the default use 16 MiB.
 The bound covers memory Magnetar controls or derives from the wire, not arbitrary extra allocation performed inside user-defined `S::Owned` during decoding.
 For a partially dispatched broker batch, only `ack_set`-selected logical members consume aggregate permits; any resulting FLOW debt is repaid on the current wire but never becomes replayable fresh credit after seek or reconnect.
 
 Concurrent `receive` calls linearize reservation/dequeue order, while their futures may complete in another order and per-waiter FIFO is not promised.
 After waiting for its first message, `receive_batch` reserves the complete bounded batch atomically so another receive cannot interleave inside it.
+Cancellation during schema preparation restores the same live delivery token at its original dequeue sequence; if concurrent fencing makes that impossible, the aggregate fails closed into resynchronization instead of silently discarding the delivery.
 
 The API supports individual and batch ack, cumulative or restored `PositionVector` ack, nack, transactional ack, and M1-limited vector seek.
 `StreamMessageId` and `PositionVector` are source-qualified `MSTR` v1 values; `DeliveryToken` is process-local authority, and ordinary `MessageId` carries no scalable segment field.
@@ -740,13 +742,14 @@ Their canonical ordinary `MessageIdData` component is bounded to 64 KiB during b
 Partial-batch deliveries retain the broker's `ack_set`; individual and cumulative acknowledgement update the remaining mask without acknowledging later selected members in the same entry.
 Commit waits for every admitted aggregate operation, a failed registration or ack poisons commit without sending `EndTxn(Commit)`, abort preserves cursors and permits redelivery, and an unknown outcome requires resynchronization.
 A transactional acknowledgement or registration that races aggregate close reports the aggregate as closed after close-owned cleanup.
-One caller owns an in-flight `EndTxn`; after the broker confirms commit or abort, an owned completion task survives caller cancellation and retries only unfinished local propagation without sending the broker command again.
+One caller owns an in-flight `EndTxn`; after the broker confirms commit or abort, an owned completion task survives caller cancellation and checkpoints each completed participant action, so retry resumes only unfinished local propagation without replaying FLOW or sending the broker command again.
 Seek requires every currently owned attached active leaf at the same layout epoch, rejects live receive/delivery/transaction reservations, invalidates old tokens, and cannot cross a topology transition or rewind sealed/remote ancestry.
 Before transmission, chunk positions project to their first chunk and batch positions project to M1's residual `ack_set`, because the M1 broker acts only on `ledger_id`, `entry_id`, and `ack_set`; every child seek is staged before any child response is awaited.
 
 Lost ownership drains already reserved and delivered work without a time limit but within the aggregate budget; gained ownership may remain `PendingOwnership` while another `Exclusive` child is still live.
 Controller and segment routing follows validated broker-authored plaintext or TLS authority directly and fails closed for missing/mismatched authority or proxy-any-broker registration.
 Owned route retirement retains at most 256 logical tombstones to fence recent late events; connection replacement and overflow resynchronize, while physical, peer, or explicit route closure terminates the aggregate.
+Resynchronization fences old child loops before confirmation-bearing teardown, waits for confirmed children and in-flight opens to disappear, and retries replacement registration while M1 still reports the retained member busy.
 Close is definitive for local routes, tasks, and children, but M1 has no scalable-consumer unregister command: broker membership may remain while another pool user keeps the controller connection open.
 See [ADR-0098](specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) and the full [PIP-460 feature notes](docs/pip-features.md#scalable-topics-pip-460--experimental).
 

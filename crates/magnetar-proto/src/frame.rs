@@ -61,6 +61,11 @@ pub const MAGIC_BROKER_ENTRY_METADATA: u16 = 0x0e02;
 /// Maximum frame size we accept on decode. Mirrors the Pulsar default of 5 MiB. Higher layers
 /// may enforce a smaller cap; this is the absolute ceiling enforced by `decode_one`.
 pub const MAX_FRAME_SIZE: usize = 5 * 1024 * 1024;
+/// One output byte reserved so a decoder can distinguish exact EOF from
+/// malformed compressed data that expands past the broker-advertised size.
+pub const DECOMPRESSION_VALIDATION_SLACK: usize = 1;
+/// Smallest zstd window accepted by the runtime decoders.
+pub const ZSTD_MIN_WINDOW_SIZE: usize = 1024;
 
 pub(crate) const TOTAL_SIZE_LEN: usize = 4;
 const CMD_SIZE_LEN: usize = 4;

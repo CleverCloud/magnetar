@@ -55,13 +55,112 @@ fn broker_seek_message_id(mut message_id: pb::MessageIdData) -> pb::MessageIdDat
         && batch_index >= 0
         && batch_size > 0
     {
-        message_id.ack_set =
-            crate::consumer::BatchAckEntry::seek_from(batch_size, batch_index).ack_set_i64();
+        message_id.ack_set = crate::consumer::BatchAckEntry::seek_from_ack_set(
+            batch_size,
+            batch_index,
+            &message_id.ack_set,
+        )
+        .ack_set_i64();
     }
     message_id.batch_index = None;
     message_id.batch_size = None;
     message_id.first_chunk_message_id = None;
     message_id
+}
+
+fn plain_ack_message_ids(
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    ack.message_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            message_id_data
+                .and_then(|ids| ids.get(index))
+                .cloned()
+                .unwrap_or_else(|| id.to_pb())
+        })
+        .collect()
+}
+
+fn apply_local_ack_state(
+    consumer: &mut crate::consumer::ConsumerState,
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    for id in &ack.message_ids {
+        if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+            tracker.remove(id);
+        }
+        if let Some(tracker) = consumer.nack_tracker.as_mut() {
+            tracker.remove(id);
+        }
+        #[cfg(feature = "scalable-topics")]
+        consumer.canonical_nack_ids.remove(id);
+        if consumer
+            .last_acked_message_id
+            .is_none_or(|previous| *id > previous)
+        {
+            consumer.last_acked_message_id = Some(*id);
+        }
+    }
+    apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
+}
+
+fn apply_batch_ack_state(
+    batch_ack_tracker: &mut rustc_hash::FxHashMap<(u64, u64), crate::consumer::BatchAckEntry>,
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    let mut ids = plain_ack_message_ids(ack, message_id_data);
+    for (id, pb_id) in ack.message_ids.iter().zip(&mut ids) {
+        if id.batch_index < 0 {
+            continue;
+        }
+        let key = (id.ledger_id, id.entry_id);
+        if !batch_ack_tracker.contains_key(&key)
+            && let Some(batch_size) = pb_id.batch_size
+            && batch_size > 0
+        {
+            batch_ack_tracker.insert(
+                key,
+                crate::consumer::BatchAckEntry::from_ack_set(batch_size, &pb_id.ack_set),
+            );
+        }
+        pb_id.ack_set.clear();
+        let fully = batch_ack_tracker.get_mut(&key).is_none_or(|entry| {
+            let fully = if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
+                entry.ack_position(id.batch_index)
+            } else {
+                entry.ack_cumulative(id.batch_index)
+            };
+            if !fully {
+                pb_id.ack_set = entry.ack_set_i64();
+            }
+            fully
+        });
+        if fully {
+            batch_ack_tracker.remove(&key);
+        }
+    }
+    if !matches!(ack.ack_type, pb::command_ack::AckType::Individual)
+        && let Some(horizon) = ack
+            .message_ids
+            .iter()
+            .max()
+            .map(|id| (id.ledger_id, id.entry_id))
+    {
+        batch_ack_tracker.retain(|key, _| *key >= horizon);
+        let horizon_is_partial = ack
+            .message_ids
+            .iter()
+            .any(|id| (id.ledger_id, id.entry_id) == horizon && id.batch_index >= 0);
+        if !horizon_is_partial {
+            batch_ack_tracker.remove(&horizon);
+        }
+    }
+    ids
 }
 
 /// The central sans-io state machine.
@@ -5189,170 +5288,8 @@ impl Connection {
     ) -> RequestId {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
-        // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
-        // (caller may have nacked then acked the same id). Also remember the highest acked
-        // id so [`Self::rebuild_consumers`] resumes from the post-ack position after a
-        // reconnect.
-        if let Some(slot) = self.consumers.get(&handle) {
-            let mut consumer = slot.state.lock();
-            for id in &ack.message_ids {
-                if let Some(t) = consumer.unacked_tracker.as_mut() {
-                    t.remove(id);
-                }
-                if let Some(t) = consumer.nack_tracker.as_mut() {
-                    t.remove(id);
-                }
-                #[cfg(feature = "scalable-topics")]
-                consumer.canonical_nack_ids.remove(id);
-                // Track the highest acked id. `MessageId` derives `Ord` and orders on
-                // `(ledger_id, entry_id, partition, batch_index, batch_size)`, which matches the
-                // broker's cursor order on the leading `(ledger_id, entry_id)` pair.
-                if consumer.last_acked_message_id.is_none_or(|prev| *id > prev) {
-                    consumer.last_acked_message_id = Some(*id);
-                }
-            }
-        }
-        // PIP-54: for any message id with `batch_index >= 0`, look up the per-batch ack
-        // tracker, clear the bit at `batch_index`, and emit either a "full" MessageIdData
-        // (no ack_set; the batch is now fully acked, so the broker can advance the cursor
-        // past it) or a partial-ack MessageIdData carrying the bitset of still-unacked
-        // positions so the broker holds the cursor.
-        let pb_ids: Vec<pb::MessageIdData> =
-            if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
-                if let Some(slot) = self.consumers.get(&handle) {
-                    let mut consumer = slot.state.lock();
-                    ack.message_ids
-                        .iter()
-                        .enumerate()
-                        .map(|(index, id)| {
-                            let mut pb_id = message_id_data
-                                .as_ref()
-                                .and_then(|ids| ids.get(index))
-                                .cloned()
-                                .unwrap_or_else(|| id.to_pb());
-                            if id.batch_index >= 0 {
-                                let key = (id.ledger_id, id.entry_id);
-                                if !consumer.batch_ack_tracker.contains_key(&key)
-                                    && let Some(batch_size) = pb_id.batch_size
-                                    && batch_size > 0
-                                {
-                                    consumer.batch_ack_tracker.insert(
-                                        key,
-                                        crate::consumer::BatchAckEntry::from_ack_set(
-                                            batch_size,
-                                            &pb_id.ack_set,
-                                        ),
-                                    );
-                                }
-                                pb_id.ack_set.clear();
-                                let fully = if let Some(entry) =
-                                    consumer.batch_ack_tracker.get_mut(&key)
-                                {
-                                    let fully = entry.ack_position(id.batch_index);
-                                    if !fully {
-                                        pb_id.ack_set = entry.ack_set_i64();
-                                    }
-                                    fully
-                                } else {
-                                    // No tracker entry — either the batch's first delivery happened
-                                    // before PIP-54 wiring or the tracker was already cleared by a
-                                    // prior full-batch ack. Fall through as a regular ack.
-                                    true
-                                };
-                                if fully {
-                                    consumer.batch_ack_tracker.remove(&key);
-                                }
-                            }
-                            pb_id
-                        })
-                        .collect()
-                } else {
-                    ack.message_ids
-                        .iter()
-                        .enumerate()
-                        .map(|(index, id)| {
-                            message_id_data
-                                .as_ref()
-                                .and_then(|ids| ids.get(index))
-                                .cloned()
-                                .unwrap_or_else(|| id.to_pb())
-                        })
-                        .collect()
-                }
-            } else {
-                if let Some(slot) = self.consumers.get(&handle) {
-                    let mut consumer = slot.state.lock();
-                    let ids =
-                        ack.message_ids
-                            .iter()
-                            .enumerate()
-                            .map(|(index, id)| {
-                                let mut pb_id = message_id_data
-                                    .as_ref()
-                                    .and_then(|ids| ids.get(index))
-                                    .cloned()
-                                    .unwrap_or_else(|| id.to_pb());
-                                if id.batch_index >= 0 {
-                                    let key = (id.ledger_id, id.entry_id);
-                                    if !consumer.batch_ack_tracker.contains_key(&key)
-                                        && let Some(batch_size) = pb_id.batch_size
-                                        && batch_size > 0
-                                    {
-                                        consumer.batch_ack_tracker.insert(
-                                            key,
-                                            crate::consumer::BatchAckEntry::from_ack_set(
-                                                batch_size,
-                                                &pb_id.ack_set,
-                                            ),
-                                        );
-                                    }
-                                    pb_id.ack_set.clear();
-                                    let fully = consumer
-                                        .batch_ack_tracker
-                                        .get_mut(&key)
-                                        .is_none_or(|entry| {
-                                            let fully = entry.ack_cumulative(id.batch_index);
-                                            if !fully {
-                                                pb_id.ack_set = entry.ack_set_i64();
-                                            }
-                                            fully
-                                        });
-                                    if fully {
-                                        consumer.batch_ack_tracker.remove(&key);
-                                    }
-                                }
-                                pb_id
-                            })
-                            .collect::<Vec<_>>();
-                    if let Some(horizon) = ack
-                        .message_ids
-                        .iter()
-                        .max()
-                        .map(|id| (id.ledger_id, id.entry_id))
-                    {
-                        consumer.batch_ack_tracker.retain(|key, _| *key >= horizon);
-                        let horizon_is_partial = ack.message_ids.iter().any(|id| {
-                            (id.ledger_id, id.entry_id) == horizon && id.batch_index >= 0
-                        });
-                        if !horizon_is_partial {
-                            consumer.batch_ack_tracker.remove(&horizon);
-                        }
-                    }
-                    ids
-                } else {
-                    ack.message_ids
-                        .iter()
-                        .enumerate()
-                        .map(|(index, id)| {
-                            message_id_data
-                                .as_ref()
-                                .and_then(|ids| ids.get(index))
-                                .cloned()
-                                .unwrap_or_else(|| id.to_pb())
-                        })
-                        .collect()
-                }
-            };
+        let ack_type = ack.ack_type;
+        let txn_id = ack.txn_id;
         let properties: Vec<pb::KeyLongValue> = ack
             .properties
             .iter()
@@ -5361,14 +5298,57 @@ impl Connection {
                 value: *v as u64,
             })
             .collect();
+        let pb_ids = if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            if let Some(txn_id) = txn_id {
+                let initial_batch_state: Vec<_> = ack
+                    .message_ids
+                    .iter()
+                    .filter(|id| id.batch_index >= 0)
+                    .map(|id| (id.ledger_id, id.entry_id))
+                    .map(|key| (key, consumer.batch_ack_tracker.get(&key).cloned()))
+                    .collect();
+                let pending = consumer
+                    .pending_transactional_acks
+                    .entry(txn_id)
+                    .or_insert_with(|| crate::consumer::PendingTransactionalAcks {
+                        batch_ack_tracker: rustc_hash::FxHashMap::default(),
+                        seeded_batch_keys: rustc_hash::FxHashSet::default(),
+                        acknowledgements: Vec::new(),
+                    });
+                for (key, initial) in initial_batch_state {
+                    if pending.seeded_batch_keys.insert(key)
+                        && let Some(initial) = initial
+                    {
+                        pending.batch_ack_tracker.insert(key, initial);
+                    }
+                }
+                let pb_ids = apply_batch_ack_state(
+                    &mut pending.batch_ack_tracker,
+                    &ack,
+                    message_id_data.as_deref(),
+                );
+                pending
+                    .acknowledgements
+                    .push(crate::consumer::PendingTransactionalAck {
+                        request: ack,
+                        message_id_data,
+                    });
+                pb_ids
+            } else {
+                apply_local_ack_state(&mut consumer, &ack, message_id_data.as_deref())
+            }
+        } else {
+            plain_ack_message_ids(&ack, message_id_data.as_deref())
+        };
         let cmd = pb::CommandAck {
             consumer_id: handle.0,
-            ack_type: ack.ack_type as i32,
+            ack_type: ack_type as i32,
             message_id: pb_ids,
             validation_error: None,
             properties,
-            txnid_least_bits: ack.txn_id.map(|t| t.least_sig_bits),
-            txnid_most_bits: ack.txn_id.map(|t| t.most_sig_bits),
+            txnid_least_bits: txn_id.map(|t| t.least_sig_bits),
+            txnid_most_bits: txn_id.map(|t| t.most_sig_bits),
             request_id: Some(request_id.0),
         };
         let base = pb::BaseCommand {
@@ -5389,6 +5369,32 @@ impl Connection {
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
         }
         request_id
+    }
+
+    /// Apply or discard local consumer state held behind transactional ACKs.
+    /// Broker commit/abort has already settled before runtimes call this method.
+    pub fn settle_transactional_acks(
+        &mut self,
+        handle: ConsumerHandle,
+        txn_id: crate::TxnId,
+        committed: bool,
+    ) {
+        let Some(slot) = self.consumers.get(&handle) else {
+            return;
+        };
+        let mut consumer = slot.state.lock();
+        let Some(pending) = consumer.pending_transactional_acks.remove(&txn_id) else {
+            return;
+        };
+        if committed {
+            for acknowledgement in pending.acknowledgements {
+                let _ = apply_local_ack_state(
+                    &mut consumer,
+                    &acknowledgement.request,
+                    acknowledgement.message_id_data.as_deref(),
+                );
+            }
+        }
     }
 
     /// Stage an individual ack into this consumer's ack-grouping tracker. The state
@@ -5721,7 +5727,7 @@ impl Connection {
                 {
                     consumer.canonical_nack_ids.insert(id, data);
                 }
-                for tracker in consumer.nack_tracker.iter_mut() {
+                if let Some(tracker) = &mut consumer.nack_tracker {
                     for &id in &message_ids {
                         tracker.add(id, now);
                     }
@@ -12949,8 +12955,8 @@ mod conn_state_tests {
             ledger_id: 8,
             entry_id: 12,
             partition: Some(2),
-            batch_index: Some(2),
-            ack_set: vec![0b1110],
+            batch_index: Some(1),
+            ack_set: vec![0b0101],
             batch_size: Some(4),
             first_chunk_message_id: None,
         };
@@ -12967,7 +12973,7 @@ mod conn_state_tests {
                 ledger_id: 8,
                 entry_id: 12,
                 partition: Some(2),
-                ack_set: vec![0b1100],
+                ack_set: vec![0b0100],
                 ..Default::default()
             })
         );
@@ -15333,6 +15339,149 @@ mod conn_state_tests {
             .expect("CommandAck");
         assert!(ack.message_id[0].ack_set.is_empty());
         assert!(batch_tracker_keys(&conn, handle).is_empty());
+    }
+
+    #[test]
+    fn transactional_ack_does_not_advance_local_state_before_commit() {
+        let now = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, now, 23, 36);
+        let message_id = MessageId {
+            ledger_id: 23,
+            entry_id: 36,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let txn_id = TxnId::new(7, 11);
+
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![message_id],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            now,
+        );
+
+        {
+            let state = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                state.last_acked_message_id, None,
+                "broker acceptance into a transaction must not advance reconnect state"
+            );
+        }
+        conn.settle_transactional_acks(handle, txn_id, false);
+        conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "an uncommitted transactional acknowledgement must remain timeout-redeliverable"
+        );
+    }
+
+    #[test]
+    fn transactional_ack_applies_local_state_only_after_commit() {
+        let now = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, now, 24, 37);
+        let message_id = MessageId {
+            ledger_id: 24,
+            entry_id: 37,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let txn_id = TxnId::new(8, 12);
+
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![message_id],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            now,
+        );
+        conn.settle_transactional_acks(handle, txn_id, true);
+
+        assert_eq!(
+            conn.consumers[&handle].state.lock().last_acked_message_id,
+            Some(message_id)
+        );
+        conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            0,
+            "commit must remove the acknowledged message from timeout tracking"
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn transactional_partial_batch_ack_defers_the_durable_mask_until_commit() {
+        let now = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let canonical = pb::MessageIdData {
+            ledger_id: 25,
+            entry_id: 38,
+            partition: Some(-1),
+            batch_index: Some(0),
+            ack_set: vec![0b101],
+            batch_size: Some(3),
+            first_chunk_message_id: None,
+        };
+        let txn_id = TxnId::new(9, 13);
+        {
+            let mut state = conn.consumers[&handle].state.lock();
+            for entry_id in 0..256 {
+                state.batch_ack_tracker.insert(
+                    (99, entry_id),
+                    crate::consumer::BatchAckEntry::from_ack_set(3, &[0b111]),
+                );
+            }
+        }
+
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&canonical)],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            vec![canonical],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode transactional partial acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, vec![0b100]);
+        {
+            let state = conn.consumers[&handle].state.lock();
+            assert!(
+                !state.batch_ack_tracker.contains_key(&(25, 38)),
+                "transaction admission must not create durable batch state"
+            );
+            let pending = &state.pending_transactional_acks[&txn_id];
+            assert_eq!(pending.batch_ack_tracker.len(), 1);
+            assert_eq!(pending.seeded_batch_keys.len(), 1);
+            assert_eq!(state.batch_ack_tracker.len(), 256);
+        }
+
+        conn.settle_transactional_acks(handle, txn_id, true);
+        let state = conn.consumers[&handle].state.lock();
+        assert!(!state.batch_ack_tracker[&(25, 38)].is_unacked(0));
+        assert!(state.batch_ack_tracker[&(25, 38)].is_unacked(2));
+        assert_eq!(state.batch_ack_tracker.len(), 257);
     }
 
     #[test]

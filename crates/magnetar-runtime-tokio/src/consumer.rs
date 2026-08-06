@@ -345,7 +345,7 @@ impl Consumer {
     #[cfg(feature = "scalable-topics")]
     pub(crate) async fn receive_deferred_until_end(
         &self,
-    ) -> Result<Option<magnetar_proto::DeferredIncomingMessage>, ClientError> {
+    ) -> Result<Option<(u64, magnetar_proto::DeferredIncomingMessage)>, ClientError> {
         match (DeferredReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
@@ -373,7 +373,7 @@ impl Consumer {
         post_process_message(message, self.decryptor.as_ref(), action)
     }
 
-    #[cfg(feature = "scalable-topics")]
+    #[cfg(any(feature = "scalable-topics", test))]
     pub(crate) fn close_best_effort(&self) {
         if !self.shared.is_no_driver() && !self.is_closed() {
             {
@@ -385,7 +385,7 @@ impl Consumer {
         }
     }
 
-    #[cfg(feature = "scalable-topics")]
+    #[cfg(any(feature = "scalable-topics", test))]
     pub(crate) fn force_close_best_effort(&self) {
         if !self.shared.is_no_driver() {
             {
@@ -570,6 +570,19 @@ impl Consumer {
         )
     }
 
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn settle_transactional_acks(&self, txn_id: magnetar_proto::TxnId, committed: bool) {
+        self.shared
+            .inner
+            .lock()
+            .settle_transactional_acks(self.handle, txn_id, committed);
+    }
+
+    #[cfg(all(test, feature = "scalable-topics"))]
+    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
+        self.slot.state.lock().last_acked_message_id
+    }
+
     fn ack_many_with_message_id_data(
         &self,
         message_ids: Vec<MessageId>,
@@ -636,8 +649,12 @@ impl Consumer {
     }
 
     #[cfg(feature = "scalable-topics")]
-    pub(crate) fn flow_for_aggregate(&self, fresh: u32, debt: u32) {
+    pub(crate) fn flow_for_aggregate_with_debt(&self, fresh: u32, debt: Option<(u64, u32)>) {
         let mut conn = self.shared.inner.lock();
+        let session_epoch = conn.session_epoch();
+        let debt = debt
+            .filter(|(debt_epoch, _)| *debt_epoch == session_epoch)
+            .map_or(0, |(_, permits)| permits);
         conn.flow_for_aggregate(self.handle, fresh, debt);
         drop(conn);
         self.shared.driver_waker.notify_one();
@@ -800,7 +817,7 @@ impl Consumer {
         self.seek_inner(SeekTarget::MessageId(message_id)).await
     }
 
-    #[cfg(feature = "scalable-topics")]
+    #[cfg(any(feature = "scalable-topics", test))]
     pub(crate) fn stage_seek_to_message_id_data(
         &self,
         message_id: pb::MessageIdData,
@@ -1793,44 +1810,41 @@ impl Drop for DeferredReceiveFut {
 
 #[cfg(feature = "scalable-topics")]
 impl Future for DeferredReceiveFut {
-    type Output = Result<magnetar_proto::DeferredIncomingMessage, ClientError>;
+    type Output = Result<(u64, magnetar_proto::DeferredIncomingMessage), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        loop {
-            let now = std::time::Instant::now();
-            let mut conn = this.shared.inner.lock();
-            if let Some(message) = conn.pop_deferred_message(this.handle, now) {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                drop(conn);
-                this.shared.driver_waker.notify_one();
-                return Poll::Ready(Ok(message));
-            }
-            if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                return Poll::Ready(Err(ClientError::Closed));
-            }
-            if this.stop_at_end && conn.consumer_reached_end_of_topic(this.handle) {
-                if let Some(key) = this.slab_key.take() {
-                    conn.cancel_consumer_receive_waker(this.handle, key);
-                }
-                return Poll::Ready(Err(ClientError::EndOfTopic));
-            }
+        let now = std::time::Instant::now();
+        let mut conn = this.shared.inner.lock();
+        if let Some(message) = conn.pop_deferred_message(this.handle, now) {
+            let session_epoch = conn.session_epoch();
             if let Some(key) = this.slab_key.take() {
                 conn.cancel_consumer_receive_waker(this.handle, key);
             }
-            let key = conn
-                .register_consumer_receive_waker(this.handle, cx.waker().clone())
-                .expect(
-                    "a non-terminal consumer remains registered while its connection is locked",
-                );
-            this.slab_key = Some(key);
-            return Poll::Pending;
+            drop(conn);
+            this.shared.driver_waker.notify_one();
+            return Poll::Ready(Ok((session_epoch, message)));
         }
+        if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        if this.stop_at_end && conn.consumer_reached_end_of_topic(this.handle) {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::EndOfTopic));
+        }
+        if let Some(key) = this.slab_key.take() {
+            conn.cancel_consumer_receive_waker(this.handle, key);
+        }
+        let key = conn
+            .register_consumer_receive_waker(this.handle, cx.waker().clone())
+            .expect("a non-terminal consumer remains registered while its connection is locked");
+        this.slab_key = Some(key);
+        Poll::Pending
     }
 }
 

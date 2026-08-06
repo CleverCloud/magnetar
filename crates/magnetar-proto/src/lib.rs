@@ -163,8 +163,8 @@ pub use crate::event::{
     ConnectionEvent, DriverRetry, GetSchemaResult, IncomingMessage, LookupOutcome,
 };
 pub use crate::frame::{
-    Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
-    decode_one, encode_command, encode_payload,
+    DECOMPRESSION_VALIDATION_SLACK, Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C,
+    MAX_FRAME_SIZE, Payload, ZSTD_MIN_WINDOW_SIZE, decode_one, encode_command, encode_payload,
 };
 pub use crate::health_probe::{
     BrokerEndpointScheme, HealthProbe, broker_authority, broker_endpoint_scheme, probe_authority,
@@ -197,10 +197,10 @@ pub use crate::stream_consumer::{
     BatchArrivalTransition, BudgetError, BudgetReservationId, BudgetReservationOwner, BudgetUse,
     CONTROL_PLANE_CLEANUP_RESERVE, ChildGeneration, ChunkAssemblyTransition, ConsumerInstanceId,
     DELIVERY_AUTHORITY_OVERHEAD, DeliveryEpoch, DeliveryToken, DequeueSequence, FlowBlock,
-    FlowPurpose, MIN_RETAINED_MESSAGE_RESERVATION, ReceiverBudget, ReceiverBudgetState,
-    SegmentPhase, StreamCompleteEntry, StreamConsumerAction, StreamConsumerModel,
-    StreamConsumerModelError, StreamConsumerStatusSnapshot, StreamEntryAcceptance,
-    StreamEntryTransition, StreamQueuedMessage, StreamReceiveState,
+    FlowPurpose, MIN_RETAINED_MESSAGE_RESERVATION, POSITION_COMPONENT_NODE_OVERHEAD,
+    ReceiverBudget, ReceiverBudgetState, SegmentPhase, StreamCompleteEntry, StreamConsumerAction,
+    StreamConsumerModel, StreamConsumerModelError, StreamConsumerStatusSnapshot,
+    StreamEntryAcceptance, StreamEntryTransition, StreamQueuedMessage, StreamReceiveState,
     TransactionAcknowledgementAuthority, TransactionAcknowledgementOutcome,
     TransactionAcknowledgementTransition, TransactionDecision, TransactionOperationId,
 };

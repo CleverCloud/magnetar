@@ -382,6 +382,10 @@ pub struct ConsumerState {
     /// ack carrying this bitset so the broker knows not to advance the cursor past the
     /// batch until every position is acked.
     pub batch_ack_tracker: rustc_hash::FxHashMap<(u64, u64), BatchAckEntry>,
+    /// Local acknowledgement mutations accepted into an open Pulsar transaction.
+    /// They remain isolated from reconnect and redelivery state until commit.
+    pub(crate) pending_transactional_acks:
+        rustc_hash::FxHashMap<crate::TxnId, PendingTransactionalAcks>,
     /// Optional ack-grouping tracker. When configured via
     /// `SubscribeRequest::ack_group_time`, the runtime's `Consumer::ack_grouped` family
     /// stages individual / cumulative acks here and the state machine flushes them as one
@@ -525,6 +529,15 @@ impl BatchAckEntry {
     #[must_use]
     pub fn seek_from(batch_size: i32, position: i32) -> Self {
         let mut entry = Self::fresh(batch_size);
+        entry.clear_before(position.max(0));
+        entry
+    }
+
+    /// Construct the broker seek mask by applying an inclusive suffix to the
+    /// batch members that are still effective in `ack_set`.
+    #[must_use]
+    pub fn seek_from_ack_set(batch_size: i32, position: i32, ack_set: &[i64]) -> Self {
+        let mut entry = Self::from_ack_set(batch_size, ack_set);
         entry.clear_before(position.max(0));
         entry
     }
@@ -916,6 +929,7 @@ impl ConsumerState {
             canonical_nack_ids: rustc_hash::FxHashMap::default(),
             unacked_tracker: None,
             batch_ack_tracker: rustc_hash::FxHashMap::default(),
+            pending_transactional_acks: rustc_hash::FxHashMap::default(),
             ack_tracker: None,
             crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
             // 3 significant digits, auto-resizing — same precision the Java client uses for
@@ -2024,6 +2038,19 @@ impl ConsumerState {
             w.wake();
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTransactionalAck {
+    pub(crate) request: crate::AckRequest,
+    pub(crate) message_id_data: Option<Vec<crate::pb::MessageIdData>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingTransactionalAcks {
+    pub(crate) batch_ack_tracker: rustc_hash::FxHashMap<(u64, u64), BatchAckEntry>,
+    pub(crate) seeded_batch_keys: rustc_hash::FxHashSet<(u64, u64)>,
+    pub(crate) acknowledgements: Vec<PendingTransactionalAck>,
 }
 
 #[cfg(test)]

@@ -741,17 +741,18 @@ Neither mode defines a total order between independent branches; broker FIFO rem
 ### Aggregate receive budget
 
 All children use manual FLOW.
-One aggregate budget covers granted-but-unconsumed permits, encoded and decompressed payload, batch/chunk work, DAG-barrier holding state, delivery leases, source-qualified authority, and retiring children.
+One aggregate budget covers granted-but-unconsumed permits, encoded and decompressed payload, batch/chunk work, queue and ledger nodes, every retained canonical-id/source sidecar, position-map nodes, DAG-barrier holding state, delivery leases, source-qualified authority, and retiring children.
 Adding segments redistributes capacity; it never multiplies the budget by segment count.
 
 The exact minimum is:
 
 ```text
 MAX_FRAME_SIZE
-+ 3 * MAX_STREAM_POSITION_SIZE
++ 5 * MAX_STREAM_POSITION_SIZE
++ 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 8,454,272 bytes
+= 13,697,152 bytes
 ```
 
 The default and examples use 16 MiB.
@@ -768,7 +769,8 @@ Each message is reserved once, and reservation/dequeue order is linearized under
 Callers that need processing completion in dequeue order keep one receive outstanding.
 
 Cancellation before reservation consumes nothing.
-Cancellation after reservation returns an owned delivery synchronously or puts the reservation back in its ordered queue.
+Cancellation after reservation returns an owned delivery synchronously or puts the same authority back at its original dequeue sequence.
+Concurrent fencing that makes restoration impossible requests aggregate resynchronization instead of silently losing the delivery.
 After its first-message wait, a batch reserves and removes its complete count/byte-bounded set atomically, so another receive cannot interleave inside the returned batch.
 
 ### Positions, acknowledgements, transactions, and seek
@@ -790,7 +792,7 @@ Transactional acknowledgement registers every represented `(segment topic, subsc
 Commit waits for all admitted operations.
 Any failed admitted registration or ack permanently poisons commit: `commit_transaction` returns `TransactionPoisoned` and sends no `EndTxn(Commit)`; abort remains available.
 Commit advances participating positions only after confirmation, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails every participant closed and requires resynchronization.
-Once the coordinator confirms commit or abort, an owned completion task records that terminal state and continues only unfinished local participant propagation, so cancellation never causes a second `EndTxn`.
+Once the coordinator confirms commit or abort, an owned completion task records that terminal state and checkpoints each completed local participant action, so cancellation causes neither a second `EndTxn` nor replay of an already-issued FLOW prefix.
 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.
 It rejects an omitted source and any live receive, batch, delivery, or transactional-ack reservation.
@@ -848,6 +850,7 @@ The `scalable` routing bit PIP-473 adds to the PIP-31 transaction commands is se
 
 The assignment-driven aggregate does not drop on a split, merge, add, or removal. It validates the replacement DAG atomically, reconciles the authoritative assignment, opens gained children, drains lost children, and applies the selected ancestry barrier before granting FLOW.
 Controller loss starts an incarnation-fenced replacement lookup/registration flow; an invalid regression or unrouteable replacement moves the aggregate to observable resynchronization-required state rather than accepting stale authority.
+Resynchronization marks reconnect intent before old-child teardown, waits for confirmed children and in-flight opens to finish, and retries a rejected replacement registration while M1 retains the previous member on its physical controller connection.
 
 The low-level raw layout-session API still emits `DagUpdated` and `DagChangedDuringConsume` classifications for diagnostics and `magnetarctl topic-info`-style tooling.
 Those raw events are not the high-level `StreamConsumer` lifecycle contract and are never duplicated into an owned aggregate route.
@@ -902,11 +905,11 @@ The CLI picks it up via `--features magnetarctl/scalable-topics`.
 | Proto            | Complete DAG, aggregate lifecycle/budget, authority, `MSTR`, transaction, and seek suites under `magnetar-proto`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Tokio + Moonpool | Matched runtime integration suites for typed routes, children, receive/ack, ownership, close, and plaintext/TLS controller routing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Stateful fake    | `magnetar-fakes::m1` models controller plus segment endpoints, assignments, ordinary data-plane commands, failures, transactions, drain, and resource counts using generated M1 frames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| Differential     | 14 public aggregate scenarios, eight baseline and six advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Differential     | 22 public aggregate scenarios, nine baseline and thirteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Real M1 e2e      | With `--features scalable-topics`, `e2e_hardened_scalable_stream_consumer_contract` compiles and is discovered; when Docker is available it runs the public builder, typed multi-segment delivery, vector ack, broker-effective inclusive vector-seek replay, transaction commit/abort, single-member split progression in Strict mode, BrokerManaged cross-member behavior, reachable broker-authored authority matching the bootstrap transport, and close residue against `apachepulsar/pulsar:5.0.0-M1`. Broker-controlled assignment timing and the standalone endpoint mean this does not isolate client-side Strict gating, distinguish authority selection from bootstrap fallback, or prove multi-broker routing. |
 
 Focused code, fake, proto, runtime, façade, and differential suites passed for the implementation.
-A local worktree invocation of `check-runtime-test-parity` reported Tokio 400 / Moonpool 400.
+A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 Docker was unavailable on the integration host, so this branch did not execute the real M1 e2e locally; existing CI policy runs the ordinary e2e target when Docker is available.
 
 Sim coverage still executes only `magnetar-runtime-moonpool` and `magnetar-differential`, but the report and hard gate now cover exactly eight crates.

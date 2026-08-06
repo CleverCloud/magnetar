@@ -4,6 +4,8 @@
 
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::too_many_lines)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -14,12 +16,12 @@ use magnetar_proto::{
     AggregatePhase, AggregateTransaction, AggregateTransactionError, AggregateTransactionState,
     ArrivalFailureDisposition, BudgetError, BudgetReservationId, BudgetUse,
     CONTROL_PLANE_CLEANUP_RESERVE, ChildGeneration, ConsumerAssignment, ConsumerInstanceId,
-    ControllerIncarnation, DagSnapshot, DeferredIncomingMessage, DeliveryEpoch, DeliveryToken,
-    FlowBlock, IncomingMessage, KeyRange, MAX_FRAME_SIZE, MessageId, OrderingMode, PositionVector,
-    ReceiverBudget, ReceiverBudgetState, SegmentId, SegmentPhase, StreamConsumerAction,
-    StreamConsumerModel, StreamConsumerModelError, StreamEntryAcceptance, StreamMessageId,
-    StreamReceiveState, TransactionAcknowledgementOutcome, TransactionDecision, TxnId,
-    canonical_segment_topic, pb,
+    ControllerIncarnation, DECOMPRESSION_VALIDATION_SLACK, DagSnapshot, DeferredIncomingMessage,
+    DeliveryEpoch, DeliveryToken, FlowBlock, IncomingMessage, KeyRange, MAX_FRAME_SIZE, MessageId,
+    OrderingMode, PositionVector, ReceiverBudget, ReceiverBudgetState, SegmentId, SegmentPhase,
+    StreamConsumerAction, StreamConsumerModel, StreamConsumerModelError, StreamEntryAcceptance,
+    StreamMessageId, StreamReceiveState, TransactionAcknowledgementOutcome, TransactionDecision,
+    TxnId, canonical_segment_topic, pb,
 };
 use prost::Message as _;
 
@@ -109,7 +111,6 @@ fn assignment_at(epoch: u64, ids: &[u64]) -> ConsumerAssignment {
         .iter()
         .map(|id| {
             let (start, end) = match *id {
-                0 => (0, 65_535),
                 1 => (0, 32_767),
                 2 => (32_768, 65_535),
                 _ => (0, 65_535),
@@ -342,16 +343,21 @@ fn receiver_budget_separates_flow_data_authority_and_cleanup_capacity() {
         Err(BudgetError::MessageTooLargeForBudget { .. })
     ));
 
-    let stale = state
+    let released = state
         .reserve(BudgetUse::BatchAssembly, 1)
         .expect("reserve batch workspace");
-    state.release(stale).expect("release batch workspace");
+    state.release(released).expect("release batch workspace");
     assert!(matches!(
-        state.transfer(stale, BudgetUse::BatchAssembly, BudgetUse::Decompression, 1,),
+        state.transfer(
+            released,
+            BudgetUse::BatchAssembly,
+            BudgetUse::Decompression,
+            1,
+        ),
         Err(BudgetError::UnknownReservation { .. })
     ));
     assert!(matches!(
-        state.release(stale),
+        state.release(released),
         Err(BudgetError::UnknownReservation { .. })
     ));
 
@@ -597,7 +603,7 @@ fn aggregate_model_acknowledgement_seek_resync_and_close_are_one_shot() {
         cumulative
             .components
             .iter()
-            .all(|component| component.cumulative())
+            .all(magnetar_proto::AcknowledgementComponent::cumulative)
     );
     let confirmed = cumulative
         .components
@@ -1721,7 +1727,10 @@ fn receive_state_accounts_transform_work_and_discards_ordinary_and_chunk_entries
     let transform_bytes = ordinary
         .transform_reservation_bytes()
         .expect("bounded transform bytes");
-    assert_eq!(transform_bytes, b"encrypted".len() + 512);
+    assert_eq!(
+        transform_bytes,
+        b"encrypted".len() + 512 + DECOMPRESSION_VALIDATION_SLACK
+    );
     let transform = ordinary_model
         .reserve_decompression(SegmentId(1), generation, transform_bytes)
         .expect("reserve transform workspace");
@@ -1869,6 +1878,113 @@ fn receive_state_accounts_transform_work_and_discards_ordinary_and_chunk_entries
             .len(),
         1
     );
+}
+
+#[test]
+fn repeated_near_limit_batch_ids_exhaust_budget_atomically() {
+    const BATCH_SIZE: usize = 32;
+    const DATA_HEADROOM: usize = 1024 * 1024;
+
+    let mut compact_model = model_with_data_capacity(MAX_FRAME_SIZE + DATA_HEADROOM);
+    let compact_open = compact_model
+        .apply_assignment(assignment(&[1]))
+        .expect("compact assignment");
+    let compact_generation = opened_generation(&compact_open[0]);
+    let compact_flow = compact_model
+        .child_opened(SegmentId(1), compact_generation)
+        .expect("compact child open");
+    let payloads = vec![b"x".as_slice(); BATCH_SIZE];
+    let mut compact_receive = StreamReceiveState::default();
+    let compact = match compact_receive
+        .accept_entry(
+            &mut compact_model,
+            SegmentId(1),
+            compact_generation,
+            flow_reservation(&compact_flow),
+            deferred_entry(
+                69,
+                encoded_batch(&payloads),
+                pb::MessageMetadata {
+                    num_messages_in_batch: Some(BATCH_SIZE as i32),
+                    ..Default::default()
+                },
+                vec![-1],
+                BATCH_SIZE as u32,
+            ),
+        )
+        .expect("accept compact-id batch frame")
+    {
+        StreamEntryAcceptance::Complete(entry) => entry,
+        other => panic!("expected complete compact batch, got {other:?}"),
+    };
+    assert_eq!(
+        compact_receive
+            .finalize_entry(
+                &mut compact_model,
+                SegmentId(1),
+                compact_generation,
+                compact,
+                &[],
+            )
+            .expect("compact-id batch fits the calibrated headroom")
+            .messages
+            .len(),
+        BATCH_SIZE
+    );
+
+    let mut model = model_with_data_capacity(MAX_FRAME_SIZE + DATA_HEADROOM);
+    let open = model
+        .apply_assignment(assignment(&[1]))
+        .expect("large-id assignment");
+    let generation = opened_generation(&open[0]);
+    let flow_actions = model
+        .child_opened(SegmentId(1), generation)
+        .expect("large-id child open");
+    let flow = flow_reservation(&flow_actions);
+    let mut receive = StreamReceiveState::default();
+    let mut entry = deferred_entry(
+        70,
+        encoded_batch(&payloads),
+        pb::MessageMetadata {
+            num_messages_in_batch: Some(BATCH_SIZE as i32),
+            ..Default::default()
+        },
+        vec![-1],
+        BATCH_SIZE as u32,
+    );
+    entry.message_id_data.first_chunk_message_id = Some(Box::new(pb::MessageIdData {
+        ledger_id: 1,
+        entry_id: 69,
+        partition: Some(0),
+        batch_index: Some(-1),
+        ack_set: vec![-1; 5_900],
+        batch_size: None,
+        first_chunk_message_id: None,
+    }));
+    let complete = match receive
+        .accept_entry(&mut model, SegmentId(1), generation, flow, entry)
+        .expect("accept large-id batch frame")
+    {
+        StreamEntryAcceptance::Complete(entry) => entry,
+        other => panic!("expected complete batch, got {other:?}"),
+    };
+    let ordinary_size = complete.message_id_data().encoded_len();
+    assert!(
+        ordinary_size <= magnetar_proto::MAX_ORDINARY_MESSAGE_ID_SIZE,
+        "canonical id uses {ordinary_size} bytes"
+    );
+    assert!(
+        ordinary_size > magnetar_proto::MAX_ORDINARY_MESSAGE_ID_SIZE - 1_024,
+        "canonical id uses {ordinary_size} bytes"
+    );
+    let budget_before = model.status().receiver_budget_used();
+
+    match receive.finalize_entry(&mut model, SegmentId(1), generation, complete, &[]) {
+        Err(StreamConsumerModelError::Budget(BudgetError::Exhausted { .. })) => {}
+        unexpected => panic!("unexpected repeated-id batch result: {unexpected:?}"),
+    }
+    assert_eq!(model.status().receiver_budget_used(), budget_before);
+    assert_eq!(model.status().attached_segments(), 1);
 }
 
 #[test]
