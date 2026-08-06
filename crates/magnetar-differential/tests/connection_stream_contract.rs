@@ -170,6 +170,33 @@ fn complete_ids_drive_partial_ack_nack_seek_and_manual_flow() {
     let ack = commands[0].ack.as_ref().expect("individual ack command");
     assert_eq!(ack.message_id[0].ack_set, vec![0b1101]);
 
+    let txn_id = magnetar_proto::TxnId {
+        most_sig_bits: 1,
+        least_sig_bits: 2,
+    };
+    let transactional_member = complete_id(7, 11, Some(2), Some(4), vec![0b1111]);
+    let mut transactional =
+        ack_request(&transactional_member, pb::command_ack::AckType::Individual);
+    transactional.txn_id = Some(txn_id);
+    let _ = connection.ack_with_message_id_data(
+        handle,
+        transactional,
+        vec![transactional_member],
+        Instant::now(),
+    );
+    let commands = drain_commands(&mut connection);
+    assert_eq!(
+        commands[0]
+            .ack
+            .as_ref()
+            .expect("transactional batch ack")
+            .message_id[0]
+            .ack_set,
+        vec![0b1001]
+    );
+    connection.settle_transactional_acks(handle, txn_id, false);
+    connection.settle_transactional_acks(unknown, txn_id, true);
+
     let cumulative = complete_id(8, 12, Some(3), Some(4), vec![0b1111]);
     let _ = connection.ack_with_message_id_data(
         handle,
@@ -203,7 +230,8 @@ fn complete_ids_drive_partial_ack_nack_seek_and_manual_flow() {
     );
     assert_eq!(drain_commands(&mut connection).len(), 2);
 
-    connection.negative_ack_with_message_id_data(handle, vec![individual.clone()], Instant::now());
+    let nack_now = Instant::now();
+    connection.negative_ack_with_message_id_data(handle, vec![individual.clone()], nack_now);
     assert!(connection.poll_transmit().is_empty());
     connection.negative_ack_with_message_id_data(unknown, vec![ordinary.clone()], Instant::now());
     connection.negative_ack_with_message_id_data(handle, Vec::new(), Instant::now());
@@ -212,6 +240,17 @@ fn complete_ids_drive_partial_ack_nack_seek_and_manual_flow() {
     assert!(redeliver.iter().all(|command| {
         command.r#type == pb::base_command::Type::RedeliverUnacknowledgedMessages as i32
     }));
+    connection.handle_timeout(nack_now + Duration::from_secs(2));
+    let delayed_redelivery = drain_commands(&mut connection);
+    assert_eq!(delayed_redelivery.len(), 1);
+    assert_eq!(
+        delayed_redelivery[0]
+            .redeliver_unacknowledged_messages
+            .as_ref()
+            .expect("delayed canonical redelivery")
+            .message_ids,
+        vec![individual.clone()]
+    );
     connection.negative_ack_with_delay(
         handle,
         MessageId::from_pb(&individual),
@@ -261,6 +300,7 @@ fn complete_ids_drive_partial_ack_nack_seek_and_manual_flow() {
 
 #[test]
 fn batch_masks_and_manual_flow_account_for_broker_selected_members() {
+    assert_eq!(BatchAckEntry::seek_from(4, 2).ack_set_i64(), vec![0b1100]);
     let boundary = BatchAckEntry::from_ack_set(64, &[-1]);
     assert!(boundary.is_unacked(0));
     assert!(boundary.is_unacked(63));
