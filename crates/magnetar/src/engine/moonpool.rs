@@ -336,6 +336,22 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::StreamConsumerB
         })
     }
 
+    fn restore_messages(&self, messages: Vec<super::RawStreamMessage>) {
+        let result = magnetar_runtime_moonpool::StreamConsumer::restore_deliveries(
+            self,
+            messages
+                .into_iter()
+                .map(|message| magnetar_runtime_moonpool::StreamConsumerMessage {
+                    message: message.message,
+                    token: message.token,
+                })
+                .collect(),
+        );
+        if let Err(error) = result {
+            magnetar_runtime_moonpool::StreamConsumer::delivery_restoration_failed(self, &error);
+        }
+    }
+
     fn get_schema<'a>(
         &'a self,
         source: &'a magnetar_proto::SegmentSource,

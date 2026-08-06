@@ -31,11 +31,16 @@ use stream_consumer_support::server::M1SocketCluster;
 
 const TOPIC: &str = "topic://public/default/scaled";
 
+fn two_frame_receiver_budget() -> magnetar::proto::ReceiverBudget {
+    magnetar::proto::ReceiverBudget::bytes(32 * 1024 * 1024)
+        .expect("two-frame differential receive budget")
+}
+
 static ADVANCED_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn advanced_socket_test_guard() -> std::sync::MutexGuard<'static, ()> {
     // LLVM coverage makes these socket-heavy scenarios interfere when the test
-    // harness runs all six independent Tokio runtimes at once.
+    // harness runs all thirteen independent Tokio runtimes at once.
     ADVANCED_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -85,6 +90,7 @@ struct SeekTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct TransactionTrace {
     commit_waited_without_wire_end: bool,
     commit_registrations: usize,
@@ -111,6 +117,7 @@ struct TransactionTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct CancellationTrace {
     ordinary_ack_retried: bool,
     transaction_registration_cancelled: bool,
@@ -150,6 +157,7 @@ struct ChildOpenTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct CloseStateTrace {
     concurrent_close_succeeded: bool,
     receive_closed: bool,
@@ -768,6 +776,7 @@ where
         .subscription("sealed-placement-sub")
         .consumer_name("sealed-placement-member")
         .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe exact-M1 aggregate");
@@ -845,6 +854,7 @@ where
         .subscription("cross-member-sub")
         .consumer_name("cross-member-a")
         .ordering_mode(ordering_mode)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe cross-member parent owner");
@@ -865,6 +875,7 @@ where
         .subscription("cross-member-sub")
         .consumer_name("cross-member-b")
         .ordering_mode(ordering_mode)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe cross-member child owner");
@@ -1053,6 +1064,7 @@ where
             .subscription("vector-seek-sub")
             .consumer_name("vector-seek-member")
             .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+            .receiver_budget(two_frame_receiver_budget())
             .subscribe(),
     )
     .await
@@ -1267,14 +1279,9 @@ where
     let failed_seek_segments = cluster
         .inspect(|fake| command_segments(fake, magnetar::proto::pb::base_command::Type::Seek));
     assert_eq!(failed_seek_segments, vec![1, 2]);
-    assert_eq!(
-        cluster
-            .update(|fake| fake.disconnect_endpoint(Endpoint::Controller))
-            .expect("disconnect controller that M1 cannot unregister"),
-        1,
-        "M1 has no controller-member unregister command; physical replacement releases it"
-    );
-
+    cluster
+        .update(|fake| fake.disconnect_connection(old_controller))
+        .expect("disconnect controller that M1 cannot unregister");
     let mut resync_reasons = Vec::new();
     let replacement_baseline = loop {
         match next_event(&consumer).await {
@@ -1402,6 +1409,7 @@ where
         .subscription("transaction-sub")
         .consumer_name("transaction-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe transaction aggregate");
@@ -1798,7 +1806,7 @@ where
             fake.resource_counts().unacked_messages == 2
         })
         .await;
-    let shared_registration_messages = vec![receive(&consumer).await, receive(&consumer).await];
+    let shared_registration_messages = [receive(&consumer).await, receive(&consumer).await];
     let shared_registration_txn = client
         .new_transaction(Duration::from_secs(30))
         .await
@@ -1937,6 +1945,7 @@ where
         .subscription("failed-finalization-sub")
         .consumer_name("failed-finalization-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe failed-finalization aggregate");
@@ -1957,7 +1966,7 @@ where
             fake.resource_counts().unacked_messages == 2
         })
         .await;
-    let mut failed_finalization_messages = vec![
+    let mut failed_finalization_messages = [
         receive(&failed_finalization_consumer).await,
         receive(&failed_finalization_consumer).await,
     ];
@@ -2045,6 +2054,7 @@ where
         .subscription("unknown-transaction-sub")
         .consumer_name("unknown-transaction-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe unknown-outcome aggregate");
@@ -2126,6 +2136,7 @@ where
         .subscription("abort-finalization-sub")
         .consumer_name("abort-finalization-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe abort-finalization aggregate");
@@ -2146,7 +2157,7 @@ where
             fake.resource_counts().unacked_messages == 2
         })
         .await;
-    let mut abort_messages = vec![receive(&consumer).await, receive(&consumer).await];
+    let mut abort_messages = [receive(&consumer).await, receive(&consumer).await];
     abort_messages.sort_by_key(|message| message.source().segment_id().0);
 
     let confirmed_abort_txn = client
@@ -2340,6 +2351,7 @@ where
         .subscription("cancellation-sub")
         .consumer_name("cancellation-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe cancellation aggregate");
@@ -2361,7 +2373,7 @@ where
             fake.resource_counts().unacked_messages == 2
         })
         .await;
-    let mut messages = vec![receive(&consumer).await, receive(&consumer).await];
+    let mut messages = [receive(&consumer).await, receive(&consumer).await];
     messages.sort_by_key(|message| message.source().segment_id().0);
 
     cluster
@@ -2689,6 +2701,7 @@ where
         .subscription("control-sub")
         .consumer_name("control-a")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe first control-plane member");
@@ -2931,6 +2944,7 @@ where
         .subscription("control-replacement-sub")
         .consumer_name("control-replacement-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe isolated controller-replacement aggregate");
@@ -3094,6 +3108,7 @@ where
         .subscription("delivery-shapes-sub")
         .consumer_name("delivery-shapes-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe delivery-shape aggregate");
@@ -3326,6 +3341,7 @@ where
         .subscription("busy-open-sub")
         .consumer_name("busy-open-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe busy-retry aggregate");
@@ -3468,6 +3484,7 @@ where
         .subscription("concurrent-close-sub")
         .consumer_name("concurrent-close-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe concurrent-close aggregate");
@@ -3544,6 +3561,7 @@ where
         .subscription("failed-close-sub")
         .consumer_name("failed-close-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe failed-close aggregate");
@@ -3616,6 +3634,7 @@ where
         .subscription("malformed-delivery-sub")
         .consumer_name("malformed-delivery-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe malformed-delivery aggregate");
@@ -3692,6 +3711,7 @@ where
         .subscription("dag-watch-recovery-sub")
         .consumer_name("dag-watch-recovery-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe DAG-watch recovery aggregate");
@@ -3810,6 +3830,7 @@ where
         .subscription(subscription)
         .consumer_name(format!("closing-transactional-ack-{suffix}-member"))
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe closing-transactional-ack aggregate");
@@ -3916,6 +3937,7 @@ where
         .subscription("partial-ack-sub")
         .consumer_name("partial-ack-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe partial-ack aggregate");

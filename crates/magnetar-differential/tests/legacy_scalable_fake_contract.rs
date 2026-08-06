@@ -9,9 +9,9 @@ use bytes::{Bytes, BytesMut};
 use magnetar_fakes::ScriptedScalableBroker;
 use magnetar_proto::{decode_one, encode_command, pb};
 
-fn encoded(command: pb::BaseCommand) -> Bytes {
+fn encoded(command: &pb::BaseCommand) -> Bytes {
     let mut bytes = BytesMut::new();
-    encode_command(&mut bytes, &command).expect("encode fake input");
+    encode_command(&mut bytes, command).expect("encode fake input");
     bytes.freeze()
 }
 
@@ -42,14 +42,14 @@ fn legacy_scalable_fake_emits_initial_split_and_merge_layouts() {
 
     let mut malformed = Bytes::from_static(b"not-a-frame");
     assert!(broker.on_client_bytes(&mut malformed).is_empty());
-    let mut ping = encoded(pb::BaseCommand {
+    let mut ping = encoded(&pb::BaseCommand {
         r#type: pb::base_command::Type::Ping as i32,
         ping: Some(pb::CommandPing {}),
         ..Default::default()
     });
     assert!(broker.on_client_bytes(&mut ping).is_empty());
 
-    let mut lookup = encoded(pb::BaseCommand {
+    let mut lookup = encoded(&pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicLookup as i32,
         scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
             session_id: 42,

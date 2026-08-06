@@ -4,6 +4,7 @@
 
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
+#![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -25,16 +26,16 @@ const TOPIC: &str = "topic://public/default/scaled";
 const TRANSACTION_COORDINATOR_TOPIC: &str =
     "persistent://pulsar/system/transaction_coordinator_assign-partition-0";
 
-fn command_bytes(command: pb::BaseCommand) -> Bytes {
+fn command_bytes(command: &pb::BaseCommand) -> Bytes {
     let mut bytes = BytesMut::new();
-    encode_command(&mut bytes, &command).expect("encode command");
+    encode_command(&mut bytes, command).expect("encode command");
     bytes.freeze()
 }
 
 fn send(
     cluster: &mut M1FakeCluster,
     connection: ConnectionId,
-    command: pb::BaseCommand,
+    command: &pb::BaseCommand,
 ) -> Result<(), M1FakeError> {
     let mut bytes = command_bytes(command);
     cluster.handle_bytes(connection, &mut bytes)
@@ -43,7 +44,7 @@ fn send(
 fn send_with_payload(
     cluster: &mut M1FakeCluster,
     connection: ConnectionId,
-    command: pb::BaseCommand,
+    command: &pb::BaseCommand,
 ) -> Result<(), M1FakeError> {
     let metadata = pb::MessageMetadata {
         producer_name: "hostile-contract".to_owned(),
@@ -54,7 +55,7 @@ fn send_with_payload(
     let mut bytes = BytesMut::new();
     encode_payload(
         &mut bytes,
-        &command,
+        command,
         &metadata,
         &Bytes::from_static(b"unexpected"),
     )
@@ -79,7 +80,7 @@ fn connect(cluster: &mut M1FakeCluster, endpoint: Endpoint) -> ConnectionId {
     send(
         cluster,
         connection,
-        pb::BaseCommand {
+        &pb::BaseCommand {
             r#type: pb::base_command::Type::Connect as i32,
             connect: Some(pb::CommandConnect {
                 client_version: "m1-public-contract".to_owned(),
@@ -113,7 +114,7 @@ fn register_member(
     send(
         cluster,
         controller,
-        pb::BaseCommand {
+        &pb::BaseCommand {
             r#type: pb::base_command::Type::ScalableTopicSubscribe as i32,
             scalable_topic_subscribe: Some(pb::CommandScalableTopicSubscribe {
                 request_id,
@@ -587,7 +588,7 @@ fn fake_projects_layout_and_assignment_and_fences_physical_connections() {
     );
     assert_eq!(cluster.resource_counts().connections, 2);
 
-    let mut ping = command_bytes(pb::BaseCommand {
+    let mut ping = command_bytes(&pb::BaseCommand {
         r#type: pb::base_command::Type::Ping as i32,
         ping: Some(pb::CommandPing {}),
         ..Default::default()
@@ -714,7 +715,7 @@ fn production_connection_adapter_round_trips_real_framing() {
         ..Default::default()
     };
     client
-        .handle_bytes(Instant::now(), &command_bytes(producer_success))
+        .handle_bytes(Instant::now(), &command_bytes(&producer_success))
         .expect("mark adapter producer ready");
     let _ = client.poll_event();
     client
@@ -1010,7 +1011,7 @@ fn assignment_plans_are_complete_historical_and_ancestry_aware() {
     send(
         &mut unknown,
         pending_controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             TOPIC,
             "unknown",
             "pending",
@@ -1055,7 +1056,7 @@ fn assignment_plans_are_complete_historical_and_ancestry_aware() {
         send(
             &mut unknown,
             pending_child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &pending_topic,
                 "unknown",
                 "pending",
@@ -1356,7 +1357,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send_with_payload(
             &mut cluster,
             payload_connect,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Connect as i32,
                 connect: Some(pb::CommandConnect {
                     feature_flags: Some(pb::FeatureFlags {
@@ -1374,14 +1375,14 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         .open_connection(Endpoint::Segment(1))
         .expect("open unconnected child endpoint");
     assert!(matches!(
-        send(&mut cluster, unconnected, flow_command(1, 1)),
+        send(&mut cluster, unconnected, &flow_command(1, 1)),
         Err(M1FakeError::HandshakeRequired { .. })
     ));
 
     let child = connect(&mut cluster, Endpoint::Segment(1));
     let topic_one = cluster.segment_topic(1).expect("segment one topic");
     let topic_two = cluster.segment_topic(2).expect("segment two topic");
-    for controller_command in [
+    for controller_command in vec![
         scalable_lookup_command(90, TOPIC),
         scalable_close_command(90),
         scalable_subscribe_command(
@@ -1401,14 +1402,16 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
             "wrong-endpoint",
         ),
         end_transaction_command(90, magnetar_proto::TxnId::new(0, 90), pb::TxnAction::Abort),
-    ] {
+    ]
+    .into_boxed_slice()
+    {
         assert!(matches!(
-            send(&mut cluster, child, controller_command),
+            send(&mut cluster, child, &controller_command),
             Err(M1FakeError::WrongEndpoint { .. })
         ));
     }
     assert!(matches!(
-        send(&mut cluster, child, lookup_command(&topic_one, 1)),
+        send(&mut cluster, child, &lookup_command(&topic_one, 1)),
         Err(M1FakeError::WrongEndpoint {
             expected: Endpoint::Controller,
             actual: Endpoint::Segment(1),
@@ -1419,7 +1422,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic_two,
                 "sub",
                 "member",
@@ -1439,7 +1442,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic_one,
                 "sub",
                 "member",
@@ -1455,7 +1458,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Pong as i32,
                 pong: Some(pb::CommandPong {}),
                 ..Default::default()
@@ -1469,7 +1472,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: i32::MAX,
                 ..Default::default()
             },
@@ -1481,7 +1484,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Connect as i32,
                 connect: Some(pb::CommandConnect::default()),
                 ..Default::default()
@@ -1493,7 +1496,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             child,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Ping as i32,
                 ..Default::default()
             },
@@ -1503,7 +1506,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
     send(
         &mut cluster,
         child,
-        pb::BaseCommand {
+        &pb::BaseCommand {
             r#type: pb::base_command::Type::Ping as i32,
             ping: Some(pb::CommandPing {}),
             ..Default::default()
@@ -1519,7 +1522,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             controller_without_features,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Connect as i32,
                 connect: Some(pb::CommandConnect::default()),
                 ..Default::default()
@@ -1534,7 +1537,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             proxied,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Connect as i32,
                 connect: Some(pb::CommandConnect {
                     proxy_to_broker_url: Some("pulsar://other:6650".to_owned()),
@@ -1557,7 +1560,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut rejecting,
             rejected,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::Connect as i32,
                 connect: Some(pb::CommandConnect {
                     auth_method_name: Some("token".to_owned()),
@@ -1576,7 +1579,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
     send(
         &mut cluster,
         controller,
-        scalable_lookup_command(40, "topic://public/default/other"),
+        &scalable_lookup_command(40, "topic://public/default/other"),
     )
     .expect("unknown scalable lookup receives a response");
     assert!(
@@ -1586,11 +1589,19 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
             .as_ref()
             .is_some_and(|update| update.error.is_some())
     );
-    send(&mut cluster, controller, scalable_lookup_command(41, TOPIC))
-        .expect("open layout session");
+    send(
+        &mut cluster,
+        controller,
+        &scalable_lookup_command(41, TOPIC),
+    )
+    .expect("open layout session");
     assert_eq!(take_frames(&mut cluster, controller).len(), 2);
     assert!(matches!(
-        send(&mut cluster, controller, scalable_lookup_command(41, TOPIC),),
+        send(
+            &mut cluster,
+            controller,
+            &scalable_lookup_command(41, TOPIC),
+        ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     cluster
@@ -1616,15 +1627,16 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         .push_stale_layout(controller, 41, 1)
         .expect("push a retained historical layout");
     let _ = take_frames(&mut cluster, controller);
-    send(&mut cluster, controller, scalable_close_command(41)).expect("close layout session");
-    send(&mut cluster, controller, scalable_close_command(41)).expect("layout close is idempotent");
+    send(&mut cluster, controller, &scalable_close_command(41)).expect("close layout session");
+    send(&mut cluster, controller, &scalable_close_command(41))
+        .expect("layout close is idempotent");
     assert!(cluster.layout_session_ids().is_empty());
     assert!(cluster.resend_layout(controller, 41).is_err());
 
     send(
         &mut cluster,
         controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             "topic://public/default/other",
             "sub",
             "unknown-topic",
@@ -1645,7 +1657,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             controller,
-            scalable_subscribe_command(TOPIC, "sub", "bad-type", 101, 101, i32::MAX),
+            &scalable_subscribe_command(TOPIC, "sub", "bad-type", 101, 101, i32::MAX),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -1653,7 +1665,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         send(
             &mut cluster,
             controller,
-            scalable_subscribe_command(
+            &scalable_subscribe_command(
                 TOPIC,
                 "sub",
                 "checkpoint",
@@ -1668,7 +1680,7 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
     send(
         &mut cluster,
         controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             TOPIC,
             "sub",
             "member",
@@ -1694,11 +1706,11 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     let child = connect(&mut cluster, Endpoint::Segment(1));
 
     assert!(matches!(
-        send_with_payload(&mut cluster, controller, tc_connect_command(90)),
+        send_with_payload(&mut cluster, controller, &tc_connect_command(90)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
-        send_with_payload(&mut cluster, controller, new_transaction_command(91)),
+        send_with_payload(&mut cluster, controller, &new_transaction_command(91)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
 
@@ -1716,7 +1728,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             send(
                 &mut cluster,
                 controller,
-                pb::BaseCommand {
+                &pb::BaseCommand {
                     r#type: command_type as i32,
                     ..Default::default()
                 },
@@ -1737,7 +1749,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             send(
                 &mut cluster,
                 child,
-                pb::BaseCommand {
+                &pb::BaseCommand {
                     r#type: command_type as i32,
                     ..Default::default()
                 },
@@ -1749,7 +1761,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     send(
         &mut cluster,
         controller,
-        lookup_command("persistent://public/default/not-active", 1),
+        &lookup_command("persistent://public/default/not-active", 1),
     )
     .expect("unknown ordinary lookup returns failure");
     assert!(
@@ -1767,10 +1779,10 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("TC connect body")
         .tc_id = 1;
     assert!(matches!(
-        send(&mut cluster, controller, invalid_tc),
+        send(&mut cluster, controller, &invalid_tc),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, controller, tc_connect_command(3)).expect("valid TC connect");
+    send(&mut cluster, controller, &tc_connect_command(3)).expect("valid TC connect");
     let _ = take_frames(&mut cluster, controller);
     let mut missing_ttl = new_transaction_command(4);
     missing_ttl
@@ -1779,10 +1791,10 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("new transaction body")
         .txn_ttl_millis = None;
     assert!(matches!(
-        send(&mut cluster, controller, missing_ttl),
+        send(&mut cluster, controller, &missing_ttl),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, controller, new_transaction_command(5)).expect("allocate wire txn");
+    send(&mut cluster, controller, &new_transaction_command(5)).expect("allocate wire txn");
     let txn = opened_transaction(&take_frames(&mut cluster, controller));
 
     let member = register_member(&mut cluster, controller, "wire-sub", "wire-member", 10, 10);
@@ -1791,7 +1803,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            get_schema_command("persistent://public/default/not-a-segment", 9),
+            &get_schema_command("persistent://public/default/not-a-segment", 9),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -1809,16 +1821,16 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             send(
                 &mut cluster,
                 child,
-                get_schema_command(malformed_attachment, 9),
+                &get_schema_command(malformed_attachment, 9),
             ),
             Err(M1FakeError::InvalidCommand { .. })
         ));
     }
     assert!(matches!(
-        send(&mut cluster, controller, get_schema_command(&topic, 10)),
+        send(&mut cluster, controller, &get_schema_command(&topic, 10)),
         Err(M1FakeError::WrongEndpoint { .. })
     ));
-    send(&mut cluster, child, get_schema_command(&topic, 11)).expect("resolve segment schema");
+    send(&mut cluster, child, &get_schema_command(&topic, 11)).expect("resolve segment schema");
     let schema = take_frames(&mut cluster, child)
         .into_iter()
         .find_map(|frame| frame.command.get_schema_response)
@@ -1833,7 +1845,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 "persistent://public/default/not-a-segment",
                 "wire-sub",
                 "wire-member",
@@ -1849,7 +1861,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic,
                 "unassigned-sub",
                 "wire-member",
@@ -1865,7 +1877,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic,
                 "wire-sub",
                 "wrong-name",
@@ -1880,7 +1892,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "wire-sub",
             "wire-member",
@@ -1896,7 +1908,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send_with_payload(
             &mut cluster,
             controller,
-            add_subscription_to_transaction_command(92, txn, &topic, "wire-sub"),
+            &add_subscription_to_transaction_command(92, txn, &topic, "wire-sub"),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -1904,7 +1916,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send_with_payload(
             &mut cluster,
             controller,
-            end_transaction_command(93, txn, pb::TxnAction::Abort),
+            &end_transaction_command(93, txn, pb::TxnAction::Abort),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -1917,7 +1929,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .subscription
         .clear();
     assert!(matches!(
-        send(&mut cluster, controller, empty_registration),
+        send(&mut cluster, controller, &empty_registration),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let topic_two = cluster.segment_topic(2).expect("segment two topic");
@@ -1925,7 +1937,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             controller,
-            add_subscription_to_transaction_command(95, txn, &topic_two, "wire-sub"),
+            &add_subscription_to_transaction_command(95, txn, &topic_two, "wire-sub"),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -1936,7 +1948,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("EndTxn body")
         .txn_action = None;
     assert!(matches!(
-        send(&mut cluster, controller, missing_action),
+        send(&mut cluster, controller, &missing_action),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut partial_end = end_transaction_command(196, txn, pb::TxnAction::Abort);
@@ -1946,19 +1958,19 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("EndTxn body")
         .txnid_least_bits = None;
     assert!(matches!(
-        send(&mut cluster, controller, partial_end),
+        send(&mut cluster, controller, &partial_end),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
         send(
             &mut cluster,
             controller,
-            end_transaction_command(97, magnetar_proto::TxnId::new(99, 99), pb::TxnAction::Abort,),
+            &end_transaction_command(97, magnetar_proto::TxnId::new(99, 99), pb::TxnAction::Abort,),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
-        send(&mut cluster, child, {
+        send(&mut cluster, child, &{
             let mut command = segment_subscribe_command(
                 &topic,
                 "wire-sub",
@@ -1981,7 +1993,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic,
                 "wire-sub",
                 "wire-member",
@@ -1994,17 +2006,19 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
-        send(&mut cluster, child, flow_command(999, 1)),
+        send(&mut cluster, child, &flow_command(999, 1)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    for unknown_child_command in [
+    for unknown_child_command in vec![
         ack_command(999, 114, pb::MessageIdData::default()),
         redeliver_command(999, pb::MessageIdData::default()),
         seek_command(999, 115, pb::MessageIdData::default()),
         close_command(999, 116),
-    ] {
+    ]
+    .into_boxed_slice()
+    {
         assert!(matches!(
-            send(&mut cluster, child, unknown_child_command),
+            send(&mut cluster, child, &unknown_child_command),
             Err(M1FakeError::InvalidCommand { .. })
         ));
     }
@@ -2013,7 +2027,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     send(
         &mut cluster,
         competing,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "wire-sub",
             "wire-member",
@@ -2041,7 +2055,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             .enqueue_message(1, Bytes::copy_from_slice(payload))
             .expect("enqueue wire message");
     }
-    send(&mut cluster, child, flow_command(11, 3)).expect("deliver wire messages");
+    send(&mut cluster, child, &flow_command(11, 3)).expect("deliver wire messages");
     let delivered = take_frames(&mut cluster, child)
         .into_iter()
         .filter_map(|frame| frame.command.message.map(|message| message.message_id))
@@ -2055,7 +2069,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("seek body")
         .message_publish_time = Some(1);
     assert!(matches!(
-        send(&mut cluster, child, publish_time_seek),
+        send(&mut cluster, child, &publish_time_seek),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut wrong_segment_seek = delivered[0].clone();
@@ -2064,47 +2078,47 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            seek_command(11, 21, wrong_segment_seek)
+            &seek_command(11, 21, wrong_segment_seek)
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut beyond_seek = delivered[0].clone();
     beyond_seek.entry_id = 99;
     assert!(matches!(
-        send(&mut cluster, child, seek_command(11, 22, beyond_seek)),
+        send(&mut cluster, child, &seek_command(11, 22, beyond_seek)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
 
     let mut partial_txn = ack_command(11, 30, delivered[0].clone());
     partial_txn.ack.as_mut().expect("ACK body").txnid_most_bits = Some(0);
     assert!(matches!(
-        send(&mut cluster, child, partial_txn),
+        send(&mut cluster, child, &partial_txn),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut no_request = transactional_ack_command(11, 31, txn, delivered[0].clone());
     no_request.ack.as_mut().expect("ACK body").request_id = None;
     assert!(matches!(
-        send(&mut cluster, child, no_request),
+        send(&mut cluster, child, &no_request),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
         send(
             &mut cluster,
             child,
-            transactional_ack_command(11, 32, txn, delivered[0].clone()),
+            &transactional_ack_command(11, 32, txn, delivered[0].clone()),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut unknown_type = ack_command(11, 33, delivered[0].clone());
     unknown_type.ack.as_mut().expect("ACK body").ack_type = i32::MAX;
     assert!(matches!(
-        send(&mut cluster, child, unknown_type),
+        send(&mut cluster, child, &unknown_type),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut empty_ack = ack_command(11, 34, delivered[0].clone());
     empty_ack.ack.as_mut().expect("ACK body").message_id.clear();
     assert!(matches!(
-        send(&mut cluster, child, empty_ack),
+        send(&mut cluster, child, &empty_ack),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut cumulative = ack_command(11, 35, delivered[0].clone());
@@ -2112,19 +2126,19 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     cumulative_body.ack_type = pb::command_ack::AckType::Cumulative as i32;
     cumulative_body.message_id.push(delivered[1].clone());
     assert!(matches!(
-        send(&mut cluster, child, cumulative),
+        send(&mut cluster, child, &cumulative),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut wrong_ledger = ack_command(11, 36, delivered[0].clone());
     wrong_ledger.ack.as_mut().expect("ACK body").message_id[0].ledger_id = 2;
     assert!(matches!(
-        send(&mut cluster, child, wrong_ledger),
+        send(&mut cluster, child, &wrong_ledger),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut wrong_identity = ack_command(11, 37, delivered[0].clone());
     wrong_identity.ack.as_mut().expect("ACK body").message_id[0].partition = Some(1);
     assert!(matches!(
-        send(&mut cluster, child, wrong_identity),
+        send(&mut cluster, child, &wrong_identity),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut duplicate = ack_command(11, 38, delivered[0].clone());
@@ -2135,7 +2149,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .message_id
         .push(delivered[0].clone());
     assert!(matches!(
-        send(&mut cluster, child, duplicate),
+        send(&mut cluster, child, &duplicate),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut wrong_first_chunk = delivered[1].clone();
@@ -2146,7 +2160,11 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         ..Default::default()
     }));
     assert!(matches!(
-        send(&mut cluster, child, ack_command(11, 138, wrong_first_chunk)),
+        send(
+            &mut cluster,
+            child,
+            &ack_command(11, 138, wrong_first_chunk)
+        ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let mut reversed_chunk_range = delivered[1].clone();
@@ -2160,20 +2178,20 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut cluster,
             child,
-            ack_command(11, 139, reversed_chunk_range)
+            &ack_command(11, 139, reversed_chunk_range)
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
 
     let mut silent_ack = ack_command(11, 39, delivered[0].clone());
     silent_ack.ack.as_mut().expect("ACK body").request_id = None;
-    send(&mut cluster, child, silent_ack).expect("silent individual ACK");
+    send(&mut cluster, child, &silent_ack).expect("silent individual ACK");
     assert!(take_frames(&mut cluster, child).is_empty());
     assert!(matches!(
         send(
             &mut cluster,
             child,
-            ack_command(11, 40, delivered[0].clone()),
+            &ack_command(11, 40, delivered[0].clone()),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -2187,7 +2205,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .message_ids[0]
         .ledger_id = 2;
     assert!(matches!(
-        send(&mut cluster, child, wrong_redelivery),
+        send(&mut cluster, child, &wrong_redelivery),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     redeliver_all
@@ -2196,7 +2214,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("redelivery body")
         .message_ids
         .clear();
-    send(&mut cluster, child, redeliver_all).expect("redeliver all unacked messages");
+    send(&mut cluster, child, &redeliver_all).expect("redeliver all unacked messages");
 
     cluster
         .script_next(
@@ -2205,13 +2223,13 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             ScriptedBehavior::Delay,
         )
         .expect("delay close for fencing");
-    send(&mut cluster, child, close_command(11, 41)).expect("hold close");
+    send(&mut cluster, child, &close_command(11, 41)).expect("hold close");
     assert!(matches!(
-        send(&mut cluster, child, flow_command(11, 1)),
+        send(&mut cluster, child, &flow_command(11, 1)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     assert!(matches!(
-        send(&mut cluster, child, close_command(11, 42)),
+        send(&mut cluster, child, &close_command(11, 42)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     cluster
@@ -2219,7 +2237,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         .expect("disconnect cancels delayed close");
     assert!(cluster.pending_operations().is_empty());
     assert!(matches!(
-        send(&mut cluster, child, flow_command(11, 1)),
+        send(&mut cluster, child, &flow_command(11, 1)),
         Err(M1FakeError::Disconnected(_))
     ));
     assert!(matches!(
@@ -2238,7 +2256,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     send(
         &mut cluster,
         pending_controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             TOPIC,
             "disconnect-sub",
             "disconnect-member",
@@ -2272,7 +2290,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut unplaced,
             unplaced_child,
-            get_schema_command(&sealed_topic, 98),
+            &get_schema_command(&sealed_topic, 98),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -2280,7 +2298,7 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         send(
             &mut unplaced,
             unplaced_child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &sealed_topic,
                 "unplaced-sub",
                 "unplaced-member",
@@ -2309,7 +2327,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             TOPIC,
             "delayed-sub",
             "failed-member",
@@ -2347,7 +2365,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         controller,
-        scalable_subscribe_command(
+        &scalable_subscribe_command(
             TOPIC,
             "delayed-sub",
             "member",
@@ -2375,7 +2393,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "delayed-sub",
             "member",
@@ -2408,7 +2426,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "delayed-sub",
             "member",
@@ -2428,7 +2446,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     cluster
         .enqueue_message(1, Bytes::from_static(b"delayed-operations"))
         .expect("enqueue child message");
-    send(&mut cluster, child, flow_command(11, 1)).expect("grant one permit");
+    send(&mut cluster, child, &flow_command(11, 1)).expect("grant one permit");
     let delivered = take_frames(&mut cluster, child);
     let delivered_id = message_id(&delivered);
 
@@ -2442,7 +2460,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        ack_command(11, 12, delivered_id.clone()),
+        &ack_command(11, 12, delivered_id.clone()),
     )
     .expect("hold acknowledgement");
     let delayed = cluster.pending_operations()[0].id;
@@ -2472,7 +2490,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        ack_command(11, 13, delivered_id.clone()),
+        &ack_command(11, 13, delivered_id.clone()),
     )
     .expect("hold acknowledgement retry");
     let delayed = cluster.pending_operations()[0].id;
@@ -2491,7 +2509,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        seek_command(11, 14, delivered_id.clone()),
+        &seek_command(11, 14, delivered_id.clone()),
     )
     .expect("hold seek");
     let delayed = cluster.pending_operations()[0].id;
@@ -2513,7 +2531,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
             ScriptedBehavior::Delay,
         )
         .expect("delay successful seek");
-    send(&mut cluster, child, seek_command(11, 15, delivered_id)).expect("hold successful seek");
+    send(&mut cluster, child, &seek_command(11, 15, delivered_id)).expect("hold successful seek");
     let delayed = cluster.pending_operations()[0].id;
     cluster
         .complete_pending(delayed, PendingCompletion::Succeed)
@@ -2523,7 +2541,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "delayed-sub",
             "member",
@@ -2542,7 +2560,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
             ScriptedBehavior::Delay,
         )
         .expect("delay close");
-    send(&mut cluster, child, close_command(12, 17)).expect("hold close");
+    send(&mut cluster, child, &close_command(12, 17)).expect("hold close");
     let delayed = cluster.pending_operations()[0].id;
     cluster
         .complete_pending(
@@ -2561,7 +2579,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
             ScriptedBehavior::Delay,
         )
         .expect("delay close retry");
-    send(&mut cluster, child, close_command(12, 18)).expect("hold close retry");
+    send(&mut cluster, child, &close_command(12, 18)).expect("hold close retry");
     let delayed = cluster.pending_operations()[0].id;
     cluster
         .complete_pending(delayed, PendingCompletion::Succeed)
@@ -2591,7 +2609,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
     send(
         &mut duplicate,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic_one,
             "duplicate",
             "member",
@@ -2606,7 +2624,7 @@ fn delayed_child_operations_commit_only_after_explicit_completion() {
         send(
             &mut duplicate,
             child,
-            segment_subscribe_command(
+            &segment_subscribe_command(
                 &topic_two,
                 "duplicate",
                 "member",
@@ -2640,7 +2658,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     send(
         &mut retry_cluster,
         retry_child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &retry_topic,
             "retry-sub",
             "retry-member",
@@ -2688,7 +2706,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "fence-sub",
             "member-a",
@@ -2732,7 +2750,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "fence-sub",
             "member-b",
@@ -2747,7 +2765,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "fence-sub",
             "member-b",
@@ -2762,7 +2780,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     cluster
         .enqueue_message(1, Bytes::from_static(b"stale-operations"))
         .expect("enqueue stale-operation delivery");
-    send(&mut cluster, child, flow_command(12, 1)).expect("FLOW stale-operation delivery");
+    send(&mut cluster, child, &flow_command(12, 1)).expect("FLOW stale-operation delivery");
     let delivered = message_id(&take_frames(&mut cluster, child));
 
     cluster
@@ -2775,7 +2793,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
         )
         .expect("move segment away from active child");
     assert!(matches!(
-        send(&mut cluster, child, flow_command(12, 1)),
+        send(&mut cluster, child, &flow_command(12, 1)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
 
@@ -2786,7 +2804,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
             ScriptedBehavior::Delay,
         )
         .expect("delay stale acknowledgement");
-    send(&mut cluster, child, ack_command(12, 6, delivered.clone()))
+    send(&mut cluster, child, &ack_command(12, 6, delivered.clone()))
         .expect("hold stale acknowledgement");
     cluster
         .script_next(
@@ -2795,9 +2813,9 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
             ScriptedBehavior::Delay,
         )
         .expect("delay stale close");
-    send(&mut cluster, child, close_command(12, 7)).expect("hold stale close");
+    send(&mut cluster, child, &close_command(12, 7)).expect("hold stale close");
     assert!(matches!(
-        send(&mut cluster, child, seek_command(12, 8, delivered)),
+        send(&mut cluster, child, &seek_command(12, 8, delivered)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let pending_ack = cluster
@@ -2824,16 +2842,16 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
         Err(M1FakeError::StalePending(id)) if id == pending_close
     ));
     assert!(matches!(
-        send(&mut cluster, child, flow_command(12, 1)),
+        send(&mut cluster, child, &flow_command(12, 1)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, child, close_command(12, 9)).expect("close stale child after fencing");
+    send(&mut cluster, child, &close_command(12, 9)).expect("close stale child after fencing");
     let _ = take_frames(&mut cluster, child);
 
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "fence-sub",
             "member-a",
@@ -2847,7 +2865,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     let _ = take_frames(&mut cluster, child);
     let mut rewind = seek_command(13, 11, pb::MessageIdData::default());
     rewind.seek.as_mut().expect("seek body").message_id = None;
-    send(&mut cluster, child, rewind).expect("seek replacement child to earliest");
+    send(&mut cluster, child, &rewind).expect("seek replacement child to earliest");
     assert!(
         take_frames(&mut cluster, child)[0]
             .command
@@ -2878,7 +2896,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "lifecycle",
             "member",
@@ -2896,11 +2914,11 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     cluster
         .enqueue_message(1, Bytes::from_static(b"second"))
         .expect("enqueue second");
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW first delivery");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW first delivery");
     let first = take_frames(&mut cluster, child);
     let first_id = message_id(&first);
-    send(&mut cluster, child, redeliver_command(7, first_id.clone())).expect("request redelivery");
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW redelivery");
+    send(&mut cluster, child, &redeliver_command(7, first_id.clone())).expect("request redelivery");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW redelivery");
     let replay = take_frames(&mut cluster, child);
     assert_eq!(
         replay
@@ -2909,7 +2927,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
             .and_then(|message| message.redelivery_count),
         Some(1)
     );
-    send(&mut cluster, child, ack_command(7, 2, first_id.clone()))
+    send(&mut cluster, child, &ack_command(7, 2, first_id.clone()))
         .expect("acknowledge first entry");
     assert!(
         take_frames(&mut cluster, child)[0]
@@ -2917,7 +2935,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
             .ack_response
             .is_some()
     );
-    send(&mut cluster, child, seek_command(7, 3, first_id)).expect("seek child cursor");
+    send(&mut cluster, child, &seek_command(7, 3, first_id)).expect("seek child cursor");
     assert!(
         take_frames(&mut cluster, child)[0]
             .command
@@ -2927,7 +2945,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "lifecycle",
             "member",
@@ -2939,7 +2957,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     )
     .expect("reopen after seek");
     let _ = take_frames(&mut cluster, child);
-    send(&mut cluster, child, flow_command(7, 2)).expect("FLOW replayed entries");
+    send(&mut cluster, child, &flow_command(7, 2)).expect("FLOW replayed entries");
     assert_eq!(
         take_frames(&mut cluster, child)
             .iter()
@@ -2958,7 +2976,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
         cluster.enqueue_message(1, Bytes::from_static(b"late")),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, child, close_command(7, 5)).expect("close child");
+    send(&mut cluster, child, &close_command(7, 5)).expect("close child");
     assert!(
         take_frames(&mut cluster, child)[0]
             .command
@@ -2978,7 +2996,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     send(
         &mut sparse,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "sparse",
             "member",
@@ -2996,20 +3014,20 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     sparse
         .enqueue_message(1, Bytes::from_static(b"one"))
         .expect("enqueue sparse one");
-    send(&mut sparse, child, flow_command(1, 2)).expect("deliver sparse messages");
+    send(&mut sparse, child, &flow_command(1, 2)).expect("deliver sparse messages");
     let delivered: Vec<_> = take_frames(&mut sparse, child)
         .into_iter()
         .filter_map(|frame| frame.command.message.map(|message| message.message_id))
         .collect();
-    send(&mut sparse, child, ack_command(1, 2, delivered[1].clone()))
+    send(&mut sparse, child, &ack_command(1, 2, delivered[1].clone()))
         .expect("acknowledge the sparse second entry");
     let _ = take_frames(&mut sparse, child);
-    send(&mut sparse, child, close_command(1, 3)).expect("close sparse child");
+    send(&mut sparse, child, &close_command(1, 3)).expect("close sparse child");
     let _ = take_frames(&mut sparse, child);
     send(
         &mut sparse,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "sparse",
             "member",
@@ -3021,7 +3039,7 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
     )
     .expect("reopen sparse-ack child");
     let _ = take_frames(&mut sparse, child);
-    send(&mut sparse, child, flow_command(2, 2)).expect("skip sparse acknowledged entry");
+    send(&mut sparse, child, &flow_command(2, 2)).expect("skip sparse acknowledged entry");
     assert_eq!(
         take_frames(&mut sparse, child)
             .iter()
@@ -3041,7 +3059,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         child,
-        segment_subscribe_command(
+        &segment_subscribe_command(
             &topic,
             "txn-sub",
             "txn-member",
@@ -3057,7 +3075,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        lookup_command(TRANSACTION_COORDINATOR_TOPIC, 10),
+        &lookup_command(TRANSACTION_COORDINATOR_TOPIC, 10),
     )
     .expect("lookup transaction coordinator");
     assert!(
@@ -3066,7 +3084,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
             .lookup_topic_response
             .is_some()
     );
-    send(&mut cluster, controller, tc_connect_command(11)).expect("connect transaction client");
+    send(&mut cluster, controller, &tc_connect_command(11)).expect("connect transaction client");
     assert!(
         take_frames(&mut cluster, controller)[0]
             .command
@@ -3078,7 +3096,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         send(
             &mut cluster,
             controller,
-            pb::BaseCommand {
+            &pb::BaseCommand {
                 r#type: pb::base_command::Type::NewTxn as i32,
                 new_txn: Some(pb::CommandNewTxn {
                     request_id: 12,
@@ -3091,7 +3109,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, controller, new_transaction_command(13)).expect("allocate commit txn");
+    send(&mut cluster, controller, &new_transaction_command(13)).expect("allocate commit txn");
     let commit_txn = opened_transaction(&take_frames(&mut cluster, controller));
 
     let mut partial_id = add_subscription_to_transaction_command(14, commit_txn, &topic, "txn-sub");
@@ -3101,7 +3119,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         .expect("registration body")
         .txnid_least_bits = None;
     assert!(matches!(
-        send(&mut cluster, controller, partial_id),
+        send(&mut cluster, controller, &partial_id),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     let unknown_topic = "persistent://public/default/not-a-segment";
@@ -3109,14 +3127,14 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         send(
             &mut cluster,
             controller,
-            add_subscription_to_transaction_command(15, commit_txn, unknown_topic, "txn-sub"),
+            &add_subscription_to_transaction_command(15, commit_txn, unknown_topic, "txn-sub"),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
     send(
         &mut cluster,
         controller,
-        add_subscription_to_transaction_command(16, commit_txn, &topic, "txn-sub"),
+        &add_subscription_to_transaction_command(16, commit_txn, &topic, "txn-sub"),
     )
     .expect("register commit subscription");
     assert!(
@@ -3129,12 +3147,12 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     cluster
         .enqueue_message(1, Bytes::from_static(b"commit"))
         .expect("enqueue commit message");
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW commit message");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW commit message");
     let commit_message = message_id(&take_frames(&mut cluster, child));
     send(
         &mut cluster,
         child,
-        transactional_ack_command(7, 17, commit_txn, commit_message.clone()),
+        &transactional_ack_command(7, 17, commit_txn, commit_message.clone()),
     )
     .expect("stage commit acknowledgement");
     let _ = take_frames(&mut cluster, child);
@@ -3146,7 +3164,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         send(
             &mut cluster,
             child,
-            transactional_ack_command(7, 117, commit_txn, commit_message),
+            &transactional_ack_command(7, 117, commit_txn, commit_message),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -3161,7 +3179,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        end_transaction_command(18, commit_txn, pb::TxnAction::Commit),
+        &end_transaction_command(18, commit_txn, pb::TxnAction::Commit),
     )
     .expect("commit staged acknowledgement");
     assert!(
@@ -3182,37 +3200,37 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         send(
             &mut cluster,
             controller,
-            end_transaction_command(19, commit_txn, pb::TxnAction::Commit),
+            &end_transaction_command(19, commit_txn, pb::TxnAction::Commit),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
 
-    send(&mut cluster, controller, new_transaction_command(20)).expect("allocate abort txn");
+    send(&mut cluster, controller, &new_transaction_command(20)).expect("allocate abort txn");
     let abort_txn = opened_transaction(&take_frames(&mut cluster, controller));
     send(
         &mut cluster,
         controller,
-        add_subscription_to_transaction_command(21, abort_txn, &topic, "txn-sub"),
+        &add_subscription_to_transaction_command(21, abort_txn, &topic, "txn-sub"),
     )
     .expect("register abort subscription");
     let _ = take_frames(&mut cluster, controller);
     cluster
         .enqueue_message(1, Bytes::from_static(b"abort"))
         .expect("enqueue abort message");
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW abort message");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW abort message");
     let abort_message = message_id(&take_frames(&mut cluster, child));
     send(
         &mut cluster,
         child,
-        transactional_ack_command(7, 22, abort_txn, abort_message.clone()),
+        &transactional_ack_command(7, 22, abort_txn, abort_message.clone()),
     )
     .expect("stage abort acknowledgement");
     let _ = take_frames(&mut cluster, child);
-    send(&mut cluster, child, flow_command(7, 1)).expect("retain redelivery permit");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("retain redelivery permit");
     send(
         &mut cluster,
         controller,
-        end_transaction_command(23, abort_txn, pb::TxnAction::Abort),
+        &end_transaction_command(23, abort_txn, pb::TxnAction::Abort),
     )
     .expect("abort staged acknowledgement");
     let _ = take_frames(&mut cluster, controller);
@@ -3233,7 +3251,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         FakeTransactionState::Aborted
     );
 
-    send(&mut cluster, controller, new_transaction_command(24)).expect("allocate pending txn");
+    send(&mut cluster, controller, &new_transaction_command(24)).expect("allocate pending txn");
     let pending_txn = opened_transaction(&take_frames(&mut cluster, controller));
     cluster
         .script_next(
@@ -3245,14 +3263,14 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        add_subscription_to_transaction_command(25, pending_txn, &topic, "txn-sub"),
+        &add_subscription_to_transaction_command(25, pending_txn, &topic, "txn-sub"),
     )
     .expect("hold transaction registration");
     assert!(matches!(
         send(
             &mut cluster,
             controller,
-            end_transaction_command(26, pending_txn, pb::TxnAction::Commit),
+            &end_transaction_command(26, pending_txn, pb::TxnAction::Commit),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -3283,7 +3301,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        add_subscription_to_transaction_command(27, pending_txn, &topic, "txn-sub"),
+        &add_subscription_to_transaction_command(27, pending_txn, &topic, "txn-sub"),
     )
     .expect("hold registration retry");
     let pending = cluster.pending_operations()[0].id;
@@ -3294,7 +3312,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     cluster
         .enqueue_message(1, Bytes::from_static(b"pending-ack"))
         .expect("enqueue pending transaction acknowledgement");
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW pending transaction message");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW pending transaction message");
     let pending_message = message_id(&take_frames(&mut cluster, child));
     cluster
         .script_next(
@@ -3306,14 +3324,14 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         child,
-        transactional_ack_command(7, 127, pending_txn, pending_message),
+        &transactional_ack_command(7, 127, pending_txn, pending_message),
     )
     .expect("hold transaction acknowledgement");
     assert!(matches!(
         send(
             &mut cluster,
             controller,
-            end_transaction_command(128, pending_txn, pb::TxnAction::Abort),
+            &end_transaction_command(128, pending_txn, pb::TxnAction::Abort),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
@@ -3330,12 +3348,12 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        end_transaction_command(28, pending_txn, pb::TxnAction::Abort),
+        &end_transaction_command(28, pending_txn, pb::TxnAction::Abort),
     )
     .expect("abort settled pending transaction");
     let _ = take_frames(&mut cluster, controller);
 
-    send(&mut cluster, controller, new_transaction_command(29))
+    send(&mut cluster, controller, &new_transaction_command(29))
         .expect("allocate scripted EndTxn transaction");
     let scripted_txn = opened_transaction(&take_frames(&mut cluster, controller));
     cluster
@@ -3351,7 +3369,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        end_transaction_command(30, scripted_txn, pb::TxnAction::Commit),
+        &end_transaction_command(30, scripted_txn, pb::TxnAction::Commit),
     )
     .expect("return scripted EndTxn failure");
     assert!(
@@ -3379,7 +3397,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        end_transaction_command(31, scripted_txn, pb::TxnAction::Commit),
+        &end_transaction_command(31, scripted_txn, pb::TxnAction::Commit),
     )
     .expect("hold EndTxn failure retry");
     let delayed_end = cluster
@@ -3415,7 +3433,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
     send(
         &mut cluster,
         controller,
-        end_transaction_command(32, scripted_txn, pb::TxnAction::Commit),
+        &end_transaction_command(32, scripted_txn, pb::TxnAction::Commit),
     )
     .expect("hold successful EndTxn retry");
     let delayed_end = cluster
@@ -3442,22 +3460,22 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         FakeTransactionState::Committed
     );
 
-    send(&mut cluster, controller, new_transaction_command(200))
+    send(&mut cluster, controller, &new_transaction_command(200))
         .expect("allocate stale-child transaction");
     let stale_child_txn = opened_transaction(&take_frames(&mut cluster, controller));
     send(
         &mut cluster,
         controller,
-        add_subscription_to_transaction_command(201, stale_child_txn, &topic, "txn-sub"),
+        &add_subscription_to_transaction_command(201, stale_child_txn, &topic, "txn-sub"),
     )
     .expect("register stale-child transaction");
     let _ = take_frames(&mut cluster, controller);
-    send(&mut cluster, child, flow_command(7, 1)).expect("FLOW stale-child transaction message");
+    send(&mut cluster, child, &flow_command(7, 1)).expect("FLOW stale-child transaction message");
     let stale_child_message = message_id(&take_frames(&mut cluster, child));
     send(
         &mut cluster,
         child,
-        transactional_ack_command(7, 202, stale_child_txn, stale_child_message),
+        &transactional_ack_command(7, 202, stale_child_txn, stale_child_message),
     )
     .expect("stage stale-child transaction acknowledgement");
     let _ = take_frames(&mut cluster, child);
@@ -3468,7 +3486,7 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         send(
             &mut cluster,
             controller,
-            end_transaction_command(203, stale_child_txn, pb::TxnAction::Commit),
+            &end_transaction_command(203, stale_child_txn, pb::TxnAction::Commit),
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));

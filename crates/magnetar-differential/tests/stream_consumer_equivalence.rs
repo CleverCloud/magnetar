@@ -20,13 +20,32 @@ use magnetar::scalable::{
 };
 use magnetar::{Engine, PulsarClient, TransactionApi};
 use magnetar_fakes::m1::{
-    BrokerFailure, Endpoint, FullAssignment, M1FakeCluster, OperationKind, ResourceCounts,
-    ScriptedBehavior,
+    BrokerFailure, Endpoint, FullAssignment, M1FakeCluster, M1Segment, OperationKind,
+    ResourceCounts, ScriptedBehavior,
 };
 use stream_consumer_support::client::{
     connect_moonpool, connect_moonpool_with_keepalive, connect_tokio, connect_tokio_with_keepalive,
 };
 use stream_consumer_support::server::M1SocketCluster;
+
+fn two_frame_receiver_budget() -> magnetar::proto::ReceiverBudget {
+    magnetar::proto::ReceiverBudget::bytes(32 * 1024 * 1024)
+        .expect("two-frame differential receive budget")
+}
+
+fn relocated_root_layout() -> Vec<M1Segment> {
+    vec![
+        M1Segment::active(1, 0, 32_767, Endpoint::Segment(1), 0),
+        M1Segment::active(2, 32_768, 65_535, Endpoint::Segment(1), 0),
+    ]
+}
+
+fn original_root_layout() -> Vec<M1Segment> {
+    vec![
+        M1Segment::active(1, 0, 32_767, Endpoint::Segment(1), 0),
+        M1Segment::active(2, 32_768, 65_535, Endpoint::Segment(2), 0),
+    ]
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourcePosition {
@@ -125,6 +144,7 @@ struct StatusTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct PublicSurfaceTrace {
     builder_debug: bool,
     missing_subscription: bool,
@@ -375,6 +395,7 @@ where
             .subscription("baseline-sub")
             .consumer_name("baseline-consumer")
             .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+            .receiver_budget(two_frame_receiver_budget())
             .subscribe(),
     )
     .await
@@ -516,6 +537,7 @@ where
         .subscription("receive-sub")
         .consumer_name("receive-consumer")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe receive matrix aggregate");
@@ -762,6 +784,7 @@ where
         .subscription("assignment-sub")
         .consumer_name("assignment-a")
         .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe first assignment aggregate");
@@ -816,19 +839,54 @@ where
         .expect("second controller member is observable");
     cluster
         .update(|fake| {
+            fake.advance_layout(2, relocated_root_layout())?;
             fake.publish_assignment_plan(
-                1,
+                2,
                 vec![
-                    FullAssignment::new(member_a, [1]),
-                    FullAssignment::new(member_b, [2]),
+                    FullAssignment::new(member_a, [1, 2]),
+                    FullAssignment::new(member_b, []),
                 ],
             )
         })
-        .expect("publish same-epoch ownership transfer");
-    let (assignment_a, resync_a) = wait_for_assignment(&consumer_a, 1, &[1]).await;
-    let (assignment_b, resync_b) = wait_for_assignment(&consumer_b, 1, &[2]).await;
-    assert!(resync_a.is_empty());
-    assert!(resync_b.is_empty());
+        .expect("start descriptor replacement with outstanding FLOW");
+    let (first_descriptor_assignment_a, first_descriptor_resync_a) =
+        wait_for_assignment(&consumer_a, 2, &[1, 2]).await;
+    let (first_descriptor_assignment_b, first_descriptor_resync_b) =
+        wait_for_assignment(&consumer_b, 2, &[]).await;
+    assert!(first_descriptor_resync_a.is_empty());
+    assert!(first_descriptor_resync_b.is_empty());
+    assert_eq!(consumer_a.status().draining_segments(), 1);
+
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.advance_layout(3, original_root_layout())?;
+            fake.publish_assignment_plan(
+                3,
+                vec![
+                    FullAssignment::new(member_a, [1, 2]),
+                    FullAssignment::new(member_b, []),
+                ],
+            )
+        })
+        .expect("change the descriptor again while the old child is draining");
+    let (second_descriptor_assignment_a, second_descriptor_resync_a) =
+        wait_for_assignment(&consumer_a, 3, &[1, 2]).await;
+    let (second_descriptor_assignment_b, second_descriptor_resync_b) =
+        wait_for_assignment(&consumer_b, 3, &[]).await;
+    assert!(second_descriptor_resync_a.is_empty());
+    assert!(second_descriptor_resync_b.is_empty());
+    assert!(
+        !cluster.inspect(|fake| {
+            fake.routes().iter().any(|route| {
+                route.command == magnetar::proto::pb::base_command::Type::Subscribe
+                    && route.resource.as_deref().is_some_and(|resource| {
+                        resource.starts_with("segment://public/default/scaled/8000-ffff-2:")
+                    })
+            })
+        }),
+        "the latest descriptor must not open before obsolete FLOW is consumed"
+    );
 
     consumer_a
         .acknowledge(&old_owner_message)
@@ -839,23 +897,58 @@ where
             fake.resource_counts().unacked_messages == 0
         })
         .await;
-    wait_for_flowing_segment(&consumer_b, cluster, 2).await;
+    assert_eq!(
+        cluster.inspect(|fake| fake.active_child_owner("assignment-sub", 2)),
+        Some(member_a),
+        "descriptor replacement retains the old child until obsolete FLOW is terminal"
+    );
     cluster
-        .wait_for("new-owner FLOW reaches the broker", |fake| {
-            fake.assigned_owner("assignment-sub", 2) == Some(member_b)
-                && fake.active_child_owner("assignment-sub", 2) == Some(member_b)
+        .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"old-flow-fence")))
+        .expect("consume the obsolete descriptor FLOW");
+    cluster
+        .wait_for("obsolete FLOW delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let flow_fence_message = receive(&consumer_a).await;
+    assert_eq!(flow_fence_message.source().segment_id().0, 2);
+    consumer_a
+        .acknowledge(&flow_fence_message)
+        .await
+        .expect("resolve the obsolete FLOW delivery");
+    cluster
+        .wait_for("obsolete FLOW acknowledgement", |fake| {
+            fake.resource_counts().unacked_messages == 0
+        })
+        .await;
+    wait_for_flowing_segment(&consumer_a, cluster, 2).await;
+    cluster
+        .wait_for("replacement FLOW reaches the relocated broker", |fake| {
+            fake.assigned_owner("assignment-sub", 2) == Some(member_a)
+                && fake.active_child_owner("assignment-sub", 2) == Some(member_a)
                 && fake.segment_permits("assignment-sub", 2) > 0
         })
         .await;
+    assert!(cluster.inspect(|fake| {
+        fake.routes().iter().any(|route| {
+            route.endpoint == Endpoint::Segment(2)
+                && route.command == magnetar::proto::pb::base_command::Type::Subscribe
+                && route.resource.as_deref().is_some_and(|resource| {
+                    resource.starts_with("segment://public/default/scaled/8000-ffff-2:")
+                })
+        })
+    }));
+
     let old_owner_status = status_trace(&consumer_a.status());
-    assert_eq!(old_owner_status.assigned_segments, 1);
-    assert_eq!(old_owner_status.attached_segments, 1);
+    assert_eq!(old_owner_status.assigned_segments, 2);
+    assert_eq!(old_owner_status.attached_segments, 2);
     assert_eq!(old_owner_status.draining_segments, 0);
     let new_owner_status = status_trace(&consumer_b.status());
-    assert_eq!(new_owner_status.assigned_segments, 1);
-    assert_eq!(new_owner_status.attached_segments, 1);
+    assert_eq!(new_owner_status.assigned_segments, 0);
+    assert_eq!(new_owner_status.attached_segments, 0);
     assert_eq!(new_owner_status.draining_segments, 0);
     assert!(new_owner_status.pending_ownership.is_empty());
+
     cluster
         .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"new-owner")))
         .expect("enqueue new-owner delivery");
@@ -864,27 +957,27 @@ where
             fake.resource_counts().unacked_messages == 1
         })
         .await;
-    let new_owner_message = receive(&consumer_b).await;
+    let new_owner_message = receive(&consumer_a).await;
     assert_eq!(new_owner_message.source().segment_id().0, 2);
-    let mut messages = [&old_owner_message]
+    let mut messages = [&old_owner_message, &flow_fence_message]
         .into_iter()
         .map(message_identity)
         .chain(core::iter::once(message_identity(&new_owner_message)))
         .collect::<Vec<_>>();
     messages.sort();
-    consumer_b
+    consumer_a
         .acknowledge(&new_owner_message)
         .await
-        .expect("acknowledge new-owner delivery");
+        .expect("acknowledge replacement delivery");
     cluster
         .wait_for("new-owner acknowledgement", |fake| {
             fake.resource_counts().unacked_messages == 0
         })
         .await;
-    let final_status = status_trace(&consumer_b.status());
-    assert_eq!(final_status.layout_epoch, Some(1));
-    assert_eq!(final_status.assigned_segments, 1);
-    assert_eq!(final_status.attached_segments, 1);
+    let final_status = status_trace(&consumer_a.status());
+    assert_eq!(final_status.layout_epoch, Some(3));
+    assert_eq!(final_status.assigned_segments, 2);
+    assert_eq!(final_status.attached_segments, 2);
     assert_eq!(final_status.draining_segments, 0);
     assert!(final_status.pending_ownership.is_empty());
 
@@ -906,7 +999,13 @@ where
         })
         .await;
     AssignmentTrace {
-        assignments: vec![initial_b, assignment_a, assignment_b],
+        assignments: vec![
+            initial_b,
+            first_descriptor_assignment_a,
+            first_descriptor_assignment_b,
+            second_descriptor_assignment_a,
+            second_descriptor_assignment_b,
+        ],
         messages,
         old_owner_status,
         new_owner_status,
@@ -947,6 +1046,7 @@ where
         .subscription("reconnect-sub")
         .consumer_name("reconnect-consumer")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe reconnect aggregate");
@@ -1122,6 +1222,7 @@ where
         .subscription("ack-failure-sub")
         .consumer_name("ack-failure-consumer")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe acknowledgement-failure aggregate");
@@ -1240,6 +1341,7 @@ where
         .subscription("negative-ack-sub")
         .consumer_name("negative-ack-consumer")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe negative-acknowledgement aggregate");
@@ -1360,6 +1462,7 @@ where
         .subscription("close-sub")
         .consumer_name("close-consumer")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe close aggregate");
@@ -1472,6 +1575,7 @@ where
         .subscription("surface-position-sub")
         .consumer_name("surface-position-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe public position surface");
@@ -1603,6 +1707,7 @@ where
         .subscription("surface-transaction-sub")
         .consumer_name("surface-transaction-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe cumulative transaction surface");
@@ -1772,6 +1877,7 @@ where
         .subscription("surface-schema-sub")
         .consumer_name("surface-schema-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe broker-schema aggregate");
@@ -1819,6 +1925,7 @@ where
         .subscription("surface-rejecting-schema-sub")
         .consumer_name("surface-rejecting-schema-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe rejecting-schema aggregate");
@@ -1871,6 +1978,7 @@ where
         .subscription("surface-final-drop-sub")
         .consumer_name("surface-final-drop-member")
         .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
         .subscribe()
         .await
         .expect("subscribe final-drop aggregate");
@@ -2004,7 +2112,7 @@ async fn aggregate_receiver_budget_is_equivalent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_epoch_assignment_and_in_flight_fence_are_equivalent() {
+async fn descriptor_change_and_in_flight_fence_are_equivalent() {
     let tokio = run_tokio_assignment().await;
     let moonpool = run_moonpool_assignment().await;
     assert_eq!(tokio, moonpool, "assignment/fence traces diverged");

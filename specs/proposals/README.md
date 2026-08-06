@@ -35,10 +35,10 @@ Once a proposal's work ships, the document either freezes with a `Status: Implem
 
 ### E2E implications
 
-| PIP     | e2e against `apachepulsar/pulsar:4.0.4` | Notes                                                                                                                                                                                                                                    |
-| ------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PIP-466 | ✅ Possible today                       | Mirror tests against existing v4 e2e suite.                                                                                                                                                                                              |
-| PIP-460 | ✅ Unblocked                            | `apachepulsar/pulsar:5.0.0-M1` is published and defaults `scalableTopicsEnabled=true`. Four-layer tests run against the stateful M1 fake; the real hardened e2e compiles and is discovered, and CI executes it when Docker is available. |
+| PIP     | e2e against `apachepulsar/pulsar:4.0.4` | Notes                                                                                                                                                                                                                                                        |
+| ------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| PIP-466 | ✅ Possible today                       | Mirror tests against existing v4 e2e suite.                                                                                                                                                                                                                  |
+| PIP-460 | ✅ Unblocked                            | `apachepulsar/pulsar:5.0.0-M1` is published and defaults `scalableTopicsEnabled=true`. The required five test layers include the stateful M1 fake and real hardened e2e; the target compiles and is discovered, and CI executes it when Docker is available. |
 
 ## How to add a proposal
 

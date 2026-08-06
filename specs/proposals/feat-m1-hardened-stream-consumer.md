@@ -141,6 +141,9 @@ During registration or reconnect:
 7. reject lower epochs within one incarnation;
 8. fail and resynchronize rather than accepting an epoch regression on a replacement connection.
 
+Resynchronization marks reconnect intent before old-child teardown, waits for every confirmed child and in-flight child open to finish, then retries a rejected replacement registration on provider time while the aggregate remains live.
+This prevents obsolete child-loop close results from recursively resynchronizing or racing a replacement baseline, and accommodates M1 retaining the old member until physical controller replacement.
+
 This is local fencing, not a claim that M1 carries a distributed controller term.
 
 ### D5 - Replace the global destructive event stream internally
@@ -207,7 +210,8 @@ Callers requiring processing-order completion use one outstanding receive.
 `receive(&self)` and `receive_batch(&self, limits)` allow concurrent callers.
 Each message is reserved exactly once.
 Cancellation before reservation consumes nothing.
-Cancellation after reservation either completes synchronously into an owned delivery or returns the reservation to its ordered queue before the future disappears.
+Cancellation after reservation either completes synchronously into an owned delivery or returns the same live authority to its original dequeue sequence before the future disappears.
+Concurrent fencing that prevents restoration requests resynchronization rather than silently discarding the delivery.
 
 A batch is reserved and removed atomically after its first-message wait; another receive cannot interleave inside the returned batch.
 Per-waiter FIFO is not promised.
@@ -216,13 +220,13 @@ The implementation uses mutex-protected state plus waker slabs/`Notify` accordin
 
 ### D10 - Use one aggregate receive budget
 
-One aggregate budget bounds client-owned receive storage across all child queues, granted-but-unconsumed permits, aggregate reservations, encoded and decompressed payload buffers, batch/chunk reassembly, DAG-barrier holding state, delivered-message leases, and retiring children.
+One aggregate budget bounds client-owned receive storage across all child queues, granted-but-unconsumed permits, aggregate reservations, encoded and decompressed payload buffers, batch/chunk reassembly, queue and ledger nodes, canonical-id/source sidecars, position-map nodes, DAG-barrier holding state, delivered-message leases, and retiring children.
 Adding segments redistributes available capacity; it never multiplies the configured budget by segment count.
 
 Every child runs in manual-FLOW mode: initial, automatic, reconnect, and refill FLOW are disabled, and only the aggregate arbiter grants permits.
 Before granting one message permit, the arbiter reserves `MAX_FRAME_SIZE` (5 MiB); arrival transfers that reservation to exact retained bytes and releases any surplus.
-Announced chunk totals and decompression workspaces are reserved before retention or allocation, and a message that cannot fit produces `MessageTooLargeForBudget` without exposing partial data.
-The configured budget must fit one maximum-size frame, three maximum-size stream-position values, two delivery-authority overheads, and a fixed 64 KiB control-plane cleanup reserve: `MAX_FRAME_SIZE + 3 * MAX_STREAM_POSITION_SIZE + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 8,454,272 bytes`.
+Announced chunk totals and decompression output plus validation slack/workspace are reserved before retention or allocation, selected batch members use right-sized payload buffers, and a message that cannot fit produces `MessageTooLargeForBudget` without exposing partial data.
+The configured budget must fit one maximum-size frame, five maximum-size stream-position values, three worst-case position-component node sets, two delivery-authority overheads, and a fixed 64 KiB control-plane cleanup reserve: `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 13,697,152 bytes`.
 Examples use 16 MiB; 8 MiB is below the valid minimum.
 
 Moving a message between child, barrier, aggregate, and delivery state transfers one reservation rather than double-counting it.
@@ -275,9 +279,10 @@ Any failed admitted registration or acknowledgement permanently poisons that tra
 Transactional acknowledgement means the broker accepted every segment component into the supplied Pulsar transaction, not that a cursor advanced.
 The position becomes durable only after the caller successfully commits that transaction through `PulsarClient`.
 The commit or abort outcome is propagated to every participating aggregate consumer.
-Pending transactional acknowledgements use separate accounting and do not advance reconnect cursors, release ordering barriers, or permanently consume batch/unacked state before confirmed commit.
+Pending transactional acknowledgements use a sparse overlay for touched batch entries and do not advance reconnect cursors, release ordering barriers, or permanently consume batch/unacked state before confirmed commit.
 Abort leaves cursors unchanged and permits redelivery; an unknown transaction outcome leaves each participant failed and resynchronization-required.
 The consumer never labels a locally staged transaction position as committed before the commit result.
+After settlement, owned propagation checkpoints each completed participant action so a cancellation retry cannot replay an already-issued FLOW prefix.
 This is not the future `CheckpointConsumer` and does not make external non-Pulsar state atomic.
 
 ### D13 - Provide strict versioned serialization
@@ -622,7 +627,7 @@ Each focused lane ran its targeted red/green checks before integration.
 The code, fake, proto, runtime, façade, and differential focused suites passed.
 The Moonpool runtime also passes a complete aggregate over simulated controller and segment sockets for four schedules derived from `MOONPOOL_SEED`, covering typed delivery from both sources, status, position, acknowledgement, and close under `SimProviders`.
 The real M1 e2e target compiles and is discovered with `--features scalable-topics`, but Docker was unavailable on the integration host, so this branch did not execute it locally; the existing all-feature CI policy runs the ordinary e2e target when Docker is available.
-A local worktree invocation of `check-runtime-test-parity` reported Tokio 400 / Moonpool 400.
+A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 `check-sim-coverage` diffs `<merge-base>..HEAD`, not the uncommitted worktree.
 The complete implementation diff must first be represented by `HEAD`, then the enforcing gate rerun before its result can satisfy this proposal's acceptance criteria.
 The proposal therefore remains in flight until the real M1 target executes successfully, the committed complete diff passes the enforcing sim-coverage gate, and the required full validation chain is green.

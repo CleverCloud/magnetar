@@ -6,8 +6,6 @@ use bytes::Bytes;
 use magnetar_proto::pb;
 use magnetar_proto::types::CompressionKind;
 
-const MAX_INFLATE_RATIO: usize = 4;
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompressionError {
     #[error("lz4 codec: {0}")]
@@ -46,41 +44,39 @@ pub(crate) fn decompress(
             ceiling,
         });
     }
-    let bound = uncompressed_size.saturating_mul(MAX_INFLATE_RATIO).max(64);
+    let validation_len = uncompressed_size
+        .checked_add(magnetar_proto::DECOMPRESSION_VALIDATION_SLACK)
+        .ok_or(CompressionError::UncompressedSizeTooLarge {
+            got: usize::MAX,
+            ceiling,
+        })?;
     match kind {
         CompressionKind::None => Ok(Bytes::copy_from_slice(ciphertext)),
         CompressionKind::Lz4 => {
-            let decompressed = lz4_flex::decompress(ciphertext, uncompressed_size)
+            let mut decompressed = vec![0_u8; validation_len];
+            let len = lz4_flex::block::decompress_into(ciphertext, &mut decompressed)
                 .map_err(|error| CompressionError::Lz4(error.to_string()))?;
-            reject_oversize(&decompressed, ceiling)?;
+            decompressed.truncate(len);
             verify_size(&decompressed, uncompressed_size)?;
             Ok(Bytes::from(decompressed))
         }
         CompressionKind::Zlib => {
-            use std::io::Read as _;
-
-            let mut decoder = flate2::read::ZlibDecoder::new(ciphertext);
-            let mut output = Vec::with_capacity(uncompressed_size);
-            decoder
-                .by_ref()
-                .take(bound.saturating_add(1) as u64)
-                .read_to_end(&mut output)?;
-            reject_oversize(&output, ceiling)?;
+            let mut decoder = flate2::bufread::ZlibDecoder::new(ciphertext);
+            let output = read_bounded(&mut decoder, validation_len)?;
             verify_size(&output, uncompressed_size)?;
             Ok(Bytes::from(output))
         }
         CompressionKind::Zstd => {
-            use std::io::Read as _;
-
-            let mut decoder = zstd::stream::Decoder::new(ciphertext)
+            let mut decoder = zstd::bulk::Decompressor::new()
                 .map_err(|error| CompressionError::Zstd(error.to_string()))?;
-            let mut output = Vec::with_capacity(uncompressed_size);
             decoder
-                .by_ref()
-                .take(ceiling.saturating_add(1) as u64)
-                .read_to_end(&mut output)
+                .window_log_max(zstd_window_log(uncompressed_size))
                 .map_err(|error| CompressionError::Zstd(error.to_string()))?;
-            reject_oversize(&output, ceiling)?;
+            let mut output = vec![0_u8; validation_len];
+            let written = decoder
+                .decompress_to_buffer(ciphertext, output.as_mut_slice())
+                .map_err(|error| CompressionError::Zstd(error.to_string()))?;
+            output.truncate(written);
             verify_size(&output, uncompressed_size)?;
             Ok(Bytes::from(output))
         }
@@ -95,26 +91,45 @@ pub(crate) fn decompress(
                     ceiling,
                 });
             }
-            let mut output = vec![0u8; announced];
+            if announced != uncompressed_size {
+                return Err(CompressionError::SizeMismatch {
+                    got: announced,
+                    expected: uncompressed_size,
+                });
+            }
+            let mut output = vec![0u8; uncompressed_size];
             let len = Decoder::new()
                 .decompress(ciphertext, &mut output)
                 .map_err(|error| CompressionError::Snappy(error.to_string()))?;
             output.truncate(len);
-            reject_oversize(&output, ceiling)?;
             verify_size(&output, uncompressed_size)?;
             Ok(Bytes::from(output))
         }
     }
 }
 
-fn reject_oversize(bytes: &[u8], ceiling: usize) -> Result<(), CompressionError> {
-    if bytes.len() > ceiling {
-        return Err(CompressionError::UncompressedSizeTooLarge {
-            got: bytes.len(),
-            ceiling,
-        });
+fn zstd_window_log(uncompressed_size: usize) -> u32 {
+    let window = uncompressed_size
+        .max(magnetar_proto::ZSTD_MIN_WINDOW_SIZE)
+        .next_power_of_two();
+    usize::BITS - window.leading_zeros() - 1
+}
+
+fn read_bounded(
+    reader: &mut impl std::io::Read,
+    validation_len: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut output = vec![0_u8; validation_len];
+    let mut written = 0;
+    while written < validation_len {
+        let read = reader.read(&mut output[written..])?;
+        if read == 0 {
+            break;
+        }
+        written += read;
     }
-    Ok(())
+    output.truncate(written);
+    Ok(output)
 }
 
 fn verify_size(bytes: &[u8], expected: usize) -> Result<(), CompressionError> {
@@ -202,10 +217,7 @@ mod tests {
             decompress(CompressionKind::Zstd, b"invalid", 1),
             Err(CompressionError::Zstd(_))
         ));
-        assert!(matches!(
-            decompress(CompressionKind::Snappy, b"invalid", 1),
-            Err(CompressionError::Snappy(_))
-        ));
+        assert!(decompress(CompressionKind::Snappy, b"invalid", 1).is_err());
 
         let input = b"size mismatch";
         let encoded = lz4_flex::compress(input);
@@ -226,5 +238,47 @@ mod tests {
             ),
             Err(CompressionError::UncompressedSizeTooLarge { .. })
         ));
+    }
+
+    #[test]
+    #[allow(clippy::match_same_arms)]
+    fn every_codec_stops_at_the_advertised_size_plus_validation_slack() {
+        let payload = vec![0_u8; 4096];
+        let lz4 = lz4_flex::compress(&payload);
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(&payload).expect("write zlib fixture");
+        let zlib = zlib.finish().expect("finish zlib fixture");
+        let zstd = zstd::stream::encode_all(payload.as_slice(), 0).expect("encode zstd fixture");
+        let snappy = snap::raw::Encoder::new()
+            .compress_vec(&payload)
+            .expect("encode snappy fixture");
+
+        for (kind, encoded) in [
+            (CompressionKind::Lz4, lz4),
+            (CompressionKind::Zlib, zlib),
+            (CompressionKind::Zstd, zstd),
+            (CompressionKind::Snappy, snappy),
+        ] {
+            let error = decompress(kind, &encoded, 1).expect_err("overexpansion rejected");
+            match (kind, error) {
+                (CompressionKind::Lz4, CompressionError::Lz4(_)) => {}
+                (
+                    CompressionKind::Zlib,
+                    CompressionError::SizeMismatch {
+                        got: 2,
+                        expected: 1,
+                    },
+                ) => {}
+                (CompressionKind::Zstd, CompressionError::Zstd(_)) => {}
+                (
+                    CompressionKind::Snappy,
+                    CompressionError::SizeMismatch {
+                        got: 4096,
+                        expected: 1,
+                    },
+                ) => {}
+                (_, other) => panic!("kind={kind:?} returned unexpected error {other:?}"),
+            }
+        }
     }
 }

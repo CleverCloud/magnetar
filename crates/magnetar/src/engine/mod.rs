@@ -1109,6 +1109,10 @@ pub trait StreamConsumerBackend: 'static + Send + Sync {
         >,
     >;
 
+    /// Return deliveries reserved by a cancelled facade future to their
+    /// original aggregate queue positions without changing their authority.
+    fn restore_messages(&self, messages: Vec<RawStreamMessage>);
+
     /// Resolve broker schema metadata for a child when the retained schema
     /// instance requests PIP-87 discovery.
     fn get_schema<'a>(

@@ -21,6 +21,7 @@
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::too_many_lines)]
 
 #[path = "stream_consumer_support/server.rs"]
 mod server;
@@ -557,7 +558,7 @@ async fn live_aggregates_surface_identical_facade_failures_after_client_close() 
     tokio_cluster
         .wait_for("Tokio facade terminal children", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 2 && counts.permits == 2
+            counts.child_consumers == 2 && counts.permits == 1
         })
         .await;
     tokio_client.close().await;
@@ -601,7 +602,7 @@ async fn live_aggregates_surface_identical_facade_failures_after_client_close() 
     moonpool_cluster
         .wait_for("Moonpool facade terminal children", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 2 && counts.permits == 2
+            counts.child_consumers == 2 && counts.permits == 1
         })
         .await;
     tokio::time::timeout(HANG_GUARD, moonpool_client.close())

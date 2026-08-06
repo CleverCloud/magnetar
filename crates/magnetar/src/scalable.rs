@@ -552,6 +552,14 @@ impl RawDeliveryLease {
         self.armed = false;
         core::mem::take(&mut self.messages)
     }
+
+    fn negative_acknowledge(&mut self) -> Result<(), StreamConsumerError> {
+        for message in &self.messages {
+            self.backend.negative_acknowledge(&message.token)?;
+        }
+        self.armed = false;
+        Ok(())
+    }
 }
 
 impl Drop for RawDeliveryLease {
@@ -559,9 +567,8 @@ impl Drop for RawDeliveryLease {
         if !self.armed {
             return;
         }
-        for message in &self.messages {
-            let _ = self.backend.negative_acknowledge(&message.token);
-        }
+        self.backend
+            .restore_messages(core::mem::take(&mut self.messages));
     }
 }
 
@@ -641,8 +648,8 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
 
     /// Concurrently await and reserve one message.
     ///
-    /// A schema failure negatively acknowledges the reserved delivery before
-    /// returning the error, so inaccessible live authority cannot leak.
+    /// Cancellation during schema preparation restores the reserved delivery
+    /// locally; an explicit schema or decode failure negatively acknowledges it.
     pub async fn receive(&self) -> Result<StreamMessage<S>, StreamConsumerError> {
         let raw = self.shared.backend.receive().await?;
         self.decode_one(raw).await
@@ -819,10 +826,19 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
         &self,
         raw: RawStreamMessage,
     ) -> Result<StreamMessage<S>, StreamConsumerError> {
-        let lease = RawDeliveryLease::new(self.shared.backend.clone(), vec![raw]);
+        let mut lease = RawDeliveryLease::new(self.shared.backend.clone(), vec![raw]);
         let raw = &lease.messages[0];
-        self.prepare_schema(raw).await?;
-        let value = self.shared.schema.decode(&raw.message.payload)?;
+        if let Err(error) = self.prepare_schema(raw).await {
+            lease.negative_acknowledge()?;
+            return Err(error);
+        }
+        let value = match self.shared.schema.decode(&raw.message.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                lease.negative_acknowledge()?;
+                return Err(error.into());
+            }
+        };
         let mut messages = lease.into_messages();
         let raw = messages.swap_remove(0);
         Ok(StreamMessage {
@@ -836,11 +852,20 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
         &self,
         raw: Vec<RawStreamMessage>,
     ) -> Result<Vec<StreamMessage<S>>, StreamConsumerError> {
-        let lease = RawDeliveryLease::new(self.shared.backend.clone(), raw);
+        let mut lease = RawDeliveryLease::new(self.shared.backend.clone(), raw);
         let mut values = Vec::with_capacity(lease.messages.len());
         for message in &lease.messages {
-            self.prepare_schema(message).await?;
-            values.push(self.shared.schema.decode(&message.message.payload)?);
+            if let Err(error) = self.prepare_schema(message).await {
+                lease.negative_acknowledge()?;
+                return Err(error);
+            }
+            match self.shared.schema.decode(&message.message.payload) {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    lease.negative_acknowledge()?;
+                    return Err(error.into());
+                }
+            }
         }
         Ok(lease
             .into_messages()
@@ -1280,6 +1305,7 @@ mod tests {
         schema_started: tokio::sync::Notify,
         schema_release: tokio::sync::Notify,
         negative_ack_calls: AtomicUsize,
+        restore_calls: AtomicUsize,
     }
 
     #[derive(Clone)]
@@ -1319,6 +1345,7 @@ mod tests {
                     schema_started: tokio::sync::Notify::new(),
                     schema_release: tokio::sync::Notify::new(),
                     negative_ack_calls: AtomicUsize::new(0),
+                    restore_calls: AtomicUsize::new(0),
                 }),
             }
         }
@@ -1405,6 +1432,15 @@ mod tests {
                     Ok(batch)
                 }
             })
+        }
+
+        fn restore_messages(&self, mut restored: Vec<RawStreamMessage>) {
+            self.state.restore_calls.fetch_add(1, Ordering::SeqCst);
+            restored.sort_by_key(|message| message.token.dequeue_sequence());
+            let mut messages = self.state.messages.lock();
+            for message in restored.into_iter().rev() {
+                messages.push_front(message);
+            }
         }
 
         fn get_schema<'a>(
@@ -1838,7 +1874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_schema_resolution_negatively_acknowledges_reserved_delivery() {
+    async fn cancelled_schema_resolution_restores_reserved_delivery() {
         let backend = FakeBackend::with_delivery(b"cancel", 1);
         backend.state.schema_blocked.store(true, Ordering::SeqCst);
         let state = backend.state.clone();
@@ -1858,7 +1894,12 @@ mod tests {
         state.schema_started.notified().await;
         drop(receive);
 
-        assert_eq!(state.negative_ack_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.negative_ack_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.restore_calls.load(Ordering::SeqCst), 1);
+        state.schema_blocked.store(false, Ordering::SeqCst);
+        let restored = consumer.receive().await.expect("restored delivery");
+        assert_eq!(restored.value(), &Bytes::from_static(b"cancel"));
+        assert_eq!(restored.delivery_token().dequeue_sequence().0, 0);
     }
 
     #[tokio::test]
