@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    AckRequest, Connection, ConnectionConfig, ConsumerHandle, MessageId, SubscribeRequest,
-    decode_one, encode_command, encode_payload, pb,
+    AckRequest, Connection, ConnectionConfig, ConsumerHandle, MessageId, OpOutcome, PendingOpKey,
+    SubscribeRequest, decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_tokio::ConnectionShared;
 
@@ -230,4 +230,32 @@ fn individual_batch_ack_after_reset_keeps_siblings_unacked() {
     let frame = decode_one(&mut wire).expect("CommandAck frame");
     let ack = frame.command.ack.expect("CommandAck");
     assert_eq!(ack.message_id[0].ack_set, vec![0b101]);
+
+    let invalid_request = conn.ack(
+        handle,
+        AckRequest {
+            message_ids: vec![MessageId {
+                ledger_id: 11,
+                entry_id: 7,
+                partition: -1,
+                batch_index: BATCH_SIZE,
+                batch_size: BATCH_SIZE,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            }],
+            ack_type: pb::command_ack::AckType::Individual,
+            properties: Vec::new(),
+            txn_id: None,
+        },
+        t0,
+    );
+    assert!(conn.poll_transmit().is_empty());
+    assert!(matches!(
+        conn.take_outcome(PendingOpKey::Request(invalid_request)),
+        Some(OpOutcome::Error {
+            code: -1,
+            ref message,
+            ..
+        }) if message == "invalid batched message id"
+    ));
 }
