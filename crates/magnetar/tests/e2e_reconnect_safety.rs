@@ -361,6 +361,8 @@ async fn e2e_batched_send_futures_resolve_for_every_reset_phase()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// One linear proxy timeline makes the durable and non-durable reattach frames unambiguous.
+#[allow(clippy::too_many_lines)]
 async fn e2e_partial_batch_ack_and_durable_cursor_survive_reconnect()
 -> Result<(), Box<dyn std::error::Error>> {
     let (upstream, _container) = start_pulsar().await?;
