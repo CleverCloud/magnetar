@@ -213,6 +213,22 @@ fn zlib(payload: &[u8]) -> Bytes {
     Bytes::from(encoder.finish().expect("finish delivery-shape compression"))
 }
 
+fn lz4(payload: &[u8]) -> Bytes {
+    Bytes::from(lz4_flex::block::compress(payload))
+}
+
+fn zstd(payload: &[u8]) -> Bytes {
+    Bytes::from(zstd::bulk::compress(payload, 0).expect("compress zstd fixture"))
+}
+
+fn snappy(payload: &[u8]) -> Bytes {
+    Bytes::from(
+        snap::raw::Encoder::new()
+            .compress_vec(payload)
+            .expect("compress snappy fixture"),
+    )
+}
+
 fn split_layout() -> Vec<M1Segment> {
     vec![
         M1Segment::active(1, 0, 32_767, Endpoint::Segment(1), 0)
@@ -3186,6 +3202,55 @@ where
         })
         .await;
 
+    for (name, compression, payload) in [
+        (
+            "lz4",
+            magnetar::proto::pb::CompressionType::Lz4,
+            lz4(b"codec"),
+        ),
+        (
+            "zstd",
+            magnetar::proto::pb::CompressionType::Zstd,
+            zstd(b"codec"),
+        ),
+        (
+            "snappy",
+            magnetar::proto::pb::CompressionType::Snappy,
+            snappy(b"codec"),
+        ),
+    ] {
+        cluster
+            .update(|fake| {
+                fake.enqueue_message_with_metadata(
+                    1,
+                    magnetar::proto::pb::MessageMetadata {
+                        compression: Some(compression as i32),
+                        uncompressed_size: Some(5),
+                        ..Default::default()
+                    },
+                    payload,
+                    Vec::new(),
+                )
+            })
+            .unwrap_or_else(|error| panic!("enqueue {name} delivery: {error}"));
+        cluster
+            .wait_for(&format!("{name} delivery dispatch"), |fake| {
+                fake.resource_counts().unacked_messages == 1
+            })
+            .await;
+        let message = receive(&consumer).await;
+        assert_eq!(message.payload(), b"codec");
+        consumer
+            .acknowledge(&message)
+            .await
+            .unwrap_or_else(|error| panic!("acknowledge {name} delivery: {error}"));
+        cluster
+            .wait_for(&format!("{name} delivery acknowledgement"), |fake| {
+                fake.resource_counts().unacked_messages == 0
+            })
+            .await;
+    }
+
     cluster
         .update(|fake| {
             fake.enqueue_message_with_metadata(
@@ -3278,7 +3343,7 @@ where
         .as_deref()
         .map(|first| first.entry_id);
     assert_eq!(chunk_payload, b"abcd");
-    assert_eq!(chunk_first_entry, Some(2));
+    assert_eq!(chunk_first_entry, Some(5));
     consumer
         .acknowledge(&chunk)
         .await
@@ -3649,11 +3714,11 @@ where
             fake.enqueue_message_with_metadata(
                 1,
                 magnetar::proto::pb::MessageMetadata {
-                    compression: Some(magnetar::proto::pb::CompressionType::Zlib as i32),
+                    compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
                     uncompressed_size: Some(4),
                     ..Default::default()
                 },
-                Bytes::from_static(b"not-zlib"),
+                snappy(b"codec"),
                 Vec::new(),
             )
         })
