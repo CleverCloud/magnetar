@@ -1021,19 +1021,238 @@ pub trait MessageDecryptorApi {
 }
 
 // ---------------------------------------------------------------------------
-// PIP-460 scalable topics (ADR-0093, experimental). The `ScalableTopicsApi`
-// extension trait follows the same ADR-0026 §D1 pattern as `TransactionApi`:
-// defined here, implemented by each runtime on its `Client` type (which is the
-// engine's `ClientState`), dispatched through
-//   `impl<E: Engine> PulsarClient<E> where E::ClientState: ScalableTopicsApi`.
-// Gated on `feature = "scalable-topics"` so the default surface is unchanged.
+// PIP-460 scalable topics (experimental). Two deliberately separate adapters
+// live here:
+//
+// - `ScalableTopicsApi` keeps the low-level lookup/watch surface used by the CLI and
+//   protocol-facing callers.
+// - `SegmentSubscriberApi` creates one owned, assignment-driven aggregate for the high-level
+//   `scalable::StreamConsumer`. Its returned backend implements `StreamConsumerBackend` and owns
+//   typed controller/child routes. It never drains the low-level client-global event queue.
+//
+// Both follow the ADR-0026 §D1 extension-trait pattern: the public runtime
+// clients remain non-Clone while an operation can return the narrow owned
+// capability needed after its opening borrow ends.
 // ---------------------------------------------------------------------------
 
+/// Runtime-neutral opening configuration for an assignment-driven scalable
+/// stream consumer.
+///
+/// This type is public only so runtime adapters and downstream engine
+/// implementations can satisfy [`SegmentSubscriberApi`]. Application callers
+/// configure it through [`crate::scalable::StreamConsumerBuilder`]. In
+/// particular, it deliberately contains no wire consumer id and no child
+/// subscription-type selector.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct StreamConsumerOptions {
+    /// Canonical scalable parent topic requested by the application.
+    pub topic: String,
+    /// Subscription shared by every assigned segment child.
+    pub subscription: String,
+    /// Stable aggregate consumer name. Child names append `-seg-<id>`.
+    pub consumer_name: String,
+    /// Broker schema metadata copied to every ordinary child subscribe.
+    pub schema: magnetar_proto::pb::Schema,
+    /// One aggregate receive budget, never multiplied by child count.
+    pub receiver_budget: magnetar_proto::ReceiverBudget,
+    /// Parent-before-child ordering policy.
+    pub ordering_mode: magnetar_proto::OrderingMode,
+}
+
+/// One raw aggregate delivery returned by a runtime backend.
+///
+/// The ordinary message owns its payload and metadata; the token is the sole
+/// process-local acknowledgement authority for that aggregate delivery.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RawStreamMessage {
+    /// Ordinary child delivery.
+    pub message: magnetar_proto::IncomingMessage,
+    /// Source-, incarnation-, generation-, and delivery-epoch-bound authority.
+    pub token: magnetar_proto::DeliveryToken,
+}
+
+/// Owned aggregate backend returned by [`SegmentSubscriberApi`].
+///
+/// Implementations are runtime resources, not public client clones. All
+/// methods target the backend's typed controller/segment routes; none may
+/// consume the client-global scalable event queue. Receive methods accept
+/// concurrent callers, and `receive_batch` must reserve its returned batch
+/// atomically after the first-message wait.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[doc(hidden)]
+pub trait StreamConsumerBackend: 'static + Send + Sync {
+    /// Await and reserve one delivery.
+    fn receive(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<RawStreamMessage, crate::scalable::StreamConsumerError>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// Await the first delivery, then atomically reserve the complete bounded
+    /// batch before another receive can interleave.
+    fn receive_batch(
+        &self,
+        policy: crate::scalable::BatchReceivePolicy,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RawStreamMessage>, crate::scalable::StreamConsumerError>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// Resolve broker schema metadata for a child when the retained schema
+    /// instance requests PIP-87 discovery.
+    fn get_schema<'a>(
+        &'a self,
+        source: &'a magnetar_proto::SegmentSource,
+        version: Option<bytes::Bytes>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        magnetar_proto::pb::Schema,
+                        crate::scalable::StreamConsumerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Individually acknowledge one live delivery.
+    fn acknowledge<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Cumulatively acknowledge the delivered position vector carried by one
+    /// live token.
+    fn acknowledge_cumulative<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Acknowledge a restored serializable position vector after validating it
+    /// against current assignment and child generations.
+    fn acknowledge_positions<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Validate all tokens, then issue a batch acknowledgement.
+    fn acknowledge_batch<'a>(
+        &'a self,
+        tokens: Vec<&'a magnetar_proto::DeliveryToken>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Negatively acknowledge one live delivery using the configured/default
+    /// redelivery delay.
+    fn negative_acknowledge(
+        &self,
+        token: &magnetar_proto::DeliveryToken,
+    ) -> Result<(), crate::scalable::StreamConsumerError>;
+
+    /// Admit and issue one individual acknowledgement in a Pulsar transaction.
+    fn acknowledge_in_transaction<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Admit every component of a live cumulative position in a transaction.
+    fn acknowledge_cumulative_in_transaction<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Admit every component of a restored position vector in a transaction.
+    fn acknowledge_positions_in_transaction<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Current highest position delivered to the application per segment.
+    fn delivered_position(&self) -> magnetar_proto::PositionVector;
+
+    /// Current aggregate lifecycle/resource snapshot.
+    fn status(&self) -> crate::scalable::StreamConsumerStatus;
+
+    /// Await the next event on this aggregate's owned typed route.
+    fn next_event(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<crate::scalable::StreamConsumerEvent>,
+                        crate::scalable::StreamConsumerError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >;
+
+    /// Apply the M1-limited all-current-leaves vector seek.
+    fn seek_positions<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
+
+    /// Propagate a confirmed or unknown transaction outcome to this aggregate.
+    fn transaction_outcome(
+        &self,
+        txn_id: magnetar_proto::TxnId,
+        outcome: crate::scalable::TransactionOutcome,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>>;
+
+    /// Globally fence the aggregate and await typed-route/task/child cleanup.
+    fn close(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>>;
+
+    /// Synchronous final-user-guard cleanup. Must not block or spawn.
+    fn close_best_effort(&self);
+}
+
+/// Engine-side factory for an owned assignment-driven segment subscriber.
+///
+/// The opening future may borrow the public runtime client, but the returned
+/// aggregate backend is owned and `'static`. This is the capability boundary
+/// that removes the former `E::ClientState: Clone` requirement.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[doc(hidden)]
+pub trait SegmentSubscriberApi: 'static + Send + Sync {
+    /// Runtime-owned aggregate backend.
+    type StreamConsumer: StreamConsumerBackend;
+
+    /// Resolve controller authority, install owned typed routes, register the
+    /// scalable member, and open its initial assigned segment children.
+    fn subscribe_stream_consumer(
+        &self,
+        options: StreamConsumerOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Self::StreamConsumer, crate::scalable::StreamConsumerError>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
 /// **Experimental** (PIP-460, ADR-0093). Engine-side scalable-topic hooks —
-/// implemented by each runtime on its `Client` type. The façade's
-/// [`crate::scalable::StreamConsumer`] dispatches through this trait once
-/// [`crate::PulsarClient<E>`] carries the
-/// `where E::ClientState: ScalableTopicsApi` bound.
+/// implemented by each runtime on its `Client` type. This is the low-level raw
+/// lookup/watch API; the assignment-driven [`crate::scalable::StreamConsumer`]
+/// dispatches through [`SegmentSubscriberApi`] instead.
 ///
 /// **Sans-io.** Async methods return `Pin<Box<dyn Future + Send + '_>>`; no
 /// tokio / mio / socket types appear in the surface. Each impl drives the
@@ -1045,9 +1264,10 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// Per-runtime client error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Open a scalable-topic session and await its first layout. The session
-    /// stays open, pushing later layouts through
-    /// [`Self::next_scalable_event`], until it is closed.
+    /// Open a low-level scalable-topic session and await its first layout. The
+    /// session stays open, pushing later layouts through
+    /// [`Self::next_scalable_event`], until it is closed. Owned high-level
+    /// consumers must not use this queue.
     fn scalable_topic_lookup<'a>(
         &'a self,
         topic: &'a str,
@@ -1101,8 +1321,9 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// Close a scalable-topic session.
     fn close_scalable_topic_session(&self, session_id: u64);
 
-    /// Await the next scalable-topic event (DAG update / drop-on-change /
-    /// close). Resolves `None` once the connection closes.
+    /// Await the next unclaimed low-level scalable-topic event. Resolves `None`
+    /// once the connection closes. Events claimed by an owned high-level route
+    /// never appear here.
     fn next_scalable_event(
         &self,
     ) -> Pin<Box<dyn Future<Output = Option<ScalableEvent>> + Send + '_>>;
@@ -1120,6 +1341,10 @@ pub struct ScalableLookup {
     pub resolved_topic_name: Option<String>,
     /// Controller broker serving this topic's layout, when advertised.
     pub controller_broker_url: Option<String>,
+    /// TLS controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url_tls: Option<String>,
+    /// Complete validated initial DAG snapshot.
+    pub snapshot: magnetar_proto::DagSnapshot,
     /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
     /// Layout epoch the snapshot was stamped with.
@@ -1140,6 +1365,10 @@ pub enum ScalableEvent {
         resolved_topic_name: Option<String>,
         /// Controller broker serving this topic's layout, when advertised.
         controller_broker_url: Option<String>,
+        /// TLS controller broker serving this topic's layout, when advertised.
+        controller_broker_url_tls: Option<String>,
+        /// Complete validated initial DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
         /// Initial DAG snapshot.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
         /// Layout epoch the snapshot was stamped with.
@@ -1151,8 +1380,12 @@ pub enum ScalableEvent {
         session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
+        /// Complete validated replacement DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
     },
-    /// The segment DAG changed under a live consumer (drop-on-change).
+    /// Legacy low-level consume-affecting DAG notification. Owned aggregate
+    /// consumers reconcile the replacement snapshot on their typed route and
+    /// do not consume this global event.
     DagChangedDuringConsume {
         /// Session id whose DAG changed.
         session_id: u64,
@@ -1170,6 +1403,8 @@ pub enum ScalableEvent {
     ConsumerAssigned {
         /// Consumer id that registered.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the baseline.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// The `segment://` topics this consumer owns.
         assignment: magnetar_proto::ConsumerAssignment,
     },
@@ -1177,6 +1412,10 @@ pub enum ScalableEvent {
     AssignmentChanged {
         /// Consumer id whose share changed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the update.
+        incarnation: magnetar_proto::ControllerIncarnation,
+        /// Complete authoritative assignment after applying the update.
+        assignment: magnetar_proto::ConsumerAssignment,
         /// What to attach to and detach from.
         delta: magnetar_proto::AssignmentDelta,
     },
@@ -1184,6 +1423,8 @@ pub enum ScalableEvent {
     ConsumerRejected {
         /// Consumer id whose registration failed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the rejection.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// Why the broker rejected it.
         reason: String,
     },

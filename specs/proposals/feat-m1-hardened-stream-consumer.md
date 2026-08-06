@@ -1,7 +1,7 @@
 # M1-hardened scalable StreamConsumer and follow-up closure
 
-- **Status**: Draft
-- **ADR**: [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) and [ADR-0095](../adr/0095-ignore-a-re-sent-scalable-layout-epoch.md), to be amended by the implementation ADR
+- **Status**: In-flight
+- **ADR**: [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md), preserving [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md)'s wire and negotiation decisions and [ADR-0095](../adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
 - **Date**: 2026-08-04
 - **Owner**: Florentin Dubois
 - **Scope**: One pull request closing `docs/follow-ups.md` sections 11, 12, 14, and 15
@@ -91,7 +91,7 @@ let consumer = client
     )
     .subscription("subscription")
     .consumer_name("worker-a")
-    .receiver_budget(ReceiverBudget::bytes(8 * 1024 * 1024))
+    .receiver_budget(ReceiverBudget::bytes(16 * 1024 * 1024)?)
     .ordering_mode(OrderingMode::Strict)
     .subscribe()
     .await?;
@@ -222,7 +222,8 @@ Adding segments redistributes available capacity; it never multiplies the config
 Every child runs in manual-FLOW mode: initial, automatic, reconnect, and refill FLOW are disabled, and only the aggregate arbiter grants permits.
 Before granting one message permit, the arbiter reserves `MAX_FRAME_SIZE` (5 MiB); arrival transfers that reservation to exact retained bytes and releases any surplus.
 Announced chunk totals and decompression workspaces are reserved before retention or allocation, and a message that cannot fit produces `MessageTooLargeForBudget` without exposing partial data.
-The configured budget must fit at least one maximum-size frame in addition to a fixed 64 KiB control-plane cleanup reserve.
+The configured budget must fit one maximum-size frame, three maximum-size stream-position values, two delivery-authority overheads, and a fixed 64 KiB control-plane cleanup reserve: `MAX_FRAME_SIZE + 3 * MAX_STREAM_POSITION_SIZE + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 8,454,272 bytes`.
+Examples use 16 MiB; 8 MiB is below the valid minimum.
 
 Moving a message between child, barrier, aggregate, and delivery state transfers one reservation rather than double-counting it.
 The reservation lease remains until the delivery is resolved or dropped.
@@ -498,13 +499,13 @@ Runtime IDs, socket addresses, task scheduling order, and timestamps are normali
 
 ## 7. Test plan
 
-| Layer                | Crate                       | Required evidence                                                                                                                                                                                                                                                                                                                                               |
-| -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Proto unit           | `magnetar-proto`            | Assignment normalization; inclusive hash ranges; equal/stale epochs; connection incarnations; malformed DAGs; strict and broker-managed ancestry; deep split and merge barriers; atomic receive/batch reservation; token and seek epochs; partial transaction failure poisoning and outcomes; budget conservation; serialization rejection; no-panic properties |
-| Tokio integration    | `magnetar-runtime-tokio`    | Real sockets; two consumers cannot steal events; push-before-response; segment fan-out; concurrent receive; batch atomicity; ack/nack/transaction/seek; unbounded drain and pending ownership; pooled-close limitation; plaintext/TLS direct controller routing                                                                                                 |
-| Moonpool integration | `magnetar-runtime-moonpool` | Exact Tokio scenarios under provider-native execution plus deterministic race schedules and seed replay                                                                                                                                                                                                                                                         |
-| Differential         | `magnetar-differential`     | Equivalent normalized behavior for assignment, delivery, ordering barriers, acknowledgements, reconnect, close, and failures                                                                                                                                                                                                                                    |
-| E2E                  | `magnetar-driver`           | Real M1 topic, official V5 CLI multi-segment publisher, public Magnetar builder, typed delivery, position-vector ack, transaction commit/abort, strict single-member ancestry, explicit broker-managed multi-member behavior, close limitation, direct multi-broker where fixture support permits                                                               |
+| Layer                | Crate                       | Required evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Proto unit           | `magnetar-proto`            | Assignment normalization; inclusive hash ranges; equal/stale epochs; connection incarnations; malformed DAGs; strict and broker-managed ancestry; deep split and merge barriers; atomic receive/batch reservation; token and seek epochs; partial transaction failure poisoning and outcomes; budget conservation; serialization rejection; no-panic properties                                                                                                                              |
+| Tokio integration    | `magnetar-runtime-tokio`    | Real sockets; two consumers cannot steal events; push-before-response; segment fan-out; concurrent receive; batch atomicity; ack/nack/transaction/seek; unbounded drain and pending ownership; pooled-close limitation; plaintext/TLS direct controller routing                                                                                                                                                                                                                              |
+| Moonpool integration | `magnetar-runtime-moonpool` | Exact Tokio scenarios under provider-native execution plus deterministic race schedules and seed replay                                                                                                                                                                                                                                                                                                                                                                                      |
+| Differential         | `magnetar-differential`     | Equivalent normalized behavior for assignment, delivery, ordering barriers, acknowledgements, reconnect, close, and failures                                                                                                                                                                                                                                                                                                                                                                 |
+| E2E                  | `magnetar-driver`           | Real M1 topic, official V5 CLI multi-segment publisher, public Magnetar builder, typed delivery, position-vector ack, transaction commit/abort, single-member split progression in Strict mode, explicit broker-managed multi-member behavior, close limitation, and reachable broker-authored authority matching the standalone bootstrap transport; broker-controlled assignment timing and the standalone endpoint do not isolate client-side Strict gating or direct-authority selection |
 
 Real e2e publishes distinct unkeyed messages with M1's bundled V5 client:
 
@@ -516,18 +517,20 @@ bin/pulsar-client --url pulsar://localhost:6650 produce \
 ```
 
 Proxy controller registration is a negative capability test until the upstream contract is resolved.
+The standalone fixture advertises the bootstrap endpoint, so it cannot distinguish direct-authority selection from bootstrap fallback and is not multi-broker routing evidence.
 
 ## 8. Follow-up 14 - current-pass sim coverage
 
 The gate must not certify source from object files it did not establish as current-pass inputs.
-The per-file missing-`SF:` candidate is rejected because LLVM legitimately emits no record for functionless module/export/constant files.
+An unconditional per-file missing-`SF:` rule is rejected because LLVM legitimately emits no record for functionless module/export/constant/bodyless-declaration files.
 
 `run_sim_lcov` creates an invocation-owned empty coverage target outside the workspace's cached `target/`, sets `CARGO_LLVM_COV_TARGET_DIR` to that same absolute path for both execution and report, and removes it after every success or failure.
 The final LCOV file remains `target/sim-coverage.lcov`, but no object or profile input comes from that cached root.
 This avoids relying on package-scoped cleaning or a mutable cache action's pruning behavior as the integrity boundary.
 
 Warm, cold, profile-only, object-only, and combined stale-artifact cases poison the default coverage target and prove it is never selected as an input.
-Functionless files remain advisory; a record-less gated crate remains a hard failure.
+Record-less files with no non-test function body remain advisory.
+A record-less file with a non-test function body hard-fails even when a sibling file proves that its gated crate reached LCOV; a wholly record-less gated crate remains a hard failure.
 
 ## 9. Follow-up 15 - coherent Tokio write deadline
 
@@ -615,8 +618,14 @@ Push and pull-request creation remain separately approval-gated.
 
 ## 12. Validation and acceptance
 
-Each focused lane runs its targeted red/green checks before integration.
-The final branch runs, serially, the complete repository chain from `CLAUDE.md`, including formatting, all-feature build/clippy/test, Docker e2e, 32-seed Moonpool sweep, deny, rustdoc, codegen, sim coverage, runtime parity, crypto matrix, and Markdown formatting.
+Each focused lane ran its targeted red/green checks before integration.
+The code, fake, proto, runtime, façade, and differential focused suites passed.
+The Moonpool runtime also passes a complete aggregate over simulated controller and segment sockets for four schedules derived from `MOONPOOL_SEED`, covering typed delivery from both sources, status, position, acknowledgement, and close under `SimProviders`.
+The real M1 e2e target compiles and is discovered with `--features scalable-topics`, but Docker was unavailable on the integration host, so this branch did not execute it locally; the existing all-feature CI policy runs the ordinary e2e target when Docker is available.
+A local worktree invocation of `check-runtime-test-parity` reported Tokio 400 / Moonpool 400.
+`check-sim-coverage` diffs `<merge-base>..HEAD`, not the uncommitted worktree.
+The complete implementation diff must first be represented by `HEAD`, then the enforcing gate rerun before its result can satisfy this proposal's acceptance criteria.
+The proposal therefore remains in flight until the real M1 target executes successfully, the committed complete diff passes the enforcing sim-coverage gate, and the required full validation chain is green.
 
 The proposal is implemented only when:
 

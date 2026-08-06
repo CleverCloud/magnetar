@@ -876,6 +876,7 @@ impl Default for CreateProducerRequest {
 
 /// Parameters for opening a consumer.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SubscribeRequest {
     /// Topic name.
     pub topic: String,
@@ -989,6 +990,11 @@ pub struct SubscribeRequest {
     /// (default `60s`). Incomplete chunked messages older than this are swept
     /// on the connection's existing timeout tick. `None` disables expiry.
     pub expire_time_of_incomplete_chunked_message: Option<Duration>,
+    /// Defer payload transformation, chunk reassembly, and batch expansion to
+    /// an owning scalable aggregate. Internal M1 children enable this so their
+    /// single receive budget can reserve every controlled allocation first.
+    #[doc(hidden)]
+    pub defer_payload_processing: bool,
 }
 
 /// PIP-4 decryption failure handling. Mirrors Java
@@ -1065,6 +1071,7 @@ impl Default for SubscribeRequest {
             expire_time_of_incomplete_chunked_message: Some(
                 crate::consumer::DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE,
             ),
+            defer_payload_processing: false,
         }
     }
 }
@@ -1091,6 +1098,9 @@ pub struct AckRequest {
 pub enum SeekTarget {
     /// Seek to a specific message id.
     MessageId(MessageId),
+    /// Seek with the complete ordinary protobuf id. Scalable restored
+    /// positions use this form to retain chunk and partial-batch fields.
+    MessageIdData(pb::MessageIdData),
     /// Seek to a specific publish timestamp (ms since UNIX epoch).
     PublishTime(u64),
 }

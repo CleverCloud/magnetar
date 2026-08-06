@@ -634,8 +634,12 @@ fn classify(err: &ClientError) -> String {
         ClientError::Io(_) => "io".to_owned(),
         ClientError::Protocol(_) => "protocol".to_owned(),
         ClientError::Tls(_) => "tls".to_owned(),
+        ClientError::BadUrl(_) => "bad-url".to_owned(),
+        ClientError::UnsupportedScheme(_) => "unsupported-scheme".to_owned(),
         ClientError::Broker { code, .. } => format!("broker:{code}"),
+        ClientError::SendRejected { code, .. } => format!("send-rejected:{code}"),
         ClientError::Closed => "closed".to_owned(),
+        ClientError::EndOfTopic => "end-of-topic".to_owned(),
         ClientError::Timeout(_) => "timeout".to_owned(),
         // Terminal drop on a plain connection (peer close / fatal decode):
         // the proto layer resolved every pending op with `OpOutcome::Terminal`
@@ -643,7 +647,32 @@ fn classify(err: &ClientError) -> String {
         // differential test asserts both legs collapse to this same bucket
         // (ADR-0055 §1).
         ClientError::PeerClosed => "peer-closed".to_owned(),
-        _ => "other".to_owned(),
+        ClientError::InvalidServerName(_) => "invalid-server-name".to_owned(),
+        ClientError::MemoryLimitExceeded { .. } => "memory-limit".to_owned(),
+        ClientError::ProxyUnsupportedOnSocketClient { .. } => "proxy-unsupported".to_owned(),
+        ClientError::ControllerUnavailable => "controller-unavailable".to_owned(),
+        ClientError::ControllerRoutingUnsupported { .. } => {
+            "controller-routing-unsupported".to_owned()
+        }
+        ClientError::ScalableAuthorityRejected => "scalable-authority-rejected".to_owned(),
+        #[cfg(feature = "scalable-topics")]
+        ClientError::ScalableAssignmentRejected { .. } => "scalable-assignment-rejected".to_owned(),
+        #[cfg(feature = "scalable-topics")]
+        ClientError::ScalableRoute(error) => match error {
+            magnetar_runtime_tokio::ScalableRouteError::Overflow { .. } => {
+                "scalable-route:overflow".to_owned()
+            }
+            magnetar_runtime_tokio::ScalableRouteError::ConnectionReplaced => {
+                "scalable-route:connection-replaced".to_owned()
+            }
+            magnetar_runtime_tokio::ScalableRouteError::ConnectionClosed => {
+                "scalable-route:connection-closed".to_owned()
+            }
+            magnetar_runtime_tokio::ScalableRouteError::Closed => {
+                "scalable-route:closed".to_owned()
+            }
+        },
+        ClientError::Other(_) => "other".to_owned(),
     }
 }
 
@@ -655,5 +684,86 @@ mod tests {
     fn classifies_operation_timeout() {
         let error = ClientError::Timeout("producer open exceeded operation_timeout".to_owned());
         assert_eq!(classify(&error), "timeout");
+    }
+
+    #[tokio::test]
+    async fn classifies_every_public_scalable_error_category() {
+        let bad_url = Client::connect("not a url", magnetar_proto::ConnectionConfig::default())
+            .await
+            .expect_err("malformed URL");
+        assert_eq!(classify(&bad_url), "bad-url");
+
+        let cases = [
+            (
+                ClientError::UnsupportedScheme("http".to_owned()),
+                "unsupported-scheme",
+            ),
+            (
+                ClientError::SendRejected {
+                    code: 5,
+                    message: "rejected".to_owned(),
+                },
+                "send-rejected:5",
+            ),
+            (ClientError::EndOfTopic, "end-of-topic"),
+            (
+                ClientError::InvalidServerName("bad name".to_owned()),
+                "invalid-server-name",
+            ),
+            (
+                ClientError::MemoryLimitExceeded {
+                    current: 2,
+                    limit: 2,
+                    requested: 1,
+                },
+                "memory-limit",
+            ),
+            (
+                ClientError::ProxyUnsupportedOnSocketClient {
+                    topic: "topic".to_owned(),
+                },
+                "proxy-unsupported",
+            ),
+            (ClientError::ControllerUnavailable, "controller-unavailable"),
+            (
+                ClientError::ControllerRoutingUnsupported { reason: "test" },
+                "controller-routing-unsupported",
+            ),
+            (
+                ClientError::ScalableAuthorityRejected,
+                "scalable-authority-rejected",
+            ),
+            (
+                ClientError::ScalableAssignmentRejected {
+                    reason: "test".to_owned(),
+                },
+                "scalable-assignment-rejected",
+            ),
+            (ClientError::Other("test".to_owned()), "other"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(classify(&error), expected);
+        }
+
+        for (error, expected) in [
+            (
+                magnetar_runtime_tokio::ScalableRouteError::Overflow { capacity: 1 },
+                "scalable-route:overflow",
+            ),
+            (
+                magnetar_runtime_tokio::ScalableRouteError::ConnectionReplaced,
+                "scalable-route:connection-replaced",
+            ),
+            (
+                magnetar_runtime_tokio::ScalableRouteError::ConnectionClosed,
+                "scalable-route:connection-closed",
+            ),
+            (
+                magnetar_runtime_tokio::ScalableRouteError::Closed,
+                "scalable-route:closed",
+            ),
+        ] {
+            assert_eq!(classify(&ClientError::ScalableRoute(error)), expected);
+        }
     }
 }

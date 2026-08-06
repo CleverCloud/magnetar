@@ -2609,8 +2609,10 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
         // A sealed segment the broker no longer serves carries no placement.
         let broker = seg.broker_url.as_deref().unwrap_or("-");
         println!(
-            "{:<10} [{:>5},{:>5}) {state:<10} {broker}",
-            seg.segment_id.0, seg.key_range.start, seg.key_range.end,
+            "{:<10} [{:>5},{:>5}] {state:<10} {broker}",
+            seg.segment_id.0,
+            seg.key_range.start(),
+            seg.key_range.end(),
         );
     }
     println!("({} segment(s))", lookup.segments.len());
@@ -3961,25 +3963,16 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
 /// `MessageIdImpl.toString()` field layout. `MessageId` is a pure proto type
 /// without a `Serialize` impl, so the shape is built by hand here and shared
 /// by every command that emits a message id (`topics terminate`,
-/// `topics get-message-id-by-index`). Under the `scalable-topics` feature the
-/// id also carries an optional PIP-460 `segmentId`; we surface it (as JSON
-/// `null` when absent) so the output faithfully represents the full type
-/// rather than silently dropping the segment.
+/// `topics get-message-id-by-index`). Scalable source identity belongs to
+/// `StreamMessageId` and is intentionally absent from this ordinary-id shape.
 pub(crate) fn message_id_to_json(id: &MessageId) -> serde_json::Value {
-    let value = serde_json::json!({
+    serde_json::json!({
         "ledgerId": id.ledger_id,
         "entryId": id.entry_id,
         "partition": id.partition,
         "batchIndex": id.batch_index,
         "batchSize": id.batch_size,
-    });
-    #[cfg(feature = "scalable-topics")]
-    let value = {
-        let mut value = value;
-        value["segmentId"] = id.segment_id.map(|s| s.0).into();
-        value
-    };
-    value
+    })
 }
 
 /// Errors surfaced from the CLI run loop.
@@ -4039,8 +4032,6 @@ fn parse_message_id_position(s: &str) -> Result<MessageId, String> {
         partition,
         batch_index,
         batch_size: -1,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     })
 }
 

@@ -122,8 +122,6 @@ async fn cross_session_state_is_isolated_between_legs() {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     let trace = Trace::new(
         "persistent://public/default/smoke-cross-session",

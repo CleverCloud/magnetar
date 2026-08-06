@@ -22,12 +22,18 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "stream_consumer_support/server.rs"]
+mod server;
+
+use magnetar::{MoonpoolEngine as FacadeMoonpoolEngine, PulsarClient, TokioEngine};
 use magnetar_differential::HANG_GUARD;
 use magnetar_differential::broker::ScriptedBroker;
+use magnetar_fakes::m1::{BrokerFailure, Endpoint, OperationKind, ScriptedBehavior};
 use magnetar_proto::{ConnectionConfig, ScalableConsumerType};
 use magnetar_runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
 use magnetar_runtime_tokio::Client as TokioClient;
 use moonpool_core::TokioProviders;
+use server::M1SocketCluster;
 
 /// A normalised, engine-independent description of one scalable exchange.
 /// Compared across engines rather than the raw types, so a difference reads as
@@ -45,19 +51,230 @@ struct Observed {
     broker_supports_tc_discovery: bool,
 }
 
-/// Drive the tokio engine's `Client` through the scalable flow.
-async fn observe_tokio(url: &str) -> Observed {
-    let client = tokio::time::timeout(
+#[derive(Debug, PartialEq, Eq)]
+struct CancelledRawEventTrace {
+    lookup: (u64, Option<String>, bool, bool, u64, usize),
+    assigned: (u64, u64, u64, Vec<u64>),
+    rejected: (u64, u64, String),
+}
+
+async fn observe_cancelled_raw_events<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> CancelledRawEventTrace
+where
+    E: magnetar::Engine,
+    E::ClientState: magnetar::scalable::ScalableTopicsApi,
+{
+    cluster.hold_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicUpdate,
+    );
+    let mut lookup = Box::pin(client.lookup_scalable_topic("topic://public/default/scaled"));
+    tokio::select! {
+        biased;
+        result = &mut lookup => panic!("held raw lookup completed early: {result:?}"),
+        () = cluster.wait_for("cancelled raw lookup command", |fake| {
+            fake.resource_counts().layout_sessions == 1
+        }) => {}
+    }
+    drop(lookup);
+    cluster.release_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicUpdate,
+    );
+    let lookup = match tokio::time::timeout(HANG_GUARD, client.next_scalable_event())
+        .await
+        .expect("cancelled raw lookup event timed out")
+        .expect("cancelled raw lookup left one event")
+    {
+        magnetar::scalable::ScalableEvent::LookupResolved {
+            session_id,
+            resolved_topic_name,
+            controller_broker_url,
+            controller_broker_url_tls,
+            snapshot,
+            segments,
+            epoch,
+        } => {
+            assert_eq!(snapshot.epoch(), epoch);
+            (
+                session_id,
+                resolved_topic_name,
+                controller_broker_url.is_some(),
+                controller_broker_url_tls.is_some(),
+                epoch,
+                segments.len(),
+            )
+        }
+        event => panic!("unexpected cancelled raw lookup event: {event:?}"),
+    };
+
+    cluster.hold_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse,
+    );
+    let mut subscribe = Box::pin(client.scalable_topic_subscribe(
+        "topic://public/default/scaled",
+        "cancelled-raw-sub",
+        "cancelled-raw-member",
+        42,
+        ScalableConsumerType::Stream,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut subscribe => panic!("held raw subscribe completed early: {result:?}"),
+        () = cluster.wait_for("cancelled raw subscribe command", |fake| {
+            fake.resource_counts().scalable_members == 1
+        }) => {}
+    }
+    drop(subscribe);
+    cluster.release_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse,
+    );
+    let assigned = match tokio::time::timeout(HANG_GUARD, client.next_scalable_event())
+        .await
+        .expect("cancelled raw assignment event timed out")
+        .expect("cancelled raw subscribe left one assignment")
+    {
+        magnetar::scalable::ScalableEvent::ConsumerAssigned {
+            consumer_id,
+            incarnation,
+            assignment,
+        } => (
+            consumer_id,
+            incarnation.0,
+            assignment.layout_epoch(),
+            assignment
+                .segments()
+                .iter()
+                .map(|segment| segment.segment_id().0)
+                .collect(),
+        ),
+        event => panic!("unexpected cancelled raw assignment event: {event:?}"),
+    };
+
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar_proto::pb::ServerError::NotAllowedError,
+                    "cancelled raw registration rejected",
+                )),
+            )
+        })
+        .expect("script cancelled raw registration rejection");
+    cluster.hold_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse,
+    );
+    let mut rejected = Box::pin(client.scalable_topic_subscribe(
+        "topic://public/default/scaled",
+        "cancelled-raw-sub",
+        "cancelled-raw-denied",
+        99,
+        ScalableConsumerType::Stream,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut rejected => panic!("held raw rejection completed early: {result:?}"),
+        () = cluster.wait_for("cancelled raw rejection command", |fake| {
+            fake.routes().iter().filter(|route| {
+                route.command
+                    == magnetar_proto::pb::base_command::Type::ScalableTopicSubscribe
+            }).count() == 2
+        }) => {}
+    }
+    drop(rejected);
+    cluster.release_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse,
+    );
+    let rejected = match tokio::time::timeout(HANG_GUARD, client.next_scalable_event())
+        .await
+        .expect("cancelled raw rejection event timed out")
+        .expect("cancelled raw rejection left one event")
+    {
+        magnetar::scalable::ScalableEvent::ConsumerRejected {
+            consumer_id,
+            incarnation,
+            reason,
+        } => (consumer_id, incarnation.0, reason),
+        event => panic!("unexpected cancelled raw rejection event: {event:?}"),
+    };
+    client.close_scalable_topic_session(lookup.0);
+
+    CancelledRawEventTrace {
+        lookup,
+        assigned,
+        rejected,
+    }
+}
+
+async fn connect_tokio_facade(url: &str) -> PulsarClient<TokioEngine> {
+    tokio::time::timeout(
         HANG_GUARD,
-        TokioClient::connect(url, ConnectionConfig::default()),
+        PulsarClient::<TokioEngine>::builder()
+            .service_url(url)
+            .operation_timeout(HANG_GUARD)
+            .build(),
     )
     .await
-    .expect("tokio connect did not time out")
-    .expect("tokio connect succeeded");
+    .expect("tokio facade connect did not time out")
+    .expect("tokio facade connect succeeded")
+}
+
+async fn connect_moonpool_facade(
+    host_port: &str,
+) -> PulsarClient<FacadeMoonpoolEngine<TokioProviders>> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let runtime_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, host_port, ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool facade connect did not time out")
+    .expect("moonpool facade connect succeeded");
+    PulsarClient::from_runtime_client(runtime_client)
+}
+
+async fn connect_moonpool_supervised_facade(
+    host_port: &str,
+) -> PulsarClient<FacadeMoonpoolEngine<TokioProviders>> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let runtime_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain_supervised(
+            &engine,
+            host_port,
+            ConnectionConfig {
+                operation_timeout: HANG_GUARD,
+                supervisor: Some(magnetar_proto::SupervisorConfig::default()),
+                redirect_url_allow_list: Some(magnetar_proto::RedirectUrlAllowList::Hosts(vec![
+                    "127.0.0.1".to_owned(),
+                ])),
+                ..ConnectionConfig::default()
+            },
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("supervised moonpool facade connect did not time out")
+    .expect("supervised moonpool facade connect succeeded");
+    PulsarClient::from_runtime_client(runtime_client)
+}
+
+/// Drive the tokio façade through the scalable flow.
+async fn observe_tokio(url: &str) -> Observed {
+    let client = connect_tokio_facade(url).await;
 
     let lookup = tokio::time::timeout(
         HANG_GUARD,
-        client.scalable_topic_lookup("topic://public/default/scaled"),
+        client.lookup_scalable_topic("topic://public/default/scaled"),
     )
     .await
     .expect("tokio lookup did not time out")
@@ -94,13 +311,13 @@ async fn observe_tokio(url: &str) -> Observed {
             .map(|s| {
                 (
                     s.segment_id.0,
-                    s.key_range.start,
-                    s.key_range.end,
+                    s.key_range.start(),
+                    s.key_range.end(),
                     s.broker_url.clone(),
                 )
             })
             .collect(),
-        assignment_epoch: assignment.layout_epoch,
+        assignment_epoch: assignment.layout_epoch(),
         assignment_topics: assignment
             .segment_topics()
             .into_iter()
@@ -116,20 +333,13 @@ async fn observe_tokio(url: &str) -> Observed {
     observed
 }
 
-/// Drive the moonpool engine's `Client` through the identical flow.
+/// Drive the moonpool façade through the identical flow.
 async fn observe_moonpool(host_port: &str) -> Observed {
-    let engine = MoonpoolEngine::new(TokioProviders::new());
-    let client = tokio::time::timeout(
-        HANG_GUARD,
-        MoonpoolClient::connect_plain(&engine, host_port, ConnectionConfig::default()),
-    )
-    .await
-    .expect("moonpool connect did not time out")
-    .expect("moonpool connect succeeded");
+    let client = connect_moonpool_facade(host_port).await;
 
     let lookup = tokio::time::timeout(
         HANG_GUARD,
-        client.scalable_topic_lookup("topic://public/default/scaled"),
+        client.lookup_scalable_topic("topic://public/default/scaled"),
     )
     .await
     .expect("moonpool lookup did not time out")
@@ -164,13 +374,13 @@ async fn observe_moonpool(host_port: &str) -> Observed {
             .map(|s| {
                 (
                     s.segment_id.0,
-                    s.key_range.start,
-                    s.key_range.end,
+                    s.key_range.start(),
+                    s.key_range.end(),
                     s.broker_url.clone(),
                 )
             })
             .collect(),
-        assignment_epoch: assignment.layout_epoch,
+        assignment_epoch: assignment.layout_epoch(),
         assignment_topics: assignment
             .segment_topics()
             .into_iter()
@@ -189,7 +399,7 @@ async fn observe_moonpool(host_port: &str) -> Observed {
 /// Wait until the namespace watch has applied the scripted diff, so both
 /// engines are compared at the same point in the transcript rather than
 /// whichever snapshot each happened to reach first.
-async fn drain_topics_tokio(client: &TokioClient, watch_id: u64) -> Vec<String> {
+async fn drain_topics_tokio(client: &PulsarClient<TokioEngine>, watch_id: u64) -> Vec<String> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     loop {
         if let Some(topics) = client.scalable_topics_snapshot(watch_id)
@@ -202,14 +412,15 @@ async fn drain_topics_tokio(client: &TokioClient, watch_id: u64) -> Vec<String> 
                 .scalable_topics_snapshot(watch_id)
                 .unwrap_or_default();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, client.next_scalable_event()).await;
     }
 }
 
-async fn drain_topics_moonpool<P>(client: &MoonpoolClient<P>, watch_id: u64) -> Vec<String>
-where
-    P: moonpool_core::Providers + Send + Sync + 'static,
-{
+async fn drain_topics_moonpool(
+    client: &PulsarClient<FacadeMoonpoolEngine<TokioProviders>>,
+    watch_id: u64,
+) -> Vec<String> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     loop {
         if let Some(topics) = client.scalable_topics_snapshot(watch_id)
@@ -222,7 +433,8 @@ where
                 .scalable_topics_snapshot(watch_id)
                 .unwrap_or_default();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, client.next_scalable_event()).await;
     }
 }
 
@@ -256,14 +468,14 @@ async fn scalable_client_surface_parity() {
     assert_eq!(
         tokio_observed.segments,
         vec![
-            (1, 0, 32_768, Some("pulsar://seg1:6650".to_owned())),
-            (2, 32_768, 65_536, Some("pulsar://seg2:6650".to_owned())),
+            (1, 0, 32_767, Some("pulsar://seg1:6650".to_owned())),
+            (2, 32_768, 65_535, Some("pulsar://seg2:6650".to_owned())),
         ]
     );
     assert_eq!(tokio_observed.assignment_epoch, 1);
     assert_eq!(
         tokio_observed.assignment_topics,
-        vec!["segment://public/default/scaled/1".to_owned()]
+        vec!["segment://public/default/scaled/0000-7fff-1".to_owned()]
     );
     assert_eq!(
         tokio_observed.topics_watch,
@@ -276,6 +488,266 @@ async fn scalable_client_surface_parity() {
     broker.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_raw_requests_leave_identical_facade_events() {
+    let tokio_cluster = M1SocketCluster::bind().await;
+    let tokio_client = connect_tokio_facade(tokio_cluster.controller_url()).await;
+    let tokio_trace = observe_cancelled_raw_events(&tokio_client, &tokio_cluster).await;
+    tokio::time::timeout(HANG_GUARD, tokio_client.close())
+        .await
+        .expect("Tokio client close with a live aggregate timed out");
+    tokio_cluster
+        .wait_for("cancelled Tokio raw-event cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    tokio_cluster.assert_healthy();
+
+    let moonpool_cluster = M1SocketCluster::bind().await;
+    let moonpool_address = moonpool_cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("plaintext Moonpool raw-event URL");
+    let moonpool_client = connect_moonpool_supervised_facade(moonpool_address).await;
+    let moonpool_trace = observe_cancelled_raw_events(&moonpool_client, &moonpool_cluster).await;
+    moonpool_client.close().await;
+    moonpool_cluster
+        .wait_for("cancelled Moonpool raw-event cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    moonpool_cluster.assert_healthy();
+
+    assert_eq!(tokio_trace, moonpool_trace);
+    assert_eq!(
+        tokio_trace.lookup.1.as_deref(),
+        Some("topic://public/default/scaled")
+    );
+    assert!(tokio_trace.lookup.2);
+    assert!(tokio_trace.lookup.3);
+    assert_eq!(tokio_trace.lookup.4, 1);
+    assert_eq!(tokio_trace.lookup.5, 2);
+    assert_eq!(tokio_trace.assigned.0, 42);
+    assert_eq!(tokio_trace.assigned.2, 1);
+    assert_eq!(tokio_trace.assigned.3, vec![1, 2]);
+    assert_eq!(tokio_trace.rejected.0, 99);
+    assert!(
+        tokio_trace
+            .rejected
+            .2
+            .contains("cancelled raw registration rejected")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_aggregates_surface_identical_facade_failures_after_client_close() {
+    let tokio_cluster = M1SocketCluster::bind().await;
+    let tokio_client = connect_tokio_facade(tokio_cluster.controller_url()).await;
+    let tokio_consumer = tokio_client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            std::sync::Arc::new(magnetar::proto::schema::BytesSchema::new()),
+        )
+        .subscription("facade-terminal-sub")
+        .consumer_name("facade-terminal-member")
+        .ordering_mode(magnetar_proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("open Tokio facade terminal aggregate");
+    tokio_cluster
+        .wait_for("Tokio facade terminal children", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.permits == 2
+        })
+        .await;
+    tokio_client.close().await;
+    let tokio_failed = loop {
+        match tokio::time::timeout(HANG_GUARD, tokio_consumer.next_event())
+            .await
+            .expect("Tokio facade terminal event timed out")
+        {
+            Ok(Some(_)) => {}
+            Err(magnetar::scalable::StreamConsumerError::Engine { engine, message }) => {
+                break engine == "tokio" && !message.is_empty();
+            }
+            result => panic!("unexpected Tokio facade terminal result: {result:?}"),
+        }
+    };
+    drop(tokio_consumer);
+    tokio_cluster
+        .wait_for("Tokio facade terminal cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    tokio_cluster.assert_healthy();
+
+    let moonpool_cluster = M1SocketCluster::bind().await;
+    let moonpool_address = moonpool_cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("plaintext Moonpool terminal URL");
+    let moonpool_client = connect_moonpool_supervised_facade(moonpool_address).await;
+    let moonpool_consumer = moonpool_client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            std::sync::Arc::new(magnetar::proto::schema::BytesSchema::new()),
+        )
+        .subscription("facade-terminal-sub")
+        .consumer_name("facade-terminal-member")
+        .ordering_mode(magnetar_proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("open Moonpool facade terminal aggregate");
+    moonpool_cluster
+        .wait_for("Moonpool facade terminal children", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.permits == 2
+        })
+        .await;
+    tokio::time::timeout(HANG_GUARD, moonpool_client.close())
+        .await
+        .expect("Moonpool client close with a live aggregate timed out");
+    let moonpool_failed = loop {
+        match tokio::time::timeout(HANG_GUARD, moonpool_consumer.next_event())
+            .await
+            .expect("Moonpool facade terminal event timed out")
+        {
+            Ok(Some(_)) => {}
+            Err(magnetar::scalable::StreamConsumerError::Engine { engine, message }) => {
+                break engine == "moonpool" && !message.is_empty();
+            }
+            result => panic!("unexpected Moonpool facade terminal result: {result:?}"),
+        }
+    };
+    drop(moonpool_consumer);
+    moonpool_cluster
+        .wait_for("Moonpool facade terminal cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    moonpool_cluster.assert_healthy();
+
+    assert!(tokio_failed);
+    assert!(moonpool_failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facade_transaction_api_fences_concurrent_end_requests() {
+    let tokio_cluster = M1SocketCluster::bind().await;
+    let tokio_client =
+        TokioClient::connect(tokio_cluster.controller_url(), ConnectionConfig::default())
+            .await
+            .expect("connect Tokio concurrent-end client");
+    let tokio_txn = magnetar::TransactionApi::new_txn(&tokio_client, HANG_GUARD)
+        .await
+        .expect("open Tokio concurrent-end transaction");
+    tokio_cluster.hold_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::EndTxnResponse,
+    );
+    let mut tokio_first = Box::pin(magnetar::TransactionApi::end_txn(
+        &tokio_client,
+        tokio_txn,
+        magnetar_proto::TxnAction::Abort,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut tokio_first => panic!("held Tokio EndTxn completed early: {result:?}"),
+        () = tokio_cluster.wait_for("first Tokio EndTxn command", |fake| {
+            fake.routes().iter().filter(|route| {
+                route.command == magnetar_proto::pb::base_command::Type::EndTxn
+            }).count() == 1
+        }) => {}
+    }
+    let tokio_error = magnetar::TransactionApi::end_txn(
+        &tokio_client,
+        tokio_txn,
+        magnetar_proto::TxnAction::Abort,
+    )
+    .await
+    .expect_err("Tokio fences a concurrent EndTxn")
+    .to_string();
+    tokio_cluster.release_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::EndTxnResponse,
+    );
+    assert_eq!(
+        tokio_first.await.expect("complete first Tokio EndTxn"),
+        magnetar_proto::TxnState::Aborted
+    );
+    tokio_client.close().await;
+
+    let moonpool_cluster = M1SocketCluster::bind().await;
+    let moonpool_address = moonpool_cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("plaintext Moonpool concurrent-end URL");
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let moonpool_client =
+        MoonpoolClient::connect_plain(&engine, moonpool_address, ConnectionConfig::default())
+            .await
+            .expect("connect Moonpool concurrent-end client");
+    let moonpool_txn = magnetar::TransactionApi::new_txn(&moonpool_client, HANG_GUARD)
+        .await
+        .expect("open Moonpool concurrent-end transaction");
+    moonpool_cluster.hold_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::EndTxnResponse,
+    );
+    let mut moonpool_first = Box::pin(magnetar::TransactionApi::end_txn(
+        &moonpool_client,
+        moonpool_txn,
+        magnetar_proto::TxnAction::Abort,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut moonpool_first => panic!("held Moonpool EndTxn completed early: {result:?}"),
+        () = moonpool_cluster.wait_for("first Moonpool EndTxn command", |fake| {
+            fake.routes().iter().filter(|route| {
+                route.command == magnetar_proto::pb::base_command::Type::EndTxn
+            }).count() == 1
+        }) => {}
+    }
+    let moonpool_error = magnetar::TransactionApi::end_txn(
+        &moonpool_client,
+        moonpool_txn,
+        magnetar_proto::TxnAction::Abort,
+    )
+    .await
+    .expect_err("Moonpool fences a concurrent EndTxn")
+    .to_string();
+    moonpool_cluster.release_command(
+        Endpoint::Controller,
+        magnetar_proto::pb::base_command::Type::EndTxnResponse,
+    );
+    assert_eq!(
+        moonpool_first
+            .await
+            .expect("complete first Moonpool EndTxn"),
+        magnetar_proto::TxnState::Aborted
+    );
+    moonpool_client.close().await;
+
+    assert!(!tokio_error.is_empty());
+    assert!(!moonpool_error.is_empty());
+    assert_eq!(
+        tokio_cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| route.command == magnetar_proto::pb::base_command::Type::EndTxn)
+                .count()
+        }),
+        1
+    );
+    assert!(moonpool_cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| route.command == magnetar_proto::pb::base_command::Type::EndTxn)
+            .count()
+            == 1
+    }));
+}
+
 /// (d) — the rebalance the broker pushes right after the registration reaches
 /// both engines' event streams identically, naming what to attach and detach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -285,9 +757,7 @@ async fn scalable_assignment_rebalance_parity() {
     let host_port = broker.host_port();
 
     let tokio_delta = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = connect_tokio_facade(&url).await;
         client
             .scalable_topic_subscribe(
                 "topic://public/default/scaled",
@@ -302,11 +772,7 @@ async fn scalable_assignment_rebalance_parity() {
     };
 
     let moonpool_delta = {
-        let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = connect_moonpool_facade(&host_port).await;
         client
             .scalable_topic_subscribe(
                 "topic://public/default/scaled",
@@ -337,7 +803,9 @@ async fn scalable_assignment_rebalance_parity() {
 /// held assignment only shows what the consumer ends up with, so a `lost` list
 /// asserted from the test's own expectations would pass even if the client
 /// computed it wrongly.
-async fn wait_for_rebalance_tokio(client: &TokioClient) -> Option<(u64, Vec<u64>, Vec<u64>)> {
+async fn wait_for_rebalance_tokio(
+    client: &PulsarClient<TokioEngine>,
+) -> Option<(u64, Vec<u64>, Vec<u64>)> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(ev)) = tokio::time::timeout(
@@ -345,11 +813,11 @@ async fn wait_for_rebalance_tokio(client: &TokioClient) -> Option<(u64, Vec<u64>
             client.next_scalable_event(),
         )
         .await
-            && let magnetar_runtime_tokio::ScalableEvent::AssignmentChanged { delta, .. } = ev
+            && let magnetar::scalable::ScalableEvent::AssignmentChanged { delta, .. } = ev
         {
             return Some((
                 delta.layout_epoch,
-                delta.gained.iter().map(|s| s.segment_id.0).collect(),
+                delta.gained.iter().map(|s| s.segment_id().0).collect(),
                 delta.lost.iter().map(|s| s.0).collect(),
             ));
         }
@@ -357,12 +825,9 @@ async fn wait_for_rebalance_tokio(client: &TokioClient) -> Option<(u64, Vec<u64>
     None
 }
 
-async fn wait_for_rebalance_moonpool<P>(
-    client: &MoonpoolClient<P>,
-) -> Option<(u64, Vec<u64>, Vec<u64>)>
-where
-    P: moonpool_core::Providers + Send + Sync + 'static,
-{
+async fn wait_for_rebalance_moonpool(
+    client: &PulsarClient<FacadeMoonpoolEngine<TokioProviders>>,
+) -> Option<(u64, Vec<u64>, Vec<u64>)> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(ev)) = tokio::time::timeout(
@@ -370,11 +835,11 @@ where
             client.next_scalable_event(),
         )
         .await
-            && let magnetar_runtime_moonpool::ScalableEvent::AssignmentChanged { delta, .. } = ev
+            && let magnetar::scalable::ScalableEvent::AssignmentChanged { delta, .. } = ev
         {
             return Some((
                 delta.layout_epoch,
-                delta.gained.iter().map(|s| s.segment_id.0).collect(),
+                delta.gained.iter().map(|s| s.segment_id().0).collect(),
                 delta.lost.iter().map(|s| s.0).collect(),
             ));
         }
@@ -395,9 +860,7 @@ async fn scalable_rejection_and_tc_discovery_parity() {
 
     // Consumer id 99 is the scripted rejection.
     let tokio_outcome = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = connect_tokio_facade(&url).await;
         let rejected = client
             .scalable_topic_subscribe(
                 "topic://public/default/scaled",
@@ -418,11 +881,7 @@ async fn scalable_rejection_and_tc_discovery_parity() {
     };
 
     let moonpool_outcome = {
-        let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = connect_moonpool_facade(&host_port).await;
         let rejected = client
             .scalable_topic_subscribe(
                 "topic://public/default/scaled",
@@ -463,7 +922,7 @@ async fn scalable_rejection_and_tc_discovery_parity() {
 }
 
 /// Drain the client's scalable events until the TC-assignment snapshot lands.
-async fn wait_for_tc_tokio(client: &TokioClient) -> Option<(u32, Vec<u64>)> {
+async fn wait_for_tc_tokio(client: &PulsarClient<TokioEngine>) -> Option<(u32, Vec<u64>)> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(ev)) = tokio::time::timeout(
@@ -471,7 +930,7 @@ async fn wait_for_tc_tokio(client: &TokioClient) -> Option<(u32, Vec<u64>)> {
             client.next_scalable_event(),
         )
         .await
-            && let magnetar_runtime_tokio::ScalableEvent::TcAssignmentsChanged {
+            && let magnetar::scalable::ScalableEvent::TcAssignmentsChanged {
                 parallelism,
                 assignments,
                 ..
@@ -483,10 +942,9 @@ async fn wait_for_tc_tokio(client: &TokioClient) -> Option<(u32, Vec<u64>)> {
     None
 }
 
-async fn wait_for_tc_moonpool<P>(client: &MoonpoolClient<P>) -> Option<(u32, Vec<u64>)>
-where
-    P: moonpool_core::Providers + Send + Sync + 'static,
-{
+async fn wait_for_tc_moonpool(
+    client: &PulsarClient<FacadeMoonpoolEngine<TokioProviders>>,
+) -> Option<(u32, Vec<u64>)> {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(ev)) = tokio::time::timeout(
@@ -494,7 +952,7 @@ where
             client.next_scalable_event(),
         )
         .await
-            && let magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsChanged {
+            && let magnetar::scalable::ScalableEvent::TcAssignmentsChanged {
                 parallelism,
                 assignments,
                 ..
@@ -600,7 +1058,7 @@ async fn scalable_pushed_layout_reaches_the_client() {
         // non-empty, and leave the epoch to `scalable_assignment_rebalance_parity`.
         let held = client
             .scalable_consumer_assignment(42)
-            .map(|a| !a.segments.is_empty());
+            .map(|a| !a.segments().is_empty());
         (wait_for_split_tokio(&client).await, held)
     };
 
@@ -626,7 +1084,7 @@ async fn scalable_pushed_layout_reaches_the_client() {
             .expect("moonpool subscribe");
         let held = client
             .scalable_consumer_assignment(42)
-            .map(|a| !a.segments.is_empty());
+            .map(|a| !a.segments().is_empty());
         (wait_for_split_moonpool(&client).await, held)
     };
 
@@ -634,8 +1092,8 @@ async fn scalable_pushed_layout_reaches_the_client() {
         tokio_seen, moonpool_seen,
         "engine pushed-layout observations diverged"
     );
-    // epoch 2, one split, parent 1 removed.
-    assert_eq!(tokio_seen.0, Some((2, 1, vec![1_u64])));
+    // Epoch 2 carries the sealed parent so the split remains fully provable.
+    assert_eq!(tokio_seen.0, Some((2, 1, vec![])));
     assert_eq!(
         tokio_seen.1,
         Some(true),
@@ -688,6 +1146,58 @@ where
         }
     }
     None
+}
+
+async fn wait_for_facade_split<E>(client: &PulsarClient<E>) -> Option<(u64, usize, Vec<u64>)>
+where
+    E: magnetar::Engine,
+    E::ClientState: magnetar::scalable::ScalableTopicsApi,
+{
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.next_scalable_event(),
+        )
+        .await
+            && let magnetar::scalable::ScalableEvent::DagUpdated { delta, .. } = ev
+        {
+            return Some((
+                delta.epoch,
+                delta.split_events.len(),
+                delta.removed.iter().map(|segment| segment.0).collect(),
+            ));
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_pushed_layout_crosses_both_facades() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_seen = {
+        let client = connect_tokio_facade(&url).await;
+        client
+            .lookup_scalable_topic("topic://public/default/scaled-split")
+            .await
+            .expect("Tokio facade lookup resolves");
+        wait_for_facade_split(&client).await
+    };
+    let moonpool_seen = {
+        let client = connect_moonpool_facade(&host_port).await;
+        client
+            .lookup_scalable_topic("topic://public/default/scaled-split")
+            .await
+            .expect("Moonpool facade lookup resolves");
+        wait_for_facade_split(&client).await
+    };
+
+    assert_eq!(tokio_seen, moonpool_seen);
+    assert_eq!(tokio_seen, Some((2, 1, vec![])));
+    broker.shutdown().await;
 }
 
 /// A rejection carrying no `message` still surfaces a reason — the client's own
@@ -743,9 +1253,7 @@ async fn scalable_watch_refusals_reach_the_client() {
     let host_port = broker.host_port();
 
     let tokio_seen = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = connect_tokio_facade(&url).await;
         // watch_id 1 — the scripted refusal for a `-deny` namespace.
         client
             .watch_scalable_topics("public/default-deny", vec![])
@@ -756,11 +1264,7 @@ async fn scalable_watch_refusals_reach_the_client() {
     };
 
     let moonpool_seen = {
-        let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = connect_moonpool_facade(&host_port).await;
         client
             .watch_scalable_topics("public/default-deny", vec![])
             .expect("watch opens");
@@ -790,7 +1294,9 @@ async fn scalable_watch_refusals_reach_the_client() {
 }
 
 /// Drain until both refusals have been seen, returning their reasons.
-async fn drain_refusals_tokio(client: &TokioClient) -> (Option<String>, Option<String>) {
+async fn drain_refusals_tokio(
+    client: &PulsarClient<TokioEngine>,
+) -> (Option<String>, Option<String>) {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     let (mut topics, mut tc) = (None, None);
     while tokio::time::Instant::now() < deadline && (topics.is_none() || tc.is_none()) {
@@ -803,10 +1309,10 @@ async fn drain_refusals_tokio(client: &TokioClient) -> (Option<String>, Option<S
             continue;
         };
         match ev {
-            magnetar_runtime_tokio::ScalableEvent::TopicsWatchClosed { reason, .. } => {
+            magnetar::scalable::ScalableEvent::TopicsWatchClosed { reason, .. } => {
                 topics = reason;
             }
-            magnetar_runtime_tokio::ScalableEvent::TcAssignmentsWatchClosed { reason, .. } => {
+            magnetar::scalable::ScalableEvent::TcAssignmentsWatchClosed { reason, .. } => {
                 tc = reason;
             }
             _ => {}
@@ -815,10 +1321,9 @@ async fn drain_refusals_tokio(client: &TokioClient) -> (Option<String>, Option<S
     (topics, tc)
 }
 
-async fn drain_refusals_moonpool<P>(client: &MoonpoolClient<P>) -> (Option<String>, Option<String>)
-where
-    P: moonpool_core::Providers + Send + Sync + 'static,
-{
+async fn drain_refusals_moonpool(
+    client: &PulsarClient<FacadeMoonpoolEngine<TokioProviders>>,
+) -> (Option<String>, Option<String>) {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     let (mut topics, mut tc) = (None, None);
     while tokio::time::Instant::now() < deadline && (topics.is_none() || tc.is_none()) {
@@ -831,12 +1336,10 @@ where
             continue;
         };
         match ev {
-            magnetar_runtime_moonpool::ScalableEvent::TopicsWatchClosed { reason, .. } => {
+            magnetar::scalable::ScalableEvent::TopicsWatchClosed { reason, .. } => {
                 topics = reason;
             }
-            magnetar_runtime_moonpool::ScalableEvent::TcAssignmentsWatchClosed {
-                reason, ..
-            } => {
+            magnetar::scalable::ScalableEvent::TcAssignmentsWatchClosed { reason, .. } => {
                 tc = reason;
             }
             _ => {}

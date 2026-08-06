@@ -9,19 +9,22 @@
 //! `magnetar-proto/tests/` and from runtime integration tests to validate
 //! client behavior against scripted broker scenarios.
 //!
-//! # Current surface (v0)
+//! # Current surface
 //!
 //! - [`BrokerFake`] — empty placeholder kept for backwards compatibility.
 //! - [`FrameRecorder`] — drains a [`magnetar_proto::Connection`]'s outbound byte stream and decodes
 //!   each frame into a [`RecordedFrame`] for wire-shape assertions. Used by the V5 mapping tests
 //!   (`crates/magnetar/tests/v5_*_mapping.rs`) to confirm that V5 surface calls translate to the
 //!   expected v4 wire commands.
+//! - `m1::M1FakeCluster` — a stateful, multi-endpoint Pulsar 5.0.0-M1 scalable-topic cluster. It
+//!   validates controller and segment routing, assignment ownership, flow permits,
+//!   acknowledgements, reconnects, and resource cleanup while exchanging only generated vendored
+//!   protocol frames.
 //!
-//! The recorder is intentionally one-way (drain, decode, assert). A
-//! later cut of the fake adds the reverse direction — synthetic broker
-//! frames fed back via `handle_bytes`, with per-command response hooks —
-//! once the V5 surface grows tests that need `ProducerSuccess` /
-//! `SendReceipt` etc. plumbed back into the client.
+//! The recorder remains intentionally one-way (drain, decode, assert).
+//! The M1 cluster provides the reverse frame direction for scalable consumers;
+//! unrelated producer responses such as `ProducerSuccess` / `SendReceipt` stay
+//! outside this focused fake.
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
@@ -29,6 +32,9 @@
 use bytes::Bytes;
 use magnetar_proto::frame::peek_full_frame_len;
 use magnetar_proto::{Connection, Frame, TransmitOwned, decode_one};
+
+#[cfg(feature = "scalable-topics")]
+pub mod m1;
 
 /// Placeholder broker fake — preserved for backwards compatibility with
 /// callers that depend on the `BrokerFake::new()` shape. New tests
@@ -250,6 +256,8 @@ mod tests {
 /// every other command: feed the client's outbound bytes via
 /// [`Self::on_client_bytes`], collect the broker's reply bytes, and pull the
 /// scripted layouts via [`Self::split_update`] / [`Self::merge_update`].
+/// Retained for transcript compatibility; new multi-endpoint consumer fixtures
+/// should use [`m1::M1FakeCluster`].
 ///
 /// Upstream pushes **whole layouts** stamped with a monotonic epoch rather than
 /// split / merge deltas, so each scripted update here is a complete
@@ -268,15 +276,15 @@ pub struct ScriptedScalableBroker {
 
 #[cfg(feature = "scalable-topics")]
 impl ScriptedScalableBroker {
-    /// Construct a broker with a two-segment initial layout (`[0,32768)` /
-    /// `[32768,65536)`) and a fixed controller URL.
+    /// Construct a broker with a two-segment initial layout (`[0,32767]` /
+    /// `[32768,65535]`) and a fixed controller URL.
     #[must_use]
     pub fn two_segment() -> Self {
         Self {
             controller_broker_url: "pulsar://controller:6650".to_owned(),
             initial_dag: vec![
-                Self::segment(1, 0, 32_768, &[]),
-                Self::segment(2, 32_768, 65_536, &[]),
+                Self::segment(1, 0, 32_767, &[]),
+                Self::segment(2, 32_768, 65_535, &[]),
             ],
             session_id: None,
             next_epoch: 1,
@@ -386,10 +394,20 @@ impl ScriptedScalableBroker {
     /// the encoded frame, or `None` if no session is open.
     #[must_use]
     pub fn split_update(&mut self) -> Option<bytes::BytesMut> {
+        let epoch = self.next_epoch;
+        let mut parent = Self::segment(1, 0, 32_767, &[]);
+        parent.state = magnetar_proto::pb::SegmentState::Sealed as i32;
+        parent.child_ids = vec![3, 4];
+        parent.sealed_at_epoch = Some(epoch);
+        let mut child_three = Self::segment(3, 0, 16_383, &[1]);
+        child_three.created_at_epoch = epoch;
+        let mut child_four = Self::segment(4, 16_384, 32_767, &[1]);
+        child_four.created_at_epoch = epoch;
         self.layout_update(vec![
-            Self::segment(2, 32_768, 65_536, &[]),
-            Self::segment(3, 0, 16_384, &[1]),
-            Self::segment(4, 16_384, 32_768, &[1]),
+            parent,
+            Self::segment(2, 32_768, 65_535, &[]),
+            child_three,
+            child_four,
         ])
     }
 
@@ -398,9 +416,30 @@ impl ScriptedScalableBroker {
     /// encoded frame, or `None` if no session is open.
     #[must_use]
     pub fn merge_update(&mut self) -> Option<bytes::BytesMut> {
+        let epoch = self.next_epoch;
+        let split_epoch = epoch.saturating_sub(1);
+        let mut root = Self::segment(1, 0, 32_767, &[]);
+        root.state = magnetar_proto::pb::SegmentState::Sealed as i32;
+        root.child_ids = vec![3, 4];
+        root.sealed_at_epoch = Some(split_epoch);
+        let mut child_three = Self::segment(3, 0, 16_383, &[1]);
+        child_three.created_at_epoch = split_epoch;
+        child_three.state = magnetar_proto::pb::SegmentState::Sealed as i32;
+        child_three.child_ids = vec![5];
+        child_three.sealed_at_epoch = Some(epoch);
+        let mut child_four = Self::segment(4, 16_384, 32_767, &[1]);
+        child_four.created_at_epoch = split_epoch;
+        child_four.state = magnetar_proto::pb::SegmentState::Sealed as i32;
+        child_four.child_ids = vec![5];
+        child_four.sealed_at_epoch = Some(epoch);
+        let mut merged = Self::segment(5, 0, 32_767, &[3, 4]);
+        merged.created_at_epoch = epoch;
         self.layout_update(vec![
-            Self::segment(2, 32_768, 65_536, &[]),
-            Self::segment(5, 0, 32_768, &[3, 4]),
+            root,
+            Self::segment(2, 32_768, 65_535, &[]),
+            child_three,
+            child_four,
+            merged,
         ])
     }
 }

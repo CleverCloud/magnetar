@@ -3600,10 +3600,6 @@ impl MessageIdResponse {
             partition: self.partition_index,
             batch_index: -1,
             batch_size: -1,
-            // PIP-460 (ADR-0093): admin REST never resolves a scalable
-            // segment id; the field only exists under `scalable-topics`.
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         })
     }
 }
@@ -4217,7 +4213,7 @@ impl AdminClientBuilder {
         // silently-ignored option.
         let http = apply_tls_options(
             http_builder,
-            self.tls_trust_cert_pem,
+            self.tls_trust_cert_pem.as_deref(),
             self.tls_allow_insecure,
         )?
         .build()
@@ -4325,14 +4321,14 @@ pub enum AdminError {
 ))]
 fn apply_tls_options(
     mut builder: reqwest::ClientBuilder,
-    trust_cert_pem: Option<Vec<u8>>,
+    trust_cert_pem: Option<&[u8]>,
     allow_insecure: bool,
 ) -> Result<reqwest::ClientBuilder, AdminError> {
     // Custom CA trust (pulsarctl `tls_trust_certs_file_path`). reqwest's
     // `add_root_certificate` adds the cert *alongside* the platform roots,
     // matching Pulsar's "extra trust anchor" semantics.
     if let Some(pem) = trust_cert_pem {
-        let cert = reqwest::Certificate::from_pem(&pem)
+        let cert = reqwest::Certificate::from_pem(pem)
             .map_err(|err| AdminError::Builder(format!("invalid tls trust cert PEM: {err}")))?;
         builder = builder.add_root_certificate(cert);
     }
@@ -4356,7 +4352,7 @@ fn apply_tls_options(
 )))]
 fn apply_tls_options(
     builder: reqwest::ClientBuilder,
-    trust_cert_pem: Option<Vec<u8>>,
+    trust_cert_pem: Option<&[u8]>,
     allow_insecure: bool,
 ) -> Result<reqwest::ClientBuilder, AdminError> {
     if trust_cert_pem.is_some() || allow_insecure {

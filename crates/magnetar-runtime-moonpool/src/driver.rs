@@ -101,8 +101,16 @@ enum RetryRequest {
 /// notifying, which would strand a caller until the next unrelated event.
 #[cfg(feature = "scalable-topics")]
 fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
-    shared.scalable_events.lock().push_back(event);
+    if let Some(unclaimed) = shared.scalable_routes.publish(event) {
+        shared.scalable_events.lock().push_back(unclaimed);
+        shared.scalable_notify.notify_waiters();
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+fn notify_scalable_waiters(shared: &ConnectionShared) {
     shared.scalable_notify.notify_waiters();
+    shared.scalable_routes.notify_waiters();
 }
 
 /// Drain the connection's semantic event queue of events the *driver* must
@@ -328,27 +336,41 @@ fn handle_pending_events(
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerAssigned {
                 consumer_id,
+                incarnation,
                 assignment,
             } => emit_scalable(
                 shared,
                 crate::ScalableEvent::ConsumerAssigned {
                     consumer_id,
+                    incarnation,
                     assignment,
                 },
             ),
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => emit_scalable(
+            ConnectionEvent::ScalableAssignmentChanged {
+                consumer_id,
+                incarnation,
+                assignment,
+                delta,
+            } => emit_scalable(
                 shared,
-                crate::ScalableEvent::AssignmentChanged { consumer_id, delta },
+                crate::ScalableEvent::AssignmentChanged {
+                    consumer_id,
+                    incarnation,
+                    assignment,
+                    delta,
+                },
             ),
             #[cfg(feature = "scalable-topics")]
             ConnectionEvent::ScalableConsumerRejected {
                 consumer_id,
+                incarnation,
                 reason,
             } => emit_scalable(
                 shared,
                 crate::ScalableEvent::ConsumerRejected {
                     consumer_id,
+                    incarnation,
                     reason,
                 },
             ),
@@ -385,25 +407,37 @@ fn handle_pending_events(
                 session_id,
                 resolved_topic_name,
                 controller_broker_url,
-                segments,
-                epoch,
+                controller_broker_url_tls,
+                snapshot,
             } => {
+                let segments = snapshot.segments();
+                let epoch = snapshot.epoch();
                 emit_scalable(
                     shared,
                     crate::ScalableEvent::LookupResolved {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
+                        controller_broker_url_tls,
+                        snapshot,
                         segments,
                         epoch,
                     },
                 );
             }
             #[cfg(feature = "scalable-topics")]
-            ConnectionEvent::SegmentDagUpdated { session_id, delta } => {
+            ConnectionEvent::SegmentDagUpdated {
+                session_id,
+                delta,
+                snapshot,
+            } => {
                 emit_scalable(
                     shared,
-                    crate::ScalableEvent::DagUpdated { session_id, delta },
+                    crate::ScalableEvent::DagUpdated {
+                        session_id,
+                        delta,
+                        snapshot,
+                    },
                 );
             }
             #[cfg(feature = "scalable-topics")]
@@ -527,6 +561,11 @@ fn retry_request_topic(conn: &magnetar_proto::Connection, req: RetryRequest) -> 
 pub(crate) fn notify_retry_generation_replaced(shared: &Arc<ConnectionShared>) {
     shared.operation_cancel_notify.notify_waiters();
     shared.driver_waker.notify_one();
+}
+
+#[cfg(feature = "scalable-topics")]
+pub(crate) fn notify_scalable_connection_replaced(shared: &Arc<ConnectionShared>) {
+    shared.scalable_routes.notify_waiters();
 }
 
 struct PendingDriverWrite {
@@ -943,6 +982,11 @@ pub(crate) struct ReconnectContext {
     /// authority (no `pulsar://` scheme), so we cache the exact string used
     /// on the initial dial as a fallback.
     pub(crate) host_port: String,
+    /// rustls configuration retained for a TLS-supervised reconnect.
+    pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Explicit rustls server name retained when the initial TLS dial used a
+    /// logical hostname different from its physical address.
+    pub(crate) tls_server_name: Option<String>,
     /// Optional PIP-121 provider polled on every reconnect attempt. When
     /// `None`, the cached `host_port` is reused (matches the pre-PIP-121
     /// behaviour). The provider returns a `pulsar://` or `pulsar+ssl://`
@@ -959,6 +1003,8 @@ impl std::fmt::Debug for ReconnectContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReconnectContext")
             .field("host_port", &self.host_port)
+            .field("tls", &self.tls_config.is_some())
+            .field("tls_server_name", &self.tls_server_name)
             .field(
                 "has_service_url_provider",
                 &self.service_url_provider.is_some(),
@@ -1014,6 +1060,8 @@ where
         // outcomes are already in place when a fresh op observes the latch.
         // 1:1 with the tokio engine.
         driver_shared.mark_no_driver();
+        #[cfg(feature = "scalable-topics")]
+        driver_shared.scalable_routes.close_all();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab, so they
         // observe the terminal connection state and stop waiting.
@@ -1083,6 +1131,8 @@ where
         // entry-point guards. Set AFTER `fail_all_pending`. 1:1 with the tokio
         // engine.
         driver_shared.mark_no_driver();
+        #[cfg(feature = "scalable-topics")]
+        driver_shared.scalable_routes.close_all();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab.
         driver_shared.event_waker.notify_waiters();
@@ -1303,15 +1353,23 @@ where
                 };
 
             let resolver = reconnect_ctx.dns_resolver.as_deref();
-            match Transport::<P>::connect_with_resolver(
+            let tls_host = reconnect_ctx.tls_server_name.as_deref().unwrap_or_else(|| {
+                crate::transport::split_host_port(&target_host_port)
+                    .map_or(target_host_port.as_str(), |(host, _)| host)
+            });
+            let dial = Transport::<P>::connect_selected(
                 providers.network(),
                 &target_host_port,
+                reconnect_ctx
+                    .tls_config
+                    .clone()
+                    .map(|tls_config| (tls_host, tls_config)),
                 resolver,
                 providers.time(),
                 connect_timeout,
             )
-            .await
-            {
+            .await;
+            match dial {
                 Ok(t) => {
                     // ADR-0061: this is a TCP-connect, NOT a confirmed reconnect
                     // — behind a TCP-accepting proxy the dial succeeds while the
@@ -1354,6 +1412,8 @@ where
         shared
             .pending_rebuild
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(feature = "scalable-topics")]
+        notify_scalable_connection_replaced(&shared);
         notify_retry_generation_replaced(&shared);
 
         transport = new_transport;
@@ -1590,7 +1650,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(&shared);
                         return Err(err.into());
                     }
                 };
@@ -1606,7 +1666,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(&shared);
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1657,7 +1717,7 @@ where
                     // re-check `is_closed()` when a scalable event arrives, so a
                     // dead connection would park them forever.
                     #[cfg(feature = "scalable-topics")]
-                    shared.scalable_notify.notify_waiters();
+                    notify_scalable_waiters(&shared);
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1770,7 +1830,7 @@ where
                         // re-check `is_closed()` when a scalable event arrives, so a
                         // dead connection would park them forever.
                         #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
+                        notify_scalable_waiters(&shared);
                         return Err(err.into());
                     }
                 }
@@ -2639,6 +2699,22 @@ mod tests {
             strip_url_to_host_port("pulsar+ssl://broker.example.com:6651").as_deref(),
             Some("broker.example.com:6651")
         );
+        crate::tls_crypto::install_default_provider();
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .expect("rustls protocol versions")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let context = super::ReconnectContext {
+            host_port: "broker.example.com:6651".to_owned(),
+            tls_config: Some(tls_config),
+            tls_server_name: Some("broker.example.com".to_owned()),
+            service_url_provider: None,
+            dns_resolver: None,
+        };
+        assert!(format!("{context:?}").contains("tls: true"));
     }
 
     #[test]

@@ -29,8 +29,8 @@ The moonpool engine gains the PIP-4 message-crypto bridge, mirroring the tokio e
 - **Producer (encrypt-on-send).** Encrypt the payload, stamping `pb::MessageMetadata` `encryption_keys` / `encryption_algo` / `encryption_param`.
   This mirrors the tokio producer's **compression → encryption** ordering for the encryption step.
   Compression itself is not yet wired on the moonpool engine — non-`None` `CompressionKind` is refused on send until the runtime codec lands (M3) — so the moonpool path is encrypt-only in practice.
-- **Consumer (decrypt-on-receive).** Decrypt the payload, honoring the three `CryptoFailureAction` arms — `Fail`, `Discard`, `Consume` — identically to tokio, then deliver.
-  Compression being refused on send, there is no decompression step to mirror: the path reduces to **decrypt, then deliver** (tokio's decrypt-first → decompress ordering with the decompress branch a no-op on moonpool until codecs land).
+- **Consumer (decrypt-then-decompress on receive).** Decrypt the payload, honoring the three `CryptoFailureAction` arms — `Fail`, `Discard`, `Consume` — identically to tokio, then bounded-decompress broker-authored LZ4, ZSTD, Snappy, or ZLIB payloads before delivery.
+  The send-side compression refusal remains independent: Moonpool must still consume compressed messages emitted by other clients, validate their announced output size, and apply the same inflation ceiling as tokio.
 - **Façade.** `MessageCryptoBridge` now implements **both** engines' trait pairs over `magnetar-messagecrypto::MessageCrypto`, so one bridge value plugs into either engine.
   The moonpool builders gain `.encryption()` / `.create_with_encryption()` (producer) and `.encryption()` / `.subscribe_with_decryption()` (consumer), routing through the new `Client::open_producer_with` / `Client::subscribe_with` entries on the moonpool engine.
 - **Engine crypto API is non-stub for both engines.** `MessageEncryptorApi` / `MessageDecryptorApi` now resolve to the real bridge on the moonpool engine.

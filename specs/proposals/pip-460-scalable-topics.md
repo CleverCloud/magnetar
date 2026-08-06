@@ -1,21 +1,22 @@
 # PIP-460 — Scalable topics / DAG-watch consumer (experimental)
 
-- **Status**: Historical — implemented, then superseded by [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) (2026-08-03)
-- **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md), superseded by [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md)
+- **Status**: Historical — wire projection superseded by [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) (2026-08-03); surviving drop-on-DAG-change scope superseded by [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md) (2026-08-05)
+- **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md) → [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) → [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md)
 - **Date**: 2026-05-26
 - **Owner**: Florentin Dubois
 - **Upstream**: [pip/pip-460.md](https://github.com/apache/pulsar/blob/master/pip/pip-460.md)
 - **Broker baseline shift**: requires `apachepulsar/pulsar:5.0.0-M1+`; the client negotiates the capability per connection and stays Pulsar-4.0+ compatible either way per [ADR-0009](../adr/0009-pulsar-4-minimum.md).
 
-> **⚠️ The wire-protocol sections below describe a projection, not the protocol upstream shipped.**
-> This proposal was written on 2026-05-26 while PIP-460 was upstream `Draft`, and it guessed the command set, field numbers, `BaseCommand.Type` discriminators (80-85 vs upstream's 70-78), segment lifecycle (four states vs two), and capability gate (a `ProtocolVersion` bump vs `FeatureFlags.supports_scalable_topics`).
+> **⚠️ The wire-protocol sections below describe a projection, not the protocol upstream shipped.** This proposal was written on 2026-05-26 while PIP-460 was upstream `Draft`, and it guessed the command set, field numbers, `BaseCommand.Type` discriminators (80-85 vs upstream's 70-78), segment lifecycle (four states vs two), and capability gate (a `ProtocolVersion` bump vs `FeatureFlags.supports_scalable_topics`).
 > Every one of those guesses turned out to be wrong.
 > The client migrated onto the vendored Pulsar 5.0.0-M1 surface under [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md), which records the measured divergence; read §1-§3 here as design history.
-> The scope decisions (StreamConsumer-only, drop-on-change, default-off feature) survive unchanged.
+> [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md) later superseded only the surviving drop-on-change and unimplemented-data-plane scope with the assignment-driven hardened aggregate.
+> The default-off experimental feature and ADR-0093's vendored wire and capability negotiation remain binding.
 
 ## TL;DR
 
-PIP-460 introduces a new `topic://<...>` URL scheme, segment-DAG metadata, three new wire commands (`CommandScalableTopicLookup`, `CommandSegmentDagWatch`, `CommandSegmentDagUpdate`), and a controller-broker session model. magnetar ships **only the StreamConsumer happy path** behind a default-off feature flag, drops on DAG-change-mid-consume (no transparent failover), and gates e2e on upstream cutting a Pulsar 5.0 RC.
+This historical proposal projected a new `topic://<...>` URL scheme, segment-DAG metadata, three guessed wire commands (`CommandScalableTopicLookup`, `CommandSegmentDagWatch`, `CommandSegmentDagUpdate`), and a controller-broker session model.
+It scoped **only the StreamConsumer happy path** behind a default-off feature flag, dropped on DAG-change-mid-consume, and gated e2e on an upstream Pulsar 5.0 RC; ADR-0093 and ADR-0098 now govern the shipped wire and data plane instead.
 The other two PIP-460 consumer types (`QueueConsumer`, `CheckpointConsumer`), controller election, and in-place repartition are explicit follow-up work.
 
 ## 1. Wire-protocol delta vs. vendored `PulsarApi.proto`
@@ -485,7 +486,9 @@ No revert PR needed; pre-PIP-460-compatible callers are unaffected.
 
 ## 9. References
 
-- [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md) — scope.
+- [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md) — original historical scope.
+- [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md) — authoritative vendored M1 wire and capability negotiation.
+- [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md) — assignment-driven hardened data plane, superseding the surviving drop-on-change scope.
 - [ADR-0024](../adr/0024-cross-runtime-test-and-coverage-policy.md) — test plan binding.
 - [ADR-0026 §D1](../adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) — `Surface<T, E>` + extension traits.
 - [ADR-0026 §D4](../adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) — vendor-proto in a dedicated commit.

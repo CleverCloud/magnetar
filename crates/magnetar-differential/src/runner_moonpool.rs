@@ -599,6 +599,7 @@ fn classify(err: &ClientError) -> String {
         ClientError::Engine(_) => "engine".to_owned(),
         ClientError::Broker { code, .. } => format!("broker:{code}"),
         ClientError::Closed => "closed".to_owned(),
+        ClientError::EndOfTopic => "end-of-topic".to_owned(),
         ClientError::Other(message) if message.contains("exceeded operation_timeout") => {
             "timeout".to_owned()
         }
@@ -608,7 +609,29 @@ fn classify(err: &ClientError) -> String {
         // differential test asserts both legs collapse to this same bucket
         // (ADR-0055 §1).
         ClientError::PeerClosed => "peer-closed".to_owned(),
-        ClientError::ProxyUnsupportedOnUnsupervisedClient { .. } => "proxy-unsupervised".to_owned(),
+        ClientError::ProxyUnsupportedOnUnsupervisedClient { .. } => "proxy-unsupported".to_owned(),
+        ClientError::ControllerUnavailable => "controller-unavailable".to_owned(),
+        ClientError::ControllerRoutingUnsupported { .. } => {
+            "controller-routing-unsupported".to_owned()
+        }
+        ClientError::ScalableAuthorityRejected => "scalable-authority-rejected".to_owned(),
+        #[cfg(feature = "scalable-topics")]
+        ClientError::ScalableAssignmentRejected { .. } => "scalable-assignment-rejected".to_owned(),
+        #[cfg(feature = "scalable-topics")]
+        ClientError::ScalableRoute(error) => match error {
+            magnetar_runtime_moonpool::ScalableRouteError::Overflow { .. } => {
+                "scalable-route:overflow".to_owned()
+            }
+            magnetar_runtime_moonpool::ScalableRouteError::ConnectionReplaced => {
+                "scalable-route:connection-replaced".to_owned()
+            }
+            magnetar_runtime_moonpool::ScalableRouteError::ConnectionClosed => {
+                "scalable-route:connection-closed".to_owned()
+            }
+            magnetar_runtime_moonpool::ScalableRouteError::Closed => {
+                "scalable-route:closed".to_owned()
+            }
+        },
         ClientError::Other(_) => "other".to_owned(),
     }
 }
@@ -621,5 +644,57 @@ mod tests {
     fn classifies_operation_timeout() {
         let error = ClientError::Other("producer open exceeded operation_timeout".to_owned());
         assert_eq!(classify(&error), "timeout");
+    }
+
+    #[test]
+    fn classifies_every_public_scalable_error_category() {
+        let cases = [
+            (ClientError::EndOfTopic, "end-of-topic"),
+            (
+                ClientError::ProxyUnsupportedOnUnsupervisedClient {
+                    topic: "topic".to_owned(),
+                },
+                "proxy-unsupported",
+            ),
+            (ClientError::ControllerUnavailable, "controller-unavailable"),
+            (
+                ClientError::ControllerRoutingUnsupported { reason: "test" },
+                "controller-routing-unsupported",
+            ),
+            (
+                ClientError::ScalableAuthorityRejected,
+                "scalable-authority-rejected",
+            ),
+            (
+                ClientError::ScalableAssignmentRejected {
+                    reason: "test".to_owned(),
+                },
+                "scalable-assignment-rejected",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(classify(&error), expected);
+        }
+
+        for (error, expected) in [
+            (
+                magnetar_runtime_moonpool::ScalableRouteError::Overflow { capacity: 1 },
+                "scalable-route:overflow",
+            ),
+            (
+                magnetar_runtime_moonpool::ScalableRouteError::ConnectionReplaced,
+                "scalable-route:connection-replaced",
+            ),
+            (
+                magnetar_runtime_moonpool::ScalableRouteError::ConnectionClosed,
+                "scalable-route:connection-closed",
+            ),
+            (
+                magnetar_runtime_moonpool::ScalableRouteError::Closed,
+                "scalable-route:closed",
+            ),
+        ] {
+            assert_eq!(classify(&ClientError::ScalableRoute(error)), expected);
+        }
     }
 }

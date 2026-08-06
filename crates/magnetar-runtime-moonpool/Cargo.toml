@@ -48,6 +48,10 @@ buggify          = ["magnetar-proto/buggify"]
 [dependencies]
 magnetar-proto = { workspace = true }
 bytes          = { workspace = true }
+lz4_flex       = { workspace = true }
+flate2         = { workspace = true }
+zstd           = { workspace = true }
+snap           = { workspace = true }
 # `futures::io::{AsyncRead,AsyncWrite}Ext` drive moonpool's futures-io
 # `TcpStream` (moonpool 0.8 uses futures-io rather than raw tokio-io). `std` gates the
 # `futures::io` module; the workspace dep is `default-features = false`.
@@ -79,6 +83,9 @@ tokio-util     = { workspace = true }
 # minimum Pulsar wire subset. See ADR-0026 §D2.
 moonpool-sim   = { workspace = true }
 async-trait    = { workspace = true }
+# The provider-native scalable aggregate integration drives the same independent
+# stateful M1 broker model as the differential suites over SimProviders sockets.
+magnetar-fakes = { workspace = true, features = ["scalable-topics"] }
 # Moonpool 0.8 captures named, flat `tracing` events inside actor spans and
 # exposes them through `TraceQuery`; no unstable tracing cfg or Valuable/Serde
 # payload bridge is required.

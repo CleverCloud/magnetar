@@ -29,6 +29,8 @@ use prost::Message as _;
 use slab::Slab;
 
 use crate::error::ConsumerError;
+#[cfg(feature = "scalable-topics")]
+use crate::event::DeferredIncomingMessage;
 use crate::event::IncomingMessage;
 use crate::pb;
 use crate::trackers::{NegativeAcksTracker, UnackedMessageTracker};
@@ -206,12 +208,24 @@ pub struct ConsumerState {
     /// starvation signal instead of the never-decrementing mirror `granted_permits` was before
     /// this split.
     pub permit_balance: u32,
+    /// Explicit permits issued through [`crate::Connection::flow`] for a
+    /// zero-queue consumer. Unlike automatic receiver-queue credit, this is
+    /// caller-owned authority and must survive a supervised transport rebuild
+    /// until the caller observes the corresponding delivery.
+    pub(crate) manual_flow_permits: u32,
     /// Number of permits we've consumed since the last flow command. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
     pub(crate) consumed_since_flow: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
+    /// Raw broker entries owned by an aggregate receive budget. Ordinary
+    /// consumers never populate this queue.
+    #[cfg(feature = "scalable-topics")]
+    deferred_queue: VecDeque<DeferredIncomingMessage>,
+    /// Whether broker entries bypass local chunk/batch processing.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) defer_payload_processing: bool,
     /// Per-uuid chunk reassembly state.
     chunk_reassembly: HashMap<String, ChunkBuffer>,
     /// FIFO insertion-order index over `chunk_reassembly`, mirroring Java
@@ -353,6 +367,9 @@ pub struct ConsumerState {
     /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
     /// delay has elapsed. `None` means immediate redelivery (the default).
     pub nack_tracker: Option<NegativeAcksTracker>,
+    /// Complete scalable IDs retained while a delayed negative ack is pending.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) canonical_nack_ids: rustc_hash::FxHashMap<MessageId, crate::pb::MessageIdData>,
     /// Optional unacked-message tracker. When configured via
     /// `SubscribeRequest::ack_timeout`, every delivered message is recorded into a
     /// sliding-window bucket and re-delivered if no positive ack arrives within the
@@ -476,18 +493,88 @@ impl BatchAckEntry {
         }
     }
 
+    /// Construct from the broker's bitset of positions that remain unacked.
+    /// An absent wire bitset means every member of the batch is available.
+    #[must_use]
+    pub fn from_ack_set(batch_size: i32, ack_set: &[i64]) -> Self {
+        if ack_set.is_empty() {
+            return Self::fresh(batch_size);
+        }
+        let size = batch_size.max(0) as usize;
+        let words = size.div_ceil(64);
+        let mut unacked = ack_set
+            .iter()
+            .take(words)
+            .map(|word| *word as u64)
+            .collect::<Vec<_>>();
+        unacked.resize(words, 0);
+        if let Some(last) = unacked.last_mut() {
+            let used = size % 64;
+            if used != 0 {
+                *last &= (1u64 << used) - 1;
+            }
+        }
+        Self {
+            batch_size,
+            unacked,
+        }
+    }
+
+    /// Construct the broker seek mask that retains the target member and every
+    /// later member in the same batch.
+    #[must_use]
+    pub fn seek_from(batch_size: i32, position: i32) -> Self {
+        let mut entry = Self::fresh(batch_size);
+        entry.clear_before(position.max(0));
+        entry
+    }
+
+    fn clear_before(&mut self, position: i32) {
+        for index in 0..position.min(self.batch_size).max(0) {
+            self.clear(index);
+        }
+    }
+
+    fn clear(&mut self, position: i32) {
+        if position < 0 || position >= self.batch_size {
+            return;
+        }
+        let position = position as usize;
+        if let Some(word) = self.unacked.get_mut(position / 64) {
+            *word &= !(1u64 << (position % 64));
+        }
+    }
+
     /// Clear the bit at `position`. Returns `true` once *every* position has been acked
     /// (bitset all-zero), which means the caller can drop this entry and send a "full"
     /// ack (no `ack_set`) so the broker advances the cursor past the batch.
     pub fn ack_position(&mut self, position: i32) -> bool {
-        if position < 0 || position >= self.batch_size {
-            return self.is_fully_acked();
-        }
-        let p = position as usize;
-        if let Some(word) = self.unacked.get_mut(p / 64) {
-            *word &= !(1u64 << (p % 64));
-        }
+        self.clear(position);
         self.is_fully_acked()
+    }
+
+    /// Clear every member through `position` for cumulative acknowledgement.
+    pub fn ack_cumulative(&mut self, position: i32) -> bool {
+        self.clear_before(position.saturating_add(1));
+        self.is_fully_acked()
+    }
+
+    /// Whether the broker selected this member for delivery.
+    #[must_use]
+    pub fn is_unacked(&self, position: usize) -> bool {
+        position < self.batch_size.max(0) as usize
+            && self
+                .unacked
+                .get(position / 64)
+                .is_some_and(|word| word & (1u64 << (position % 64)) != 0)
+    }
+
+    /// Number of selected members whose dispatch consumed broker permits.
+    #[must_use]
+    pub fn unacked_count(&self) -> u32 {
+        self.unacked
+            .iter()
+            .fold(0u32, |count, word| count.saturating_add(word.count_ones()))
     }
 
     /// `true` if every position in the batch has been acked.
@@ -785,8 +872,13 @@ impl ConsumerState {
             last_adjust_at: None,
             granted_permits: 0,
             permit_balance: 0,
+            manual_flow_permits: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
+            #[cfg(feature = "scalable-topics")]
+            deferred_queue: VecDeque::new(),
+            #[cfg(feature = "scalable-topics")]
+            defer_payload_processing: false,
             chunk_reassembly: HashMap::new(),
             chunk_reassembly_order: VecDeque::new(),
             chunk_buffered_bytes: 0,
@@ -820,6 +912,8 @@ impl ConsumerState {
             total_msgs_dead_lettered: 0,
             total_chunked_msgs_received: 0,
             nack_tracker: None,
+            #[cfg(feature = "scalable-topics")]
+            canonical_nack_ids: rustc_hash::FxHashMap::default(),
             unacked_tracker: None,
             batch_ack_tracker: rustc_hash::FxHashMap::default(),
             ack_tracker: None,
@@ -1012,7 +1106,11 @@ impl ConsumerState {
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
     pub fn maybe_flow(&mut self) -> Option<pb::CommandFlow> {
-        if self.closed || self.pending_seek.is_some() || self.paused {
+        if self.closed
+            || self.pending_seek.is_some()
+            || self.paused
+            || self.receiver_queue_size == 0
+        {
             return None;
         }
         let threshold = (self.receiver_queue_size / 2).max(1) as u32;
@@ -1060,7 +1158,11 @@ impl ConsumerState {
     /// Failover active-consumer-change re-arm — route through here, so each
     /// grants the policy's CURRENT target rather than a stale raw value.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
-        let permits = self.receiver_queue_size as u32;
+        let permits = if self.receiver_queue_size == 0 {
+            self.manual_flow_permits
+        } else {
+            self.receiver_queue_size as u32
+        };
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
@@ -1213,6 +1315,9 @@ impl ConsumerState {
     /// [ADR-0086]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0086-inject-now-into-proto-latency-recording.md
     pub fn pop_message(&mut self, now: std::time::Instant) -> Option<IncomingMessage> {
         let msg = self.queue.pop_front()?;
+        if self.receiver_queue_size == 0 {
+            self.manual_flow_permits = self.manual_flow_permits.saturating_sub(1);
+        }
         // Issue #301: keep the buffered-queue-bytes counter in lock-step with
         // the enqueue bump in `classify_and_queue`.
         self.queued_bytes = self.queued_bytes.saturating_sub(msg.payload.len() as u64);
@@ -1230,9 +1335,51 @@ impl ConsumerState {
         Some(msg)
     }
 
+    /// Pop one raw entry reserved for an owning scalable aggregate.
+    #[cfg(feature = "scalable-topics")]
+    pub fn pop_deferred_message(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<DeferredIncomingMessage> {
+        let entry = self.deferred_queue.pop_front()?;
+        self.manual_flow_permits = self
+            .manual_flow_permits
+            .saturating_sub(entry.dispatch_permits);
+        self.queued_bytes = self
+            .queued_bytes
+            .saturating_sub(entry.message.payload.len() as u64);
+        self.consumed_since_flow = self
+            .consumed_since_flow
+            .saturating_add(entry.dispatch_permits);
+        if let Some(histogram) = self.receive_latency_hist.as_mut() {
+            let latency_ms = u64::try_from(
+                now.saturating_duration_since(entry.message.arrived_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            histogram.saturating_record(latency_ms);
+        }
+        Some(entry)
+    }
+
+    /// Drop every raw aggregate entry during seek or session reset.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn clear_deferred_messages(&mut self) {
+        self.deferred_queue.clear();
+    }
+
     /// Number of messages waiting to be popped.
     pub fn queue_len(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + {
+            #[cfg(feature = "scalable-topics")]
+            {
+                self.deferred_queue.len()
+            }
+            #[cfg(not(feature = "scalable-topics"))]
+            {
+                0
+            }
+        }
     }
 
     /// Number of distinct incomplete chunked messages currently buffered.
@@ -1381,6 +1528,36 @@ impl ConsumerState {
             return Ok(DeliverOutcome::Dropped);
         }
         let redelivery = cmd.redelivery_count.unwrap_or(0);
+        #[cfg(feature = "scalable-topics")]
+        if self.defer_payload_processing {
+            let batch_size = metadata.num_messages_in_batch.unwrap_or(1);
+            let dispatch_permits = if batch_size > 1 {
+                BatchAckEntry::from_ack_set(batch_size, &cmd.ack_set).unacked_count()
+            } else {
+                1
+            };
+            let message = IncomingMessage {
+                message_id: MessageId::from_pb(&cmd.message_id),
+                metadata: std::sync::Arc::new(metadata),
+                single_metadata: None,
+                payload: body,
+                redelivery_count: redelivery,
+                broker_entry_metadata: broker_entry_metadata.map(std::sync::Arc::new),
+                arrived_at: now,
+            };
+            self.permit_balance = self.permit_balance.saturating_sub(dispatch_permits);
+            self.queued_bytes = self
+                .queued_bytes
+                .saturating_add(message.payload.len() as u64);
+            self.deferred_queue.push_back(DeferredIncomingMessage {
+                message,
+                message_id_data: cmd.message_id.clone(),
+                ack_set: cmd.ack_set.clone(),
+                dispatch_permits,
+            });
+            self.wake_receivers();
+            return Ok(DeliverOutcome::Buffered);
+        }
         let mut message_id = MessageId::from_pb(&cmd.message_id);
 
         // Chunked message path.
@@ -1609,12 +1786,15 @@ impl ConsumerState {
         // Batched message path.
         let num_in_batch = metadata.num_messages_in_batch.unwrap_or(1);
         if num_in_batch > 1 {
+            let incoming_ack_set = BatchAckEntry::from_ack_set(num_in_batch, &cmd.ack_set);
             // PIP-54: stamp the per-batch ack tracker once. Subsequent acks of individual
             // positions in this batch clear bits in the bitset; the broker sees the partial
             // ack state and only advances the cursor once every position is acked.
-            self.batch_ack_tracker
-                .entry((message_id.ledger_id, message_id.entry_id))
-                .or_insert_with(|| BatchAckEntry::fresh(num_in_batch));
+            if !incoming_ack_set.is_fully_acked() {
+                self.batch_ack_tracker
+                    .entry((message_id.ledger_id, message_id.entry_id))
+                    .or_insert_with(|| incoming_ack_set.clone());
+            }
             // Wrap the per-batch metadata once so every sub-message shares
             // a refcount instead of deep-cloning. For a 100-message batch
             // this collapses 100 `MessageMetadata::clone()` calls (each of
@@ -1645,17 +1825,19 @@ impl ConsumerState {
                 let mut single_mid = message_id;
                 single_mid.batch_index = idx;
                 single_mid.batch_size = num_in_batch;
-                let im = IncomingMessage {
-                    message_id: single_mid,
-                    metadata: shared_meta.clone(),
-                    single_metadata: Some(single),
-                    payload,
-                    redelivery_count: redelivery,
-                    broker_entry_metadata: shared_bem.clone(),
-                    arrived_at: now,
-                };
-                self.classify_and_queue(im, redelivery, now);
-                delivered += 1;
+                if incoming_ack_set.is_unacked(idx as usize) {
+                    let im = IncomingMessage {
+                        message_id: single_mid,
+                        metadata: shared_meta.clone(),
+                        single_metadata: Some(single),
+                        payload,
+                        redelivery_count: redelivery,
+                        broker_entry_metadata: shared_bem.clone(),
+                        arrived_at: now,
+                    };
+                    self.classify_and_queue(im, redelivery, now);
+                    delivered += 1;
+                }
             }
             self.wake_receivers();
             return Ok(DeliverOutcome::Delivered { count: delivered });
@@ -1743,6 +1925,18 @@ impl ConsumerState {
         self.pending_seek = Some(request_id);
         // Drop buffered messages — the broker will resend from the new position.
         self.queue.clear();
+        #[cfg(feature = "scalable-topics")]
+        {
+            self.deferred_queue.clear();
+            self.canonical_nack_ids.clear();
+        }
+        self.queued_bytes = 0;
+        // A successful seek replaces the broker-side consumer. Existing manual
+        // credit belongs to the old incarnation and must never be replayed.
+        self.manual_flow_permits = 0;
+        self.granted_permits = 0;
+        self.permit_balance = 0;
+        self.consumed_since_flow = 0;
     }
 
     /// Acknowledge a previously-issued seek. Returns the request id, if one was pending.
@@ -1947,6 +2141,82 @@ mod tests {
         assert_eq!(m2.message_id.batch_index, 1);
         assert_eq!(m1.payload.as_ref(), b"a");
         assert_eq!(m2.payload.as_ref(), b"bb");
+    }
+
+    #[test]
+    fn partial_batch_delivers_only_selected_members_and_preserves_tracker_mask() {
+        let mut consumer =
+            ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = consumer.initial_flow();
+        let mut body = bytes::BytesMut::new();
+        for payload in [b"zero".as_ref(), b"one".as_ref(), b"two".as_ref()] {
+            let metadata = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            body.extend_from_slice(&(metadata.encoded_len() as u32).to_be_bytes());
+            metadata.encode(&mut body).expect("encode batch member");
+            body.extend_from_slice(payload);
+        }
+        let mut command = message_cmd(0);
+        command.ack_set = vec![0b101];
+
+        let outcome = consumer
+            .deliver(
+                &command,
+                metadata(3),
+                None,
+                body.freeze(),
+                std::time::Instant::now(),
+            )
+            .expect("deliver partial batch");
+
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 2 }));
+        let first = consumer
+            .pop_message(std::time::Instant::now())
+            .expect("first selected member");
+        let second = consumer
+            .pop_message(std::time::Instant::now())
+            .expect("second selected member");
+        assert_eq!(first.message_id.batch_index, 0);
+        assert_eq!(first.payload.as_ref(), b"zero");
+        assert_eq!(second.message_id.batch_index, 2);
+        assert_eq!(second.payload.as_ref(), b"two");
+        assert!(consumer.pop_message(std::time::Instant::now()).is_none());
+        assert_eq!(consumer.permit_balance, 98);
+        assert_eq!(
+            consumer
+                .batch_ack_tracker
+                .get(&(1, 1))
+                .expect("partial tracker")
+                .ack_set_i64(),
+            vec![0b101]
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn deferred_partial_batch_carries_command_mask_and_selected_permit_count() {
+        let mut consumer = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 0);
+        consumer.defer_payload_processing = true;
+        let mut command = message_cmd(0);
+        command.ack_set = vec![0b1010];
+
+        let outcome = consumer
+            .deliver(
+                &command,
+                metadata(4),
+                None,
+                Bytes::from_static(b"encoded batch"),
+                std::time::Instant::now(),
+            )
+            .expect("defer partial batch");
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        let deferred = consumer
+            .pop_deferred_message(std::time::Instant::now())
+            .expect("deferred entry");
+        assert_eq!(deferred.ack_set, vec![0b1010]);
+        assert_eq!(deferred.dispatch_permits, 2);
     }
 
     #[test]
@@ -2260,6 +2530,16 @@ mod tests {
         let _ = e.ack_position(99);
         assert!(!e.is_fully_acked());
         assert_eq!(e.unacked, vec![0b1111]);
+    }
+
+    #[test]
+    fn batch_ack_entry_seeds_wire_mask_and_cumulative_ack_is_bounded() {
+        let mut entry = BatchAckEntry::from_ack_set(5, &[0b1_1110, -1]);
+        assert_eq!(entry.ack_set_i64(), vec![0b1_1110]);
+        assert_eq!(entry.unacked_count(), 4);
+        assert!(!entry.ack_cumulative(2));
+        assert_eq!(entry.ack_set_i64(), vec![0b1_1000]);
+        assert!(entry.ack_cumulative(4));
     }
 
     /// Drive a synthetic distribution through `receive_latency_hist` and confirm the snapshot
@@ -3137,8 +3417,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // chunkMsgId2 := (first=2/2/2, last=3/3/3) — its "logical" id is 3/3/3.
         let id2 = MessageId {
@@ -3147,8 +3425,6 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         use core::cmp::Ordering;
         assert_eq!(id1.cmp(&id2), Ordering::Less);
@@ -3173,8 +3449,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let logical_id_of_chunk2 = MessageId {
             ledger_id: 3,
@@ -3182,8 +3456,6 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
 
         // A plain `MessageId` matching the lastChunkMessageId of chunk1.
@@ -3193,8 +3465,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // Equal to itself.
         assert_eq!(logical_id_of_chunk1, logical_id_of_chunk1);
@@ -3262,6 +3532,30 @@ mod tests {
         // should leave the previous rate untouched.
         c.record_rate_window(t0);
         assert!(c.current_msgs_per_sec.is_finite());
+    }
+
+    #[test]
+    fn seek_clears_buffered_message_bytes_with_the_queue() {
+        let mut consumer =
+            ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 10);
+        let _ = consumer.initial_flow();
+        consumer
+            .deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"buffered"),
+                std::time::Instant::now(),
+            )
+            .expect("buffer one message");
+        assert_eq!(consumer.queue_len(), 1);
+        assert_eq!(consumer.queued_bytes, 8);
+
+        consumer.begin_seek(RequestId(7));
+
+        assert_eq!(consumer.queue_len(), 0);
+        assert_eq!(consumer.queued_bytes, 0);
+        assert_eq!(consumer.pending_seek, Some(RequestId(7)));
     }
 
     /// Counter-backed `Wake` implementation used by the
@@ -3428,8 +3722,6 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
             metadata: std::sync::Arc::new(meta),
             single_metadata: None,

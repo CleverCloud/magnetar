@@ -1357,7 +1357,9 @@ impl Client {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.end_txn(txn, action)
+                .map_err(|err| ClientError::Other(format!("end_txn: {err}")))?
         };
+        let _waiter = EndTxnWaiterGuard::new(self.shared.clone(), txn, action);
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
@@ -1619,6 +1621,24 @@ impl Client {
     // PIP-145 topic-list deltas. No channels.
     // -------------------------------------------------------------------
 
+    /// Create the narrow owned capability used by an assignment-driven
+    /// scalable stream consumer. The public client itself remains non-Clone.
+    #[cfg(feature = "scalable-topics")]
+    pub fn segment_subscriber(&self) -> Result<crate::SegmentSubscriber, ClientError> {
+        let pool = self
+            .pool
+            .clone()
+            .ok_or(ClientError::ControllerRoutingUnsupported {
+                reason: "a URL-based supervised pool is required for direct controller routing",
+            })?;
+        let operation_timeout = self.shared.inner.lock().operation_timeout();
+        Ok(crate::SegmentSubscriber::new(
+            self.shared.clone(),
+            pool,
+            operation_timeout,
+        ))
+    }
+
     /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic session for
     /// `topic` and await its first layout.
     ///
@@ -1667,6 +1687,8 @@ impl Client {
                 Some(crate::ScalableEvent::LookupResolved {
                     resolved_topic_name,
                     controller_broker_url,
+                    controller_broker_url_tls,
+                    snapshot,
                     segments,
                     epoch,
                     ..
@@ -1675,6 +1697,8 @@ impl Client {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
+                        controller_broker_url_tls,
+                        snapshot,
                         segments,
                         epoch,
                     });
@@ -1730,6 +1754,7 @@ impl Client {
         consumer_id: u64,
         consumer_type: magnetar_proto::ScalableConsumerType,
     ) -> Result<magnetar_proto::ConsumerAssignment, ClientError> {
+        let incarnation = self.shared.allocate_controller_incarnation()?;
         {
             let mut conn = self.shared.inner.lock();
             conn.scalable_topic_subscribe(
@@ -1738,6 +1763,7 @@ impl Client {
                 consumer_name,
                 consumer_id,
                 consumer_type,
+                incarnation,
             )
             .map_err(|err| ClientError::Other(err.to_string()))?;
         }
@@ -1756,10 +1782,18 @@ impl Client {
                 pos.and_then(|p| buf.remove(p))
             };
             match drained {
-                Some(crate::ScalableEvent::ConsumerAssigned { assignment, .. }) => {
+                Some(crate::ScalableEvent::ConsumerAssigned {
+                    incarnation: event_incarnation,
+                    assignment,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Ok(assignment);
                 }
-                Some(crate::ScalableEvent::ConsumerRejected { reason, .. }) => {
+                Some(crate::ScalableEvent::ConsumerRejected {
+                    incarnation: event_incarnation,
+                    reason,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Err(ClientError::Other(reason));
                 }
                 _ => {}
@@ -2178,7 +2212,7 @@ fn direct_broker_url(
 /// call. [`magnetar_proto::broker_authority`] owns authority validation and
 /// default-port synthesis. This adapter preserves the explicit Pulsar scheme
 /// when present and otherwise inherits the bootstrap connection's TLS posture.
-fn parse_direct_broker_url(
+pub(crate) fn parse_direct_broker_url(
     broker_url: &str,
     bootstrap_scheme: Scheme,
 ) -> Result<ParsedUrl, ClientError> {
@@ -2354,6 +2388,35 @@ impl ConnectedFut {
     }
 }
 
+struct EndTxnWaiterGuard {
+    shared: Arc<ConnectionShared>,
+    txn: magnetar_proto::TxnId,
+    action: magnetar_proto::TxnAction,
+}
+
+impl EndTxnWaiterGuard {
+    fn new(
+        shared: Arc<ConnectionShared>,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Self {
+        Self {
+            shared,
+            txn,
+            action,
+        }
+    }
+}
+
+impl Drop for EndTxnWaiterGuard {
+    fn drop(&mut self) {
+        self.shared
+            .inner
+            .lock()
+            .release_end_txn_waiter(self.txn, self.action);
+    }
+}
+
 /// "Wait for the broker reply to a request-id-keyed command" future.
 ///
 /// Reused for lookup, partitioned-metadata, watch-topic-list-snapshot, and
@@ -2515,6 +2578,44 @@ pub(crate) async fn wait_subscribe_acked(
         notification: None,
     }
     .await
+}
+
+#[cfg(feature = "scalable-topics")]
+pub(crate) async fn subscribe_manual_flow_on(
+    shared: Arc<ConnectionShared>,
+    req: SubscribeRequest,
+    operation_timeout: std::time::Duration,
+) -> Result<Consumer, ClientError> {
+    shared.fail_if_no_driver()?;
+    let (handle, slot) = {
+        let mut conn = shared.inner.lock();
+        let handle = conn.subscribe(req);
+        let slot = conn
+            .consumer(handle)
+            .cloned()
+            .ok_or_else(|| ClientError::Other("new segment consumer is missing".to_owned()))?;
+        (handle, slot)
+    };
+    // Set the manual-FLOW fence before the subscribe frame can leave. A zero
+    // queue suppresses initial permits; `paused` suppresses every refill path.
+    slot.state.lock().paused = true;
+    shared.driver_waker.notify_one();
+    let mut guard = PendingConsumerSubscribeGuard::new(shared.clone(), handle);
+    match tokio::time::timeout(
+        operation_timeout,
+        wait_subscribe_acked(&shared, handle, true, None),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            guard.disarm();
+            Ok(Consumer::assemble(shared, handle, slot, None))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ClientError::Timeout(
+            "segment consumer subscribe exceeded operation_timeout".to_owned(),
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
