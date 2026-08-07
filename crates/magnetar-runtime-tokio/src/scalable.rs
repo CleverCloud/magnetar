@@ -17,6 +17,7 @@ use crate::{ClientError, ConnectionShared, ScalableEvent};
 const MAX_ROUTE_EVENTS: usize = 64;
 const MAX_AGGREGATE_EVENTS: usize = 256;
 const MAX_RETIRED_ROUTES: usize = 256;
+const DISCARD_POLICY_ERROR: &str = "scalable child used discard policy";
 
 fn route_error_is_recoverable(error: &ClientError) -> bool {
     matches!(
@@ -71,6 +72,18 @@ pub struct StreamAckFailure {
     pub position: magnetar_proto::StreamMessageId,
     /// Secret-free runtime diagnostic.
     pub message: String,
+}
+
+impl StreamAckFailure {
+    fn from_error(
+        position: magnetar_proto::StreamMessageId,
+        error: &impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            position,
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Runtime aggregate operation failure.
@@ -2023,9 +2036,7 @@ impl StreamConsumerInner {
         match consumer.post_process_deferred(complete.message_mut()) {
             crate::consumer::PostProcessOutcome::Fail(error) => return Err(error.into()),
             crate::consumer::PostProcessOutcome::Discard => {
-                return Err(StreamConsumerError::Failed(
-                    "scalable child used discard policy".to_owned(),
-                ));
+                return Err(StreamConsumerError::Failed(DISCARD_POLICY_ERROR.to_owned()));
             }
             crate::consumer::PostProcessOutcome::Deliver => {}
         }
@@ -2220,12 +2231,11 @@ impl StreamConsumerInner {
                             .await
                     }
                     Err(error) => {
-                        for position in positions {
-                            failed.push(StreamAckFailure {
-                                position,
-                                message: error.to_string(),
-                            });
-                        }
+                        failed.extend(
+                            positions
+                                .into_iter()
+                                .map(|position| StreamAckFailure::from_error(position, &error)),
+                        );
                         continue;
                     }
                 };
@@ -2235,12 +2245,11 @@ impl StreamConsumerInner {
                     confirmed.extend(positions);
                 }
                 Err(error) => {
-                    for position in positions {
-                        failed.push(StreamAckFailure {
-                            position,
-                            message: error.to_string(),
-                        });
-                    }
+                    failed.extend(
+                        positions
+                            .into_iter()
+                            .map(|position| StreamAckFailure::from_error(position, &error)),
+                    );
                 }
             }
         }
