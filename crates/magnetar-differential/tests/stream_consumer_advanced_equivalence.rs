@@ -1672,13 +1672,9 @@ where
     abort_redeliveries.sort_unstable();
     assert_eq!(abort_redeliveries, vec![(1, 1), (2, 1)]);
     consumer
-        .acknowledge(&first_redelivery)
+        .acknowledge_cumulative(&second_redelivery)
         .await
-        .expect("acknowledge first aborted transaction redelivery");
-    consumer
-        .acknowledge(&second_redelivery)
-        .await
-        .expect("acknowledge second aborted transaction redelivery");
+        .expect("cumulative acknowledgement resolves originals and redeliveries");
     cluster
         .wait_for("abort redeliveries acknowledged", |fake| {
             fake.resource_counts().unacked_messages == 0
