@@ -2837,7 +2837,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             match update {
                 ControlUpdate::Dag(Ok(
                     ScalableEvent::DagUpdated { .. } | ScalableEvent::LookupResolved { .. },
-                )) => {
+                ))
+                | ControlUpdate::Assignment(Ok(_)) => {
                     if let Err(error) = self.apply_aligned_control_plane(&dag, &controller).await {
                         self.request_resync(error.to_string());
                     }
@@ -2865,11 +2866,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     } else {
                         self.fail_closed(error.to_string());
                         break;
-                    }
-                }
-                ControlUpdate::Assignment(Ok(_assignment)) => {
-                    if let Err(error) = self.apply_aligned_control_plane(&dag, &controller).await {
-                        self.request_resync(error.to_string());
                     }
                 }
             }

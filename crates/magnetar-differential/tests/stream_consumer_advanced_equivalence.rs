@@ -161,8 +161,12 @@ struct DeliveryShapeTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct ChildOpenTrace {
     busy_segment_attempts: usize,
+    permanent_failure_resynced: bool,
+    permanent_failure_retried: bool,
+    permanent_failure_attempts: usize,
     cancelled_open_removed: bool,
     cancelled_open_close_failed: bool,
     provisional_close_failures: usize,
@@ -4116,6 +4120,84 @@ where
     assert_eq!(busy_segment_attempts, 2);
     close_and_count(busy, cluster).await;
 
+    let opens_before_permanent_failure = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::Subscribe
+            })
+            .count()
+    });
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "permanent current child-open failure",
+                )),
+            )
+        })
+        .expect("script permanent current child-open failure");
+    let failed = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("current-open-failure-sub")
+        .consumer_name("current-open-failure-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe current child-open failure aggregate");
+    let permanent_failure_resynced = loop {
+        match next_event(&failed).await {
+            StreamConsumerEvent::ResyncRequired { reason } => {
+                assert!(
+                    reason.contains("permanent current child-open failure"),
+                    "unexpected permanent child-open failure reason: {reason}"
+                );
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected permanent child-open event: {unexpected:?}"),
+        }
+    };
+    let permanent_failure_retried = loop {
+        match next_event(&failed).await {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("scalable member is busy") =>
+            {
+                break true;
+            }
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected replacement-registration event: {unexpected:?}"),
+        }
+    };
+    assert_eq!(
+        failed.status().phase(),
+        magnetar::proto::AggregatePhase::ResyncRequired
+    );
+    let permanent_failure_attempts = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::Subscribe
+            })
+            .count()
+            - opens_before_permanent_failure
+    });
+    assert_eq!(permanent_failure_attempts, 1);
+    close_and_count(failed, cluster).await;
+
     withdraw_failed_child_open(
         client,
         cluster,
@@ -4439,6 +4521,9 @@ where
     let after_close = cluster.inspect(M1FakeCluster::resource_counts);
     ChildOpenTrace {
         busy_segment_attempts,
+        permanent_failure_resynced,
+        permanent_failure_retried,
+        permanent_failure_attempts,
         cancelled_open_removed,
         cancelled_open_close_failed,
         provisional_close_failures,
