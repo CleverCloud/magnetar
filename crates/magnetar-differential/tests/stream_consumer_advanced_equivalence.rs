@@ -166,6 +166,138 @@ struct ChildOpenTrace {
     after_close: ResourceCounts,
 }
 
+async fn withdraw_failed_child_open<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+    suffix: &str,
+    completion: BrokerFailure,
+) where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let subscription = format!("withdraw-{suffix}-sub");
+    let member_name = format!("withdraw-{suffix}-member");
+    let takeover_name = format!("withdraw-{suffix}-takeover");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::ConsumerBusy,
+                    "park child ownership retry",
+                )),
+            )?;
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("script stale child-open failure");
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription(subscription.clone())
+        .consumer_name(member_name.clone())
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe stale child-open member");
+    cluster
+        .wait_for("pending stale child-open retry", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::SegmentOpen
+            })
+        })
+        .await;
+    let member = cluster
+        .inspect(|fake| fake.member(&subscription, &member_name))
+        .expect("stale child-open member");
+    let pending = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| {
+                    pending.endpoint == Endpoint::Segment(1)
+                        && pending.kind == OperationKind::SegmentOpen
+                })
+                .map(|pending| pending.id)
+        })
+        .expect("pending stale child-open retry id");
+    let takeover = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription(subscription.clone())
+        .consumer_name(takeover_name.clone())
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe stale child-open takeover");
+    let takeover_member = cluster
+        .inspect(|fake| fake.member(&subscription, &takeover_name))
+        .expect("stale child-open takeover member");
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Error,
+    );
+    cluster
+        .update(|fake| {
+            fake.complete_pending(pending, PendingCompletion::Fail(completion))?;
+            fake.publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(member, [2]),
+                    FullAssignment::new(takeover_member, [1]),
+                ],
+            )
+        })
+        .expect("withdraw pending child-open authority");
+    loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::AssignmentApplied { sources, .. }
+                if sources.iter().map(|source| source.segment_id().0).eq([2]) =>
+            {
+                break;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected stale child-open event: {unexpected:?}"),
+        }
+    }
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Error,
+    );
+    cluster
+        .wait_for("stale child-open failure cleanup", |fake| {
+            fake.resource_counts().pending_operations == 0
+                && fake.active_child_owner(&subscription, 1) == Some(takeover_member)
+                && fake.active_child_owner(&subscription, 2) == Some(member)
+        })
+        .await;
+    let status = consumer.status();
+    assert_eq!(status.attached_segments(), 1);
+    assert!(status.pending_ownership().is_empty());
+    consumer
+        .close()
+        .await
+        .expect("close stale child-open member");
+    takeover
+        .close()
+        .await
+        .expect("close stale child-open takeover");
+    cluster
+        .wait_for("stale child-open aggregate cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+        })
+        .await;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct CloseStateTrace {
@@ -3872,6 +4004,27 @@ where
     });
     assert_eq!(busy_segment_attempts, 2);
     close_and_count(busy, cluster).await;
+
+    withdraw_failed_child_open(
+        client,
+        cluster,
+        "busy",
+        BrokerFailure::new(
+            magnetar::proto::pb::ServerError::ConsumerBusy,
+            "withdrawn busy child-open retry",
+        ),
+    )
+    .await;
+    withdraw_failed_child_open(
+        client,
+        cluster,
+        "failure",
+        BrokerFailure::new(
+            magnetar::proto::pb::ServerError::PersistenceError,
+            "withdrawn failed child-open retry",
+        ),
+    )
+    .await;
 
     cluster.hold_command(
         Endpoint::Segment(1),
