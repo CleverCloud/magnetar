@@ -151,6 +151,13 @@ struct ControlPlaneTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalControllerTrace {
+    terminal_failure_reported: bool,
+    replacement_assignment_applied: bool,
+    after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeliveryShapeTrace {
     compressed_payloads: Vec<Vec<u8>>,
     compressed_batch_indexes: Vec<i32>,
@@ -3803,6 +3810,150 @@ async fn run_moonpool_control_plane() -> ControlPlaneTrace {
     trace
 }
 
+async fn observe_terminal_controller_failure<E, Close, CloseFuture>(
+    client: PulsarClient<E>,
+    close_client: Close,
+    cluster: &M1SocketCluster,
+) -> TerminalControllerTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+    Close: FnOnce(PulsarClient<E>) -> CloseFuture,
+    CloseFuture: std::future::Future<Output = ()>,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("terminal-controller-sub")
+        .consumer_name("terminal-controller-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe terminal-controller aggregate");
+    cluster
+        .wait_for("terminal-controller initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    let seek = magnetar::proto::PositionVector::new(
+        1,
+        [1, 2].into_iter().map(|segment_id| {
+            let source = magnetar::proto::SegmentSource::new(
+                magnetar::proto::SegmentId(segment_id),
+                cluster.inspect(|fake| {
+                    fake.segment_topic(segment_id)
+                        .expect("terminal-controller segment topic")
+                }),
+            )
+            .expect("canonical terminal-controller source");
+            (
+                source,
+                magnetar::proto::MessageId {
+                    ledger_id: segment_id,
+                    entry_id: 0,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                },
+            )
+        }),
+    )
+    .expect("terminal-controller all-leaf seek");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.script_next(
+                Endpoint::Segment(2),
+                OperationKind::Seek,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "force terminal controller reconnect",
+                )),
+            )
+        })
+        .expect("script terminal replacement controller and failed seek");
+    consumer
+        .seek_positions(&seek)
+        .await
+        .expect_err("failed seek requests terminal controller reconnect");
+    let controller = cluster
+        .inspect(|fake| fake.member("terminal-controller-sub", "terminal-controller-member"))
+        .expect("controller before terminal reconnect")
+        .connection;
+    cluster
+        .update(|fake| fake.disconnect_connection(controller))
+        .expect("disconnect controller before terminal reconnect");
+    cluster
+        .wait_for("pending terminal controller registration", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::ScalableOpen)
+                && fake.resource_counts().child_consumers == 0
+        })
+        .await;
+    close_client(client).await;
+    let mut replacement_assignment_applied = false;
+    let terminal_failure_reported = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("closed") || reason.contains("driver") =>
+            {
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. } => {
+                replacement_assignment_applied = true;
+            }
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected terminal-controller event: {unexpected:?}"),
+        }
+    };
+    cluster
+        .wait_for("terminal-controller cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.connections == 0
+                && counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
+        })
+        .await;
+    TerminalControllerTrace {
+        terminal_failure_reported,
+        replacement_assignment_applied,
+        after_close: cluster.inspect(M1FakeCluster::resource_counts),
+    }
+}
+
+async fn run_tokio_terminal_controller_failure() -> TerminalControllerTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    observe_terminal_controller_failure(
+        client,
+        PulsarClient::<magnetar::TokioEngine>::close,
+        &cluster,
+    )
+    .await
+}
+
+async fn run_moonpool_terminal_controller_failure() -> TerminalControllerTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    observe_terminal_controller_failure(
+        client,
+        PulsarClient::<magnetar::MoonpoolEngine<moonpool_core::TokioProviders>>::close,
+        &cluster,
+    )
+    .await
+}
+
 async fn observe_delivery_shapes<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -5485,6 +5636,16 @@ async fn control_plane_push_epoch_order_and_replacement_are_equivalent() {
     let tokio_trace = run_tokio_control_plane().await;
     let moonpool_trace = run_moonpool_control_plane().await;
     assert_eq!(tokio_trace, moonpool_trace);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_controller_registration_failure_is_equivalent() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_terminal_controller_failure().await;
+    let moonpool_trace = run_moonpool_terminal_controller_failure().await;
+    assert_eq!(tokio_trace, moonpool_trace);
+    assert!(tokio_trace.terminal_failure_reported);
+    assert!(!tokio_trace.replacement_assignment_applied);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
