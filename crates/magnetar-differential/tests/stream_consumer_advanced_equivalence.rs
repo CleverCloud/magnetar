@@ -130,6 +130,7 @@ struct CancellationTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct ControlPlaneTrace {
     push_preceded_response: bool,
     assignments: Vec<(u64, Vec<u64>)>,
@@ -138,6 +139,8 @@ struct ControlPlaneTrace {
     final_status_epoch: Option<u64>,
     equal_epoch_ack_retained: bool,
     lower_epoch_fenced: bool,
+    alignment_failure_reported: bool,
+    alignment_failure_applied_epoch_three: bool,
     after_close: ResourceCounts,
 }
 
@@ -3361,6 +3364,100 @@ where
     assert_eq!(replacement_status.assigned_segments(), 2);
     assert_eq!(replacement_status.attached_segments(), 2);
 
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.script_next(
+                Endpoint::Segment(2),
+                OperationKind::Seek,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "force alignment-failure reconnect",
+                )),
+            )
+        })
+        .expect("script delayed replacement controller and failed seek");
+    replacement_consumer
+        .seek_positions(&replacement_seek)
+        .await
+        .expect_err("failed child operation requests another controller baseline");
+    let prior_controller = cluster
+        .inspect(|fake| fake.member("control-replacement-sub", "control-replacement-member"))
+        .expect("controller before alignment-failure reconnect")
+        .connection;
+    cluster
+        .update(|fake| fake.disconnect_connection(prior_controller))
+        .expect("disconnect controller before alignment-failure reconnect");
+    cluster
+        .wait_for("delayed alignment-failure controller open", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::ScalableOpen)
+                && fake
+                    .member("control-replacement-sub", "control-replacement-member")
+                    .is_some_and(|member| member.connection != prior_controller)
+                && fake.resource_counts().child_consumers == 0
+        })
+        .await;
+    let pending_open = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::ScalableOpen)
+                .map(|pending| pending.id)
+        })
+        .expect("delayed alignment-failure controller open id");
+    let pending_member = cluster
+        .inspect(|fake| fake.member("control-replacement-sub", "control-replacement-member"))
+        .expect("pending alignment-failure controller member");
+    let (dag_connection, dag_session) = cluster
+        .inspect(M1FakeCluster::layout_session_ids)
+        .into_iter()
+        .find(|(connection, _)| *connection == pending_member.connection)
+        .expect("replacement DAG session on pending controller connection");
+    cluster
+        .update(|fake| {
+            fake.fail_layout_session(
+                dag_connection,
+                dag_session,
+                BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::ServiceNotReady,
+                    "alignment DAG closed before epoch catch-up",
+                ),
+            )?;
+            fake.advance_layout(3, same_topology_at_epoch_two())?;
+            fake.publish_assignment_plan(3, vec![FullAssignment::new(pending_member, [1, 2])])?;
+            fake.complete_pending(pending_open, PendingCompletion::Succeed)
+        })
+        .expect("complete mismatched replacement controller baseline");
+    let mut alignment_failure_applied_epoch_three = false;
+    let alignment_failure_reported = loop {
+        match next_event(&replacement_consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("alignment DAG closed before epoch catch-up") =>
+            {
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied {
+                layout_epoch: 3, ..
+            } => {
+                alignment_failure_applied_epoch_three = true;
+            }
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected alignment-failure event: {unexpected:?}"),
+        }
+    };
+    assert!(alignment_failure_reported);
+    assert!(!alignment_failure_applied_epoch_three);
+
     replacement_consumer
         .close()
         .await
@@ -3379,6 +3476,8 @@ where
         final_status_epoch,
         equal_epoch_ack_retained,
         lower_epoch_fenced,
+        alignment_failure_reported,
+        alignment_failure_applied_epoch_three,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
     }
 }
