@@ -5116,10 +5116,8 @@ where
     {
         magnetar::scalable::StreamConsumerError::Engine { .. }
         | magnetar::scalable::StreamConsumerError::Model(
-            magnetar::proto::StreamConsumerModelError::StaleAcknowledgementAuthority,
-        )
-        | magnetar::scalable::StreamConsumerError::Model(
-            magnetar::proto::StreamConsumerModelError::InvalidAggregatePhase {
+            magnetar::proto::StreamConsumerModelError::StaleAcknowledgementAuthority
+            | magnetar::proto::StreamConsumerModelError::InvalidAggregatePhase {
                 phase: magnetar::proto::AggregatePhase::ResyncRequired,
             },
         ) => "registration-disconnected".to_owned(),

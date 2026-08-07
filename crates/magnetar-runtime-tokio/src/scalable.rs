@@ -2451,7 +2451,7 @@ impl StreamConsumerInner {
             if state.close_state.is_closing() {
                 return Err(StreamConsumerError::Closed);
             }
-            match state.transaction_outcomes.get(&txn_id) {
+            let completion = match state.transaction_outcomes.get(&txn_id) {
                 Some(completion) if completion.outcome == outcome => completion.clone(),
                 Some(completion) => {
                     return Err(StreamConsumerError::Failed(format!(
@@ -2466,37 +2466,32 @@ impl StreamConsumerInner {
                         .insert(txn_id, completion.clone());
                     completion
                 }
+            };
+            if completion.try_start() {
+                let inner = self.clone();
+                let task_completion = completion.clone();
+                let dropped_completion = completion.clone();
+                let completion_inner = Arc::downgrade(self);
+                let handle = self.subscriber.spawn_task_with_completion(
+                    async move {
+                        let result = inner
+                            .propagate_transaction_outcome(txn_id, outcome, &task_completion)
+                            .await;
+                        task_completion.finish(result.map_err(|error| error.to_string()));
+                    },
+                    move || {
+                        dropped_completion.finish(Err(
+                            "transaction outcome propagation was interrupted".to_owned(),
+                        ));
+                        if let Some(inner) = completion_inner.upgrade() {
+                            inner.notify.notify_waiters();
+                        }
+                    },
+                );
+                Self::track_task(&mut state, handle);
             }
+            completion
         };
-        let leader = completion.try_start();
-        if leader {
-            let mut state = self.state.lock();
-            if state.close_state.is_closing() {
-                completion.finish(Err("stream consumer is closed".to_owned()));
-                return Err(StreamConsumerError::Closed);
-            }
-            let inner = self.clone();
-            let task_completion = completion.clone();
-            let dropped_completion = completion.clone();
-            let completion_inner = Arc::downgrade(self);
-            let handle = self.subscriber.spawn_task_with_completion(
-                async move {
-                    let result = inner
-                        .propagate_transaction_outcome(txn_id, outcome, &task_completion)
-                        .await;
-                    task_completion.finish(result.map_err(|error| error.to_string()));
-                },
-                move || {
-                    dropped_completion.finish(Err(
-                        "transaction outcome propagation was interrupted".to_owned(),
-                    ));
-                    if let Some(inner) = completion_inner.upgrade() {
-                        inner.notify.notify_waiters();
-                    }
-                },
-            );
-            Self::track_task(&mut state, handle);
-        }
         completion.wait().await.map_err(StreamConsumerError::Failed)
     }
 
