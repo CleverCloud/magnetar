@@ -1600,15 +1600,6 @@ impl StreamConsumerInner {
                 .await
             {
                 Ok(consumer) => {
-                    if !self.child_open_is_current(
-                        &source,
-                        controller_incarnation,
-                        child_generation,
-                    ) {
-                        return self
-                            .finish_cancelled_open(source, child_generation, Some(consumer))
-                            .await;
-                    }
                     let actions = {
                         let mut state = self.state.lock();
                         if state.close_state.is_closing()
@@ -2025,29 +2016,13 @@ impl StreamConsumerInner {
             )?);
         }
 
+        // Scalable children are opened with the default `Fail` crypto policy.
         match consumer.post_process_deferred(complete.message_mut()) {
             crate::consumer::PostProcessOutcome::Fail(error) => return Err(error.into()),
             crate::consumer::PostProcessOutcome::Discard => {
-                let ack = consumer.ack_stream_component(
-                    vec![complete.message_id()],
-                    vec![complete.message_id_data().clone()],
-                    magnetar_proto::pb::command_ack::AckType::Individual,
-                    None,
-                );
-                let actions = {
-                    let mut state = self.state.lock();
-                    let state = &mut *state;
-                    state.receive.discard_entry(
-                        &mut state.model,
-                        source.segment_id(),
-                        generation,
-                        complete,
-                        &work,
-                    )?
-                };
-                self.execute_actions(actions).await?;
-                ack.await?;
-                return Ok(());
+                return Err(StreamConsumerError::Failed(
+                    "scalable child used discard policy".to_owned(),
+                ));
             }
             crate::consumer::PostProcessOutcome::Deliver => {}
         }
