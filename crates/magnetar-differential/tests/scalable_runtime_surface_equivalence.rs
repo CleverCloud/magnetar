@@ -210,6 +210,26 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         .await
         .expect("receive Tokio restoration delivery");
     let restored_sequence = restored.token.dequeue_sequence();
+    cluster
+        .wait_for("Tokio post-dequeue restoration permit", |fake| {
+            fake.resource_counts().permits == 1
+        })
+        .await;
+    let fresh_segment = cluster.inspect(|fake| {
+        if fake.segment_permits("runtime-zero-batch-sub", 1) > 0 {
+            1
+        } else {
+            2
+        }
+    });
+    cluster
+        .update(|fake| fake.enqueue_message(fresh_segment, bytes::Bytes::from_static(b"fresh")))
+        .expect("enqueue fresh Tokio delivery before restoration");
+    cluster
+        .wait_for("fresh Tokio delivery before restoration", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
     direct_aggregate
         .restore_deliveries(vec![restored])
         .expect("restore Tokio delivery");
@@ -218,10 +238,19 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         .await
         .expect("receive restored Tokio delivery");
     assert_eq!(restored.token.dequeue_sequence(), restored_sequence);
+    let fresh = direct_aggregate
+        .receive()
+        .await
+        .expect("receive later fresh Tokio delivery");
+    assert!(fresh.token.dequeue_sequence() > restored_sequence);
     direct_aggregate
         .acknowledge(&restored.token)
         .await
         .expect("acknowledge restored Tokio delivery");
+    direct_aggregate
+        .acknowledge(&fresh.token)
+        .await
+        .expect("acknowledge fresh Tokio delivery");
     direct_aggregate
         .close()
         .await
@@ -457,6 +486,26 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         .await
         .expect("receive Moonpool restoration delivery");
     let restored_sequence = restored.token.dequeue_sequence();
+    cluster
+        .wait_for("Moonpool post-dequeue restoration permit", |fake| {
+            fake.resource_counts().permits == 1
+        })
+        .await;
+    let fresh_segment = cluster.inspect(|fake| {
+        if fake.segment_permits("runtime-zero-batch-sub", 1) > 0 {
+            1
+        } else {
+            2
+        }
+    });
+    cluster
+        .update(|fake| fake.enqueue_message(fresh_segment, bytes::Bytes::from_static(b"fresh")))
+        .expect("enqueue fresh Moonpool delivery before restoration");
+    cluster
+        .wait_for("fresh Moonpool delivery before restoration", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
     direct_aggregate
         .restore_deliveries(vec![restored])
         .expect("restore Moonpool delivery");
@@ -465,10 +514,19 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         .await
         .expect("receive restored Moonpool delivery");
     assert_eq!(restored.token.dequeue_sequence(), restored_sequence);
+    let fresh = direct_aggregate
+        .receive()
+        .await
+        .expect("receive later fresh Moonpool delivery");
+    assert!(fresh.token.dequeue_sequence() > restored_sequence);
     direct_aggregate
         .acknowledge(&restored.token)
         .await
         .expect("acknowledge restored Moonpool delivery");
+    direct_aggregate
+        .acknowledge(&fresh.token)
+        .await
+        .expect("acknowledge fresh Moonpool delivery");
     direct_aggregate
         .close()
         .await
