@@ -107,6 +107,7 @@ struct TransactionTrace {
     cancelled_commit_commands: usize,
     pending_commit_cancelled: bool,
     confirmed_commit_retried_without_wire_end: bool,
+    outcome_retry_reused_retained_close: bool,
     failed_finalization_errors: (bool, bool),
     failed_commit_reported_unknown: bool,
     unknown_outcome_event: bool,
@@ -1671,9 +1672,13 @@ where
     abort_redeliveries.sort_unstable();
     assert_eq!(abort_redeliveries, vec![(1, 1), (2, 1)]);
     consumer
-        .acknowledge_cumulative(&second_redelivery)
+        .acknowledge(&first_redelivery)
         .await
-        .expect("cumulative acknowledgement resolves originals and redeliveries");
+        .expect("acknowledge first aborted transaction redelivery");
+    consumer
+        .acknowledge(&second_redelivery)
+        .await
+        .expect("acknowledge second aborted transaction redelivery");
     cluster
         .wait_for("abort redeliveries acknowledged", |fake| {
             fake.resource_counts().unacked_messages == 0
@@ -1888,6 +1893,174 @@ where
     );
     cluster
         .wait_for("shared-registration transaction cleanup", |fake| {
+            fake.resource_counts().unacked_messages == 0
+        })
+        .await;
+
+    let outcome_consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("outcome-retry-sub")
+        .consumer_name("outcome-retry-owner")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe transaction-outcome retry owner");
+    cluster
+        .wait_for("transaction-outcome retry children", |fake| {
+            fake.resource_counts().child_consumers == 4
+        })
+        .await;
+    wait_for_initial_flow(&outcome_consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"outcome-retry")))
+        .expect("enqueue transaction-outcome retry participant");
+    cluster
+        .wait_for("transaction-outcome retry delivery", |fake| {
+            fake.resource_counts().unacked_messages >= 1
+        })
+        .await;
+    let outcome_message = receive(&outcome_consumer).await;
+    let outcome_txn = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open transaction-outcome retry transaction");
+    outcome_consumer
+        .acknowledge_in_transaction(&outcome_message, outcome_txn)
+        .await
+        .expect("stage transaction-outcome retry acknowledgement");
+
+    let takeover_consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("outcome-retry-sub")
+        .consumer_name("outcome-retry-takeover")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe transaction-outcome retry takeover");
+    let _ = wait_for_assignment(&takeover_consumer, 1, &[]).await;
+    let outcome_member = cluster
+        .inspect(|fake| fake.member("outcome-retry-sub", "outcome-retry-owner"))
+        .expect("transaction-outcome retry owner member");
+    let takeover_member = cluster
+        .inspect(|fake| fake.member("outcome-retry-sub", "outcome-retry-takeover"))
+        .expect("transaction-outcome retry takeover member");
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(outcome_member, [2]),
+                    FullAssignment::new(takeover_member, [1]),
+                ],
+            )
+        })
+        .expect("transfer transaction-bearing segment before outcome");
+    let _ = wait_for_assignment(&outcome_consumer, 1, &[2]).await;
+    let _ = wait_for_assignment(&takeover_consumer, 1, &[1]).await;
+
+    let mut outcome_commit = Box::pin(client.commit_transaction(outcome_txn));
+    tokio::select! {
+        biased;
+        result = &mut outcome_commit => panic!("delayed outcome close completed early: {result:?}"),
+        () = cluster.wait_for("retained transaction-outcome close", |fake| {
+            end_transaction_command_count(fake, "commit") == 1
+                && fake.pending_operations().iter().any(|pending| {
+                    pending.kind == OperationKind::Close
+                        && pending.endpoint == Endpoint::Segment(1)
+                })
+        }) => {}
+    }
+    let pending_outcome_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| {
+                    pending.kind == OperationKind::Close && pending.endpoint == Endpoint::Segment(1)
+                })
+                .map(|pending| pending.id)
+        })
+        .expect("retained transaction-outcome close id");
+    drop(outcome_commit);
+    let mut resumed_outcome_commit = Box::pin(client.commit_transaction(outcome_txn));
+    tokio::select! {
+        biased;
+        result = &mut resumed_outcome_commit => panic!("retained outcome retry completed early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    let outcome_retry_reused_retained_close = cluster.inspect(|fake| {
+        end_transaction_command_count(fake, "commit") == 1
+            && fake
+                .routes()
+                .iter()
+                .filter(|route| {
+                    route.command == magnetar::proto::pb::base_command::Type::CloseConsumer
+                })
+                .count()
+                == 1
+            && fake
+                .pending_operations()
+                .iter()
+                .any(|pending| pending.id == pending_outcome_close)
+    });
+    assert!(outcome_retry_reused_retained_close);
+    cluster
+        .update(|fake| fake.complete_pending(pending_outcome_close, PendingCompletion::Succeed))
+        .expect("complete retained transaction-outcome close");
+    assert_eq!(
+        resumed_outcome_commit
+            .await
+            .expect("resume confirmed transaction outcome"),
+        magnetar::TxnState::Committed
+    );
+    assert_eq!(
+        cluster.inspect(|fake| fake.segment_unacked("outcome-retry-sub", 1)),
+        0,
+        "confirmed outcome clears the transferred segment delivery"
+    );
+    cluster
+        .wait_for("transaction-outcome takeover", |fake| {
+            fake.active_child_owner("outcome-retry-sub", 1) == Some(takeover_member)
+                && fake.resource_counts().pending_operations == 0
+        })
+        .await;
+    outcome_consumer
+        .close()
+        .await
+        .expect("close transaction-outcome retry owner");
+    takeover_consumer
+        .close()
+        .await
+        .expect("close transaction-outcome retry takeover");
+    let remaining_unacked = cluster.inspect(|fake| {
+        (
+            fake.segment_unacked("transaction-sub", 1),
+            fake.segment_unacked("transaction-sub", 2),
+            fake.segment_unacked("outcome-retry-sub", 1),
+            fake.segment_unacked("outcome-retry-sub", 2),
+        )
+    });
+    assert_eq!(
+        remaining_unacked,
+        (1, 0, 0, 0),
+        "the independent transaction subscription receives its own published copy"
+    );
+    let independent_copy = receive(&consumer).await;
+    assert_eq!(independent_copy.source().segment_id().0, 1);
+    assert_eq!(independent_copy.value().as_ref(), b"outcome-retry");
+    consumer
+        .acknowledge(&independent_copy)
+        .await
+        .expect("acknowledge independent transaction-sub copy");
+    cluster
+        .wait_for("transaction-outcome retry unacked baseline", |fake| {
             fake.resource_counts().unacked_messages == 0
         })
         .await;
@@ -2328,6 +2501,7 @@ where
         cancelled_commit_commands,
         pending_commit_cancelled,
         confirmed_commit_retried_without_wire_end,
+        outcome_retry_reused_retained_close,
         failed_finalization_errors,
         failed_commit_reported_unknown,
         unknown_outcome_event,
@@ -4137,6 +4311,7 @@ async fn vector_transactions_commit_abort_redeliver_and_poison_equivalently() {
     let tokio_trace = run_tokio_transactions().await;
     let moonpool_trace = run_moonpool_transactions().await;
     assert_eq!(tokio_trace, moonpool_trace);
+    assert!(tokio_trace.outcome_retry_reused_retained_close);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
