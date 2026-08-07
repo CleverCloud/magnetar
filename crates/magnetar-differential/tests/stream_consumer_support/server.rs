@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use magnetar_fakes::m1::{
-    Endpoint, EndpointAuthorities, M1FakeCluster, M1FakeConfig, M1FakeError, TransportSecurity,
+    BrokerFailure, Endpoint, EndpointAuthorities, M1FakeCluster, M1FakeConfig, M1FakeError,
+    TransportSecurity,
 };
 use magnetar_proto::{FrameError, decode_one, encode_command};
 use parking_lot::Mutex;
@@ -24,6 +25,7 @@ struct Shared {
     held_message_endpoints: Mutex<BTreeSet<Endpoint>>,
     held_output_commands: Mutex<BTreeSet<(Endpoint, i32)>>,
     held_messages: Mutex<BTreeMap<magnetar_fakes::m1::ConnectionId, VecDeque<Bytes>>>,
+    transaction_registration_errors: Mutex<VecDeque<BrokerFailure>>,
     retain_sealed_placements: AtomicBool,
     advertise_controller_authority: bool,
 }
@@ -83,6 +85,7 @@ impl M1SocketCluster {
             held_message_endpoints: Mutex::new(BTreeSet::new()),
             held_output_commands: Mutex::new(BTreeSet::new()),
             held_messages: Mutex::new(BTreeMap::new()),
+            transaction_registration_errors: Mutex::new(VecDeque::new()),
             retain_sealed_placements: AtomicBool::new(false),
             advertise_controller_authority,
         });
@@ -209,6 +212,14 @@ impl M1SocketCluster {
             .lock()
             .remove(&(endpoint, command as i32));
         self.shared.output_ready.notify_waiters();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rewrite_next_transaction_registration_error(&self, failure: BrokerFailure) {
+        self.shared
+            .transaction_registration_errors
+            .lock()
+            .push_back(failure);
     }
 }
 
@@ -342,6 +353,7 @@ fn prepare_output(
         .is_some_and(|messages| !messages.is_empty());
     for bytes in output {
         let bytes = rewrite_layout(shared, bytes)?;
+        let bytes = rewrite_transaction_registration_error(shared, bytes)?;
         let mut candidate = bytes.clone();
         let frame = decode_one(&mut candidate)
             .map_err(|error| format!("generated fake frame decode failed: {error}"))?;
@@ -361,6 +373,42 @@ fn prepare_output(
         }
     }
     Ok(ready)
+}
+
+fn rewrite_transaction_registration_error(shared: &Shared, bytes: Bytes) -> Result<Bytes, String> {
+    let mut rewrites = shared.transaction_registration_errors.lock();
+    if rewrites.is_empty() {
+        return Ok(bytes);
+    }
+    let mut candidate = bytes.clone();
+    let frame = decode_one(&mut candidate)
+        .map_err(|error| format!("generated fake frame decode failed: {error}"))?;
+    if frame.command.r#type
+        != magnetar_proto::pb::base_command::Type::AddSubscriptionToTxnResponse as i32
+    {
+        return Ok(bytes);
+    }
+    let request_id = frame
+        .command
+        .add_subscription_to_txn_response
+        .ok_or("transaction registration response omitted its payload")?
+        .request_id;
+    let failure = rewrites
+        .pop_front()
+        .expect("non-empty rewrite queue was checked");
+    let command = magnetar_proto::pb::BaseCommand {
+        r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+        error: Some(magnetar_proto::pb::CommandError {
+            request_id,
+            error: failure.error as i32,
+            message: failure.message,
+        }),
+        ..Default::default()
+    };
+    let mut encoded = BytesMut::new();
+    encode_command(&mut encoded, &command)
+        .map_err(|error| format!("transaction registration error encode failed: {error}"))?;
+    Ok(encoded.freeze())
 }
 
 fn rewrite_layout(shared: &Shared, bytes: Bytes) -> Result<Bytes, String> {
