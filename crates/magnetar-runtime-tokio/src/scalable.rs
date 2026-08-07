@@ -4283,18 +4283,101 @@ mod tests {
             inner: aggregate_inner_with_two_messages(),
         };
         let first = consumer.receive().await.expect("first delivery");
+        let second = consumer.receive().await.expect("second delivery");
         assert_eq!(first.message.message_id.entry_id, 1);
+        assert_eq!(second.message.message_id.entry_id, 2);
 
         consumer
-            .restore_deliveries(vec![first])
-            .expect("restore cancelled delivery");
+            .restore_deliveries(vec![second, first])
+            .expect("restore cancelled deliveries in reverse order");
 
-        let restored = consumer.receive().await.expect("restored delivery");
-        let later = consumer.receive().await.expect("later delivery");
-        assert_eq!(restored.message.message_id.entry_id, 1);
-        assert_eq!(restored.token.dequeue_sequence().0, 0);
-        assert_eq!(later.message.message_id.entry_id, 2);
-        assert_eq!(later.token.dequeue_sequence().0, 1);
+        let restored_first = consumer.receive().await.expect("first restored delivery");
+        let restored_second = consumer.receive().await.expect("second restored delivery");
+        assert_eq!(restored_first.message.message_id.entry_id, 1);
+        assert_eq!(restored_first.token.dequeue_sequence().0, 0);
+        assert_eq!(restored_second.message.message_id.entry_id, 2);
+        assert_eq!(restored_second.token.dequeue_sequence().0, 1);
+
+        let closing = StreamConsumer {
+            inner: aggregate_inner_with_two_messages(),
+        };
+        let rejected = closing.receive().await.expect("delivery before close");
+        closing.inner.state.lock().close_state = AggregateCloseState::Closing;
+        assert!(matches!(
+            closing.restore_deliveries(vec![rejected]),
+            Err(StreamConsumerError::Closed)
+        ));
+        assert_eq!(closing.inner.state.lock().queue.len(), 1);
+
+        let failed = StreamConsumer {
+            inner: empty_aggregate_inner(),
+        };
+        failed.inner.state.lock().terminal_error = Some("retained receive failure".to_owned());
+        assert!(matches!(
+            failed.receive().await,
+            Err(StreamConsumerError::Failed(message)) if message == "retained receive failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_delivery_reservations_fail_without_state_mutation() {
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        inner.state.lock().flow_reservations.clear();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        assert!(matches!(
+            inner
+                .message_arrived(
+                    child.source.clone(),
+                    child.generation,
+                    session_epoch,
+                    &child.consumer,
+                    deferred_message(
+                        7,
+                        magnetar_proto::pb::MessageMetadata::default(),
+                        bytes::Bytes::from_static(b"missing-flow"),
+                        1,
+                    ),
+                )
+                .await,
+            Err(StreamConsumerError::Failed(message))
+                if message.contains("without an aggregate FLOW reservation")
+        ));
+        assert!(inner.state.lock().queue.is_empty());
+
+        let malformed = aggregate_inner_with_child().0;
+        let (source, generation) = {
+            let state = malformed.state.lock();
+            let child = state.children.values().next().expect("malformed child");
+            (child.source.clone(), child.generation)
+        };
+        let message = deferred_message(
+            8,
+            magnetar_proto::pb::MessageMetadata::default(),
+            bytes::Bytes::from_static(b"missing-budget"),
+            1,
+        );
+        malformed.state.lock().queue.push_back(QueuedMessage {
+            source,
+            generation,
+            reservation: None,
+            message: message.message,
+            message_id_data: message.message_id_data,
+            token: None,
+        });
+        assert!(matches!(
+            malformed.reserve_batch(1, usize::MAX).await,
+            Err(StreamConsumerError::Failed(message))
+                if message.contains("fresh aggregate queue entry has no reservation")
+        ));
+        assert_eq!(malformed.state.lock().queue.len(), 1);
     }
 
     #[tokio::test]
