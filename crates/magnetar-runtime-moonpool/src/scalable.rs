@@ -5527,6 +5527,44 @@ mod tests {
             assert_eq!(seeks, 1);
         }
         drop(operation);
+
+        let (missing_inner, _) = aggregate_inner_with_child();
+        let missing_source = missing_inner
+            .state
+            .lock()
+            .model
+            .assignment()
+            .expect("missing-child assignment")
+            .segments()[0]
+            .source();
+        let vector = magnetar_proto::PositionVector::new(
+            1,
+            [(missing_source.clone(), magnetar_proto::MessageId::EARLIEST)],
+        )
+        .expect("missing-child seek vector");
+        let actions = {
+            let mut state = missing_inner.state.lock();
+            let actions = state
+                .model
+                .begin_seek(&vector)
+                .expect("begin missing-child seek");
+            state.children.clear();
+            actions
+        };
+        assert!(matches!(
+            missing_inner.execute_actions(actions).await,
+            Err(StreamConsumerError::Model(
+                magnetar_proto::StreamConsumerModelError::PositionSourceUnavailable {
+                    segment_source,
+                }
+            )) if segment_source == missing_source
+        ));
+        let state = missing_inner.state.lock();
+        assert_eq!(
+            state.model.phase(),
+            magnetar_proto::AggregatePhase::ResyncRequired
+        );
+        assert!(state.reconnect_requested);
     }
 
     #[tokio::test]
