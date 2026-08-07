@@ -200,6 +200,8 @@ pub enum OperationKind {
     Seek,
     /// Ordinary `CommandCloseConsumer` on a segment endpoint.
     Close,
+    /// Ordinary `CommandGetSchema` on a segment endpoint.
+    GetSchema,
     /// `CommandAddSubscriptionToTxn` on the controller.
     TransactionRegistration,
     /// `CommandEndTxn` on the controller.
@@ -810,6 +812,12 @@ enum PendingOperation {
         request_id: u64,
         fence: ChildFence,
     },
+    GetSchema {
+        info: PendingOperationInfo,
+        request_id: u64,
+        topic: String,
+        schema_version: Option<Bytes>,
+    },
     TransactionRegistration {
         info: PendingOperationInfo,
         txn_id: magnetar_proto::TxnId,
@@ -832,6 +840,7 @@ impl PendingOperation {
             | Self::Ack { info, .. }
             | Self::Seek { info, .. }
             | Self::Close { info, .. }
+            | Self::GetSchema { info, .. }
             | Self::TransactionRegistration { info, .. }
             | Self::EndTransaction { info, .. } => info,
         }
@@ -1297,6 +1306,21 @@ impl M1FakeCluster {
                     })
                 }
             },
+            PendingOperation::GetSchema {
+                info,
+                request_id,
+                topic,
+                schema_version,
+            } => self.queue_get_schema_response(
+                info.connection,
+                request_id,
+                topic,
+                schema_version,
+                match &completion {
+                    PendingCompletion::Succeed => None,
+                    PendingCompletion::Fail(failure) => Some(failure),
+                },
+            ),
             PendingOperation::TransactionRegistration {
                 info,
                 txn_id,
@@ -2518,25 +2542,42 @@ impl M1FakeCluster {
             )
         })?;
         self.require_endpoint(connection, endpoint, pb::base_command::Type::GetSchema)?;
-        self.queue_command(
-            connection,
-            &pb::BaseCommand {
-                r#type: pb::base_command::Type::GetSchemaResponse as i32,
-                get_schema_response: Some(pb::CommandGetSchemaResponse {
-                    request_id: command.request_id,
-                    error_code: None,
-                    error_message: None,
-                    schema: Some(pb::Schema {
-                        name: command.topic.clone(),
-                        schema_data: Bytes::new(),
-                        r#type: pb::schema::Type::None as i32,
-                        properties: Vec::new(),
-                    }),
-                    schema_version: command.schema_version.clone(),
-                }),
-                ..Default::default()
-            },
-        )
+        match self.take_behavior(endpoint, OperationKind::GetSchema) {
+            Some(ScriptedBehavior::Fail(failure)) => self.queue_get_schema_response(
+                connection,
+                command.request_id,
+                command.topic.clone(),
+                command.schema_version.clone(),
+                Some(&failure),
+            ),
+            Some(ScriptedBehavior::Delay) => {
+                let id = self.allocate_pending_id();
+                let info = PendingOperationInfo {
+                    id,
+                    endpoint,
+                    kind: OperationKind::GetSchema,
+                    connection,
+                    request_id: Some(command.request_id),
+                };
+                self.pending.insert(
+                    id,
+                    PendingOperation::GetSchema {
+                        info,
+                        request_id: command.request_id,
+                        topic: command.topic.clone(),
+                        schema_version: command.schema_version.clone(),
+                    },
+                );
+                Ok(())
+            }
+            None => self.queue_get_schema_response(
+                connection,
+                command.request_id,
+                command.topic.clone(),
+                command.schema_version.clone(),
+                None,
+            ),
+        }
     }
 
     fn handle_tc_client_connect(
@@ -4254,6 +4295,35 @@ impl M1FakeCluster {
             ..Default::default()
         };
         self.queue_command(connection, &command)
+    }
+
+    fn queue_get_schema_response(
+        &mut self,
+        connection: ConnectionId,
+        request_id: u64,
+        topic: String,
+        schema_version: Option<Bytes>,
+        failure: Option<&BrokerFailure>,
+    ) -> Result<(), M1FakeError> {
+        self.queue_command(
+            connection,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::GetSchemaResponse as i32,
+                get_schema_response: Some(pb::CommandGetSchemaResponse {
+                    request_id,
+                    error_code: failure.map(|failure| failure.error as i32),
+                    error_message: failure.map(|failure| failure.message.clone()),
+                    schema: failure.is_none().then_some(pb::Schema {
+                        name: topic,
+                        schema_data: Bytes::new(),
+                        r#type: pb::schema::Type::None as i32,
+                        properties: Vec::new(),
+                    }),
+                    schema_version,
+                }),
+                ..Default::default()
+            },
+        )
     }
 
     fn queue_add_subscription_response(

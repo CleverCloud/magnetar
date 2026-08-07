@@ -1841,6 +1841,66 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         schema.schema.expect("resolved schema").r#type,
         pb::schema::Type::None as i32
     );
+    cluster
+        .script_next(
+            Endpoint::Segment(1),
+            OperationKind::GetSchema,
+            ScriptedBehavior::Delay,
+        )
+        .expect("delay schema success");
+    send(&mut cluster, child, &get_schema_command(&topic, 12)).expect("hold schema success");
+    let delayed_schema = cluster
+        .pending_operations()
+        .into_iter()
+        .find(|pending| pending.kind == OperationKind::GetSchema)
+        .expect("delayed schema operation");
+    assert_eq!(delayed_schema.request_id, Some(12));
+    cluster
+        .complete_pending(delayed_schema.id, PendingCompletion::Succeed)
+        .expect("complete delayed schema success");
+    let schema = take_frames(&mut cluster, child)
+        .into_iter()
+        .find_map(|frame| frame.command.get_schema_response)
+        .expect("delayed schema response");
+    assert_eq!(schema.request_id, 12);
+    assert!(schema.error_code.is_none());
+
+    cluster
+        .script_next(
+            Endpoint::Segment(1),
+            OperationKind::GetSchema,
+            ScriptedBehavior::Delay,
+        )
+        .expect("delay schema failure");
+    send(&mut cluster, child, &get_schema_command(&topic, 13)).expect("hold schema failure");
+    let delayed_schema = cluster
+        .pending_operations()
+        .into_iter()
+        .find(|pending| pending.kind == OperationKind::GetSchema)
+        .expect("delayed schema failure operation");
+    cluster
+        .complete_pending(
+            delayed_schema.id,
+            PendingCompletion::Fail(BrokerFailure::new(
+                pb::ServerError::MetadataError,
+                "delayed schema failure",
+            )),
+        )
+        .expect("complete delayed schema failure");
+    let schema = take_frames(&mut cluster, child)
+        .into_iter()
+        .find_map(|frame| frame.command.get_schema_response)
+        .expect("delayed schema failure response");
+    assert_eq!(schema.request_id, 13);
+    assert_eq!(
+        schema.error_code,
+        Some(pb::ServerError::MetadataError as i32)
+    );
+    assert_eq!(
+        schema.error_message.as_deref(),
+        Some("delayed schema failure")
+    );
+    assert!(schema.schema.is_none());
     assert!(matches!(
         send(
             &mut cluster,
