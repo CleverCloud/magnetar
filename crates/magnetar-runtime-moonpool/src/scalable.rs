@@ -754,6 +754,14 @@ struct ControllerRegistration {
 }
 
 impl ControllerRegistration {
+    fn from_session(controller: &ControllerSession) -> Self {
+        Self {
+            shared: controller.shared.clone(),
+            consumer_id: controller.consumer_id,
+            incarnation: controller.incarnation,
+        }
+    }
+
     fn close(&self) {
         self.shared
             .inner
@@ -894,6 +902,33 @@ struct AggregateState<P: Providers> {
     close_state: AggregateCloseState,
     close_error: Option<String>,
     tasks: Vec<ScalableTaskHandle<P>>,
+}
+
+impl<P: Providers> AggregateState<P> {
+    fn new(
+        model: magnetar_proto::StreamConsumerModel,
+        controller_registration: ControllerRegistration,
+    ) -> Self {
+        Self {
+            model,
+            receive: magnetar_proto::StreamReceiveState::default(),
+            children: BTreeMap::new(),
+            flow_reservations: BTreeMap::new(),
+            dispatch_permit_debt: BTreeMap::new(),
+            queue: VecDeque::new(),
+            events: VecDeque::new(),
+            pending_transactions: BTreeMap::new(),
+            transaction_registrations: BTreeMap::new(),
+            transaction_outcomes: BTreeMap::new(),
+            controller_registration: Some(controller_registration),
+            terminal_error: None,
+            reconnect_requested: false,
+            open_tasks: 0,
+            close_state: AggregateCloseState::Open,
+            close_error: None,
+            tasks: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1134,29 +1169,10 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
             subscription: options.subscription,
             consumer_name: options.consumer_name,
             consumer_id,
-            state: Mutex::new(AggregateState {
+            state: Mutex::new(AggregateState::new(
                 model,
-                receive: magnetar_proto::StreamReceiveState::default(),
-                children: BTreeMap::new(),
-                flow_reservations: BTreeMap::new(),
-                dispatch_permit_debt: BTreeMap::new(),
-                queue: VecDeque::new(),
-                events: VecDeque::new(),
-                pending_transactions: BTreeMap::new(),
-                transaction_registrations: BTreeMap::new(),
-                transaction_outcomes: BTreeMap::new(),
-                controller_registration: Some(ControllerRegistration {
-                    shared: controller.shared.clone(),
-                    consumer_id,
-                    incarnation,
-                }),
-                terminal_error: None,
-                reconnect_requested: false,
-                open_tasks: 0,
-                close_state: AggregateCloseState::Open,
-                close_error: None,
-                tasks: Vec::new(),
-            }),
+                ControllerRegistration::from_session(&controller),
+            )),
             notify: Notify::new(),
             #[cfg(test)]
             control_park_hook: None,
@@ -2977,11 +2993,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             assignment.clone(),
                         );
                         if transition.is_ok() {
-                            state.controller_registration = Some(ControllerRegistration {
-                                shared: controller.shared.clone(),
-                                consumer_id: self.consumer_id,
-                                incarnation,
-                            });
+                            state.controller_registration =
+                                Some(ControllerRegistration::from_session(&controller));
                             state.reconnect_requested = false;
                         }
                         transition
