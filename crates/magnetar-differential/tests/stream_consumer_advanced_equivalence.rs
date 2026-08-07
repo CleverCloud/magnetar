@@ -159,6 +159,8 @@ struct ChildOpenTrace {
     busy_segment_attempts: usize,
     cancelled_open_removed: bool,
     cancelled_open_close_failed: bool,
+    provisional_close_failures: usize,
+    provisional_close_routes: usize,
     after_close: ResourceCounts,
 }
 
@@ -4007,11 +4009,127 @@ where
                 && counts.permits == 0
         })
         .await;
+
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Success,
+    );
+    let provisional = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("provisional-close-sub")
+        .consumer_name("provisional-close-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe provisional-close aggregate");
+    cluster
+        .wait_for("held provisional child-open response", |fake| {
+            fake.resource_counts().child_consumers == 2
+                && fake
+                    .active_child_owner("provisional-close-sub", 1)
+                    .is_some()
+        })
+        .await;
+    let close_routes_before = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::CloseConsumer
+            })
+            .count()
+    });
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("delay provisional child's compensating close");
+    let repeated_provisional = provisional.clone();
+    let mut first_close = Box::pin(provisional.close());
+    let mut second_close = Box::pin(repeated_provisional.close());
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Success,
+    );
+    tokio::select! {
+        biased;
+        result = &mut first_close => panic!("first provisional close completed before child confirmation: {result:?}"),
+        result = &mut second_close => panic!("second provisional close completed before child confirmation: {result:?}"),
+        () = cluster.wait_for("pending provisional child close", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::Close
+            })
+        }) => {}
+    }
+    let pending_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| {
+                    pending.endpoint == Endpoint::Segment(1) && pending.kind == OperationKind::Close
+                })
+                .map(|pending| pending.id)
+        })
+        .expect("pending provisional child close id");
+    cluster
+        .update(|fake| {
+            fake.complete_pending(
+                pending_close,
+                PendingCompletion::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "provisional close barrier failure",
+                )),
+            )
+        })
+        .expect("fail provisional child's compensating close");
+    let (first_result, second_result) = tokio::join!(&mut first_close, &mut second_close);
+    let provisional_close_errors = [
+        first_result
+            .expect_err("first provisional close fails")
+            .to_string(),
+        second_result
+            .expect_err("second provisional close repeats failure")
+            .to_string(),
+    ];
+    assert!(
+        provisional_close_errors
+            .iter()
+            .all(|error| error.contains("provisional close barrier failure"))
+    );
+    assert!(provisional_close_errors[1].contains("stream consumer failed"));
+    let provisional_close_failures = provisional_close_errors.len();
+    cluster
+        .wait_for("provisional-close lifecycle cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
+        })
+        .await;
+    let provisional_close_routes = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::CloseConsumer
+            })
+            .count()
+            - close_routes_before
+    });
+    assert_eq!(provisional_close_routes, 2);
     let after_close = cluster.inspect(M1FakeCluster::resource_counts);
     ChildOpenTrace {
         busy_segment_attempts,
         cancelled_open_removed,
         cancelled_open_close_failed,
+        provisional_close_failures,
+        provisional_close_routes,
         after_close,
     }
 }
