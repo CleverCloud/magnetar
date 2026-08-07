@@ -324,9 +324,9 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         }
     }
 
-    /// Open the retained DAG watch and controller registration under one
-    /// provider-timed operation deadline. Missing controller authority reopens
-    /// the lookup without ever sending credentials to an unvalidated target.
+    /// Open the retained DAG watch and controller registration, then align
+    /// their authoritative epochs. Missing controller authority reuses the
+    /// authenticated direct bootstrap; invalid published authority fails.
     pub async fn open_control_plane(
         &self,
         topic: &str,
@@ -334,23 +334,12 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         consumer_name: &str,
     ) -> Result<(DagSession, ControllerSession), ClientError> {
         let operation = async {
-            loop {
-                let mut dag = self.open_dag_session(topic).await?;
-                match self
-                    .open_controller_session(&dag, subscription, consumer_name)
-                    .await
-                {
-                    Ok(mut controller) => {
-                        Self::align_control_plane(&mut dag, &mut controller).await?;
-                        return Ok((dag, controller));
-                    }
-                    Err(ClientError::ControllerUnavailable) => {
-                        dag.close();
-                        self.sleep(std::time::Duration::from_millis(1)).await?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            let mut dag = self.open_dag_session(topic).await?;
+            let mut controller = self
+                .open_controller_session(&dag, subscription, consumer_name)
+                .await?;
+            Self::align_control_plane(&mut dag, &mut controller).await?;
+            Ok((dag, controller))
         };
         let timeout = (self.sleep_provider)(self.operation_timeout);
         let mut operation = std::pin::pin!(operation);
