@@ -5714,12 +5714,13 @@ impl Connection {
             && let Some(slot) = self.consumers.get(&handle)
         {
             let mut consumer = slot.state.lock();
+            let consumer = &mut *consumer;
             if let Some(tracker) = consumer.unacked_tracker.as_mut() {
                 for id in &message_ids {
                     tracker.remove(id);
                 }
             }
-            if consumer.nack_tracker.is_some() {
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 for (id, data) in message_ids
                     .iter()
                     .copied()
@@ -5727,10 +5728,8 @@ impl Connection {
                 {
                     consumer.canonical_nack_ids.insert(id, data);
                 }
-                if let Some(tracker) = &mut consumer.nack_tracker {
-                    for &id in &message_ids {
-                        tracker.add(id, now);
-                    }
+                for &id in &message_ids {
+                    tracker.add(id, now);
                 }
                 return;
             }

@@ -3346,7 +3346,7 @@ impl M1FakeCluster {
             )
         })?;
         let member = MemberId::new(connection, close.consumer_id);
-        if !self.child_consumers.contains_key(&member) {
+        let Some(consumer) = self.child_consumers.get(&member) else {
             let endpoint = self.connection_endpoint(connection)?;
             if matches!(endpoint, Endpoint::Segment(_)) && self.closed_consumers.contains(&member) {
                 return self.queue_success(connection, close.request_id);
@@ -3355,9 +3355,9 @@ impl M1FakeCluster {
                 pb::base_command::Type::CloseConsumer,
                 format!("unknown child consumer {}", close.consumer_id),
             ));
-        }
-        let endpoint = self.require_child_route(member, pb::base_command::Type::CloseConsumer)?;
-        let fence = self.child_fence(member)?;
+        };
+        let endpoint = consumer.serving_endpoint;
+        let fence = child_fence(member, consumer);
         if self
             .child_consumers
             .get(&member)
@@ -3542,11 +3542,14 @@ impl M1FakeCluster {
     fn remove_child_consumer(&mut self, member: MemberId) {
         if let Some(consumer) = self.child_consumers.remove(&member) {
             self.closed_consumers.insert(member);
-            if let Some(subscription) = self.child_subscriptions.get_mut(&consumer.key)
-                && matches!(subscription.owner, Some(ChildOwner::Active(owner)) if owner == member)
-            {
-                subscription.owner = None;
-            }
+            let subscription = self
+                .child_subscriptions
+                .get_mut(&consumer.key)
+                .expect("an active child retains its subscription");
+            debug_assert!(
+                matches!(subscription.owner, Some(ChildOwner::Active(owner)) if owner == member)
+            );
+            subscription.owner = None;
         }
     }
 
@@ -4002,20 +4005,6 @@ impl M1FakeCluster {
             ));
         }
         Ok(())
-    }
-
-    fn require_child_route(
-        &self,
-        member: MemberId,
-        command: pb::base_command::Type,
-    ) -> Result<Endpoint, M1FakeError> {
-        let consumer = self.child_consumers.get(&member).ok_or_else(|| {
-            invalid(
-                command,
-                format!("unknown child consumer {}", member.consumer_id),
-            )
-        })?;
-        Ok(consumer.serving_endpoint)
     }
 
     fn segment_id_for_topic(&self, topic: &str) -> Option<u64> {
