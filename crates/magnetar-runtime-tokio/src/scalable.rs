@@ -407,9 +407,12 @@ impl SegmentSubscriber {
         let controller_url = match self.pool.bootstrap_scheme() {
             Scheme::Plain => dag.controller_broker_url.as_deref(),
             Scheme::Tls => dag.controller_broker_url_tls.as_deref(),
-        }
-        .ok_or(ClientError::ControllerUnavailable)?;
-        let shared = self.resolve_direct_url(controller_url).await?;
+        };
+        let shared = match controller_url {
+            Some(controller_url) => self.resolve_direct_url(controller_url).await?,
+            // M1 uses the configured service connection until leader election publishes a URL.
+            None => self.bootstrap.clone(),
+        };
         shared.fail_if_no_driver()?;
         let incarnation = self.bootstrap.allocate_controller_incarnation()?;
         let registration_topic = dag

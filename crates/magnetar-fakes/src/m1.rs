@@ -857,7 +857,7 @@ pub struct M1FakeCluster {
     completed_segments: BTreeSet<(GroupKey, u64)>,
     child_subscriptions: BTreeMap<ChildSubscriptionKey, ChildSubscriptionState>,
     child_consumers: BTreeMap<MemberId, ChildConsumer>,
-    closed_consumer_ids: BTreeSet<u64>,
+    closed_consumers: BTreeSet<MemberId>,
     ledgers: BTreeMap<u64, Vec<StoredMessage>>,
     terminal_segments: BTreeSet<u64>,
     transactions: BTreeMap<magnetar_proto::TxnId, FakeTransaction>,
@@ -964,7 +964,7 @@ impl M1FakeCluster {
             completed_segments: BTreeSet::new(),
             child_subscriptions: BTreeMap::new(),
             child_consumers: BTreeMap::new(),
-            closed_consumer_ids: BTreeSet::new(),
+            closed_consumers: BTreeSet::new(),
             ledgers: BTreeMap::new(),
             terminal_segments: BTreeSet::new(),
             transactions: BTreeMap::new(),
@@ -3336,9 +3336,7 @@ impl M1FakeCluster {
         let member = MemberId::new(connection, close.consumer_id);
         if !self.child_consumers.contains_key(&member) {
             let endpoint = self.connection_endpoint(connection)?;
-            if matches!(endpoint, Endpoint::Segment(_))
-                && self.closed_consumer_ids.contains(&close.consumer_id)
-            {
+            if matches!(endpoint, Endpoint::Segment(_)) && self.closed_consumers.contains(&member) {
                 return self.queue_success(connection, close.request_id);
             }
             return Err(invalid(
@@ -3498,8 +3496,7 @@ impl M1FakeCluster {
     }
 
     fn activate_child_consumer(&mut self, activation: ChildActivation) {
-        self.closed_consumer_ids
-            .remove(&activation.member.consumer_id);
+        self.closed_consumers.remove(&activation.member);
         let subscription = self
             .child_subscriptions
             .entry(activation.key.clone())
@@ -3532,7 +3529,7 @@ impl M1FakeCluster {
 
     fn remove_child_consumer(&mut self, member: MemberId) {
         if let Some(consumer) = self.child_consumers.remove(&member) {
-            self.closed_consumer_ids.insert(member.consumer_id);
+            self.closed_consumers.insert(member);
             if let Some(subscription) = self.child_subscriptions.get_mut(&consumer.key)
                 && matches!(subscription.owner, Some(ChildOwner::Active(owner)) if owner == member)
             {

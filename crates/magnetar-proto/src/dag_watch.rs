@@ -1433,6 +1433,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scalable_session_preserves_absent_controller_authority() {
+        let mut update = update(7, 1, vec![info(1, 0, 65_535, &[], &[])]);
+        let dag = update.dag.as_mut().expect("layout");
+        dag.controller_broker_url = None;
+        dag.controller_broker_url_tls = None;
+        let mut session = DagWatchSession::new(7);
+
+        session
+            .handle_update(&update)
+            .expect("layout applies")
+            .expect("initial layout yields a delta");
+
+        assert_eq!(session.controller_broker_url(), None);
+        assert_eq!(session.controller_broker_url_tls(), None);
+        assert_eq!(
+            session.snapshot()[0].broker_url.as_deref(),
+            Some("pulsar://seg1:6650")
+        );
+    }
+
     /// Layer (a) test: a non-advancing layout epoch is ignored — no delta, no
     /// state change, and crucially the session survives.
     ///

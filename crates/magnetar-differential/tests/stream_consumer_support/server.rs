@@ -25,6 +25,7 @@ struct Shared {
     held_output_commands: Mutex<BTreeSet<(Endpoint, i32)>>,
     held_messages: Mutex<BTreeMap<magnetar_fakes::m1::ConnectionId, VecDeque<Bytes>>>,
     retain_sealed_placements: AtomicBool,
+    advertise_controller_authority: bool,
 }
 
 /// Real-socket bridge around the sans-I/O M1 cluster.
@@ -39,6 +40,15 @@ impl M1SocketCluster {
     /// fake, so every advertised authority names the real listener selected by
     /// the runtime pools.
     pub(crate) async fn bind() -> Self {
+        Self::bind_with_controller_authority(true).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn bind_without_controller_authority() -> Self {
+        Self::bind_with_controller_authority(false).await
+    }
+
+    async fn bind_with_controller_authority(advertise_controller_authority: bool) -> Self {
         let controller = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind M1 controller");
@@ -74,6 +84,7 @@ impl M1SocketCluster {
             held_output_commands: Mutex::new(BTreeSet::new()),
             held_messages: Mutex::new(BTreeMap::new()),
             retain_sealed_placements: AtomicBool::new(false),
+            advertise_controller_authority,
         });
         let accept_tasks = vec![
             spawn_accept_loop(shared.clone(), Endpoint::Controller, controller),
@@ -330,7 +341,7 @@ fn prepare_output(
         .get(&connection)
         .is_some_and(|messages| !messages.is_empty());
     for bytes in output {
-        let bytes = retain_sealed_placements(shared, bytes)?;
+        let bytes = rewrite_layout(shared, bytes)?;
         let mut candidate = bytes.clone();
         let frame = decode_one(&mut candidate)
             .map_err(|error| format!("generated fake frame decode failed: {error}"))?;
@@ -352,8 +363,10 @@ fn prepare_output(
     Ok(ready)
 }
 
-fn retain_sealed_placements(shared: &Shared, bytes: Bytes) -> Result<Bytes, String> {
-    if !shared.retain_sealed_placements.load(Ordering::Acquire) {
+fn rewrite_layout(shared: &Shared, bytes: Bytes) -> Result<Bytes, String> {
+    if !shared.retain_sealed_placements.load(Ordering::Acquire)
+        && shared.advertise_controller_authority
+    {
         return Ok(bytes);
     }
     let mut candidate = bytes.clone();
@@ -369,6 +382,16 @@ fn retain_sealed_placements(shared: &Shared, bytes: Bytes) -> Result<Bytes, Stri
     let Some(dag) = update.dag.as_mut() else {
         return Ok(bytes);
     };
+    if !shared.advertise_controller_authority {
+        dag.controller_broker_url = None;
+        dag.controller_broker_url_tls = None;
+    }
+    if !shared.retain_sealed_placements.load(Ordering::Acquire) {
+        let mut encoded = BytesMut::new();
+        encode_command(&mut encoded, &command)
+            .map_err(|error| format!("controller-authority frame encode failed: {error}"))?;
+        return Ok(encoded.freeze());
+    }
     let fake = shared.fake.lock();
     for segment in &dag.segments {
         if segment.state != magnetar_proto::pb::SegmentState::Sealed as i32

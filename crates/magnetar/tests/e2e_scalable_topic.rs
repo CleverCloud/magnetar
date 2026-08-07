@@ -18,11 +18,11 @@
 //! 1. [`e2e_hardened_scalable_stream_consumer_contract`] — one transaction-enabled M1 broker proves
 //!    typed multi-segment delivery, live and restored-vector acknowledgement, broker-effective
 //!    vector seek replay, transaction commit/abort, single-member split progression in Strict mode,
-//!    explicit broker-managed cross-member behavior, reachable broker-authored authorities matching
+//!    explicit broker-managed cross-member behavior, direct-bootstrap controller fallback when M1
+//!    has not published a controller URL, reachable broker-authored segment authorities matching
 //!    the bootstrap transport, and the accepted logical-close membership residue. Because the
-//!    standalone broker controls child assignment and advertises the bootstrap endpoint, this does
-//!    not isolate client-side Strict gating or distinguish direct-authority selection from
-//!    fallback.
+//!    standalone broker controls child assignment, this does not isolate client-side Strict gating
+//!    or prove same-cluster multi-broker routing.
 //! 2. [`e2e_scalable_topic_info_cli_round_trip`] — the `magnetarctl topic-info` view of the topic
 //!    matches the layout the client library resolves, so the CLI and the driver cannot drift.
 //! 3. [`e2e_scalable_topic_drops_on_broker_split`] — an admin-triggered segment split bumps the
@@ -249,10 +249,10 @@ async fn start_broker(
 
 /// Start the positive M1 fixture with direct routing and transactions enabled.
 ///
-/// M1 writes its advertised broker authority into both the controller and every
-/// segment placement. Reserve an ephemeral loopback listener before container
-/// startup and proxy that advertised port to Docker's random host mapping, so
-/// concurrent test runs cannot race for one global host port.
+/// M1 writes its advertised broker authority into every segment placement, but
+/// may omit the controller URL until leader election publishes one. Reserve an ephemeral loopback
+/// listener before container startup and proxy that advertised port to Docker's random host
+/// mapping, so concurrent test runs cannot race for one global host port.
 async fn start_hardened_broker() -> TestResult<(String, PulsarContainer, HostPortProxy)> {
     init_tracing();
     let image_tag = scalable_image_tag();
@@ -717,7 +717,7 @@ async fn force_delete_scalable_topics(
     }
 }
 
-async fn verify_direct_topology(
+async fn verify_m1_topology(
     client: &PulsarClient,
     topic: &str,
     service_url: &str,
@@ -730,9 +730,13 @@ async fn verify_direct_topology(
                 format!("M1 resolved `{topic}` as {:?}", lookup.resolved_topic_name).into(),
             );
         }
-        if lookup.controller_broker_url.as_deref() != Some(service_url) {
+        if lookup
+            .controller_broker_url
+            .as_deref()
+            .is_some_and(|controller_url| controller_url != service_url)
+        {
             return Err(format!(
-                "controller authority must be the reachable broker-authored direct URL \
+                "published controller authority must be the reachable broker-authored direct URL \
                  `{service_url}`, got {:?}",
                 lookup.controller_broker_url
             )
@@ -772,7 +776,7 @@ async fn exercise_delivery_and_close_residue(
     let subscription = format!("e2e-delivery-{suffix}");
     create_scalable_topic(container, &topic, 4).await?;
     created_topics.push(topic.clone());
-    verify_direct_topology(client, &topic, service_url, 4).await?;
+    verify_m1_topology(client, &topic, service_url, 4).await?;
 
     let consumer = subscribe_byte_stream(
         client,
@@ -1384,8 +1388,9 @@ async fn exercise_broker_managed_split(
 ///
 /// The phases are sequential and UUID-isolated so this adds no concurrent broker
 /// beyond the lightweight lookup test it replaces. Standalone cannot prove a
-/// same-cluster multi-broker route or distinguish broker-authored authority
-/// selection from bootstrap fallback because both name the same endpoint.
+/// same-cluster multi-broker route. M1 may omit its controller URL before
+/// leader election, in which case successful subscription proves reuse of the
+/// already-authenticated direct bootstrap connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
     let (service_url, container, _proxy) = start_hardened_broker().await?;

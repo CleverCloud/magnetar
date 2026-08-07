@@ -51,8 +51,9 @@ Resynchronization marks reconnect intent before child teardown, suppresses expec
 Because M1 cannot unregister a scalable member logically, a broker rejection encountered during that replacement registration is retried on provider time until physical connection replacement releases the old member or the aggregate closes.
 
 Controller and segment authorities are taken from broker-authored direct URLs matching the bootstrap transport: plaintext uses plaintext authority and TLS uses TLS authority.
-Every authority passes the existing redirect allow-list before credentials are reused.
-Missing authority, transport mismatch, rejected authority, and proxy-any-broker controller registration return typed routing failures rather than falling back to the bootstrap connection or downgrading TLS.
+Every published authority passes the existing redirect allow-list before credentials are reused.
+Pulsar 5.0.0-M1 can omit the controller URL before leader election publishes one; only in that case, and only for a direct bootstrap, controller registration reuses the already-authenticated configured service connection, matching the official V5 client.
+Missing segment authority, an explicit transport mismatch or rejected authority, and proxy-any-broker controller registration still return typed routing failures rather than guessing another target or downgrading TLS.
 
 ### Complete DAG and ordering contract
 
@@ -162,9 +163,9 @@ Focused code, fake, proto, runtime, façade, and differential suites passed for 
 A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 
 The real `e2e_hardened_scalable_stream_consumer_contract` target compiles and is discovered when the default-off `scalable-topics` product feature is enabled; it has no `#[ignore]` or separate e2e feature.
-When Docker is available it must run against `apachepulsar/pulsar:5.0.0-M1` and prove the public `Arc<BytesSchema>` builder, multi-segment typed delivery, live and restored vector acknowledgement, broker-effective inclusive vector-seek replay, transaction commit and abort, single-member split progression in Strict mode, explicit BrokerManaged cross-member behavior, reachable broker-authored authority matching the bootstrap transport, and logical-close membership residue.
+When Docker is available it must run against `apachepulsar/pulsar:5.0.0-M1` and prove the public `Arc<BytesSchema>` builder, multi-segment typed delivery, live and restored vector acknowledgement, broker-effective inclusive vector-seek replay, transaction commit and abort, single-member split progression in Strict mode, explicit BrokerManaged cross-member behavior, direct-bootstrap controller fallback when M1 omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and logical-close membership residue.
 The accepting host had no Docker, so this branch did not execute that real-broker target locally; existing CI policy runs e2e when Docker is available.
-Because the standalone fixture advertises the same reachable endpoint used for bootstrap, it cannot distinguish broker-authority selection from bootstrap fallback and cannot prove same-cluster multi-broker routing.
+Because the standalone fixture uses one reachable endpoint for bootstrap and controller registration, it cannot prove same-cluster multi-broker controller routing.
 Because the M1 broker controls when child segments enter the assignment, the real-broker Strict phase also does not isolate Magnetar's client-side ancestry gate; the fake-backed differential suites provide that evidence.
 
 The sim-coverage report and hard-gated prefix sets now contain exactly these eight packages:

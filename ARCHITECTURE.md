@@ -1377,7 +1377,8 @@ The drain is bounded in memory and unbounded in time; an application that never 
 A gained segment remains `PendingOwnership` while another `Exclusive` owner is live, with bounded `ConsumerBusy` attempts repeated on provider time while the assignment remains current.
 
 Controller and segment authority comes from broker-authored direct URLs matching the bootstrap transport.
-Plaintext and TLS stay distinct, every target passes the redirect allow-list, and missing/mismatched authority or proxy-any-broker registration fails closed instead of falling back or downgrading.
+Plaintext and TLS stay distinct, and every published target passes the redirect allow-list.
+Before M1 leader election publishes a controller URL, registration reuses only the already-authenticated direct bootstrap connection; missing segment authority, a mismatched or rejected published target, and proxy-any-broker registration still fail closed instead of guessing or downgrading.
 
 Explicit close through any clone is globally definitive for local routes, tasks, and ordinary children; final drop performs synchronous best-effort fencing without blocking or spawning.
 M1 has no scalable-consumer unregister command, so close cannot promise broker membership removal while a pooled physical controller connection remains open.

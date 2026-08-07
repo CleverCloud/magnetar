@@ -62,6 +62,7 @@ struct RuntimeFailureTrace {
     controller_timed_out: bool,
     controller_pending_cancelled: bool,
     segment_timed_out: bool,
+    missing_controller_authority_reused_bootstrap: bool,
     proxy_target_rejected: bool,
     close_failure_recovered: bool,
     plain_driver_closed: bool,
@@ -779,6 +780,36 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
     let controller_pending_cancelled = true;
     controller_cluster.assert_healthy();
 
+    let fallback_cluster = M1SocketCluster::bind_without_controller_authority().await;
+    let fallback_client = magnetar_runtime_tokio::Client::connect(
+        fallback_cluster.controller_url(),
+        supervised_config(),
+    )
+    .await
+    .expect("connect Tokio controller-fallback client");
+    let fallback_subscriber = fallback_client
+        .segment_subscriber()
+        .expect("Tokio controller-fallback subscriber");
+    let fallback_dag = fallback_subscriber
+        .open_dag_session(TOPIC)
+        .await
+        .expect("open Tokio controller-fallback DAG");
+    let fallback_controller = fallback_subscriber
+        .open_controller_session(&fallback_dag, "fallback-sub", "fallback-member")
+        .await
+        .expect("reuse Tokio direct bootstrap for controller registration");
+    let missing_controller_authority_reused_bootstrap =
+        fallback_cluster.inspect(|fake| fake.resource_counts().connections == 1);
+    fallback_controller.close();
+    fallback_dag.close();
+    fallback_client.close().await;
+    fallback_cluster
+        .wait_for("Tokio controller-fallback cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    fallback_cluster.assert_healthy();
+
     let proxy_broker = ScriptedBroker::bind()
         .await
         .expect("bind Tokio proxy broker");
@@ -948,6 +979,7 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
         controller_timed_out,
         controller_pending_cancelled,
         segment_timed_out,
+        missing_controller_authority_reused_bootstrap,
         proxy_target_rejected,
         close_failure_recovered,
         plain_driver_closed,
@@ -1129,6 +1161,44 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
         .await;
     let controller_pending_cancelled = true;
     controller_cluster.assert_healthy();
+
+    let fallback_cluster = M1SocketCluster::bind_without_controller_authority().await;
+    let fallback_address = fallback_cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("plaintext controller-fallback URL");
+    let engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let fallback_client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &engine,
+        fallback_address,
+        supervised_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect Moonpool controller-fallback client");
+    let fallback_subscriber = fallback_client
+        .segment_subscriber()
+        .expect("Moonpool controller-fallback subscriber");
+    let fallback_dag = fallback_subscriber
+        .open_dag_session(TOPIC)
+        .await
+        .expect("open Moonpool controller-fallback DAG");
+    let fallback_controller = fallback_subscriber
+        .open_controller_session(&fallback_dag, "fallback-sub", "fallback-member")
+        .await
+        .expect("reuse Moonpool direct bootstrap for controller registration");
+    let missing_controller_authority_reused_bootstrap =
+        fallback_cluster.inspect(|fake| fake.resource_counts().connections == 1);
+    fallback_controller.close();
+    fallback_dag.close();
+    fallback_client.close().await;
+    fallback_cluster
+        .wait_for("Moonpool controller-fallback cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    fallback_cluster.assert_healthy();
 
     let proxy_broker = ScriptedBroker::bind()
         .await
@@ -1319,6 +1389,7 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
         controller_timed_out,
         controller_pending_cancelled,
         segment_timed_out,
+        missing_controller_authority_reused_bootstrap,
         proxy_target_rejected,
         close_failure_recovered,
         plain_driver_closed,
@@ -1864,6 +1935,7 @@ async fn owned_scalable_runtime_failures_are_bounded_and_equivalent() {
     assert!(tokio_trace.controller_timed_out);
     assert!(tokio_trace.controller_pending_cancelled);
     assert!(tokio_trace.segment_timed_out);
+    assert!(tokio_trace.missing_controller_authority_reused_bootstrap);
     assert!(tokio_trace.proxy_target_rejected);
     assert!(tokio_trace.close_failure_recovered);
     assert!(tokio_trace.plain_driver_closed);
