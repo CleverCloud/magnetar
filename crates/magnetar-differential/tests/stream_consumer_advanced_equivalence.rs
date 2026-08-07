@@ -141,6 +141,8 @@ struct ControlPlaneTrace {
     lower_epoch_fenced: bool,
     alignment_failure_reported: bool,
     alignment_failure_applied_epoch_three: bool,
+    alignment_retry_reported: bool,
+    alignment_retry_baseline: (u64, Vec<u64>),
     after_close: ResourceCounts,
 }
 
@@ -3460,6 +3462,47 @@ where
     assert!(alignment_failure_reported);
     assert!(!alignment_failure_applied_epoch_three);
 
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::ServiceNotReady,
+                    "retry controller registration",
+                )),
+            )?;
+            fake.disconnect_connection(pending_member.connection)
+        })
+        .expect("release failed alignment authority and reject one retry");
+    let mut alignment_retry_reported = false;
+    let alignment_retry_baseline = loop {
+        match next_event(&replacement_consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason } => {
+                alignment_retry_reported |= reason.contains("retry controller registration");
+            }
+            StreamConsumerEvent::AssignmentApplied {
+                layout_epoch,
+                sources,
+            } if alignment_retry_reported => {
+                break (
+                    layout_epoch,
+                    sources
+                        .iter()
+                        .map(|source| source.segment_id().0)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected alignment-retry event: {unexpected:?}"),
+        }
+    };
+    assert!(alignment_retry_reported);
+    assert_eq!(alignment_retry_baseline, (3, vec![1, 2]));
+
     replacement_consumer
         .close()
         .await
@@ -3467,7 +3510,10 @@ where
     cluster
         .wait_for("control-plane cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0 && counts.permits == 0
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
         })
         .await;
     ControlPlaneTrace {
@@ -3480,6 +3526,8 @@ where
         lower_epoch_fenced,
         alignment_failure_reported,
         alignment_failure_applied_epoch_three,
+        alignment_retry_reported,
+        alignment_retry_baseline,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
     }
 }
