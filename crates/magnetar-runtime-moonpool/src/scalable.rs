@@ -4477,6 +4477,19 @@ mod tests {
             Some(StreamConsumerEvent::ResyncRequired { reason })
                 if reason.contains("delivery restoration failed")
         ));
+        let event_count = state.events.len();
+        drop(state);
+
+        inner.state.lock().close_state = AggregateCloseState::Closing;
+        inner.request_resync("ignored after close".to_owned());
+
+        let state = inner.state.lock();
+        assert_eq!(state.events.len(), event_count);
+        assert_eq!(
+            state.model.phase(),
+            magnetar_proto::AggregatePhase::ResyncRequired
+        );
+        assert!(state.reconnect_requested);
     }
 
     #[tokio::test]
