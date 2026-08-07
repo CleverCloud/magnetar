@@ -125,6 +125,7 @@ struct CancellationTrace {
     transaction_poisoned: String,
     transaction_aborted: bool,
     seek_cancellation_resync: bool,
+    stale_seek_completion_fenced: bool,
     after_close: ResourceCounts,
 }
 
@@ -2847,12 +2848,136 @@ where
         })
         .await;
 
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"stale-seek-one")))
+        .expect("enqueue first current-generation seek target");
+    cluster
+        .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"stale-seek-two")))
+        .expect("enqueue second current-generation seek target");
+    cluster
+        .wait_for("current-generation seek targets", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
+    let mut stale_targets = vec![receive(&consumer).await, receive(&consumer).await];
+    stale_targets.sort_by_key(|message| message.source().segment_id().0);
+    let stale_positions = position_from_messages(1, &stale_targets);
+    consumer
+        .acknowledge_batch(&stale_targets)
+        .await
+        .expect("acknowledge current-generation seek targets");
+    cluster
+        .wait_for("current-generation seek target acknowledgements", |fake| {
+            fake.resource_counts().unacked_messages == 0
+        })
+        .await;
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+                fake.script_next(endpoint, OperationKind::Seek, ScriptedBehavior::Delay)?;
+                fake.script_next(
+                    endpoint,
+                    OperationKind::SegmentOpen,
+                    ScriptedBehavior::Delay,
+                )?;
+            }
+            Ok(())
+        })
+        .expect("delay stale seek completions and replacement child opens");
+    let mut stale_seek = Box::pin(consumer.seek_positions(&stale_positions));
+    tokio::select! {
+        biased;
+        result = &mut stale_seek => panic!("stale-completion seek completed before fencing: {result:?}"),
+        () = cluster.wait_for("stale-completion vector SEEK commands", |fake| {
+            fake.pending_operations().iter().filter(|pending| {
+                pending.kind == OperationKind::Seek
+            }).count() == 2
+        }) => {}
+    }
+    let stale_pending_seeks = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .filter(|pending| pending.kind == OperationKind::Seek)
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>()
+    });
+    for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+        cluster.hold_command(endpoint, magnetar::proto::pb::base_command::Type::Success);
+    }
+    for pending_seek in stale_pending_seeks {
+        cluster
+            .update(|fake| fake.complete_pending(pending_seek, PendingCompletion::Succeed))
+            .expect("queue successful stale seek response");
+    }
+    assert_eq!(
+        cluster
+            .update(|fake| fake.disconnect_endpoint(Endpoint::Controller))
+            .expect("disconnect stale-seek controller incarnation"),
+        1
+    );
+    loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { .. } => break,
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected stale-seek fencing event: {unexpected:?}"),
+        }
+    }
+    for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+        cluster.release_command(endpoint, magnetar::proto::pb::base_command::Type::Success);
+    }
+    assert!(
+        stale_seek.await.is_err(),
+        "successful old-generation SEEK completion must fail after controller fencing"
+    );
+    let stale_seek_completion_fenced = cluster.inspect(|fake| {
+        !fake
+            .routes()
+            .iter()
+            .any(|route| route.command == magnetar::proto::pb::base_command::Type::Flow)
+    });
+    assert!(
+        stale_seek_completion_fenced,
+        "successful stale SEEK completions must not revive old-generation FLOW"
+    );
+    cluster
+        .wait_for("delayed replacement child opens", |fake| {
+            fake.pending_operations()
+                .iter()
+                .filter(|pending| pending.kind == OperationKind::SegmentOpen)
+                .count()
+                == 2
+        })
+        .await;
+    let replacement_opens = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .filter(|pending| pending.kind == OperationKind::SegmentOpen)
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>()
+    });
+    for pending_open in replacement_opens {
+        cluster
+            .update(|fake| fake.complete_pending(pending_open, PendingCompletion::Succeed))
+            .expect("complete replacement child open");
+    }
+    cluster
+        .wait_for("stale-seek replacement children", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.pending_operations == 0
+        })
+        .await;
+
     CancellationTrace {
         ordinary_ack_retried,
         transaction_registration_cancelled,
         transaction_poisoned,
         transaction_aborted,
         seek_cancellation_resync,
+        stale_seek_completion_fenced,
         after_close: close_and_count(consumer, cluster).await,
     }
 }
