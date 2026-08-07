@@ -222,6 +222,7 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
             2
         }
     });
+    let budget_before_fresh = direct_aggregate.status().receiver_budget_used();
     cluster
         .update(|fake| fake.enqueue_message(fresh_segment, bytes::Bytes::from_static(b"fresh")))
         .expect("enqueue fresh Tokio delivery before restoration");
@@ -230,6 +231,13 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
             fake.resource_counts().unacked_messages == 2
         })
         .await;
+    tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        while direct_aggregate.status().receiver_budget_used() <= budget_before_fresh {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Tokio aggregate retained fresh delivery before restoration");
     direct_aggregate
         .restore_deliveries(vec![restored])
         .expect("restore Tokio delivery");
@@ -354,14 +362,21 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         Err(magnetar_runtime_tokio::ClientError::ScalableAssignmentRejected { .. })
     );
     dag.close();
-    for _ in 0..=70 {
+    for _ in 0..=256 {
         subscriber
             .open_dag_session(TOPIC)
             .await
             .expect("open Tokio route-retirement session")
             .close();
     }
-    let route_tombstones_bounded = true;
+    cluster
+        .wait_for("Tokio route-retirement closes", |fake| {
+            fake.resource_counts().layout_sessions == 0
+        })
+        .await;
+    let route_tombstones_bounded =
+        cluster.inspect(|fake| fake.resource_counts().layout_sessions == 0);
+    assert!(route_tombstones_bounded);
     client.close().await;
     cluster
         .wait_for("Tokio runtime-surface cleanup", |fake| {
@@ -498,6 +513,7 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
             2
         }
     });
+    let budget_before_fresh = direct_aggregate.status().receiver_budget_used();
     cluster
         .update(|fake| fake.enqueue_message(fresh_segment, bytes::Bytes::from_static(b"fresh")))
         .expect("enqueue fresh Moonpool delivery before restoration");
@@ -506,6 +522,13 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
             fake.resource_counts().unacked_messages == 2
         })
         .await;
+    tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        while direct_aggregate.status().receiver_budget_used() <= budget_before_fresh {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Moonpool aggregate retained fresh delivery before restoration");
     direct_aggregate
         .restore_deliveries(vec![restored])
         .expect("restore Moonpool delivery");
@@ -633,14 +656,21 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         Err(magnetar_runtime_moonpool::ClientError::ScalableAssignmentRejected { .. })
     );
     dag.close();
-    for _ in 0..=70 {
+    for _ in 0..=256 {
         subscriber
             .open_dag_session(TOPIC)
             .await
             .expect("open Moonpool route-retirement session")
             .close();
     }
-    let route_tombstones_bounded = true;
+    cluster
+        .wait_for("Moonpool route-retirement closes", |fake| {
+            fake.resource_counts().layout_sessions == 0
+        })
+        .await;
+    let route_tombstones_bounded =
+        cluster.inspect(|fake| fake.resource_counts().layout_sessions == 0);
+    assert!(route_tombstones_bounded);
     client.close().await;
     cluster
         .wait_for("Moonpool runtime-surface cleanup", |fake| {
