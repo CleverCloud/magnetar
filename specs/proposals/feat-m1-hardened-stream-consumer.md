@@ -337,6 +337,9 @@ A gained segment stays in assignment-owned `PendingOwnership` while another clie
 Each ordinary lookup/subscribe attempt remains bounded by the normal operation deadline, but `ConsumerBusy` schedules another provider-timed attempt beyond any one operation deadline or ordinary retry count while the assignment remains current.
 Assignment removal, controller-incarnation replacement, aggregate close, or a permanent error cancels and fences that loop.
 Within one aggregate, replacement waits for the old generation's confirmation-bearing close; across clients, the new owner can observe only `ConsumerBusy` and eventual successful attach.
+An assigned active parent becoming sealed without replacement placement is different from ownership loss: retain its connected child and generation until terminal plus retained work establish completion, because M1 cannot route a replacement open.
+Every other routeable descriptor change still follows the confirmation-bearing replacement sequence.
+Losing the retained connection before completion follows ordinary child-failure resynchronization; no sealed authority is invented.
 
 ### D16 - Keep the Java-style pooled controller lifecycle honest
 

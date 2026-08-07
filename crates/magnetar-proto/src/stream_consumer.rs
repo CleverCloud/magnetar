@@ -2336,8 +2336,11 @@ impl StreamConsumerModel {
     }
 
     /// Atomically replace the DAG and assignment for the current controller
-    /// incarnation. Children whose descriptor or source changed drain and
-    /// reopen through the existing confirmation-bearing close fence.
+    /// incarnation. Children whose active descriptor or source changed drain
+    /// and reopen through the existing confirmation-bearing close fence. A
+    /// child whose descriptor became sealed without replacement authority
+    /// drains in place: M1 retains sealed assignments while deliberately
+    /// omitting their replacement placement.
     ///
     /// # Errors
     ///
@@ -2375,7 +2378,17 @@ impl StreamConsumerModel {
             .children
             .keys()
             .copied()
-            .filter(|segment_id| self.dag.segment(*segment_id) != dag.segment(*segment_id))
+            .filter(|segment_id| {
+                let previous = self.dag.segment(*segment_id);
+                let current = dag.segment(*segment_id);
+                let drains_in_place = previous.zip(current).is_some_and(|(previous, current)| {
+                    previous.state == SegmentState::Active
+                        && current.state == SegmentState::Sealed
+                        && current.broker_url.is_none()
+                        && current.broker_url_tls.is_none()
+                });
+                previous != current && !drains_in_place
+            })
             .collect();
         let mut staged = self.clone();
         staged.dag = dag;
@@ -4973,6 +4986,78 @@ mod tests {
         split_dag_at(1, "pulsar://broker-1:6650")
     }
 
+    fn root_dag_at(epoch: u64) -> DagSnapshot {
+        DagSnapshot::try_from_pb(&pb::ScalableTopicDag {
+            epoch,
+            segments: vec![info(
+                0,
+                0,
+                65_535,
+                pb::SegmentState::Active,
+                &[],
+                &[],
+                0,
+                None,
+            )],
+            segment_brokers: vec![pb::SegmentBrokerAddress {
+                segment_id: 0,
+                broker_url: "pulsar://broker-0:6650".to_owned(),
+                broker_url_tls: None,
+            }],
+            controller_broker_url: None,
+            controller_broker_url_tls: None,
+        })
+        .expect("valid root DAG")
+    }
+
+    fn exact_split_dag_at(epoch: u64) -> DagSnapshot {
+        let mut dag = pb::ScalableTopicDag {
+            epoch,
+            segments: vec![
+                info(
+                    0,
+                    0,
+                    65_535,
+                    pb::SegmentState::Sealed,
+                    &[],
+                    &[1, 2],
+                    0,
+                    Some(epoch),
+                ),
+                info(
+                    1,
+                    0,
+                    32_767,
+                    pb::SegmentState::Active,
+                    &[0],
+                    &[],
+                    epoch,
+                    None,
+                ),
+                info(
+                    2,
+                    32_768,
+                    65_535,
+                    pb::SegmentState::Active,
+                    &[0],
+                    &[],
+                    epoch,
+                    None,
+                ),
+            ],
+            segment_brokers: Vec::new(),
+            controller_broker_url: None,
+            controller_broker_url_tls: None,
+        };
+        dag.segment_brokers
+            .extend((1..=2).map(|id| pb::SegmentBrokerAddress {
+                segment_id: id,
+                broker_url: format!("pulsar://broker-{id}:6650"),
+                broker_url_tls: None,
+            }));
+        DagSnapshot::try_from_pb(&dag).expect("valid exact M1 split DAG")
+    }
+
     fn assignment(epoch: u64, ids: &[u64]) -> ConsumerAssignment {
         let segments = ids
             .iter()
@@ -5141,6 +5226,91 @@ mod tests {
             StreamConsumerAction::GrantFlow { source, .. }
                 if source.segment_id() == SegmentId(1)
         )));
+    }
+
+    #[test]
+    fn sealed_assigned_parent_drains_in_place_without_reopen() {
+        let mut model = StreamConsumerModel::new(
+            "topic://t/n/x".to_owned(),
+            ConsumerInstanceId(10),
+            ControllerIncarnation(3),
+            OrderingMode::Strict,
+            root_dag_at(1),
+            ReceiverBudget::bytes(
+                MAX_FRAME_SIZE * 3
+                    + RECEIVER_BUDGET_AUTHORITY_HEADROOM
+                    + CONTROL_PLANE_CLEANUP_RESERVE,
+            )
+            .expect("budget"),
+        )
+        .expect("root model");
+        let parent_open = model
+            .apply_assignment(assignment(1, &[0]))
+            .expect("parent assignment");
+        let parent_generation = opened_generation(&parent_open[0]);
+        let parent_flow = model
+            .child_opened(SegmentId(0), parent_generation)
+            .expect("parent open");
+        let (parent, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(0),
+            parent_generation,
+            flow_reservation(&parent_flow),
+            1,
+        );
+
+        let split = model
+            .apply_control_plane(exact_split_dag_at(2), assignment(2, &[0]))
+            .expect("parent-only split assignment");
+        assert!(split.is_empty(), "the connected parent drains in place");
+        assert_eq!(model.children[&SegmentId(0)].generation, parent_generation);
+        assert!(!model.pending_ownership.contains_key(&SegmentId(0)));
+
+        model
+            .observe_terminal(SegmentId(0), parent_generation)
+            .expect("parent terminal");
+        let children = model
+            .apply_assignment(assignment(2, &[0, 1, 2]))
+            .expect("post-drain descendants");
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|action| matches!(
+            action,
+            StreamConsumerAction::OpenChild { source, .. }
+                if source.segment_id() != SegmentId(0)
+        )));
+        let child_generations = children.iter().map(opened_generation).collect::<Vec<_>>();
+        for (segment_id, generation) in [SegmentId(1), SegmentId(2)]
+            .into_iter()
+            .zip(child_generations)
+        {
+            assert!(
+                model
+                    .child_opened(segment_id, generation)
+                    .expect("descendant open")
+                    .is_empty(),
+                "outstanding parent delivery keeps descendants blocked"
+            );
+        }
+
+        let acknowledgement = model
+            .admit_individual_acknowledgement(&parent)
+            .expect("parent acknowledgement");
+        let confirmed = BTreeSet::from([parent.stream_message_id().source().clone()]);
+        assert!(
+            model
+                .settle_acknowledgement(&acknowledgement.authority, &confirmed)
+                .expect("parent acknowledgement settles")
+                .is_empty()
+        );
+        let flow = model
+            .complete_segment(SegmentId(0), parent_generation)
+            .expect("parent completion retains its generation");
+        assert_eq!(
+            flow.iter()
+                .filter(|action| matches!(action, StreamConsumerAction::GrantFlow { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

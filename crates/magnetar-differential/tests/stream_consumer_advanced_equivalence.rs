@@ -57,7 +57,10 @@ struct LocalAncestryTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SealedPlacementTrace {
-    failure: String,
+    descendants_blocked_before_ack: bool,
+    parent_subscribes: usize,
+    descendant_subscribes: Vec<u64>,
+    descendant_flow_commands: Vec<u64>,
     after_close: ResourceCounts,
 }
 
@@ -948,12 +951,21 @@ where
         })
         .await;
     wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"sealed-parent")))
+        .expect("enqueue exact-M1 parent delivery");
+    cluster
+        .wait_for("exact-M1 parent delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let parent = receive(&consumer).await;
+    assert_eq!(parent.source().segment_id().0, 1);
     let member = cluster
         .inspect(|fake| fake.member("sealed-placement-sub", "sealed-placement-member"))
         .expect("exact-M1 member observable");
     cluster
         .update(|fake| {
-            fake.clear_routes();
             fake.advance_layout(2, split_layout())?;
             fake.publish_early_descendant_assignment_plan(
                 2,
@@ -963,25 +975,62 @@ where
         })
         .expect("publish exact-M1 sealed assignment");
     let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
-    let failure = loop {
-        match next_event(&consumer).await {
-            StreamConsumerEvent::ResyncRequired { reason }
-                if reason.contains("controller authority is unavailable") =>
-            {
-                break "missing-sealed-placement".to_owned();
-            }
-            StreamConsumerEvent::AssignmentApplied { .. }
-            | StreamConsumerEvent::SegmentPhaseChanged { .. }
-            | StreamConsumerEvent::OrderingUnprovable { .. } => {}
-            unexpected => panic!("unexpected exact-M1 assignment event: {unexpected:?}"),
-        }
-    };
-    cluster.inspect(|fake| {
-        assert_eq!(flow_command_count(fake, 3), 0);
-        assert_eq!(flow_command_count(fake, 4), 0);
-    });
+    cluster
+        .wait_for("exact-M1 descendants attach without FLOW", |fake| {
+            let subscribed =
+                command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+            subscribed.contains(&3) && subscribed.contains(&4)
+        })
+        .await;
+    let descendants_blocked_before_ack = cluster
+        .inspect(|fake| flow_command_count(fake, 3) == 0 && flow_command_count(fake, 4) == 0);
+    assert!(descendants_blocked_before_ack);
+    consumer
+        .acknowledge(&parent)
+        .await
+        .expect("acknowledge exact-M1 parent");
+    drop(parent);
+    cluster
+        .wait_for("exact-M1 parent completion", |fake| {
+            fake.segment_is_complete("sealed-placement-sub", 1)
+        })
+        .await;
+    wait_for_flowing_sources(&consumer, &[3, 4]).await;
+    cluster
+        .wait_for("exact-M1 descendants receive FLOW", |fake| {
+            flow_command_count(fake, 3) > 0 && flow_command_count(fake, 4) > 0
+        })
+        .await;
+    let (parent_subscribes, descendant_subscribes, descendant_flow_commands) =
+        cluster.inspect(|fake| {
+            let subscribed =
+                command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+            let parent_subscribes = subscribed
+                .iter()
+                .filter(|segment_id| **segment_id == 1)
+                .count();
+            let descendant_subscribes = subscribed
+                .into_iter()
+                .filter(|segment_id| matches!(segment_id, 3 | 4))
+                .collect::<Vec<_>>();
+            let descendant_flow_commands = [3, 4]
+                .into_iter()
+                .filter(|segment_id| flow_command_count(fake, *segment_id) > 0)
+                .collect::<Vec<_>>();
+            (
+                parent_subscribes,
+                descendant_subscribes,
+                descendant_flow_commands,
+            )
+        });
+    assert_eq!(parent_subscribes, 1, "the sealed parent never reopens");
+    assert_eq!(descendant_subscribes, vec![3, 4]);
+    assert_eq!(descendant_flow_commands, vec![3, 4]);
     SealedPlacementTrace {
-        failure,
+        descendants_blocked_before_ack,
+        parent_subscribes,
+        descendant_subscribes,
+        descendant_flow_commands,
         after_close: close_and_count(consumer, cluster).await,
     }
 }
@@ -5297,7 +5346,7 @@ async fn strict_local_ancestry_waits_for_every_parent_and_merge_barrier() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exact_m1_sealed_assignment_limitation_is_explicit() {
+async fn exact_m1_sealed_assignment_drains_without_parent_reopen() {
     let _serial = advanced_socket_test_guard();
     let tokio_trace = run_tokio_exact_m1_sealed_placement().await;
     let moonpool_trace = run_moonpool_exact_m1_sealed_placement().await;
