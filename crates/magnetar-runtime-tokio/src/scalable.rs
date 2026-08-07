@@ -311,9 +311,9 @@ impl SegmentSubscriber {
         }
     }
 
-    /// Open the retained DAG watch and controller registration under one
-    /// operation deadline. A layout with no routeable controller is retried by
-    /// reopening the lookup; credentials are never sent to an unknown target.
+    /// Open the retained DAG watch and controller registration, then align
+    /// their authoritative epochs. Missing controller authority reuses the
+    /// authenticated direct bootstrap; invalid published authority fails.
     pub async fn open_control_plane(
         &self,
         topic: &str,
@@ -321,23 +321,12 @@ impl SegmentSubscriber {
         consumer_name: &str,
     ) -> Result<(DagSession, ControllerSession), ClientError> {
         let operation = async {
-            loop {
-                let mut dag = self.open_dag_session(topic).await?;
-                match self
-                    .open_controller_session(&dag, subscription, consumer_name)
-                    .await
-                {
-                    Ok(mut controller) => {
-                        Self::align_control_plane(&mut dag, &mut controller).await?;
-                        return Ok((dag, controller));
-                    }
-                    Err(ClientError::ControllerUnavailable) => {
-                        dag.close();
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            let mut dag = self.open_dag_session(topic).await?;
+            let mut controller = self
+                .open_controller_session(&dag, subscription, consumer_name)
+                .await?;
+            Self::align_control_plane(&mut dag, &mut controller).await?;
+            Ok((dag, controller))
         };
         match tokio::time::timeout(self.operation_timeout, operation).await {
             Ok(result) => result,
