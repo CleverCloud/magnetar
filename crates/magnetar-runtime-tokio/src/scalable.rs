@@ -378,7 +378,7 @@ impl SegmentSubscriber {
         let registration_topic = dag
             .resolved_topic_name
             .as_deref()
-            .unwrap_or_else(|| dag.requested_topic());
+            .unwrap_or(&dag.requested_topic);
         if previous.registration_topic != registration_topic {
             return Err(ClientError::ControllerRoutingUnsupported {
                 reason: "replacement controller changed the scalable registration topic",
@@ -418,7 +418,7 @@ impl SegmentSubscriber {
         let registration_topic = dag
             .resolved_topic_name
             .as_deref()
-            .unwrap_or_else(|| dag.requested_topic())
+            .unwrap_or(&dag.requested_topic)
             .to_owned();
         let route = {
             let mut conn = shared.inner.lock();
@@ -3199,10 +3199,6 @@ impl DagSession {
     /// Close the watch locally and stage the protocol close command.
     pub fn close(mut self) {
         self.close_inner();
-    }
-
-    fn requested_topic(&self) -> &str {
-        &self.requested_topic
     }
 
     fn close_inner(&mut self) {
