@@ -888,31 +888,14 @@ fn message_id_to_json_emits_full_camel_case_shape() {
     id.batch_size = 5;
 
     let json = cli::message_id_to_json(&id);
-    assert_eq!(json["ledgerId"], 7);
-    assert_eq!(json["entryId"], 42);
-    assert_eq!(json["partition"], 3);
-    assert_eq!(json["batchIndex"], 1);
-    assert_eq!(json["batchSize"], 5);
-}
-
-// Under `scalable-topics`, the id carries an optional PIP-460 segment. The
-// output must surface it — `null` when absent, the raw id when present —
-// rather than dropping it. Only compiled when the feature is on.
-#[cfg(feature = "scalable-topics")]
-#[test]
-fn message_id_to_json_surfaces_segment_id_under_feature() {
-    use magnetar::proto::SegmentId;
-
-    let mut id = magnetar::MessageId::EARLIEST;
-    id.ledger_id = 1;
-    id.entry_id = 2;
-
-    let without = cli::message_id_to_json(&id);
-    assert!(
-        without["segmentId"].is_null(),
-        "absent segment must serialise as JSON null, not be dropped"
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "ledgerId": 7,
+            "entryId": 42,
+            "partition": 3,
+            "batchIndex": 1,
+            "batchSize": 5,
+        })
     );
-
-    let with = cli::message_id_to_json(&id.with_segment(SegmentId(9)));
-    assert_eq!(with["segmentId"], 9);
 }

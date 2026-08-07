@@ -43,8 +43,882 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use prost::Message as _;
+
 use crate::pb;
-use crate::types::{SegmentDescriptor, SegmentId};
+use crate::scalable_consumer::{AssignmentError, ConsumerAssignment};
+use crate::types::{
+    KeyRange, MAX_HASH, MIN_HASH, SegmentDescriptor, SegmentDescriptorError, SegmentId,
+    SegmentState,
+};
+
+/// Maximum nodes accepted in one atomic M1 DAG snapshot.
+pub const MAX_DAG_SEGMENTS: usize = 4_096;
+/// Maximum logical edges accepted in one atomic M1 DAG snapshot.
+pub const MAX_DAG_EDGES: usize = 16_384;
+/// Maximum parent-to-child ancestry depth accepted in one M1 DAG snapshot.
+pub const MAX_DAG_DEPTH: usize = 256;
+/// Maximum encoded size of one M1 DAG snapshot.
+pub const MAX_DAG_SERIALIZED_SIZE: usize = 1024 * 1024;
+
+/// Resource bounds applied while validating an untrusted DAG snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DagLimits {
+    /// Maximum segment descriptors.
+    pub segments: usize,
+    /// Maximum logical edges.
+    pub edges: usize,
+    /// Maximum ancestry depth.
+    pub depth: usize,
+    /// Maximum encoded protobuf bytes.
+    pub serialized_size: usize,
+}
+
+impl Default for DagLimits {
+    fn default() -> Self {
+        Self {
+            segments: MAX_DAG_SEGMENTS,
+            edges: MAX_DAG_EDGES,
+            depth: MAX_DAG_DEPTH,
+            serialized_size: MAX_DAG_SERIALIZED_SIZE,
+        }
+    }
+}
+
+/// Parent-before-child policy for aggregate stream delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum OrderingMode {
+    /// Require local proof that every transitive ancestor completed.
+    #[default]
+    Strict,
+    /// Apply local barriers but rely on the broker for ancestors never owned by
+    /// this aggregate.
+    BrokerManaged,
+}
+
+/// Result of evaluating a segment's complete transitive ancestry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderingEligibility {
+    /// Every ancestor was locally owned and completed.
+    Eligible,
+    /// Locally-owned ancestors still have unsettled work.
+    Blocked {
+        /// Incomplete local ancestors, sorted by id.
+        incomplete_ancestors: Vec<SegmentId>,
+        /// Remote ancestors delegated to the broker in broker-managed mode.
+        broker_managed_ancestors: Vec<SegmentId>,
+    },
+    /// Delivery is eligible only under broker-managed ancestry semantics.
+    BrokerManaged {
+        /// Ancestors this aggregate never owned, sorted by id.
+        remote_ancestors: Vec<SegmentId>,
+    },
+}
+
+impl OrderingEligibility {
+    /// Whether FLOW and application delivery are permitted.
+    #[must_use]
+    pub const fn permits_flow(&self) -> bool {
+        matches!(self, Self::Eligible | Self::BrokerManaged { .. })
+    }
+}
+
+/// An ancestry decision that cannot be proven from the validated local graph
+/// and ownership history.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OrderingError {
+    /// The requested segment is not in the current snapshot.
+    #[error("segment {segment_id} is not in the current DAG")]
+    UnknownSegment {
+        /// Missing segment.
+        segment_id: SegmentId,
+    },
+    /// Strict mode cannot prove remote ancestry complete.
+    #[error(
+        "ordering for segment {segment_id} is unprovable through remote ancestors {ancestors:?}"
+    )]
+    OrderingUnprovable {
+        /// Descendant being evaluated.
+        segment_id: SegmentId,
+        /// Remote or pruned ancestry roots preventing proof.
+        ancestors: Vec<SegmentId>,
+    },
+}
+
+/// Full-snapshot validation failure. No variant permits partial installation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DagValidationError {
+    /// Encoded input exceeds the fixed control-plane bound.
+    #[error("DAG snapshot is {actual} bytes; maximum is {max}")]
+    SerializedSize {
+        /// Encoded bytes.
+        actual: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// The snapshot contains too many segment nodes.
+    #[error("DAG snapshot has {actual} segments; maximum is {max}")]
+    SegmentCount {
+        /// Segment count.
+        actual: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// Placement count is bounded independently before indexing.
+    #[error("DAG snapshot has {actual} placements; maximum is {max}")]
+    PlacementCount {
+        /// Placement count.
+        actual: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// Segment ids must be unique.
+    #[error("DAG snapshot repeats segment id {segment_id}")]
+    DuplicateSegment {
+        /// Repeated id.
+        segment_id: SegmentId,
+    },
+    /// Placement ids must be unique.
+    #[error("DAG snapshot repeats placement id {segment_id}")]
+    DuplicatePlacement {
+        /// Repeated id.
+        segment_id: SegmentId,
+    },
+    /// A placement cannot name a segment absent from the snapshot.
+    #[error("placement names unknown segment {segment_id}")]
+    DanglingPlacement {
+        /// Unknown id.
+        segment_id: SegmentId,
+    },
+    /// A broker placement URL must not be empty.
+    #[error("placement for segment {segment_id} has an empty broker URL")]
+    EmptyPlacementUrl {
+        /// Segment id.
+        segment_id: SegmentId,
+    },
+    /// Descriptor range, state, placement, or legacy marker is invalid.
+    #[error("segment {segment_id} is invalid: {source}")]
+    InvalidDescriptor {
+        /// Segment id.
+        segment_id: SegmentId,
+        /// Descriptor validation failure.
+        source: SegmentDescriptorError,
+    },
+    /// A segment cannot be created after the containing layout epoch.
+    #[error("segment {segment_id} was created at epoch {created}, after layout epoch {layout}")]
+    CreatedAfterLayout {
+        /// Segment id.
+        segment_id: SegmentId,
+        /// Creation epoch.
+        created: u64,
+        /// Layout epoch.
+        layout: u64,
+    },
+    /// Active segments cannot carry a seal epoch.
+    #[error("active segment {segment_id} carries sealed epoch {sealed}")]
+    ActiveWithSealEpoch {
+        /// Segment id.
+        segment_id: SegmentId,
+        /// Invalid seal epoch.
+        sealed: u64,
+    },
+    /// Active segments are the current leaves.
+    #[error("active segment {segment_id} has children")]
+    ActiveWithChildren {
+        /// Segment id.
+        segment_id: SegmentId,
+    },
+    /// A sealed segment must state when it sealed.
+    #[error("sealed segment {segment_id} has no seal epoch")]
+    SealedWithoutEpoch {
+        /// Segment id.
+        segment_id: SegmentId,
+    },
+    /// A seal epoch must fall between creation and the snapshot epoch.
+    #[error(
+        "segment {segment_id} has invalid seal epoch {sealed} for creation {created} and layout {layout}"
+    )]
+    InvalidSealEpoch {
+        /// Segment id.
+        segment_id: SegmentId,
+        /// Creation epoch.
+        created: u64,
+        /// Seal epoch.
+        sealed: u64,
+        /// Layout epoch.
+        layout: u64,
+    },
+    /// Parent ids within a descriptor must be unique.
+    #[error("segment {segment_id} repeats parent {parent_id}")]
+    DuplicateParent {
+        /// Child id.
+        segment_id: SegmentId,
+        /// Repeated parent.
+        parent_id: SegmentId,
+    },
+    /// Child ids within a descriptor must be unique.
+    #[error("segment {segment_id} repeats child {child_id}")]
+    DuplicateChild {
+        /// Parent id.
+        segment_id: SegmentId,
+        /// Repeated child.
+        child_id: SegmentId,
+    },
+    /// Self edges are cycles and rejected directly.
+    #[error("segment {segment_id} has a self edge")]
+    SelfEdge {
+        /// Segment id.
+        segment_id: SegmentId,
+    },
+    /// Logical edge count exceeded the configured bound.
+    #[error("DAG snapshot has {actual} edges; maximum is {max}")]
+    EdgeCount {
+        /// Edge count.
+        actual: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// A parent reference names no node.
+    #[error("segment {segment_id} names missing parent {parent_id}")]
+    DanglingParent {
+        /// Child id.
+        segment_id: SegmentId,
+        /// Missing parent.
+        parent_id: SegmentId,
+    },
+    /// A child reference names no node.
+    #[error("segment {segment_id} names missing child {child_id}")]
+    DanglingChild {
+        /// Parent id.
+        segment_id: SegmentId,
+        /// Missing child.
+        child_id: SegmentId,
+    },
+    /// Parent and child descriptors disagree about an edge.
+    #[error("edge {parent_id}->{child_id} is not reciprocal")]
+    NonReciprocalEdge {
+        /// Parent id.
+        parent_id: SegmentId,
+        /// Child id.
+        child_id: SegmentId,
+    },
+    /// Child creation and parent sealing must describe the same transition.
+    #[error(
+        "edge {parent_id}->{child_id} has parent seal epoch {sealed} but child creation epoch {created}"
+    )]
+    EdgeEpochMismatch {
+        /// Parent id.
+        parent_id: SegmentId,
+        /// Child id.
+        child_id: SegmentId,
+        /// Parent seal epoch.
+        sealed: u64,
+        /// Child creation epoch.
+        created: u64,
+    },
+    /// The graph contains a cycle.
+    #[error("DAG snapshot contains a cycle")]
+    Cycle,
+    /// Acyclic graph depth exceeded the configured bound.
+    #[error("DAG ancestry depth {actual} exceeds maximum {max}")]
+    Depth {
+        /// Observed depth.
+        actual: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// One parent cannot simultaneously describe split and merge children.
+    #[error("segment {segment_id} has conflicting split/merge topology")]
+    ConflictingTopology {
+        /// Parent id.
+        segment_id: SegmentId,
+    },
+    /// Split children must exactly partition their parent range.
+    #[error("split children do not exactly cover parent segment {segment_id}")]
+    InvalidSplitCoverage {
+        /// Parent id.
+        segment_id: SegmentId,
+    },
+    /// Merge parents must exactly partition their child range.
+    #[error("merge parents do not exactly cover child segment {segment_id}")]
+    InvalidMergeCoverage {
+        /// Child id.
+        segment_id: SegmentId,
+    },
+    /// At least one active leaf must serve the key space.
+    #[error("DAG snapshot has no active segments")]
+    NoActiveSegments,
+    /// Active leaves overlap or leave a gap before a segment.
+    #[error(
+        "active key-space coverage expected start {expected}, got {actual} at segment {segment_id}"
+    )]
+    ActiveCoverageDiscontinuity {
+        /// Next required hash.
+        expected: u32,
+        /// Actual next start.
+        actual: u32,
+        /// Segment exposing the discontinuity.
+        segment_id: SegmentId,
+    },
+    /// Active leaves did not reach the final M1 hash.
+    #[error("active key-space coverage ended at {actual}, expected {expected}")]
+    ActiveCoverageEnd {
+        /// Last covered hash.
+        actual: u32,
+        /// Required final hash.
+        expected: u32,
+    },
+}
+
+/// Assignment-to-DAG attachment validation failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttachmentError {
+    /// Assignment and graph must describe one layout generation.
+    #[error("assignment epoch {assignment} does not match DAG epoch {dag}")]
+    EpochMismatch {
+        /// Assignment epoch.
+        assignment: u64,
+        /// DAG epoch.
+        dag: u64,
+    },
+    /// Assigned segment is absent from the graph.
+    #[error("assignment names unknown segment {segment_id}")]
+    UnknownSegment {
+        /// Missing id.
+        segment_id: SegmentId,
+    },
+    /// Assignment and graph disagree about the inclusive range.
+    #[error("assignment range for segment {segment_id} does not match the DAG")]
+    RangeMismatch {
+        /// Segment id.
+        segment_id: SegmentId,
+    },
+    /// A synthetic legacy node has no `segment://` attachment.
+    #[error("legacy segment {segment_id} cannot use a segment attachment")]
+    LegacySegment {
+        /// Legacy id.
+        segment_id: SegmentId,
+    },
+}
+
+/// Fully validated, immutable M1 DAG snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagSnapshot {
+    epoch: u64,
+    segments: BTreeMap<SegmentId, SegmentDescriptor>,
+    topological_order: Vec<SegmentId>,
+    incomplete_roots: BTreeSet<SegmentId>,
+}
+
+impl DagSnapshot {
+    /// Validate one untrusted wire snapshot under the fixed production bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DagValidationError`] for any malformed topology. Validation is
+    /// all-or-nothing.
+    pub fn try_from_pb(dag: &pb::ScalableTopicDag) -> Result<Self, DagValidationError> {
+        Self::try_from_pb_with_limits(dag, DagLimits::default())
+    }
+
+    /// Validate with explicit bounds, primarily for deterministic boundary
+    /// testing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DagValidationError`] before constructing a snapshot.
+    pub fn try_from_pb_with_limits(
+        dag: &pb::ScalableTopicDag,
+        limits: DagLimits,
+    ) -> Result<Self, DagValidationError> {
+        let encoded_size = dag.encoded_len();
+        if encoded_size > limits.serialized_size {
+            return Err(DagValidationError::SerializedSize {
+                actual: encoded_size,
+                max: limits.serialized_size,
+            });
+        }
+        if dag.segments.len() > limits.segments {
+            return Err(DagValidationError::SegmentCount {
+                actual: dag.segments.len(),
+                max: limits.segments,
+            });
+        }
+        if dag.segment_brokers.len() > limits.segments {
+            return Err(DagValidationError::PlacementCount {
+                actual: dag.segment_brokers.len(),
+                max: limits.segments,
+            });
+        }
+
+        let mut placements = BTreeMap::new();
+        for placement in &dag.segment_brokers {
+            let segment_id = SegmentId(placement.segment_id);
+            if placements.insert(segment_id, placement).is_some() {
+                return Err(DagValidationError::DuplicatePlacement { segment_id });
+            }
+            if placement.broker_url.is_empty() {
+                return Err(DagValidationError::EmptyPlacementUrl { segment_id });
+            }
+        }
+
+        let mut segments = BTreeMap::new();
+        let mut parent_references = 0usize;
+        let mut child_references = 0usize;
+        for info in &dag.segments {
+            let segment_id = SegmentId(info.segment_id);
+            if segments.contains_key(&segment_id) {
+                return Err(DagValidationError::DuplicateSegment { segment_id });
+            }
+            let descriptor =
+                SegmentDescriptor::try_from_pb(info, placements.get(&segment_id).copied())
+                    .map_err(|source| DagValidationError::InvalidDescriptor {
+                        segment_id,
+                        source,
+                    })?;
+            validate_lifecycle(&descriptor, dag.epoch)?;
+            validate_edge_list(&descriptor.parent_ids, segment_id, true)?;
+            validate_edge_list(&descriptor.child_ids, segment_id, false)?;
+            parent_references = parent_references.saturating_add(descriptor.parent_ids.len());
+            child_references = child_references.saturating_add(descriptor.child_ids.len());
+            if parent_references > limits.edges || child_references > limits.edges {
+                return Err(DagValidationError::EdgeCount {
+                    actual: parent_references.max(child_references),
+                    max: limits.edges,
+                });
+            }
+            segments.insert(segment_id, descriptor);
+        }
+
+        for segment_id in placements.keys() {
+            if !segments.contains_key(segment_id) {
+                return Err(DagValidationError::DanglingPlacement {
+                    segment_id: *segment_id,
+                });
+            }
+        }
+
+        validate_reciprocal_edges(&segments)?;
+        let topological_order = validate_acyclic_and_depth(&segments, limits.depth)?;
+        validate_range_transitions(&segments)?;
+        validate_active_coverage(&segments)?;
+        let incomplete_roots = segments
+            .values()
+            .filter(|segment| segment.parent_ids.is_empty() && segment.created_at_epoch > 0)
+            .map(|segment| segment.segment_id)
+            .collect();
+
+        Ok(Self {
+            epoch: dag.epoch,
+            segments,
+            topological_order,
+            incomplete_roots,
+        })
+    }
+
+    /// Layout epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Segment descriptor by id.
+    #[must_use]
+    pub fn segment(&self, segment_id: SegmentId) -> Option<&SegmentDescriptor> {
+        self.segments.get(&segment_id)
+    }
+
+    /// Deterministic segment-id snapshot.
+    #[must_use]
+    pub fn segments(&self) -> Vec<SegmentDescriptor> {
+        self.segments.values().cloned().collect()
+    }
+
+    /// Parent-before-child order computed during validation.
+    #[must_use]
+    pub fn topological_order(&self) -> &[SegmentId] {
+        &self.topological_order
+    }
+
+    /// Validate every assignment attachment against this exact layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachmentError`] for epoch, membership, range, or legacy
+    /// mismatches.
+    pub fn validate_assignment(
+        &self,
+        assignment: &ConsumerAssignment,
+    ) -> Result<(), AttachmentError> {
+        if assignment.layout_epoch() != self.epoch {
+            return Err(AttachmentError::EpochMismatch {
+                assignment: assignment.layout_epoch(),
+                dag: self.epoch,
+            });
+        }
+        for assigned in assignment.segments() {
+            let segment_id = assigned.segment_id();
+            let Some(descriptor) = self.segments.get(&segment_id) else {
+                return Err(AttachmentError::UnknownSegment { segment_id });
+            };
+            if descriptor.key_range != assigned.key_range() {
+                return Err(AttachmentError::RangeMismatch { segment_id });
+            }
+            if descriptor.is_legacy() {
+                return Err(AttachmentError::LegacySegment { segment_id });
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate all transitive ancestors for one assigned segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderingError::OrderingUnprovable`] for pruned ancestry in
+    /// both modes and for remote ancestry in strict mode.
+    pub fn ordering_eligibility(
+        &self,
+        segment_id: SegmentId,
+        mode: OrderingMode,
+        local_ownership_history: &BTreeSet<SegmentId>,
+        completed: &BTreeSet<SegmentId>,
+    ) -> Result<OrderingEligibility, OrderingError> {
+        if !self.segments.contains_key(&segment_id) {
+            return Err(OrderingError::UnknownSegment { segment_id });
+        }
+        let ancestors = self.ancestors(segment_id);
+        let mut unprovable_roots: Vec<SegmentId> = ancestors
+            .iter()
+            .copied()
+            .chain(core::iter::once(segment_id))
+            .filter(|id| self.incomplete_roots.contains(id))
+            .collect();
+        unprovable_roots.sort_unstable();
+        unprovable_roots.dedup();
+        if !unprovable_roots.is_empty() {
+            return Err(OrderingError::OrderingUnprovable {
+                segment_id,
+                ancestors: unprovable_roots,
+            });
+        }
+
+        let incomplete: Vec<SegmentId> = ancestors
+            .iter()
+            .copied()
+            .filter(|id| local_ownership_history.contains(id) && !completed.contains(id))
+            .collect();
+        let remote: Vec<SegmentId> = ancestors
+            .iter()
+            .copied()
+            .filter(|id| !local_ownership_history.contains(id))
+            .collect();
+        if mode == OrderingMode::Strict && !remote.is_empty() {
+            return Err(OrderingError::OrderingUnprovable {
+                segment_id,
+                ancestors: remote,
+            });
+        }
+        if !incomplete.is_empty() {
+            return Ok(OrderingEligibility::Blocked {
+                incomplete_ancestors: incomplete,
+                broker_managed_ancestors: remote,
+            });
+        }
+        if remote.is_empty() {
+            Ok(OrderingEligibility::Eligible)
+        } else {
+            Ok(OrderingEligibility::BrokerManaged {
+                remote_ancestors: remote,
+            })
+        }
+    }
+
+    fn ancestors(&self, segment_id: SegmentId) -> Vec<SegmentId> {
+        let mut pending: Vec<SegmentId> = self
+            .segments
+            .get(&segment_id)
+            .map_or_else(Vec::new, |segment| segment.parent_ids.clone());
+        let mut ancestors = BTreeSet::new();
+        while let Some(parent_id) = pending.pop() {
+            if ancestors.insert(parent_id)
+                && let Some(parent) = self.segments.get(&parent_id)
+            {
+                pending.extend(parent.parent_ids.iter().copied());
+            }
+        }
+        ancestors.into_iter().collect()
+    }
+}
+
+fn validate_lifecycle(
+    segment: &SegmentDescriptor,
+    layout_epoch: u64,
+) -> Result<(), DagValidationError> {
+    if segment.created_at_epoch > layout_epoch {
+        return Err(DagValidationError::CreatedAfterLayout {
+            segment_id: segment.segment_id,
+            created: segment.created_at_epoch,
+            layout: layout_epoch,
+        });
+    }
+    match segment.state {
+        SegmentState::Active => {
+            if let Some(sealed) = segment.sealed_at_epoch {
+                return Err(DagValidationError::ActiveWithSealEpoch {
+                    segment_id: segment.segment_id,
+                    sealed,
+                });
+            }
+            if !segment.child_ids.is_empty() {
+                return Err(DagValidationError::ActiveWithChildren {
+                    segment_id: segment.segment_id,
+                });
+            }
+        }
+        SegmentState::Sealed => {
+            let Some(sealed) = segment.sealed_at_epoch else {
+                return Err(DagValidationError::SealedWithoutEpoch {
+                    segment_id: segment.segment_id,
+                });
+            };
+            if sealed < segment.created_at_epoch || sealed > layout_epoch {
+                return Err(DagValidationError::InvalidSealEpoch {
+                    segment_id: segment.segment_id,
+                    created: segment.created_at_epoch,
+                    sealed,
+                    layout: layout_epoch,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_edge_list(
+    ids: &[SegmentId],
+    segment_id: SegmentId,
+    parents: bool,
+) -> Result<(), DagValidationError> {
+    let mut unique = BTreeSet::new();
+    for id in ids {
+        if *id == segment_id {
+            return Err(DagValidationError::SelfEdge { segment_id });
+        }
+        if !unique.insert(*id) {
+            return Err(if parents {
+                DagValidationError::DuplicateParent {
+                    segment_id,
+                    parent_id: *id,
+                }
+            } else {
+                DagValidationError::DuplicateChild {
+                    segment_id,
+                    child_id: *id,
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_reciprocal_edges(
+    segments: &BTreeMap<SegmentId, SegmentDescriptor>,
+) -> Result<(), DagValidationError> {
+    for segment in segments.values() {
+        for parent_id in &segment.parent_ids {
+            let Some(parent) = segments.get(parent_id) else {
+                return Err(DagValidationError::DanglingParent {
+                    segment_id: segment.segment_id,
+                    parent_id: *parent_id,
+                });
+            };
+            if !parent.child_ids.contains(&segment.segment_id) {
+                return Err(DagValidationError::NonReciprocalEdge {
+                    parent_id: *parent_id,
+                    child_id: segment.segment_id,
+                });
+            }
+            let sealed = parent.sealed_at_epoch.unwrap_or_default();
+            if parent.sealed_at_epoch != Some(segment.created_at_epoch) {
+                return Err(DagValidationError::EdgeEpochMismatch {
+                    parent_id: *parent_id,
+                    child_id: segment.segment_id,
+                    sealed,
+                    created: segment.created_at_epoch,
+                });
+            }
+        }
+        for child_id in &segment.child_ids {
+            let Some(child) = segments.get(child_id) else {
+                return Err(DagValidationError::DanglingChild {
+                    segment_id: segment.segment_id,
+                    child_id: *child_id,
+                });
+            };
+            if !child.parent_ids.contains(&segment.segment_id) {
+                return Err(DagValidationError::NonReciprocalEdge {
+                    parent_id: segment.segment_id,
+                    child_id: *child_id,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_acyclic_and_depth(
+    segments: &BTreeMap<SegmentId, SegmentDescriptor>,
+    max_depth: usize,
+) -> Result<Vec<SegmentId>, DagValidationError> {
+    let mut indegree: BTreeMap<SegmentId, usize> = segments
+        .iter()
+        .map(|(id, segment)| (*id, segment.parent_ids.len()))
+        .collect();
+    let mut ready: BTreeSet<SegmentId> = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut depth: BTreeMap<SegmentId, usize> = ready.iter().map(|id| (*id, 0)).collect();
+    let mut order = Vec::with_capacity(segments.len());
+    while let Some(id) = ready.pop_first() {
+        order.push(id);
+        let parent_depth = depth.get(&id).copied().unwrap_or_default();
+        let children = segments
+            .get(&id)
+            .map_or(&[][..], |segment| segment.child_ids.as_slice());
+        for child_id in children {
+            let child_depth = parent_depth.saturating_add(1);
+            let entry = depth.entry(*child_id).or_default();
+            *entry = (*entry).max(child_depth);
+            if *entry > max_depth {
+                return Err(DagValidationError::Depth {
+                    actual: *entry,
+                    max: max_depth,
+                });
+            }
+            let degree = indegree.entry(*child_id).or_default();
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 {
+                ready.insert(*child_id);
+            }
+        }
+    }
+    if order.len() != segments.len() {
+        return Err(DagValidationError::Cycle);
+    }
+    Ok(order)
+}
+
+fn validate_range_transitions(
+    segments: &BTreeMap<SegmentId, SegmentDescriptor>,
+) -> Result<(), DagValidationError> {
+    for parent in segments
+        .values()
+        .filter(|segment| !segment.child_ids.is_empty())
+    {
+        let children: Vec<&SegmentDescriptor> = parent
+            .child_ids
+            .iter()
+            .filter_map(|id| segments.get(id))
+            .collect();
+        let split = children.iter().all(|child| child.parent_ids.len() == 1);
+        let merge = children.len() == 1 && children[0].parent_ids.len() > 1;
+        if split {
+            if !ranges_cover(
+                parent.key_range,
+                children.iter().map(|child| child.key_range),
+            ) {
+                return Err(DagValidationError::InvalidSplitCoverage {
+                    segment_id: parent.segment_id,
+                });
+            }
+        } else if !merge {
+            return Err(DagValidationError::ConflictingTopology {
+                segment_id: parent.segment_id,
+            });
+        }
+    }
+    for child in segments
+        .values()
+        .filter(|segment| segment.parent_ids.len() > 1)
+    {
+        if !ranges_cover(
+            child.key_range,
+            child
+                .parent_ids
+                .iter()
+                .filter_map(|id| segments.get(id))
+                .map(|parent| parent.key_range),
+        ) {
+            return Err(DagValidationError::InvalidMergeCoverage {
+                segment_id: child.segment_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ranges_cover(target: KeyRange, ranges: impl Iterator<Item = KeyRange>) -> bool {
+    let mut ranges: Vec<KeyRange> = ranges.collect();
+    ranges.sort_unstable();
+    let mut expected = target.start();
+    for (index, range) in ranges.iter().copied().enumerate() {
+        if !target.contains_range(range) || range.start() != expected {
+            return false;
+        }
+        if range.end() == target.end() {
+            return index + 1 == ranges.len();
+        }
+        expected = range.end() + 1;
+    }
+    false
+}
+
+fn validate_active_coverage(
+    segments: &BTreeMap<SegmentId, SegmentDescriptor>,
+) -> Result<(), DagValidationError> {
+    let mut active: Vec<&SegmentDescriptor> = segments
+        .values()
+        .filter(|segment| segment.state == SegmentState::Active)
+        .collect();
+    if active.is_empty() {
+        return Err(DagValidationError::NoActiveSegments);
+    }
+    active.sort_by_key(|segment| (segment.key_range, segment.segment_id));
+    let mut expected = MIN_HASH;
+    let mut complete = false;
+    for segment in active {
+        if complete {
+            return Err(DagValidationError::ActiveCoverageDiscontinuity {
+                expected: MAX_HASH,
+                actual: segment.key_range.start(),
+                segment_id: segment.segment_id,
+            });
+        }
+        if segment.key_range.start() != expected {
+            return Err(DagValidationError::ActiveCoverageDiscontinuity {
+                expected,
+                actual: segment.key_range.start(),
+                segment_id: segment.segment_id,
+            });
+        }
+        if segment.key_range.end() == MAX_HASH {
+            complete = true;
+        } else {
+            expected = segment.key_range.end() + 1;
+        }
+    }
+    if !complete {
+        return Err(DagValidationError::ActiveCoverageEnd {
+            actual: expected.saturating_sub(1),
+            expected: MAX_HASH,
+        });
+    }
+    Ok(())
+}
 
 /// The delta produced by applying one `CommandScalableTopicUpdate` to a
 /// [`DagWatchSession`]. Surfaced to the runtime so it can decide whether the
@@ -168,6 +1042,10 @@ pub enum DagError {
         /// The `session_id` the broker sent.
         session_id: u64,
     },
+
+    /// The replacement snapshot failed complete structural validation.
+    #[error("invalid scalable-topic DAG snapshot: {0}")]
+    InvalidSnapshot(#[from] DagValidationError),
 }
 
 /// Errors raised when opening a scalable-topic session.
@@ -184,6 +1062,9 @@ pub enum ScalableTopicError {
         "broker does not support scalable topics (PIP-460): CommandConnected did not advertise supports_scalable_topics"
     )]
     BrokerUnsupported,
+    /// A reconnect attempted an invalid consumer-incarnation transition.
+    #[error(transparent)]
+    Assignment(#[from] AssignmentError),
 }
 
 /// A scalable-topic watch session: monotonic layout-epoch tracking plus the
@@ -195,17 +1076,15 @@ pub enum ScalableTopicError {
 pub struct DagWatchSession {
     /// Client-allocated session id, echoed by the broker on every update.
     session_id: u64,
-    /// Highest layout `epoch` applied so far. `None` means "no layout yet" —
-    /// the first update is accepted at any epoch, including `0`.
-    epoch: Option<u64>,
     /// Canonical `topic://...` identity the broker resolved the request to,
     /// once an update has carried one.
     resolved_topic_name: Option<String>,
     /// Controller-broker URL from the most recent layout, when advertised.
     controller_broker_url: Option<String>,
-    /// Current DAG, keyed by segment id for O(log n) membership checks and a
-    /// deterministic snapshot order.
-    dag: BTreeMap<SegmentId, SegmentDescriptor>,
+    /// TLS controller-broker URL from the most recent layout, when advertised.
+    controller_broker_url_tls: Option<String>,
+    /// Current fully validated DAG. `None` before the first successful update.
+    dag: Option<DagSnapshot>,
 }
 
 impl DagWatchSession {
@@ -215,17 +1094,17 @@ impl DagWatchSession {
     pub fn new(session_id: u64) -> Self {
         Self {
             session_id,
-            epoch: None,
             resolved_topic_name: None,
             controller_broker_url: None,
-            dag: BTreeMap::new(),
+            controller_broker_url_tls: None,
+            dag: None,
         }
     }
 
     /// `true` once a layout has landed.
     #[must_use]
     pub fn is_resolved(&self) -> bool {
-        self.epoch.is_some()
+        self.dag.is_some()
     }
 
     /// The canonical `topic://...` identity the broker resolved to, if known.
@@ -240,16 +1119,32 @@ impl DagWatchSession {
         self.controller_broker_url.as_deref()
     }
 
+    /// TLS controller-broker URL from the most recent layout, if advertised.
+    #[must_use]
+    pub fn controller_broker_url_tls(&self) -> Option<&str> {
+        self.controller_broker_url_tls.as_deref()
+    }
+
+    /// Current validated snapshot.
+    #[must_use]
+    pub fn validated_snapshot(&self) -> Option<&DagSnapshot> {
+        self.dag.as_ref()
+    }
+
     /// Snapshot of the current DAG, ordered by segment id.
     #[must_use]
     pub fn snapshot(&self) -> Vec<SegmentDescriptor> {
-        self.dag.values().cloned().collect()
+        self.dag
+            .as_ref()
+            .map_or_else(Vec::new, DagSnapshot::segments)
     }
 
     /// `true` when `segment_id` is currently part of the DAG.
     #[must_use]
     pub fn contains(&self, segment_id: SegmentId) -> bool {
-        self.dag.contains_key(&segment_id)
+        self.dag
+            .as_ref()
+            .is_some_and(|dag| dag.segment(segment_id).is_some())
     }
 
     /// Apply a `CommandScalableTopicUpdate`, replacing the layout and
@@ -303,46 +1198,36 @@ impl DagWatchSession {
         // Not an error: a re-sent or reordered snapshot carries a layout this
         // session has already applied, so there is nothing to do and nothing to
         // report. Only a *forward* epoch changes state.
-        if let Some(prev) = self.epoch
+        if let Some(prev) = self.dag.as_ref().map(DagSnapshot::epoch)
             && dag.epoch <= prev
         {
             return Ok(None);
         }
 
-        // Placement is a parallel list keyed by segment id; index it once.
-        let addresses: BTreeMap<u64, &pb::SegmentBrokerAddress> = dag
-            .segment_brokers
-            .iter()
-            .map(|a| (a.segment_id, a))
-            .collect();
+        // Validate the complete replacement before deriving a delta or mutating
+        // any session field. A malformed snapshot cannot partially land.
+        let incoming = DagSnapshot::try_from_pb(dag)?;
 
-        let incoming: BTreeMap<SegmentId, SegmentDescriptor> = dag
-            .segments
-            .iter()
-            .map(|info| {
-                let descriptor =
-                    SegmentDescriptor::from_pb(info, addresses.get(&info.segment_id).copied());
-                (descriptor.segment_id, descriptor)
-            })
-            .collect();
-
-        let before: BTreeSet<SegmentId> = self.dag.keys().copied().collect();
-        let after: BTreeSet<SegmentId> = incoming.keys().copied().collect();
+        let before: BTreeSet<SegmentId> =
+            self.dag.as_ref().map_or_else(BTreeSet::new, |snapshot| {
+                snapshot.segments.keys().copied().collect()
+            });
+        let after: BTreeSet<SegmentId> = incoming.segments.keys().copied().collect();
 
         let added: Vec<SegmentDescriptor> = after
             .difference(&before)
-            .filter_map(|id| incoming.get(id).cloned())
+            .filter_map(|id| incoming.segments.get(id).cloned())
             .collect();
         let removed: Vec<SegmentId> = before.difference(&after).copied().collect();
 
         let (split_events, merge_events) = derive_topology_changes(&added, &before);
 
-        self.epoch = Some(dag.epoch);
-        self.dag = incoming;
+        self.dag = Some(incoming);
         if let Some(name) = upd.resolved_topic_name.as_ref() {
             self.resolved_topic_name = Some(name.clone());
         }
         self.controller_broker_url = dag.controller_broker_url.clone();
+        self.controller_broker_url_tls = dag.controller_broker_url_tls.clone();
 
         Ok(Some(DagDelta {
             epoch: dag.epoch,
@@ -409,11 +1294,6 @@ mod tests {
     use super::*;
     use crate::types::{KeyRange, SegmentState};
 
-    /// Build a `SegmentInfoProto` with the given topology edges.
-    fn seg_info(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
-        info(id, start, end, parents, &[])
-    }
-
     fn info(
         id: u64,
         start: u32,
@@ -434,6 +1314,42 @@ mod tests {
             sealed_at_ms: None,
             legacy_topic_name: None,
         }
+    }
+
+    fn sealed_info(
+        id: u64,
+        start: u32,
+        end: u32,
+        parents: &[u64],
+        children: &[u64],
+        created: u64,
+        sealed: u64,
+    ) -> pb::SegmentInfoProto {
+        pb::SegmentInfoProto {
+            segment_id: id,
+            hash_start: start,
+            hash_end: end,
+            state: pb::SegmentState::Sealed as i32,
+            parent_ids: parents.to_vec(),
+            child_ids: children.to_vec(),
+            created_at_epoch: created,
+            sealed_at_epoch: Some(sealed),
+            created_at_ms: 0,
+            sealed_at_ms: Some(0),
+            legacy_topic_name: None,
+        }
+    }
+
+    fn child_info(
+        id: u64,
+        start: u32,
+        end: u32,
+        parents: &[u64],
+        created: u64,
+    ) -> pb::SegmentInfoProto {
+        let mut child = info(id, start, end, parents, &[]);
+        child.created_at_epoch = created;
+        child
     }
 
     fn address(id: u64) -> pb::SegmentBrokerAddress {
@@ -458,7 +1374,7 @@ mod tests {
                 segments,
                 segment_brokers,
                 controller_broker_url: Some("pulsar://controller:6650".to_owned()),
-                controller_broker_url_tls: None,
+                controller_broker_url_tls: Some("pulsar+ssl://controller:6651".to_owned()),
             }),
             error: None,
             message: None,
@@ -468,7 +1384,7 @@ mod tests {
 
     fn resolved_session() -> DagWatchSession {
         let mut s = DagWatchSession::new(7);
-        s.handle_update(&update(7, 1, vec![info(1, 0, 65_536, &[], &[])]))
+        s.handle_update(&update(7, 1, vec![info(1, 0, 65_535, &[], &[])]))
             .expect("initial layout applies")
             .expect("the first layout yields a delta");
         s
@@ -486,8 +1402,8 @@ mod tests {
                 7,
                 4,
                 vec![
-                    info(1, 0, 32_768, &[], &[]),
-                    info(2, 32_768, 65_536, &[], &[]),
+                    info(1, 0, 32_767, &[], &[]),
+                    info(2, 32_768, 65_535, &[], &[]),
                 ],
             ))
             .expect("layout applies")
@@ -506,9 +1422,34 @@ mod tests {
             Some("topic://public/default/scaled")
         );
         assert_eq!(s.controller_broker_url(), Some("pulsar://controller:6650"));
+        assert_eq!(
+            s.controller_broker_url_tls(),
+            Some("pulsar+ssl://controller:6651")
+        );
         // Placement is joined onto the descriptor from the parallel address list.
         assert_eq!(
             s.snapshot()[0].broker_url.as_deref(),
+            Some("pulsar://seg1:6650")
+        );
+    }
+
+    #[test]
+    fn scalable_session_preserves_absent_controller_authority() {
+        let mut update = update(7, 1, vec![info(1, 0, 65_535, &[], &[])]);
+        let dag = update.dag.as_mut().expect("layout");
+        dag.controller_broker_url = None;
+        dag.controller_broker_url_tls = None;
+        let mut session = DagWatchSession::new(7);
+
+        session
+            .handle_update(&update)
+            .expect("layout applies")
+            .expect("initial layout yields a delta");
+
+        assert_eq!(session.controller_broker_url(), None);
+        assert_eq!(session.controller_broker_url_tls(), None);
+        assert_eq!(
+            session.snapshot()[0].broker_url.as_deref(),
             Some("pulsar://seg1:6650")
         );
     }
@@ -547,7 +1488,7 @@ mod tests {
         assert!(s.is_resolved());
 
         // And the session still accepts the next real advance.
-        let advance = update(7, 2, vec![info(9, 0, 65_536, &[], &[])]);
+        let advance = update(7, 2, vec![info(9, 0, 65_535, &[], &[])]);
         let delta = s
             .handle_update(&advance)
             .expect("a forward epoch applies")
@@ -556,8 +1497,7 @@ mod tests {
         assert!(s.contains(SegmentId(9)));
     }
 
-    /// Layer (a) test: a split is derived from the children's `parent_ids`
-    /// and the parent leaves the layout.
+    /// Layer (a) test: a split is derived from reciprocal parent/child edges.
     #[test]
     fn scalable_session_derives_split_from_edges() {
         let mut s = resolved_session();
@@ -566,8 +1506,9 @@ mod tests {
                 7,
                 2,
                 vec![
-                    info(2, 0, 32_768, &[1], &[]),
-                    info(3, 32_768, 65_536, &[1], &[]),
+                    sealed_info(1, 0, 65_535, &[], &[2, 3], 0, 2),
+                    child_info(2, 0, 32_767, &[1], 2),
+                    child_info(3, 32_768, 65_535, &[1], 2),
                 ],
             ))
             .expect("split layout applies")
@@ -575,14 +1516,14 @@ mod tests {
 
         assert!(delta.is_consume_affecting());
         assert_eq!(delta.change_reason(), DagChangeReason::Split);
-        assert_eq!(delta.removed, vec![SegmentId(1)]);
+        assert!(delta.removed.is_empty());
         assert_eq!(delta.split_events.len(), 1, "1 -> {{2,3}} is one split");
         assert_eq!(delta.split_events[0].parent_segment_id, SegmentId(1));
         assert_eq!(
             delta.split_events[0].child_segment_ids,
             vec![SegmentId(2), SegmentId(3)]
         );
-        assert!(!s.contains(SegmentId(1)), "parent left the layout");
+        assert!(s.contains(SegmentId(1)), "sealed parent remains a barrier");
         assert!(s.contains(SegmentId(2)) && s.contains(SegmentId(3)));
     }
 
@@ -594,15 +1535,23 @@ mod tests {
             7,
             1,
             vec![
-                info(5, 0, 32_768, &[], &[]),
-                info(6, 32_768, 65_536, &[], &[]),
+                info(5, 0, 32_767, &[], &[]),
+                info(6, 32_768, 65_535, &[], &[]),
             ],
         ))
         .expect("initial layout")
         .expect("the first layout yields a delta");
 
         let delta = s
-            .handle_update(&update(7, 2, vec![info(7, 0, 65_536, &[5, 6], &[])]))
+            .handle_update(&update(
+                7,
+                2,
+                vec![
+                    sealed_info(5, 0, 32_767, &[], &[7], 0, 2),
+                    sealed_info(6, 32_768, 65_535, &[], &[7], 0, 2),
+                    child_info(7, 0, 65_535, &[5, 6], 2),
+                ],
+            ))
             .expect("merge layout applies")
             .expect("a merge yields a delta");
 
@@ -614,8 +1563,8 @@ mod tests {
             vec![SegmentId(5), SegmentId(6)]
         );
         assert_eq!(delta.merge_events[0].child_segment_id, SegmentId(7));
-        assert_eq!(delta.removed.len(), 2);
-        assert_eq!(s.snapshot().len(), 1);
+        assert!(delta.removed.is_empty());
+        assert_eq!(s.snapshot().len(), 3);
     }
 
     /// A merge whose wire `parent_ids` arrive out of order still reports them
@@ -629,8 +1578,8 @@ mod tests {
             7,
             1,
             vec![
-                seg_info(5, 0, 32_768, &[]),
-                seg_info(6, 32_768, 65_536, &[]),
+                info(5, 0, 32_767, &[], &[]),
+                info(6, 32_768, 65_535, &[], &[]),
             ],
         ))
         .expect("initial layout")
@@ -638,7 +1587,15 @@ mod tests {
 
         // Descending on the wire.
         let delta = s
-            .handle_update(&update(7, 2, vec![seg_info(7, 0, 65_536, &[6, 5])]))
+            .handle_update(&update(
+                7,
+                2,
+                vec![
+                    sealed_info(5, 0, 32_767, &[], &[7], 0, 2),
+                    sealed_info(6, 32_768, 65_535, &[], &[7], 0, 2),
+                    child_info(7, 0, 65_535, &[6, 5], 2),
+                ],
+            ))
             .expect("merge layout applies")
             .expect("a merge yields a delta");
 
@@ -708,18 +1665,16 @@ mod tests {
         assert!(s.contains(SegmentId(1)), "layout untouched on error");
     }
 
-    /// A layout that only adds segments is not consume-affecting.
+    /// Adding a detached sealed history node is not consume-affecting.
     #[test]
     fn scalable_session_add_only_is_benign() {
         let mut s = resolved_session();
+        let added_history = sealed_info(2, 0, 65_535, &[], &[], 0, 1);
         let delta = s
             .handle_update(&update(
                 7,
                 2,
-                vec![
-                    info(1, 0, 65_536, &[], &[]),
-                    info(2, 65_536, 131_072, &[], &[]),
-                ],
+                vec![info(1, 0, 65_535, &[], &[]), added_history],
             ))
             .expect("add applies")
             .expect("an add yields a delta");
@@ -734,7 +1689,7 @@ mod tests {
     #[test]
     fn scalable_session_legacy_layout_is_marked() {
         let mut s = DagWatchSession::new(7);
-        let mut legacy = info(0, 0, 65_536, &[], &[]);
+        let mut legacy = info(0, 0, 65_535, &[], &[]);
         legacy.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
         s.handle_update(&update(7, 0, vec![legacy]))
             .expect("legacy layout applies")
@@ -751,12 +1706,474 @@ mod tests {
         // non-advancing epochs *after* one has landed.
         assert!(s.is_resolved(), "epoch 0 is a legitimate first layout");
         assert_eq!(snap[0].state, SegmentState::Active);
-        assert_eq!(
-            snap[0].key_range,
-            KeyRange {
-                start: 0,
-                end: 65_536
-            }
+        assert_eq!(snap[0].key_range, KeyRange::FULL);
+    }
+
+    fn dag_from_segments(epoch: u64, segments: Vec<pb::SegmentInfoProto>) -> pb::ScalableTopicDag {
+        update(7, epoch, segments).dag.expect("test update has DAG")
+    }
+
+    fn valid_split_dag() -> pb::ScalableTopicDag {
+        dag_from_segments(
+            1,
+            vec![
+                sealed_info(0, 0, 65_535, &[], &[1, 2], 0, 1),
+                child_info(1, 0, 32_767, &[0], 1),
+                child_info(2, 32_768, 65_535, &[0], 1),
+            ],
+        )
+    }
+
+    fn valid_merge_dag() -> pb::ScalableTopicDag {
+        dag_from_segments(
+            2,
+            vec![
+                sealed_info(0, 0, 32_767, &[], &[2], 0, 2),
+                sealed_info(1, 32_768, 65_535, &[], &[2], 0, 2),
+                child_info(2, 0, 65_535, &[0, 1], 2),
+            ],
+        )
+    }
+
+    fn assert_invalid(
+        dag: &pb::ScalableTopicDag,
+        predicate: impl FnOnce(&DagValidationError) -> bool,
+    ) {
+        let error = DagSnapshot::try_from_pb(dag).expect_err("snapshot must be rejected");
+        assert!(predicate(&error), "unexpected validation error: {error:?}");
+    }
+
+    #[test]
+    fn dag_validation_rejects_duplicate_and_dangling_identities() {
+        let mut duplicate_segment = valid_split_dag();
+        duplicate_segment
+            .segments
+            .push(duplicate_segment.segments[0].clone());
+        assert_invalid(&duplicate_segment, |error| {
+            matches!(error, DagValidationError::DuplicateSegment { .. })
+        });
+
+        let mut duplicate_placement = valid_split_dag();
+        duplicate_placement
+            .segment_brokers
+            .push(duplicate_placement.segment_brokers[0].clone());
+        assert_invalid(&duplicate_placement, |error| {
+            matches!(error, DagValidationError::DuplicatePlacement { .. })
+        });
+
+        let mut dangling_placement = valid_split_dag();
+        dangling_placement.segment_brokers.push(address(999));
+        assert_invalid(&dangling_placement, |error| {
+            matches!(error, DagValidationError::DanglingPlacement { .. })
+        });
+
+        let mut empty_placement = valid_split_dag();
+        empty_placement.segment_brokers[0].broker_url.clear();
+        assert_invalid(&empty_placement, |error| {
+            matches!(error, DagValidationError::EmptyPlacementUrl { .. })
+        });
+    }
+
+    #[test]
+    fn dag_validation_rejects_every_edge_inconsistency_and_cycles() {
+        let mut duplicate_parent = valid_split_dag();
+        duplicate_parent.segments[1].parent_ids.push(0);
+        assert_invalid(&duplicate_parent, |error| {
+            matches!(error, DagValidationError::DuplicateParent { .. })
+        });
+
+        let mut duplicate_child = valid_split_dag();
+        duplicate_child.segments[0].child_ids.push(1);
+        assert_invalid(&duplicate_child, |error| {
+            matches!(error, DagValidationError::DuplicateChild { .. })
+        });
+
+        let mut self_edge = valid_split_dag();
+        self_edge.segments[1].parent_ids = vec![1];
+        assert_invalid(&self_edge, |error| {
+            matches!(error, DagValidationError::SelfEdge { .. })
+        });
+
+        let mut dangling_parent = valid_split_dag();
+        dangling_parent.segments[0]
+            .child_ids
+            .retain(|child| *child != 1);
+        dangling_parent.segments[1].parent_ids = vec![999];
+        assert_invalid(&dangling_parent, |error| {
+            matches!(error, DagValidationError::DanglingParent { .. })
+        });
+
+        let mut dangling_child = valid_split_dag();
+        dangling_child.segments[0].child_ids.push(999);
+        assert_invalid(&dangling_child, |error| {
+            matches!(error, DagValidationError::DanglingChild { .. })
+        });
+
+        let mut non_reciprocal = valid_split_dag();
+        non_reciprocal.segments[1].parent_ids.clear();
+        assert_invalid(&non_reciprocal, |error| {
+            matches!(error, DagValidationError::NonReciprocalEdge { .. })
+        });
+
+        let mut epoch_mismatch = valid_split_dag();
+        epoch_mismatch.segments[1].created_at_epoch = 0;
+        assert_invalid(&epoch_mismatch, |error| {
+            matches!(error, DagValidationError::EdgeEpochMismatch { .. })
+        });
+
+        let cycle = dag_from_segments(
+            1,
+            vec![
+                info(0, 0, 65_535, &[], &[]),
+                sealed_info(10, 0, 65_535, &[11], &[11], 1, 1),
+                sealed_info(11, 0, 65_535, &[10], &[10], 1, 1),
+            ],
         );
+        assert_invalid(&cycle, |error| matches!(error, DagValidationError::Cycle));
+    }
+
+    #[test]
+    fn dag_validation_rejects_invalid_states_epochs_and_descriptors() {
+        let mut invalid_range = dag_from_segments(0, vec![info(0, 0, 65_535, &[], &[])]);
+        invalid_range.segments[0].hash_end = 65_536;
+        assert_invalid(&invalid_range, |error| {
+            matches!(error, DagValidationError::InvalidDescriptor { .. })
+        });
+
+        let mut unknown_state = dag_from_segments(0, vec![info(0, 0, 65_535, &[], &[])]);
+        unknown_state.segments[0].state = 99;
+        assert_invalid(&unknown_state, |error| {
+            matches!(error, DagValidationError::InvalidDescriptor { .. })
+        });
+
+        let mut empty_legacy = dag_from_segments(0, vec![info(0, 0, 65_535, &[], &[])]);
+        empty_legacy.segments[0].legacy_topic_name = Some(String::new());
+        assert_invalid(&empty_legacy, |error| {
+            matches!(error, DagValidationError::InvalidDescriptor { .. })
+        });
+
+        let created_after = dag_from_segments(0, vec![child_info(0, 0, 65_535, &[], 1)]);
+        assert_invalid(&created_after, |error| {
+            matches!(error, DagValidationError::CreatedAfterLayout { .. })
+        });
+
+        let mut active_with_seal = dag_from_segments(1, vec![info(0, 0, 65_535, &[], &[])]);
+        active_with_seal.segments[0].sealed_at_epoch = Some(1);
+        assert_invalid(&active_with_seal, |error| {
+            matches!(error, DagValidationError::ActiveWithSealEpoch { .. })
+        });
+
+        let mut active_with_children = dag_from_segments(1, vec![info(0, 0, 65_535, &[], &[])]);
+        active_with_children.segments[0].child_ids.push(1);
+        assert_invalid(&active_with_children, |error| {
+            matches!(error, DagValidationError::ActiveWithChildren { .. })
+        });
+
+        let mut sealed_without_epoch = dag_from_segments(1, vec![info(0, 0, 65_535, &[], &[])]);
+        sealed_without_epoch.segments[0].state = pb::SegmentState::Sealed as i32;
+        assert_invalid(&sealed_without_epoch, |error| {
+            matches!(error, DagValidationError::SealedWithoutEpoch { .. })
+        });
+
+        let invalid_seal = dag_from_segments(2, vec![sealed_info(0, 0, 65_535, &[], &[], 2, 1)]);
+        assert_invalid(&invalid_seal, |error| {
+            matches!(error, DagValidationError::InvalidSealEpoch { .. })
+        });
+    }
+
+    #[test]
+    fn dag_validation_enforces_bounds_without_large_fixtures() {
+        let dag = valid_split_dag();
+        let encoded_size = dag.encoded_len();
+
+        let error = DagSnapshot::try_from_pb_with_limits(
+            &dag,
+            DagLimits {
+                serialized_size: encoded_size - 1,
+                ..DagLimits::default()
+            },
+        )
+        .expect_err("serialized size bound");
+        assert!(matches!(error, DagValidationError::SerializedSize { .. }));
+
+        for (limits, expected) in [
+            (
+                DagLimits {
+                    segments: 2,
+                    ..DagLimits::default()
+                },
+                "segments",
+            ),
+            (
+                DagLimits {
+                    edges: 0,
+                    ..DagLimits::default()
+                },
+                "edges",
+            ),
+            (
+                DagLimits {
+                    depth: 0,
+                    ..DagLimits::default()
+                },
+                "depth",
+            ),
+        ] {
+            let error =
+                DagSnapshot::try_from_pb_with_limits(&dag, limits).expect_err("bound must reject");
+            assert_eq!(
+                match error {
+                    DagValidationError::SegmentCount { .. } => "segments",
+                    DagValidationError::EdgeCount { .. } => "edges",
+                    DagValidationError::Depth { .. } => "depth",
+                    other => panic!("unexpected bounds error: {other:?}"),
+                },
+                expected
+            );
+        }
+
+        let error = DagSnapshot::try_from_pb_with_limits(
+            &dag,
+            DagLimits {
+                segments: 3,
+                ..DagLimits::default()
+            },
+        )
+        .expect("three segments and placements fit");
+        assert_eq!(error.segments().len(), 3);
+
+        let mut placement_heavy = dag.clone();
+        placement_heavy.segment_brokers.push(address(99));
+        let error = DagSnapshot::try_from_pb_with_limits(
+            &placement_heavy,
+            DagLimits {
+                segments: 3,
+                ..DagLimits::default()
+            },
+        )
+        .expect_err("placement count checked before dangling id");
+        assert!(matches!(error, DagValidationError::PlacementCount { .. }));
+    }
+
+    #[test]
+    fn dag_validation_enforces_split_merge_and_active_leaf_coverage() {
+        let mut invalid_split = valid_split_dag();
+        invalid_split.segments[1].hash_end = 32_766;
+        assert_invalid(&invalid_split, |error| {
+            matches!(error, DagValidationError::InvalidSplitCoverage { .. })
+        });
+
+        let mut invalid_merge = valid_merge_dag();
+        invalid_merge.segments[2].hash_end = 65_534;
+        assert_invalid(&invalid_merge, |error| {
+            matches!(error, DagValidationError::InvalidMergeCoverage { .. })
+        });
+
+        let conflicting = dag_from_segments(
+            1,
+            vec![
+                sealed_info(0, 0, 32_767, &[], &[2, 3], 0, 1),
+                sealed_info(1, 32_768, 65_535, &[], &[3], 0, 1),
+                child_info(2, 0, 16_383, &[0], 1),
+                child_info(3, 16_384, 65_535, &[0, 1], 1),
+            ],
+        );
+        assert_invalid(&conflicting, |error| {
+            matches!(error, DagValidationError::ConflictingTopology { .. })
+        });
+
+        let gap = dag_from_segments(
+            0,
+            vec![
+                info(0, 0, 32_766, &[], &[]),
+                info(1, 32_768, 65_535, &[], &[]),
+            ],
+        );
+        assert_invalid(&gap, |error| {
+            matches!(
+                error,
+                DagValidationError::ActiveCoverageDiscontinuity { .. }
+            )
+        });
+
+        let overlap = dag_from_segments(
+            0,
+            vec![
+                info(0, 0, 32_768, &[], &[]),
+                info(1, 32_768, 65_535, &[], &[]),
+            ],
+        );
+        assert_invalid(&overlap, |error| {
+            matches!(
+                error,
+                DagValidationError::ActiveCoverageDiscontinuity { .. }
+            )
+        });
+
+        let short = dag_from_segments(0, vec![info(0, 0, 65_534, &[], &[])]);
+        assert_invalid(&short, |error| {
+            matches!(error, DagValidationError::ActiveCoverageEnd { .. })
+        });
+
+        let none = dag_from_segments(1, vec![sealed_info(0, 0, 65_535, &[], &[], 0, 1)]);
+        assert_invalid(&none, |error| {
+            matches!(error, DagValidationError::NoActiveSegments)
+        });
+    }
+
+    fn assignment(epoch: u64, id: u64, start: u32, end: u32) -> ConsumerAssignment {
+        let range = KeyRange::new(start, end).expect("test assignment range");
+        ConsumerAssignment::try_from_pb(
+            &pb::ScalableConsumerAssignment {
+                layout_epoch: epoch,
+                segments: vec![pb::ScalableAssignedSegment {
+                    segment_id: id,
+                    hash_start: start,
+                    hash_end: end,
+                    segment_topic: crate::canonical_segment_topic(
+                        "topic://public/default/scaled",
+                        range,
+                        SegmentId(id),
+                    )
+                    .expect("canonical attachment"),
+                }],
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("valid assignment value")
+    }
+
+    #[test]
+    fn dag_attachment_validation_covers_epoch_membership_range_and_legacy() {
+        let snapshot = DagSnapshot::try_from_pb(&valid_split_dag()).expect("snapshot");
+        assert_eq!(
+            snapshot.validate_assignment(&assignment(2, 1, 0, 32_767)),
+            Err(AttachmentError::EpochMismatch {
+                assignment: 2,
+                dag: 1,
+            })
+        );
+        assert_eq!(
+            snapshot.validate_assignment(&assignment(1, 99, 0, 65_535)),
+            Err(AttachmentError::UnknownSegment {
+                segment_id: SegmentId(99),
+            })
+        );
+        assert_eq!(
+            snapshot.validate_assignment(&assignment(1, 1, 0, 32_768)),
+            Err(AttachmentError::RangeMismatch {
+                segment_id: SegmentId(1),
+            })
+        );
+
+        let mut legacy = info(0, 0, 65_535, &[], &[]);
+        legacy.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
+        let legacy =
+            DagSnapshot::try_from_pb(&dag_from_segments(0, vec![legacy])).expect("legacy snapshot");
+        assert_eq!(
+            legacy.validate_assignment(&assignment(0, 0, 0, 65_535)),
+            Err(AttachmentError::LegacySegment {
+                segment_id: SegmentId(0),
+            })
+        );
+    }
+
+    #[test]
+    fn ordering_eligibility_is_transitive_across_split_then_merge() {
+        let dag = dag_from_segments(
+            2,
+            vec![
+                sealed_info(0, 0, 65_535, &[], &[1, 2], 0, 1),
+                sealed_info(1, 0, 32_767, &[0], &[3], 1, 2),
+                sealed_info(2, 32_768, 65_535, &[0], &[3], 1, 2),
+                child_info(3, 0, 65_535, &[1, 2], 2),
+            ],
+        );
+        let snapshot = DagSnapshot::try_from_pb(&dag).expect("deep valid DAG");
+        assert_eq!(
+            snapshot.topological_order(),
+            &[SegmentId(0), SegmentId(1), SegmentId(2), SegmentId(3)]
+        );
+        let owned = BTreeSet::from([SegmentId(0), SegmentId(1), SegmentId(2), SegmentId(3)]);
+        let completed = BTreeSet::from([SegmentId(0), SegmentId(1)]);
+        assert_eq!(
+            snapshot.ordering_eligibility(SegmentId(3), OrderingMode::Strict, &owned, &completed,),
+            Ok(OrderingEligibility::Blocked {
+                incomplete_ancestors: vec![SegmentId(2)],
+                broker_managed_ancestors: Vec::new(),
+            })
+        );
+        let completed = BTreeSet::from([SegmentId(0), SegmentId(1), SegmentId(2)]);
+        assert_eq!(
+            snapshot.ordering_eligibility(SegmentId(3), OrderingMode::Strict, &owned, &completed,),
+            Ok(OrderingEligibility::Eligible)
+        );
+
+        let only_child = BTreeSet::from([SegmentId(3)]);
+        assert!(matches!(
+            snapshot.ordering_eligibility(
+                SegmentId(3),
+                OrderingMode::Strict,
+                &only_child,
+                &BTreeSet::new(),
+            ),
+            Err(OrderingError::OrderingUnprovable { ancestors, .. })
+                if ancestors == vec![SegmentId(0), SegmentId(1), SegmentId(2)]
+        ));
+        assert!(matches!(
+            snapshot.ordering_eligibility(
+                SegmentId(3),
+                OrderingMode::BrokerManaged,
+                &only_child,
+                &BTreeSet::new(),
+            ),
+            Ok(OrderingEligibility::BrokerManaged { remote_ancestors })
+                if remote_ancestors == vec![SegmentId(0), SegmentId(1), SegmentId(2)]
+        ));
+    }
+
+    #[test]
+    fn pruned_ancestry_is_unprovable_in_both_modes() {
+        let dag = dag_from_segments(2, vec![child_info(3, 0, 65_535, &[], 2)]);
+        let snapshot = DagSnapshot::try_from_pb(&dag).expect("pruned root is structurally valid");
+        for mode in [OrderingMode::Strict, OrderingMode::BrokerManaged] {
+            assert_eq!(
+                snapshot.ordering_eligibility(
+                    SegmentId(3),
+                    mode,
+                    &BTreeSet::from([SegmentId(3)]),
+                    &BTreeSet::new(),
+                ),
+                Err(OrderingError::OrderingUnprovable {
+                    segment_id: SegmentId(3),
+                    ancestors: vec![SegmentId(3)],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_replacement_is_atomic_and_stops_delivery_state_change() {
+        let mut session = resolved_session();
+        let before = session.validated_snapshot().cloned();
+        let topic_before = session.resolved_topic_name().map(str::to_owned);
+        let mut invalid = valid_split_dag();
+        invalid.epoch = 2;
+        invalid.segments[1].hash_end = 32_766;
+        let update = pb::CommandScalableTopicUpdate {
+            session_id: 7,
+            dag: Some(invalid),
+            error: None,
+            message: None,
+            resolved_topic_name: Some("topic://other/ns/topic".to_owned()),
+        };
+        assert!(matches!(
+            session.handle_update(&update),
+            Err(DagError::InvalidSnapshot(
+                DagValidationError::InvalidSplitCoverage { .. }
+            ))
+        ));
+        assert_eq!(session.validated_snapshot(), before.as_ref());
+        assert_eq!(session.resolved_topic_name(), topic_before.as_deref());
     }
 }

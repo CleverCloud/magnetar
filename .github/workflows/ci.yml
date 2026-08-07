@@ -454,12 +454,12 @@ jobs:
     # SIM_COVERAGE_EXCLUDE_FRAGMENTS in xtask/src/main.rs, which is the
     # authority). Note what that does NOT cover: the bail is not keyed on
     # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
-    # sim run never compiles — the façade, magnetar-admin, magnetarctl —
-    # still pays the full instrumented build and then prints those files as
-    # advisory `not gated`. Measured over the last 40 merged PRs: 30%
-    # short-circuit, 60% build and can produce a verdict, 10% build for a
-    # verdict that is impossible. Keeping that 10% is deliberate — bailing
-    # early would suppress the `not gated` report ADR-0088 exists to print.
+    # sim run never compiles — magnetar-admin, magnetarctl, or another package
+    # outside the eight-package closure — still pays the full instrumented
+    # build and then prints those files as advisory `not gated`. The façade
+    # and fakes are compiled and hard-gated through the differential aggregate
+    # suites. The older 30/60/10 measurement predates that closure expansion
+    # and is not used to characterize the current job.
     runs-on: ubuntu-latest
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
@@ -529,7 +529,7 @@ jobs:
 
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its
   # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron
-  # schedule with 16 freshly-generated random seeds in parallel. Per
+  # schedule with 128 freshly-generated random seeds in parallel. Per
   # ADR-0036, fixed seeds in per-PR / per-push CI are useless — they
   # always cover the same scheduling — while random seeds over time
   # cover the seed space much better. The regular `test` job above

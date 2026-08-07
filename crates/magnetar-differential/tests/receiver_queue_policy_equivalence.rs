@@ -347,8 +347,6 @@ fn lock_and_run_busy(conn: &mut Connection, t0: Instant) -> BusyReaction {
                     partition: -1,
                     batch_index: -1,
                     batch_size: -1,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),

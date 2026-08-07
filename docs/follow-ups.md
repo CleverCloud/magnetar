@@ -6,7 +6,7 @@ Each entry lists the gap, the reason it stays open, and (where actionable) a `/g
 For the public-facing parity status, see the [parity matrix in the README](../README.md#java-client-parity-matrix).
 
 This file is the **single source of truth** for what is intentionally deferred or blocked.
-Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
+Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
 When a PR closes an item, the entry is **removed** (git log + the ADR / docs file carry the post-implementation reference); partially-closed items are trimmed to their remaining open residual.
 
@@ -20,69 +20,27 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                     | Status                   |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)           | ⚡ ready to dispatch     |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                         | 🧠 needs design decision |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)     | ⚡ ready to dispatch     |
-| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load) | ⚡ ready to dispatch     |
+| #   | Item                                                                                                                                                    | Status                 |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| 16  | [PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts](#16-pip-460-upstream-assignment-lifecycle-dag-ordering-and-proxy-contracts) | 🔗 blocked on upstream |
 
 ---
 
-## 11. `scalable_stream_consumer` is uncallable on the tokio engine
+## 16. PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts
 
-**Gap.** `PulsarClient::scalable_stream_consumer` is bound `where E::ClientState: Clone`, and **neither** engine's client implements `Clone` — not `magnetar_runtime_tokio::Client`, nor `magnetar_runtime_moonpool::Client<P>`.
-The method therefore resolves on no engine at all, and no caller has ever constructed a `StreamConsumer`.
-It went unnoticed because the four in-process test layers drive `magnetar_proto::Connection` directly and the e2e bodies were stubs until [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md); the e2e written against a real broker is what surfaced it.
+**Gap.** Four contracts needed for full PIP-460 parity are absent, incomplete, or undocumented in both Pulsar 5.0.0-M1 and the inspected current `master` implementation:
 
-**Why it stays open.** The fix is a small API decision rather than a bug fix: either make both clients cheap-clone (each is already `Arc`-backed internally, so this is close to a `derive`), or drop the `Clone` bound and have `StreamConsumer` hold a borrow or an `Arc` of the client. Both change a published signature, so it wants a deliberate choice rather than the first thing that compiles.
+1. Different consumer assignments may carry the same `layout_epoch`, but the wire has no assignment generation, controller term, or cross-connection fencing rule ([apache/pulsar#26273](https://github.com/apache/pulsar/issues/26273)).
+2. A pooled Java V5 consumer has no wire unregister command; logical close removes only the local callback and can leave durable broker membership indefinitely while another pool user keeps the connection alive ([apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272)).
+3. The broker's assignment barrier gates active direct children but does not establish the complete PIP-460 ordering contract for sealed intermediate segments, deep DAGs, merge, or cursor rewind ([apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274)).
+4. Proxy-any-broker controller registration appears to select an arbitrary broker even though scalable consumer registration is leader-only, and the upstream proxy e2e exercises `QueueConsumer`, which never sends that command ([apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275)).
 
-**Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same wire path `StreamConsumer` wraps. `crates/magnetar/tests/e2e_scalable_topic.rs` uses exactly that.
+**Interim Magnetar contract.** [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) fences callbacks with a local connection incarnation, defaults to a strict barrier where local ownership history can prove every ancestor complete, reports cross-member ancestry as unprovable, documents pooled close as local-only, reuses the already-authenticated direct bootstrap when M1 has not published a controller URL, and fails closed when a published controller authority cannot be routed directly or registration arrives through a proxy target.
+An explicit broker-managed compatibility mode may rely on M1 for ancestry owned by another member, but it does not claim the stronger local ordering guarantee.
+It does not invent protocol fields or claim those local mechanisms settle the distributed contract.
 
-## 12. PIP-460 per-segment consumer fan-out
-
-**Gap.** A registered scalable consumer receives its [`ConsumerAssignment`](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the `segment://` topics it owns — and the client surfaces every rebalance, but nothing attaches an ordinary consumer to those segment topics and merges their streams.
-`StreamConsumer` observes the layout; it does not yet deliver messages.
-
-**Why it stays open.** Needs a design decision on ordering across segments, on how per-segment cursors interact with the single subscription name, and on what happens to in-flight messages at a rebalance. `QueueConsumer` and `CheckpointConsumer` sit behind the same decision, and ADR-0093 deliberately left all three out of scope.
-
-## 14. `check-sim-coverage` can report over artifacts it did not build
-
-**Gap.** [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) split the gate into an execution step and a re-export step with **different scopes**.
-Execution passes `-p magnetar-runtime-moonpool -p magnetar-differential`, and `cargo llvm-cov`'s `-p` also selects which packages get _cleaned_.
-The report then covers all six of `SIM_COVERAGE_REPORT_PACKAGES`, so `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-auth-athenz` and `magnetar-auth-sasl` are re-exported from object files no step in the current pass is guaranteed to have produced.
-CI compounds it: `Swatinem/rust-cache@v2` in the `check-sim-coverage` job runs unconfigured, so it archives `target/` — including `target/llvm-cov-target`, which its workspace-artifact pruning does not know about.
-
-**Why it stays open.** It was investigated as the suspected cause of the PR #391 false red and **refuted**: `cargo llvm-cov clean --workspace` followed by a cold `CARGO_INCREMENTAL=0` run reproduced the failing report exactly (81 `SF:` records, `DA:271,0`).
-The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
-So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
-
-**Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
-Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
-
-## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
-
-**Observed.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bounded-cancellable-driver-write.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
-
-**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so its 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. A paused-clock test on a single thread should be deterministic, and this one is not: it depends on host load.
-
-**Hypothesis, not conclusion — clock-domain mismatch.** The driver computes its write deadline on the **real** clock: `use std::time::Instant` (`driver.rs:51`), `write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout)` (`driver.rs:1394`), `deadline.saturating_duration_since(Instant::now())` (`driver.rs:1682`). `tokio::time::pause()` advances tokio's timer clock; it does not advance `std::time::Instant`. So the harness measures its margin in virtual time while the code under test measures its deadline in real time, and the two can be raced against each other by host load. That is consistent with every observation above and it is what should be investigated first.
-
-It is **not proven**. This entry previously asserted "a real thread, a `spawn_blocking`, or a lock held across an await"; none of those was verified, and the mixed clock domains are a better-supported explanation. Whoever picks this up should confirm the mechanism before fixing it, not inherit this paragraph as fact.
-
-**Measured 2026-08-04**, on `feat/pip-460-upstream-wire`:
-
-| condition                                                                                                    | result         |
-| ------------------------------------------------------------------------------------------------------------ | -------------- |
-| inside `cargo test --workspace --all-features` while a full instrumented coverage rebuild saturated 16 cores | FAILED         |
-| 3 isolated runs, load average still ~13                                                                      | 1 FAILED, 2 ok |
-| 30 isolated runs of the test binary at idle                                                                  | 0/30 failed    |
-
-**Ancestry: inferred, not measured.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin, and the three deadline lines above are byte-identical to `origin/main`; every change `feat/pip-460-upstream-wire` makes to `driver.rs` is a `#[cfg(feature = "scalable-topics")]` addition. So both the test and the suspected mechanism predate that branch. It has **not** been reproduced on `origin/main` under equivalent load, which is what would actually establish "pre-existing" — until someone does that, this is a well-supported inference and no more. CI has not reproduced it on either branch.
-
-**Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
-
-**Do not** fix this by widening the 90-second margin. The margin is virtual; widening it makes the race less likely to be observed without changing anything real, which is the failure mode [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) and the `lookup_error_propagation` correction both exist to avoid.
+**Why it stays open.** Closing these gaps requires an authoritative upstream answer, tests, and potentially a released Pulsar wire change.
+If a response requires new fields or commands, Magnetar updates its vendored proto only from a tagged upstream revision under ADR-0026 §D4; no hand-maintained projection is acceptable after the failure recorded by ADR-0093.
 
 ## Notes on this file
 
@@ -93,5 +51,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md) and §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md). §11 and §12 were both surfaced by that work: the first is dispatch-ready, the second needs a design decision. §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines; its number is retired, which is why the entry added here is §14.
+§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §11 and §12 with [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), §14 with [ADR-0096](../specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md), and §15 with [ADR-0097](../specs/adr/0097-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

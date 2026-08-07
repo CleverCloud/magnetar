@@ -43,6 +43,8 @@ impl<P: Providers> PulsarClient<MoonpoolEngine<P>> {
         Self {
             inner: magnetar_runtime_moonpool::Client::from_parts(shared, driver),
             memory_limit: None,
+            #[cfg(feature = "scalable-topics")]
+            transactions: Arc::new(crate::transaction::TransactionCoordinator::default()),
         }
     }
 
@@ -63,6 +65,8 @@ impl<P: Providers> PulsarClient<MoonpoolEngine<P>> {
                 shared, driver, providers,
             ),
             memory_limit: None,
+            #[cfg(feature = "scalable-topics")]
+            transactions: Arc::new(crate::transaction::TransactionCoordinator::default()),
         }
     }
 
@@ -75,6 +79,8 @@ impl<P: Providers> PulsarClient<MoonpoolEngine<P>> {
         Self {
             inner: client,
             memory_limit: None,
+            #[cfg(feature = "scalable-topics")]
+            transactions: Arc::new(crate::transaction::TransactionCoordinator::default()),
         }
     }
 

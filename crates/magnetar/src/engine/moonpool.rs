@@ -160,6 +160,8 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsA
                 session_id: l.session_id,
                 resolved_topic_name: l.resolved_topic_name,
                 controller_broker_url: l.controller_broker_url,
+                controller_broker_url_tls: l.controller_broker_url_tls,
+                snapshot: l.snapshot,
                 segments: l.segments,
                 epoch: l.epoch,
             })
@@ -240,6 +242,427 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsA
     }
 }
 
+#[cfg(feature = "scalable-topics")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> super::SegmentSubscriberApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    type StreamConsumer = magnetar_runtime_moonpool::StreamConsumer<P>;
+
+    fn subscribe_stream_consumer(
+        &self,
+        options: super::StreamConsumerOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Self::StreamConsumer, crate::scalable::StreamConsumerError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let subscriber = magnetar_runtime_moonpool::Client::segment_subscriber(self)
+                .map_err(|error| crate::scalable::StreamConsumerError::engine("moonpool", error))?;
+            subscriber
+                .subscribe_stream_consumer(magnetar_runtime_moonpool::StreamConsumerOptions {
+                    topic: options.topic,
+                    subscription: options.subscription,
+                    consumer_name: options.consumer_name,
+                    schema: options.schema,
+                    receiver_budget: options.receiver_budget,
+                    ordering_mode: options.ordering_mode,
+                })
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> super::StreamConsumerBackend
+    for magnetar_runtime_moonpool::StreamConsumer<P>
+{
+    fn receive(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<super::RawStreamMessage, crate::scalable::StreamConsumerError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let message = magnetar_runtime_moonpool::StreamConsumer::receive(self)
+                .await
+                .map_err(map_stream_consumer_error)?;
+            Ok(super::RawStreamMessage {
+                message: message.message,
+                token: message.token,
+            })
+        })
+    }
+
+    fn receive_batch(
+        &self,
+        policy: crate::scalable::BatchReceivePolicy,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<super::RawStreamMessage>,
+                        crate::scalable::StreamConsumerError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::receive_batch(
+                self,
+                policy.max_messages(),
+                policy.max_bytes(),
+                policy.max_wait(),
+            )
+            .await
+            .map(|messages| {
+                messages
+                    .into_iter()
+                    .map(|message| super::RawStreamMessage {
+                        message: message.message,
+                        token: message.token,
+                    })
+                    .collect()
+            })
+            .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn restore_messages(&self, messages: Vec<super::RawStreamMessage>) {
+        let result = magnetar_runtime_moonpool::StreamConsumer::restore_deliveries(
+            self,
+            messages
+                .into_iter()
+                .map(|message| magnetar_runtime_moonpool::StreamConsumerMessage {
+                    message: message.message,
+                    token: message.token,
+                })
+                .collect(),
+        );
+        if let Err(error) = result {
+            magnetar_runtime_moonpool::StreamConsumer::delivery_restoration_failed(self, &error);
+        }
+    }
+
+    fn get_schema<'a>(
+        &'a self,
+        source: &'a magnetar_proto::SegmentSource,
+        version: Option<bytes::Bytes>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        magnetar_proto::pb::Schema,
+                        crate::scalable::StreamConsumerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::get_schema(self, source, version)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge(self, token)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge_cumulative<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_cumulative(self, token)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge_positions<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_positions(self, positions)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge_batch<'a>(
+        &'a self,
+        tokens: Vec<&'a magnetar_proto::DeliveryToken>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_batch(self, &tokens)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn negative_acknowledge(
+        &self,
+        token: &magnetar_proto::DeliveryToken,
+    ) -> Result<(), crate::scalable::StreamConsumerError> {
+        magnetar_runtime_moonpool::StreamConsumer::negative_acknowledge(self, token)
+            .map_err(map_stream_consumer_error)
+    }
+
+    fn acknowledge_in_transaction<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_in_transaction(
+                self, token, txn_id,
+            )
+            .await
+            .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge_cumulative_in_transaction<'a>(
+        &'a self,
+        token: &'a magnetar_proto::DeliveryToken,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_cumulative_in_transaction(
+                self, token, txn_id,
+            )
+            .await
+            .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn acknowledge_positions_in_transaction<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::acknowledge_positions_in_transaction(
+                self, positions, txn_id,
+            )
+            .await
+            .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn delivered_position(&self) -> magnetar_proto::PositionVector {
+        magnetar_runtime_moonpool::StreamConsumer::delivered_position(self)
+    }
+
+    fn status(&self) -> crate::scalable::StreamConsumerStatus {
+        map_stream_consumer_status(&magnetar_runtime_moonpool::StreamConsumer::status(self))
+    }
+
+    fn next_event(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<crate::scalable::StreamConsumerEvent>,
+                        crate::scalable::StreamConsumerError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::next_event(self)
+                .await
+                .map(|event| event.map(map_stream_consumer_event))
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn seek_positions<'a>(
+        &'a self,
+        positions: &'a magnetar_proto::PositionVector,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::seek_positions(self, positions)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn transaction_outcome(
+        &self,
+        txn_id: magnetar_proto::TxnId,
+        outcome: crate::scalable::TransactionOutcome,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::transaction_outcome(
+                self,
+                txn_id,
+                map_transaction_outcome(outcome),
+            )
+            .await
+            .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn close(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::StreamConsumer::close(self)
+                .await
+                .map_err(map_stream_consumer_error)
+        })
+    }
+
+    fn close_best_effort(&self) {
+        magnetar_runtime_moonpool::StreamConsumer::close_best_effort(self);
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+fn map_stream_consumer_error(
+    error: magnetar_runtime_moonpool::StreamConsumerError,
+) -> crate::scalable::StreamConsumerError {
+    match error {
+        magnetar_runtime_moonpool::StreamConsumerError::Model(error) => error.into(),
+        magnetar_runtime_moonpool::StreamConsumerError::Client(error) => {
+            crate::scalable::StreamConsumerError::engine("moonpool", error)
+        }
+        magnetar_runtime_moonpool::StreamConsumerError::PartialAcknowledgement {
+            confirmed,
+            failed,
+        } => crate::scalable::StreamConsumerError::PartialAcknowledgement {
+            confirmed,
+            failed: failed
+                .into_iter()
+                .map(|failure| {
+                    crate::scalable::StreamAckFailure::engine(
+                        failure.position,
+                        "moonpool",
+                        failure.message,
+                    )
+                })
+                .collect(),
+        },
+        magnetar_runtime_moonpool::StreamConsumerError::Closed => {
+            crate::scalable::StreamConsumerError::engine("moonpool", "stream consumer is closed")
+        }
+        magnetar_runtime_moonpool::StreamConsumerError::Failed(message) => {
+            crate::scalable::StreamConsumerError::engine("moonpool", message)
+        }
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+fn map_stream_consumer_status(
+    status: &magnetar_proto::StreamConsumerStatusSnapshot,
+) -> crate::scalable::StreamConsumerStatus {
+    let phase = status.phase();
+    crate::scalable::StreamConsumerStatus::new(
+        phase,
+        (phase != magnetar_proto::AggregatePhase::ResyncRequired).then_some(status.layout_epoch()),
+        status.assigned_segments(),
+        status.attached_segments(),
+        status.draining_segments(),
+        status.pending_ownership().to_vec(),
+        status.ordering_unprovable().to_vec(),
+        status.receiver_budget_limit(),
+        status.receiver_budget_used(),
+    )
+}
+
+#[cfg(feature = "scalable-topics")]
+fn map_transaction_outcome(
+    outcome: crate::scalable::TransactionOutcome,
+) -> magnetar_proto::TransactionAcknowledgementOutcome {
+    match outcome {
+        crate::scalable::TransactionOutcome::Committed => {
+            magnetar_proto::TransactionAcknowledgementOutcome::Committed
+        }
+        crate::scalable::TransactionOutcome::Aborted => {
+            magnetar_proto::TransactionAcknowledgementOutcome::Aborted
+        }
+        crate::scalable::TransactionOutcome::Unknown => {
+            magnetar_proto::TransactionAcknowledgementOutcome::Unknown
+        }
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+fn map_stream_consumer_event(
+    event: magnetar_runtime_moonpool::StreamConsumerEvent,
+) -> crate::scalable::StreamConsumerEvent {
+    match event {
+        magnetar_runtime_moonpool::StreamConsumerEvent::AssignmentApplied {
+            layout_epoch,
+            sources,
+        } => crate::scalable::StreamConsumerEvent::AssignmentApplied {
+            layout_epoch,
+            sources,
+        },
+        magnetar_runtime_moonpool::StreamConsumerEvent::SegmentPhaseChanged { source, phase } => {
+            crate::scalable::StreamConsumerEvent::SegmentPhaseChanged { source, phase }
+        }
+        magnetar_runtime_moonpool::StreamConsumerEvent::OrderingUnprovable {
+            segment_id,
+            ancestors,
+        } => crate::scalable::StreamConsumerEvent::OrderingUnprovable {
+            segment_id,
+            ancestors,
+        },
+        magnetar_runtime_moonpool::StreamConsumerEvent::ResyncRequired { reason } => {
+            crate::scalable::StreamConsumerEvent::ResyncRequired { reason }
+        }
+        magnetar_runtime_moonpool::StreamConsumerEvent::TransactionOutcome { txn_id, outcome } => {
+            let outcome = match outcome {
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed => {
+                    crate::scalable::TransactionOutcome::Committed
+                }
+                magnetar_proto::TransactionAcknowledgementOutcome::Aborted => {
+                    crate::scalable::TransactionOutcome::Aborted
+                }
+                magnetar_proto::TransactionAcknowledgementOutcome::Unknown => {
+                    crate::scalable::TransactionOutcome::Unknown
+                }
+            };
+            crate::scalable::StreamConsumerEvent::TransactionOutcome { txn_id, outcome }
+        }
+        magnetar_runtime_moonpool::StreamConsumerEvent::Closed => {
+            crate::scalable::StreamConsumerEvent::Closed
+        }
+    }
+}
+
 /// Map a moonpool-runtime `ScalableEvent` onto the façade's engine-agnostic one.
 #[cfg(feature = "scalable-topics")]
 fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::ScalableEvent {
@@ -248,18 +671,28 @@ fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::Sc
             session_id,
             resolved_topic_name,
             controller_broker_url,
+            controller_broker_url_tls,
+            snapshot,
             segments,
             epoch,
         } => super::ScalableEvent::LookupResolved {
             session_id,
             resolved_topic_name,
             controller_broker_url,
+            controller_broker_url_tls,
+            snapshot,
             segments,
             epoch,
         },
-        magnetar_runtime_moonpool::ScalableEvent::DagUpdated { session_id, delta } => {
-            super::ScalableEvent::DagUpdated { session_id, delta }
-        }
+        magnetar_runtime_moonpool::ScalableEvent::DagUpdated {
+            session_id,
+            delta,
+            snapshot,
+        } => super::ScalableEvent::DagUpdated {
+            session_id,
+            delta,
+            snapshot,
+        },
         magnetar_runtime_moonpool::ScalableEvent::DagChangedDuringConsume {
             session_id,
             reason,
@@ -269,19 +702,31 @@ fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::Sc
         }
         magnetar_runtime_moonpool::ScalableEvent::ConsumerAssigned {
             consumer_id,
+            incarnation,
             assignment,
         } => super::ScalableEvent::ConsumerAssigned {
             consumer_id,
+            incarnation,
             assignment,
         },
-        magnetar_runtime_moonpool::ScalableEvent::AssignmentChanged { consumer_id, delta } => {
-            super::ScalableEvent::AssignmentChanged { consumer_id, delta }
-        }
+        magnetar_runtime_moonpool::ScalableEvent::AssignmentChanged {
+            consumer_id,
+            incarnation,
+            assignment,
+            delta,
+        } => super::ScalableEvent::AssignmentChanged {
+            consumer_id,
+            incarnation,
+            assignment,
+            delta,
+        },
         magnetar_runtime_moonpool::ScalableEvent::ConsumerRejected {
             consumer_id,
+            incarnation,
             reason,
         } => super::ScalableEvent::ConsumerRejected {
             consumer_id,
+            incarnation,
             reason,
         },
         magnetar_runtime_moonpool::ScalableEvent::TopicsChanged { watch_id, change } => {
@@ -410,8 +855,11 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
         Box::pin(async move {
             let request_id = {
                 let mut conn = shared.inner.lock();
-                conn.end_txn(txn, action)
+                conn.end_txn(txn, action).map_err(|err| {
+                    magnetar_runtime_moonpool::ClientError::Other(format!("end_txn: {err}"))
+                })?
             };
+            let _waiter = MoonpoolEndTxnWaiterGuard::new(shared.clone(), txn, action);
             shared.driver_waker.notify_one();
             let outcome = moonpool_request_fut(shared.clone(), request_id).await;
             match outcome {
@@ -426,6 +874,35 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
                 ))),
             }
         })
+    }
+}
+
+struct MoonpoolEndTxnWaiterGuard {
+    shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
+    txn: magnetar_proto::TxnId,
+    action: magnetar_proto::TxnAction,
+}
+
+impl MoonpoolEndTxnWaiterGuard {
+    fn new(
+        shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Self {
+        Self {
+            shared,
+            txn,
+            action,
+        }
+    }
+}
+
+impl Drop for MoonpoolEndTxnWaiterGuard {
+    fn drop(&mut self) {
+        self.shared
+            .inner
+            .lock()
+            .release_end_txn_waiter(self.txn, self.action);
     }
 }
 

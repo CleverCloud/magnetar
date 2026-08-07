@@ -54,6 +54,13 @@ pub struct Consumer {
     pub(crate) close_guard: Arc<ConsumerCloseGuard>,
 }
 
+pub(crate) struct StagedConsumerSeek {
+    request_id: magnetar_proto::RequestId,
+    receiver_queue_size: usize,
+    seek_message_id: Option<String>,
+    seek_timestamp: Option<u64>,
+}
+
 impl Clone for Consumer {
     fn clone(&self) -> Self {
         Self {
@@ -335,6 +342,61 @@ impl Consumer {
         }
     }
 
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) async fn receive_deferred_until_end(
+        &self,
+    ) -> Result<Option<(u64, magnetar_proto::DeferredIncomingMessage)>, ClientError> {
+        match (DeferredReceiveFut {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            slab_key: None,
+            stop_at_end: true,
+        })
+        .await
+        {
+            Ok(message) => Ok(Some(message)),
+            Err(ClientError::EndOfTopic) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn post_process_deferred(
+        &self,
+        message: &mut IncomingMessage,
+    ) -> PostProcessOutcome {
+        let action = self
+            .shared
+            .inner
+            .lock()
+            .consumer_crypto_failure_action(self.handle);
+        post_process_message(message, self.decryptor.as_ref(), action)
+    }
+
+    #[cfg(any(feature = "scalable-topics", test))]
+    pub(crate) fn close_best_effort(&self) {
+        if !self.shared.is_no_driver() && !self.is_closed() {
+            {
+                let mut conn = self.shared.inner.lock();
+                let _ = conn.close_consumer_forget(self.handle, std::time::Instant::now());
+            }
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
+    }
+
+    #[cfg(any(feature = "scalable-topics", test))]
+    pub(crate) fn force_close_best_effort(&self) {
+        if !self.shared.is_no_driver() {
+            {
+                let mut conn = self.shared.inner.lock();
+                let _ = conn.close_consumer_forget(self.handle, std::time::Instant::now());
+            }
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
+    }
+
     /// Acknowledge a single message (individual ack).
     ///
     /// Returns a future that resolves when the broker confirms (`CommandAckResponse`).
@@ -488,6 +550,47 @@ impl Consumer {
         properties: Vec<(String, i64)>,
         txn_id: Option<magnetar_proto::TxnId>,
     ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with_message_id_data(message_ids, ack_type, properties, txn_id, None)
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn ack_stream_component(
+        &self,
+        message_ids: Vec<MessageId>,
+        message_id_data: Vec<pb::MessageIdData>,
+        ack_type: pb::command_ack::AckType,
+        txn_id: Option<magnetar_proto::TxnId>,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with_message_id_data(
+            message_ids,
+            ack_type,
+            Vec::new(),
+            txn_id,
+            Some(message_id_data),
+        )
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn settle_transactional_acks(&self, txn_id: magnetar_proto::TxnId, committed: bool) {
+        self.shared
+            .inner
+            .lock()
+            .settle_transactional_acks(self.handle, txn_id, committed);
+    }
+
+    #[cfg(all(test, feature = "scalable-topics"))]
+    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
+        self.slot.state.lock().last_acked_message_id
+    }
+
+    fn ack_many_with_message_id_data(
+        &self,
+        message_ids: Vec<MessageId>,
+        ack_type: pb::command_ack::AckType,
+        properties: Vec<(String, i64)>,
+        txn_id: Option<magnetar_proto::TxnId>,
+        message_id_data: Option<Vec<pb::MessageIdData>>,
+    ) -> impl Future<Output = Result<(), ClientError>> {
         // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
         tracing::trace!(
             handle = ?self.handle,
@@ -502,16 +605,18 @@ impl Consumer {
         let now = std::time::Instant::now();
         let request_id = {
             let mut conn = shared.inner.lock();
-            conn.ack(
-                self.handle,
-                AckRequest {
-                    message_ids,
-                    ack_type,
-                    properties,
-                    txn_id,
-                },
-                now,
-            )
+            let ack = AckRequest {
+                message_ids,
+                ack_type,
+                properties,
+                txn_id,
+            };
+            match message_id_data {
+                Some(message_id_data) => {
+                    conn.ack_with_message_id_data(self.handle, ack, message_id_data, now)
+                }
+                None => conn.ack(self.handle, ack, now),
+            }
         };
         shared.driver_waker.notify_one();
         async move {
@@ -543,10 +648,34 @@ impl Consumer {
         self.shared.driver_waker.notify_one();
     }
 
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn flow_for_aggregate_with_debt(&self, fresh: u32, debt: Option<(u64, u32)>) {
+        let mut conn = self.shared.inner.lock();
+        let session_epoch = conn.session_epoch();
+        let debt = debt
+            .filter(|(debt_epoch, _)| *debt_epoch == session_epoch)
+            .map_or(0, |(_, permits)| permits);
+        conn.flow_for_aggregate(self.handle, fresh, debt);
+        drop(conn);
+        self.shared.driver_waker.notify_one();
+    }
+
     /// Negatively acknowledge a single message. The broker will redeliver it (subject to
     /// `maxRedeliverCount` and any DLQ policy configured server-side). Fire-and-forget.
     pub fn negative_ack(&self, message_id: MessageId) {
         self.negative_ack_many(vec![message_id]);
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn negative_ack_message_id_data(&self, message_id: pb::MessageIdData) {
+        let mut conn = self.shared.inner.lock();
+        conn.negative_ack_with_message_id_data(
+            self.handle,
+            vec![message_id],
+            std::time::Instant::now(),
+        );
+        drop(conn);
+        self.shared.driver_waker.notify_one();
     }
 
     /// Negatively acknowledge a batch of messages.
@@ -688,6 +817,14 @@ impl Consumer {
         self.seek_inner(SeekTarget::MessageId(message_id)).await
     }
 
+    #[cfg(any(feature = "scalable-topics", test))]
+    pub(crate) fn stage_seek_to_message_id_data(
+        &self,
+        message_id: pb::MessageIdData,
+    ) -> StagedConsumerSeek {
+        self.stage_seek(SeekTarget::MessageIdData(message_id))
+    }
+
     /// Seek this consumer to a specific publish timestamp (millis since the UNIX epoch).
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), ClientError> {
         self.seek_inner(SeekTarget::PublishTime(publish_time_ms))
@@ -708,17 +845,42 @@ impl Consumer {
     }
 
     async fn seek_inner(&self, target: SeekTarget) -> Result<(), ClientError> {
+        let staged = self.stage_seek(target);
+        self.complete_staged_seek(staged).await
+    }
+
+    fn stage_seek(&self, target: SeekTarget) -> StagedConsumerSeek {
         // Snapshot the seek target for the lifecycle record below (`target`
         // moves into `conn.seek`).
         let (seek_message_id, seek_timestamp) = match &target {
             SeekTarget::MessageId(id) => (Some(id.to_string()), None),
+            SeekTarget::MessageIdData(id) => (Some(MessageId::from_pb(id).to_string()), None),
             SeekTarget::PublishTime(ts) => (None, Some(*ts)),
         };
+        let receiver_queue_size = self.slot.state.lock().receiver_queue_size;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.seek(self.handle, target)
         };
         self.shared.driver_waker.notify_one();
+        StagedConsumerSeek {
+            request_id,
+            receiver_queue_size,
+            seek_message_id,
+            seek_timestamp,
+        }
+    }
+
+    pub(crate) async fn complete_staged_seek(
+        &self,
+        staged: StagedConsumerSeek,
+    ) -> Result<(), ClientError> {
+        let StagedConsumerSeek {
+            request_id,
+            receiver_queue_size,
+            seek_message_id,
+            seek_timestamp,
+        } = staged;
         let outcome = RequestFut {
             shared: self.shared.clone(),
             key: PendingOpKey::Request(request_id),
@@ -754,7 +916,9 @@ impl Consumer {
                     {
                         let now = std::time::Instant::now();
                         let mut conn = self.shared.inner.lock();
-                        let _ = conn.initial_flow(self.handle, now);
+                        if receiver_queue_size != 0 {
+                            let _ = conn.initial_flow(self.handle, now);
+                        }
                         conn.redeliver_unacked_all(self.handle);
                     }
                     self.shared.driver_waker.notify_one();
@@ -764,7 +928,7 @@ impl Consumer {
                 // on seek without a `CommandCloseConsumer`, so the engine
                 // re-subscribes, replays the initial flow permits, and asks
                 // for full redelivery.
-                let initial_flow_permits = self.slot.state.lock().receiver_queue_size as u64;
+                let initial_flow_permits = receiver_queue_size as u64;
                 tracing::info!(
                     topic = %self.slot.identity.topic,
                     subscription = %self.slot.identity.subscription,
@@ -1317,7 +1481,7 @@ impl Consumer {
 
 /// Outcome returned by [`post_process_message`].
 #[derive(Debug)]
-enum PostProcessOutcome {
+pub(crate) enum PostProcessOutcome {
     /// The message is ready for the caller (plaintext, or — under `Consume` — ciphertext).
     Deliver,
     /// Decryption failed and the policy is [`magnetar_proto::CryptoFailureAction::Discard`].
@@ -1617,6 +1781,70 @@ impl Future for ReceiveFut {
             }
             return Poll::Ready(Ok(msg));
         }
+    }
+}
+
+/// Raw receive used only by the scalable aggregate. Payload transformation is
+/// deliberately deferred until the aggregate has reserved its complete
+/// workspace in `StreamConsumerModel`.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug)]
+struct DeferredReceiveFut {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    slab_key: Option<usize>,
+    stop_at_end: bool,
+}
+
+#[cfg(feature = "scalable-topics")]
+impl Drop for DeferredReceiveFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            self.shared
+                .inner
+                .lock()
+                .cancel_consumer_receive_waker(self.handle, key);
+        }
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+impl Future for DeferredReceiveFut {
+    type Output = Result<(u64, magnetar_proto::DeferredIncomingMessage), ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let now = std::time::Instant::now();
+        let mut conn = this.shared.inner.lock();
+        if let Some(message) = conn.pop_deferred_message(this.handle, now) {
+            let session_epoch = conn.session_epoch();
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            drop(conn);
+            this.shared.driver_waker.notify_one();
+            return Poll::Ready(Ok((session_epoch, message)));
+        }
+        if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        if this.stop_at_end && conn.consumer_reached_end_of_topic(this.handle) {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(this.handle, key);
+            }
+            return Poll::Ready(Err(ClientError::EndOfTopic));
+        }
+        if let Some(key) = this.slab_key.take() {
+            conn.cancel_consumer_receive_waker(this.handle, key);
+        }
+        let key = conn
+            .register_consumer_receive_waker(this.handle, cx.waker().clone())
+            .expect("a non-terminal consumer remains registered while its connection is locked");
+        this.slab_key = Some(key);
+        Poll::Pending
     }
 }
 
@@ -2107,6 +2335,177 @@ mod tests {
         shared
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn seek_waits_for_reattach_before_restoring_flow() {
+        let shared = handshake_complete_shared();
+        let (handle, slot) = {
+            let mut conn = shared.inner.lock();
+            let _ = conn.poll_transmit();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/seek-reattach".to_owned(),
+                subscription: "seek-reattach".to_owned(),
+                receiver_queue_size: 3,
+                ..Default::default()
+            });
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let _ = conn.poll_transmit();
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode initial subscribe success");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish consumer");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+            (handle, slot)
+        };
+        let consumer = Consumer::assemble(shared.clone(), handle, slot, None);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move {
+            task_consumer
+                .seek_to_message(magnetar_proto::MessageId {
+                    ledger_id: 7,
+                    entry_id: 11,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let seek_request_id = {
+            let mut staged = shared.inner.lock().poll_transmit();
+            let mut request_id = None;
+            while !staged.is_empty() {
+                let command = decode_one(&mut staged).expect("decode seek frame").command;
+                if let Some(seek) = command.seek {
+                    request_id = Some(seek.request_id);
+                }
+            }
+            request_id.expect("seek command")
+        };
+        let seek_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: seek_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &seek_success).expect("encode seek success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle seek success");
+        tokio::task::yield_now().await;
+
+        let reattach_request_id = {
+            let mut staged = shared.inner.lock().poll_transmit();
+            let mut request_id = None;
+            while !staged.is_empty() {
+                let command = decode_one(&mut staged)
+                    .expect("decode pre-reattach frame")
+                    .command;
+                assert_ne!(command.r#type, pb::base_command::Type::Flow as i32);
+                assert_ne!(
+                    command.r#type,
+                    pb::base_command::Type::RedeliverUnacknowledgedMessages as i32
+                );
+                if let Some(subscribe) = command.subscribe {
+                    request_id = Some(subscribe.request_id);
+                }
+            }
+            request_id.expect("seek reattach subscribe")
+        };
+        let reattach_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: reattach_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &reattach_success).expect("encode reattach success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle reattach success");
+        shared.event_waker.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("seek completes after reattach")
+            .expect("seek task")
+            .expect("seek succeeds");
+
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut saw_flow = false;
+        let mut saw_redelivery = false;
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged)
+                .expect("decode post-reattach frame")
+                .command;
+            if command.r#type == pb::base_command::Type::Flow as i32 {
+                assert!(!saw_redelivery, "FLOW must precede redelivery");
+                saw_flow = true;
+            }
+            if command.r#type == pb::base_command::Type::RedeliverUnacknowledgedMessages as i32 {
+                assert!(saw_flow, "redelivery must follow restored FLOW");
+                saw_redelivery = true;
+            }
+        }
+        assert!(saw_flow);
+        assert!(saw_redelivery);
+
+        let staged_seek = consumer.stage_seek_to_message_id_data(pb::MessageIdData {
+            ledger_id: 7,
+            entry_id: 12,
+            ..Default::default()
+        });
+        let seek_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: staged_seek.request_id.0,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &seek_success).expect("encode raced seek success");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle raced seek success");
+            let _ = conn.unsubscribe(handle, false);
+        }
+        consumer
+            .complete_staged_seek(staged_seek)
+            .await
+            .expect("a concurrent unsubscribe suppresses seek reattachment");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged)
+                .expect("decode raced seek frame")
+                .command;
+            assert_ne!(
+                command.r#type,
+                pb::base_command::Type::Subscribe as i32,
+                "unsubscribe must suppress seek reattachment"
+            );
+        }
+    }
+
     /// Capture the per-slot Arc for a `handle` known to be in the registry.
     fn consumer_slot_for(
         shared: &std::sync::Arc<ConnectionShared>,
@@ -2587,8 +2986,6 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         });
         assert!(!consumer.is_closed());
     }
@@ -2618,8 +3015,6 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         });
         assert!(!consumer.is_closed());
     }
@@ -2656,8 +3051,6 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let fut = consumer.ack_with_txn(mid, txn);
         let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
@@ -2695,8 +3088,6 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let fut = consumer.ack_cumulative_with_txn(mid, txn);
         let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
@@ -3754,8 +4145,6 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
             payload: Bytes::from_static(b"retryme"),
             metadata: std::sync::Arc::new(magnetar_proto::pb::MessageMetadata::default()),
@@ -3801,11 +4190,9 @@ mod tests {
     /// A consumer with the matching XOR decryptor must deliver the original
     /// plaintext.
     ///
-    /// Has no 1:1 moonpool mirror: the moonpool producer refuses any non-`None`
-    /// compression on send, so the moonpool consumer's `post_process_message`
-    /// has no decompression branch and nothing to reorder. The parity-count
-    /// delta is compensated by `moonpool_helper_handles_encrypted_only_payload`
-    /// on the moonpool side.
+    /// The Moonpool runtime mirrors this inbound path even though its producer
+    /// still refuses compressed sends: broker-authored compressed deliveries
+    /// are valid independently of producer support.
     #[tokio::test(flavor = "current_thread")]
     async fn receive_decrypts_then_decompresses_compressed_encrypted_payload() {
         use magnetar_proto::types::CompressionKind;
@@ -3884,6 +4271,28 @@ mod tests {
              decompress (compressed plaintext → user plaintext); legacy reverse \
              order would have failed at decompress on raw ciphertext"
         );
+
+        let mut uncompressed = magnetar_proto::IncomingMessage {
+            message_id: magnetar_proto::MessageId::EARLIEST,
+            metadata: Arc::new(pb::MessageMetadata {
+                compression: Some(pb::CompressionType::None as i32),
+                ..Default::default()
+            }),
+            single_metadata: None,
+            payload: bytes::Bytes::from_static(b"plain"),
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: Instant::now(),
+        };
+        assert!(matches!(
+            super::post_process_message(
+                &mut uncompressed,
+                None,
+                magnetar_proto::CryptoFailureAction::Fail,
+            ),
+            super::PostProcessOutcome::Deliver
+        ));
+        assert_eq!(uncompressed.payload.as_ref(), b"plain");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3955,5 +4364,9 @@ mod tests {
             Err(ClientError::Closed) => {}
             other => panic!("expected Err(Closed) after local close, got {other:?}"),
         }
+        consumer.close_best_effort();
+        consumer.force_close_best_effort();
+        shared.mark_no_driver();
+        consumer.force_close_best_effort();
     }
 }

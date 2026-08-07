@@ -8,8 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.**
-  The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
+- **BREAKING: the experimental PIP-460 `StreamConsumer` is now an assignment-driven, message-delivering aggregate instead of a layout-only consumer that drops on DAG change.** `PulsarClient::scalable_stream_consumer(topic, Arc<S>)` now returns a schema-generic owned builder requiring `.subscription(...)`; it accepts a stable consumer name, one validated aggregate receive budget, and `OrderingMode::Strict` (the default) or explicit `BrokerManaged`, then registers with the controller and opens one ordinary `Exclusive` child for every assigned `segment://` source.
+  Public runtime clients remain non-`Clone`; the runtimes own an internal `SegmentSubscriber`, while `StreamConsumer<S, E>` is cheap to clone over aggregate state and `StreamMessage<S>` owns `S::Owned`.
+  The aggregate now supports concurrent single and atomic batch receive, source-qualified typed delivery, individual/batch/cumulative/restored-vector ack, nack, transactional ack with commit admission and poison-on-failure, M1-limited vector seek, unbounded-in-time bounded-memory ownership drain, observable pending ownership, incarnation-fenced controller reconnect, direct plaintext/TLS controller routing, and async local close.
+  Pulsar 5.0.0-M1 may omit its controller URL before leader election; controller registration now matches the official V5 client by reusing only the already-authenticated direct bootstrap connection, while missing segment authority, invalid published authority, and proxy-any-broker registration remain fail-closed.
+  Changed equal-epoch assignments apply in one controller incarnation's receive order because `layout_epoch` versions topology rather than membership; exact duplicates are ignored and lower epochs fail closed.
+  Strict mode releases descendants only after every locally provable transitive ancestor is terminal and fully resolved; cross-member ancestry is `OrderingUnprovable`.
+  `BrokerManaged` explicitly delegates only that cross-member proof to M1 and does not promise a total order between independent segments.
+  One manual-FLOW budget covers all children and retiring state, including queue/ledger nodes, canonical-id/source sidecars, position-map nodes, and right-sized selected batch payloads.
+  Tokio and Moonpool both reserve receive work before decrypting and bounded-decompressing inbound LZ4, ZSTD, Snappy, or ZLIB payloads; zlib reads borrowed input into a bounded destination and zstd caps both destination and window, while Moonpool's remaining compression gap is producer-side only.
+  Its exact minimum is `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 13,697,152 bytes`; the default and examples use 16 MiB, and arbitrary additional memory inside user-defined `S::Owned` remains outside the bound.
+  Schema-preparation cancellation restores the same live authority at its original dequeue sequence, transaction-outcome retries resume after completed participant actions without replaying FLOW, and descriptor-changing reassignment upgrades an existing drain before close/reopen so old FLOW is fenced.
+  Resynchronization now fences obsolete child loops before confirmation-bearing teardown, waits for confirmed children and in-flight child opens before controller replacement, and retries replacement registration while M1 retains the old physical member.
+  **Low-level `magnetar-proto` breakage:** the new aggregate model, typed route/incarnation keys, complete atomic DAG validation, inclusive hash ranges `[start,end]` over `0..=65535`, delivery authority, transaction lifecycle, and seek generations replace the old drop-on-change scaffolding.
+  Ordinary `MessageId` has no scalable `segment_id`; scalable identity is the canonical `SegmentSource` carried by `StreamMessageId` and `PositionVector`, serialized in the strict version-1 `MSTR` envelope, while `DeliveryToken` remains process-local. M1 still has no logical unregister, distributed assignment generation, remote ancestor-completion proof, or defined proxy-any-broker controller route; apache/pulsar#26272-#26275 remain open, and close may leave broker membership until the pooled physical connection closes.
+  The sim-coverage report and hard-gated source sets grow from six to exactly eight packages by adding `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` through `magnetar-differential`'s public aggregate tests.
+  Execution remains only `magnetar-runtime-moonpool` plus `magnetar-differential`, so façade Docker e2e targets do not run under coverage and ADR-0096's isolated-artifact behavior is unchanged.
+  A gated function-bearing file with no LCOV `SF:` record now fails even when sibling files reported; genuinely non-executable files remain advisory, and a wholly record-less gated crate still fails.
+  (ADR-0098; supersedes ADR-0031/ADR-0093's surviving drop-on-change and unimplemented-data-plane scope plus ADR-0093 § D5's blanket non-advancing-assignment rejection; ADR-0093's vendored M1 wire and capability negotiation remain binding)
+
+- **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.** The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
   Every consumer instead spoke `pb/scalable_topics.rs`, a hand-encoded projection written while PIP-460 was upstream `Draft`, and nothing in it matched: `BaseCommand` types 80-85 against upstream's 70-78, a `CommandScalableTopicLookupResponse` that does not exist, a separate DAG-watch handshake keyed by a `lookup_token` that does not exist, `SplitEvent` / `MergeEvent` delta frames that do not exist, four segment states against upstream's two, and a fabricated `ProtocolVersion = 22` where upstream gates the feature on `FeatureFlags.supports_scalable_topics` and still tops at `v21`.
   `magnetar-fakes` implemented the same projection, so all four ADR-0024 test layers plus the golden trace were green against bytes no Pulsar broker at any version could parse.
   The vendored proto moves to `v5.0.0-M1` (`8dae0236`), the hand-encoded module is deleted along with the `PB_HAND_MAINTAINED_FILES` carve-out that hid it from `codegen --check`, and the state machine follows the upstream shape: the lookup **is** the watch subscribe, keyed by a client-allocated `session_id`; `CommandScalableTopicUpdate` carries both the initial layout and every pushed one; layouts are whole snapshots ordered by a monotonic `epoch`, with split and merge derived from the `parent_ids` / `child_ids` edges rather than read from event frames; and segment placement is an optional join from the parallel `SegmentBrokerAddress` list.
@@ -20,22 +38,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.**
-  `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
+- **Tokio driver-write deadlines now use Tokio's clock end to end.** ADR-0083 retained one fixed deadline across `select!` reconstruction, but anchored it with `std::time::Instant` and scheduled each expiry with a relative Tokio timer; under paused time the harness clock advanced while the deadline source did not, so a cancelled and reconstructed write could receive almost a fresh budget and the 90-second virtual guard could win under host load.
+  The write-local anchor is now `tokio::time::Instant`, and every reconstructed arm races against that same absolute instant with `tokio::time::timeout_at`.
+  The regression test forces a higher-priority arm to cancel the first stalled write, observes its reconstruction, advances beyond the original deadline but not a fresh one, and requires `Io(TimedOut)` plus disconnection; it passed 128 consecutive repetitions.
+  Proto-facing `std::time::Instant` values and Moonpool's injected clock are unchanged.
+  (ADR-0097; closes `docs/follow-ups.md` §15)
+
+- **`check-sim-coverage` now reports only over artifacts built by its current pass.** The execution phase runs two packages while the report re-exports six, and cargo-llvm-cov 0.8.7's `--no-report` path does not clean first-party objects; a warm local target or restored CI target could therefore contribute stale profiles or objects to an enforcing verdict.
+  Both phases now share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem.
+  Broker-independent artifact injection through LLVM coverage/profdata flag variables is rejected, locked metadata cannot rewrite `Cargo.lock`, final-component symlinks and mount roots fail safely, and the scratch directory is removed on every catchable outcome without masking a primary error.
+  The report remains at `target/sim-coverage.lcov`, but that path is output-only.
+  Cold, back-to-back warm, profile-only, object-only, `ui_test`, and trybuild poison cases prove cached inputs cannot affect the result.
+  (ADR-0096; closes `docs/follow-ups.md` §14)
+
+- **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.** `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
   Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.
   The differential transcript covering it passed locally and timed out on CI before this, which is how the race surfaced.
   (ADR-0093)
 
-- **A scalable-topic watch no longer dies on the broker's own duplicate layout.**
-  `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
+- **A scalable-topic watch no longer dies on the broker's own duplicate layout.** `DagWatchSession::handle_update` treated a layout `epoch` that did not strictly advance as `DagError::NonMonotonic`, and `Connection` closes the session on any update error.
   Pulsar 5.0.0-M1 answers `CommandScalableTopicLookup` with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup opened — so the very first thing a real broker sends after resolving tore the session down, and the client never saw another epoch, the split among them.
-  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open. Only a session mismatch, a broker-side error, or a bodyless update ends a session.
+  A non-advancing epoch is now ignored: `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open.
+  Only a session mismatch, a broker-side error, or a bodyless update ends a session.
   `DagError::NonMonotonic` is removed and `handle_update` returns `Result<Option<DagDelta>, DagError>`; both are behind the default-off `scalable-topics` feature.
-  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it. All four now cover the duplicate.
+  Every scripted test advanced the epoch on each frame, which is why all four layers were green — only the e2e against a real broker caught it.
+  All four now cover the duplicate.
   (ADR-0095, amending ADR-0093 § D2)
 
-- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.**
-  The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
+- **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.** The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
   `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
   The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
   It also failed **open**, crediting a line that never ran when the neighbour it was folded into did, which is the half that matters for a gate whose job is proving patch coverage.
@@ -49,7 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
   Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
   `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
-  An assignment whose `layout_epoch` does not advance is rejected rather than applied: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
+  ADR-0098 later amends the initial epoch guard: changed equal-epoch assignments are valid membership updates, exact duplicates are ignored, and only lower epochs fail closed.
   `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
   `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
   `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
@@ -146,8 +176,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The façade and both engines' `Consumer` surfaces are unaffected.
   (docs/follow-ups.md §4; ADR-0084, amends ADR-0071's arming premise)
 
-- **A dial whose handshake completed too quickly hung for the full `operation_timeout` instead of returning:** `ConnectedFut` — the future behind `wait_connected`, which every bootstrap and every pool dial parks on until the broker answers CONNECT — enrolled for the driver's wakeup from a _spawned helper task_.
-  The driver announces handshake completion with `notify_waiters()`, which stores no permit (ARCHITECTURE.md § "Enroll-before-drain wakeup discipline"), so the helper only enrolled once the runtime scheduled it and a pulse that landed first was lost outright.
+- **A dial whose handshake completed too quickly hung for the full `operation_timeout` instead of returning:** `ConnectedFut` — the future behind `wait_connected`, which every bootstrap and every pool dial parks on until the broker answers CONNECT — enrolled for the driver's wakeup from a _spawned helper task_. The driver announces handshake completion with `notify_waiters()`, which stores no permit (ARCHITECTURE.md § "Enroll-before-drain wakeup discipline"), so the helper only enrolled once the runtime scheduled it and a pulse that landed first was lost outright.
   A freshly dialled connection is silent after CONNECTED, so nothing ever pulsed again and the wait burned the whole 30 s `operation_timeout`, surfacing at the caller as `Other("open_producer: timed out: producer target resolution exceeded operation_timeout")`.
   Losing the race needs CPU contention, which is why it reproduced on 4-vCPU CI runners and not on an idle dev box: it hit 5 of the 10 dependabot runs off base `5d6c39f` on 2026-07-22, each in a different, unrelated e2e test.
   `ConnectedFut` now owns an `OwnedNotified` on `event_waker` and polls it BEFORE inspecting connection state, exactly like its sibling `EventWaitFut` and the same discipline already applied to `await_reconnect_or_terminal`, the PIP-33 marker accessor, and the subscribe-readiness waiter; the event drain also narrows to `poll_event_if(Connected | Closed)` so unrelated events stay queued for their own waiter.
@@ -299,8 +328,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `magnetarctl admin topics stats <topic>` emits all of them in its JSON output, so `jq '.msgRateIn'` (and the out-rate, throughput, and storage/backlog sizes) now work for both non-partitioned and partitioned topics.
   Fields default to `0` when a broker release omits them.
   (#293)
-- **`magnetarctl` message-id output — `segmentId` no longer dropped:** under the `scalable-topics` feature, `topics terminate` and `topics get-message-id-by-index` now surface the PIP-460 `segmentId` (JSON `null` when absent) instead of silently omitting it; both commands share one `message_id_to_json` renderer so their shapes can't drift.
-  (#293)
+- **Historical PIP-460 projection correction for `magnetarctl` message-id output:** the 1.1.1 implementation attempted to surface a projected `segmentId`, but the Pulsar 5.0.0-M1 `MessageIdData` that ADR-0093 later vendored has no such field, so ordinary `MessageId` and the current `topics terminate` / `topics get-message-id-by-index` JSON do not carry it.
+  Scalable delivery identity now lives in `StreamMessageId` and `PositionVector`, each qualified by its canonical `SegmentSource`; the old renderer claim must not be read as current API documentation.
+  (#293; corrected by ADR-0093 and ADR-0098)
 
 ### Changed
 

@@ -21,6 +21,8 @@ workspace = true
 # trace equivalence tests (tokio ↔ moonpool DagWatch event-stream parity).
 # Propagates the proto wire surface plus the engine `ScalableTopicsApi` impls.
 scalable-topics = [
+    "magnetar-driver/scalable-topics",
+    "magnetar-fakes/scalable-topics",
     "magnetar-proto/scalable-topics",
     "magnetar-runtime-tokio/scalable-topics",
     "magnetar-runtime-moonpool/scalable-topics",
@@ -49,6 +51,8 @@ tokio                     = { workspace = true, features = ["rt", "rt-multi-thre
 tracing                   = { workspace = true }
 
 [dev-dependencies]
+magnetar-driver = { workspace = true, default-features = false, features = ["tokio", "moonpool", "crypto-aws-lc-rs"] }
+magnetar-fakes  = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "test-util", "time", "sync"] }
 # Already a workspace dep of `magnetar-proto`. `tests/aggregate_stats_equivalence.rs`
 # (issue #347, ADR-0024 layer d) seeds a deterministic `hdrhistogram::Histogram<u64>`
@@ -72,6 +76,10 @@ magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"
 async-trait = { workspace = true }
 # PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
 prost = { workspace = true }
+flate2 = { workspace = true }
+lz4_flex = { workspace = true }
+snap = { workspace = true }
+zstd = { workspace = true }
 # Capturing fmt subscriber for `tests/corrupted_frame_equivalence.rs` — the
 # proto point-of-detection `error!` is the witness that the injected
 # CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).

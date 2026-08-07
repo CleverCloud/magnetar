@@ -105,8 +105,8 @@ The façade's `MessageCryptoBridge` ([`crates/magnetar/src/crypto_bridge.rs`](..
 
 - **Producer (encrypt-on-send).** The moonpool producer encrypts the payload, stamping `pb::MessageMetadata` `encryption_keys` / `encryption_algo` / `encryption_param`.
   This mirrors the tokio producer's **compression → encryption** ordering for the encryption step; compression itself is not yet wired on the moonpool engine — non-`None` `CompressionKind` is refused on send until the runtime codec lands (M3) — so in practice the moonpool path is encrypt-only.
-- **Consumer (decrypt-on-receive).** The moonpool consumer decrypts the payload — honoring the three `CryptoFailureAction` arms (`Fail`, `Discard`, `Consume`) identically to tokio — then delivers it.
-  Because compression is refused on send, there is no decompression step to mirror: the receive path reduces to **decrypt, then deliver** (tokio's decrypt-first → decompress ordering, with the decompress branch a no-op on moonpool until codecs land).
+- **Consumer (decrypt-then-decompress on receive).** The moonpool consumer decrypts the payload — honoring the three `CryptoFailureAction` arms (`Fail`, `Discard`, `Consume`) identically to tokio — then bounded-decompresses broker-authored LZ4, ZSTD, Snappy, or ZLIB payloads before delivery.
+  The decompressor validates the announced output size and applies the same inflation ceiling as tokio, so send-side refusal does not prevent Moonpool from consuming compressed messages produced by other clients.
 
 The façade builders gain `.encryption()` / `.create_with_encryption()` (producer) and `.encryption()` / `.subscribe_with_decryption()` (consumer) for the moonpool engine, routing through the new `Client::open_producer_with` / `Client::subscribe_with` entries.
 The engine crypto API (`MessageEncryptorApi` / `MessageDecryptorApi`) is now **non-stub for both engines**; `NoEncryption` is retained only as the documented opt-out (the resolved API when no bridge is supplied), not as the moonpool default.

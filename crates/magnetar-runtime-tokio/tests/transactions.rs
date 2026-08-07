@@ -206,7 +206,9 @@ async fn end_txn_commit_resolves_to_committed() {
         least_sig_bits: 0x88,
     };
 
-    let request_id = conn.end_txn(txn, TxnAction::Commit);
+    let request_id = conn
+        .end_txn(txn, TxnAction::Commit)
+        .expect("claim EndTxn waiter");
     let frame = end_txn_response_bytes(request_id.0);
     conn.handle_bytes(at, &frame).expect("apply EndTxnResponse");
     let outcome = conn
@@ -219,4 +221,31 @@ async fn end_txn_commit_resolves_to_committed() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_end_txn_waiter_is_rejected_and_cancelled_waiter_resumes() {
+    let at = Instant::now();
+    let mut conn = handshake_complete(at);
+    let _ = conn.poll_transmit();
+    let txn = TxnId::new(0x91, 0x92);
+
+    let first = conn.end_txn(txn, TxnAction::Commit).expect("first waiter");
+    assert!(matches!(
+        conn.end_txn(txn, TxnAction::Commit),
+        Err(magnetar_proto::TxnError::AlreadyEnding { .. })
+    ));
+    conn.release_end_txn_waiter(txn, TxnAction::Commit);
+    let resumed = conn
+        .end_txn(txn, TxnAction::Commit)
+        .expect("resumed waiter");
+    assert_eq!(resumed, first);
+
+    let mut wire = conn.poll_transmit();
+    let mut end_commands = 0;
+    while !wire.is_empty() {
+        let frame = magnetar_proto::decode_one(&mut wire).expect("decode EndTxn command");
+        end_commands += usize::from(frame.command.r#type == pb::base_command::Type::EndTxn as i32);
+    }
+    assert_eq!(end_commands, 1);
 }

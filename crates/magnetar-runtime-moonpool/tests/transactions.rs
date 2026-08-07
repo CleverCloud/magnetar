@@ -140,6 +140,7 @@ async fn end_txn_commit_resolves_to_committed() {
     let request_id = {
         let mut conn = shared.inner.lock();
         conn.end_txn(txn, TxnAction::Commit)
+            .expect("claim EndTxn waiter")
     };
     let frame = end_txn_response_bytes(request_id.0);
     {
@@ -158,4 +159,38 @@ async fn end_txn_commit_resolves_to_committed() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+/// A concurrent `EndTxn` caller is rejected, while cancellation releases the
+/// sole waiter lease and resumes the canonical wire request.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_end_txn_waiter_is_rejected_and_cancelled_waiter_resumes() {
+    let at = Instant::now();
+    let shared = handshake_complete_shared(at);
+    let txn = TxnId::new(0x91, 0x92);
+
+    let (first, resumed, mut wire) = {
+        let mut conn = shared.inner.lock();
+        let _ = conn.poll_transmit();
+        let first = conn.end_txn(txn, TxnAction::Commit).expect("first waiter");
+        assert!(matches!(
+            conn.end_txn(txn, TxnAction::Commit),
+            Err(magnetar_proto::TxnError::AlreadyEnding { .. })
+        ));
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+        let resumed = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("resumed waiter");
+        (first, resumed, conn.poll_transmit())
+    };
+    assert_eq!(resumed, first);
+
+    let mut end_commands = 0;
+    while !wire.is_empty() {
+        let frame = magnetar_proto::decode_one(&mut wire).expect("decode EndTxn command");
+        end_commands += usize::from(
+            frame.command.r#type == magnetar_proto::pb::base_command::Type::EndTxn as i32,
+        );
+    }
+    assert_eq!(end_commands, 1);
 }

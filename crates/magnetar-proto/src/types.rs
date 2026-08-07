@@ -64,8 +64,9 @@ impl fmt::Display for SequenceId {
 /// PIP-460 segment identifier — unique within a scalable topic's segment DAG.
 ///
 /// **Experimental** (PIP-460, ADR-0093). Only meaningful under
-/// `feature = "scalable-topics"`; carried on [`MessageId::segment_id`] for
-/// messages read from a scalable topic.
+/// `feature = "scalable-topics"`. M1 ordinary [`MessageId`] values do not carry
+/// this identity; scalable deliveries qualify them with a separate segment
+/// source.
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SegmentId(pub u64);
@@ -77,7 +78,41 @@ impl fmt::Display for SegmentId {
     }
 }
 
-/// PIP-460 hash key range `[start, end)` a segment is responsible for.
+/// Lowest value in the M1 16-bit hash key space.
+#[cfg(feature = "scalable-topics")]
+pub const MIN_HASH: u32 = 0;
+
+/// Highest value in the M1 16-bit hash key space.
+#[cfg(feature = "scalable-topics")]
+pub const MAX_HASH: u32 = u16::MAX as u32;
+
+/// An invalid M1 inclusive hash range.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum KeyRangeError {
+    /// The start lies outside the 16-bit key space.
+    #[error("hash range start {start} is outside 0..={MAX_HASH}")]
+    StartOutOfBounds {
+        /// Invalid inclusive start.
+        start: u32,
+    },
+    /// The end lies outside the 16-bit key space.
+    #[error("hash range end {end} is outside 0..={MAX_HASH}")]
+    EndOutOfBounds {
+        /// Invalid inclusive end.
+        end: u32,
+    },
+    /// An inclusive range cannot end before it starts.
+    #[error("hash range end {end} precedes start {start}")]
+    Reversed {
+        /// Inclusive start.
+        start: u32,
+        /// Inclusive end.
+        end: u32,
+    },
+}
+
+/// PIP-460 inclusive hash key range `[start, end]` a segment is responsible for.
 ///
 /// **Experimental** (PIP-460, ADR-0093). Surfaces the key range for
 /// observation only — segment-aware sticky-key dispatch (Key_Shared across
@@ -86,9 +121,95 @@ impl fmt::Display for SegmentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyRange {
     /// Inclusive start of the hash range.
-    pub start: u32,
-    /// Exclusive end of the hash range.
-    pub end: u32,
+    start: u32,
+    /// Inclusive end of the hash range.
+    end: u32,
+}
+
+#[cfg(feature = "scalable-topics")]
+impl KeyRange {
+    /// The complete M1 key space, `0..=65535`.
+    pub const FULL: Self = Self {
+        start: MIN_HASH,
+        end: MAX_HASH,
+    };
+
+    /// Validate and construct an inclusive M1 key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyRangeError`] when either endpoint lies outside the 16-bit
+    /// key space or the range is reversed.
+    pub fn new(start: u32, end: u32) -> Result<Self, KeyRangeError> {
+        if start > MAX_HASH {
+            return Err(KeyRangeError::StartOutOfBounds { start });
+        }
+        if end > MAX_HASH {
+            return Err(KeyRangeError::EndOutOfBounds { end });
+        }
+        if end < start {
+            return Err(KeyRangeError::Reversed { start, end });
+        }
+        Ok(Self { start, end })
+    }
+
+    /// Inclusive start.
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Inclusive end.
+    #[must_use]
+    pub const fn end(self) -> u32 {
+        self.end
+    }
+
+    /// Number of hash values in this inclusive range.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.end - self.start + 1
+    }
+
+    /// Whether this range contains no values. A validated range is never empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+
+    /// Whether this range contains `hash`, including both endpoints.
+    #[must_use]
+    pub const fn contains(self, hash: u32) -> bool {
+        self.start <= hash && hash <= self.end
+    }
+
+    /// Whether this range completely contains `other`.
+    #[must_use]
+    pub const fn contains_range(self, other: Self) -> bool {
+        self.start <= other.start && self.end >= other.end
+    }
+
+    /// Whether this range and `other` touch without overlapping.
+    #[must_use]
+    pub const fn is_adjacent_to(self, other: Self) -> bool {
+        (self.end < MAX_HASH && self.end + 1 == other.start)
+            || (other.end < MAX_HASH && other.end + 1 == self.start)
+    }
+
+    /// Canonical M1 lower-case hexadecimal range descriptor.
+    #[must_use]
+    pub fn to_hex_string(self) -> String {
+        format!("{:04x}-{:04x}", self.start, self.end)
+    }
+}
+
+#[cfg(feature = "scalable-topics")]
+impl TryFrom<(u32, u32)> for KeyRange {
+    type Error = KeyRangeError;
+
+    fn try_from((start, end): (u32, u32)) -> Result<Self, Self::Error> {
+        Self::new(start, end)
+    }
 }
 
 /// PIP-460 segment lifecycle state.
@@ -114,13 +235,17 @@ pub enum SegmentState {
 
 #[cfg(feature = "scalable-topics")]
 impl SegmentState {
-    /// Convert from the wire enum integer, saturating an unrecognised value to
-    /// [`Self::Active`] (forward-compatibility with a future broker enum).
-    #[must_use]
-    pub fn from_pb_i32(value: i32) -> Self {
+    /// Strictly convert from the M1 wire enum integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unknown integer instead of silently treating a future state
+    /// as active.
+    pub fn try_from_pb_i32(value: i32) -> Result<Self, i32> {
         match crate::pb::SegmentState::try_from(value) {
-            Ok(crate::pb::SegmentState::Sealed) => Self::Sealed,
-            Ok(crate::pb::SegmentState::Active) | Err(_) => Self::Active,
+            Ok(crate::pb::SegmentState::Sealed) => Ok(Self::Sealed),
+            Ok(crate::pb::SegmentState::Active) => Ok(Self::Active),
+            Err(_) => Err(value),
         }
     }
 
@@ -176,30 +301,66 @@ pub struct SegmentDescriptor {
     pub legacy_topic_name: Option<String>,
 }
 
+/// Invalid data while joining an M1 segment descriptor and placement.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SegmentDescriptorError {
+    /// The wire range is not an inclusive 16-bit range.
+    #[error("invalid segment hash range: {0}")]
+    InvalidRange(#[from] KeyRangeError),
+    /// The wire carried a segment lifecycle state not defined by M1.
+    #[error("unknown M1 segment state {0}")]
+    UnknownState(i32),
+    /// A placement was joined to a different descriptor.
+    #[error("placement for segment {placement_id} cannot attach to segment {segment_id}")]
+    PlacementMismatch {
+        /// Descriptor id.
+        segment_id: u64,
+        /// Placement id.
+        placement_id: u64,
+    },
+    /// M1 uses absence, not an empty string, for a non-legacy segment.
+    #[error("legacy topic name must not be empty")]
+    EmptyLegacyTopic,
+}
+
 #[cfg(feature = "scalable-topics")]
 impl SegmentDescriptor {
     /// Assemble from the wire pair. `broker` is the [`pb::SegmentBrokerAddress`]
     /// whose `segment_id` matches `info`, when the DAG carries one.
-    #[must_use]
-    pub fn from_pb(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentDescriptorError`] for invalid M1 ranges, states, legacy
+    /// markers, or a mismatched placement id.
+    pub fn try_from_pb(
         info: &crate::pb::SegmentInfoProto,
         broker: Option<&crate::pb::SegmentBrokerAddress>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SegmentDescriptorError> {
+        if let Some(broker) = broker
+            && broker.segment_id != info.segment_id
+        {
+            return Err(SegmentDescriptorError::PlacementMismatch {
+                segment_id: info.segment_id,
+                placement_id: broker.segment_id,
+            });
+        }
+        if info.legacy_topic_name.as_deref() == Some("") {
+            return Err(SegmentDescriptorError::EmptyLegacyTopic);
+        }
+        Ok(Self {
             segment_id: SegmentId(info.segment_id),
-            key_range: KeyRange {
-                start: info.hash_start,
-                end: info.hash_end,
-            },
+            key_range: KeyRange::new(info.hash_start, info.hash_end)?,
             broker_url: broker.map(|b| b.broker_url.clone()),
             broker_url_tls: broker.and_then(|b| b.broker_url_tls.clone()),
-            state: SegmentState::from_pb_i32(info.state),
+            state: SegmentState::try_from_pb_i32(info.state)
+                .map_err(SegmentDescriptorError::UnknownState)?,
             parent_ids: info.parent_ids.iter().copied().map(SegmentId).collect(),
             child_ids: info.child_ids.iter().copied().map(SegmentId).collect(),
             created_at_epoch: info.created_at_epoch,
             sealed_at_epoch: info.sealed_at_epoch,
             legacy_topic_name: info.legacy_topic_name.clone(),
-        }
+        })
     }
 
     /// Split back into the wire pair. The address half is `None` when the
@@ -219,8 +380,8 @@ impl SegmentDescriptor {
     ) {
         let info = crate::pb::SegmentInfoProto {
             segment_id: self.segment_id.0,
-            hash_start: self.key_range.start,
-            hash_end: self.key_range.end,
+            hash_start: self.key_range.start(),
+            hash_end: self.key_range.end(),
             state: self.state.to_pb_i32(),
             parent_ids: self.parent_ids.iter().map(|s| s.0).collect(),
             child_ids: self.child_ids.iter().map(|s| s.0).collect(),
@@ -245,7 +406,9 @@ impl SegmentDescriptor {
     /// regular, unmigrated topic rather than a controller-managed segment.
     #[must_use]
     pub fn is_legacy(&self) -> bool {
-        self.legacy_topic_name.is_some()
+        self.legacy_topic_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
     }
 }
 
@@ -280,15 +443,9 @@ pub struct TcAssignment {
 /// observes ids that compare equal to the source-side reader's ids — "same
 /// message" is structurally evident and needs no out-of-band correlation key.
 ///
-/// # PIP-460 scalable-topic segment (experimental)
-///
-/// Under `feature = "scalable-topics"` the id carries an optional
-/// `segment_id` field. The derived `PartialEq` / `Ord` / `Hash`
-/// give exactly the cross-mode contract ADR-0093 specifies: two v4 ids both
-/// carry `None`, so the segment field is a tie and the v4 invariant is
-/// preserved bit-for-bit; a scalable id (`Some(_)`) never compares equal to a
-/// v4 id (`None`) — so callers can't accidentally deduplicate across the
-/// scalable / partitioned mode boundary.
+/// M1 does not extend `MessageIdData` with a scalable segment. Scalable values
+/// therefore qualify this ordinary id with an explicit segment source rather
+/// than changing its equality or wire representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId {
     /// Bookkeeper ledger id where the entry lives.
@@ -301,12 +458,6 @@ pub struct MessageId {
     pub batch_index: i32,
     /// Size of the batch the message came from, `-1` if not batched.
     pub batch_size: i32,
-    /// PIP-460 segment id (experimental). `None` for v4 partitioned /
-    /// non-partitioned topics — this preserves the v4 wire layout and
-    /// structural-equality contract. `Some(_)` only for messages read from a
-    /// scalable topic.
-    #[cfg(feature = "scalable-topics")]
-    pub segment_id: Option<SegmentId>,
 }
 
 impl MessageId {
@@ -317,8 +468,6 @@ impl MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
 
     /// A sentinel "latest" position. Mirrors `MessageId.latest`.
@@ -328,8 +477,6 @@ impl MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
 
     /// Construct a message id from the wire protobuf representation.
@@ -340,8 +487,6 @@ impl MessageId {
             partition: pb.partition.unwrap_or(-1),
             batch_index: pb.batch_index.unwrap_or(-1),
             batch_size: pb.batch_size.unwrap_or(-1),
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         }
     }
 
@@ -379,25 +524,6 @@ impl MessageId {
         use prost::Message as _;
         let pb = pb::MessageIdData::decode(bytes).ok()?;
         Some(Self::from_pb(&pb))
-    }
-
-    /// PIP-460: attach a [`SegmentId`] to this message id, marking it as read
-    /// from a scalable topic's segment. The runtime scalable layer calls this
-    /// when surfacing a message delivered on a per-segment v4 consumer so the
-    /// caller can correlate the id back to its DAG node.
-    #[cfg(feature = "scalable-topics")]
-    #[must_use]
-    pub fn with_segment(mut self, segment_id: SegmentId) -> Self {
-        self.segment_id = Some(segment_id);
-        self
-    }
-
-    /// PIP-460: the segment this message was read from, if any. `None` for v4
-    /// partitioned / non-partitioned topics.
-    #[cfg(feature = "scalable-topics")]
-    #[must_use]
-    pub fn segment(&self) -> Option<SegmentId> {
-        self.segment_id
     }
 }
 
@@ -456,7 +582,91 @@ impl CompressionKind {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "scalable-topics")]
+    use proptest::prelude::*;
+
     use super::*;
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn key_range_uses_inclusive_m1_endpoints() {
+        let full = KeyRange::FULL;
+        assert_eq!(full.start(), 0);
+        assert_eq!(full.end(), 65_535);
+        assert_eq!(full.len(), 65_536);
+        assert!(full.contains(0));
+        assert!(full.contains(65_535));
+        assert_eq!(full.to_hex_string(), "0000-ffff");
+
+        let halves = [
+            KeyRange::new(0, 32_767).expect("lower half"),
+            KeyRange::new(32_768, 65_535).expect("upper half"),
+        ];
+        assert!(halves[0].is_adjacent_to(halves[1]));
+        assert_eq!(halves[0].len() + halves[1].len(), full.len());
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn key_range_rejects_every_invalid_shape() {
+        assert_eq!(
+            KeyRange::new(65_536, 65_536),
+            Err(KeyRangeError::StartOutOfBounds { start: 65_536 })
+        );
+        assert_eq!(
+            KeyRange::new(0, 65_536),
+            Err(KeyRangeError::EndOutOfBounds { end: 65_536 })
+        );
+        assert_eq!(
+            KeyRange::new(2, 1),
+            Err(KeyRangeError::Reversed { start: 2, end: 1 })
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn segment_descriptor_rejects_mismatched_placement_identity() {
+        let info = pb::SegmentInfoProto {
+            segment_id: 1,
+            hash_start: 0,
+            hash_end: 65_535,
+            state: pb::SegmentState::Active as i32,
+            parent_ids: Vec::new(),
+            child_ids: Vec::new(),
+            created_at_epoch: 0,
+            sealed_at_epoch: None,
+            created_at_ms: 0,
+            sealed_at_ms: None,
+            legacy_topic_name: None,
+        };
+        let placement = pb::SegmentBrokerAddress {
+            segment_id: 2,
+            broker_url: "pulsar://broker:6650".to_owned(),
+            broker_url_tls: None,
+        };
+        assert_eq!(
+            SegmentDescriptor::try_from_pb(&info, Some(&placement)),
+            Err(SegmentDescriptorError::PlacementMismatch {
+                segment_id: 1,
+                placement_id: 2,
+            })
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    proptest! {
+        #[test]
+        fn key_range_contains_exactly_its_inclusive_interval(
+            start in 0u32..=65_535,
+            end in 0u32..=65_535,
+            hash in 0u32..=65_535,
+        ) {
+            let (start, end) = if start <= end { (start, end) } else { (end, start) };
+            let range = KeyRange::new(start, end).expect("ordered bounded range");
+            prop_assert_eq!(range.contains(hash), start <= hash && hash <= end);
+            prop_assert_eq!(range.len(), end - start + 1);
+        }
+    }
 
     /// Helper: build a non-batched MessageId mirroring Java `MessageIdImpl(ledger, entry,
     /// partition)`. `batch_index = -1` marks "not batched" (Java semantics).
@@ -467,8 +677,6 @@ mod tests {
             partition,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         }
     }
 
@@ -481,57 +689,7 @@ mod tests {
             partition,
             batch_index,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         }
-    }
-
-    /// Layer (a) test #4: `MessageId { segment_id: Some(..) }` round-trips
-    /// through [`MessageId::with_segment`] / [`MessageId::segment`], and the
-    /// v4-shape (`segment_id: None`) `to_bytes` is **byte-identical** to a
-    /// plain v4 id — the wire `MessageIdData` carries no segment field, so a
-    /// legacy producer / consumer round-trips bit-for-bit (ADR-0093 §2.1).
-    #[cfg(feature = "scalable-topics")]
-    #[test]
-    fn message_id_with_segment_roundtrip() {
-        let v4 = mid(10, 20, 1);
-        assert_eq!(v4.segment(), None, "v4 id has no segment");
-
-        // In-process segment attach / read.
-        let scaled = v4.with_segment(SegmentId(7));
-        assert_eq!(scaled.segment(), Some(SegmentId(7)));
-
-        // Cross-mode equality contract: scalable (`Some`) != v4 (`None`).
-        assert_ne!(scaled, v4, "Some(_) segment never equals None segment");
-        // Same segment + same coords == equal.
-        let scaled2 = mid(10, 20, 1).with_segment(SegmentId(7));
-        assert_eq!(scaled, scaled2);
-        // Different segment, same coords != equal.
-        let other_seg = mid(10, 20, 1).with_segment(SegmentId(8));
-        assert_ne!(scaled, other_seg);
-
-        // v4 invariant preserved: two `None`-segment ids compare exactly as
-        // the 5-field v4 contract did.
-        let v4b = mid(10, 20, 1);
-        assert_eq!(v4, v4b);
-
-        // Byte-identical guard: the wire `MessageIdData` has no segment field,
-        // so `to_bytes` for a `None`-segment id matches a freshly-built v4 id
-        // with the same coords. (The segment rides the lookup / DAG, not the
-        // per-message wire id, until the Pulsar 5.0 RC vendor bump.)
-        let none_seg = mid(10, 20, 1);
-        assert_eq!(
-            none_seg.to_bytes(),
-            v4.to_bytes(),
-            "None-segment wire encoding is byte-identical to v4"
-        );
-        // A `Some`-segment id encodes the same wire bytes (segment is dropped
-        // on the scaffold wire) — documented scaffold behaviour.
-        assert_eq!(
-            scaled.to_bytes(),
-            v4.to_bytes(),
-            "segment is in-process only on the scaffold wire"
-        );
     }
 
     #[test]
@@ -542,8 +700,6 @@ mod tests {
             partition: 2,
             batch_index: 7,
             batch_size: 16,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode");
@@ -574,8 +730,6 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
             MessageId {
                 ledger_id: u64::MAX,
@@ -583,8 +737,6 @@ mod tests {
                 partition: i32::MAX,
                 batch_index: i32::MIN,
                 batch_size: i32::MIN,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
         ] {
             // No panic on encode + round-trip — the previous `.expect(...)` path is gone.
@@ -689,8 +841,6 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode non-partitioned id");
@@ -711,8 +861,6 @@ mod tests {
             partition: 3,
             batch_index: 4,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode batched id w/o batch_size");
@@ -739,8 +887,6 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: -1,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
             "empty buffer decodes to wire-format defaults"
         );
@@ -758,8 +904,6 @@ mod tests {
             partition: 9,
             batch_index: 10,
             batch_size: 11,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let b = a;
         let mut set = HashSet::new();
@@ -802,8 +946,6 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let shadow_side = MessageId {
             ledger_id: 42,
@@ -811,8 +953,6 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         assert_eq!(source_side, shadow_side, "PIP-180 structural equality");
         // Hash consistency — must collide so callers can use the id as a HashSet/HashMap key
@@ -827,8 +967,6 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         assert_ne!(source_side, other);
     }

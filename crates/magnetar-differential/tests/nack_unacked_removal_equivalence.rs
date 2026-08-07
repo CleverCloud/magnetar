@@ -129,8 +129,6 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Vec<Redelivery> {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     conn.negative_ack(handle, vec![nacked_id], t0);
 
