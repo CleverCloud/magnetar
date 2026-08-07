@@ -1497,6 +1497,10 @@ async fn run_tokio_transactions(cluster: &M1SocketCluster) -> RuntimeTransaction
         .new_txn(Duration::from_secs(30))
         .await
         .expect("open Tokio cached-registration transaction");
+    cluster.rewrite_next_transaction_registration_error(BrokerFailure::new(
+        magnetar_proto::pb::ServerError::PersistenceError,
+        "generic cached registration failure",
+    ));
     cluster
         .update(|fake| {
             fake.clear_routes();
@@ -1510,10 +1514,15 @@ async fn run_tokio_transactions(cluster: &M1SocketCluster) -> RuntimeTransaction
             )
         })
         .expect("script Tokio cached-registration failure");
-    let first_registration_failed = aggregate
+    let first_registration_failed = matches!(
+        aggregate
         .acknowledge_in_transaction(&failed_message.token, failed_txn)
-        .await
-        .is_err();
+        .await,
+        Err(magnetar_runtime_tokio::StreamConsumerError::Client(
+            magnetar_runtime_tokio::ClientError::Broker { code, message }
+        )) if code == magnetar_proto::pb::ServerError::PersistenceError as i32
+            && message == "generic cached registration failure"
+    );
     let cached_registration_failed = aggregate
         .acknowledge_in_transaction(&failed_message.token, failed_txn)
         .await
@@ -1746,6 +1755,10 @@ async fn run_moonpool_transactions(cluster: &M1SocketCluster) -> RuntimeTransact
         .new_txn(Duration::from_secs(30))
         .await
         .expect("open Moonpool cached-registration transaction");
+    cluster.rewrite_next_transaction_registration_error(BrokerFailure::new(
+        magnetar_proto::pb::ServerError::PersistenceError,
+        "generic cached registration failure",
+    ));
     cluster
         .update(|fake| {
             fake.clear_routes();
@@ -1759,10 +1772,15 @@ async fn run_moonpool_transactions(cluster: &M1SocketCluster) -> RuntimeTransact
             )
         })
         .expect("script Moonpool cached-registration failure");
-    let first_registration_failed = aggregate
+    let first_registration_failed = matches!(
+        aggregate
         .acknowledge_in_transaction(&failed_message.token, failed_txn)
-        .await
-        .is_err();
+        .await,
+        Err(magnetar_runtime_moonpool::StreamConsumerError::Client(
+            magnetar_runtime_moonpool::ClientError::Broker { code, message }
+        )) if code == magnetar_proto::pb::ServerError::PersistenceError as i32
+            && message == "generic cached registration failure"
+    );
     let cached_registration_failed = aggregate
         .acknowledge_in_transaction(&failed_message.token, failed_txn)
         .await
