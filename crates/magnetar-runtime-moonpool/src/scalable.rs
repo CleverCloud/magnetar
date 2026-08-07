@@ -1520,6 +1520,15 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         child_generation: magnetar_proto::ChildGeneration,
     ) -> bool {
         let state = self.state.lock();
+        Self::child_open_is_current_state(&state, source, controller_incarnation, child_generation)
+    }
+
+    fn child_open_is_current_state(
+        state: &AggregateState<P>,
+        source: &magnetar_proto::SegmentSource,
+        controller_incarnation: magnetar_proto::ControllerIncarnation,
+        child_generation: magnetar_proto::ChildGeneration,
+    ) -> bool {
         !state.close_state.is_closing()
             && state.model.controller_incarnation() == controller_incarnation
             && state.model.accepts_child_result(source, child_generation)
@@ -1699,14 +1708,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 Ok(consumer) => {
                     let actions = {
                         let mut state = self.state.lock();
-                        if state.close_state.is_closing()
-                            || state.model.controller_incarnation() != controller_incarnation
-                            || !state.model.accepts_child_result(&source, child_generation)
-                            || state.model.segment_phase(source.segment_id())
-                                != Some(&magnetar_proto::SegmentPhase::Opening)
-                        {
-                            None
-                        } else {
+                        if Self::child_open_is_current_state(
+                            &state,
+                            &source,
+                            controller_incarnation,
+                            child_generation,
+                        ) {
                             let actions = state
                                 .model
                                 .child_opened(source.segment_id(), child_generation)?;
@@ -1719,6 +1726,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                                 },
                             );
                             Some(actions)
+                        } else {
+                            None
                         }
                     };
                     let Some(actions) = actions else {
@@ -1735,18 +1744,18 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 {
                     let current = {
                         let mut state = self.state.lock();
-                        if state.close_state.is_closing()
-                            || state.model.controller_incarnation() != controller_incarnation
-                            || !state.model.accepts_child_result(&source, child_generation)
-                            || state.model.segment_phase(source.segment_id())
-                                != Some(&magnetar_proto::SegmentPhase::Opening)
-                        {
-                            false
-                        } else {
+                        if Self::child_open_is_current_state(
+                            &state,
+                            &source,
+                            controller_incarnation,
+                            child_generation,
+                        ) {
                             state
                                 .model
                                 .child_open_busy(source.segment_id(), child_generation)?;
                             true
+                        } else {
+                            false
                         }
                     };
                     if !current {
@@ -2884,7 +2893,15 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         }
     }
 
-    async fn wait_control_plane_retry(&self, reason: String) -> bool {
+    async fn retry_control_plane_error(&self, error: ClientError) -> bool {
+        if control_plane_error_is_terminal(&error) {
+            self.fail_closed(error.to_string());
+            return false;
+        }
+        let reason = match error {
+            ClientError::ScalableAssignmentRejected { reason } => reason,
+            error => error.to_string(),
+        };
         self.push_event(StreamConsumerEvent::ResyncRequired { reason });
         if let Err(error) = self
             .subscriber
@@ -2895,15 +2912,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             return false;
         }
         true
-    }
-
-    async fn retry_control_plane_error(&self, error: &ClientError) -> bool {
-        if control_plane_error_is_terminal(error) {
-            self.fail_closed(error.to_string());
-            false
-        } else {
-            self.wait_control_plane_retry(error.to_string()).await
-        }
     }
 
     async fn reconnect_control_plane(
@@ -2920,7 +2928,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             let mut opened_dag = match self.subscriber.open_dag_session(&self.topic).await {
                 Ok(dag) => dag,
                 Err(error) => {
-                    if !self.retry_control_plane_error(&error).await {
+                    if !self.retry_control_plane_error(error).await {
                         return None;
                     }
                     continue;
@@ -2954,7 +2962,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     if let Err(error) = aligned {
                         controller.close();
                         opened_dag.close();
-                        if !self.retry_control_plane_error(&error).await {
+                        if !self.retry_control_plane_error(error).await {
                             return None;
                         }
                         continue;
@@ -2963,22 +2971,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     let assignment = controller.assignment().clone();
                     let transition = {
                         let mut state = self.state.lock();
-                        let mut model = state.model.clone();
-                        let transition = model.begin_controller_incarnation(incarnation).and_then(
-                            |mut actions| {
-                                model
-                                    .apply_control_plane(
-                                        opened_dag.snapshot().clone(),
-                                        assignment.clone(),
-                                    )
-                                    .map(|next| {
-                                        actions.extend(next);
-                                        actions
-                                    })
-                            },
+                        let transition = state.model.apply_reconnect_baseline(
+                            incarnation,
+                            opened_dag.snapshot().clone(),
+                            assignment.clone(),
                         );
                         if transition.is_ok() {
-                            state.model = model;
                             state.controller_registration = Some(ControllerRegistration {
                                 shared: controller.shared.clone(),
                                 consumer_id: self.consumer_id,
@@ -3004,15 +3002,9 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                     return Some((opened_dag, controller));
                 }
-                Err(ClientError::ScalableAssignmentRejected { reason }) => {
-                    opened_dag.close();
-                    if !self.wait_control_plane_retry(reason).await {
-                        return None;
-                    }
-                }
                 Err(error) => {
                     opened_dag.close();
-                    if !self.retry_control_plane_error(&error).await {
+                    if !self.retry_control_plane_error(error).await {
                         return None;
                     }
                 }

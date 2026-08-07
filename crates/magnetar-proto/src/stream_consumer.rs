@@ -2460,6 +2460,26 @@ impl StreamConsumerModel {
         Ok(actions)
     }
 
+    /// Atomically enter a replacement controller incarnation and apply its
+    /// aligned DAG and assignment baseline.
+    ///
+    /// # Errors
+    ///
+    /// Rejects either transition without mutating the current incarnation,
+    /// DAG, assignment, children, or budget.
+    pub fn apply_reconnect_baseline(
+        &mut self,
+        incarnation: ControllerIncarnation,
+        dag: DagSnapshot,
+        assignment: ConsumerAssignment,
+    ) -> Result<Vec<StreamConsumerAction>, StreamConsumerModelError> {
+        let mut staged = self.clone();
+        let mut actions = staged.begin_controller_incarnation(incarnation)?;
+        actions.extend(staged.apply_control_plane(dag, assignment)?);
+        *self = staged;
+        Ok(actions)
+    }
+
     /// Atomically begin an aggregate vector seek across every currently
     /// assigned active leaf.
     ///
@@ -6393,6 +6413,55 @@ mod tests {
                 AssignmentError::NonAdvancingIncarnation { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn reconnect_baseline_rejection_leaves_the_model_untouched() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("initial assignment");
+        let generation = opened_generation(&open[0]);
+        model
+            .child_opened(SegmentId(1), generation)
+            .expect("initial child open");
+        let before = (
+            model.controller_incarnation(),
+            model.generation(),
+            model.delivery_epoch(),
+            model.dag().clone(),
+            model.assignment().cloned(),
+            model.status(),
+        );
+
+        assert!(matches!(
+            model.apply_reconnect_baseline(
+                ControllerIncarnation(4),
+                split_dag_at(2, "pulsar://replacement:6650"),
+                assignment(1, &[1]),
+            ),
+            Err(StreamConsumerModelError::Attachment(
+                AttachmentError::EpochMismatch {
+                    assignment: 1,
+                    dag: 2,
+                }
+            ))
+        ));
+        assert_eq!(
+            (
+                model.controller_incarnation(),
+                model.generation(),
+                model.delivery_epoch(),
+                model.dag().clone(),
+                model.assignment().cloned(),
+                model.status(),
+            ),
+            before
+        );
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::Flowing)
+        );
     }
 
     #[test]
