@@ -154,6 +154,7 @@ struct DeliveryShapeTrace {
 struct ChildOpenTrace {
     busy_segment_attempts: usize,
     cancelled_open_removed: bool,
+    cancelled_open_close_failed: bool,
     after_close: ResourceCounts,
 }
 
@@ -3673,6 +3674,106 @@ where
         .await
         .expect("close cancellation aggregate");
     takeover.close().await.expect("close takeover aggregate");
+
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Success,
+    );
+    let failing = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("failed-cancel-open-sub")
+        .consumer_name("failed-cancel-open-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe failed-cancellation aggregate");
+    cluster
+        .wait_for("held failed-cancellation child-open response", |fake| {
+            fake.resource_counts().child_consumers == 2
+                && fake
+                    .active_child_owner("failed-cancel-open-sub", 1)
+                    .is_some()
+        })
+        .await;
+    let failing_member = cluster
+        .inspect(|fake| fake.member("failed-cancel-open-sub", "failed-cancel-open-member"))
+        .expect("failed-cancellation aggregate member");
+    let failing_takeover = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("failed-cancel-open-sub")
+        .consumer_name("failed-cancel-open-takeover")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe failed-cancellation takeover");
+    let failing_takeover_member = cluster
+        .inspect(|fake| fake.member("failed-cancel-open-sub", "failed-cancel-open-takeover"))
+        .expect("failed-cancellation takeover member");
+    cluster
+        .update(|fake| {
+            fake.publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(failing_member, [2]),
+                    FullAssignment::new(failing_takeover_member, [1]),
+                ],
+            )
+        })
+        .expect("withdraw the failing provisional child");
+    loop {
+        match next_event(&failing).await {
+            StreamConsumerEvent::AssignmentApplied { sources, .. }
+                if sources.iter().map(|source| source.segment_id().0).eq([2]) =>
+            {
+                break;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected failed-cancellation event: {unexpected:?}"),
+        }
+    }
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "cancelled child-open close failure",
+                )),
+            )
+        })
+        .expect("fail the cancelled child's compensating close");
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::Success,
+    );
+    let cancelled_open_close_failed = loop {
+        match next_event(&failing).await {
+            StreamConsumerEvent::ResyncRequired { reason } => {
+                assert!(
+                    reason.contains("cancelled child-open close failure"),
+                    "unexpected failed-cancellation resync reason: {reason}"
+                );
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected failed-close event: {unexpected:?}"),
+        }
+    };
+    failing
+        .close()
+        .await
+        .expect("close failed-cancellation aggregate after resync request");
+    failing_takeover
+        .close()
+        .await
+        .expect("close failed-cancellation takeover");
     cluster
         .wait_for("child-open lifecycle cleanup", |fake| {
             let counts = fake.resource_counts();
@@ -3686,6 +3787,7 @@ where
     ChildOpenTrace {
         busy_segment_attempts,
         cancelled_open_removed,
+        cancelled_open_close_failed,
         after_close,
     }
 }
