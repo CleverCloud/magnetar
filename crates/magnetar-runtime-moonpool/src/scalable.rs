@@ -3396,14 +3396,6 @@ impl ControllerSession {
                     self.assignment = assignment.clone();
                     return Ok(assignment);
                 }
-                ScalableEvent::ConsumerAssigned {
-                    incarnation,
-                    assignment,
-                    ..
-                } if incarnation == self.incarnation => {
-                    self.assignment = assignment.clone();
-                    return Ok(assignment);
-                }
                 ScalableEvent::ConsumerRejected {
                     incarnation,
                     reason,
