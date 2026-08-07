@@ -211,10 +211,7 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
             future.await;
             drop(completion);
         });
-        ScalableTaskHandle {
-            join: Some(join),
-            completed,
-        }
+        ScalableTaskHandle { join, completed }
     }
 
     /// Provider-native sleep used by ownership retry loops.
@@ -3233,7 +3230,7 @@ impl<C: FnOnce()> Drop for TaskCompletion<C> {
 
 /// Joinable provider-native aggregate task.
 pub struct ScalableTaskHandle<P: Providers> {
-    join: Option<<<P as Providers>::Task as TaskProvider>::JoinHandle>,
+    join: <<P as Providers>::Task as TaskProvider>::JoinHandle,
     completed: Arc<AtomicBool>,
 }
 
@@ -3253,11 +3250,9 @@ impl<P: Providers> ScalableTaskHandle<P> {
     /// Await provider-confirmed task termination. Aggregate close first
     /// signals cooperative shutdown, then joins every owned task through this
     /// operation.
-    pub async fn join(mut self) -> Result<(), ClientError> {
-        let Some(join) = self.join.take() else {
-            return Ok(());
-        };
-        join.await
+    pub async fn join(self) -> Result<(), ClientError> {
+        self.join
+            .await
             .map_err(|error| ClientError::Other(format!("scalable task failed: {error}")))
     }
 }
