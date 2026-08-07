@@ -1320,6 +1320,8 @@ M1 hash ranges are inclusive `[start,end]` within `0..=65535`; there is no half-
 Strict mode grants descendant FLOW only when retained local ownership history proves every transitive ancestor complete.
 A local ancestor is complete only after terminal/end-of-topic and after all delivered messages, pre-terminal reservations, required acks, and participating transaction commits settle.
 Unknown or cross-member ancestry yields observable `OrderingUnprovable` state and no descendant FLOW.
+An assigned active parent that becomes sealed without replacement placement retains its connected child and generation while it drains; the model never invents an unrouteable replacement open, while every other routeable descriptor change still uses confirmation-bearing close/reopen.
+Loss of that retained connection before completion follows the ordinary child-failure resynchronization path; no sealed authority is synthesized.
 
 Explicit `BrokerManaged` keeps every locally provable barrier but delegates remote ancestry to the controller.
 It does not upgrade M1 into a cross-member ordering proof.

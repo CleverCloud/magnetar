@@ -137,6 +137,9 @@ The failed seek publishes reconnect intent before awaiting confirmation-bearing 
 Assignment loss stops new FLOW and receive reservations but retains already reserved or delivered messages and the old child as an acknowledgement target.
 The drain is unbounded in time, not in memory: it may wait forever for the application to resolve a delivery while remaining inside the aggregate budget.
 Only then does the old `Exclusive` child close and allow a replacement generation to open.
+An assigned active parent becoming sealed without replacement placement is not ownership loss: the existing connected child and generation drain in place until terminal and retained work settle.
+M1 deliberately emits that shape, so reopening the parent would be unrouteable; every other routeable descriptor change still uses the confirmation-bearing replacement fence.
+If the retained connection fails before completion, ordinary child-failure resynchronization applies and no sealed authority is synthesized.
 
 A gained segment remains observable as `PendingOwnership` while another process retains its old `Exclusive` child.
 Each open attempt is bounded by the ordinary operation deadline, while `ConsumerBusy` schedules another provider-timed attempt for as long as the assignment remains current.
@@ -154,7 +157,7 @@ No existing close, unsubscribe, or layout-close command is repurposed as an unre
 It validates commands and independent invariants rather than repeating the client state machine.
 
 The public aggregate has 22 differential scenarios across the baseline and advanced suites: nine baseline and thirteen advanced.
-They cover typed delivery, concurrent receive and atomic batch, aggregate budget, same-epoch rebalance and drain, child reconnect, ack failure/retry, nack redelivery, close wakeup, strict split/merge barriers, the exact M1 sealed-assignment limitation, Strict versus BrokerManaged cross-member ancestry, vector seek/resync, transaction commit/abort/poison, and controller push/baseline/incarnation ordering.
+They cover typed delivery, concurrent receive and atomic batch, aggregate budget, same-epoch rebalance and drain, child reconnect, ack failure/retry, nack redelivery, close wakeup, strict split/merge barriers, exact-M1 sealed-assignment drain without parent reopen, Strict versus BrokerManaged cross-member ancestry, vector seek/resync, transaction commit/abort/poison, and controller push/baseline/incarnation ordering.
 
 The Moonpool runtime additionally runs the complete aggregate over `SimProviders` controller and segment sockets for four schedules derived from `MOONPOOL_SEED`.
 That provider-native test covers two-source typed delivery, aggregate status and position, acknowledgement, and close without an ambient Tokio runtime.

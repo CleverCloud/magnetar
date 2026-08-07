@@ -806,6 +806,9 @@ A successful seek clears pre-seek buffers and invalidates old tokens; any child 
 When assignment removes a source, the aggregate stops new FLOW and receive reservations, fences old child completions, and keeps the child as an acknowledgement target for already permitted, reserved, or delivered work.
 That drain is bounded by the aggregate memory budget and unbounded in time: if the application never resolves a delivery, handoff may wait forever.
 The replacement opens only after the old `Exclusive` child confirms release.
+When an assigned active parent becomes sealed without replacement placement, its existing connected child instead drains under the same generation until terminal and retained work settle.
+M1 emits that shape for sealed segments, so the aggregate does not attempt an unrouteable parent reopen; every other routeable descriptor change uses the replacement fence.
+If the retained connection fails before completion, normal child-failure resynchronization applies and no sealed authority is synthesized.
 
 A gained source remains observable as `PendingOwnership` while another process owns the old child.
 Each subscribe attempt is bounded by the ordinary operation deadline, while `ConsumerBusy` schedules another provider-timed attempt as long as the assignment remains current.
