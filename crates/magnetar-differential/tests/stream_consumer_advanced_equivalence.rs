@@ -174,8 +174,8 @@ struct CloseStateTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MalformedDeliveryTrace {
-    decompression_resync: bool,
-    after_close: ResourceCounts,
+    resync_reasons: Vec<String>,
+    after_close: Vec<ResourceCounts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4190,55 +4190,97 @@ where
     E: Engine,
     E::ClientState: SegmentSubscriberApi,
 {
-    let consumer = client
-        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
-        .subscription("malformed-delivery-sub")
-        .consumer_name("malformed-delivery-member")
-        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
-        .receiver_budget(two_frame_receiver_budget())
-        .subscribe()
-        .await
-        .expect("subscribe malformed-delivery aggregate");
-    cluster
-        .wait_for("malformed-delivery children", |fake| {
-            fake.resource_counts().child_consumers == 2
-        })
-        .await;
-    wait_for_initial_flow(&consumer, &[1, 2]).await;
-    cluster
-        .update(|fake| {
-            fake.enqueue_message_with_metadata(
-                1,
-                magnetar::proto::pb::MessageMetadata {
-                    compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
-                    uncompressed_size: Some(4),
-                    ..Default::default()
-                },
-                snappy(b"codec"),
-                Vec::new(),
-            )
-        })
-        .expect("enqueue malformed compressed delivery");
-    cluster
-        .wait_for("malformed delivery reaches child", |fake| {
-            fake.resource_counts().unacked_messages == 1
-        })
-        .await;
-    let reason = loop {
-        match next_event(&consumer).await {
-            StreamConsumerEvent::ResyncRequired { reason } => break reason,
-            StreamConsumerEvent::AssignmentApplied { .. }
-            | StreamConsumerEvent::SegmentPhaseChanged { .. }
-            | StreamConsumerEvent::OrderingUnprovable { .. }
-            | StreamConsumerEvent::TransactionOutcome { .. } => {}
-            unexpected => panic!("unexpected malformed-delivery event: {unexpected:?}"),
-        }
-    };
-    let decompression_resync = reason.contains("decompress");
-    assert!(decompression_resync, "unexpected resync reason: {reason}");
-    let after_close = close_and_count(consumer, cluster).await;
+    let cases = [
+        (
+            "decompression",
+            magnetar::proto::pb::MessageMetadata {
+                compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                uncompressed_size: Some(4),
+                ..Default::default()
+            },
+            snappy(b"codec"),
+            "decompress",
+        ),
+        (
+            "chunk",
+            magnetar::proto::pb::MessageMetadata {
+                num_chunks_from_msg: Some(2),
+                total_chunk_msg_size: Some(1),
+                uuid: Some("malformed-chunk".to_owned()),
+                ..Default::default()
+            },
+            Bytes::from_static(b"x"),
+            "chunk id is absent",
+        ),
+        (
+            "transform-budget",
+            magnetar::proto::pb::MessageMetadata {
+                compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                uncompressed_size: Some(u32::MAX),
+                ..Default::default()
+            },
+            snappy(b"x"),
+            "data budget is",
+        ),
+        (
+            "batch",
+            magnetar::proto::pb::MessageMetadata {
+                num_messages_in_batch: Some(2),
+                ..Default::default()
+            },
+            Bytes::new(),
+            "single-message metadata length is truncated",
+        ),
+    ];
+    let mut resync_reasons = Vec::with_capacity(cases.len());
+    let mut after_close = Vec::with_capacity(cases.len());
+    for (label, metadata, payload, reason_fragment) in cases {
+        let consumer = client
+            .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+            .subscription(format!("malformed-{label}-sub"))
+            .consumer_name(format!("malformed-{label}-member"))
+            .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+            .receiver_budget(two_frame_receiver_budget())
+            .subscribe()
+            .await
+            .expect("subscribe malformed-delivery aggregate");
+        cluster
+            .wait_for("malformed-delivery children", |fake| {
+                fake.resource_counts().child_consumers == 2
+            })
+            .await;
+        wait_for_initial_flow(&consumer, &[1, 2]).await;
+        cluster
+            .update(|fake| fake.enqueue_message_with_metadata(1, metadata, payload, Vec::new()))
+            .expect("enqueue malformed delivery");
+        cluster
+            .wait_for("malformed delivery reaches child", |fake| {
+                fake.resource_counts().unacked_messages == 1
+            })
+            .await;
+        let reason = loop {
+            match next_event(&consumer).await {
+                StreamConsumerEvent::ResyncRequired { reason } => break reason,
+                StreamConsumerEvent::AssignmentApplied { .. }
+                | StreamConsumerEvent::SegmentPhaseChanged { .. }
+                | StreamConsumerEvent::OrderingUnprovable { .. }
+                | StreamConsumerEvent::TransactionOutcome { .. } => {}
+                unexpected => panic!("unexpected malformed-delivery event: {unexpected:?}"),
+            }
+        };
+        assert!(
+            reason.contains(reason_fragment),
+            "unexpected {label} resync reason: {reason}"
+        );
+        assert_eq!(
+            consumer.status().phase(),
+            magnetar::proto::AggregatePhase::ResyncRequired
+        );
+        resync_reasons.push(reason);
+        after_close.push(close_and_count(consumer, cluster).await);
+    }
     MalformedDeliveryTrace {
-        decompression_resync,
+        resync_reasons,
         after_close,
     }
 }
