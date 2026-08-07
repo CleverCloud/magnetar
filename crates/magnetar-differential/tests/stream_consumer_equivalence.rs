@@ -169,6 +169,7 @@ struct PublicSurfaceTrace {
     default_name_generated: bool,
     broker_schema_resolved: bool,
     broker_schema_lookups: usize,
+    schema_prepare_failures_nacked: [bool; 2],
     schema_cancellation_restored: bool,
     schema_restoration_failure_resynced: bool,
     decode_failure_nacked: bool,
@@ -1929,6 +1930,98 @@ where
         })
         .await;
 
+    let mut schema_prepare_failures_nacked = [false; 2];
+    for (index, batch) in [false, true].into_iter().enumerate() {
+        let label = if batch { "batch" } else { "single" };
+        let prepare_failure_consumer = client
+            .scalable_stream_consumer(
+                "topic://public/default/scaled",
+                Arc::new(AutoConsumeSchema::new()),
+            )
+            .subscription(format!("surface-{label}-schema-prepare-failure-sub"))
+            .consumer_name(format!("surface-{label}-schema-prepare-failure-member"))
+            .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+            .receiver_budget(two_frame_receiver_budget())
+            .subscribe()
+            .await
+            .expect("subscribe schema-prepare failure aggregate");
+        cluster
+            .wait_for("schema-prepare failure children", |fake| {
+                fake.resource_counts().child_consumers == 2
+            })
+            .await;
+        wait_for_initial_flow(&prepare_failure_consumer).await;
+        cluster
+            .update(|fake| {
+                fake.clear_routes();
+                fake.script_next(
+                    Endpoint::Segment(1),
+                    OperationKind::GetSchema,
+                    ScriptedBehavior::Fail(BrokerFailure::new(
+                        magnetar::proto::pb::ServerError::MetadataError,
+                        "scripted schema preparation failure",
+                    )),
+                )?;
+                fake.enqueue_message(1, Bytes::from_static(b"schema-prepare-failure-one"))?;
+                if batch {
+                    fake.enqueue_message(1, Bytes::from_static(b"schema-prepare-failure-two"))?;
+                }
+                Ok(())
+            })
+            .expect("enqueue schema-prepare failure delivery");
+        let result = async {
+            if batch {
+                prepare_failure_consumer
+                    .receive_batch(
+                        BatchReceivePolicy::messages(2, Duration::from_secs(1))
+                            .expect("valid schema-prepare failure batch policy"),
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                prepare_failure_consumer.receive().await.map(|_| ())
+            }
+        }
+        .await;
+        let error = result.expect_err("schema preparation rejection reaches caller");
+        assert!(
+            error
+                .to_string()
+                .contains("scripted schema preparation failure")
+        );
+        cluster
+            .wait_for("schema-prepare failure negative acknowledgement", |fake| {
+                fake.routes().iter().any(|route| {
+                    route.command
+                        == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
+                })
+            })
+            .await;
+        schema_prepare_failures_nacked[index] = cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.command
+                        == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
+                })
+                .count()
+                == 1
+        });
+        assert!(schema_prepare_failures_nacked[index]);
+        prepare_failure_consumer
+            .close()
+            .await
+            .expect("close schema-prepare failure aggregate");
+        cluster
+            .wait_for("schema-prepare failure cleanup", |fake| {
+                let counts = fake.resource_counts();
+                counts.child_consumers == 0
+                    && counts.pending_operations == 0
+                    && counts.unacked_messages == 0
+            })
+            .await;
+    }
+
     let cancellation_schema = Arc::new(AutoConsumeSchema::new());
     let cancellation_consumer = client
         .scalable_stream_consumer("topic://public/default/scaled", cancellation_schema.clone())
@@ -2275,6 +2368,7 @@ where
         default_name_generated,
         broker_schema_resolved,
         broker_schema_lookups,
+        schema_prepare_failures_nacked,
         schema_cancellation_restored,
         schema_restoration_failure_resynced,
         decode_failure_nacked,
