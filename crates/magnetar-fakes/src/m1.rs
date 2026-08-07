@@ -3581,17 +3581,19 @@ impl M1FakeCluster {
     }
 
     fn remove_child_consumer(&mut self, member: MemberId) {
-        if let Some(consumer) = self.child_consumers.remove(&member) {
-            self.closed_consumers.insert(member);
-            let subscription = self
-                .child_subscriptions
-                .get_mut(&consumer.key)
-                .expect("an active child retains its subscription");
-            debug_assert!(
-                matches!(subscription.owner, Some(ChildOwner::Active(owner)) if owner == member)
-            );
-            subscription.owner = None;
-        }
+        let consumer = self
+            .child_consumers
+            .remove(&member)
+            .expect("child-removal callers retain an active consumer");
+        self.closed_consumers.insert(member);
+        let subscription = self
+            .child_subscriptions
+            .get_mut(&consumer.key)
+            .expect("an active child retains its subscription");
+        debug_assert!(
+            matches!(subscription.owner, Some(ChildOwner::Active(owner)) if owner == member)
+        );
+        subscription.owner = None;
     }
 
     fn release_pending_child_owner(

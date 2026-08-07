@@ -1322,7 +1322,7 @@ fn prospective_position_heap_bytes(
     source: &SegmentSource,
     message_id: &StreamMessageId,
     replace: bool,
-) -> Result<(usize, usize), StreamConsumerModelError> {
+) -> (usize, usize) {
     let mut vector = 0usize;
     let mut canonical = 0usize;
     let mut found = false;
@@ -1336,31 +1336,23 @@ fn prospective_position_heap_bytes(
             }
             existing_id
         };
-        vector = vector
-            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
-            .and_then(|bytes| bytes.checked_add(existing_source.topic().len()))
-            .and_then(|bytes| bytes.checked_add(selected.ordinary_message_id_bytes().len()))
-            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
-        canonical = canonical
-            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
-            .and_then(|bytes| bytes.checked_add(existing_source.topic().len()))
-            .and_then(|bytes| bytes.checked_add(selected.source().topic().len()))
-            .and_then(|bytes| bytes.checked_add(selected.ordinary_message_id_bytes().len()))
-            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+        vector += POSITION_COMPONENT_NODE_OVERHEAD
+            + existing_source.topic().len()
+            + selected.ordinary_message_id_bytes().len();
+        canonical += POSITION_COMPONENT_NODE_OVERHEAD
+            + existing_source.topic().len()
+            + selected.source().topic().len()
+            + selected.ordinary_message_id_bytes().len();
     }
     if !found {
-        vector = vector
-            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
-            .and_then(|bytes| bytes.checked_add(source.topic().len()))
-            .and_then(|bytes| bytes.checked_add(message_id.ordinary_message_id_bytes().len()))
-            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
-        canonical = canonical
-            .checked_add(POSITION_COMPONENT_NODE_OVERHEAD)
-            .and_then(|bytes| bytes.checked_add(source.topic().len().saturating_mul(2)))
-            .and_then(|bytes| bytes.checked_add(message_id.ordinary_message_id_bytes().len()))
-            .ok_or(StreamConsumerModelError::ReceiveSizeOverflow)?;
+        vector += POSITION_COMPONENT_NODE_OVERHEAD
+            + source.topic().len()
+            + message_id.ordinary_message_id_bytes().len();
+        canonical += POSITION_COMPONENT_NODE_OVERHEAD
+            + source.topic().len() * 2
+            + message_id.ordinary_message_id_bytes().len();
     }
-    Ok((vector, canonical))
+    (vector, canonical)
 }
 
 /// Result of accepting one raw broker entry.
@@ -3658,7 +3650,7 @@ impl StreamConsumerModel {
             &source,
             &stream_message_id,
             replace,
-        )?;
+        );
         let stream_message_id_bytes = stream_message_id.encoded_len()?;
         let stream_message_id_heap = source
             .topic()
@@ -4628,17 +4620,17 @@ impl StreamConsumerModel {
 
     fn refresh_delivered_position(&mut self) -> Result<(), StreamConsumerModelError> {
         let position = PositionVector::from_canonical(self.dag.epoch(), &self.delivered_positions)?;
-        let (position_heap, canonical_heap) = self.delivered_positions.first_key_value().map_or(
-            Ok((0, 0)),
-            |(source, message_id)| {
-                prospective_position_heap_bytes(
-                    &self.delivered_positions,
-                    source,
-                    message_id,
-                    false,
-                )
-            },
-        )?;
+        let (position_heap, canonical_heap) =
+            self.delivered_positions
+                .first_key_value()
+                .map_or((0, 0), |(source, message_id)| {
+                    prospective_position_heap_bytes(
+                        &self.delivered_positions,
+                        source,
+                        message_id,
+                        false,
+                    )
+                });
         self.delivered_positions_reservation
             .map_or(Ok(()), |reservation| {
                 position
@@ -5932,8 +5924,7 @@ mod tests {
             source,
             token.stream_message_id(),
             false,
-        )
-        .expect("position allocation accounting");
+        );
         let stream_message_id_heap =
             source.topic().len() + token.stream_message_id().ordinary_message_id_bytes().len();
         let authority_bytes = token
