@@ -1251,6 +1251,10 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
         live.child_closed(SegmentId(1), generation),
         Err(StreamConsumerModelError::InvalidChildTransition { .. })
     ));
+    assert!(matches!(
+        live.seek_completed(SegmentId(1), ChildGeneration(generation.0 + 1)),
+        Err(StreamConsumerModelError::StaleChildGeneration { .. })
+    ));
     let (token, _) = issue_delivery(&mut live, 1, generation, flow, 70);
     let first_ack = live
         .admit_individual_acknowledgement(&token)
