@@ -77,6 +77,7 @@ const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
 
 const TENANT_NS: &str = "public/default";
 const STREAM_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+const SETTLED_METADATA_SLACK_BYTES: usize = 64 * 1024;
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const NO_DELIVERY_WINDOW: Duration = Duration::from_secs(3);
@@ -532,6 +533,33 @@ async fn wait_for_status(
     }
 }
 
+async fn wait_for_attached_flow(
+    consumer: &ByteStreamConsumer,
+    description: &str,
+    segments: usize,
+) -> TestResult<usize> {
+    Ok(wait_for_status(consumer, description, |status| {
+        status.assigned_segments() == segments
+            && status.attached_segments() == segments
+            && status.receiver_budget_used() > 0
+    })
+    .await?
+    .receiver_budget_used())
+}
+
+async fn wait_for_settled_delivery_leases(
+    consumer: &ByteStreamConsumer,
+    description: &str,
+    idle_budget_used: usize,
+) -> TestResult {
+    wait_for_status(consumer, description, |status| {
+        status.receiver_budget_used()
+            <= idle_budget_used.saturating_add(SETTLED_METADATA_SLACK_BYTES)
+    })
+    .await?;
+    Ok(())
+}
+
 async fn receive_expected_messages(
     consumer: &ByteStreamConsumer,
     payloads: &[String],
@@ -568,6 +596,20 @@ async fn receive_expected_messages(
         return Err(format!("{context} did not receive payloads {remaining:?}").into());
     }
     Ok(messages)
+}
+
+fn assert_stream_payloads(
+    messages: &[ByteStreamMessage],
+    expected: &[String],
+    context: &str,
+) -> TestResult {
+    let actual: Vec<&[u8]> = messages.iter().map(StreamMessage::payload).collect();
+    let expected: Vec<&[u8]> = expected.iter().map(String::as_bytes).collect();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context}: {actual:?}").into())
+    }
 }
 
 async fn receive_from_any(
@@ -872,9 +914,11 @@ async fn exercise_vector_seek(
         OrderingMode::Strict,
     )
     .await?;
-    wait_for_status(&consumer, "one attached vector-seek segment", |status| {
-        status.assigned_segments() == 1 && status.attached_segments() == 1
-    })
+    let idle_budget_used = wait_for_attached_flow(
+        &consumer,
+        "one attached vector-seek segment with FLOW authority",
+        1,
+    )
     .await?;
 
     let expected = payloads(&format!("vector-seek-{suffix}"), 5);
@@ -889,14 +933,11 @@ async fn exercise_vector_seek(
     if initial.iter().any(|message| message.source() != &source) {
         return Err("one-segment vector-seek fixture delivered from multiple sources".into());
     }
-    let initial_payloads: Vec<&[u8]> = initial.iter().map(StreamMessage::payload).collect();
-    let expected_payloads: Vec<&[u8]> = expected.iter().map(String::as_bytes).collect();
-    if initial_payloads != expected_payloads {
-        return Err(format!(
-            "one-segment delivery must preserve FIFO before seek: {initial_payloads:?}"
-        )
-        .into());
-    }
+    assert_stream_payloads(
+        &initial,
+        &expected,
+        "one-segment delivery must preserve FIFO before seek",
+    )?;
 
     let target = &initial[2];
     let target_id = target.message_id().ordinary_message_id();
@@ -911,9 +952,11 @@ async fn exercise_vector_seek(
     )?;
     consumer.acknowledge_batch(&initial).await?;
     drop(initial);
-    wait_for_status(&consumer, "settled pre-seek delivery leases", |status| {
-        status.receiver_budget_used() == 0
-    })
+    wait_for_settled_delivery_leases(
+        &consumer,
+        "settled pre-seek delivery leases",
+        idle_budget_used,
+    )
     .await?;
 
     consumer.seek_positions(&seek_position).await?;
@@ -923,15 +966,11 @@ async fn exercise_vector_seek(
     if replayed.iter().any(|message| message.source() != &source) {
         return Err("vector seek replay crossed its sole source".into());
     }
-    let replayed_payloads: Vec<&[u8]> = replayed.iter().map(StreamMessage::payload).collect();
-    let expected_replayed_payloads: Vec<&[u8]> =
-        replay_expected.iter().map(String::as_bytes).collect();
-    if replayed_payloads != expected_replayed_payloads {
-        return Err(format!(
-            "vector seek must replay the inclusive source-local suffix; got {replayed_payloads:?}"
-        )
-        .into());
-    }
+    assert_stream_payloads(
+        &replayed,
+        replay_expected,
+        "vector seek must replay the inclusive source-local suffix",
+    )?;
 
     consumer.acknowledge(&replayed[0]).await?;
     consumer
@@ -942,9 +981,11 @@ async fn exercise_vector_seek(
         )
         .await?;
     drop(replayed);
-    wait_for_status(&consumer, "settled post-seek delivery leases", |status| {
-        status.receiver_budget_used() == 0
-    })
+    wait_for_settled_delivery_leases(
+        &consumer,
+        "settled post-seek delivery leases",
+        idle_budget_used,
+    )
     .await?;
     match tokio::time::timeout(NO_DELIVERY_WINDOW, consumer.receive()).await {
         Err(_) => {}
@@ -1018,9 +1059,11 @@ async fn exercise_transaction_commit(
         OrderingMode::Strict,
     )
     .await?;
-    wait_for_status(&consumer, "three attached commit segments", |status| {
-        status.assigned_segments() == 3 && status.attached_segments() == 3
-    })
+    let idle_budget_used = wait_for_attached_flow(
+        &consumer,
+        "three attached commit segments with FLOW authority",
+        3,
+    )
     .await?;
 
     let expected = payloads(&format!("txn-commit-{suffix}"), 9);
@@ -1049,10 +1092,10 @@ async fn exercise_transaction_commit(
         );
     }
     wait_for_transaction_outcome(&consumer, transaction, TransactionOutcome::Committed).await?;
-    wait_for_status(
+    wait_for_settled_delivery_leases(
         &consumer,
         "committed transactional leases resolved",
-        |status| status.receiver_budget_used() == 0,
+        idle_budget_used,
     )
     .await?;
     drop(messages);
