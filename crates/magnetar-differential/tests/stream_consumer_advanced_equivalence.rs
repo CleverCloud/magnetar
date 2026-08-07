@@ -327,6 +327,9 @@ struct DagWatchRecoveryTrace {
 struct AcknowledgementFailureTrace {
     partial_confirmed: usize,
     partial_failed: usize,
+    registration_disconnect_error: String,
+    registration_disconnect_recovered: bool,
+    close_during_ack_fenced: bool,
     close_after_ack_success: String,
     close_after_ack_failure: String,
     after_close: ResourceCounts,
@@ -4846,6 +4849,269 @@ where
     error
 }
 
+async fn close_during_ordinary_ack<E>(client: &PulsarClient<E>, cluster: &M1SocketCluster) -> bool
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("closing-ordinary-ack-sub")
+        .consumer_name("closing-ordinary-ack-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe closing ordinary-ack aggregate");
+    cluster
+        .wait_for("closing ordinary-ack children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    for segment in [1, 2] {
+        cluster
+            .update(|fake| {
+                fake.enqueue_message(segment, Bytes::from(format!("closing-ack-{segment}")))
+            })
+            .expect("enqueue closing ordinary acknowledgement component");
+    }
+    cluster
+        .wait_for("closing ordinary acknowledgement deliveries", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
+    let mut messages = vec![receive(&consumer).await, receive(&consumer).await];
+    messages.sort_by_key(|message| message.source().segment_id().0);
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Ack,
+                ScriptedBehavior::Delay,
+            )?;
+            for segment in [1, 2] {
+                fake.script_next(
+                    Endpoint::Segment(segment),
+                    OperationKind::Close,
+                    ScriptedBehavior::Delay,
+                )?;
+            }
+            Ok(())
+        })
+        .expect("delay ordinary acknowledgement and child closes");
+    let mut acknowledgement = Box::pin(consumer.acknowledge_batch(&messages));
+    tokio::select! {
+        biased;
+        result = &mut acknowledgement => panic!("ordinary acknowledgement completed before delay: {result:?}"),
+        () = cluster.wait_for("pending ordinary acknowledgement", |fake| {
+            fake.pending_operations().iter().any(|pending| pending.kind == OperationKind::Ack)
+        }) => {}
+    }
+    let pending_ack = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::Ack)
+                .map(|pending| pending.id)
+        })
+        .expect("pending ordinary acknowledgement id");
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::AckResponse,
+    );
+    cluster
+        .update(|fake| fake.complete_pending(pending_ack, PendingCompletion::Succeed))
+        .expect("settle delayed ordinary acknowledgement behind the wire");
+    let mut close = Box::pin(consumer.clone().close());
+    tokio::select! {
+        biased;
+        result = &mut close => panic!("aggregate close completed before child confirmations: {result:?}"),
+        () = cluster.wait_for("first pending close during ordinary acknowledgement", |fake| {
+            fake.pending_operations().iter().any(|pending| pending.kind == OperationKind::Close)
+        }) => {}
+    }
+    let first_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::Close)
+                .map(|pending| pending.id)
+        })
+        .expect("first pending ordinary-ack child close");
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::AckResponse,
+    );
+    let fenced = match acknowledgement
+        .await
+        .expect_err("closing aggregate fences ordinary acknowledgement settlement")
+    {
+        magnetar::scalable::StreamConsumerError::Model(
+            magnetar::proto::StreamConsumerModelError::InvalidAggregatePhase {
+                phase: magnetar::proto::AggregatePhase::Closing,
+            },
+        ) => true,
+        unexpected => panic!("unexpected closing ordinary acknowledgement error: {unexpected:?}"),
+    };
+    assert!(fenced);
+    cluster
+        .update(|fake| fake.complete_pending(first_close, PendingCompletion::Succeed))
+        .expect("confirm first ordinary-ack child close");
+    tokio::select! {
+        biased;
+        result = &mut close => panic!("aggregate close completed before second child confirmation: {result:?}"),
+        () = cluster.wait_for("second pending close during ordinary acknowledgement", |fake| {
+            fake.pending_operations().iter().any(|pending| pending.kind == OperationKind::Close)
+        }) => {}
+    }
+    let second_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::Close)
+                .map(|pending| pending.id)
+        })
+        .expect("second pending ordinary-ack child close");
+    cluster
+        .update(|fake| fake.complete_pending(second_close, PendingCompletion::Succeed))
+        .expect("confirm second ordinary-ack child close");
+    close.await.expect("close ordinary-ack aggregate");
+    cluster
+        .wait_for("closing ordinary acknowledgement cleanup", |fake| {
+            fake.resource_counts().child_consumers == 0
+                && fake.resource_counts().pending_operations == 0
+        })
+        .await;
+    fenced
+}
+
+async fn disconnect_during_transaction_registration<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> (String, bool)
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi,
+{
+    const SUBSCRIPTION: &str = "registration-disconnect-sub";
+    const MEMBER: &str = "registration-disconnect-member";
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription(SUBSCRIPTION)
+        .consumer_name(MEMBER)
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe registration-disconnect aggregate");
+    cluster
+        .wait_for("registration-disconnect children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"registration-disconnect")))
+        .expect("enqueue registration-disconnect delivery");
+    cluster
+        .wait_for("registration-disconnect delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let message = receive(&consumer).await;
+    let transaction = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open registration-disconnect transaction");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::TransactionRegistration,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("delay transaction registration before disconnect");
+    let mut acknowledgement = Box::pin(consumer.acknowledge_in_transaction(&message, transaction));
+    tokio::select! {
+        biased;
+        result = &mut acknowledgement => panic!("transaction registration completed before disconnect: {result:?}"),
+        () = cluster.wait_for("pending transaction registration before disconnect", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.kind == OperationKind::TransactionRegistration
+            })
+        }) => {}
+    }
+    let old_controller = cluster
+        .inspect(|fake| fake.member(SUBSCRIPTION, MEMBER))
+        .expect("registration-disconnect member")
+        .connection;
+    cluster
+        .update(|fake| fake.disconnect_connection(old_controller))
+        .expect("disconnect controller during transaction registration");
+    let registration_disconnect_error = match acknowledgement
+        .await
+        .expect_err("controller disconnect rejects transaction registration")
+    {
+        magnetar::scalable::StreamConsumerError::Engine { .. }
+        | magnetar::scalable::StreamConsumerError::Model(
+            magnetar::proto::StreamConsumerModelError::StaleAcknowledgementAuthority,
+        ) => "registration-disconnected".to_owned(),
+        unexpected => panic!("unexpected registration-disconnect error: {unexpected:?}"),
+    };
+    let mut saw_resync = false;
+    let registration_disconnect_recovered = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { .. } => saw_resync = true,
+            StreamConsumerEvent::AssignmentApplied { sources, .. } if saw_resync => {
+                assert_eq!(
+                    sources
+                        .iter()
+                        .map(|source| source.segment_id().0)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected registration-disconnect event: {unexpected:?}"),
+        }
+    };
+    assert_eq!(registration_disconnect_error, "registration-disconnected");
+    assert!(registration_disconnect_recovered);
+    cluster
+        .wait_for("registration-disconnect recovery", |fake| {
+            fake.resource_counts().child_consumers == 2
+                && fake.resource_counts().pending_operations == 0
+                && fake
+                    .member(SUBSCRIPTION, MEMBER)
+                    .is_some_and(|member| member.connection != old_controller)
+        })
+        .await;
+    client
+        .abort_transaction(transaction)
+        .await
+        .expect("abort transaction after registration disconnect");
+    assert_eq!(
+        stale_token_kind(
+            consumer
+                .acknowledge(&message)
+                .await
+                .expect_err("registration disconnect invalidates the old delivery lease"),
+        ),
+        "stale-token"
+    );
+    close_and_count(consumer, cluster).await;
+    (
+        registration_disconnect_error,
+        registration_disconnect_recovered,
+    )
+}
+
 async fn observe_acknowledgement_failures<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -4854,6 +5120,9 @@ where
     E: Engine,
     E::ClientState: SegmentSubscriberApi + TransactionApi,
 {
+    let (registration_disconnect_error, registration_disconnect_recovered) =
+        disconnect_during_transaction_registration(client, cluster).await;
+    let close_during_ack_fenced = close_during_ordinary_ack(client, cluster).await;
     let consumer = client
         .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
         .subscription("partial-ack-sub")
@@ -4931,6 +5200,9 @@ where
     AcknowledgementFailureTrace {
         partial_confirmed,
         partial_failed,
+        registration_disconnect_error,
+        registration_disconnect_recovered,
+        close_during_ack_fenced,
         close_after_ack_success,
         close_after_ack_failure,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
