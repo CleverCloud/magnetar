@@ -1457,7 +1457,7 @@ async fn exercise_broker_managed_split(
     consumers[0].acknowledge(&parent).await?;
     drop(parent);
     for consumer in &consumers {
-        wait_for_status(consumer, "balanced post-drain split assignment", |status| {
+        wait_for_status_with_events(consumer, "balanced post-drain split assignment", |status| {
             status
                 .layout_epoch()
                 .is_some_and(|epoch| epoch > initial_epoch)
