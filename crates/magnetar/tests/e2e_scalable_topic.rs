@@ -533,6 +533,63 @@ async fn wait_for_status(
     }
 }
 
+async fn wait_for_status_with_events(
+    consumer: &ByteStreamConsumer,
+    description: &str,
+    mut predicate: impl FnMut(&magnetar::scalable::StreamConsumerStatus) -> bool,
+) -> TestResult<magnetar::scalable::StreamConsumerStatus> {
+    let deadline = Instant::now() + STATUS_TIMEOUT;
+    let mut statuses = Vec::new();
+    let mut events = Vec::new();
+    loop {
+        let status = consumer.status();
+        if statuses.last() != Some(&status) {
+            if statuses.len() == 32 {
+                statuses.remove(0);
+            }
+            statuses.push(status.clone());
+        }
+        if predicate(&status) {
+            return Ok(status);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "stream consumer did not reach {description} within {STATUS_TIMEOUT:?}; \
+                 status history: {statuses:#?}; event history: {events:#?}"
+            )
+            .into());
+        }
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(100)),
+            consumer.next_event(),
+        )
+        .await
+        {
+            Ok(Ok(Some(event))) => {
+                if events.len() == 32 {
+                    events.remove(0);
+                }
+                events.push(event);
+            }
+            Ok(Ok(None)) => {
+                if events.len() == 32 {
+                    events.remove(0);
+                }
+                events.push(StreamConsumerEvent::Closed);
+            }
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "stream consumer event stream failed while waiting for {description}: \
+                     {error}; status history: {statuses:#?}; event history: {events:#?}"
+                )
+                .into());
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 async fn wait_for_attached_flow(
     consumer: &ByteStreamConsumer,
     description: &str,
@@ -1271,7 +1328,7 @@ async fn exercise_strict_split(
     }
     consumer.acknowledge(&parent).await?;
     drop(parent);
-    wait_for_status(
+    wait_for_status_with_events(
         &consumer,
         "sealed parent plus two strict children",
         |status| {
