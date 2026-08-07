@@ -90,6 +90,14 @@ use parking_lot::Mutex;
 mod common;
 use common::sweep_seeds;
 
+struct CountingWake(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountingWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Port the in-sim broker binds to. The sim network hands every workload
 /// its own IP, so a fixed port keeps the client→broker derivation trivial.
 const BROKER_PORT: u16 = 6650;
@@ -576,4 +584,32 @@ fn moonpool_producer_memory_limit_fail_immediately_sweep_8_seeds() {
          exercise the memory-limit reservation — every seed was \
          connect-blocked by chaos (contract never tested): {report:?}",
     );
+}
+
+#[test]
+fn moonpool_producer_block_waiter_progresses_after_budget_release() {
+    let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig {
+        memory_limit_bytes: LIMIT_BYTES,
+        memory_limit_policy: MemoryLimitPolicy::ProducerBlock,
+        ..ConnectionConfig::default()
+    });
+    shared
+        .try_reserve_memory(LIMIT_BYTES)
+        .expect("first send fills budget");
+    let wake = std::sync::Arc::new(CountingWake(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wake.clone());
+    let token = shared
+        .try_reserve_memory_or_register(LIMIT_BYTES, &waker)
+        .expect_err("second send must park while budget is full");
+
+    shared.release_memory(LIMIT_BYTES);
+    assert_eq!(
+        wake.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "releasing the first send wakes the parked ProducerBlock waiter"
+    );
+    shared.cancel_memory_waker(token);
+    shared
+        .try_reserve_memory(LIMIT_BYTES)
+        .expect("woken second send can reserve the released budget");
 }

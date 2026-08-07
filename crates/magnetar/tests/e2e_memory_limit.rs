@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! E2E: `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy::FailImmediately)`.
+//! E2E: `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)`.
 //!
 //! Java parity: `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. See
 //! [ADR-0017](../../../specs/adr/0017-memory-limit-atomic-reservation.md).
@@ -9,11 +9,14 @@
 //!   1. **Reject path** — limit = 1 KiB, send a 2 KiB message. Expect
 //!      `ClientError::MemoryLimitExceeded` (synchronous reservation failure; the bytes never reach
 //!      the wire).
-//!   2. **Happy path** — limit = 64 KiB, send a 1 KiB message. Expect a normal `SendReceipt` (the
-//!      reservation succeeds and is released on completion).
+//!   2. **`ProducerBlock` path** — saturate a 1 KiB budget with one send, poll a second send before
+//!      yielding to the driver, and require it to stay pending until the first receipt releases the
+//!      reservation.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046).
 
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 use std::time::Duration;
 
 use magnetar::{MemoryLimitPolicy, OutgoingMessage, PulsarClient};
@@ -23,7 +26,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
+const DEFAULT_IMAGE_TAG: &str = "4.0.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
@@ -121,27 +124,42 @@ async fn e2e_memory_limit_rejects_oversize() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_memory_limit_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_memory_limit_producer_block_waits_for_budget() -> Result<(), Box<dyn std::error::Error>>
+{
     let (service_url, _admin_url, _container) = start_pulsar().await?;
 
-    // 64 KiB budget. A 1 KiB payload fits — the send completes normally and
-    // the reservation is released when SendFut drops.
+    // One payload exactly fills the budget. The second send must park until
+    // the first receipt releases the reservation.
     let client = PulsarClient::builder()
         .service_url(service_url)
-        .memory_limit(64 * 1024, MemoryLimitPolicy::FailImmediately)
+        .memory_limit(1024, MemoryLimitPolicy::ProducerBlock)
         .build()
         .await?;
-    let topic = "persistent://public/default/magnetar-e2e-memory-limit-ok";
+    let topic = "persistent://public/default/magnetar-e2e-memory-limit-producer-block";
     let producer = client.producer(topic).create().await?;
 
-    let payload = vec![0xABu8; 1024];
-    let id = producer
-        .send(OutgoingMessage::with_payload(payload).into())
-        .await?;
-    // The receipt's ledger / entry ids are broker-assigned; any successful
-    // SendReceipt suffices to prove the reservation released cleanly.
-    let _ = id;
+    // A current-thread runtime cannot schedule the driver between these immediately-ready
+    // `poll_fn` calls, so the first broker receipt is deterministically retained until both sends
+    // have been polled once.
+    let mut first = Box::pin(producer.send(OutgoingMessage::with_payload(vec![0xAB; 1024]).into()));
+    let first_poll = poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "the first send must queue and await its broker receipt"
+    );
+
+    let mut second =
+        Box::pin(producer.send(OutgoingMessage::with_payload(vec![0xCD; 1024]).into()));
+    let second_poll = poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx))).await;
+    assert!(
+        second_poll.is_pending(),
+        "ProducerBlock must park the second send while the budget is full; \
+         FailImmediately would resolve MemoryLimitExceeded here"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), first).await??;
+    tokio::time::timeout(Duration::from_secs(10), second).await??;
 
     producer.close().await?;
     client.close().await;

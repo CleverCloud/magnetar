@@ -36,7 +36,7 @@
 //! its handshake, the inner loop calls [`magnetar_proto::Connection::rebuild_producers`] and
 //! [`magnetar_proto::Connection::rebuild_consumers`], which re-emit every still-open producer's
 //! `CommandProducer` (with a bumped `epoch`) and every still-open consumer's `CommandSubscribe`
-//! plus `CommandFlow` (resuming from `last_acked_message_id` when known). The producer rebuild
+//! plus `CommandFlow` (durable consumers defer to the broker cursor). The producer rebuild
 //! also re-issues every snapshotted in-flight publish onto the new session — user-facing send
 //! futures stay pending until the replayed `CommandSendReceipt` arrives, never observing the
 //! reset. This delivers at-least-once publish parity with the Java client (mirrors
