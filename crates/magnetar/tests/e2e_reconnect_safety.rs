@@ -305,6 +305,10 @@ async fn e2e_batched_send_futures_resolve_for_every_reset_phase()
         .batching_max_publish_delay(Duration::from_secs(30))
         .create()
         .await?;
+    // A successful non-batched receipt is the readiness barrier after each accepted proxy
+    // session. `wait_for_sessions` alone observes TCP accept before the reconnect handshake and
+    // producer rebuild have necessarily completed.
+    let readiness_probe = client.producer(&topic).create().await?;
 
     // Before flush: both eager SendFuts are present in the batch container when the socket drops.
     let preflush: Vec<_> = [b"pre-a".as_slice(), b"pre-b".as_slice()]
@@ -315,6 +319,12 @@ async fn e2e_batched_send_futures_resolve_for_every_reset_phase()
     let preflush_results = tokio::time::timeout(WAIT, join_all(preflush)).await?;
     assert_batch_reset_errors(preflush_results);
     gate.wait_for_sessions(2).await;
+    tokio::time::timeout(
+        WAIT,
+        readiness_probe
+            .send(OutgoingMessage::with_payload(b"ready-after-preflush".to_vec()).into()),
+    )
+    .await??;
 
     // After flush, before receipt: suppress the ranged receipt and close that session.
     let flushed: Vec<_> = [b"flush-a".as_slice(), b"flush-b".as_slice()]
@@ -329,6 +339,11 @@ async fn e2e_batched_send_futures_resolve_for_every_reset_phase()
     flush_result?;
     assert_batch_reset_errors(flushed_results);
     gate.wait_for_sessions(3).await;
+    tokio::time::timeout(
+        WAIT,
+        readiness_probe.send(OutgoingMessage::with_payload(b"ready-after-flush".to_vec()).into()),
+    )
+    .await??;
 
     // After receipt: every SendFut succeeds before the cut and remains resolved across it.
     let control: Vec<_> = [b"ok-a".as_slice(), b"ok-b".as_slice()]
@@ -346,15 +361,15 @@ async fn e2e_batched_send_futures_resolve_for_every_reset_phase()
     gate.cut_current();
     gate.wait_for_sessions(4).await;
 
-    // The same producer remains usable, proving the cut happened after the ranged receipt was
-    // applied rather than racing that receipt.
-    let post_receipt =
-        producer.send(OutgoingMessage::with_payload(b"after-receipt".to_vec()).into());
-    let (flush_result, post_receipt_result) =
-        tokio::time::timeout(WAIT, async { tokio::join!(producer.flush(), post_receipt) }).await?;
-    flush_result?;
-    post_receipt_result?;
+    // A receipt on the fourth session proves the cut happened after the ranged receipt was
+    // applied rather than merely leaving the previous successful futures undisturbed.
+    tokio::time::timeout(
+        WAIT,
+        readiness_probe.send(OutgoingMessage::with_payload(b"ready-after-receipt".to_vec()).into()),
+    )
+    .await??;
 
+    readiness_probe.close().await?;
     producer.close().await?;
     client.close().await;
     Ok(())
