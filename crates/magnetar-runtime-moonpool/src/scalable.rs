@@ -770,10 +770,15 @@ enum TransactionRegistration {
 #[derive(Debug)]
 struct TransactionOutcomeCompletion {
     outcome: magnetar_proto::TransactionAcknowledgementOutcome,
-    result: Mutex<Option<Result<(), String>>>,
-    running: AtomicBool,
+    state: Mutex<TransactionOutcomeState>,
     work: Mutex<Option<TransactionOutcomeWork>>,
     notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct TransactionOutcomeState {
+    result: Option<Result<(), String>>,
+    running: bool,
 }
 
 #[derive(Debug)]
@@ -786,37 +791,29 @@ impl TransactionOutcomeCompletion {
     fn new(outcome: magnetar_proto::TransactionAcknowledgementOutcome) -> Self {
         Self {
             outcome,
-            result: Mutex::new(None),
-            running: AtomicBool::new(false),
+            state: Mutex::new(TransactionOutcomeState::default()),
             work: Mutex::new(None),
             notify: Notify::new(),
         }
     }
 
     fn try_start(&self) -> bool {
-        if matches!(&*self.result.lock(), Some(Ok(()))) {
+        let mut state = self.state.lock();
+        if matches!(state.result, Some(Ok(()))) || state.running {
             return false;
         }
-        if self
-            .running
-            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        if matches!(&*self.result.lock(), Some(Err(_))) {
-            *self.result.lock() = None;
-        }
+        state.result = None;
+        state.running = true;
         true
     }
 
     fn finish(&self, result: Result<(), String>) {
-        let mut current = self.result.lock();
-        if current.is_none() {
-            *current = Some(result);
+        let mut state = self.state.lock();
+        if state.result.is_none() {
+            state.result = Some(result);
         }
-        drop(current);
-        self.running.store(false, AtomicOrdering::Release);
+        state.running = false;
+        drop(state);
         self.notify.notify_waiters();
     }
 
@@ -825,7 +822,7 @@ impl TransactionOutcomeCompletion {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(result) = self.result.lock().clone() {
+            if let Some(result) = self.state.lock().result.clone() {
                 return result;
             }
             notified.await;
@@ -5441,6 +5438,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transaction_outcome_admission_is_singleflight_and_retryable() {
+        let completion = TransactionOutcomeCompletion::new(
+            magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+        );
+        assert!(completion.try_start());
+        assert!(!completion.try_start(), "one worker owns propagation");
+
+        completion.finish(Err("retryable failure".to_owned()));
+        assert!(completion.try_start(), "a failed worker may be retried");
+        completion.finish(Ok(()));
+        assert!(!completion.try_start(), "success is terminal");
+
+        let state = completion.state.lock();
+        assert!(matches!(state.result, Some(Ok(()))));
+        assert!(!state.running);
+    }
+
     #[tokio::test]
     async fn transaction_outcome_continues_after_waiter_cancellation() {
         let mut inner = empty_aggregate_inner();
@@ -5490,8 +5505,9 @@ mod tests {
                 .transaction_outcomes
                 .get(&txn_id)
                 .expect("tracked outcome")
-                .result
+                .state
                 .lock()
+                .result
                 .clone(),
             Some(Ok(()))
         ));
