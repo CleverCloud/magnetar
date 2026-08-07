@@ -23,6 +23,7 @@ use moonpool_core::TokioProviders;
 use server::M1SocketCluster;
 
 const TOPIC: &str = "topic://public/default/scaled";
+const FOREIGN_TOPIC: &str = "topic://public/default/foreign-scaled";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeSurfaceTrace {
@@ -45,6 +46,7 @@ struct RuntimeSurfaceTrace {
     wrong_scheme_rejected: bool,
     disallowed_authority_rejected: bool,
     child_topic: String,
+    replacement_topic_drift_rejected: bool,
     replacement_rejected: bool,
     route_tombstones_bounded: bool,
     direct_aggregate_debug: bool,
@@ -357,6 +359,39 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         .expect("open valid Tokio segment consumer");
     let child_topic = child.topic();
     child.close().await.expect("close Tokio segment consumer");
+    let drift_controller = subscriber
+        .open_controller_session(&dag, "runtime-drift-sub", "runtime-drift-member")
+        .await
+        .expect("open Tokio controller for topic-drift rejection");
+    let foreign_cluster = M1SocketCluster::bind_for_topic(FOREIGN_TOPIC).await;
+    let foreign_client = magnetar_runtime_tokio::Client::connect(
+        foreign_cluster.controller_url(),
+        supervised_config(),
+    )
+    .await
+    .expect("connect foreign Tokio runtime client");
+    let foreign_subscriber = foreign_client
+        .segment_subscriber()
+        .expect("foreign Tokio segment subscriber");
+    let foreign_dag = foreign_subscriber
+        .open_dag_session(FOREIGN_TOPIC)
+        .await
+        .expect("open foreign Tokio DAG session");
+    let replacement_topic_drift_rejected = matches!(
+        subscriber
+            .reopen_controller_session(&foreign_dag, drift_controller)
+            .await,
+        Err(magnetar_runtime_tokio::ClientError::ControllerRoutingUnsupported { .. })
+    );
+    foreign_dag.close();
+    foreign_client.close().await;
+    foreign_cluster
+        .wait_for("foreign Tokio runtime cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.connections == 0 && counts.layout_sessions == 0
+        })
+        .await;
+    foreign_cluster.assert_healthy();
     let replacement_rejected = matches!(
         subscriber.reopen_controller_session(&dag, controller).await,
         Err(magnetar_runtime_tokio::ClientError::ScalableAssignmentRejected { .. })
@@ -409,6 +444,7 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         wrong_scheme_rejected,
         disallowed_authority_rejected,
         child_topic,
+        replacement_topic_drift_rejected,
         replacement_rejected,
         route_tombstones_bounded,
         direct_aggregate_debug,
@@ -651,6 +687,47 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         .close()
         .await
         .expect("close Moonpool segment consumer");
+    let drift_controller = subscriber
+        .open_controller_session(&dag, "runtime-drift-sub", "runtime-drift-member")
+        .await
+        .expect("open Moonpool controller for topic-drift rejection");
+    let foreign_cluster = M1SocketCluster::bind_for_topic(FOREIGN_TOPIC).await;
+    let foreign_engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let foreign_address = foreign_cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("foreign plaintext controller URL");
+    let foreign_client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &foreign_engine,
+        foreign_address,
+        supervised_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect foreign Moonpool runtime client");
+    let foreign_subscriber = foreign_client
+        .segment_subscriber()
+        .expect("foreign Moonpool segment subscriber");
+    let foreign_dag = foreign_subscriber
+        .open_dag_session(FOREIGN_TOPIC)
+        .await
+        .expect("open foreign Moonpool DAG session");
+    let replacement_topic_drift_rejected = matches!(
+        subscriber
+            .reopen_controller_session(&foreign_dag, drift_controller)
+            .await,
+        Err(magnetar_runtime_moonpool::ClientError::ControllerRoutingUnsupported { .. })
+    );
+    foreign_dag.close();
+    foreign_client.close().await;
+    foreign_cluster
+        .wait_for("foreign Moonpool runtime cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.connections == 0 && counts.layout_sessions == 0
+        })
+        .await;
+    foreign_cluster.assert_healthy();
     let replacement_rejected = matches!(
         subscriber.reopen_controller_session(&dag, controller).await,
         Err(magnetar_runtime_moonpool::ClientError::ScalableAssignmentRejected { .. })
@@ -703,6 +780,7 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         wrong_scheme_rejected,
         disallowed_authority_rejected,
         child_topic,
+        replacement_topic_drift_rejected,
         replacement_rejected,
         route_tombstones_bounded,
         direct_aggregate_debug,
@@ -2010,6 +2088,7 @@ async fn owned_scalable_runtime_surfaces_are_equivalent() {
     assert!(tokio_trace.missing_authority_rejected);
     assert!(tokio_trace.wrong_scheme_rejected);
     assert!(tokio_trace.disallowed_authority_rejected);
+    assert!(tokio_trace.replacement_topic_drift_rejected);
     assert!(tokio_trace.replacement_rejected);
     assert!(tokio_trace.direct_aggregate_debug);
     assert!(tokio_trace.zero_message_batch);

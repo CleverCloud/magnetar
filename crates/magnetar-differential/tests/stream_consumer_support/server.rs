@@ -42,15 +42,23 @@ impl M1SocketCluster {
     /// fake, so every advertised authority names the real listener selected by
     /// the runtime pools.
     pub(crate) async fn bind() -> Self {
-        Self::bind_with_controller_authority(true).await
+        Self::bind_for_topic_with_controller_authority("topic://public/default/scaled", true).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn bind_for_topic(topic: &str) -> Self {
+        Self::bind_for_topic_with_controller_authority(topic, true).await
     }
 
     #[allow(dead_code)]
     pub(crate) async fn bind_without_controller_authority() -> Self {
-        Self::bind_with_controller_authority(false).await
+        Self::bind_for_topic_with_controller_authority("topic://public/default/scaled", false).await
     }
 
-    async fn bind_with_controller_authority(advertise_controller_authority: bool) -> Self {
+    async fn bind_for_topic_with_controller_authority(
+        topic: &str,
+        advertise_controller_authority: bool,
+    ) -> Self {
         let controller = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind M1 controller");
@@ -70,7 +78,7 @@ impl M1SocketCluster {
                 format!("pulsar+ssl://{address}"),
             )
         };
-        let config = M1FakeConfig::new("topic://public/default/scaled")
+        let config = M1FakeConfig::new(topic)
             .expect("valid M1 topic")
             .with_endpoint_authorities(Endpoint::Controller, authorities(controller_address))
             .with_endpoint_authorities(Endpoint::Segment(1), authorities(segment_one_address))
