@@ -143,6 +143,7 @@ struct ControlPlaneTrace {
     alignment_failure_applied_epoch_three: bool,
     alignment_retry_reported: bool,
     alignment_retry_baseline: (u64, Vec<u64>),
+    close_interrupted_alignment: bool,
     after_close: ResourceCounts,
 }
 
@@ -3638,10 +3639,66 @@ where
     assert!(alignment_retry_reported);
     assert_eq!(alignment_retry_baseline, (3, vec![1, 2]));
 
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.script_next(
+                Endpoint::Segment(2),
+                OperationKind::Seek,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "force close-during-alignment reconnect",
+                )),
+            )
+        })
+        .expect("script delayed controller baseline before close");
     replacement_consumer
-        .close()
+        .seek_positions(&replacement_seek)
         .await
-        .expect("close replacement aggregate");
+        .expect_err("failed seek requests close-during-alignment reconnect");
+    let closing_controller = cluster
+        .inspect(|fake| fake.member("control-replacement-sub", "control-replacement-member"))
+        .expect("controller before close-during-alignment reconnect")
+        .connection;
+    cluster
+        .update(|fake| fake.disconnect_connection(closing_controller))
+        .expect("disconnect controller before close-during-alignment reconnect");
+    cluster
+        .wait_for(
+            "delayed controller baseline before aggregate close",
+            |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::ScalableOpen)
+                    && fake.resource_counts().child_consumers == 0
+            },
+        )
+        .await;
+    let delayed_baseline = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::ScalableOpen)
+                .map(|pending| pending.id)
+        })
+        .expect("delayed close-during-alignment baseline id");
+    let mut close = Box::pin(replacement_consumer.clone().close());
+    tokio::select! {
+        biased;
+        result = &mut close => panic!("aggregate close completed before delayed baseline: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    cluster
+        .update(|fake| fake.complete_pending(delayed_baseline, PendingCompletion::Succeed))
+        .expect("release controller baseline after aggregate close starts");
+    close
+        .await
+        .expect("close interrupts replacement control-plane alignment");
+    let close_interrupted_alignment = true;
     cluster
         .wait_for("control-plane cleanup", |fake| {
             let counts = fake.resource_counts();
@@ -3651,6 +3708,7 @@ where
                 && counts.permits == 0
         })
         .await;
+
     ControlPlaneTrace {
         push_preceded_response,
         assignments,
@@ -3663,6 +3721,7 @@ where
         alignment_failure_applied_epoch_three,
         alignment_retry_reported,
         alignment_retry_baseline,
+        close_interrupted_alignment,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
     }
 }
@@ -4327,6 +4386,7 @@ where
             - close_routes_before
     });
     assert_eq!(provisional_close_routes, 2);
+
     let after_close = cluster.inspect(M1FakeCluster::resource_counts);
     ChildOpenTrace {
         busy_segment_attempts,
@@ -5057,6 +5117,11 @@ where
         magnetar::scalable::StreamConsumerError::Engine { .. }
         | magnetar::scalable::StreamConsumerError::Model(
             magnetar::proto::StreamConsumerModelError::StaleAcknowledgementAuthority,
+        )
+        | magnetar::scalable::StreamConsumerError::Model(
+            magnetar::proto::StreamConsumerModelError::InvalidAggregatePhase {
+                phase: magnetar::proto::AggregatePhase::ResyncRequired,
+            },
         ) => "registration-disconnected".to_owned(),
         unexpected => panic!("unexpected registration-disconnect error: {unexpected:?}"),
     };
