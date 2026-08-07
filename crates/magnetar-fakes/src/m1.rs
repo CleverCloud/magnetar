@@ -2123,6 +2123,18 @@ impl M1FakeCluster {
         }
     }
 
+    /// Number of unacknowledged entries retained by one segment subscription.
+    #[must_use]
+    pub fn segment_unacked(&self, subscription: &str, segment_id: u64) -> usize {
+        self.child_consumers
+            .values()
+            .filter(|consumer| {
+                consumer.key.subscription == subscription && consumer.segment_id == segment_id
+            })
+            .map(|consumer| consumer.unacked.len())
+            .sum()
+    }
+
     fn handle_frame(&mut self, connection: ConnectionId, frame: &Frame) -> Result<(), M1FakeError> {
         let kind = pb::base_command::Type::try_from(frame.command.r#type).map_err(|_| {
             M1FakeError::InvalidCommand {
