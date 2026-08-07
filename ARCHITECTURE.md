@@ -1322,6 +1322,7 @@ A local ancestor is complete only after terminal/end-of-topic and after all deli
 Unknown or cross-member ancestry yields observable `OrderingUnprovable` state and no descendant FLOW.
 An assigned active parent that becomes sealed without replacement placement retains its connected child and generation while it drains; the model never invents an unrouteable replacement open, while every other routeable descriptor change still uses confirmation-bearing close/reopen.
 Loss of that retained connection before completion follows the ordinary child-failure resynchronization path; no sealed authority is synthesized.
+A locally completed sealed segment may remain or reappear in a later complete assignment snapshot but is excluded from gained-child generation accounting, pending ownership, and ordinary child opens; active segments in the same assignment reconcile unchanged.
 
 Explicit `BrokerManaged` keeps every locally provable barrier but delegates remote ancestry to the controller.
 It does not upgrade M1 into a cross-member ordering proof.
@@ -1784,7 +1785,7 @@ High-level summary:
   Trackers ship 13 ported behavioral cases from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer ships 6 ported cases from `BatchMessageContainerImplTest`.
 - **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, the complete scalable aggregate over simulated controller and segment sockets, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
-  The stateful M1 fake drives 22 public aggregate scenarios, nine baseline and thirteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.
+  The stateful M1 fake drives 23 public aggregate scenarios, nine baseline and fourteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.
 - **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no dedicated `e2e` feature and no `#[ignore]`; owning product features still gate feature-specific targets ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)), and Docker is the runtime prerequisite.
   Spins suite-specific Pulsar 4.x images for stable and compatibility coverage and `apachepulsar/pulsar:5.0.0-M1` for PIP-460 via `testcontainers`.
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover, and the hardened scalable aggregate contract.

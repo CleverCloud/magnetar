@@ -40,7 +40,7 @@ static ADVANCED_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 
 fn advanced_socket_test_guard() -> std::sync::MutexGuard<'static, ()> {
     // LLVM coverage makes these socket-heavy scenarios interfere when the test
-    // harness runs all thirteen independent Tokio runtimes at once.
+    // harness runs all advanced independent Tokio runtimes at once.
     ADVANCED_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -529,17 +529,34 @@ where
     }
 }
 
-fn flow_command_count(fake: &M1FakeCluster, segment_id: u64) -> usize {
+fn command_segment_count(
+    fake: &M1FakeCluster,
+    command: magnetar::proto::pb::base_command::Type,
+    segment_id: u64,
+) -> usize {
     let topic = fake
         .segment_topic(segment_id)
         .expect("segment has canonical topic");
     fake.routes()
         .iter()
         .filter(|route| {
-            route.command == magnetar::proto::pb::base_command::Type::Flow
-                && route.resource.as_deref() == Some(topic.as_str())
+            route.command == command
+                && route.resource.as_deref().is_some_and(|resource| {
+                    resource == topic
+                        || resource
+                            .strip_prefix(&topic)
+                            .is_some_and(|rest| rest.starts_with(':'))
+                })
         })
         .count()
+}
+
+fn flow_command_count(fake: &M1FakeCluster, segment_id: u64) -> usize {
+    command_segment_count(
+        fake,
+        magnetar::proto::pb::base_command::Type::Flow,
+        segment_id,
+    )
 }
 
 fn command_segments(
@@ -962,6 +979,16 @@ where
         })
         .await;
     wait_for_initial_flow(&consumer, &[1, 2]).await;
+    let sink = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("sealed-placement-sub")
+        .consumer_name("sealed-placement-sink")
+        .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe exact-M1 sink member");
+    let _ = wait_for_assignment(&sink, 1, &[]).await;
     cluster
         .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"sealed-parent")))
         .expect("enqueue exact-M1 parent delivery");
@@ -975,12 +1002,18 @@ where
     let member = cluster
         .inspect(|fake| fake.member("sealed-placement-sub", "sealed-placement-member"))
         .expect("exact-M1 member observable");
+    let sink_member = cluster
+        .inspect(|fake| fake.member("sealed-placement-sub", "sealed-placement-sink"))
+        .expect("exact-M1 sink member observable");
     cluster
         .update(|fake| {
             fake.advance_layout(2, split_layout())?;
             fake.publish_early_descendant_assignment_plan(
                 2,
-                vec![FullAssignment::new(member, [1, 2, 3, 4])],
+                vec![
+                    FullAssignment::new(member, [1, 2, 3, 4]),
+                    FullAssignment::new(sink_member, []),
+                ],
             )?;
             fake.terminate_segment(1)
         })
@@ -996,6 +1029,34 @@ where
     let descendants_blocked_before_ack = cluster
         .inspect(|fake| flow_command_count(fake, 3) == 0 && flow_command_count(fake, 4) == 0);
     assert!(descendants_blocked_before_ack);
+    cluster
+        .update(|fake| {
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![
+                    FullAssignment::new(member, [2, 3, 4]),
+                    FullAssignment::new(sink_member, [1]),
+                ],
+            )
+        })
+        .expect("temporarily revoke exact-M1 sealed parent");
+    let _ = wait_for_assignment(&consumer, 2, &[2, 3, 4]).await;
+    cluster
+        .update(|fake| {
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![
+                    FullAssignment::new(member, [1, 2, 3, 4]),
+                    FullAssignment::new(sink_member, []),
+                ],
+            )
+        })
+        .expect("restore exact-M1 sealed parent while it drains");
+    let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
+    assert_eq!(
+        consumer.status().pending_ownership(),
+        &[parent.source().clone()]
+    );
     consumer
         .acknowledge(&parent)
         .await
@@ -1012,37 +1073,35 @@ where
             flow_command_count(fake, 3) > 0 && flow_command_count(fake, 4) > 0
         })
         .await;
-    let (parent_subscribes, descendant_subscribes, descendant_flow_commands) =
-        cluster.inspect(|fake| {
-            let subscribed =
-                command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
-            let parent_subscribes = subscribed
-                .iter()
-                .filter(|segment_id| **segment_id == 1)
-                .count();
-            let descendant_subscribes = subscribed
-                .into_iter()
-                .filter(|segment_id| matches!(segment_id, 3 | 4))
-                .collect::<Vec<_>>();
-            let descendant_flow_commands = [3, 4]
-                .into_iter()
-                .filter(|segment_id| flow_command_count(fake, *segment_id) > 0)
-                .collect::<Vec<_>>();
-            (
-                parent_subscribes,
-                descendant_subscribes,
-                descendant_flow_commands,
-            )
-        });
-    assert_eq!(parent_subscribes, 1, "the sealed parent never reopens");
+    let (descendant_subscribes, descendant_flow_commands) = cluster.inspect(|fake| {
+        let subscribed = command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+        let descendant_subscribes = subscribed
+            .into_iter()
+            .filter(|segment_id| matches!(segment_id, 3 | 4))
+            .collect::<Vec<_>>();
+        let descendant_flow_commands = [3, 4]
+            .into_iter()
+            .filter(|segment_id| flow_command_count(fake, *segment_id) > 0)
+            .collect::<Vec<_>>();
+        (descendant_subscribes, descendant_flow_commands)
+    });
     assert_eq!(descendant_subscribes, vec![3, 4]);
     assert_eq!(descendant_flow_commands, vec![3, 4]);
+    sink.close().await.expect("close exact-M1 sink member");
+    let after_close = close_and_count(consumer, cluster).await;
+    let parent_subscribes = cluster.inspect(|fake| {
+        command_segment_count(fake, magnetar::proto::pb::base_command::Type::Subscribe, 1)
+    });
+    assert_eq!(
+        parent_subscribes, 1,
+        "the completed sealed parent never reopens after assignment regain"
+    );
     SealedPlacementTrace {
         descendants_blocked_before_ack,
         parent_subscribes,
         descendant_subscribes,
         descendant_flow_commands,
-        after_close: close_and_count(consumer, cluster).await,
+        after_close,
     }
 }
 

@@ -1097,6 +1097,100 @@ fn aggregate_model_completion_barriers_balance_before_ancestor_completion() {
 }
 
 #[test]
+fn completed_sealed_segment_is_not_reopened_after_assignment_rebalance() {
+    let mut sealed = model();
+    let open = sealed
+        .apply_assignment(assignment(&[0]))
+        .expect("sealed parent assignment");
+    let generation = opened_generation(&open[0]);
+    sealed
+        .child_opened(SegmentId(0), generation)
+        .expect("sealed parent opens");
+    assert!(
+        sealed
+            .observe_terminal(SegmentId(0), generation)
+            .expect("sealed parent terminal")
+            .is_empty()
+    );
+    sealed
+        .complete_segment(SegmentId(0), generation)
+        .expect("sealed parent completes");
+    assert!(matches!(
+        sealed
+            .apply_assignment(assignment(&[]))
+            .expect("transient empty rebalance")
+            .as_slice(),
+        [StreamConsumerAction::CloseChild { .. }]
+    ));
+    sealed
+        .child_closed(SegmentId(0), generation)
+        .expect("sealed parent closes");
+
+    let actions = sealed
+        .apply_assignment(assignment(&[0, 1]))
+        .expect("balanced retained-parent assignment");
+    assert!(actions.iter().all(|action| !matches!(
+        action,
+        StreamConsumerAction::OpenChild { source, .. } if source.segment_id() == SegmentId(0)
+    )));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        StreamConsumerAction::OpenChild { source, .. } if source.segment_id() == SegmentId(1)
+    )));
+
+    let mut deferred = model();
+    let open = deferred
+        .apply_assignment(assignment(&[0]))
+        .expect("deferred sealed parent assignment");
+    let deferred_generation = opened_generation(&open[0]);
+    deferred
+        .child_opened(SegmentId(0), deferred_generation)
+        .expect("deferred sealed parent opens");
+    deferred
+        .apply_assignment(assignment(&[]))
+        .expect("deferred sealed parent starts draining");
+    deferred
+        .apply_assignment(assignment(&[0]))
+        .expect("deferred sealed parent regains assignment while draining");
+    assert_eq!(deferred.pending_ownership(), vec![source(0)]);
+    deferred
+        .observe_terminal(SegmentId(0), deferred_generation)
+        .expect("deferred sealed parent terminal");
+    deferred
+        .complete_segment(SegmentId(0), deferred_generation)
+        .expect("deferred sealed parent completes");
+    assert!(
+        deferred
+            .child_closed(SegmentId(0), deferred_generation)
+            .expect("deferred sealed parent closes")
+            .is_empty()
+    );
+    assert!(deferred.pending_ownership().is_empty());
+
+    let (mut active, active_generation, _flow) = opened_one_child();
+    active
+        .observe_terminal(SegmentId(1), active_generation)
+        .expect("active segment terminal");
+    active
+        .complete_segment(SegmentId(1), active_generation)
+        .expect("active segment completes locally");
+    active
+        .apply_assignment(assignment(&[]))
+        .expect("active segment loses assignment");
+    active
+        .child_closed(SegmentId(1), active_generation)
+        .expect("active segment closes");
+    assert!(matches!(
+        active
+            .apply_assignment(assignment(&[1]))
+            .expect("active segment regains assignment")
+            .as_slice(),
+        [StreamConsumerAction::OpenChild { source, .. }]
+            if source.segment_id() == SegmentId(1)
+    ));
+}
+
+#[test]
 fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
     let mut empty = model();
     assert!(matches!(

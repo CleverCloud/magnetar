@@ -2797,11 +2797,22 @@ impl StreamConsumerModel {
             .iter()
             .map(|segment| (segment.segment_id(), segment.source()))
             .collect();
+        let completed_sealed: BTreeSet<SegmentId> = self
+            .completed
+            .iter()
+            .copied()
+            .filter(|segment_id| {
+                self.dag
+                    .segment(*segment_id)
+                    .is_some_and(|segment| segment.state == SegmentState::Sealed)
+            })
+            .collect();
         let gained_count = after
             .iter()
             .filter(|(id, source)| {
                 (replacements.contains(id) || before.get(id) != Some(*source))
                     && !self.children.contains_key(id)
+                    && !completed_sealed.contains(id)
             })
             .count();
         let gained_count = u64::try_from(gained_count)
@@ -2878,6 +2889,9 @@ impl StreamConsumerModel {
         }
 
         for (segment_id, source) in &after {
+            if completed_sealed.contains(segment_id) {
+                continue;
+            }
             if !replacements.contains(segment_id) && before.get(segment_id) == Some(source) {
                 continue;
             }
@@ -2889,6 +2903,7 @@ impl StreamConsumerModel {
             next_child_generation = next_child_generation
                 .checked_add(1)
                 .ok_or(StreamConsumerModelError::GenerationExhausted)?;
+            self.completed.remove(segment_id);
             ownership_history.insert(*segment_id);
             children.insert(
                 *segment_id,
@@ -2998,7 +3013,12 @@ impl StreamConsumerModel {
 
         let owner = child.owner();
         let source = child.source.clone();
-        let pending = (self.phase == AggregatePhase::Open)
+        let completed_sealed = self.completed.contains(&segment_id)
+            && self
+                .dag
+                .segment(segment_id)
+                .is_some_and(|segment| segment.state == SegmentState::Sealed);
+        let pending = (self.phase == AggregatePhase::Open && !completed_sealed)
             .then(|| self.pending_ownership.get(&segment_id).cloned())
             .flatten();
         let replacement = pending
@@ -3018,6 +3038,7 @@ impl StreamConsumerModel {
         let mut actions = Vec::new();
         if let Some((source, child_generation, next_child_generation)) = replacement {
             self.next_child_generation = next_child_generation;
+            self.completed.remove(&segment_id);
             self.ownership_history.insert(segment_id);
             self.children.insert(
                 segment_id,
@@ -5302,6 +5323,7 @@ mod tests {
                 .expect("parent acknowledgement settles")
                 .is_empty()
         );
+        let mut deferred = model.clone();
         let flow = model
             .complete_segment(SegmentId(0), parent_generation)
             .expect("parent completion retains its generation");
@@ -5311,6 +5333,29 @@ mod tests {
                 .count(),
             2
         );
+
+        deferred
+            .apply_assignment(assignment(2, &[]))
+            .expect("parent loses assignment before completion");
+        deferred
+            .apply_assignment(assignment(2, &[0]))
+            .expect("parent regains assignment while draining");
+        assert_eq!(
+            deferred.pending_ownership(),
+            vec![assignment(2, &[0]).segments()[0].source()]
+        );
+        deferred
+            .complete_segment(SegmentId(0), parent_generation)
+            .expect("deferred parent completion");
+        let closed = deferred
+            .child_closed(SegmentId(0), parent_generation)
+            .expect("completed parent close confirmation");
+        assert!(closed.iter().all(|action| !matches!(
+            action,
+            StreamConsumerAction::OpenChild { source, .. }
+                if source.segment_id() == SegmentId(0)
+        )));
+        assert!(deferred.pending_ownership().is_empty());
     }
 
     #[test]
