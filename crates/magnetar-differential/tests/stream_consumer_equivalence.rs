@@ -170,6 +170,7 @@ struct PublicSurfaceTrace {
     broker_schema_resolved: bool,
     broker_schema_lookups: usize,
     schema_cancellation_restored: bool,
+    schema_restoration_failure_resynced: bool,
     decode_failure_nacked: bool,
     final_drop_fenced: bool,
     after_close: ResourceCounts,
@@ -2133,6 +2134,123 @@ where
         .await;
     let final_drop_fenced = true;
 
+    let fencing_schema = Arc::new(AutoConsumeSchema::new());
+    let fencing_consumer = client
+        .scalable_stream_consumer("topic://public/default/scaled", fencing_schema)
+        .subscription("surface-schema-fencing-sub")
+        .consumer_name("surface-schema-fencing-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe schema-fencing aggregate");
+    cluster
+        .wait_for("schema-fencing children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&fencing_consumer).await;
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
+    );
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.enqueue_message(1, Bytes::from_static(b"schema-fencing"))
+        })
+        .expect("enqueue schema-fencing message");
+    let mut fencing_receive = Box::pin(fencing_consumer.receive());
+    tokio::select! {
+        biased;
+        result = &mut fencing_receive => panic!("held fencing schema preparation completed early: {result:?}"),
+        () = cluster.wait_for("held fencing schema preparation", |fake| {
+            fake.routes().iter().any(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::GetSchema
+            })
+        }) => {}
+    }
+    assert_eq!(
+        cluster
+            .update(|fake| fake.disconnect_endpoint(Endpoint::Controller))
+            .expect("disconnect schema-fencing controller incarnation"),
+        1
+    );
+    loop {
+        match fencing_consumer
+            .next_event()
+            .await
+            .expect("read schema-fencing event")
+            .expect("schema-fencing aggregate remains open")
+        {
+            StreamConsumerEvent::ResyncRequired { .. } => break,
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected schema-fencing event: {unexpected:?}"),
+        }
+    }
+    drop(fencing_receive);
+    let schema_restoration_failure_resynced = loop {
+        match fencing_consumer
+            .next_event()
+            .await
+            .expect("read restoration-failure event")
+            .expect("restoration-failure aggregate remains open")
+        {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("delivery restoration failed") =>
+            {
+                break true;
+            }
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected restoration-failure event: {unexpected:?}"),
+        }
+    };
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
+    );
+    loop {
+        match fencing_consumer
+            .next_event()
+            .await
+            .expect("read schema-fencing replacement event")
+            .expect("schema-fencing aggregate remains open during replacement")
+        {
+            StreamConsumerEvent::AssignmentApplied { .. } => break,
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected schema-fencing replacement event: {unexpected:?}"),
+        }
+    }
+    cluster
+        .wait_for("schema-fencing replacement", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.pending_operations == 0
+        })
+        .await;
+    fencing_consumer
+        .close()
+        .await
+        .expect("close schema-fencing aggregate after replacement");
+    cluster
+        .wait_for("schema-fencing cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.unacked_messages == 0
+        })
+        .await;
+
     PublicSurfaceTrace {
         builder_debug,
         missing_subscription,
@@ -2158,6 +2276,7 @@ where
         broker_schema_resolved,
         broker_schema_lookups,
         schema_cancellation_restored,
+        schema_restoration_failure_resynced,
         decode_failure_nacked,
         final_drop_fenced,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
