@@ -1494,6 +1494,13 @@ where
         .close()
         .await
         .expect("repeated close through another clone is idempotent");
+    let close_commands = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| route.command == magnetar::proto::pb::base_command::Type::CloseConsumer)
+            .count()
+    });
+    assert_eq!(close_commands, 2, "each child must be closed exactly once");
     cluster
         .wait_for("global close cleanup", |fake| {
             let counts = fake.resource_counts();

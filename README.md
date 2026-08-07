@@ -747,7 +747,8 @@ Seek requires every currently owned attached active leaf at the same layout epoc
 Before transmission, chunk positions project to their first chunk and batch positions project to M1's residual `ack_set`, because the M1 broker acts only on `ledger_id`, `entry_id`, and `ack_set`; every child seek is staged before any child response is awaited.
 
 Lost ownership drains already reserved and delivered work without a time limit but within the aggregate budget; gained ownership may remain `PendingOwnership` while another `Exclusive` child is still live.
-Controller and segment routing follows validated broker-authored plaintext or TLS authority directly and fails closed for missing/mismatched authority or proxy-any-broker registration.
+Controller and segment routing follows validated broker-authored plaintext or TLS authority directly.
+When M1 has not yet published a controller URL, registration reuses only the already-authenticated direct bootstrap connection; missing segment authority, mismatched or rejected published authority, and proxy-any-broker registration still fail closed.
 Owned route retirement retains at most 256 logical tombstones to fence recent late events; connection replacement and overflow resynchronize, while physical, peer, or explicit route closure terminates the aggregate.
 Resynchronization fences old child loops before confirmation-bearing teardown, waits for confirmed children and in-flight opens to disappear, and retries replacement registration while M1 still reports the retained member busy.
 Close is definitive for local routes, tasks, and children, but M1 has no scalable-consumer unregister command: broker membership may remain while another pool user keeps the controller connection open.

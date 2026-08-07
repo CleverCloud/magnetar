@@ -2990,6 +2990,11 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
             .success
             .is_some()
     );
+    let unrelated_connection = connect(&mut cluster, Endpoint::Segment(1));
+    assert!(matches!(
+        send(&mut cluster, unrelated_connection, &close_command(7, 7)),
+        Err(M1FakeError::InvalidCommand { .. })
+    ));
     let counts = cluster.resource_counts();
     assert_eq!(counts.child_consumers, 0);
     assert_eq!(counts.permits, 0);
