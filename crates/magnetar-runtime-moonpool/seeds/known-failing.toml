@@ -1,7 +1,7 @@
 # Known failing seeds — moonpool deterministic-simulation registry.
 #
 # Discovered by `.github/workflows/moonpool-seed-sweep.yml` (daily,
-# 16 random seeds per run). Replayed on every per-PR CI run + every
+# 128 random seeds per run). Replayed on every per-PR CI run + every
 # push to `main` by the `seed-replay` job in
 # `.github/workflows/ci.yml`, and locally by
 # `cargo run -p xtask -- check-known-failing-seeds`. ADR-0047 binds

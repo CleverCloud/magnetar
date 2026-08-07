@@ -103,6 +103,14 @@ The pack targets the supervised reconnect path, PIP-121 + PIP-188 reconnection f
 The supervised reconnect body (anti-thrash cooldown + multi-attempt redial) is exercised by [`supervised_redial.rs`](../crates/magnetar-runtime-moonpool/tests/supervised_redial.rs) — a `SimProviders` drop → accept → drop → accept fixture paired 1:1 with the real-loopback tokio mirror [`crates/magnetar-runtime-tokio/tests/supervised_redial.rs`](../crates/magnetar-runtime-tokio/tests/supervised_redial.rs).
 See [`moonpool-engine.md#deterministic-chaos-pack`](moonpool-engine.md#deterministic-chaos-pack) for the per-scenario breakdown.
 
+### Swarm configurations (ADR-0097)
+
+Each `sim_chaos.rs` produce/consume iteration derives a `SwarmConfig` from its seed — a pure splitmix64 hash over `moonpool_sim::current_sim_seed()` that consumes no RNG stream — and runs a subset of the optional campaign features: the four [ADR-0048](../specs/adr/0048-buggify-fault-injection.md) buggify labels (armed per-label through `Buggify::with_rng_and_filter` and the `ConnectionConfig.buggify` engine-arming slot, which only the moonpool engine honours) plus the optional workload operations `op.client_ack` and `op.client_close`, each drawn at 50% inclusion.
+1 in 4 seeds runs the inclusive `full()` configuration, an all-off draw collapses to `full()`, and the sub-seed-pinning regression tests force the recorded `baseline()` shape so their trajectories stay byte-identical.
+The canonical config line — seed, slot, labels, operations, effective weights, knowingly-vacuous invariants — prints before the workload runs and is embedded in every gate and invariant failure message, so a failing seed reproduces from `MOONPOOL_SEED` alone.
+Purity and campaign composition are pinned by [`swarm_config.rs`](../crates/magnetar-runtime-moonpool/tests/swarm_config.rs); the production engine's indifference to the whole surface is pinned by the tokio twin [`swarm_off_is_nop.rs`](../crates/magnetar-runtime-tokio/tests/swarm_off_is_nop.rs).
+See [ADR-0097](../specs/adr/0097-swarm-testing-sim-configurations.md).
+
 ## Differential equivalence
 
 Lives in [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/).
