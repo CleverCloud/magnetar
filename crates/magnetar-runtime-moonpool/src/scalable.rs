@@ -2884,6 +2884,28 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         }
     }
 
+    async fn wait_control_plane_retry(&self, reason: String) -> bool {
+        self.push_event(StreamConsumerEvent::ResyncRequired { reason });
+        if let Err(error) = self
+            .subscriber
+            .sleep(std::time::Duration::from_millis(100))
+            .await
+        {
+            self.fail_closed(error.to_string());
+            return false;
+        }
+        true
+    }
+
+    async fn retry_control_plane_error(&self, error: &ClientError) -> bool {
+        if control_plane_error_is_terminal(error) {
+            self.fail_closed(error.to_string());
+            false
+        } else {
+            self.wait_control_plane_retry(error.to_string()).await
+        }
+    }
+
     async fn reconnect_control_plane(
         self: &Arc<Self>,
         dag: DagSession,
@@ -2898,19 +2920,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             let mut opened_dag = match self.subscriber.open_dag_session(&self.topic).await {
                 Ok(dag) => dag,
                 Err(error) => {
-                    if control_plane_error_is_terminal(&error) {
-                        self.fail_closed(error.to_string());
-                        return None;
-                    }
-                    self.push_event(StreamConsumerEvent::ResyncRequired {
-                        reason: error.to_string(),
-                    });
-                    if let Err(error) = self
-                        .subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await
-                    {
-                        self.fail_closed(error.to_string());
+                    if !self.retry_control_plane_error(&error).await {
                         return None;
                     }
                     continue;
@@ -2944,19 +2954,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     if let Err(error) = aligned {
                         controller.close();
                         opened_dag.close();
-                        if control_plane_error_is_terminal(&error) {
-                            self.fail_closed(error.to_string());
-                            return None;
-                        }
-                        self.push_event(StreamConsumerEvent::ResyncRequired {
-                            reason: error.to_string(),
-                        });
-                        if let Err(error) = self
-                            .subscriber
-                            .sleep(std::time::Duration::from_millis(100))
-                            .await
-                        {
-                            self.fail_closed(error.to_string());
+                        if !self.retry_control_plane_error(&error).await {
                             return None;
                         }
                         continue;
@@ -3008,31 +3006,13 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 }
                 Err(ClientError::ScalableAssignmentRejected { reason }) => {
                     opened_dag.close();
-                    self.push_event(StreamConsumerEvent::ResyncRequired { reason });
-                    if let Err(error) = self
-                        .subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await
-                    {
-                        self.fail_closed(error.to_string());
+                    if !self.wait_control_plane_retry(reason).await {
                         return None;
                     }
                 }
                 Err(error) => {
                     opened_dag.close();
-                    if control_plane_error_is_terminal(&error) {
-                        self.fail_closed(error.to_string());
-                        return None;
-                    }
-                    self.push_event(StreamConsumerEvent::ResyncRequired {
-                        reason: error.to_string(),
-                    });
-                    if let Err(error) = self
-                        .subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await
-                    {
-                        self.fail_closed(error.to_string());
+                    if !self.retry_control_plane_error(&error).await {
                         return None;
                     }
                 }
