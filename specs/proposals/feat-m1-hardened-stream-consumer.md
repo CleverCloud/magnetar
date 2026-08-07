@@ -340,6 +340,7 @@ Within one aggregate, replacement waits for the old generation's confirmation-be
 An assigned active parent becoming sealed without replacement placement is different from ownership loss: retain its connected child and generation until terminal plus retained work establish completion, because M1 cannot route a replacement open.
 Every other routeable descriptor change still follows the confirmation-bearing replacement sequence.
 Losing the retained connection before completion follows ordinary child-failure resynchronization; no sealed authority is invented.
+A locally completed sealed parent may remain or reappear in a later complete assignment, but it remains assignment-visible without another ordinary child or pending-ownership claim; active gains alongside it still open.
 
 ### D16 - Keep the Java-style pooled controller lifecycle honest
 

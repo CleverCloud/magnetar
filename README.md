@@ -727,6 +727,7 @@ Each layout is accepted atomically only after complete identity, placement, life
 Explicit `BrokerManaged` applies every locally provable barrier but delegates cross-member ancestry to M1 and promises no total order between independent branches.
 When an assigned active parent becomes sealed without replacement placement, its connected child drains in place under the same generation until terminal and retained work settle; M1 intentionally emits that shape, while a routeable descriptor change still uses close/reopen.
 If that retained connection fails before completion, the aggregate follows normal child-failure resynchronization and never synthesizes sealed authority.
+After local completion, a sealed segment may remain or reappear in a complete controller assignment and stays visible there, but it never opens another ordinary child; active gains in the same rebalance still attach normally.
 
 One manual-FLOW budget covers all active and retiring children rather than multiplying by segment count.
 It charges queue/ledger nodes, every retained source and canonical ordinary-id allocation, position-vector map nodes, decompression output plus validation slack/workspace, and right-sized selected batch payloads instead of retaining a whole batch backing buffer per member.

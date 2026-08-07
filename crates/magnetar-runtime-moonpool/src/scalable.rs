@@ -2355,8 +2355,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             .model
             .settle_acknowledgement(&transition.authority, &confirmed_sources)?;
         cancellation.disarm();
-        self.execute_actions(actions).await?;
         self.try_complete_components(&transition.components).await;
+        self.execute_actions(actions).await?;
         if failed.is_empty() {
             Ok(())
         } else {
@@ -3887,6 +3887,89 @@ mod tests {
         control_plane_fixture_at(1)
     }
 
+    fn sealed_parent_fixture() -> (
+        magnetar_proto::DagSnapshot,
+        magnetar_proto::ConsumerAssignment,
+    ) {
+        let parent = "topic://public/default/scaled";
+        let segment = |segment_id, hash_start, hash_end, state, parents, children, sealed| {
+            magnetar_proto::pb::SegmentInfoProto {
+                segment_id,
+                hash_start,
+                hash_end,
+                state: state as i32,
+                parent_ids: parents,
+                child_ids: children,
+                created_at_epoch: if segment_id == 1 { 0 } else { 2 },
+                sealed_at_epoch: sealed,
+                created_at_ms: 0,
+                sealed_at_ms: sealed.map(|_| 0),
+                legacy_topic_name: None,
+            }
+        };
+        let dag = magnetar_proto::DagSnapshot::try_from_pb(&magnetar_proto::pb::ScalableTopicDag {
+            epoch: 2,
+            segments: vec![
+                segment(
+                    1,
+                    0,
+                    65_535,
+                    magnetar_proto::pb::SegmentState::Sealed,
+                    Vec::new(),
+                    vec![2, 3],
+                    Some(2),
+                ),
+                segment(
+                    2,
+                    0,
+                    32_767,
+                    magnetar_proto::pb::SegmentState::Active,
+                    vec![1],
+                    Vec::new(),
+                    None,
+                ),
+                segment(
+                    3,
+                    32_768,
+                    65_535,
+                    magnetar_proto::pb::SegmentState::Active,
+                    vec![1],
+                    Vec::new(),
+                    None,
+                ),
+            ],
+            segment_brokers: (1..=3)
+                .map(|segment_id| magnetar_proto::pb::SegmentBrokerAddress {
+                    segment_id,
+                    broker_url: "pulsar://allowed.example:6650".to_owned(),
+                    broker_url_tls: None,
+                })
+                .collect(),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+        })
+        .expect("valid sealed-parent DAG");
+        let assignment = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: 2,
+                segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
+                    segment_id: 1,
+                    hash_start: 0,
+                    hash_end: 65_535,
+                    segment_topic: magnetar_proto::canonical_segment_topic(
+                        parent,
+                        magnetar_proto::KeyRange::FULL,
+                        magnetar_proto::SegmentId(1),
+                    )
+                    .expect("canonical parent segment topic"),
+                }],
+            },
+            parent,
+        )
+        .expect("valid sealed-parent assignment");
+        (dag, assignment)
+    }
+
     fn shared() -> Arc<ConnectionShared> {
         ConnectionShared::new(magnetar_proto::ConnectionConfig::default())
     }
@@ -4133,13 +4216,16 @@ mod tests {
         )
     }
 
-    fn aggregate_inner_with_child() -> (
+    fn aggregate_inner_with_child_from(
+        snapshot: magnetar_proto::DagSnapshot,
+        assignment: magnetar_proto::ConsumerAssignment,
+    ) -> (
         Arc<StreamConsumerInner<moonpool_core::TokioProviders>>,
         Arc<ConnectionShared>,
     ) {
         let subscriber = subscriber_with_allow_list();
-        let (snapshot, assignment) = control_plane_fixture();
         let source = assignment.segments()[0].source();
+        let segment_id = source.segment_id();
         let mut model = magnetar_proto::StreamConsumerModel::new(
             "topic://public/default/scaled".to_owned(),
             magnetar_proto::ConsumerInstanceId(42),
@@ -4197,10 +4283,7 @@ mod tests {
                         consumer: child,
                     },
                 )]),
-                flow_reservations: BTreeMap::from([(
-                    (magnetar_proto::SegmentId(1), generation),
-                    reservation,
-                )]),
+                flow_reservations: BTreeMap::from([((segment_id, generation), reservation)]),
                 dispatch_permit_debt: BTreeMap::new(),
                 queue: VecDeque::new(),
                 events: VecDeque::new(),
@@ -4220,6 +4303,14 @@ mod tests {
             transaction_outcome_park_hook: None,
         });
         (inner, child_shared)
+    }
+
+    fn aggregate_inner_with_child() -> (
+        Arc<StreamConsumerInner<moonpool_core::TokioProviders>>,
+        Arc<ConnectionShared>,
+    ) {
+        let (snapshot, assignment) = control_plane_fixture();
+        aggregate_inner_with_child_from(snapshot, assignment)
     }
 
     #[test]
@@ -4917,6 +5008,150 @@ mod tests {
                 .close_consumer
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn final_ack_completes_sealed_parent_before_deferred_close_confirmation() {
+        let (snapshot, assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from(snapshot, assignment.clone());
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("sealed parent child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    71,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"terminal"),
+                    1,
+                ),
+            )
+            .await
+            .expect("retain sealed-parent delivery");
+        let message = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve sealed-parent delivery")
+            .pop()
+            .expect("one sealed-parent delivery");
+        let empty = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: assignment.layout_epoch(),
+                segments: Vec::new(),
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("empty rebalance assignment");
+        let stop = inner
+            .state
+            .lock()
+            .model
+            .apply_assignment(empty)
+            .expect("sealed parent loses ownership while delivery is live");
+        inner.execute_actions(stop).await.expect("stop parent flow");
+        assert!(
+            inner
+                .state
+                .lock()
+                .model
+                .apply_assignment(assignment)
+                .expect("sealed parent regains ownership while draining")
+                .is_empty()
+        );
+        {
+            let mut state = inner.state.lock();
+            assert_eq!(state.model.pending_ownership(), vec![child.source.clone()]);
+            assert!(
+                state
+                    .model
+                    .observe_terminal(child.source.segment_id(), child.generation)
+                    .expect("sealed parent terminal with live acknowledgement")
+                    .is_empty()
+            );
+        }
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let mut acknowledgement = Box::pin(consumer.acknowledge(&message.token));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let ack = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode terminal acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let ack_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: ack.consumer_id,
+                request_id: ack.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&ack_response))
+            .expect("confirm terminal acknowledgement");
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let close = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode sealed-parent close")
+            .command
+            .close_consumer
+            .expect("CommandCloseConsumer");
+        let close_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close.request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&close_response))
+            .expect("confirm sealed-parent close");
+        acknowledgement
+            .await
+            .expect("terminal acknowledgement settles");
+
+        let state = inner.state.lock();
+        assert!(state.children.is_empty());
+        assert!(state.model.pending_ownership().is_empty());
+        assert!(
+            state
+                .model
+                .segment_phase(child.source.segment_id())
+                .is_none()
+        );
+        assert_eq!(state.open_tasks, 0, "completed sealed parent never reopens");
     }
 
     #[tokio::test]
