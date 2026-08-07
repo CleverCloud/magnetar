@@ -1653,10 +1653,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             }
             should_fence
         };
-        self.notify.notify_waiters();
         if should_fence {
             self.push_event(StreamConsumerEvent::ResyncRequired { reason });
             self.close_best_effort();
+        } else {
+            self.notify.notify_waiters();
         }
     }
 
@@ -1856,27 +1857,29 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     reservation,
                     ..
                 } => {
-                    let consumer = {
+                    {
                         let mut state = self.state.lock();
                         let key = (source.segment_id(), child_generation);
+                        let accepts_flow = !matches!(
+                            state.model.segment_phase(source.segment_id()),
+                            Some(
+                                magnetar_proto::SegmentPhase::Closing
+                                    | magnetar_proto::SegmentPhase::Failed
+                            )
+                        );
                         let consumer = state
                             .children
                             .get(&source.segment_id())
-                            .filter(|child| child.generation == child_generation)
+                            .filter(|child| accepts_flow && child.generation == child_generation)
                             .map(|child| child.consumer.clone());
-                        if consumer.is_some() {
+                        if let Some(consumer) = consumer {
                             state.flow_reservations.insert(key, reservation);
-                        }
-                        consumer.map(|consumer| {
                             let debt = state
                                 .dispatch_permit_debt
                                 .remove(&key)
                                 .map(|debt| (debt.session_epoch, debt.permits));
-                            (consumer, debt)
-                        })
-                    };
-                    if let Some((consumer, debt)) = consumer {
-                        consumer.flow_for_aggregate_with_debt(1, debt);
+                            consumer.flow_for_aggregate_with_debt(1, debt);
+                        }
                     }
                     self.push_phase_event(&source);
                 }
@@ -5652,7 +5655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_transaction_outcome_retries_retained_close_action() {
+    async fn interrupted_transaction_outcome_fences_stale_flow_and_retries_close() {
         let (inner, child_shared) = aggregate_inner_with_child();
         let actions = {
             let mut state = inner.state.lock();
@@ -5714,7 +5717,7 @@ mod tests {
                 first_flows += 1;
             }
         }
-        assert_eq!(first_flows, 1);
+        assert_eq!(first_flows, 0, "closing children reject stale FLOW work");
 
         let mut retry = Box::pin(inner.propagate_transaction_outcome(
             txn_id,
