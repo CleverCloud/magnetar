@@ -2792,6 +2792,23 @@ impl StreamConsumerInner {
         }
     }
 
+    async fn wait_control_plane_retry(&self, reason: String) -> bool {
+        self.push_event(StreamConsumerEvent::ResyncRequired { reason });
+        self.subscriber
+            .sleep(std::time::Duration::from_millis(100))
+            .await;
+        true
+    }
+
+    async fn retry_control_plane_error(&self, error: &ClientError) -> bool {
+        if control_plane_error_is_terminal(error) {
+            self.fail_closed(error.to_string());
+            false
+        } else {
+            self.wait_control_plane_retry(error.to_string()).await
+        }
+    }
+
     async fn reconnect_control_plane(
         self: &Arc<Self>,
         dag: DagSession,
@@ -2806,16 +2823,9 @@ impl StreamConsumerInner {
             let mut opened_dag = match self.subscriber.open_dag_session(&self.topic).await {
                 Ok(dag) => dag,
                 Err(error) => {
-                    if control_plane_error_is_terminal(&error) {
-                        self.fail_closed(error.to_string());
+                    if !self.retry_control_plane_error(&error).await {
                         return None;
                     }
-                    self.push_event(StreamConsumerEvent::ResyncRequired {
-                        reason: error.to_string(),
-                    });
-                    self.subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await;
                     continue;
                 }
             };
@@ -2845,16 +2855,9 @@ impl StreamConsumerInner {
                     if let Err(error) = aligned {
                         controller.close();
                         opened_dag.close();
-                        if control_plane_error_is_terminal(&error) {
-                            self.fail_closed(error.to_string());
+                        if !self.retry_control_plane_error(&error).await {
                             return None;
                         }
-                        self.push_event(StreamConsumerEvent::ResyncRequired {
-                            reason: error.to_string(),
-                        });
-                        self.subscriber
-                            .sleep(std::time::Duration::from_millis(100))
-                            .await;
                         continue;
                     }
                     let incarnation = controller.incarnation();
@@ -2904,23 +2907,13 @@ impl StreamConsumerInner {
                 }
                 Err(ClientError::ScalableAssignmentRejected { reason }) => {
                     opened_dag.close();
-                    self.push_event(StreamConsumerEvent::ResyncRequired { reason });
-                    self.subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await;
+                    self.wait_control_plane_retry(reason).await;
                 }
                 Err(error) => {
                     opened_dag.close();
-                    if control_plane_error_is_terminal(&error) {
-                        self.fail_closed(error.to_string());
+                    if !self.retry_control_plane_error(&error).await {
                         return None;
                     }
-                    self.push_event(StreamConsumerEvent::ResyncRequired {
-                        reason: error.to_string(),
-                    });
-                    self.subscriber
-                        .sleep(std::time::Duration::from_millis(100))
-                        .await;
                 }
             }
         }
