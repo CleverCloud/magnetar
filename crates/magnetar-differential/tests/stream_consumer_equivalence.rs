@@ -169,6 +169,7 @@ struct PublicSurfaceTrace {
     default_name_generated: bool,
     broker_schema_resolved: bool,
     broker_schema_lookups: usize,
+    schema_cancellation_restored: bool,
     decode_failure_nacked: bool,
     final_drop_fenced: bool,
     after_close: ResourceCounts,
@@ -1927,6 +1928,85 @@ where
         })
         .await;
 
+    let cancellation_schema = Arc::new(AutoConsumeSchema::new());
+    let cancellation_consumer = client
+        .scalable_stream_consumer("topic://public/default/scaled", cancellation_schema.clone())
+        .subscription("surface-schema-cancellation-sub")
+        .consumer_name("surface-schema-cancellation-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe schema-cancellation aggregate");
+    cluster
+        .wait_for("schema-cancellation children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&cancellation_consumer).await;
+    cluster.hold_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
+    );
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.enqueue_message(1, Bytes::from_static(b"schema-cancellation"))
+        })
+        .expect("enqueue schema-cancellation message");
+    let mut cancelled_receive = Box::pin(cancellation_consumer.receive());
+    tokio::select! {
+        biased;
+        result = &mut cancelled_receive => panic!("held schema preparation completed early: {result:?}"),
+        () = cluster.wait_for("held schema preparation", |fake| {
+            fake.routes().iter().any(|route| {
+                route.endpoint == Endpoint::Segment(1)
+                    && route.command == magnetar::proto::pb::base_command::Type::GetSchema
+            })
+        }) => {}
+    }
+    drop(cancelled_receive);
+    cluster.release_command(
+        Endpoint::Segment(1),
+        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
+    );
+    let restored_schema_message = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        cancellation_consumer.receive(),
+    )
+    .await
+    .expect("restored schema-cancellation receive timed out")
+    .expect("restored schema-cancellation receive failed");
+    let schema_cancellation_restored = restored_schema_message.value().as_ref()
+        == b"schema-cancellation"
+        && restored_schema_message
+            .delivery_token()
+            .dequeue_sequence()
+            .0
+            == 0
+        && cancellation_schema.has_cached_schema()
+        && cluster.inspect(|fake| {
+            !fake.routes().iter().any(|route| {
+                route.command
+                    == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
+            })
+        });
+    assert!(schema_cancellation_restored);
+    cancellation_consumer
+        .acknowledge(&restored_schema_message)
+        .await
+        .expect("acknowledge restored schema-cancellation message");
+    cancellation_consumer
+        .close()
+        .await
+        .expect("close schema-cancellation aggregate");
+    cluster
+        .wait_for("schema-cancellation cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0 && counts.unacked_messages == 0
+        })
+        .await;
+
     let rejecting_consumer = client
         .scalable_stream_consumer("topic://public/default/scaled", Arc::new(RejectingSchema))
         .subscription("surface-rejecting-schema-sub")
@@ -2077,6 +2157,7 @@ where
         default_name_generated,
         broker_schema_resolved,
         broker_schema_lookups,
+        schema_cancellation_restored,
         decode_failure_nacked,
         final_drop_fenced,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
