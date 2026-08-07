@@ -4854,6 +4854,31 @@ mod tests {
             .await,
             Err(ClientError::Other(message)) if message == "closed while catching up"
         ));
+
+        let mut retry_inner = empty_aggregate_inner();
+        Arc::get_mut(&mut retry_inner)
+            .expect("fixture has one aggregate owner")
+            .subscriber
+            .sleep_provider =
+            Arc::new(|_| Box::pin(async { Err(moonpool_core::TimeError::Shutdown) }));
+        assert!(
+            !retry_inner
+                .retry_control_plane_error(ClientError::Other("retryable failure".to_owned()))
+                .await
+        );
+        let state = retry_inner.state.lock();
+        assert!(state.close_state.is_closing());
+        assert!(
+            state
+                .terminal_error
+                .as_deref()
+                .is_some_and(|error| error.contains("scalable retry sleep failed"))
+        );
+        assert!(matches!(
+            state.events.back(),
+            Some(StreamConsumerEvent::ResyncRequired { reason })
+                if reason.contains("scalable retry sleep failed")
+        ));
     }
 
     #[tokio::test]
@@ -6114,6 +6139,82 @@ mod tests {
                 .await,
             Err(ClientError::ControllerRoutingUnsupported { .. })
         ));
+
+        crate::tls_crypto::install_default_provider();
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let bootstrap = shared();
+        let tls_pool = ProxyConnectionPool::new(crate::pool::ConnectionFactory {
+            addr: "allowed.example:6651".to_owned(),
+            bootstrap_config: magnetar_proto::ConnectionConfig {
+                redirect_url_allow_list: Some(magnetar_proto::RedirectUrlAllowList::Exact(vec![
+                    "pulsar+ssl://allowed.example:6651".to_owned(),
+                ])),
+                ..Default::default()
+            },
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            providers: moonpool_core::TokioProviders::new(),
+            tls_config: Some(tls_config),
+            service_url_provider: None,
+            dns_resolver: None,
+            schemeless_default_port: 6651,
+        });
+        let tls_subscriber = SegmentSubscriber::new(
+            bootstrap.clone(),
+            tls_pool,
+            std::time::Duration::from_secs(1),
+            crate::tokio_sleep_provider(),
+        );
+        let (snapshot, assignment) = control_plane_fixture();
+        let source = assignment.segments()[0].source();
+        let mut descriptor = snapshot
+            .segment(source.segment_id())
+            .expect("assigned TLS descriptor")
+            .clone();
+        descriptor.broker_url_tls = None;
+        assert!(matches!(
+            tls_subscriber
+                .open_segment_consumer(
+                    &source,
+                    &descriptor,
+                    &SegmentConsumerOptions {
+                        subscription: "workers".to_owned(),
+                        consumer_name: "worker-a".to_owned(),
+                        schema: magnetar_proto::pb::Schema::default(),
+                    },
+                )
+                .await,
+            Err(ClientError::ControllerUnavailable)
+        ));
+        let dag = DagSession {
+            shared: bootstrap,
+            route: claim_dag(&tls_subscriber.bootstrap, 91),
+            session_id: 91,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot,
+            closed: true,
+        };
+        let controller_error = tls_subscriber
+            .open_controller_session(&dag, "workers", "worker-a")
+            .await
+            .expect_err("driverless TLS bootstrap rejects controller registration");
+        assert!(
+            matches!(
+                &controller_error,
+                ClientError::Other(message)
+                    if message == "broker does not support scalable topics (PIP-460): \
+                        CommandConnected did not advertise supports_scalable_topics"
+            ),
+            "unexpected driverless TLS controller error: {controller_error:?}"
+        );
     }
 
     #[tokio::test]
