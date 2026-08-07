@@ -2799,11 +2799,10 @@ impl StreamConsumerModel {
             .map(|(id, source)| (*id, source.clone()))
             .collect();
         for segment_id in replacements {
-            if let Some(child) = children.get(segment_id) {
-                retiring
-                    .entry(*segment_id)
-                    .or_insert_with(|| child.source.clone());
-            }
+            let child = &children[segment_id];
+            retiring
+                .entry(*segment_id)
+                .or_insert_with(|| child.source.clone());
         }
         for (lost, source) in &retiring {
             pending_ownership.remove(lost);

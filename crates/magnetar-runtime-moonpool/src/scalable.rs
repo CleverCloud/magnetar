@@ -717,24 +717,23 @@ struct ChildRuntime<P: Providers> {
     consumer: crate::Consumer<P>,
 }
 
-impl<P: Providers> std::fmt::Debug for ChildRuntime<P> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ChildRuntime")
-            .field("source", &self.source)
-            .field("generation", &self.generation)
-            .finish_non_exhaustive()
-    }
+#[derive(Debug)]
+enum QueuedDelivery {
+    Fresh {
+        reservation: magnetar_proto::BudgetReservationId,
+        message_id_data: magnetar_proto::pb::MessageIdData,
+    },
+    Restored {
+        token: magnetar_proto::DeliveryToken,
+    },
 }
 
 #[derive(Debug)]
 struct QueuedMessage {
     source: magnetar_proto::SegmentSource,
     generation: magnetar_proto::ChildGeneration,
-    reservation: Option<magnetar_proto::BudgetReservationId>,
     message: magnetar_proto::IncomingMessage,
-    message_id_data: magnetar_proto::pb::MessageIdData,
-    token: Option<magnetar_proto::DeliveryToken>,
+    delivery: QueuedDelivery,
 }
 
 #[derive(Debug, Clone)]
@@ -1848,23 +1847,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     child_generation,
                     ..
                 } => {
-                    let child = {
-                        let mut state = self.state.lock();
-                        state
-                            .children
-                            .get(&source.segment_id())
-                            .is_some_and(|child| child.generation == child_generation)
-                            .then(|| state.children.remove(&source.segment_id()))
-                            .flatten()
-                    };
-                    let mut close_error = None;
-                    if let Some(child) = child {
-                        let retry = child.consumer.clone();
-                        if let Err(error) = child.consumer.close().await {
-                            retry.force_close_best_effort();
-                            close_error = Some(StreamConsumerError::Client(error));
-                        }
-                    }
                     if let Ok(next) = self
                         .state
                         .lock()
@@ -1872,9 +1854,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         .child_closed(source.segment_id(), child_generation)
                     {
                         actions.extend(next);
-                    }
-                    if let Some(error) = close_error {
-                        execution_error = Some(error);
                     }
                 }
                 magnetar_proto::StreamConsumerAction::StopFlow { source, .. } => {
@@ -2175,28 +2154,21 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 state.queue.push_back(QueuedMessage {
                     source: source.clone(),
                     generation,
-                    reservation: Some(queued.reservation),
                     message: queued.message,
-                    message_id_data: queued.message_id_data,
-                    token: None,
+                    delivery: QueuedDelivery::Fresh {
+                        reservation: queued.reservation,
+                        message_id_data: queued.message_id_data,
+                    },
                 });
             }
             if transition.permit_debt > 0 {
-                let debt = state
-                    .dispatch_permit_debt
-                    .entry((source.segment_id(), generation))
-                    .or_insert(DispatchPermitDebt {
-                        session_epoch,
-                        permits: 0,
-                    });
-                if debt.session_epoch == session_epoch {
-                    debt.permits = debt.permits.saturating_add(transition.permit_debt);
-                } else {
-                    *debt = DispatchPermitDebt {
+                state.dispatch_permit_debt.insert(
+                    (source.segment_id(), generation),
+                    DispatchPermitDebt {
                         session_epoch,
                         permits: transition.permit_debt,
-                    };
-                }
+                    },
+                );
             }
             transition.actions
         };
@@ -2233,36 +2205,36 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     let mut staged = state.model.clone();
                     let mut fresh_tokens = VecDeque::new();
                     for queued in state.queue.iter().take(count) {
-                        if queued.token.is_some() {
-                            continue;
-                        }
-                        let stream_message_id =
-                            magnetar_proto::StreamMessageId::from_message_id_data(
-                                queued.source.clone(),
-                                &queued.message_id_data,
-                            )
-                            .map_err(magnetar_proto::StreamConsumerModelError::from)?;
-                        fresh_tokens.push_back(staged.issue_delivery(
-                            queued.source.segment_id(),
-                            queued.generation,
-                            stream_message_id,
-                            queued.reservation.ok_or_else(|| {
-                                StreamConsumerError::Failed(
-                                    "fresh aggregate queue entry has no reservation".to_owned(),
+                        if let QueuedDelivery::Fresh {
+                            reservation,
+                            message_id_data,
+                        } = &queued.delivery
+                        {
+                            let stream_message_id =
+                                magnetar_proto::StreamMessageId::from_message_id_data(
+                                    queued.source.clone(),
+                                    message_id_data,
                                 )
-                            })?,
-                        )?);
+                                .map_err(magnetar_proto::StreamConsumerModelError::from)?;
+                            fresh_tokens.push_back(staged.issue_delivery(
+                                queued.source.segment_id(),
+                                queued.generation,
+                                stream_message_id,
+                                *reservation,
+                            )?);
+                        }
                     }
                     state.model = staged;
                     let messages = state
                         .queue
                         .drain(..count)
                         .map(|queued| {
-                            let token = queued.token.unwrap_or_else(|| {
-                                fresh_tokens
+                            let token = match queued.delivery {
+                                QueuedDelivery::Fresh { .. } => fresh_tokens
                                     .pop_front()
-                                    .expect("every fresh queue entry issued one token")
-                            });
+                                    .expect("every fresh queue entry issued one token"),
+                                QueuedDelivery::Restored { token } => token,
+                            };
                             StreamConsumerMessage {
                                 message: queued.message,
                                 token,
@@ -2293,60 +2265,31 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         if state.close_state.is_closing() {
             return Err(StreamConsumerError::Closed);
         }
-        let mut seen = BTreeSet::new();
-        for message in &messages {
-            let sequence = message.token.dequeue_sequence();
-            if !seen.insert(sequence)
-                || state.queue.iter().any(|queued| {
-                    queued
-                        .token
-                        .as_ref()
-                        .is_some_and(|token| token.dequeue_sequence() == sequence)
-                })
-            {
-                return Err(StreamConsumerError::Failed(
-                    "delivery is already queued for restoration".to_owned(),
-                ));
-            }
-        }
         let mut restored = Vec::with_capacity(messages.len());
         for message in messages {
             let source = message.token.stream_message_id().source().clone();
             let generation = state.model.validate_delivery_restoration(&message.token)?;
-            let message_id_data = message
-                .token
-                .stream_message_id()
-                .ordinary_message_id_data()
-                .map_err(magnetar_proto::StreamConsumerModelError::from)?;
-            restored.push(QueuedMessage {
-                source,
-                generation,
-                reservation: None,
-                message: message.message,
-                message_id_data,
-                token: Some(message.token),
-            });
+            let sequence = message.token.dequeue_sequence();
+            restored.push((
+                sequence,
+                QueuedMessage {
+                    source,
+                    generation,
+                    message: message.message,
+                    delivery: QueuedDelivery::Restored {
+                        token: message.token,
+                    },
+                },
+            ));
         }
-        restored.sort_by_key(|queued| {
-            queued
-                .token
-                .as_ref()
-                .map(magnetar_proto::DeliveryToken::dequeue_sequence)
-        });
-        for queued in restored {
-            let sequence = queued
-                .token
-                .as_ref()
-                .expect("restored queue entries retain their token")
-                .dequeue_sequence();
+        restored.sort_by_key(|(sequence, _)| *sequence);
+        for (sequence, queued) in restored {
             let index = state
                 .queue
                 .iter()
-                .position(|existing| {
-                    existing
-                        .token
-                        .as_ref()
-                        .is_none_or(|token| token.dequeue_sequence() > sequence)
+                .position(|existing| match &existing.delivery {
+                    QueuedDelivery::Fresh { .. } => true,
+                    QueuedDelivery::Restored { token } => token.dequeue_sequence() > sequence,
                 })
                 .unwrap_or(state.queue.len());
             state.queue.insert(index, queued);
@@ -4111,13 +4054,15 @@ mod tests {
                     message.retained_bytes(),
                 )
                 .expect("message retained");
+            let message_id_data = message.message_id.to_pb();
             queue.push_back(QueuedMessage {
                 source: source.clone(),
                 generation,
-                reservation: Some(transition.retained),
-                message_id_data: message.message_id.to_pb(),
                 message,
-                token: None,
+                delivery: QueuedDelivery::Fresh {
+                    reservation: transition.retained,
+                    message_id_data,
+                },
             });
             actions = transition.actions;
         }
@@ -4451,7 +4396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_delivery_reservations_fail_without_state_mutation() {
+    async fn delivery_without_flow_reservation_fails_without_queue_mutation() {
         let (inner, child_shared) = aggregate_inner_with_child();
         let child = inner
             .state
@@ -4482,33 +4427,6 @@ mod tests {
                 if message.contains("without an aggregate FLOW reservation")
         ));
         assert!(inner.state.lock().queue.is_empty());
-
-        let malformed = aggregate_inner_with_child().0;
-        let (source, generation) = {
-            let state = malformed.state.lock();
-            let child = state.children.values().next().expect("malformed child");
-            (child.source.clone(), child.generation)
-        };
-        let message = deferred_message(
-            8,
-            magnetar_proto::pb::MessageMetadata::default(),
-            bytes::Bytes::from_static(b"missing-budget"),
-            1,
-        );
-        malformed.state.lock().queue.push_back(QueuedMessage {
-            source,
-            generation,
-            reservation: None,
-            message: message.message,
-            message_id_data: message.message_id_data,
-            token: None,
-        });
-        assert!(matches!(
-            malformed.reserve_batch(1, usize::MAX).await,
-            Err(StreamConsumerError::Failed(message))
-                if message.contains("fresh aggregate queue entry has no reservation")
-        ));
-        assert_eq!(malformed.state.lock().queue.len(), 1);
     }
 
     #[tokio::test]
@@ -6062,7 +5980,16 @@ mod tests {
     #[tokio::test]
     async fn aggregate_batch_reservation_is_atomic() {
         let inner = aggregate_inner_with_two_messages();
-        inner.state.lock().queue[1].message_id_data.partition = Some(-2);
+        {
+            let mut state = inner.state.lock();
+            let QueuedDelivery::Fresh {
+                message_id_data, ..
+            } = &mut state.queue[1].delivery
+            else {
+                panic!("aggregate fixture queue entries are fresh");
+            };
+            message_id_data.partition = Some(-2);
+        }
 
         assert!(matches!(
             inner.reserve_batch(2, usize::MAX).await,
@@ -6081,7 +6008,16 @@ mod tests {
             assert!(state.model.delivered_position().is_empty());
         }
 
-        inner.state.lock().queue[1].message_id_data.partition = Some(-1);
+        {
+            let mut state = inner.state.lock();
+            let QueuedDelivery::Fresh {
+                message_id_data, ..
+            } = &mut state.queue[1].delivery
+            else {
+                panic!("aggregate fixture queue entries are fresh");
+            };
+            message_id_data.partition = Some(-1);
+        }
         let messages = inner
             .reserve_batch(2, usize::MAX)
             .await
