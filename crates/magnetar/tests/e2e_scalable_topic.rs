@@ -826,10 +826,25 @@ async fn exercise_delivery_and_close_residue(
     }
     let restored = PositionVector::from_bytes(&position.to_bytes()?)?;
     consumer.acknowledge_positions(&restored).await?;
-    wait_for_status(&consumer, "all delivery leases acknowledged", |status| {
-        status.receiver_budget_used() == 0
-    })
-    .await?;
+    for (index, message) in messages.iter().enumerate() {
+        match consumer.acknowledge(message).await {
+            Err(StreamConsumerError::Model(
+                magnetar::proto::StreamConsumerModelError::StaleDeliveryToken,
+            )) => {}
+            Ok(()) => {
+                return Err(format!(
+                    "delivery {index} remained acknowledgeable after restored-vector acknowledgement"
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "delivery {index} returned {error} instead of stale authority"
+                )
+                .into());
+            }
+        }
+    }
     consumer.close().await?;
 
     // M1 has no unregister command. Logical close is definitive locally but
