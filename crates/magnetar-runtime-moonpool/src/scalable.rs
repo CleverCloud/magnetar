@@ -1677,9 +1677,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         if should_fence {
             self.push_event(StreamConsumerEvent::ResyncRequired { reason });
             self.close_best_effort();
-        } else {
-            self.notify.notify_waiters();
         }
+        self.notify.notify_waiters();
     }
 
     async fn open_child(
@@ -4853,6 +4852,24 @@ mod tests {
             )
             .await,
             Err(ClientError::Other(message)) if message == "closed while catching up"
+        ));
+        assert!(
+            closed_shared
+                .scalable_routes
+                .publish(ScalableEvent::DagWatchClosed {
+                    session_id: 81,
+                    reason: None,
+                })
+                .is_none()
+        );
+        assert!(matches!(
+            SegmentSubscriber::<moonpool_core::TokioProviders>::align_control_plane(
+                &mut dag,
+                &mut controller,
+            )
+            .await,
+            Err(ClientError::Other(message))
+                if message == "scalable DAG watch closed while aligning control-plane epochs"
         ));
 
         let mut retry_inner = empty_aggregate_inner();
