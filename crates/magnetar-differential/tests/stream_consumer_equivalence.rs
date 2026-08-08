@@ -24,7 +24,9 @@ use magnetar_fakes::m1::{
     ResourceCounts, ScriptedBehavior,
 };
 use stream_consumer_support::client::{
-    connect_moonpool, connect_moonpool_with_keepalive, connect_tokio, connect_tokio_with_keepalive,
+    connect_moonpool, connect_moonpool_with_keepalive,
+    connect_moonpool_with_terminal_reconnect_budget, connect_tokio, connect_tokio_with_keepalive,
+    connect_tokio_with_terminal_reconnect_budget,
 };
 use stream_consumer_support::server::M1SocketCluster;
 
@@ -104,6 +106,13 @@ struct ReconnectTrace {
     post_reconnect_permits: u64,
     status: StatusTrace,
     after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalChildTrace {
+    resync_reason: String,
+    phase: magnetar::proto::AggregatePhase,
+    assigned_segments: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1194,6 +1203,83 @@ async fn run_moonpool_reconnect() -> ReconnectTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_moonpool(&cluster).await;
     let trace = observe_segment_reconnect(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn observe_terminal_child_resync<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> TerminalChildTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription("terminal-child-sub")
+        .consumer_name("terminal-child-consumer")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe terminal-child aggregate");
+    cluster
+        .wait_for("terminal-child initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer).await;
+    assert_eq!(
+        cluster
+            .update(|fake| fake.disconnect_endpoint(Endpoint::Segment(1)))
+            .expect("disconnect terminal-budget child endpoint"),
+        1
+    );
+    let resync_reason = loop {
+        let event = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
+            .await
+            .expect("terminal-child event timed out")
+            .expect("terminal-child event failed")
+            .expect("terminal-child aggregate closed before resynchronization");
+        match event {
+            StreamConsumerEvent::ResyncRequired { reason } => break reason,
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. } => {}
+            unexpected => panic!("unexpected terminal-child event: {unexpected:?}"),
+        }
+    };
+    assert_eq!(resync_reason, "connection is closed");
+    let raw_status = consumer.status();
+    let phase = raw_status.phase();
+    assert_eq!(phase, magnetar::proto::AggregatePhase::ResyncRequired);
+    let assigned_segments = raw_status.assigned_segments();
+    assert_eq!(assigned_segments, 0);
+
+    drop(consumer);
+    TerminalChildTrace {
+        resync_reason,
+        phase,
+        assigned_segments,
+    }
+}
+
+async fn run_tokio_terminal_child_resync() -> TerminalChildTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_child_resync(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_terminal_child_resync() -> TerminalChildTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_child_resync(&client, &cluster).await;
     client.close().await;
     trace
 }
@@ -2470,6 +2556,13 @@ async fn segment_reconnect_is_equivalent() {
     let tokio = run_tokio_reconnect().await;
     let moonpool = run_moonpool_reconnect().await;
     assert_eq!(tokio, moonpool, "segment reconnect traces diverged");
+}
+
+#[tokio::test]
+async fn terminal_child_receive_requests_equivalent_resynchronization() {
+    let tokio = run_tokio_terminal_child_resync().await;
+    let moonpool = run_moonpool_terminal_child_resync().await;
+    assert_eq!(tokio, moonpool, "terminal-child resync traces diverged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
