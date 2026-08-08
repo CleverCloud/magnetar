@@ -4889,7 +4889,13 @@ where
             .iter()
             .all(|error| error.contains("provisional close barrier failure"))
     );
-    assert!(provisional_close_errors[1].contains("stream consumer failed"));
+    assert_eq!(
+        provisional_close_errors
+            .iter()
+            .filter(|error| error.contains("stream consumer failed"))
+            .count(),
+        1
+    );
     let provisional_close_failures = provisional_close_errors.len();
     cluster
         .wait_for("provisional-close lifecycle cleanup", |fake| {
