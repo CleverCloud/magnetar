@@ -326,6 +326,7 @@ struct CloseStateTrace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MalformedDeliveryTrace {
     resync_reasons: Vec<String>,
+    close_routes: Vec<usize>,
     after_close: Vec<ResourceCounts>,
 }
 
@@ -4926,6 +4927,7 @@ where
             },
             snappy(b"codec"),
             "decompress",
+            true,
         ),
         (
             "chunk",
@@ -4937,6 +4939,7 @@ where
             },
             Bytes::from_static(b"x"),
             "chunk id is absent",
+            false,
         ),
         (
             "transform-budget",
@@ -4947,6 +4950,7 @@ where
             },
             snappy(b"x"),
             "data budget is",
+            false,
         ),
         (
             "batch",
@@ -4956,11 +4960,13 @@ where
             },
             Bytes::new(),
             "single-message metadata length is truncated",
+            false,
         ),
     ];
     let mut resync_reasons = Vec::with_capacity(cases.len());
+    let mut close_routes = Vec::with_capacity(cases.len());
     let mut after_close = Vec::with_capacity(cases.len());
-    for (label, metadata, payload, reason_fragment) in cases {
+    for (label, metadata, payload, reason_fragment, fail_child_close) in cases {
         let consumer = client
             .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
             .subscription(format!("malformed-{label}-sub"))
@@ -4976,8 +4982,29 @@ where
             })
             .await;
         wait_for_initial_flow(&consumer, &[1, 2]).await;
+        let closes_before = cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.endpoint == Endpoint::Segment(1)
+                        && route.command == magnetar::proto::pb::base_command::Type::CloseConsumer
+                })
+                .count()
+        });
         cluster
-            .update(|fake| fake.enqueue_message_with_metadata(1, metadata, payload, Vec::new()))
+            .update(|fake| {
+                if fail_child_close {
+                    fake.script_next(
+                        Endpoint::Segment(1),
+                        OperationKind::Close,
+                        ScriptedBehavior::Fail(BrokerFailure::new(
+                            magnetar::proto::pb::ServerError::PersistenceError,
+                            "resync child close rejected",
+                        )),
+                    )?;
+                }
+                fake.enqueue_message_with_metadata(1, metadata, payload, Vec::new())
+            })
             .expect("enqueue malformed delivery");
         cluster
             .wait_for("malformed delivery reaches child", |fake| {
@@ -5004,9 +5031,22 @@ where
         );
         resync_reasons.push(reason);
         after_close.push(close_and_count(consumer, cluster).await);
+        let closes = cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.endpoint == Endpoint::Segment(1)
+                        && route.command == magnetar::proto::pb::base_command::Type::CloseConsumer
+                })
+                .count()
+                .saturating_sub(closes_before)
+        });
+        assert_eq!(closes, if fail_child_close { 2 } else { 1 });
+        close_routes.push(closes);
     }
     MalformedDeliveryTrace {
         resync_reasons,
+        close_routes,
         after_close,
     }
 }
