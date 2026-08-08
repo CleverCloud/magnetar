@@ -768,6 +768,7 @@ The bulk of the parity matrix above ships on `main`, including:
 - **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
 - **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips — [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).
 - **Daily 128-random-seed moonpool sweep** ([ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md)).
+- **Swarm-tested simulation configurations** — each seed runs a derived subset of buggify labels + workload operations, with a reserved inclusive slice ([ADR-0097](specs/adr/0097-swarm-testing-sim-configurations.md)).
 - **Anti-thrash supervised reconnect policy** (opt-in, [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
 Known open work is narrow and tracked in [`docs/follow-ups.md`](docs/follow-ups.md).

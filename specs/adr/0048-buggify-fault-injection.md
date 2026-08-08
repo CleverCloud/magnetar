@@ -1,6 +1,6 @@
 # ADR-0048 — Buggify fault-injection points in `magnetar-proto`
 
-- **Status**: Accepted
+- **Status**: Accepted (**amended by [ADR-0097](0097-swarm-testing-sim-configurations.md)**, which adds the per-label filter `Buggify::with_rng_and_filter` and the `ConnectionConfig.buggify` engine-arming slot this ADR's §Alternatives deferred; the four labels, the 5% call-site probability, and the disabled-is-NOP contract are unchanged)
 - **Date**: 2026-06-01
 - **Decider**: Florentin Dubois
 - **Tags**: simulation, fault-injection, testing, magnetar-proto, moonpool

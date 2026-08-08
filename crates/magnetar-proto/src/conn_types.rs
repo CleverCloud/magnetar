@@ -318,6 +318,18 @@ pub struct ConnectionConfig {
     /// `statsIntervalSeconds` later), so this is parity-correct rather
     /// than a rounding artefact.
     pub stats_interval: Option<Duration>,
+    /// Engine-arming slot for the ADR-0048 buggify fault-injection helper
+    /// (ADR-0097 swarm configurations). Default [`crate::Buggify::disabled`]
+    /// — a zero-sized no-op unless the `buggify` Cargo feature is enabled
+    /// AND an engine chooses to honour the slot.
+    ///
+    /// Only the **moonpool** engine reads this field: it installs the
+    /// helper on every connection it constructs (initial dial and every
+    /// supervised re-dial share the config, so the fire-counter map
+    /// survives resets). The tokio engine deliberately ignores the slot,
+    /// preserving ADR-0048's guarantee that production binaries never see
+    /// synthetic faults; `buggify_off_is_nop.rs` pins that contract.
+    pub buggify: crate::Buggify,
 }
 
 /// Policy applied when the configured global publish memory budget is
@@ -373,6 +385,7 @@ impl Default for ConnectionConfig {
             // the sweep off so this flip could be its own one-line commit,
             // bisectable on its own moonpool seed sweep.
             stats_interval: Some(Duration::from_mins(1)),
+            buggify: crate::Buggify::disabled(),
         }
     }
 }
@@ -410,6 +423,19 @@ mod redirect_url_allow_list_tests {
         assert!(
             cfg.redirect_url_allow_list.is_none(),
             "default must be permissive (None) to preserve pre-allow-list behaviour",
+        );
+    }
+
+    /// ADR-0097: the buggify engine-arming slot defaults to the disarmed
+    /// helper on every build axis, so a config that never touches the
+    /// field cannot inject faults — the ADR-0048 disabled-is-NOP
+    /// contract holds through the new slot.
+    #[test]
+    fn default_buggify_slot_is_disarmed() {
+        let cfg = ConnectionConfig::default();
+        assert!(
+            !cfg.buggify.is_armed(),
+            "ConnectionConfig::default() must carry a disarmed Buggify slot",
         );
     }
 

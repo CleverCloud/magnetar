@@ -32,7 +32,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, SubscribeRequest, decode_one,
     encode_command, encode_payload, pb,
 };
+use magnetar_runtime_moonpool::swarm::SwarmConfig;
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::{
     NetworkProvider, Providers, RandomProvider, TaskProvider, TcpListenerTrait, TimeProvider,
@@ -49,7 +50,7 @@ use moonpool_core::{
 use moonpool_sim::providers::SimProviders;
 use moonpool_sim::{
     Invariant, SimContext, SimulationBuilder, SimulationError, SimulationResult, TraceQuery,
-    Workload, WorkloadTopology, assert_always,
+    Workload, WorkloadTopology, assert_always, current_sim_seed,
 };
 use parking_lot::Mutex;
 
@@ -1289,12 +1290,31 @@ fn emit_message(
 // Invariants — continuous, cursor-incremental.
 // =============================================================================
 
+/// Shared handle through which the client workload publishes the
+/// iteration's drawn [`SwarmConfig`] to the invariants (ADR-0097): a
+/// violation message must carry the run's configuration, or the failing
+/// seed is not reproducible from the report alone — ADR-0047 triage
+/// depends on the printed config line. Default-constructed invariants
+/// (the swizzle tests', whose workloads draw no config) leave the handle
+/// empty and print no suffix.
+type SwarmConfigHandle = Arc<Mutex<Option<SwarmConfig>>>;
+
+/// Format the violation-message suffix carrying the active swarm
+/// configuration, or an empty string when no config was published.
+fn swarm_suffix(handle: &SwarmConfigHandle) -> String {
+    handle
+        .lock()
+        .as_ref()
+        .map_or_else(String::new, |c| format!(" [{c}]"))
+}
+
 /// Per-producer sequence-id must be monotonically increasing on the
 /// timeline of accepted sends. Cursor-incremental walk over the
 /// `broker_sends` timeline.
 struct MonotonicMsgIdInvariant {
     cursor: Cell<usize>,
     last_seq: RefCell<HashMap<u64, u64>>,
+    swarm: SwarmConfigHandle,
 }
 
 impl Default for MonotonicMsgIdInvariant {
@@ -1302,6 +1322,18 @@ impl Default for MonotonicMsgIdInvariant {
         Self {
             cursor: Cell::new(0),
             last_seq: RefCell::new(HashMap::new()),
+            swarm: SwarmConfigHandle::default(),
+        }
+    }
+}
+
+impl MonotonicMsgIdInvariant {
+    /// Bind this invariant to the client workload's swarm-config handle
+    /// so violations report the active configuration (ADR-0097).
+    fn with_config(swarm: SwarmConfigHandle) -> Self {
+        Self {
+            swarm,
+            ..Self::default()
         }
     }
 }
@@ -1324,7 +1356,10 @@ impl Invariant for MonotonicMsgIdInvariant {
             if let Some(p) = prev {
                 assert_always!(
                     cur > p,
-                    format!("non-monotonic sequence_id for producer {pid}: prev={p} got={cur}")
+                    format!(
+                        "non-monotonic sequence_id for producer {pid}: prev={p} got={cur}{}",
+                        swarm_suffix(&self.swarm)
+                    )
                 );
             }
             self.last_seq.borrow_mut().insert(pid, cur);
@@ -1358,6 +1393,7 @@ struct HandleResolutionInvariant {
     /// Counts how many resolutions arrived per (producer, `send_index`)
     /// key. Anything `> 1` is a double-resolve violation.
     resolution_count: RefCell<HashMap<(u64, u64), u8>>,
+    swarm: SwarmConfigHandle,
 }
 
 impl Default for HandleResolutionInvariant {
@@ -1366,6 +1402,18 @@ impl Default for HandleResolutionInvariant {
             started_cursor: Cell::new(0),
             resolved_cursor: Cell::new(0),
             resolution_count: RefCell::new(HashMap::new()),
+            swarm: SwarmConfigHandle::default(),
+        }
+    }
+}
+
+impl HandleResolutionInvariant {
+    /// Bind this invariant to the client workload's swarm-config handle
+    /// so violations report the active configuration (ADR-0097).
+    fn with_config(swarm: SwarmConfigHandle) -> Self {
+        Self {
+            swarm,
+            ..Self::default()
         }
     }
 }
@@ -1410,8 +1458,10 @@ impl Invariant for HandleResolutionInvariant {
                         | SEND_RESOLUTION_MEMORY_LIMIT
                 ),
                 format!(
-                    "unknown send resolution kind {kind} for handle={} index={}",
-                    key.0, key.1
+                    "unknown send resolution kind {kind} for handle={} index={}{}",
+                    key.0,
+                    key.1,
+                    swarm_suffix(&self.swarm)
                 )
             );
             let mut counts = self.resolution_count.borrow_mut();
@@ -1420,8 +1470,11 @@ impl Invariant for HandleResolutionInvariant {
             assert_always!(
                 *entry_count <= 1,
                 format!(
-                    "double-resolve on producer={} send_index={}: count={}",
-                    key.0, key.1, *entry_count
+                    "double-resolve on producer={} send_index={}: count={}{}",
+                    key.0,
+                    key.1,
+                    *entry_count,
+                    swarm_suffix(&self.swarm)
                 )
             );
         }
@@ -1435,6 +1488,7 @@ struct AckAfterReceiveInvariant {
     ack_cursor: Cell<usize>,
     delivered: RefCell<HashMap<(u64, u64, u64), u64>>,
     deliver_cursor: Cell<usize>,
+    swarm: SwarmConfigHandle,
 }
 
 impl Default for AckAfterReceiveInvariant {
@@ -1443,6 +1497,18 @@ impl Default for AckAfterReceiveInvariant {
             ack_cursor: Cell::new(0),
             delivered: RefCell::new(HashMap::new()),
             deliver_cursor: Cell::new(0),
+            swarm: SwarmConfigHandle::default(),
+        }
+    }
+}
+
+impl AckAfterReceiveInvariant {
+    /// Bind this invariant to the client workload's swarm-config handle
+    /// so violations report the active configuration (ADR-0097).
+    fn with_config(swarm: SwarmConfigHandle) -> Self {
+        Self {
+            swarm,
+            ..Self::default()
         }
     }
 }
@@ -1483,8 +1549,12 @@ impl Invariant for AckAfterReceiveInvariant {
             assert_always!(
                 delivery_seq.is_some_and(|seq| trace_occurs_before(seq, event.seq)),
                 format!(
-                    "ack precedes delivery: consumer={} ({}, {}), ack_seq={}, delivery_seq={delivery_seq:?}",
-                    key.0, key.1, key.2, event.seq
+                    "ack precedes delivery: consumer={} ({}, {}), ack_seq={}, delivery_seq={delivery_seq:?}{}",
+                    key.0,
+                    key.1,
+                    key.2,
+                    event.seq,
+                    swarm_suffix(&self.swarm)
                 )
             );
         }
@@ -1498,6 +1568,7 @@ struct NoDupOnAckedInvariant {
     cursor: Cell<usize>,
     acked: RefCell<HashMap<(u64, u64, u64), u64>>,
     delivered_after_ack_seen: Cell<bool>,
+    swarm: SwarmConfigHandle,
 }
 
 impl Default for NoDupOnAckedInvariant {
@@ -1506,6 +1577,18 @@ impl Default for NoDupOnAckedInvariant {
             cursor: Cell::new(0),
             acked: RefCell::new(HashMap::new()),
             delivered_after_ack_seen: Cell::new(false),
+            swarm: SwarmConfigHandle::default(),
+        }
+    }
+}
+
+impl NoDupOnAckedInvariant {
+    /// Bind this invariant to the client workload's swarm-config handle
+    /// so violations report the active configuration (ADR-0097).
+    fn with_config(swarm: SwarmConfigHandle) -> Self {
+        Self {
+            swarm,
+            ..Self::default()
         }
     }
 }
@@ -1549,8 +1632,12 @@ impl Invariant for NoDupOnAckedInvariant {
             assert_always!(
                 !ack_seq.is_some_and(|seq| trace_occurs_before(seq, event.seq)),
                 format!(
-                    "broker redelivered acked message: consumer={} ({}, {}), delivery_seq={}, ack_seq={ack_seq:?}",
-                    key.0, key.1, key.2, event.seq
+                    "broker redelivered acked message: consumer={} ({}, {}), delivery_seq={}, ack_seq={ack_seq:?}{}",
+                    key.0,
+                    key.1,
+                    key.2,
+                    event.seq,
+                    swarm_suffix(&self.swarm)
                 )
             );
         }
@@ -1590,14 +1677,96 @@ struct ProducerConsumerWorkload {
     sent: Arc<Mutex<Vec<u32>>>,
     received: Arc<Mutex<Vec<u32>>>,
     completed: AtomicBool,
+    /// ADR-0097: `true` forces [`SwarmConfig::baseline`] — the pre-swarm
+    /// workload shape — instead of the per-seed draw. Sub-seed-pinning
+    /// regression tests set this so their recorded trajectories stay
+    /// byte-identical.
+    force_baseline: bool,
+    /// The iteration's active [`SwarmConfig`], drawn in [`Workload::setup`]
+    /// (pure function of `current_sim_seed()`, before the first
+    /// operation) and shared with the invariants for violation messages.
+    swarm: SwarmConfigHandle,
+    /// Non-vacuity evidence (ADR-0097): counts the ack calls the run
+    /// actually issued. When `op.client_ack` is enabled and messages were
+    /// received, `check()` requires this to be non-zero — an enabled
+    /// operation must prove it ran, so a gating bug cannot silently turn
+    /// `AckAfterReceiveInvariant` vacuous while the config claims otherwise.
+    acks_attempted: AtomicU64,
 }
 
 impl ProducerConsumerWorkload {
     fn new() -> Self {
+        Self::with_mode(false)
+    }
+
+    /// ADR-0097: the constructor for sub-seed-pinning regression tests —
+    /// forces the recorded [`SwarmConfig::baseline`] shape every iteration.
+    fn new_baseline() -> Self {
+        Self::with_mode(true)
+    }
+
+    fn with_mode(force_baseline: bool) -> Self {
         Self {
             sent: Arc::new(Mutex::new(Vec::new())),
             received: Arc::new(Mutex::new(Vec::new())),
             completed: AtomicBool::new(false),
+            force_baseline,
+            swarm: SwarmConfigHandle::default(),
+            acks_attempted: AtomicU64::new(0),
+        }
+    }
+
+    /// The shared handle the invariants bind to via `with_config` so
+    /// their violation messages carry the active configuration.
+    fn swarm_handle(&self) -> SwarmConfigHandle {
+        self.swarm.clone()
+    }
+
+    /// The iteration's active config — populated by `setup()`.
+    fn active_swarm(&self) -> SwarmConfig {
+        self.swarm
+            .lock()
+            .clone()
+            .expect("setup() draws the swarm config before run()/check()")
+    }
+
+    /// Receive until every distinct payload is in hand, within the
+    /// config's attempt budget (ADR-0097 effective weight: 4x
+    /// `PRODUCE_COUNT` when `op.client_ack` is off, since every
+    /// reconnect then redelivers the full ledger; 2x otherwise). Dedup
+    /// by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised reconnect
+    /// legitimately REDELIVERS the un-acked tail at-least-once, so the
+    /// same broker message id can arrive twice; counting it once keeps
+    /// the at-least-once set honest. The ack leg is the `op.client_ack`
+    /// swarm feature; each issued ack is counted as non-vacuity
+    /// evidence for `check()`.
+    async fn receive_distinct<P: Providers, T: TimeProvider>(
+        &self,
+        swarm: &SwarmConfig,
+        consumer: &magnetar_runtime_moonpool::Consumer<P>,
+        time: &T,
+    ) {
+        let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
+        for _ in 0..(swarm.receive_budget_multiplier() * PRODUCE_COUNT) {
+            if self.received.lock().len() >= PRODUCE_COUNT as usize {
+                break;
+            }
+            let recv = time
+                .timeout(Duration::from_secs(10), consumer.receive())
+                .await;
+            let Ok(Ok(msg)) = recv else {
+                break;
+            };
+            let id = (msg.message_id.ledger_id, msg.message_id.entry_id);
+            if seen_ids.insert(id) && msg.payload.len() == 4 {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&msg.payload[..4]);
+                self.received.lock().push(u32::from_le_bytes(bytes));
+            }
+            if swarm.client_ack() {
+                self.acks_attempted.fetch_add(1, Ordering::SeqCst);
+                let _ = consumer.ack(msg.message_id).await;
+            }
         }
     }
 }
@@ -1608,13 +1777,50 @@ impl Workload for ProducerConsumerWorkload {
         "client"
     }
 
+    async fn setup(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
+        // Per-iteration state reset. The same workload instance is reused
+        // across iterations (`SimulationBuilder::workload` docs), so without
+        // this, iteration ≥2 of a sweep sees iteration 1's `received` vector,
+        // breaks out of the receive loop immediately, and every operation —
+        // and therefore every per-iteration swarm config — is vacuous.
+        self.sent.lock().clear();
+        self.received.lock().clear();
+        self.completed.store(false, Ordering::SeqCst);
+        self.acks_attempted.store(0, Ordering::SeqCst);
+        // ADR-0097: draw the iteration's swarm configuration — a pure
+        // function of the iteration seed, consuming no RNG stream — before
+        // the first operation (moonpool guarantees every setup() completes
+        // before any run() starts). Print the canonical config line so the
+        // drawn subset is part of every CI log a failing seed links.
+        let seed = current_sim_seed();
+        let config = if self.force_baseline {
+            SwarmConfig::baseline(seed)
+        } else {
+            SwarmConfig::from_seed(seed)
+        };
+        println!("{config}");
+        *self.swarm.lock() = Some(config);
+        Ok(())
+    }
+
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let swarm = self.active_swarm();
         let broker_ip = ctx
             .peer("broker")
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
         let time_provider_setup = ctx.providers().time().clone();
+
+        // ADR-0097: arm the drawn buggify label subset through the
+        // ConnectionConfig engine-arming slot. The RNG rides
+        // `Providers::Random` (the in-run seeded stream), so armed choice
+        // points draw deterministically per seed; with no label enabled —
+        // the baseline slot included — `build_buggify` returns the disabled
+        // helper and the connection behaves exactly as pre-swarm code.
+        let mut conn_config = supervised_config();
+        let buggify_rng = ctx.providers().random().clone();
+        conn_config.buggify = swarm.build_buggify(Arc::new(move || buggify_rng.random::<u64>()));
 
         // Supervised connect (ADR-0055 §3): a bit-flip-induced terminal drop is
         // recovered by reconnect + replay against the persistent broker, rather
@@ -1623,8 +1829,7 @@ impl Workload for ProducerConsumerWorkload {
         // drop DURING the initial dial itself (before the supervised driver
         // exists to reconnect on its own) — see its doc comment (#366).
         let client =
-            retry_supervised_connect(&time_provider_setup, &engine, &addr, supervised_config())
-                .await?;
+            retry_supervised_connect(&time_provider_setup, &engine, &addr, conn_config).await?;
 
         // Open consumer first so it's ready to receive before we publish.
         // `retry_setup` re-issues the op across a transient chaos drop (a
@@ -1690,32 +1895,18 @@ impl Workload for ProducerConsumerWorkload {
             self.sent.lock().push(i);
         }
 
-        // Receive until every distinct payload is in hand, with a bounded
-        // iteration budget — the sim time-limit guards against a true hang.
-        // Dedup by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised
-        // reconnect legitimately REDELIVERS the un-acked tail at-least-once, so
-        // the same broker message id can arrive twice; counting it once keeps
-        // the at-least-once set honest and stops a duplicate from consuming the
-        // budget meant for a not-yet-seen message. The extra slack
-        // (`2 * PRODUCE_COUNT`) covers the redelivered duplicates.
-        let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
-        for _ in 0..(2 * PRODUCE_COUNT) {
-            if self.received.lock().len() >= PRODUCE_COUNT as usize {
-                break;
-            }
-            let recv = time_provider_setup
-                .timeout(Duration::from_secs(10), consumer.receive())
-                .await;
-            let Ok(Ok(msg)) = recv else {
-                break;
-            };
-            let id = (msg.message_id.ledger_id, msg.message_id.entry_id);
-            if seen_ids.insert(id) && msg.payload.len() == 4 {
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&msg.payload[..4]);
-                self.received.lock().push(u32::from_le_bytes(bytes));
-            }
-            let _ = consumer.ack(msg.message_id).await;
+        // Receive until every distinct payload is in hand, within the
+        // config's attempt budget — the sim time-limit guards against a
+        // true hang; see `receive_distinct` for the dedup + ack-leg rules.
+        self.receive_distinct(&swarm, &consumer, &time_provider_setup)
+            .await;
+
+        // ADR-0097 `op.client_close`: an explicit producer + consumer close,
+        // exercising the CLOSE_PRODUCER / CLOSE_CONSUMER broker paths this
+        // workload never drove before the swarm campaign.
+        if swarm.client_close() {
+            let _ = producer.close().await;
+            let _ = consumer.close().await;
         }
 
         self.completed.store(true, Ordering::SeqCst);
@@ -1731,7 +1922,7 @@ impl Workload for ProducerConsumerWorkload {
             let missing: Vec<u32> = sent.difference(&received).copied().collect();
             if !missing.is_empty() {
                 return Err(SimulationError::InvalidState(format!(
-                    "at-least-once violated: sent {sent:?} but missing {missing:?}"
+                    "at-least-once violated: sent {sent:?} but missing {missing:?} [{swarm}]"
                 )));
             }
         }
@@ -1739,10 +1930,11 @@ impl Workload for ProducerConsumerWorkload {
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
+        let swarm = self.active_swarm();
         if !self.completed.load(Ordering::SeqCst) {
-            return Err(SimulationError::InvalidState(
-                "client workload did not complete".into(),
-            ));
+            return Err(SimulationError::InvalidState(format!(
+                "client workload did not complete [{swarm}]"
+            )));
         }
         // At-least-once delivery: every sent payload must appear in the
         // received set (Pulsar's set-difference pattern). Duplicates
@@ -1753,7 +1945,20 @@ impl Workload for ProducerConsumerWorkload {
         let missing: Vec<u32> = sent.difference(&received).copied().collect();
         if !missing.is_empty() {
             return Err(SimulationError::InvalidState(format!(
-                "at-least-once violated: sent {sent:?} but missing {missing:?}",
+                "at-least-once violated: sent {sent:?} but missing {missing:?} [{swarm}]",
+            )));
+        }
+        // ADR-0097 non-vacuity: when the drawn config enables
+        // `op.client_ack` and the run received messages, the run must have
+        // actually issued acks — an enabled operation proves it ran, so a
+        // gating bug cannot silently starve `AckAfterReceiveInvariant`
+        // while the config line claims the op was on.
+        if swarm.client_ack()
+            && !received.is_empty()
+            && self.acks_attempted.load(Ordering::SeqCst) == 0
+        {
+            return Err(SimulationError::InvalidState(format!(
+                "op.client_ack enabled but no ack was attempted [{swarm}]"
             )));
         }
         Ok(())
@@ -1766,14 +1971,16 @@ impl Workload for ProducerConsumerWorkload {
 /// `no_dup_on_acked`).
 #[test]
 fn sim_chaos_produce_consume_with_invariants() {
+    let client = ProducerConsumerWorkload::new();
+    let swarm = client.swarm_handle();
     let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
-        .workload(ProducerConsumerWorkload::new())
-        .invariant(MonotonicMsgIdInvariant::default())
-        .invariant(AckAfterReceiveInvariant::default())
-        .invariant(NoDupOnAckedInvariant::default())
-        .invariant(HandleResolutionInvariant::default())
+        .workload(client)
+        .invariant(MonotonicMsgIdInvariant::with_config(swarm.clone()))
+        .invariant(AckAfterReceiveInvariant::with_config(swarm.clone()))
+        .invariant(NoDupOnAckedInvariant::with_config(swarm.clone()))
+        .invariant(HandleResolutionInvariant::with_config(swarm))
         .set_debug_seeds(sweep_seeds(1))
         .set_iterations(1)
         .run();
@@ -1794,14 +2001,16 @@ fn sim_chaos_produce_consume_with_invariants() {
 /// 16-seed sweep of the full produce/consume + invariants surface.
 #[test]
 fn sim_chaos_produce_consume_sweep_16_seeds() {
+    let client = ProducerConsumerWorkload::new();
+    let swarm = client.swarm_handle();
     let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
-        .workload(ProducerConsumerWorkload::new())
-        .invariant(MonotonicMsgIdInvariant::default())
-        .invariant(AckAfterReceiveInvariant::default())
-        .invariant(NoDupOnAckedInvariant::default())
-        .invariant(HandleResolutionInvariant::default())
+        .workload(client)
+        .invariant(MonotonicMsgIdInvariant::with_config(swarm.clone()))
+        .invariant(AckAfterReceiveInvariant::with_config(swarm.clone()))
+        .invariant(NoDupOnAckedInvariant::with_config(swarm.clone()))
+        .invariant(HandleResolutionInvariant::with_config(swarm))
         .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
@@ -1829,14 +2038,19 @@ fn sim_chaos_seed_2_does_not_hang() {
     assert!(trace_occurs_before(1, 2));
     assert!(!trace_occurs_before(2, 1));
 
+    // ADR-0097: pinned regression reproducer — force the recorded
+    // baseline shape so the trajectory stays byte-identical to the
+    // original seed-2 hang reproducer.
+    let client = ProducerConsumerWorkload::new_baseline();
+    let swarm = client.swarm_handle();
     let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
-        .workload(ProducerConsumerWorkload::new())
-        .invariant(MonotonicMsgIdInvariant::default())
-        .invariant(AckAfterReceiveInvariant::default())
-        .invariant(NoDupOnAckedInvariant::default())
-        .invariant(HandleResolutionInvariant::default())
+        .workload(client)
+        .invariant(MonotonicMsgIdInvariant::with_config(swarm.clone()))
+        .invariant(AckAfterReceiveInvariant::with_config(swarm.clone()))
+        .invariant(NoDupOnAckedInvariant::with_config(swarm.clone()))
+        .invariant(HandleResolutionInvariant::with_config(swarm))
         .set_debug_seeds(vec![2])
         .set_iterations(1)
         .run();
@@ -2679,14 +2893,18 @@ fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
 /// tied to the original reproducer.
 #[test]
 fn sim_chaos_produce_consume_sub_seed_366() {
+    // ADR-0097: pinned regression reproducer — force the recorded
+    // baseline shape so the #366 trajectory stays byte-identical.
+    let client = ProducerConsumerWorkload::new_baseline();
+    let swarm = client.swarm_handle();
     let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
-        .workload(ProducerConsumerWorkload::new())
-        .invariant(MonotonicMsgIdInvariant::default())
-        .invariant(AckAfterReceiveInvariant::default())
-        .invariant(NoDupOnAckedInvariant::default())
-        .invariant(HandleResolutionInvariant::default())
+        .workload(client)
+        .invariant(MonotonicMsgIdInvariant::with_config(swarm.clone()))
+        .invariant(AckAfterReceiveInvariant::with_config(swarm.clone()))
+        .invariant(NoDupOnAckedInvariant::with_config(swarm.clone()))
+        .invariant(HandleResolutionInvariant::with_config(swarm))
         .set_debug_seeds(vec![16_011_264_899_749_977_182])
         .set_iterations(1)
         .run();

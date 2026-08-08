@@ -133,7 +133,7 @@ pub use crate::auth::{
 pub use crate::backoff::Backoff;
 pub use crate::buggify::Buggify;
 #[cfg(feature = "buggify")]
-pub use crate::buggify::BuggifyRng;
+pub use crate::buggify::{BuggifyFilter, BuggifyRng};
 pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,

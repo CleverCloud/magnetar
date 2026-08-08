@@ -1241,7 +1241,15 @@ where
         // so the two share one definition of "the last reconnect counted as
         // stable". A socket that died inside `drop_grace` (or never handshaked
         // at all, behind a TCP-accepting proxy) resets neither.
-        let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
+        let backoff = backoff.get_or_insert_with(|| {
+            let mut b = cfg.build_backoff(seed);
+            // ADR-0097: share the connection's buggify helper (armed from the
+            // ConnectionConfig slot, or the disabled default) so the
+            // `retry_clock.skew` label draws from the same RNG + fire-counter
+            // map as the connection's three choice points, per ADR-0048.
+            b.install_buggify(shared.inner.lock().buggify().clone());
+            b
+        });
         // ADR-0011: route the elapsed-duration computation through the
         // engine-supplied clock instead of `Instant::elapsed()` (which
         // implicitly reads the host `Instant::now`). Under `SimProviders`
