@@ -1284,6 +1284,138 @@ async fn run_moonpool_terminal_child_resync() -> TerminalChildTrace {
     trace
 }
 
+async fn observe_assignment_close_failure<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> (String, ResourceCounts)
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let owner = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription("assignment-close-failure-sub")
+        .consumer_name("assignment-close-failure-owner")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe assignment-close-failure owner");
+    cluster
+        .wait_for("assignment-close-failure children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&owner).await;
+    let takeover = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription("assignment-close-failure-sub")
+        .consumer_name("assignment-close-failure-takeover")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe assignment-close-failure takeover");
+    let (_, takeover_resyncs) = wait_for_assignment(&takeover, 1, &[]).await;
+    assert!(takeover_resyncs.is_empty());
+    let owner_member = cluster
+        .inspect(|fake| {
+            fake.member(
+                "assignment-close-failure-sub",
+                "assignment-close-failure-owner",
+            )
+        })
+        .expect("assignment-close-failure owner member");
+    let takeover_member = cluster
+        .inspect(|fake| {
+            fake.member(
+                "assignment-close-failure-sub",
+                "assignment-close-failure-takeover",
+            )
+        })
+        .expect("assignment-close-failure takeover member");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "assignment child close failure",
+                )),
+            )?;
+            fake.publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(owner_member, [2]),
+                    FullAssignment::new(takeover_member, [1]),
+                ],
+            )
+        })
+        .expect("apply assignment with a rejected child close");
+    let (_, owner_resyncs) = wait_for_assignment(&owner, 1, &[2]).await;
+    assert!(owner_resyncs.is_empty());
+    let (_, takeover_resyncs) = wait_for_assignment(&takeover, 1, &[1]).await;
+    assert!(takeover_resyncs.is_empty());
+    let reason = loop {
+        match tokio::time::timeout(magnetar_differential::HANG_GUARD, owner.next_event())
+            .await
+            .expect("assignment-close-failure event timed out")
+            .expect("assignment-close-failure event failed")
+            .expect("assignment-close-failure aggregate closed before resync")
+        {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("assignment child close failure") =>
+            {
+                break reason;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. }
+            | StreamConsumerEvent::ResyncRequired { .. } => {}
+            unexpected => panic!("unexpected assignment-close-failure event: {unexpected:?}"),
+        }
+    };
+    owner
+        .close()
+        .await
+        .expect("close assignment-close-failure owner");
+    takeover
+        .close()
+        .await
+        .expect("close assignment-close-failure takeover");
+    cluster
+        .wait_for("assignment-close-failure cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0 && counts.pending_operations == 0 && counts.permits == 0
+        })
+        .await;
+    (reason, cluster.inspect(M1FakeCluster::resource_counts))
+}
+
+async fn run_tokio_assignment_close_failure() -> (String, ResourceCounts) {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_assignment_close_failure(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_assignment_close_failure() -> (String, ResourceCounts) {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_assignment_close_failure(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
 fn acknowledgement_failure(error: magnetar::scalable::StreamConsumerError) -> String {
     match error {
         magnetar::scalable::StreamConsumerError::PartialAcknowledgement { confirmed, failed } => {
@@ -2563,6 +2695,13 @@ async fn terminal_child_receive_requests_equivalent_resynchronization() {
     let tokio = run_tokio_terminal_child_resync().await;
     let moonpool = run_moonpool_terminal_child_resync().await;
     assert_eq!(tokio, moonpool, "terminal-child resync traces diverged");
+}
+
+#[tokio::test]
+async fn assignment_child_close_failure_requests_equivalent_resynchronization() {
+    let tokio = run_tokio_assignment_close_failure().await;
+    let moonpool = run_moonpool_assignment_close_failure().await;
+    assert_eq!(tokio, moonpool, "assignment-close failure traces diverged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
