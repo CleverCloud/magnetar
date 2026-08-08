@@ -26,7 +26,10 @@ use magnetar_fakes::m1::{
     M1Segment, OperationKind, PendingCompletion, ResourceCounts, ScriptedBehavior,
 };
 use prost::Message as _;
-use stream_consumer_support::client::{connect_moonpool, connect_tokio};
+use stream_consumer_support::client::{
+    connect_moonpool, connect_moonpool_with_terminal_reconnect_budget, connect_tokio,
+    connect_tokio_with_terminal_reconnect_budget,
+};
 use stream_consumer_support::server::M1SocketCluster;
 
 const TOPIC: &str = "topic://public/default/scaled";
@@ -153,6 +156,13 @@ struct ControlPlaneTrace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalControllerTrace {
     terminal_failure_reported: bool,
+    replacement_assignment_applied: bool,
+    after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalDagReconnectTrace {
+    terminal_reason: String,
     replacement_assignment_applied: bool,
     after_close: ResourceCounts,
 }
@@ -4014,6 +4024,146 @@ async fn run_moonpool_terminal_controller_failure() -> TerminalControllerTrace {
     .await
 }
 
+async fn observe_terminal_dag_reconnect<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> TerminalDagReconnectTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("terminal-dag-reconnect-sub")
+        .consumer_name("terminal-dag-reconnect-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe terminal-DAG-reconnect aggregate");
+    cluster
+        .wait_for("terminal-DAG-reconnect children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| {
+            for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+                fake.script_next(endpoint, OperationKind::Close, ScriptedBehavior::Delay)?;
+            }
+            fake.enqueue_message_with_metadata(
+                1,
+                magnetar::proto::pb::MessageMetadata {
+                    compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                    uncompressed_size: Some(4),
+                    ..Default::default()
+                },
+                snappy(b"terminal-dag"),
+                Vec::new(),
+            )
+        })
+        .expect("enqueue terminal-DAG-reconnect malformed delivery");
+    cluster
+        .wait_for("terminal-DAG-reconnect delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason } if reason.contains("decompress") => {
+                break;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. }
+            | StreamConsumerEvent::ResyncRequired { .. } => {}
+            unexpected => panic!("unexpected terminal-DAG-reconnect event: {unexpected:?}"),
+        }
+    }
+    cluster
+        .wait_for("first held terminal-DAG-reconnect child close", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::Close)
+        })
+        .await;
+    for close_index in 0..2 {
+        cluster
+            .wait_for("held terminal-DAG-reconnect child close", |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::Close)
+            })
+            .await;
+        let pending = cluster
+            .inspect(|fake| {
+                fake.pending_operations()
+                    .into_iter()
+                    .find(|pending| pending.kind == OperationKind::Close)
+                    .map(|pending| pending.id)
+            })
+            .expect("held terminal-DAG-reconnect child close id");
+        if close_index == 0 {
+            cluster
+                .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+                .expect("complete first terminal-DAG-reconnect child close");
+        } else {
+            assert_eq!(
+                cluster
+                    .update(|fake| {
+                        fake.complete_pending(pending, PendingCompletion::Succeed)?;
+                        fake.disconnect_endpoint(Endpoint::Controller)
+                    })
+                    .expect("complete final child close and disconnect controller"),
+                1
+            );
+        }
+    }
+    let mut replacement_assignment_applied = false;
+    let terminal_reason = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("closed") || reason.contains("driver") =>
+            {
+                break reason;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. } => {
+                replacement_assignment_applied = true;
+            }
+            StreamConsumerEvent::ResyncRequired { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected terminal-DAG-reconnect event: {unexpected:?}"),
+        }
+    };
+    assert!(!replacement_assignment_applied);
+    let after_close = close_and_count(consumer, cluster).await;
+    TerminalDagReconnectTrace {
+        terminal_reason,
+        replacement_assignment_applied,
+        after_close,
+    }
+}
+
+async fn run_tokio_terminal_dag_reconnect() -> TerminalDagReconnectTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_dag_reconnect(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_terminal_dag_reconnect() -> TerminalDagReconnectTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_dag_reconnect(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_delivery_shapes<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -5744,6 +5894,15 @@ async fn terminal_controller_registration_failure_is_equivalent() {
     let moonpool_trace = run_moonpool_terminal_controller_failure().await;
     assert_eq!(tokio_trace, moonpool_trace);
     assert!(tokio_trace.terminal_failure_reported);
+    assert!(!tokio_trace.replacement_assignment_applied);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_dag_reconnect_failure_is_equivalent() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_terminal_dag_reconnect().await;
+    let moonpool_trace = run_moonpool_terminal_dag_reconnect().await;
+    assert_eq!(tokio_trace, moonpool_trace);
     assert!(!tokio_trace.replacement_assignment_applied);
 }
 
