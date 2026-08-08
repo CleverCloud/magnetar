@@ -164,6 +164,7 @@ struct TerminalControllerTrace {
 struct TerminalDagReconnectTrace {
     terminal_reason: String,
     replacement_assignment_applied: bool,
+    queued_delivery_fenced: bool,
     after_close: ResourceCounts,
 }
 
@@ -4049,6 +4050,17 @@ where
     wait_for_initial_flow(&consumer, &[1, 2]).await;
     cluster
         .update(|fake| {
+            fake.clear_routes();
+            fake.enqueue_message(2, Bytes::from_static(b"terminal-dag-queued"))
+        })
+        .expect("enqueue queued delivery before terminal-DAG resync");
+    cluster
+        .wait_for("queued delivery reaches terminal-DAG aggregate", |fake| {
+            fake.resource_counts().unacked_messages == 1 && flow_command_count(fake, 2) > 0
+        })
+        .await;
+    cluster
+        .update(|fake| {
             for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
                 fake.script_next(endpoint, OperationKind::Close, ScriptedBehavior::Delay)?;
             }
@@ -4066,7 +4078,7 @@ where
         .expect("enqueue terminal-DAG-reconnect malformed delivery");
     cluster
         .wait_for("terminal-DAG-reconnect delivery", |fake| {
-            fake.resource_counts().unacked_messages == 1
+            fake.resource_counts().unacked_messages == 2
         })
         .await;
     loop {
@@ -4140,10 +4152,17 @@ where
         }
     };
     assert!(!replacement_assignment_applied);
+    let receive_error = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.receive())
+        .await
+        .expect("terminal DAG recovery must resolve aggregate receive")
+        .expect_err("terminal DAG recovery must fence the queued delivery");
+    assert!(!receive_error.to_string().is_empty());
+    let queued_delivery_fenced = true;
     let after_close = close_and_count(consumer, cluster).await;
     TerminalDagReconnectTrace {
         terminal_reason,
         replacement_assignment_applied,
+        queued_delivery_fenced,
         after_close,
     }
 }

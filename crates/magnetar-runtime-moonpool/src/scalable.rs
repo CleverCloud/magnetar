@@ -1919,10 +1919,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         state
                             .receive
                             .remove_child(source.segment_id(), child_generation);
-                        state.queue.retain(|queued| {
-                            queued.source.segment_id() != source.segment_id()
-                                || queued.generation != child_generation
-                        });
                         state
                             .children
                             .get(&source.segment_id())
