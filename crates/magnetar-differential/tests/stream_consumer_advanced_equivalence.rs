@@ -342,11 +342,15 @@ struct MalformedDeliveryTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct DagWatchRecoveryTrace {
     watch_failure_reported: bool,
     baseline_reported: bool,
     replacement_session: u64,
     controller_opens: usize,
+    terminal_watch_failure_reported: bool,
+    terminal_reopen_failed: bool,
+    replacement_assignment_after_terminal: bool,
     after_close: ResourceCounts,
 }
 
@@ -5311,11 +5315,10 @@ where
                     .any(|(_, replacement)| *replacement != session_id)
         })
         .await;
-    let replacement_session = cluster
+    let (replacement_connection, replacement_session) = cluster
         .inspect(M1FakeCluster::layout_session_ids)
         .into_iter()
-        .map(|(_, replacement)| replacement)
-        .find(|replacement| *replacement != session_id)
+        .find(|(_, replacement)| *replacement != session_id)
         .expect("replacement DAG-watch session");
     let controller_opens = cluster.inspect(|fake| {
         fake.routes()
@@ -5326,19 +5329,82 @@ where
             .count()
     });
     assert_eq!(controller_opens, 1);
+    cluster
+        .update(|fake| {
+            fake.fail_layout_session(
+                replacement_connection,
+                replacement_session,
+                BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::ServiceNotReady,
+                    "terminal replacement DAG watch",
+                ),
+            )
+        })
+        .expect("fail replacement DAG watch");
+    let terminal_watch_failure_reported = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason }
+                if reason.contains("terminal replacement DAG watch") =>
+            {
+                break true;
+            }
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. }
+            | StreamConsumerEvent::ResyncRequired { .. } => {}
+            unexpected => panic!("unexpected replacement DAG-watch event: {unexpected:?}"),
+        }
+    };
+    cluster
+        .update(|fake| fake.disconnect_connection(replacement_connection))
+        .expect("disconnect replacement DAG-watch controller");
+    let mut terminal_reopen_failed = false;
+    let mut replacement_assignment_after_terminal = false;
+    while !terminal_reopen_failed {
+        match tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
+            .await
+            .expect("terminal DAG-watch event timed out")
+        {
+            Ok(Some(StreamConsumerEvent::ResyncRequired { reason })) => {
+                terminal_reopen_failed |= reason.contains("closed") || reason.contains("driver");
+            }
+            Ok(Some(StreamConsumerEvent::AssignmentApplied { .. })) => {
+                replacement_assignment_after_terminal = true;
+            }
+            Ok(Some(
+                StreamConsumerEvent::SegmentPhaseChanged { .. }
+                | StreamConsumerEvent::OrderingUnprovable { .. }
+                | StreamConsumerEvent::TransactionOutcome { .. },
+            )) => {}
+            Ok(Some(unexpected)) => {
+                panic!("unexpected terminal DAG-watch event: {unexpected:?}");
+            }
+            Ok(None) => terminal_reopen_failed = true,
+            Err(error) => {
+                let error = error.to_string();
+                assert!(error.contains("closed") || error.contains("driver"));
+                terminal_reopen_failed = true;
+            }
+        }
+    }
+    assert!(!replacement_assignment_after_terminal);
     let after_close = close_and_count(consumer, cluster).await;
     DagWatchRecoveryTrace {
         watch_failure_reported,
         baseline_reported,
         replacement_session,
         controller_opens,
+        terminal_watch_failure_reported,
+        terminal_reopen_failed,
+        replacement_assignment_after_terminal,
         after_close,
     }
 }
 
 async fn run_tokio_dag_watch_recovery() -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
-    let client = connect_tokio(&cluster).await;
+    let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
     let trace = observe_dag_watch_recovery(&client, &cluster).await;
     client.close().await;
     trace
@@ -5346,7 +5412,7 @@ async fn run_tokio_dag_watch_recovery() -> DagWatchRecoveryTrace {
 
 async fn run_moonpool_dag_watch_recovery() -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
-    let client = connect_moonpool(&cluster).await;
+    let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
     let trace = observe_dag_watch_recovery(&client, &cluster).await;
     client.close().await;
     trace
