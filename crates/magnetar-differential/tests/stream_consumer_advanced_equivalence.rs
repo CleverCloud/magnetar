@@ -363,7 +363,17 @@ struct AcknowledgementFailureTrace {
     close_during_ack_fenced: bool,
     close_after_ack_success: String,
     close_after_ack_failure: String,
+    shared_registration_close: SharedRegistrationCloseTrace,
     after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+struct SharedRegistrationCloseTrace {
+    one_registration: bool,
+    no_transactional_acks: bool,
+    waiter_closed_before_registration_completion: bool,
+    leader_closed_after_registration_completion: bool,
 }
 
 fn encoded_batch(payloads: &[&[u8]]) -> Bytes {
@@ -5528,6 +5538,186 @@ where
     error
 }
 
+async fn close_wakes_shared_transaction_registration_waiter<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> SharedRegistrationCloseTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("closing-shared-registration-sub")
+        .consumer_name("closing-shared-registration-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe closing shared-registration aggregate");
+    cluster
+        .wait_for("closing shared-registration children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    for payload in ["shared-close-leader", "shared-close-waiter"] {
+        cluster
+            .update(|fake| fake.enqueue_message(1, Bytes::from_static(payload.as_bytes())))
+            .expect("enqueue closing shared-registration delivery");
+    }
+    cluster
+        .wait_for("closing shared-registration deliveries", |fake| {
+            fake.resource_counts().unacked_messages == 2
+        })
+        .await;
+    let messages = [receive(&consumer).await, receive(&consumer).await];
+    let transaction = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open closing shared-registration transaction");
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::TransactionRegistration,
+                ScriptedBehavior::Delay,
+            )?;
+            for segment in [1, 2] {
+                fake.script_next(
+                    Endpoint::Segment(segment),
+                    OperationKind::Close,
+                    ScriptedBehavior::Delay,
+                )?;
+            }
+            Ok(())
+        })
+        .expect("delay shared registration and child closes");
+    let mut leader = Box::pin(consumer.acknowledge_in_transaction(&messages[0], transaction));
+    tokio::select! {
+        biased;
+        result = &mut leader => panic!("shared-registration leader completed early: {result:?}"),
+        () = cluster.wait_for("pending closing shared registration", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.kind == OperationKind::TransactionRegistration
+            })
+        }) => {}
+    }
+    let registration = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::TransactionRegistration)
+                .map(|pending| pending.id)
+        })
+        .expect("pending closing shared-registration id");
+    let mut waiter = Box::pin(consumer.acknowledge_in_transaction(&messages[1], transaction));
+    tokio::select! {
+        biased;
+        result = &mut waiter => panic!("shared-registration waiter completed early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    let one_registration =
+        cluster.inspect(|fake| transaction_registration_command_count(fake) == 1);
+    assert!(one_registration);
+    assert_eq!(
+        cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| route.command == magnetar::proto::pb::base_command::Type::Ack)
+                .count()
+        }),
+        0
+    );
+    let mut close = Box::pin(consumer.clone().close());
+    tokio::select! {
+        biased;
+        result = &mut close => panic!("shared-registration close completed early: {result:?}"),
+        () = cluster.wait_for("first closing shared-registration child close", |fake| {
+            fake.pending_operations().iter().any(|pending| pending.kind == OperationKind::Close)
+        }) => {}
+    }
+    let waiter_closed_before_registration_completion = match waiter
+        .await
+        .expect_err("aggregate close wakes shared-registration waiter")
+    {
+        magnetar::scalable::StreamConsumerError::Engine { message, .. } => {
+            assert!(message.contains("closed"));
+            true
+        }
+        unexpected => panic!("unexpected shared-registration waiter error: {unexpected:?}"),
+    };
+    assert!(cluster.inspect(|fake| {
+        fake.pending_operations()
+            .iter()
+            .any(|pending| pending.id == registration)
+    }));
+    cluster
+        .update(|fake| fake.complete_pending(registration, PendingCompletion::Succeed))
+        .expect("complete shared registration after aggregate close");
+    let leader_closed_after_registration_completion = match leader
+        .await
+        .expect_err("aggregate close fences shared-registration leader")
+    {
+        magnetar::scalable::StreamConsumerError::Engine { message, .. } => {
+            assert!(message.contains("closed"));
+            true
+        }
+        unexpected => panic!("unexpected shared-registration leader error: {unexpected:?}"),
+    };
+    assert_eq!(
+        client
+            .abort_transaction(transaction)
+            .await
+            .expect("abort closing shared-registration transaction"),
+        magnetar::TxnState::Aborted
+    );
+    for _ in 0..2 {
+        tokio::select! {
+            biased;
+            result = &mut close => panic!("shared-registration close completed before both child confirmations: {result:?}"),
+            () = cluster.wait_for("pending closing shared-registration child close", |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::Close)
+            }) => {}
+        }
+        let pending_close = cluster
+            .inspect(|fake| {
+                fake.pending_operations()
+                    .into_iter()
+                    .find(|pending| pending.kind == OperationKind::Close)
+                    .map(|pending| pending.id)
+            })
+            .expect("pending closing shared-registration child close id");
+        cluster
+            .update(|fake| fake.complete_pending(pending_close, PendingCompletion::Succeed))
+            .expect("complete closing shared-registration child close");
+    }
+    close.await.expect("close shared-registration aggregate");
+    cluster
+        .wait_for("closing shared-registration cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.unacked_messages == 0
+        })
+        .await;
+    let no_transactional_acks = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .all(|route| route.command != magnetar::proto::pb::base_command::Type::Ack)
+    });
+    assert!(no_transactional_acks);
+    SharedRegistrationCloseTrace {
+        one_registration,
+        no_transactional_acks,
+        waiter_closed_before_registration_completion,
+        leader_closed_after_registration_completion,
+    }
+}
+
 async fn close_during_ordinary_ack<E>(client: &PulsarClient<E>, cluster: &M1SocketCluster) -> bool
 where
     E: Engine,
@@ -5879,6 +6069,8 @@ where
         )),
     )
     .await;
+    let shared_registration_close =
+        close_wakes_shared_transaction_registration_waiter(client, cluster).await;
     AcknowledgementFailureTrace {
         partial_confirmed,
         partial_failed,
@@ -5887,6 +6079,7 @@ where
         close_during_ack_fenced,
         close_after_ack_success,
         close_after_ack_failure,
+        shared_registration_close,
         after_close: cluster.inspect(M1FakeCluster::resource_counts),
     }
 }
