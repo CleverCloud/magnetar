@@ -23,6 +23,8 @@ struct Shared {
     failure: Mutex<Option<String>>,
     sessions: Mutex<Vec<JoinHandle<()>>>,
     held_message_endpoints: Mutex<BTreeSet<Endpoint>>,
+    duplicate_message_endpoints: Mutex<BTreeSet<Endpoint>>,
+    duplicated_message_counts: Mutex<BTreeMap<Endpoint, usize>>,
     held_output_commands: Mutex<BTreeSet<(Endpoint, i32)>>,
     held_messages: Mutex<BTreeMap<magnetar_fakes::m1::ConnectionId, VecDeque<Bytes>>>,
     transaction_registration_errors: Mutex<VecDeque<BrokerFailure>>,
@@ -91,6 +93,8 @@ impl M1SocketCluster {
             failure: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             held_message_endpoints: Mutex::new(BTreeSet::new()),
+            duplicate_message_endpoints: Mutex::new(BTreeSet::new()),
+            duplicated_message_counts: Mutex::new(BTreeMap::new()),
             held_output_commands: Mutex::new(BTreeSet::new()),
             held_messages: Mutex::new(BTreeMap::new()),
             transaction_registration_errors: Mutex::new(VecDeque::new()),
@@ -193,6 +197,26 @@ impl M1SocketCluster {
     pub(crate) fn release_messages(&self, endpoint: Endpoint) {
         self.shared.held_message_endpoints.lock().remove(&endpoint);
         self.shared.output_ready.notify_waiters();
+    }
+
+    /// Duplicate one broker-generated message frame at the socket boundary.
+    /// The fake retains sole ownership of permit and acknowledgement accounting.
+    #[allow(dead_code)]
+    pub(crate) fn duplicate_next_message(&self, endpoint: Endpoint) {
+        self.shared
+            .duplicate_message_endpoints
+            .lock()
+            .insert(endpoint);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn duplicated_message_count(&self, endpoint: Endpoint) -> usize {
+        self.shared
+            .duplicated_message_counts
+            .lock()
+            .get(&endpoint)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Hold one generated response command and every frame behind it on the
@@ -369,15 +393,28 @@ fn prepare_output(
             .held_output_commands
             .lock()
             .contains(&(endpoint, frame.command.r#type));
-        if blocked
-            || (holding_messages
-                && frame.command.r#type == magnetar_proto::pb::base_command::Type::Message as i32)
-            || command_is_held
-        {
-            held.entry(connection).or_default().push_back(bytes);
-            blocked = true;
-        } else {
-            ready.push(bytes);
+        let duplicate = frame.command.r#type
+            == magnetar_proto::pb::base_command::Type::Message as i32
+            && shared.duplicate_message_endpoints.lock().remove(&endpoint);
+        if duplicate {
+            *shared
+                .duplicated_message_counts
+                .lock()
+                .entry(endpoint)
+                .or_default() += 1;
+        }
+        for _ in 0..=usize::from(duplicate) {
+            if blocked
+                || (holding_messages
+                    && frame.command.r#type
+                        == magnetar_proto::pb::base_command::Type::Message as i32)
+                || command_is_held
+            {
+                held.entry(connection).or_default().push_back(bytes.clone());
+                blocked = true;
+            } else {
+                ready.push(bytes.clone());
+            }
         }
     }
     Ok(ready)
