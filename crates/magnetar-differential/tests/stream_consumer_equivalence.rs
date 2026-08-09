@@ -116,6 +116,15 @@ struct TerminalChildTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct OverDeliveryTrace {
+    resync_reason: String,
+    phase: magnetar::proto::AggregatePhase,
+    assigned_segments: usize,
+    before_close: ResourceCounts,
+    after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AcknowledgementTrace {
     first_failure: String,
     stale_failure: String,
@@ -1282,6 +1291,156 @@ async fn run_moonpool_terminal_child_resync() -> TerminalChildTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
     let trace = observe_terminal_child_resync(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn observe_broker_over_delivery<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> OverDeliveryTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let minimum_budget = match magnetar::proto::ReceiverBudget::bytes(0) {
+        Err(magnetar::proto::BudgetError::BudgetTooSmall { minimum, .. }) => minimum,
+        result => panic!("zero receiver budget returned an unexpected result: {result:?}"),
+    };
+    let consumer = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription("over-delivery-sub")
+        .consumer_name("over-delivery-consumer")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(
+            magnetar::proto::ReceiverBudget::bytes(minimum_budget)
+                .expect("minimum aggregate budget is valid"),
+        )
+        .subscribe()
+        .await
+        .expect("subscribe over-delivery aggregate");
+    cluster
+        .wait_for("over-delivery children and sole FLOW permit", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.permits == 1
+        })
+        .await;
+
+    let mut assignment = None;
+    let mut flowing_segment = None;
+    let mut phased_segments = BTreeSet::new();
+    while assignment.is_none() || flowing_segment.is_none() || phased_segments.len() < 2 {
+        let event = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
+            .await
+            .expect("over-delivery lifecycle event timed out")
+            .expect("over-delivery lifecycle event failed")
+            .expect("over-delivery aggregate closed before initial FLOW");
+        match event {
+            StreamConsumerEvent::AssignmentApplied {
+                layout_epoch,
+                sources,
+            } => {
+                assert_eq!(layout_epoch, 1);
+                assignment = Some(
+                    sources
+                        .iter()
+                        .map(|source| source.segment_id().0)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            StreamConsumerEvent::SegmentPhaseChanged {
+                source,
+                phase: magnetar::proto::SegmentPhase::Flowing,
+            } => {
+                phased_segments.insert(source.segment_id().0);
+                flowing_segment = Some(source.segment_id().0);
+            }
+            StreamConsumerEvent::SegmentPhaseChanged { source, .. } => {
+                phased_segments.insert(source.segment_id().0);
+            }
+            unexpected => panic!("unexpected over-delivery lifecycle event: {unexpected:?}"),
+        }
+    }
+    assert_eq!(assignment, Some(vec![1, 2]));
+    assert_eq!(phased_segments, BTreeSet::from([1, 2]));
+    let flowing_segment = flowing_segment.expect("one segment entered FLOW");
+    cluster.duplicate_next_message(Endpoint::Segment(flowing_segment));
+    cluster
+        .update(|fake| {
+            fake.enqueue_message(flowing_segment, Bytes::from_static(b"broker-over-delivery"))
+        })
+        .expect("enqueue permitted over-delivery message");
+    cluster
+        .wait_for("one broker-accounted over-delivery", |fake| {
+            let counts = fake.resource_counts();
+            counts.permits == 0 && counts.unacked_messages == 1
+        })
+        .await;
+
+    let resync_reason = loop {
+        let event = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
+            .await
+            .expect("over-delivery resync event timed out")
+            .expect("over-delivery resync event failed")
+            .expect("over-delivery aggregate closed before resynchronization");
+        match event {
+            StreamConsumerEvent::ResyncRequired { reason } => break reason,
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. } => {}
+            unexpected => panic!("unexpected over-delivery event: {unexpected:?}"),
+        }
+    };
+    assert_eq!(
+        resync_reason,
+        "stream consumer failed: segment delivered without an aggregate FLOW reservation"
+    );
+    let status = consumer.status();
+    let phase = status.phase();
+    assert_eq!(phase, magnetar::proto::AggregatePhase::ResyncRequired);
+    let assigned_segments = status.assigned_segments();
+    assert_eq!(assigned_segments, 0);
+    let before_close = cluster.inspect(M1FakeCluster::resource_counts);
+    assert_eq!(
+        cluster.duplicated_message_count(Endpoint::Segment(flowing_segment)),
+        1
+    );
+    assert_eq!(before_close.unacked_messages, 1);
+
+    consumer
+        .close()
+        .await
+        .expect("close over-delivery aggregate");
+    cluster
+        .wait_for("over-delivery cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0 && counts.permits == 0 && counts.unacked_messages == 0
+        })
+        .await;
+    OverDeliveryTrace {
+        resync_reason,
+        phase,
+        assigned_segments,
+        before_close,
+        after_close: cluster.inspect(M1FakeCluster::resource_counts),
+    }
+}
+
+async fn run_tokio_broker_over_delivery() -> OverDeliveryTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_broker_over_delivery(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_broker_over_delivery() -> OverDeliveryTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_broker_over_delivery(&client, &cluster).await;
     client.close().await;
     trace
 }
@@ -2834,6 +2993,13 @@ async fn terminal_child_receive_requests_equivalent_resynchronization() {
     let tokio = run_tokio_terminal_child_resync().await;
     let moonpool = run_moonpool_terminal_child_resync().await;
     assert_eq!(tokio, moonpool, "terminal-child resync traces diverged");
+}
+
+#[tokio::test]
+async fn broker_over_delivery_requests_equivalent_resynchronization() {
+    let tokio = run_tokio_broker_over_delivery().await;
+    let moonpool = run_moonpool_broker_over_delivery().await;
+    assert_eq!(tokio, moonpool, "broker over-delivery traces diverged");
 }
 
 #[tokio::test]
