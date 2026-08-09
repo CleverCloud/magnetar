@@ -4455,6 +4455,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dag_delta_before_baseline_is_rejected() {
+        let subscriber = subscriber_with_allow_list();
+        connect_shared(&subscriber.bootstrap);
+        let mut open = Box::pin(subscriber.open_dag_session("topic://public/default/scaled"));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(open.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let (snapshot, _) = control_plane_fixture_at(2);
+        assert!(
+            subscriber
+                .bootstrap
+                .scalable_routes
+                .publish(ScalableEvent::DagUpdated {
+                    session_id: 1,
+                    delta: magnetar_proto::DagDelta {
+                        epoch: 2,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        split_events: Vec::new(),
+                        merge_events: Vec::new(),
+                    },
+                    snapshot,
+                })
+                .is_none()
+        );
+
+        assert!(matches!(
+            open.await,
+            Err(ClientError::Other(message))
+                if message.contains("unexpected scalable DAG baseline event")
+        ));
+        assert!(subscriber.bootstrap.inner.lock().dag_snapshot(1).is_none());
+    }
+
+    #[tokio::test]
     async fn cancelled_controller_setup_removes_protocol_registration() {
         let subscriber = subscriber_with_allow_list();
         connect_shared(&subscriber.bootstrap);
@@ -4505,6 +4545,7 @@ mod tests {
         let subscriber = subscriber_with_allow_list();
         connect_shared(&subscriber.bootstrap);
         let (snapshot, assignment) = control_plane_fixture();
+        let assignment_two = control_plane_fixture_at(2).1;
         let dag = DagSession {
             shared: subscriber.bootstrap.clone(),
             route: claim_dag(&subscriber.bootstrap, 41),
@@ -4554,6 +4595,22 @@ mod tests {
             subscriber
                 .bootstrap
                 .scalable_routes
+                .publish(ScalableEvent::AssignmentChanged {
+                    consumer_id: 42,
+                    incarnation: magnetar_proto::ControllerIncarnation(1),
+                    assignment: assignment_two.clone(),
+                    delta: magnetar_proto::AssignmentDelta {
+                        layout_epoch: 2,
+                        gained: Vec::new(),
+                        lost: Vec::new(),
+                    },
+                })
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .bootstrap
+                .scalable_routes
                 .publish(ScalableEvent::ConsumerAssigned {
                     consumer_id: 42,
                     incarnation: magnetar_proto::ControllerIncarnation(1),
@@ -4561,7 +4618,7 @@ mod tests {
                 })
                 .is_none()
         );
-        let reopened = task.await.expect("task").expect("reopened controller");
+        let mut reopened = task.await.expect("task").expect("reopened controller");
         assert_eq!(reopened.consumer_id(), 42);
         assert_eq!(
             reopened.incarnation(),
@@ -4570,6 +4627,41 @@ mod tests {
         assert_eq!(
             reopened.registration_topic(),
             "topic://public/default/scaled"
+        );
+        assert!(
+            subscriber
+                .bootstrap
+                .scalable_routes
+                .publish(ScalableEvent::ConsumerAssigned {
+                    consumer_id: 42,
+                    incarnation: magnetar_proto::ControllerIncarnation(1),
+                    assignment: reopened.assignment().clone(),
+                })
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .bootstrap
+                .scalable_routes
+                .publish(ScalableEvent::AssignmentChanged {
+                    consumer_id: 42,
+                    incarnation: magnetar_proto::ControllerIncarnation(1),
+                    assignment: assignment_two,
+                    delta: magnetar_proto::AssignmentDelta {
+                        layout_epoch: 2,
+                        gained: Vec::new(),
+                        lost: Vec::new(),
+                    },
+                })
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .next_assignment()
+                .await
+                .expect("post-baseline assignment")
+                .layout_epoch(),
+            2
         );
     }
 
