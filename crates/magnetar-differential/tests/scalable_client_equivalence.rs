@@ -22,6 +22,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::await_holding_lock)]
 
 #[path = "stream_consumer_support/server.rs"]
 mod server;
@@ -35,6 +36,16 @@ use magnetar_runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
 use magnetar_runtime_tokio::Client as TokioClient;
 use moonpool_core::TokioProviders;
 use server::M1SocketCluster;
+
+static SCALABLE_CLIENT_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn scalable_client_socket_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    // LLVM coverage makes these socket-heavy scenarios interfere when the test
+    // harness runs their independent Tokio runtimes concurrently.
+    SCALABLE_CLIENT_SOCKET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A normalised, engine-independent description of one scalable exchange.
 /// Compared across engines rather than the raw types, so a difference reads as
@@ -443,6 +454,7 @@ async fn drain_topics_moonpool(
 /// the resolved layout, the consumer's assignment, and the namespace-watch set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_client_surface_parity() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -491,6 +503,7 @@ async fn scalable_client_surface_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_raw_requests_leave_identical_facade_events() {
+    let _serial = scalable_client_socket_test_guard();
     let tokio_cluster = M1SocketCluster::bind().await;
     let tokio_client = connect_tokio_facade(tokio_cluster.controller_url()).await;
     let tokio_trace = observe_cancelled_raw_events(&tokio_client, &tokio_cluster).await;
@@ -542,6 +555,7 @@ async fn cancelled_raw_requests_leave_identical_facade_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_aggregates_surface_identical_facade_failures_after_client_close() {
+    let _serial = scalable_client_socket_test_guard();
     let tokio_cluster = M1SocketCluster::bind().await;
     let tokio_client = connect_tokio_facade(tokio_cluster.controller_url()).await;
     let tokio_consumer = tokio_client
@@ -634,6 +648,7 @@ async fn live_aggregates_surface_identical_facade_failures_after_client_close() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn facade_transaction_api_fences_concurrent_end_requests() {
+    let _serial = scalable_client_socket_test_guard();
     let tokio_cluster = M1SocketCluster::bind().await;
     let tokio_client =
         TokioClient::connect(tokio_cluster.controller_url(), ConnectionConfig::default())
@@ -753,6 +768,7 @@ async fn facade_transaction_api_fences_concurrent_end_requests() {
 /// both engines' event streams identically, naming what to attach and detach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_assignment_rebalance_parity() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -855,6 +871,7 @@ async fn wait_for_rebalance_moonpool(
 /// rejection and TC arms are exercised end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_rejection_and_tc_discovery_parity() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -974,6 +991,7 @@ async fn wait_for_tc_moonpool(
 /// same contract for the lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_lookup_rejection_errors_rather_than_hangs() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -1030,6 +1048,7 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
 /// is never exercised end to end — only the sans-io half is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_pushed_layout_reaches_the_client() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -1175,6 +1194,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_pushed_layout_crosses_both_facades() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -1205,6 +1225,7 @@ async fn scalable_pushed_layout_crosses_both_facades() {
 /// fallback wording — rather than an empty error string.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_lookup_rejection_without_message_still_reports() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -1249,6 +1270,7 @@ async fn scalable_lookup_rejection_without_message_still_reports() {
 /// matching topics" / "no coordinators".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_watch_refusals_reach_the_client() {
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let url = broker.pulsar_url();
     let host_port = broker.host_port();
@@ -1366,6 +1388,7 @@ async fn drain_refusals_moonpool(
 async fn scalable_subscribe_errors_when_the_connection_closes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let _serial = scalable_client_socket_test_guard();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -1493,6 +1516,7 @@ async fn spawn_hangup_broker() -> std::net::SocketAddr {
 async fn scripted_broker_tolerates_payloadless_scalable_frames() {
     use tokio::io::AsyncWriteExt;
 
+    let _serial = scalable_client_socket_test_guard();
     let broker = ScriptedBroker::bind().await.expect("broker bind");
     let mut sock = tokio::net::TcpStream::connect(broker.host_port())
         .await
@@ -1541,6 +1565,7 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 /// hang-up test caught on the `Ok(0)` side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_subscribe_errors_when_the_connection_resets() {
+    let _serial = scalable_client_socket_test_guard();
     let addr = spawn_resetting_broker().await;
     let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
         .await
