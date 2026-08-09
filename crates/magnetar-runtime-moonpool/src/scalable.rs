@@ -1795,13 +1795,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 close_error = Some(StreamConsumerError::Client(error));
             }
         }
-        let (closing, closed) = {
+        let closed = {
             let mut state = self.state.lock();
-            let closing = state.close_state.is_closing();
-            let closed = state
+            state
                 .model
-                .child_closed(source.segment_id(), child_generation);
-            (closing, closed)
+                .child_closed(source.segment_id(), child_generation)
         };
         let result = match closed {
             Ok(actions) => self.execute_actions(actions).await,
@@ -1809,7 +1807,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 magnetar_proto::StreamConsumerModelError::UnknownChild { .. }
                 | magnetar_proto::StreamConsumerModelError::StaleChildGeneration { .. },
             ) => Ok(()),
-            Err(_) if closing => Ok(()),
             Err(error) => Err(error.into()),
         };
         match close_error {
