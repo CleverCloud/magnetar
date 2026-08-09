@@ -1238,6 +1238,26 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
         .child_closed(SegmentId(1), generation)
         .expect("cancelled open closes");
 
+    let mut closing_open = model();
+    let open = closing_open
+        .apply_assignment(assignment(&[1]))
+        .expect("opening assignment before aggregate close");
+    let generation = opened_generation(&open[0]);
+    assert!(matches!(
+        closing_open
+            .close()
+            .expect("close opening aggregate")
+            .as_slice(),
+        [StreamConsumerAction::CancelOpen { .. }]
+    ));
+    assert!(
+        closing_open
+            .child_closed(SegmentId(1), generation)
+            .expect("cancelled opening child confirms aggregate close")
+            .is_empty()
+    );
+    assert_eq!(closing_open.phase(), AggregatePhase::Closed);
+
     let (mut live, generation, flow) = opened_one_child();
     assert!(matches!(
         live.child_opened(SegmentId(1), generation),
