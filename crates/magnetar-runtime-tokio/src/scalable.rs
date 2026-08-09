@@ -4708,6 +4708,24 @@ mod tests {
             assert!(state.events.is_empty());
         }
 
+        controller.assignment = assignment.clone();
+        controller.incarnation = magnetar_proto::ControllerIncarnation(2);
+        assert!(matches!(
+            inner.apply_aligned_control_plane(&dag, &controller).await,
+            Err(StreamConsumerError::Model(
+                magnetar_proto::StreamConsumerModelError::Assignment(
+                    magnetar_proto::AssignmentError::IncarnationMismatch { .. }
+                )
+            ))
+        ));
+        {
+            let state = inner.state.lock();
+            assert_eq!(state.model.dag().epoch(), 1);
+            assert!(state.events.is_empty());
+            assert!(state.children.is_empty());
+        }
+
+        controller.incarnation = magnetar_proto::ControllerIncarnation(1);
         controller.assignment = assignment;
         inner
             .apply_aligned_control_plane(&dag, &controller)
