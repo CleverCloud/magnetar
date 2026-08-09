@@ -21,7 +21,7 @@ use magnetar::scalable::{
 use magnetar::{Engine, PulsarClient, TransactionApi};
 use magnetar_fakes::m1::{
     BrokerFailure, Endpoint, FullAssignment, M1FakeCluster, M1Segment, OperationKind,
-    ResourceCounts, ScriptedBehavior,
+    PendingCompletion, ResourceCounts, ScriptedBehavior,
 };
 use stream_consumer_support::client::{
     connect_moonpool, connect_moonpool_with_keepalive,
@@ -180,6 +180,8 @@ struct PublicSurfaceTrace {
     broker_schema_lookups: usize,
     schema_prepare_failures_nacked: [bool; 2],
     schema_cancellation_restored: bool,
+    schema_cancellation_order: Vec<u64>,
+    schema_close_cancellation_fenced: bool,
     schema_restoration_failure_resynced: bool,
     decode_failure_nacked: bool,
     final_drop_fenced: bool,
@@ -2256,46 +2258,97 @@ where
         })
         .await;
     wait_for_initial_flow(&cancellation_consumer).await;
-    cluster.hold_command(
-        Endpoint::Segment(1),
-        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
-    );
     cluster
         .update(|fake| {
             fake.clear_routes();
-            fake.enqueue_message(1, Bytes::from_static(b"schema-cancellation"))
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::GetSchema,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.enqueue_message(1, Bytes::from_static(b"schema-cancellation-one"))
         })
-        .expect("enqueue schema-cancellation message");
-    let mut cancelled_receive = Box::pin(cancellation_consumer.receive());
+        .expect("enqueue first schema-cancellation message");
+    let mut first_cancelled_receive = Box::pin(cancellation_consumer.receive());
     tokio::select! {
         biased;
-        result = &mut cancelled_receive => panic!("held schema preparation completed early: {result:?}"),
-        () = cluster.wait_for("held schema preparation", |fake| {
-            fake.routes().iter().any(|route| {
-                route.endpoint == Endpoint::Segment(1)
-                    && route.command == magnetar::proto::pb::base_command::Type::GetSchema
+        result = &mut first_cancelled_receive => panic!("delayed first schema preparation completed early: {result:?}"),
+        () = cluster.wait_for("delayed first schema preparation", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::GetSchema
             })
         }) => {}
     }
-    drop(cancelled_receive);
-    cluster.release_command(
-        Endpoint::Segment(1),
-        magnetar::proto::pb::base_command::Type::GetSchemaResponse,
-    );
-    let restored_schema_message = tokio::time::timeout(
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(2),
+                OperationKind::GetSchema,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.enqueue_message(2, Bytes::from_static(b"schema-cancellation-two"))
+        })
+        .expect("enqueue second schema-cancellation message");
+    let mut second_cancelled_receive = Box::pin(cancellation_consumer.receive());
+    tokio::select! {
+        biased;
+        result = &mut second_cancelled_receive => panic!("delayed second schema preparation completed early: {result:?}"),
+        () = cluster.wait_for("delayed second schema preparation", |fake| {
+            fake.pending_operations().iter().filter(|pending| {
+                pending.kind == OperationKind::GetSchema
+            }).count() == 2
+        }) => {}
+    }
+    let delayed_schema_operations = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .filter(|pending| pending.kind == OperationKind::GetSchema)
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>()
+    });
+    drop(second_cancelled_receive);
+    drop(first_cancelled_receive);
+    for operation in delayed_schema_operations {
+        cluster
+            .update(|fake| fake.complete_pending(operation, PendingCompletion::Succeed))
+            .expect("complete cancelled schema preparation");
+    }
+    let first_restored_schema_message = tokio::time::timeout(
         magnetar_differential::HANG_GUARD,
         cancellation_consumer.receive(),
     )
     .await
-    .expect("restored schema-cancellation receive timed out")
-    .expect("restored schema-cancellation receive failed");
-    let schema_cancellation_restored = restored_schema_message.value().as_ref()
-        == b"schema-cancellation"
-        && restored_schema_message
+    .expect("first restored schema-cancellation receive timed out")
+    .expect("first restored schema-cancellation receive failed");
+    let second_restored_schema_message = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        cancellation_consumer.receive(),
+    )
+    .await
+    .expect("second restored schema-cancellation receive timed out")
+    .expect("second restored schema-cancellation receive failed");
+    let restored_schema_messages = [
+        first_restored_schema_message,
+        second_restored_schema_message,
+    ];
+    let schema_cancellation_order = restored_schema_messages
+        .iter()
+        .map(|message| message.source().segment_id().0)
+        .collect::<Vec<_>>();
+    let schema_cancellation_restored = schema_cancellation_order == [1, 2]
+        && restored_schema_messages[0].value().as_ref() == b"schema-cancellation-one"
+        && restored_schema_messages[1].value().as_ref() == b"schema-cancellation-two"
+        && restored_schema_messages[0]
             .delivery_token()
             .dequeue_sequence()
             .0
             == 0
+        && restored_schema_messages[1]
+            .delivery_token()
+            .dequeue_sequence()
+            .0
+            == 1
         && cancellation_schema.has_cached_schema()
         && cluster.inspect(|fake| {
             !fake.routes().iter().any(|route| {
@@ -2305,9 +2358,9 @@ where
         });
     assert!(schema_cancellation_restored);
     cancellation_consumer
-        .acknowledge(&restored_schema_message)
+        .acknowledge_batch(&restored_schema_messages)
         .await
-        .expect("acknowledge restored schema-cancellation message");
+        .expect("acknowledge restored schema-cancellation messages");
     cancellation_consumer
         .close()
         .await
@@ -2316,6 +2369,90 @@ where
         .wait_for("schema-cancellation cleanup", |fake| {
             let counts = fake.resource_counts();
             counts.child_consumers == 0 && counts.unacked_messages == 0
+        })
+        .await;
+
+    let close_cancellation_consumer = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(AutoConsumeSchema::new()),
+        )
+        .subscription("surface-schema-close-cancellation-sub")
+        .consumer_name("surface-schema-close-cancellation-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe schema-close-cancellation aggregate");
+    cluster
+        .wait_for("schema-close-cancellation children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&close_cancellation_consumer).await;
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::GetSchema,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.enqueue_message(1, Bytes::from_static(b"schema-close-cancellation"))
+        })
+        .expect("enqueue schema-close-cancellation message");
+    let close_cancellation_observer = close_cancellation_consumer.clone();
+    let mut close_cancelled_receive = Box::pin(close_cancellation_observer.receive());
+    tokio::select! {
+        biased;
+        result = &mut close_cancelled_receive => panic!("delayed close-cancellation schema preparation completed early: {result:?}"),
+        () = cluster.wait_for("delayed close-cancellation schema preparation", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::GetSchema
+            })
+        }) => {}
+    }
+    let delayed_close_schema = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .find(|pending| pending.kind == OperationKind::GetSchema)
+            .map(|pending| pending.id)
+            .expect("delayed close-cancellation schema operation")
+    });
+    close_cancellation_consumer
+        .close()
+        .await
+        .expect("close aggregate during schema preparation");
+    drop(close_cancelled_receive);
+    if cluster.inspect(|fake| {
+        fake.pending_operations()
+            .iter()
+            .any(|pending| pending.id == delayed_close_schema)
+    }) {
+        cluster
+            .update(|fake| fake.complete_pending(delayed_close_schema, PendingCompletion::Succeed))
+            .expect("complete schema preparation cancelled by close");
+    }
+    let schema_close_cancellation_fenced = matches!(
+        tokio::time::timeout(
+            magnetar_differential::HANG_GUARD,
+            close_cancellation_observer.receive(),
+        )
+        .await
+        .expect("post-close schema receive timed out")
+        .expect_err("closed aggregate rejects restored schema delivery"),
+        magnetar::scalable::StreamConsumerError::Engine { message, .. }
+            if message.contains("closed")
+    );
+    assert!(schema_close_cancellation_fenced);
+    cluster
+        .wait_for("schema-close-cancellation cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
         })
         .await;
 
@@ -2588,6 +2725,8 @@ where
         broker_schema_lookups,
         schema_prepare_failures_nacked,
         schema_cancellation_restored,
+        schema_cancellation_order,
+        schema_close_cancellation_fenced,
         schema_restoration_failure_resynced,
         decode_failure_nacked,
         final_drop_fenced,
