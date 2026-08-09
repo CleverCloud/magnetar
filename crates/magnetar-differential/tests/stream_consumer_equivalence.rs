@@ -1295,6 +1295,125 @@ async fn run_moonpool_terminal_child_resync() -> TerminalChildTrace {
     trace
 }
 
+async fn observe_terminal_close_failure<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> TerminalChildTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription("terminal-close-failure-sub")
+        .consumer_name("terminal-close-failure-consumer")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe terminal-close-failure aggregate");
+    cluster
+        .wait_for("terminal-close-failure children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer).await;
+    let member = cluster
+        .inspect(|fake| {
+            fake.member(
+                "terminal-close-failure-sub",
+                "terminal-close-failure-consumer",
+            )
+        })
+        .expect("terminal-close-failure member");
+    cluster
+        .update(|fake| {
+            fake.advance_layout(2, relocated_root_layout())?;
+            fake.publish_assignment_plan(2, vec![FullAssignment::new(member, [1, 2])])
+        })
+        .expect("replace descriptor behind obsolete FLOW");
+    let (_, resyncs) = wait_for_assignment(&consumer, 2, &[1, 2]).await;
+    assert!(resyncs.is_empty());
+    assert_eq!(consumer.status().draining_segments(), 1);
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(2),
+                OperationKind::Close,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "terminal child close failure",
+                )),
+            )?;
+            fake.terminate_segment(2)
+        })
+        .expect("terminate child with a rejected confirmation close");
+    assert!(
+        cluster.inspect(|fake| fake.broker_frames().iter().any(|frame| {
+            frame.command == magnetar::proto::pb::base_command::Type::ReachedEndOfTopic
+        }))
+    );
+
+    let resync_reason = loop {
+        let event = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
+            .await
+            .expect("terminal-close-failure event timed out")
+            .expect("terminal-close-failure event failed")
+            .expect("terminal-close-failure aggregate closed before resynchronization");
+        match event {
+            StreamConsumerEvent::ResyncRequired { reason } => break reason,
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. } => {}
+            unexpected => panic!("unexpected terminal-close-failure event: {unexpected:?}"),
+        }
+    };
+    assert!(
+        resync_reason.contains("terminal child close failure"),
+        "unexpected terminal close-failure reason: {resync_reason}"
+    );
+    let status = consumer.status();
+    let phase = status.phase();
+    assert_eq!(phase, magnetar::proto::AggregatePhase::ResyncRequired);
+    let assigned_segments = status.assigned_segments();
+    assert_eq!(assigned_segments, 0);
+
+    consumer
+        .close()
+        .await
+        .expect("close terminal-close-failure aggregate");
+    cluster
+        .wait_for("terminal-close-failure cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0 && counts.pending_operations == 0 && counts.permits == 0
+        })
+        .await;
+    TerminalChildTrace {
+        resync_reason,
+        phase,
+        assigned_segments,
+    }
+}
+
+async fn run_tokio_terminal_close_failure() -> TerminalChildTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_close_failure(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_terminal_close_failure() -> TerminalChildTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
+    let trace = observe_terminal_close_failure(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_broker_over_delivery<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -2993,6 +3112,13 @@ async fn terminal_child_receive_requests_equivalent_resynchronization() {
     let tokio = run_tokio_terminal_child_resync().await;
     let moonpool = run_moonpool_terminal_child_resync().await;
     assert_eq!(tokio, moonpool, "terminal-child resync traces diverged");
+}
+
+#[tokio::test]
+async fn terminal_child_close_failure_requests_equivalent_resynchronization() {
+    let tokio = run_tokio_terminal_close_failure().await;
+    let moonpool = run_moonpool_terminal_close_failure().await;
+    assert_eq!(tokio, moonpool, "terminal close-failure traces diverged");
 }
 
 #[tokio::test]
