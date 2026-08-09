@@ -4486,6 +4486,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_aggregate_rejects_new_child_work() {
+        let (inner, _child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("attached child")
+            .clone();
+        let stop_flow = magnetar_proto::StreamConsumerAction::StopFlow {
+            source: child.source.clone(),
+            controller_incarnation: magnetar_proto::ControllerIncarnation(1),
+            child_generation: child.generation,
+        };
+        inner.state.lock().close_state = AggregateCloseState::Closing;
+
+        inner.spawn_open_task(
+            child.source.clone(),
+            magnetar_proto::ControllerIncarnation(1),
+            child.generation,
+        );
+        inner.spawn_child_task(child.source, child.generation, child.consumer);
+        inner.spawn_actions(vec![stop_flow]);
+
+        let state = inner.state.lock();
+        assert_eq!(state.open_tasks, 0);
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.children.len(), 1);
+    }
+
+    #[tokio::test]
     async fn parked_route_is_woken_after_connection_replacement() {
         let shared = shared();
         let route = claim_dag(&shared, 18);
