@@ -64,6 +64,7 @@ Contributors with a FIPS toolchain installed locally can substitute `--all-featu
 The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** in one local command.
 Per ADR-0098, per-PR CI executes the same surface as one non-e2e matrix cell and four e2e cells so they run concurrently and each stays below the 180-minute ceiling.
 The e2e cells derive their inventory from the sorted `e2e_*.rs` filenames, and only the cell containing `e2e_replicated_subscriptions` starts the PIP-33 fixture.
+The cell containing `e2e_scalable_topic` builds `magnetarctl` before that target because its CLI round-trip test consumes the companion binary and target-specific Cargo test commands do not build other workspace packages.
 
 ## Unit tests
 

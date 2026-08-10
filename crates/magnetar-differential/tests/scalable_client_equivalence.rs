@@ -580,9 +580,9 @@ async fn scalable_pushed_layout_reaches_the_client() {
             HANG_GUARD,
             TokioClient::connect(&url, ConnectionConfig::default()),
         )
-            .await
-            .expect("tokio pushed-layout connect returned rather than hanging")
-            .expect("tokio connect");
+        .await
+        .expect("tokio pushed-layout connect returned rather than hanging")
+        .expect("tokio connect");
         tokio::time::timeout(
             HANG_GUARD,
             client.scalable_topic_lookup("topic://public/default/scaled-split"),

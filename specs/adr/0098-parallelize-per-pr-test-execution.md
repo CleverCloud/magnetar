@@ -22,6 +22,7 @@ Keep ADR-0046's test semantics and split only the CI execution topology.
 4. Every cell retains `--all-features`, `--locked`, normal libtest execution, failure output, and the 180-minute hard timeout.
 5. The local validation contract remains `cargo test --workspace --all-features --locked`; no Cargo feature, `#[ignore]`, retry, or widened test timeout is introduced.
 6. The six previously unbounded connect, lookup, and subscribe waits in `scalable_pushed_layout_reaches_the_client` use the existing one-minute `HANG_GUARD`, so a recurrence names the blocked engine and operation instead of consuming the whole CI budget.
+7. Before `e2e_scalable_topic`, its shard explicitly builds the `magnetarctl` companion binary with all features because target-specific `cargo test` no longer builds binaries from other workspace packages as the aggregate workspace command did.
 
 The shard inventory is fail-closed without a second maintained list: the shell glob is the inventory, every matching path receives exactly one numeric assignment, and a shard that selects no targets fails.
 A newly added `e2e_*.rs` target therefore runs automatically.
@@ -38,6 +39,7 @@ A newly added `e2e_*.rs` target therefore runs automatically.
 **Negative**
 
 - Four e2e runners compile the all-features façade independently, increasing total billed runner minutes in exchange for lower wall-clock latency and isolation.
+- The shard containing `e2e_scalable_topic` also compiles `magnetarctl`, preserving the CLI round-trip prerequisite that the former workspace-wide build supplied implicitly.
 - A failure in shared setup can appear in more than one cell.
 
 **Neutral**

@@ -238,6 +238,9 @@ jobs:
             fi
             selected=$((selected + 1))
             echo "::group::$target"
+            if [ "$target" = e2e_scalable_topic ]; then
+              cargo build -p magnetarctl --all-features --locked
+            fi
             cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
             echo "::endgroup::"
           done
