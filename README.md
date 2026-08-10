@@ -798,7 +798,7 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`).
+End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`); per-PR CI parallelizes that surface into one non-e2e cell and four e2e cells (ADR-0098).
 Docker is the only prerequisite; the suite spins `pulsar:4.0.4` via `testcontainers-rs`.
 
 Additional `xtask` checks specific to the sans-io invariants:

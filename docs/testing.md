@@ -61,7 +61,9 @@ cargo test -p magnetar --tests
 Contributors with a FIPS toolchain installed locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 `cargo run -p xtask -- check-crypto-matrix` is the authoritative per-provider sweep regardless.
 
-The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** (ADR-0046 folded the former opt-in `e2e` job into the regular `test` job).
+The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** in one local command.
+Per ADR-0098, per-PR CI executes the same surface as one non-e2e matrix cell and four e2e cells so they run concurrently and each stays below the 180-minute ceiling.
+The e2e cells derive their inventory from the sorted `e2e_*.rs` filenames, and only the cell containing `e2e_replicated_subscriptions` starts the PIP-33 fixture.
 
 ## Unit tests
 
@@ -134,6 +136,7 @@ Notable equivalence suites:
 
 Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite carries **no feature flag and no `#[ignore]`** — every `cargo test` invocation that activates the workspace runs the e2e tests.
 Contributors without Docker on the host should run unit / integration / moonpool tests crate-by-crate (`-p magnetar-proto`, `-p magnetar-runtime-tokio`, `-p magnetar-runtime-moonpool`, `-p magnetar-differential`) which never touch the network boundary.
+The CI sharding in [ADR-0098](../specs/adr/0098-parallelize-per-pr-test-execution.md) changes execution topology only; it does not make e2e optional or alter the local command.
 
 ```bash
 # Full validation chain (runs e2e automatically when Docker is present).
