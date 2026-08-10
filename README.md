@@ -768,6 +768,7 @@ The bulk of the parity matrix above ships on `main`, including:
 - **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
 - **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips — [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).
 - **Daily 128-random-seed moonpool sweep** ([ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md)).
+- **Swarm-tested simulation configurations** — each seed runs a derived subset of buggify labels + workload operations, with a reserved inclusive slice ([ADR-0097](specs/adr/0097-swarm-testing-sim-configurations.md)).
 - **Anti-thrash supervised reconnect policy** (opt-in, [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
 Known open work is narrow and tracked in [`docs/follow-ups.md`](docs/follow-ups.md).
@@ -797,7 +798,7 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`).
+End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`); per-PR CI parallelizes that surface into one non-e2e cell and four e2e cells (ADR-0098).
 Docker is the only prerequisite; the suite spins `pulsar:4.0.4` via `testcontainers-rs`.
 
 Additional `xtask` checks specific to the sans-io invariants:

@@ -34,9 +34,10 @@ scalable-topics  = []
 # behaviour with zero runtime overhead. Enabling the feature turns each
 # label into a seed-controlled RNG roll routed through the engine's
 # `RandomProvider` (sans-io: the proto layer never reaches for the host
-# RNG; the engine plugs a closure in via `Connection::set_buggify_rng`
-# and `Backoff::install_buggify`). Tests opt in via the moonpool
-# integration suite.
+# RNG; the engine plugs a closure in via `Connection::set_buggify`
+# and `Backoff::install_buggify`, per-label filtered through
+# `Buggify::with_rng_and_filter` under ADR-0097 swarm configurations).
+# Tests opt in via the moonpool integration suite.
 buggify          = []
 
 [dependencies]

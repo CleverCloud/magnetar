@@ -61,7 +61,10 @@ cargo test -p magnetar --tests
 Contributors with a FIPS toolchain installed locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 `cargo run -p xtask -- check-crypto-matrix` is the authoritative per-provider sweep regardless.
 
-The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** (ADR-0046 folded the former opt-in `e2e` job into the regular `test` job).
+The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** in one local command.
+Per ADR-0098, per-PR CI executes the same surface as one non-e2e matrix cell and four e2e cells so they run concurrently and each stays below the 180-minute ceiling.
+The e2e cells derive their inventory from the sorted `e2e_*.rs` filenames, and only the cell containing `e2e_replicated_subscriptions` starts the PIP-33 fixture.
+The cell containing `e2e_scalable_topic` builds `magnetarctl` before that target because its CLI round-trip test consumes the companion binary and target-specific Cargo test commands do not build other workspace packages.
 
 ## Unit tests
 
@@ -103,6 +106,14 @@ The pack targets the supervised reconnect path, PIP-121 + PIP-188 reconnection f
 The supervised reconnect body (anti-thrash cooldown + multi-attempt redial) is exercised by [`supervised_redial.rs`](../crates/magnetar-runtime-moonpool/tests/supervised_redial.rs) — a `SimProviders` drop → accept → drop → accept fixture paired 1:1 with the real-loopback tokio mirror [`crates/magnetar-runtime-tokio/tests/supervised_redial.rs`](../crates/magnetar-runtime-tokio/tests/supervised_redial.rs).
 See [`moonpool-engine.md#deterministic-chaos-pack`](moonpool-engine.md#deterministic-chaos-pack) for the per-scenario breakdown.
 
+### Swarm configurations (ADR-0097)
+
+Each `sim_chaos.rs` produce/consume iteration derives a `SwarmConfig` from its seed — a pure splitmix64 hash over `moonpool_sim::current_sim_seed()` that consumes no RNG stream — and runs a subset of the optional campaign features: the four [ADR-0048](../specs/adr/0048-buggify-fault-injection.md) buggify labels (armed per-label through `Buggify::with_rng_and_filter` and the `ConnectionConfig.buggify` engine-arming slot, which only the moonpool engine honours) plus the optional workload operations `op.client_ack` and `op.client_close`, each drawn at 50% inclusion.
+1 in 4 seeds runs the inclusive `full()` configuration, an all-off draw collapses to `full()`, and the sub-seed-pinning regression tests force the recorded `baseline()` shape so their trajectories stay byte-identical.
+The canonical config line — seed, slot, labels, operations, effective weights, knowingly-vacuous invariants — prints before the workload runs and is embedded in every gate and invariant failure message, so a failing seed reproduces from `MOONPOOL_SEED` alone.
+Purity and campaign composition are pinned by [`swarm_config.rs`](../crates/magnetar-runtime-moonpool/tests/swarm_config.rs); the production engine's indifference to the whole surface is pinned by the tokio twin [`swarm_off_is_nop.rs`](../crates/magnetar-runtime-tokio/tests/swarm_off_is_nop.rs).
+See [ADR-0097](../specs/adr/0097-swarm-testing-sim-configurations.md).
+
 ## Differential equivalence
 
 Lives in [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/).
@@ -126,6 +137,7 @@ Notable equivalence suites:
 
 Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite carries **no feature flag and no `#[ignore]`** — every `cargo test` invocation that activates the workspace runs the e2e tests.
 Contributors without Docker on the host should run unit / integration / moonpool tests crate-by-crate (`-p magnetar-proto`, `-p magnetar-runtime-tokio`, `-p magnetar-runtime-moonpool`, `-p magnetar-differential`) which never touch the network boundary.
+The CI sharding in [ADR-0098](../specs/adr/0098-parallelize-per-pr-test-execution.md) changes execution topology only; it does not make e2e optional or alter the local command.
 
 ```bash
 # Full validation chain (runs e2e automatically when Docker is present).

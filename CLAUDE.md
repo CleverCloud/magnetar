@@ -169,8 +169,8 @@ cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container ca
 cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # patch coverage on diff over the 6 crates the sim run compiles; ENFORCING — an uncovered added line fails (ADR-0024, ADR-0088, ADR-0090, ADR-0092)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo run -p xtask -- check-known-failing-seeds # replay every open registry seed — the local mirror of CI's per-PR `seed-replay` job (ADR-0047 §5, landed by ADR-0097)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
-# (known-failing seed replay runs in CI via the per-PR `seed-replay` job; ADR-0047)
 ```
 
 Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).
