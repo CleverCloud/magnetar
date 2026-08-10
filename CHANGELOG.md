@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-10
+
+### Added
+
+- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
+  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
+  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
+  An assignment whose `layout_epoch` does not advance is rejected rather than applied: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
+  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
+  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
+  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
+  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
+  (ADR-0093 §D5)
+
 ### Changed
 
 - **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.** The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
@@ -16,6 +30,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Surface changes, all behind the default-off `scalable-topics` feature: `SegmentDescriptor::broker_url` becomes `Option<String>` and the type gains `broker_url_tls`, `parent_ids`, `child_ids`, `created_at_epoch`, `sealed_at_epoch` and `legacy_topic_name`; `SegmentState` loses `Splitting` and `Merging`; `DagDelta` gains `epoch`; `SplitEvent` / `MergeEvent` lose their `*_at_entry` fields; `DagError` swaps `UnknownSegment` for `Broker` and `Empty`; `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS` and the whole `pb::scalable_topics` module are removed; `Connection::{send_scalable_topic_lookup, open_dag_watch, close_dag_watch}` become `{open_scalable_topic_session, close_scalable_topic_session}`; and every `watch_session_id` field is now `session_id`.
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
+
+### Removed
+
+- **Five uncalled scalable-topic accessors are removed** (behind the default-off `scalable-topics` feature).
+  `DagWatchSession::{session_id, epoch}`, `ScalableConsumerSession::consumer_id` and `ScalableTopicsWatch::{watch_id, is_resolved}` had no caller in either engine, the façade or the CLI — their only uses were assertions written to observe them, and publishing API whose sole consumer is a test that asserts it exists is not worth the surface on a module already marked experimental.
+  `ScalableTopicsWatch`'s backing `resolved` field goes with its getter.
+  `DagWatchSession::is_resolved` is kept, because `conn.rs` genuinely branches on it to tell a session's first layout from a pushed one.
+  The tests assert the observable contract instead: an unresolved watch has an empty matching set, and the delta carries the epoch it moved to.
+  They were also the bulk of what `check-sim-coverage` flagged on CI while reporting clean locally, since a trivial getter's coverage counter survives or vanishes with inlining decisions that differ between build environments.
+  (8e2cbd9, a58a5f8)
 
 ### Fixed
 
@@ -42,6 +66,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   All four now cover the duplicate.
   (ADR-0095, amending ADR-0093 § D2)
 
+- **A rejected scalable-topic lookup now returns an error instead of parking the caller until the connection closes.** `scalable_topic_lookup` drained only `LookupResolved` for its own session id, so a broker that refuses the session — topic not found, authorization — ended it as `DagWatchClosed`, which the loop never matched.
+  Both engines now race the two outcomes, which is the contract the sibling `scalable_topic_subscribe` always had.
+  `MergeEvent::parent_segment_ids` is sorted rather than carried in the broker's wire order: nothing in the `.proto` requires `parent_ids` to be sorted, so two engines observing the same merge could build `MergeEvent`s that compare unequal.
+  Both are behind the default-off `scalable-topics` feature.
+  (cross-review findings on #391; be1b876)
+
 - **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.** The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
   `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
   The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
@@ -51,17 +81,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Toolchain skew and stale object files were both tested and refuted first.
   (ADR-0094)
 
-### Added
-
-- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
-  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
-  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
-  An assignment whose `layout_epoch` does not advance is rejected rather than applied: the broker recomputes assignments per layout, so acting on an out-of-order push would attach the consumer to segments that no longer exist.
-  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
-  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
-  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
-  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
-  (ADR-0093 §D5)
+- **The PIP-33 two-cluster test fixture now actually initializes cluster metadata.** `pulsar-init`'s `command:` was a YAML folded scalar whose continuation lines sat at a deeper indent than its first content line, so their newlines survived folding and `bash -c` received a twelve-line script: `initialize-cluster-metadata` ran with no options at all and each `--flag` line ran as its own command, while a trailing `|| true` turned that into `Exited (0)` and satisfied the downstream `service_completed_successfully` conditions.
+  The fixture had only ever worked because the post-up `configure_replicated_subs.sh` registers both clusters itself, so a local `docker compose up -d` alone left the replicated-subscription tests with nothing to replicate.
+  Every service `command:` is now an exec-form list over a literal block scalar, which has no folding semantics; the two bookkeeper services' `A && B || true && C` precedence bug no longer swallows a failing `apply-config-from-env.py`; `pulsar-init` gains the `PULSAR_MEM` cap every other service in the fixture already carried; and both workflows assert that both clusters are registered before `configure_replicated_subs.sh` runs, with a bounded 30-attempt retry so a healthy-but-not-yet-warm broker is not read as a missing cluster.
+  (issue #389; 9c231f7, cfff6cd)
 
 ## [1.3.0] - 2026-08-03
 
@@ -467,6 +490,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.4.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.0
 [1.3.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.3.0
 [1.2.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.3
 [1.2.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.2
