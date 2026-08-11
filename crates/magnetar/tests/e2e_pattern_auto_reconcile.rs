@@ -22,72 +22,24 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::InitialPosition;
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 async fn start_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        // The test pattern uses a UUID suffix that pushes the regex past the
-        // broker's default `subscriptionPatternMaxLength=50` limit. Bump it
-        // via PULSAR_PREFIX_; the image's CMD is `sh` (no entrypoint that
-        // wires the env-config helper), so we apply it explicitly before
-        // launching the broker.
-        .with_env_var("PULSAR_PREFIX_subscriptionPatternMaxLength", "200")
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
-                 conf/standalone.conf && bin/pulsar standalone"
-                .to_owned(),
-        ])
+    // The test pattern uses a UUID suffix that pushes the regex past the
+    // broker's default `subscriptionPatternMaxLength=50` limit, so raise it.
+    let broker = Pulsar::new(Broker::Default)
+        .config("subscriptionPatternMaxLength", "200")
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+    Ok(broker.into_parts())
 }
 
 /// Reconciler ticker rediscovers topics created *after* the [`PatternConsumer`]

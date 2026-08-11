@@ -1,6 +1,6 @@
 # ADR-0046 — e2e tests are casual: no feature flag, no `#[ignore]`
 
-- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); the weekly two-cluster gate is retained. The rest of this ADR stands.
+- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); §5's single-job CI topology superseded by [ADR-0098](0098-parallelize-per-pr-test-execution.md). The no-feature-gate and no-`#[ignore]` decisions stand.
 - **Date**: 2026-06-01
 - **Decider**: Florentin Dubois
 - **Tags**: testing, ci, process, agents

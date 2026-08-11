@@ -6,7 +6,7 @@ Each entry lists the gap, the reason it stays open, and (where actionable) a `/g
 For the public-facing parity status, see the [parity matrix in the README](../README.md#java-client-parity-matrix).
 
 This file is the **single source of truth** for what is intentionally deferred or blocked.
-Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
+Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
 When a PR closes an item, the entry is **removed** (git log + the ADR / docs file carry the post-implementation reference); partially-closed items are trimmed to their remaining open residual.
 
@@ -20,9 +20,25 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                                    | Status                 |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| 16  | [PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts](#16-pip-460-upstream-assignment-lifecycle-dag-ordering-and-proxy-contracts) | 🔗 blocked on upstream |
+| #   | Item                                                                                                                                                     | Status                   |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                           | ⚡ ready to dispatch     |
+| 12  | [PIP-460 remaining GA wire and API gaps](#12-pip-460-remaining-ga-wire-and-api-gaps)                                                                         | ⚡ ready to dispatch     |
+| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)                     | ⚡ ready to dispatch     |
+| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)                 | ⚡ ready to dispatch     |
+| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered)           | 🟡 deferred              |
+| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                           | 🟡 deferred              |
+| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                 | 🧠 needs design decision |
+| 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection) | 🧠 needs design decision |
+| 20  | [No deadline on a pending `ProducerOpen` / `Subscribe` request](#20-no-deadline-on-a-pending-produceropen--subscribe-request)                            | ⚡ ready to dispatch     |
+| 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
+| 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                       | 🟡 deferred              |
+| 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                   | ⚡ ready to dispatch     |
+| 24  | [A Reader started inside a batch re-delivers the members before it](#24-a-reader-started-inside-a-batch-re-delivers-the-members-before-it)               | ⚡ ready to dispatch     |
+| 25  | [`permit_balance` cannot go negative](#25-permit_balance-cannot-go-negative)                                                                             | 🟡 deferred              |
+| 26  | [`receive_batch` inner pops do not wake the driver](#26-receive_batch-inner-pops-do-not-wake-the-driver)                                                 | ⚡ ready to dispatch     |
+| 27  | [An undecodable batched entry is dropped without an ack](#27-an-undecodable-batched-entry-is-dropped-without-an-ack)                                     | 🧠 needs design decision |
+| 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                          | 🧠 needs design decision |
 
 ---
 
@@ -35,12 +51,157 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 3. The broker's assignment barrier gates active direct children but does not establish the complete PIP-460 ordering contract for sealed intermediate segments, deep DAGs, merge, or cursor rewind ([apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274)).
 4. Proxy-any-broker controller registration appears to select an arbitrary broker even though scalable consumer registration is leader-only, and the upstream proxy e2e exercises `QueueConsumer`, which never sends that command ([apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275)).
 
-**Interim Magnetar contract.** [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) fences callbacks with a local connection incarnation, defaults to a strict barrier where local ownership history can prove every ancestor complete, reports cross-member ancestry as unprovable, documents pooled close as local-only, reuses the already-authenticated direct bootstrap when M1 has not published a controller URL, and fails closed when a published controller authority cannot be routed directly or registration arrives through a proxy target.
-An explicit broker-managed compatibility mode may rely on M1 for ancestry owned by another member, but it does not claim the stronger local ordering guarantee.
-It does not invent protocol fields or claim those local mechanisms settle the distributed contract.
+**Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same layout session `StreamConsumer` wraps, with one difference: `lookup_scalable_topic` is read-only (`create_if_missing = false`), so it never creates a missing topic, whereas `scalable_stream_consumer` sends `true`. No façade API sends `true` until this item is fixed. `crates/magnetar/tests/e2e_scalable_topic.rs` uses the read-only lookup and pre-creates its topics.
 
-**Why it stays open.** Closing these gaps requires an authoritative upstream answer, tests, and potentially a released Pulsar wire change.
-If a response requires new fields or commands, Magnetar updates its vendored proto only from a tagged upstream revision under ADR-0026 §D4; no hand-maintained projection is acceptable after the failure recorded by ADR-0093.
+## 12. PIP-460 remaining GA wire and API gaps
+
+**Status.** Assignment-driven `StreamConsumer` fan-out, ordinary segment children, aggregate flow control, delivery tracking, acknowledgements, transactions, seek, resynchronization, and close semantics are implemented by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md). The following independent GA capabilities remain unimplemented; the feature stays experimental and default-off.
+
+- **`CommandScalableTopicUnsubscribe`** (`BaseCommand` type 82, acknowledged by `CommandSuccess`) is not sent. It is the clean leave of a scalable consumer: the controller deletes the registration and rebalances at once instead of after the disconnect grace period. GA handles type 82 and treats unknown consumer IDs as idempotent success; Magnetar must issue it after in-flight registration settles. An inbound type-82 frame is currently skipped without an error.
+- **PIP-486 entry bucketing is ignored.** A topic a 5.0.0 broker creates already carries `entryBucketSplits=[16384,32768,49152]` (measured 2026-10-12), so this is the common case. `ScalableAssignedSegment.bucket_ranges` is not yet applied by the aggregate. A non-empty list means the segment is shared by entry bucket, so a consumer must use the broker-required Key_Shared sticky subscription and declare the matching bucket ranges instead of taking whole-segment Exclusive ownership. `MessageMetadata.entry_hash_min` / `entry_hash_max` are set only by scalable-topic producers, and `SegmentInfoProto.entry_bucket_splits` configures their bucket layout; a scalable producer would have to stamp and honour them. Consumer assignment ranges are carried separately in `ScalableAssignedSegment.bucket_ranges`.
+- **A namespace (multi-topic) consumer passes `create_if_missing = false`** to `open_scalable_topic_session` on its per-topic lookups, as the Java v5 client does (`MultiTopicQueueConsumer.java:169` at `v5.0.0`), so a reconnecting watch cannot resurrect a deleted topic. The namespace consumer surface does not exist yet.
+
+## 14. `check-sim-coverage` can report over artifacts it did not build
+
+**Gap.** [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) split the gate into an execution step and a re-export step with **different scopes**.
+Execution passes `-p magnetar-runtime-moonpool -p magnetar-differential`, and `cargo llvm-cov`'s `-p` also selects which packages get _cleaned_.
+The report then covers all six of `SIM_COVERAGE_REPORT_PACKAGES`, so `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-auth-athenz` and `magnetar-auth-sasl` are re-exported from object files no step in the current pass is guaranteed to have produced.
+CI compounds it: `Swatinem/rust-cache@v2` in the `check-sim-coverage` job runs unconfigured, so it archives `target/` — including `target/llvm-cov-target`, which its workspace-artifact pruning does not know about.
+
+**Why it stays open.** It was investigated as the suspected cause of the PR #391 false red and **refuted**: `cargo llvm-cov clean --workspace` followed by a cold `CARGO_INCREMENTAL=0` run reproduced the failing report exactly (81 `SF:` records, `DA:271,0`).
+The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
+So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
+
+**Demonstrated since, outside this tree (2026-10-13).** In a two-crate workspace, a coverage run over crate `a`'s own tests followed by an edit to `a` and a gate-shaped pass (execute `-p b`, re-export `-p a -p b`) reported `a`'s **old** line mapping onto the new source: the stale `a` test binary was walked first and `llvm-cov` keeps the first record per function, so the current one was discarded.
+That is a wrong report, not just a stale one; on `magnetar` the same shape needs an earlier coverage run of `magnetar-proto` or `magnetar-runtime-tokio`'s own tests in the same target directory.
+
+**A second, separate cause of record-less gated files is closed.** In a default incremental build at `rustc 1.99.0`, a new `magnetar-runtime-tokio` module the sim binaries never call into lost all its records because the linker dropped its codegen unit, and the gate printed it as advisory `not gated` where a `CARGO_INCREMENTAL=0` build failed it; [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md)'s 2026-10-13 amendment pins one codegen unit per crate, so a record-less file in a crate that did report now has no instrumented function at all.
+
+**Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
+Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
+
+## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
+
+**Observed.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bounded-cancellable-driver-write.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
+
+**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so its 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. A paused-clock test on a single thread should be deterministic, and this one is not: it depends on host load.
+
+**Hypothesis, not conclusion — clock-domain mismatch.** The driver computes its write deadline on the **real** clock: `use std::time::Instant` (`driver.rs:51`), `write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout)` (`driver.rs:1394`), `deadline.saturating_duration_since(Instant::now())` (`driver.rs:1682`). `tokio::time::pause()` advances tokio's timer clock; it does not advance `std::time::Instant`. So the harness measures its margin in virtual time while the code under test measures its deadline in real time, and the two can be raced against each other by host load. That is consistent with every observation above and it is what should be investigated first.
+
+It is **not proven**. This entry previously asserted "a real thread, a `spawn_blocking`, or a lock held across an await"; none of those was verified, and the mixed clock domains are a better-supported explanation. Whoever picks this up should confirm the mechanism before fixing it, not inherit this paragraph as fact.
+
+**Measured 2026-08-04**, on `feat/pip-460-upstream-wire`:
+
+| condition                                                                                                    | result         |
+| ------------------------------------------------------------------------------------------------------------ | -------------- |
+| inside `cargo test --workspace --all-features` while a full instrumented coverage rebuild saturated 16 cores | FAILED         |
+| 3 isolated runs, load average still ~13                                                                      | 1 FAILED, 2 ok |
+| 30 isolated runs of the test binary at idle                                                                  | 0/30 failed    |
+
+**Ancestry: inferred, not measured.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin, and the three deadline lines above are byte-identical to `origin/main`; every change `feat/pip-460-upstream-wire` makes to `driver.rs` is a `#[cfg(feature = "scalable-topics")]` addition. So both the test and the suspected mechanism predate that branch. It has **not** been reproduced on `origin/main` under equivalent load, which is what would actually establish "pre-existing" — until someone does that, this is a well-supported inference and no more. CI has not reproduced it on either branch.
+
+**Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
+
+**Do not** fix this by widening the 90-second margin. The margin is virtual; widening it makes the race less likely to be observed without changing anything real, which is the failure mode [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) and the `lookup_error_propagation` correction both exist to avoid.
+
+## 16. The batched `deliver` loop counts dead-lettered members as delivered
+
+**Gap.** `ConsumerState::deliver`'s batched branch increments its own `delivered` counter after every `classify_and_queue` call, including for a member the dead-letter branch routed to `dead_letter_pending` rather than to the queue.
+The branch then returns `DeliverOutcome::Delivered { count: delivered }`, so `count` over-reports by the number of dead-lettered members.
+`conn.rs`'s `Message` arm reads `count` as "the number of newly delivered tail entries" and clones `queue[queue_len - count ..]` to emit one `ConnectionEvent::Message` per entry, so an over-reported count makes it re-emit observational events for OLDER queued entries it already announced.
+
+**Why it stays open.** It is adjacent to [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md) and read-verified, but it changes event emission rather than flow accounting, so it wants its own test layers and its own line in the compatibility story — an application counting `ConnectionEvent::Message` sees a behaviour change.
+The permit ledger is unaffected either way: `record_dispatch_unit` and the dead-letter refund are per-member and do not read `delivered`.
+
+## 17. The PIP-33 marker branch returns before `maybe_flow`
+
+**Gap.** `conn.rs`'s `Message` arm filters a replicated-subscription marker, calls `consumer.record_marker_consumed()` — which credits `consumed_since_flow` — and returns from the arm before reaching the `consumer.maybe_flow()` call the ordinary delivery path makes.
+A marker-only stream therefore accrues refunds it never emits: the grant waits for the next non-marker frame, or for a `pop_message` that a stream carrying no user messages never gets.
+
+**Why it stays open.** The accounting is correct (the ledger holds the credit, nothing is lost) and the practical window is a replicated subscription with no user traffic at all, so the cost is latency to the next grant rather than a wedge.
+Closing it means deciding whether the marker path should emit its own flow or whether the keepalive sweep should drain the ledger, which is a small design call and the ADR-0024 five layers.
+
+## 18. `dead_letter_pending` is unbounded and never auto-drained
+
+**Gap.** `ConsumerState::dead_letter_pending` is a plain `Vec<IncomingMessage>` with no cap, and every caller that empties it is user-driven (`Consumer::drain_dead_letter`, `Consumer::republish_dead_letters` and the aggregate wrappers).
+Before [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md) the missing flow refund was an accidental bound: the subscription wedged once a receiver queue's worth of poison had accumulated, so the buffer stopped growing.
+With the refund in place a poison-heavy topic keeps dispatching and the buffer grows until the application drains it.
+
+**Why it stays open.** Needs a product decision, and the Java client offers no precedent: it has no client-side dead-letter buffer at all, it republishes to the DLQ topic and acks inside `messageReceived`.
+The options are not equivalent — cap and drop (loses messages the application asked to see), cap and stop refunding (reintroduces the wedge deliberately, with a documented contract), or auto-republish when a producer is configured (changes what `dead_letter_policy` means).
+There is a residual bound today regardless: a dead-lettered unit stays unacked at the broker until `republish_dead_letters` acks it, so an application that never drains eventually stops at `maxUnackedMessagesPerConsumer`.
+
+## 19. Re-home an established producer or consumer to another broker connection
+
+**Gap.** [ADR-0106](../specs/adr/0106-reattach-broker-closed-producer-in-place.md) re-attaches a broker-closed producer on the connection it is already pinned to, and issue #307 does the same for a consumer.
+Neither can follow the bundle to a different broker.
+When the `CommandCloseProducer` / `CommandCloseConsumer` carries an `assigned_broker_service_url` naming another broker, or when the retry leg's lookup answers `Redirected`, the in-place re-attach fails: `lookup_then` terminalizes the handle and the application must re-create it.
+Java re-homes instead — `ConnectionHandler.grabCnx(hostUrl)` dials the assigned host, or performs a fresh lookup and takes whatever connection it resolves to.
+
+**Why it stays open.** No proto or pool primitive exists for it.
+A `Producer` / `Consumer` holds one `Arc<ConnectionShared>` for its lifetime (the engines' `open_producer` / `subscribe` capture it at creation), so re-homing means moving a live handle between two `Connection` state machines — including its pending publishes, its permit mirrors and its registered wakers.
+That is an architectural decision with its own ADR, not an amendment to ADR-0106.
+The current behaviour is a bounded terminal error rather than a silent hang, which is the part that mattered for issue #451.
+
+The consumer arm's own `assigned_broker_service_url = Some(url)` branch belongs to the same decision: it still diverts to the supervised reconnect, and ADR-0106 deliberately did not transfer the producer-side argument to it without separate evidence.
+
+## 20. No deadline on a pending `ProducerOpen` / `Subscribe` request
+
+**Gap.** `Connection::handle_timeout` sweeps only `PendingRequestKind::Ack`.
+A `CommandProducer` or `CommandSubscribe` the broker never answers leaves the slot at `broker_ready = false` (or the consumer's flow gate armed) with `open_request_id = Some(_)` forever.
+That reproduces the issue #451 symptom exactly — every publish resolves `code=-1 send timeout` — and it additionally makes every LATER broker close ineligible for an in-place re-attach, because `open_request_id.is_some()` is a refusal.
+
+**Why it stays open.** It is shared by every re-attach path — the ADR-0080 retry leg, the reconnect rebuilds, the issue #307 consumer re-subscribe and ADR-0106's producer re-attach — so it belongs to the request-deadline surface as a whole, not to any one of them.
+Java covers it with `operationTimeout` applied to every pending request; the equivalent here is a per-kind deadline on `pending_requests` plus the terminalization each kind already has.
+
+## 22. Memory reservations of publishes the broker will never answer
+
+**Gap.** Since [ADR-0111](../specs/adr/0111-share-one-memory-limit-controller-per-client.md) a publish holds its bytes against the client-wide `memory_limit` until its op leaves the pending queue, so an op the broker will never answer holds budget for EVERY producer of the client until something fails it.
+Two known cases: batched sends already flushed but unacknowledged when the broker closes the producer and it re-attaches in place ([ADR-0106](../specs/adr/0106-reattach-broker-closed-producer-in-place.md)) — their per-message ops carry empty `replay_frames`, so `ProducerState::replay_pending_outbound` never re-sends them — and the sends of a producer whose `CommandCloseProducer` the broker rejected.
+The default 30 s `send_timeout` fails and releases them; with `send_timeout: None` they are held for the life of the client.
+
+**Why it stays open.** The ops themselves predate ADR-0111 (their futures already hung or timed out); only the budget they hold is new.
+Closing it means failing un-replayable batched ops on an in-place re-attach the way `Connection::reset` already does on a reconnect, and deciding what a rejected close leaves pending — each with the ADR-0024 five layers.
+
+## 23. Dropped send futures leave their outcome behind
+
+**Gap.** When an op resolves — receipt, send error, send timeout, terminal failure, and since ADR-0111 the acknowledgement of its producer's close — `Connection` records an `OpOutcome` under its `PendingOpKey::Send` unconditionally.
+If the caller already dropped its `SendFut`, nothing ever takes that entry, so every fire-and-forget send leaves one permanent `outcomes` entry: the issue #241 leak shape, which the request paths already guard with "record only while a waker is parked".
+
+**Why it stays open.** It predates ADR-0111 on the receipt path, and the fix crosses both engines: the `Send` arms need the same waker-presence guard, and a `SendFut` dropped between the wake and its next poll must still find its outcome, so the guard and the future's `Drop` have to agree on who removes the entry.
+
+## 24. A Reader started inside a batch re-delivers the members before it
+
+**Gap.** A Reader opened at a start message id that points inside a batched entry receives the whole entry, members `0..k-1` included.
+Java skips those members and refunds their permits (`ConsumerImpl.java` around `:1318-1324` and `:1874-1875`).
+
+**Why it stays open.** Recorded by [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) as a follow-up; it is a Reader semantics change with its own test layers.
+
+## 25. `permit_balance` cannot go negative
+
+**Gap.** `ConsumerState::permit_balance` is a `u32` decremented with `saturating_sub`, so the negative balance a broker reaches after a forced whole-entry dispatch reads as `0` on the client.
+
+**Why it stays open.** The refund ledger, not the balance, drives `maybe_flow`, so this only blurs the starvation signal; widening the field is an API change on a public field.
+
+## 26. `receive_batch` inner pops do not wake the driver
+
+**Gap.** The tokio `Consumer::receive_batch_with_bytes_cap` pops every message after the first under the connection lock without calling `driver_waker.notify_one()`, so a `CommandFlow` one of those pops queues waits for the driver's next wake instead of leaving at once.
+
+**Why it stays open.** Latency rather than a wedge — any later wake flushes it — and found while fixing issue #860, outside its scope.
+
+## 27. An undecodable batched entry is dropped without an ack
+
+**Gap.** Since [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) a batched entry no layout can decode is refunded and logged, but never acknowledged, so a durable subscription's mark-delete position stays behind it.
+Java's `discardCorruptedMessage` acknowledges such an entry with a validation error.
+
+**Why it stays open.** Acknowledging deletes data a fixed client could still read, so whether to follow Java is a product decision.
+
+## 28. Batched + encrypted messages are not Java-compatible
+
+**Gap.** Producer side: Java encrypts the whole compressed batch body once and stamps the keys on the batch metadata; `ProducerState::flush_batch` builds the batch's `MessageMetadata` fresh, so since [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) an encrypted message is never batched at all — an encrypting producer with batching enabled sends one entry per message.
+Consumer side: a Java batched + encrypted entry has to be decrypted as one body, then decompressed, then split; `ConsumerState::deliver` cannot decrypt — the decryptor lives in the engine, after the pop — so such an entry is undecodable and is dropped and refunded with one `warn!`.
+
+**Why it stays open.** Both halves are a wire change of their own: the encryptor has to run over the batch body inside `flush_batch`, and the decryptor has to reach `deliver` (or the split has to move after the engine's decrypt step).
 
 ## Notes on this file
 
@@ -51,5 +212,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the wire surface Apache Pulsar actually ships (vendored from 5.0.0-M1) and fleshed out the e2e against a real broker; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §11 and §12 with [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md), §14 with [ADR-0096](../specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md), and §15 with [ADR-0097](../specs/adr/0097-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
+§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the upstream wire surface and added real-broker e2e coverage; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §12 was partially closed by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), §14 by [ADR-0118](../specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md), and §15 by [ADR-0119](../specs/adr/0119-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

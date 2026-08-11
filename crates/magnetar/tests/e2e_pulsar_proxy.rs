@@ -5,11 +5,11 @@
 //!
 //! Spins up:
 //!
-//! 1. `apachepulsar/pulsar:latest` in **standalone** mode (embedded Zookeeper on `2181`, broker
-//!    binary on `6650`, admin REST on `8080`).
-//! 2. `apachepulsar/pulsar:latest` in **proxy** mode, pointed at the standalone container's
-//!    Zookeeper via `--zookeeper-servers <standalone-host>:<mapped-zk-port>` and serving the proxy
-//!    binary protocol on a random host port.
+//! 1. The shared fixture's default Pulsar image (`common/pulsar.rs`, ADR-0115) in **standalone**
+//!    mode (embedded Zookeeper on `2181`, broker binary on `6650`, admin REST on `8080`).
+//! 2. The same image in **proxy** mode, pointed at the standalone container's Zookeeper via
+//!    `--zookeeper-servers <standalone-host>:<mapped-zk-port>` and serving the proxy binary
+//!    protocol on a random host port.
 //!
 //! The client connects to the **proxy** address, opens a producer, sends
 //! a payload, then opens a consumer and reads it back. The whole
@@ -27,53 +27,28 @@
 //! are started — a standalone broker (~30 s startup), and a proxy
 //! (~10 s startup once the broker is healthy). The proxy needs network
 //! reachability back to the standalone's mapped Zookeeper port. On
-//! Linux the test uses the standalone container's bridge IP
-//! (`get_bridge_ip_address`) so the proxy can reach Zookeeper directly.
-//! Falls back to `host.docker.internal` when the bridge IP is
-//! unavailable (Docker Desktop on macOS / Windows).
+//! Linux the operator supplies the routable Docker bridge gateway through
+//! `MAGNETAR_E2E_DOCKER_HOST_GATEWAY`; Docker Desktop may use
+//! `host.docker.internal`. The proxy uses the standalone's `standalone`
+//! cluster name, required by its OpenTelemetry initialization. The standalone
+//! explicitly enables `ZooKeeper` so the proxy can use the exposed metadata port.
 
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const STANDALONE_BINARY_PORT: u16 = 6650;
-const STANDALONE_ZK_PORT: u16 = 2181;
-const STANDALONE_HTTP_PORT: u16 = 8080;
-const PROXY_BINARY_PORT: u16 = 6650;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
+use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, init_tracing};
 
 /// Start the Pulsar standalone container and return its host-mapped binary
 /// port, admin port, zk port, plus the container handle (drop = stop).
+///
+/// The standalone keeps its metadata in `ZooKeeper` (`PULSAR_STANDALONE_USE_ZOOKEEPER`)
+/// and advertises its own container address, so the proxy can reach the metadata
+/// store and follow the broker's lookup answers over the bridge network.
 async fn start_standalone() -> Result<
     (
         String,                                       /* service_url (host:port for binary
@@ -84,23 +59,15 @@ async fn start_standalone() -> Result<
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(STANDALONE_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(STANDALONE_HTTP_PORT))
-        .with_exposed_port(ContainerPort::Tcp(STANDALONE_ZK_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
+    let broker = Pulsar::new(Broker::Default)
+        .zookeeper_metadata()
+        .advertise_container_address()
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(STANDALONE_BINARY_PORT).await?;
-    let zk_port = container.get_host_port_ipv4(STANDALONE_ZK_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    Ok((service_url, zk_port, container))
+    let zookeeper_port = broker
+        .zookeeper_port
+        .ok_or("the fixture published no ZooKeeper port")?;
+    Ok((broker.service_url, zookeeper_port, broker.container))
 }
 
 /// Start the Pulsar proxy pointed at the standalone's Zookeeper. Returns
@@ -117,28 +84,18 @@ async fn start_proxy(
 > {
     let zk_servers = format!("{zk_host}:{zk_port}");
     // The Apache Pulsar Proxy reads its config from env vars when run with
-    // `bin/apply-config-from-env.py conf/proxy.conf`. We point
-    // `zookeeperServers` at the standalone container's bridge address and
-    // start the proxy.
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(PROXY_BINARY_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Started ProxyService at"))
-        .with_startup_timeout(Duration::from_mins(1))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_env_var("PULSAR_PREFIX_zookeeperServers", &zk_servers)
-        .with_env_var("PULSAR_PREFIX_configurationStoreServers", &zk_servers)
-        .with_env_var("PULSAR_PREFIX_servicePort", PROXY_BINARY_PORT.to_string())
-        .with_cmd(vec![
-            "bash".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env.py conf/proxy.conf && bin/pulsar proxy".to_owned(),
-        ])
-        .start()
+    // `bin/apply-config-from-env.py conf/proxy.conf`, which the shared fixture
+    // does for a proxy. We point `zookeeperServers` at the standalone container's
+    // bridge address and start the proxy.
+    let proxy = Pulsar::new(Broker::Default)
+        .config("clusterName", "standalone")
+        .config("zookeeperServers", &zk_servers)
+        .config("configurationStoreServers", &zk_servers)
+        // The fixture publishes and maps the proxy on the broker binary port.
+        .config("servicePort", BROKER_BINARY_PORT.to_string())
+        .start_proxy()
         .await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(PROXY_BINARY_PORT).await?;
-    let url = format!("pulsar://{host}:{port}");
-    Ok((url, container))
+    Ok((proxy.service_url, proxy.container))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

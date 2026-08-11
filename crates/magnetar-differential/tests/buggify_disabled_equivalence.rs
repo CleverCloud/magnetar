@@ -73,3 +73,48 @@ fn buggify_default_disabled_is_byte_identical_across_engines() {
         assert_eq!(moonpool_conn.buggify().fire_count(label), 0);
     }
 }
+
+/// ADR-0097 — an armed helper whose per-label filter rejects every
+/// label is observationally identical to `Buggify::disabled` across
+/// BOTH engines. The moonpool engine honours the `ConnectionConfig`
+/// buggify slot (so its helper reports armed under the `buggify`
+/// feature) while the tokio engine ignores the slot entirely — an
+/// intended asymmetry in wiring — yet the user-visible contract is
+/// byte-identical: no label ever fires, no counter ever moves, and no
+/// RNG is ever consumed (the filter short-circuits before the roll).
+#[test]
+fn buggify_all_labels_filtered_matches_disabled_across_engines() {
+    use std::sync::Arc;
+    let hostile = || magnetar_proto::ConnectionConfig {
+        buggify: magnetar_proto::Buggify::with_rng_and_filter(
+            Arc::new(|| 0_u64) as Arc<dyn Fn() -> u64 + Send + Sync>,
+            Arc::new(|_label: &'static str| false)
+                as Arc<dyn Fn(&'static str) -> bool + Send + Sync>,
+        ),
+        ..ConnectionConfig::default()
+    };
+    let tokio_shared = magnetar_runtime_tokio::ConnectionShared::new(hostile());
+    let moonpool_shared = magnetar_runtime_moonpool::ConnectionShared::new(hostile());
+
+    let tokio_conn = tokio_shared.inner.lock();
+    let moonpool_conn = moonpool_shared.inner.lock();
+
+    for label in [
+        labels::CONNECTION_RESET_DELAY,
+        labels::BATCH_CONTAINER_FLUSH_SPLIT,
+        labels::HANDLE_BYTES_SHORT_READ,
+        labels::RETRY_CLOCK_SKEW,
+    ] {
+        for p in [0.05_f64, 0.5, 0.95, 1.0] {
+            let tokio_fire = tokio_conn.buggify().should_fire(label, p);
+            let moonpool_fire = moonpool_conn.buggify().should_fire(label, p);
+            assert_eq!(
+                tokio_fire, moonpool_fire,
+                "engines diverged on filtered {label}@p={p}"
+            );
+            assert!(!tokio_fire, "filtered label {label} fired at p={p}");
+        }
+        assert_eq!(tokio_conn.buggify().fire_count(label), 0);
+        assert_eq!(moonpool_conn.buggify().fire_count(label), 0);
+    }
+}

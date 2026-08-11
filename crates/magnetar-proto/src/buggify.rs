@@ -52,6 +52,16 @@ use std::sync::Arc;
 #[cfg(feature = "buggify")]
 pub type BuggifyRng = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// Engine-supplied per-label enablement filter used by [`Buggify`] when
+/// the `buggify` feature is enabled (ADR-0097 swarm configurations).
+/// The closure receives the choice-point label and returns `true` when
+/// the label is armed for this run. A filtered-out label short-circuits
+/// [`Buggify::should_fire`] to `false` BEFORE the RNG is consulted —
+/// the same no-roll contract as the `p <= 0.0` fast path — so the
+/// enabled labels' roll sequence is a pure function of (seed, filter).
+#[cfg(feature = "buggify")]
+pub type BuggifyFilter = Arc<dyn Fn(&'static str) -> bool + Send + Sync>;
+
 /// FoundationDB-style buggify helper. Holds the engine-supplied RNG
 /// handle (under the `buggify` feature) and exposes a single
 /// [`Self::should_fire`] entry that every choice point in the
@@ -69,6 +79,8 @@ pub struct Buggify {
 #[cfg(feature = "buggify")]
 struct BuggifyInner {
     rng: BuggifyRng,
+    /// `None` = every label armed (the pre-ADR-0097 all-or-nothing shape).
+    filter: Option<BuggifyFilter>,
     counts: parking_lot::Mutex<std::collections::HashMap<&'static str, u64>>,
 }
 
@@ -120,9 +132,39 @@ impl Buggify {
         Self {
             inner: Some(Arc::new(BuggifyInner {
                 rng,
+                filter: None,
                 counts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             })),
         }
+    }
+
+    /// Construct a buggify helper backed by `rng` with a per-label
+    /// enablement `filter` (ADR-0097 swarm configurations). A label the
+    /// filter rejects never fires and never consumes the RNG — the
+    /// short-circuit happens before the roll, exactly like the
+    /// `p <= 0.0` fast path — so the armed labels' roll sequence is
+    /// deterministic per (seed, filter) and a run's replay identity
+    /// stays `MOONPOOL_SEED` alone once the filter is itself derived
+    /// from the seed.
+    #[cfg(feature = "buggify")]
+    #[must_use]
+    pub fn with_rng_and_filter(rng: BuggifyRng, filter: BuggifyFilter) -> Self {
+        Self {
+            inner: Some(Arc::new(BuggifyInner {
+                rng,
+                filter: Some(filter),
+                counts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            })),
+        }
+    }
+
+    /// Stub of [`Self::with_rng_and_filter`] for the no-feature build
+    /// path. Consumes both closures to keep one call shape on both
+    /// feature axes; the result is the zero-sized disabled helper.
+    #[cfg(not(feature = "buggify"))]
+    #[must_use]
+    pub fn with_rng_and_filter<R, F>(_rng: R, _filter: F) -> Self {
+        Self::default()
     }
 
     /// Stub for the no-feature build path. Consumes `_rng` to keep the
@@ -148,6 +190,14 @@ impl Buggify {
         let Some(inner) = self.inner.as_ref() else {
             return false;
         };
+        // ADR-0097 per-label filter: a disarmed label neither fires nor
+        // rolls, so the armed labels' RNG sequence is independent of how
+        // many disarmed call sites execute in between.
+        if let Some(filter) = inner.filter.as_ref()
+            && !filter(label)
+        {
+            return false;
+        }
         let p = probability.clamp(0.0, 1.0);
         if p <= 0.0 {
             return false;
@@ -411,5 +461,59 @@ mod tests {
             pattern.iter().any(|hit| *hit),
             "p=0.5 sweep should land at least one fire"
         );
+    }
+
+    /// ADR-0097: a filtered-out label never fires and NEVER consumes the
+    /// RNG — the roll count proves the short-circuit sits before the
+    /// draw, which is what keeps the armed labels' roll sequence
+    /// independent of disarmed call sites executing in between.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn filtered_label_neither_fires_nor_rolls() {
+        let draws = std::sync::Arc::new(parking_lot::Mutex::new(0_u64));
+        let draws_handle = draws.clone();
+        let b = Buggify::with_rng_and_filter(
+            std::sync::Arc::new(move || {
+                *draws_handle.lock() += 1;
+                0_u64 // would fire at any non-zero probability
+            }),
+            std::sync::Arc::new(|label: &'static str| label == labels::RETRY_CLOCK_SKEW),
+        );
+        assert!(b.is_armed());
+        // Disarmed labels: no fire, no roll — even at p = 1.0.
+        assert!(!b.should_fire(labels::CONNECTION_RESET_DELAY, 1.0));
+        assert!(!b.should_fire(labels::BATCH_CONTAINER_FLUSH_SPLIT, 1.0));
+        assert!(!b.should_fire(labels::HANDLE_BYTES_SHORT_READ, 0.05));
+        assert_eq!(*draws.lock(), 0, "disarmed labels must not consume RNG");
+        assert_eq!(b.fire_count(labels::CONNECTION_RESET_DELAY), 0);
+        // The armed label still rolls and fires (rng returns 0 → roll 0.0 < p).
+        assert!(b.should_fire(labels::RETRY_CLOCK_SKEW, 0.05));
+        assert_eq!(*draws.lock(), 1, "armed label rolls exactly once");
+        assert_eq!(b.fire_count(labels::RETRY_CLOCK_SKEW), 1);
+    }
+
+    /// ADR-0097: an armed helper whose filter rejects every label is
+    /// observationally identical to [`Buggify::disabled`] — the shape
+    /// the differential layer pins end-to-end in
+    /// `buggify_disabled_equivalence.rs`.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn all_labels_filtered_matches_disabled() {
+        let b = Buggify::with_rng_and_filter(
+            std::sync::Arc::new(|| 0_u64),
+            std::sync::Arc::new(|_label: &'static str| false),
+        );
+        for label in [
+            labels::CONNECTION_RESET_DELAY,
+            labels::BATCH_CONTAINER_FLUSH_SPLIT,
+            labels::HANDLE_BYTES_SHORT_READ,
+            labels::RETRY_CLOCK_SKEW,
+        ] {
+            assert!(!b.should_fire(label, 1.0));
+            assert_eq!(b.fire_count(label), 0);
+        }
+        // Distinction from `disabled()`: the helper still reports armed —
+        // the filter is a per-label gate, not a global kill switch.
+        assert!(b.is_armed());
     }
 }

@@ -8,15 +8,20 @@
 //! 1:1 by index. The harness then byte-compares the two event streams
 //! produced by the tokio and moonpool runners.
 //!
-//! Op surface is intentionally tight: `Send`, `Recv`, `Ack`, `Nack`,
-//! `Seek`, `Close`, last-clone producer/consumer drops, plus
+//! Op surface is intentionally tight: `Send`, `SendBatch`, `Recv`, `Ack`,
+//! `Nack`, `Seek`, `Close`, last-clone producer/consumer drops, plus
 //! partition-aware siblings `SendPartition`, `RecvPartition`,
-//! `AckPartition`, `SeekPartition` for the partitioned-topic traces.
+//! `AckPartition`, `SeekPartition` for the partitioned-topic traces, and the
+//! `…Shared` family (`OpenSharedConsumer`, `RecvShared`, `AckShared`,
+//! `AckLastReceivedShared`, `NackShared`, `DrainDeadLettersShared`,
+//! `CloseSharedConsumer`, `ResubscribeShared`) for the
+//! Shared-subscription traces.
 //! Extend it as new differential coverage lands; keep every variant
 //! **observable** so the equivalence check stays meaningful.
 
 use std::time::Duration;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use magnetar_proto::MessageId;
 
 /// A single operation in a [`Trace`].
@@ -28,6 +33,47 @@ pub enum Op {
     Send {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
+    },
+    /// Issue #436: publish ONE broker entry carrying `payloads.len()` packed
+    /// messages — a batched entry, the shape the wedge needs.
+    ///
+    /// The runner frames the body with [`pack_batch_body`] and stamps
+    /// `MessageMetadata.num_messages_in_batch`, exactly as a producer with
+    /// batching enabled would; the scripted broker stores what it is told and
+    /// echoes it back on dispatch. The whole batch is ONE ledger entry, so it
+    /// resolves to ONE [`Event::Sent`] and the consumer explodes it back into
+    /// `payloads.len()` messages with `batch_index` `0..n`.
+    ///
+    /// The point is that "one entry" and "one message" stop being the same
+    /// thing: a redelivery, a permit, and a mark-delete all address the ENTRY,
+    /// while an ack addresses a position inside it.
+    SendBatch {
+        /// Raw payload bytes of each packed message, in batch-index order.
+        payloads: Vec<Vec<u8>>,
+    },
+    /// Issue #860 review (send order): publish `payloads` through a SECOND producer on
+    /// [`Trace::topic`] that batches, with a batch byte cap of `max_batch_bytes` and a 10 ms
+    /// publish delay. Every send is enqueued before any is awaited, so a payload that does not
+    /// fit the pending batch meets it there — the wire must still carry the payloads in send
+    /// order. Resolves to ONE [`Event::SentAll`].
+    SendThroughBatchingProducer {
+        /// Raw payload bytes, in send order.
+        payloads: Vec<Vec<u8>>,
+        /// `CreateProducerRequest::max_batch_size_bytes` of the batching producer.
+        max_batch_bytes: usize,
+    },
+    /// Issue #860: publish ONE batched entry whose body is COMPRESSED with `codec`, laid out
+    /// as `layout` says. The runner builds the publish with [`compressed_batch_message`] — the
+    /// same bytes on both legs — through a producer that compresses nothing itself, so what
+    /// reaches the broker is exactly the hand-built body under the batch-level `compression`
+    /// and `uncompressed_size` stamps, which the scripted broker echoes back on dispatch.
+    SendCompressedBatch {
+        /// Raw payload bytes of each packed message, in batch-index order.
+        payloads: Vec<Vec<u8>>,
+        /// Codec stamped on the batch and used to build its body.
+        codec: magnetar_proto::types::CompressionKind,
+        /// How the compressed body is laid out.
+        layout: BatchLayout,
     },
     /// Receive one message with the given timeout. The harness waits
     /// up to `timeout` for a message to arrive on the consumer's
@@ -153,6 +199,123 @@ pub enum Op {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
     },
+    /// Issue #406 / ADR-0100: open an ADDITIONAL producer on
+    /// [`Trace::topic`] under an explicit `producer_name`, bounded by the
+    /// runner's `operation_timeout`, and drop it immediately. The point is
+    /// the open's outcome, not the handle: a name the broker still holds
+    /// answers `ProducerBusy`, and an open whose `CommandProducerSuccess` is
+    /// withheld past the deadline is abandoned — which is exactly when the
+    /// engine must push a `CommandCloseProducer` so the next open under the
+    /// same name succeeds. Pair with
+    /// [`crate::broker::ScriptedBroker::withhold_first_producer_success_for_name`].
+    OpenNamedProducer {
+        /// Producer name to pin on `CommandProducer.producer_name`.
+        name: String,
+    },
+    /// Issue #414: open an ADDITIONAL `SubType::Shared` consumer on
+    /// [`Trace::topic`] / [`Trace::subscription`] under a harness-local
+    /// `name`, held for the rest of the trace. Every Shared consumer joins the
+    /// scripted broker's ONE dispatcher for that `(topic, subscription)` — one
+    /// cursor, round-robin over whoever holds permits — so a churn scenario
+    /// (open two, drain a little, detach one mid-stream) is representable.
+    ///
+    /// `receiver_queue_size` is deliberately caller-supplied and small: a
+    /// one-permit window makes the round-robin hand-off deterministic across
+    /// both engines instead of letting whichever consumer subscribed first
+    /// swallow the whole backlog.
+    OpenSharedConsumer {
+        /// Harness-local name for later `…Shared` ops. Not a Pulsar
+        /// `consumer_name`.
+        name: String,
+        /// Receiver-queue size for this consumer (its initial permit grant).
+        receiver_queue_size: usize,
+        /// Issue #437: `SubscribeRequest::max_redeliver_count`. A dispatch whose
+        /// `redelivery_count` exceeds this routes to the consumer's dead-letter
+        /// pending list instead of the receiver queue. `0` — the value every
+        /// pre-#437 trace passes — disables the dead-letter branch entirely and
+        /// leaves the subscribe frame byte-identical.
+        max_redeliver_count: u32,
+    },
+    /// Issue #414: receive from the named Shared consumer.
+    RecvShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// How long to wait before surfacing [`Event::RecvTimeout`].
+        timeout: Duration,
+    },
+    /// Issue #414: individually acknowledge a message id on the named Shared
+    /// consumer, which also retires it from that consumer's broker-side
+    /// in-flight set (so a later detach does not redeliver it).
+    AckShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// Target message id.
+        message_id: MessageId,
+    },
+    /// Issue #436: acknowledge whatever the named Shared consumer received LAST,
+    /// unless this trace has already acknowledged that exact id — the shape a
+    /// real application has, and the one the wedge needs.
+    ///
+    /// [`Self::AckShared`] names an id the trace author picked in advance, which
+    /// silently assumes the consumer delivered it. An application cannot make
+    /// that assumption: it acknowledges what it was handed, and it does not
+    /// acknowledge the same message twice. That difference is the whole
+    /// scenario. A consumer that re-delivers positions the application already
+    /// acknowledged hands it nothing to ack, so the positions that genuinely
+    /// still owe an ack are never reached — issue #436's "the application is
+    /// acking" (`acks_sent` tracking `msgs_received` bar the unacked gap) while
+    /// one entry never completes.
+    ///
+    /// Resolves to [`Event::Acked`] when an acknowledgement went to the broker
+    /// and [`Event::AckSkippedDuplicate`] when the id was already acknowledged.
+    AckLastReceivedShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
+    /// Issue #437: negatively acknowledge a message id on the named Shared
+    /// consumer, handing the entry back to that subscription's dispatcher so the
+    /// broker re-dispatches it with an incremented `redelivery_count`.
+    ///
+    /// [`Self::Nack`] targets the trace's default single consumer, which is a
+    /// different subscription shape — the dead-letter threshold only takes effect
+    /// on a re-dispatch the Shared dispatcher stamps, so the wedge needs this one.
+    /// Resolves to [`Event::Nacked`], fire-and-forget at the engine surface.
+    NackShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// Target message id.
+        message_id: MessageId,
+    },
+    /// Issue #437: drain the named Shared consumer's dead-letter pending list —
+    /// what an application does before republishing to its DLQ topic.
+    ///
+    /// Resolves to [`Event::DeadLettersDrained`] carrying the number of messages
+    /// taken, so a trace can assert that an over-redelivered entry was routed to
+    /// the buffer rather than the receiver queue.
+    DrainDeadLettersShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
+    /// Issue #414: close the named Shared consumer — the mid-drain detach. Its
+    /// un-acked in-flight entries go back to the subscription's redelivery pool
+    /// and the survivors pick them up.
+    CloseSharedConsumer {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
+    /// Issue #414: call `Consumer::resubscribe()` on the named Shared consumer —
+    /// the caller-driven in-place recovery.
+    ///
+    /// The call only stages the `CommandSubscribe` and wakes the driver, so the
+    /// event says whether the engine accepted it, not whether the grant landed.
+    /// That the grant DID land is proved by the trace instead: publish after the
+    /// recovery and receive it, which is impossible without a re-armed permit.
+    /// A consumer that has already been closed is refused, identically on both
+    /// engines.
+    ResubscribeShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
     /// PIP-31: acknowledge a single message id against the currently-
     /// open transaction id (set by the most recent [`Self::NewTxn`]).
     /// The scripted broker stages the ack against the per-txn ledger
@@ -166,6 +329,28 @@ pub enum Op {
     },
 }
 
+/// The per-consumer subscribe knobs an [`Op::OpenSharedConsumer`] carries,
+/// folded into ONE runner parameter.
+///
+/// Both runners' `open_shared_consumer` already takes the client, the
+/// harness-local consumer map, the name, the topic, the subscription and the
+/// invocation-wide ack timeout; issue #437's `max_redeliver_count` would have
+/// been the eighth scalar and `clippy::too_many_arguments` (7) is denied
+/// workspace-wide. Grouping the two window knobs keeps the signature under the
+/// limit without an `#[allow]`, and keeps the tokio and moonpool runners
+/// identical on this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedConsumerWindow {
+    /// Receiver-queue size for this consumer (its initial permit grant).
+    pub receiver_queue_size: usize,
+    /// Issue #437: `SubscribeRequest::max_redeliver_count`. A dispatch whose
+    /// `redelivery_count` exceeds this routes to the consumer's dead-letter
+    /// pending list instead of the receiver queue. `0` — the value every
+    /// pre-#437 trace passes — disables the dead-letter branch entirely and
+    /// leaves the subscribe frame byte-identical.
+    pub max_redeliver_count: u32,
+}
+
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`
 /// resolves to `EventStream::events[i]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +359,12 @@ pub enum Event {
     Sent {
         /// Sequence id the engine surfaced on success.
         message_id: MessageId,
+    },
+    /// [`Op::SendThroughBatchingProducer`] resolved: one outcome per payload, in send order —
+    /// the broker-assigned id, or the error bucket [`Event::SendError`] would carry.
+    SentAll {
+        /// Per-payload outcomes.
+        outcomes: Vec<Result<MessageId, String>>,
     },
     /// `Send` failed at the engine surface (e.g. closed connection).
     SendError {
@@ -200,6 +391,12 @@ pub enum Event {
         /// Stable error category string.
         kind: String,
     },
+    /// [`Op::AckLastReceivedShared`] found the last received id already
+    /// acknowledged by this trace and sent nothing. Issue #436: an application
+    /// that is handed a message it already acknowledged has no ack to send, so
+    /// the redelivery buys the subscription no progress at all — this event is
+    /// where that shows up in the stream.
+    AckSkippedDuplicate,
     /// `Nack` was enqueued (fire-and-forget at the engine surface).
     /// The redelivery itself surfaces as a follow-up [`Event::Received`].
     Nacked,
@@ -307,6 +504,46 @@ pub enum Event {
         /// Stable error category string.
         kind: String,
     },
+    /// [`Op::OpenSharedConsumer`] resolved: the broker acked the subscribe and
+    /// the engine armed the initial flow. `permits` is the balance read back
+    /// through `Consumer::available_permits()` — issue #414 re-pointed that
+    /// accessor at the client-accounted decrementing balance, so both engines must report
+    /// the same value here and it must equal the receiver-queue size before any
+    /// dispatch lands.
+    SharedConsumerOpened {
+        /// Client-accounted unspent permits right after the initial flow, not broker admin stats.
+        permits: u32,
+    },
+    /// [`Op::DrainDeadLettersShared`] resolved: `count` messages were taken off the
+    /// named consumer's dead-letter pending list. Issue #437: a dead-lettered unit
+    /// lands here instead of the receiver queue, and the permit the broker spent on
+    /// it is refunded at that moment.
+    DeadLettersDrained {
+        /// Number of messages the drain removed.
+        count: usize,
+    },
+    /// [`Op::CloseSharedConsumer`] resolved: the broker acked the close and the
+    /// consumer detached from its Shared dispatcher.
+    SharedConsumerClosed,
+    /// [`Op::ResubscribeShared`] was accepted: the engine staged a fresh
+    /// `CommandSubscribe` for the same consumer id and woke the driver.
+    SharedConsumerResubscribed,
+    /// [`Op::ResubscribeShared`] was refused because the consumer is not
+    /// eligible for an in-place re-attach (closed, unsubscribing, terminal,
+    /// mid-seek, or already re-attaching).
+    SharedConsumerResubscribeError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// [`Op::OpenNamedProducer`] resolved: the broker acked the pinned name.
+    NamedProducerOpened,
+    /// [`Op::OpenNamedProducer`] failed. Same `kind` collapse as
+    /// [`Event::SendError`] — `timeout` when the open outlived the
+    /// operation deadline, `broker:16` when the name was still held.
+    NamedProducerOpenError {
+        /// Stable error category string.
+        kind: String,
+    },
 }
 
 /// A scripted sequence of [`Op`]s the harness replays against an
@@ -373,6 +610,113 @@ impl Default for EventStream {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Issue #860: how [`Op::SendCompressedBatch`] lays out a compressed batched entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchLayout {
+    /// Java `BatchMessageContainerImpl`: the packed body compressed ONCE, `uncompressed_size`
+    /// its packed length — what a Java producer writes, and magnetar's since ADR-0112.
+    Java,
+    /// magnetar ≤ 1.7.2: every payload compressed on its own, the packed body left raw, and
+    /// `uncompressed_size` the sum of the COMPRESSED member sizes.
+    Legacy,
+    /// Bytes that decode in neither layout under the codec stamp — the entry ADR-0112 drops
+    /// and refunds.
+    Undecodable,
+}
+
+/// Build [`Op::SendCompressedBatch`]'s publish: `payloads` packed with [`pack_batch_body`],
+/// compressed with `codec` as `layout` says, and stamped with `num_messages_in_batch`, the
+/// batch-level `compression` and (through [`OutgoingMessage::uncompressed_size`], which the
+/// producer copies onto the metadata) `uncompressed_size`.
+///
+/// [`OutgoingMessage::uncompressed_size`]: magnetar_proto::producer::OutgoingMessage::uncompressed_size
+#[must_use]
+pub fn compressed_batch_message(
+    payloads: &[Vec<u8>],
+    codec: magnetar_proto::types::CompressionKind,
+    layout: BatchLayout,
+) -> magnetar_proto::producer::OutgoingMessage {
+    use magnetar_proto::compress::compress;
+    let packed = pack_batch_body(payloads);
+    let (body, uncompressed_size) = match layout {
+        BatchLayout::Java => (compress(codec, &packed).unwrap_or_default(), packed.len()),
+        BatchLayout::Legacy => {
+            let members: Vec<Vec<u8>> = payloads
+                .iter()
+                .map(|p| compress(codec, p).map(|m| m.to_vec()).unwrap_or_default())
+                .collect();
+            let total = members.iter().map(Vec::len).sum();
+            (pack_batch_body(&members), total)
+        }
+        BatchLayout::Undecodable => (Bytes::from(vec![0xA5u8; 64]), packed.len()),
+    };
+    let num_messages = i32::try_from(payloads.len()).unwrap_or(i32::MAX);
+    magnetar_proto::producer::OutgoingMessage {
+        payload: body,
+        metadata: magnetar_proto::pb::MessageMetadata {
+            num_messages_in_batch: Some(num_messages),
+            compression: Some(codec.to_pb() as i32),
+            ..Default::default()
+        },
+        uncompressed_size: u32::try_from(uncompressed_size).unwrap_or(u32::MAX),
+        num_messages,
+        txn_id: None,
+        source_message_id: None,
+    }
+}
+
+/// The batching producer [`Op::SendThroughBatchingProducer`] opens on `topic`.
+#[must_use]
+pub fn batching_producer_request(
+    topic: &str,
+    max_batch_bytes: usize,
+) -> magnetar_proto::CreateProducerRequest {
+    magnetar_proto::CreateProducerRequest {
+        topic: topic.to_owned(),
+        enable_batching: true,
+        max_batch_size_bytes: max_batch_bytes,
+        batching_max_publish_delay: Some(Duration::from_millis(10)),
+        ..Default::default()
+    }
+}
+
+/// A plain, uncompressed publish of `payload`.
+#[must_use]
+pub fn plain_message(payload: &[u8]) -> magnetar_proto::producer::OutgoingMessage {
+    magnetar_proto::producer::OutgoingMessage {
+        payload: Bytes::copy_from_slice(payload),
+        metadata: magnetar_proto::pb::MessageMetadata::default(),
+        uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        num_messages: 1,
+        txn_id: None,
+        source_message_id: None,
+    }
+}
+
+/// Frame `payloads` as one batched entry's body: a `(u32 big-endian single_size)
+/// (SingleMessageMetadata)(payload)` triple per packed message, concatenated.
+///
+/// This is the exact wire layout `magnetar_proto::consumer::ConsumerState::deliver` walks
+/// when `MessageMetadata.num_messages_in_batch` is present, and the one Java's
+/// `BatchMessageContainerImpl` writes. Both runners build [`Op::SendBatch`]'s frame through
+/// here so the two legs publish byte-identical bodies (issue #436).
+#[must_use]
+pub fn pack_batch_body(payloads: &[Vec<u8>]) -> Bytes {
+    let mut body = BytesMut::new();
+    for payload in payloads {
+        let single = magnetar_proto::pb::SingleMessageMetadata {
+            payload_size: i32::try_from(payload.len()).unwrap_or(i32::MAX),
+            ..Default::default()
+        };
+        let encoded_len = prost::Message::encoded_len(&single);
+        body.put_u32(u32::try_from(encoded_len).unwrap_or(u32::MAX));
+        // `encode` only fails on a short buffer; `BytesMut` grows, so this cannot.
+        let _ = prost::Message::encode(&single, &mut body);
+        body.extend_from_slice(payload);
+    }
+    body.freeze()
 }
 
 #[cfg(test)]

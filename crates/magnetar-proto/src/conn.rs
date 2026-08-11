@@ -41,8 +41,9 @@ use crate::error::ProtocolError;
 use crate::event::{ConnectionEvent, IncomingMessage, LookupOutcome, TxnRoundTrip};
 use crate::frame::{Frame, decode_one, encode_command, encode_payload, encode_payload_head};
 use crate::lookup::{LookupRegistry, LookupRequest, LookupSubmitError, is_partition_topic};
+use crate::memory_limit::MemoryReservation;
 use crate::pb;
-use crate::producer::{ProducerState, SendDecision};
+use crate::producer::{OpSend, ProducerState, SendDecision};
 use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
 use crate::txn::{TxnAction, TxnClient, TxnError, TxnId};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
@@ -98,12 +99,6 @@ fn apply_local_ack_state(
         }
         #[cfg(feature = "scalable-topics")]
         consumer.canonical_nack_ids.remove(id);
-        if consumer
-            .last_acked_message_id
-            .is_none_or(|previous| *id > previous)
-        {
-            consumer.last_acked_message_id = Some(*id);
-        }
     }
     apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
 }
@@ -210,6 +205,17 @@ pub struct Connection {
     inbound: BytesMut,
     /// Event queue.
     events: VecDeque<ConnectionEvent>,
+    /// Observational events (per-message `Message` / `MessageReceivedFromShadow`
+    /// clones) dropped because [`Self::events`] was at
+    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`]. Issue #413: nothing in the production
+    /// runtime consumes those events (`ReceiveFut` drains via `pop_message`,
+    /// `MessageListener` loops over `receive()`, `EventWaitFut` matches only
+    /// producer/subscribe families), so an unconsumed backlog of them retained
+    /// every received payload and grew the queue without bound — the OOM class
+    /// diagnosed on the accesslogs converter (heap profile: `VecDeque` growth +
+    /// `BytesMut` retention). Dropping them is always safe: they are emitted
+    /// for observability only and carry no protocol obligation.
+    dropped_observational_events: u64,
     /// Exact failed generations for built-in runtime retry legs.
     driver_retries: VecDeque<crate::DriverRetry>,
     /// Outcomes ready to be consumed by user futures.
@@ -244,6 +250,28 @@ pub struct Connection {
     /// freshly-handshaked transport via [`Self::rebuild_producers`]. Mirrors the parameters
     /// Java keeps inside `ProducerImpl#conf` for the same purpose.
     producer_create_requests: HashMap<ProducerHandle, CreateProducerRequest>,
+    /// Producer ids abandoned by [`Self::cancel_producer_open`], keyed by
+    /// `(topic, producer_name)` (issue #406, ADR-0100).
+    ///
+    /// The cancel-time `CommandCloseProducer` is issued while the broker's own
+    /// producer creation may still be in flight, and the outcome of that
+    /// interleaving is not the client's to decide. This map is what lets a
+    /// later `ProducerBusy` under the same name be *recovered from* instead of
+    /// merely retried: it names the exact producer ids that may still own the
+    /// registration, so the retry can reclaim it.
+    ///
+    /// Only user-provided names are tracked — an unnamed open gets a unique
+    /// broker-assigned name and can never collide.
+    ///
+    /// **Bounded by construction.** A fixed-size, self-overwriting ring of
+    /// [`MAX_ABANDONED_PRODUCER_OPENS`] records with no growth path: the insert
+    /// is an unconditional store at `index % capacity`. Records are cleared on
+    /// the name's next `CommandProducerSuccess` and wholesale by
+    /// [`Self::reset`] — producer ids are session-scoped, so they mean nothing
+    /// on a rebuilt connection.
+    abandoned_producer_opens: [Option<AbandonedProducerOpen>; MAX_ABANDONED_PRODUCER_OPENS],
+    /// Next write index into the [`Self::abandoned_producer_opens`] ring.
+    abandoned_producer_opens_next: usize,
     /// In-flight publish snapshots — populated by [`Self::reset`] and consumed by
     /// [`Self::rebuild_producers`]. Keyed by producer handle; each value is the in-FIFO-order
     /// list of [`crate::producer::OpSend`] entries that were unconfirmed at reset time, with
@@ -387,6 +415,52 @@ impl core::fmt::Debug for Connection {
 /// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
 
+/// Hard cap on abandoned producer opens remembered for the issue #406
+/// recovery (see `Connection::abandoned_producer_opens`).
+///
+/// The store is a fixed-size, self-overwriting ring: an insert always lands in
+/// `index % MAX_ABANDONED_PRODUCER_OPENS` and overwrites whatever was there.
+/// There is no growth path and no eviction policy to get wrong — the memory is
+/// the same on a connection that never wedges a name and on one that wedges a
+/// million. Sixteen covers any realistic burst of concurrently-wedged pinned
+/// names on a single connection, and losing the oldest record costs only the
+/// recovery for that name, never correctness.
+pub const MAX_ABANDONED_PRODUCER_OPENS: usize = 16;
+
+/// One producer id abandoned under a pinned `(topic, producer_name)`, retained
+/// so a later `ProducerBusy` under that name can be recovered from.
+///
+/// See [`Connection::abandoned_producer_opens`] for the lifecycle.
+#[derive(Debug, Clone)]
+struct AbandonedProducerOpen {
+    topic: String,
+    producer_name: String,
+    /// The abandoned producer id — what a re-close or a successor re-attach
+    /// has to name.
+    handle: ProducerHandle,
+    /// `true` once this id has been re-closed in response to a `ProducerBusy`.
+    /// A name still busy after that is one the broker no longer maps to this
+    /// id, which is what escalates the recovery to a successor re-attach.
+    reclosed: bool,
+    /// Epoch to stamp on the next successor re-attach of this id. Monotone, so
+    /// every re-attach strictly succeeds the registration it is reclaiming.
+    next_epoch: u64,
+}
+
+/// Cap on OBSERVATIONAL events queued in `Connection::events` — the ones
+/// emitted once per message, on either side of the connection:
+/// `ConnectionEvent::Message` / `MessageReceivedFromShadow` when consuming,
+/// `SendReceipt` / `SendError` when producing. No production consumer drains
+/// them (issue #413), so without a bound they grow the queue until OOM.
+/// Issue #423 is the same defect on the producer side: a steady sender queued
+/// one event per acknowledged message for the whole life of the connection.
+/// Dropping them is always safe — payload delivery goes through
+/// `pop_message`, send completion through the operation outcome and its
+/// waker, and both are settled before the event is queued. Protocol-bearing
+/// events (subscribe/producer/connection lifecycle) are NEVER dropped and are
+/// not counted against this cap.
+pub const EVENT_QUEUE_OBSERVATIONAL_CAP: usize = 4096;
+
 /// Error code surfaced when a publish exceeds its configured `send_timeout`.
 ///
 /// Pulsar's wire-protocol `ServerError` enum has no `TimeoutError` variant, so both
@@ -397,6 +471,22 @@ const SEND_TIMEOUT_CODE: i32 = -1;
 
 /// Error message paired with [`SEND_TIMEOUT_CODE`]. Callers match on this exact string.
 const SEND_TIMEOUT_MESSAGE: &str = "send timeout";
+
+/// Error surfaced when a batched publish cannot be replayed after a connection reset.
+const BATCH_RESET_ERROR_CODE: i32 = -1;
+
+/// Message paired with [`BATCH_RESET_ERROR_CODE`].
+const BATCH_RESET_ERROR_MESSAGE: &str = "batched send cannot be replayed after connection reset";
+
+/// Terminal reason for a publish still pending when the broker acknowledged its producer's
+/// `CommandCloseProducer` (see `Connection::fail_sends_of_closed_producer`).
+const PRODUCER_CLOSED_REASON: &str = "producer closed before the send was acknowledged";
+
+/// Local error used when a caller supplies inconsistent producer-batch coordinates.
+const INVALID_BATCH_ACK_CODE: i32 = -1;
+
+/// Message paired with [`INVALID_BATCH_ACK_CODE`].
+const INVALID_BATCH_ACK_MESSAGE: &str = "invalid batched message id";
 
 /// Whether a producer or consumer slot's rolling rate window is due for a
 /// re-sample at `now`, given the slot's existing `last_rate_snapshot` baseline
@@ -525,6 +615,21 @@ enum PendingRequestKind {
     ConsumerCloseForgotten {
         handle: ConsumerHandle,
     },
+    /// First half of issue #414's two-phase in-place recovery
+    /// ([`Connection::resubscribe_consumer_in_place`]): a `CommandCloseConsumer`
+    /// emitted for a consumer the client intends to keep, purely so the broker
+    /// really drops its dispatcher slot before the re-attach.
+    ///
+    /// Its `Success` is the trigger for the `CommandSubscribe` — a bare
+    /// re-subscribe for a still-live consumer id changes nothing broker-side
+    /// (`ServerCnx.handleSubscribe`'s `consumers.putIfAbsent` hit answers
+    /// `sendSuccessResponse` and returns), so the close is what makes the
+    /// re-attach real. Like the two forgotten variants above it has no
+    /// `RequestFut` behind it, so both handlers consume the ack in place
+    /// instead of leaking an undrainable [`OpOutcome`].
+    ConsumerCloseForReattach {
+        handle: ConsumerHandle,
+    },
     TopicWatcher {
         watcher_id: u64,
     },
@@ -565,6 +670,7 @@ impl Connection {
             pending_vectored_segments: Vec::new(),
             inbound: BytesMut::with_capacity(4 * 1024),
             events: VecDeque::new(),
+            dropped_observational_events: 0,
             driver_retries: VecDeque::new(),
             outcomes: HashMap::new(),
             wakers: HashMap::new(),
@@ -574,6 +680,8 @@ impl Connection {
             end_txn_waiters: HashMap::new(),
             producers: HashMap::new(),
             producer_create_requests: HashMap::new(),
+            abandoned_producer_opens: [const { None }; MAX_ABANDONED_PRODUCER_OPENS],
+            abandoned_producer_opens_next: 0,
             in_flight_publish_snapshots: HashMap::new(),
             consumers: HashMap::new(),
             consumer_subscribe_requests: HashMap::new(),
@@ -660,6 +768,15 @@ impl Connection {
             );
         }
         self.state = next;
+        // Routing reads an atomic hint instead of the connection and slot
+        // mutexes. A transport drop shuts every hint immediately; recovery
+        // restores only attachments the broker has acknowledged on this
+        // session. The protocol drain gate remains the send authority.
+        let connected = matches!(next, HandshakeState::Connected);
+        for slot in self.producers.values() {
+            let state = slot.state.lock();
+            slot.set_routing_ready(connected && state.broker_ready && !state.closed);
+        }
     }
 
     /// Returns whether the connection is ready to accept producer / consumer opens.
@@ -932,13 +1049,15 @@ impl Connection {
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
     ///    round-trip, …). The corresponding user futures are woken with that outcome.
-    /// 3. Snapshot every in-flight producer publish into `in_flight_publish_snapshots` (key =
-    ///    `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each original
-    ///    send-future waker exactly once — but do *not* install a `SessionLost` outcome on the
-    ///    publish key. The user future re-polls, finds no outcome, re-registers, and stays pending
-    ///    until the replayed [`crate::producer::OpSend`] surfaces its eventual `CommandSendReceipt`
-    ///    (transparent at-least-once replay). Clear every producer's batch container so unflushed
-    ///    partial batches do not survive the reconnect — the caller is responsible for those.
+    /// 3. Snapshot every replayable in-flight producer publish into `in_flight_publish_snapshots`
+    ///    (key = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
+    ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
+    ///    the publish key. The user future re-polls, finds no outcome, re-registers, and stays
+    ///    pending until the replayed [`crate::producer::OpSend`] surfaces its eventual
+    ///    `CommandSendReceipt` (transparent at-least-once replay). Batched sends have no
+    ///    per-message replay frame, even after flush, so resolve them with [`OpOutcome::SendError`]
+    ///    before waking their futures. Clear every producer's batch container so partial batches do
+    ///    not survive the reconnect.
     /// 4. Reset every consumer's queue + pending seek + ack tracker. Producers and consumers
     ///    themselves are *not* removed — [`Self::rebuild_producers`] and
     ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
@@ -950,8 +1069,13 @@ impl Connection {
         self.session_epoch = self.session_epoch.wrapping_add(1);
 
         // (2) Fail every pending request and wake its waiter. Forgotten
-        // producer/consumer closes have no waiter by construction, so consume
-        // them without materializing an undrainable outcome.
+        // producer/consumer closes — and issue #414's close-then-re-attach
+        // first half, whose `Success` was the only thing that would have read
+        // it — have no waiter by construction, so consume them without
+        // materializing an undrainable outcome. Dropping the
+        // `ConsumerCloseForReattach` entry here is also what hands the
+        // re-attach back to `rebuild_consumers`: the session that close was
+        // written on is gone, so the broker reaped that consumer with it.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
@@ -964,6 +1088,7 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForgotten { .. }
+                    | PendingRequestKind::ConsumerCloseForReattach { .. }
             ) {
                 let _ = self.wakers.remove(&key);
                 continue;
@@ -974,7 +1099,11 @@ impl Connection {
             }
         }
 
-        // (3) Snapshot every in-flight publish so [`rebuild_producers`] can replay it on
+        // Events queued before reset belong to the dead session. Clear them before producing any
+        // local reset outcomes so a non-replayable batch's SendError remains observable.
+        self.events.clear();
+
+        // (3) Snapshot every replayable in-flight publish so [`rebuild_producers`] can replay it on
         // the freshly-handshaked session. We pluck the wakers out of each `OpSend` (so we
         // wake the user's future without double-firing on the replayed receipt) and stash
         // the now-wakerless `OpSend` under its producer's snapshot bucket. We deliberately
@@ -993,12 +1122,12 @@ impl Connection {
         // because anything successfully replayed is gone from the map.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
-            let snap = self
-                .producers
-                .get(&handle)
-                .map(|slot| slot.state.lock().snapshot_pending_sends());
-            if let Some((wakers, snapshots)) = snap {
-                for (seq, waker_opt) in wakers {
+            let snap = self.producers.get(&handle).map(|slot| {
+                slot.set_routing_ready(false);
+                slot.state.lock().snapshot_pending_sends()
+            });
+            if let Some((replay_wakers, dropped, snapshots)) = snap {
+                for (seq, waker_opt) in replay_wakers {
                     // Prefer the producer-stored waker (registered via
                     // ProducerState::register_waker); fall back to the connection-level
                     // slab when no producer-stored waker was set. Wake exactly once —
@@ -1014,6 +1143,16 @@ impl Connection {
                     } else if let Some(w) = self.wakers.remove(&key) {
                         w.wake();
                     }
+                }
+                for mut op in dropped {
+                    self.resolve_send_error(
+                        handle,
+                        op.sequence_id,
+                        BATCH_RESET_ERROR_CODE,
+                        BATCH_RESET_ERROR_MESSAGE,
+                        op.waker.take(),
+                    );
+                    // Dropping the op releases its memory reservation (ADR-0111).
                 }
                 if !snapshots.is_empty() {
                     self.in_flight_publish_snapshots
@@ -1072,8 +1211,13 @@ impl Connection {
 
         // (4) Drop queued events + raw bytes. Anything not yet observed by the runtime
         // belongs to the dead session.
-        self.events.clear();
         self.driver_retries.clear();
+        // Producer ids are per-session: the broker reaps every producer of a
+        // dead connection, so an abandoned id means nothing on the rebuilt one
+        // and re-attaching to it would be a fabricated successor claim
+        // (issue #406).
+        self.abandoned_producer_opens = [const { None }; MAX_ABANDONED_PRODUCER_OPENS];
+        self.abandoned_producer_opens_next = 0;
         self.outbound.clear();
         self.inbound.clear();
         #[cfg(feature = "scalable-topics")]
@@ -1165,8 +1309,9 @@ impl Connection {
     /// connection cannot deadlock.
     pub fn fail_all_pending(&mut self, reason: &str) {
         // (1) Terminate every pending request and wake its waiter. Forgotten
-        // producer/consumer closes have no waiter by construction, so consume
-        // them without materializing an undrainable outcome.
+        // producer/consumer closes, and issue #414's close-then-re-attach first
+        // half, have no waiter by construction, so consume them without
+        // materializing an undrainable outcome.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
@@ -1179,6 +1324,7 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForgotten { .. }
+                    | PendingRequestKind::ConsumerCloseForReattach { .. }
             ) {
                 let _ = self.wakers.remove(&key);
                 continue;
@@ -1215,27 +1361,11 @@ impl Connection {
             let drained = self.producers.get(&handle).map(|slot| {
                 let mut slot_state = slot.state.lock();
                 slot_state.closed = true;
+                slot.set_routing_ready(false);
                 slot_state.drain_pending_sends()
             });
             let Some(drained) = drained else { continue };
-            for (seq, waker_opt) in drained {
-                let key = PendingOpKey::Send(handle, seq);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                // Prefer the producer-stored waker; drop any connection-level
-                // slab waker for this key too so it is not double-fired below.
-                if let Some(w) = waker_opt {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
+            self.terminalize_drained_sends(handle, drained, reason);
         }
 
         // (2b) Issue #369, Change 2 (separable from Change 1 — a reviewer can drop this
@@ -1369,26 +1499,11 @@ impl Connection {
         let drained = self.producers.get(&handle).map(|slot| {
             let mut slot_state = slot.state.lock();
             slot_state.closed = true;
-            slot_state.broker_ready = false;
+            slot.set_broker_ready(&mut slot_state, false, false);
             slot_state.drain_pending_sends()
         });
         if let Some(drained) = drained {
-            for (seq, waker_opt) in drained {
-                let key = PendingOpKey::Send(handle, seq);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                if let Some(w) = waker_opt {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
+            self.terminalize_drained_sends(handle, drained, reason);
         }
         // Sends extracted by `reset()` no longer live in the producer slot.
         // Terminalize those replay snapshots too; their futures re-registered
@@ -1703,9 +1818,44 @@ impl Connection {
 
     /// Cancel a producer that has not completed its opening operation.
     ///
-    /// Idempotent and local-only: the broker has not acknowledged the handle,
-    /// so no `CommandCloseProducer` is required. Any detached retry leg sees
-    /// the missing request/slot and exits without re-issuing.
+    /// Idempotent. Local correlation state (pending request, slot, replay
+    /// request, queued attachment events, driver retries) is always dropped.
+    ///
+    /// **Issue #406 — close before giving up.** Purging local state is not
+    /// enough when the `CommandProducer` already entered the current
+    /// session's byte stream: the broker completes the open regardless of the
+    /// client's deadline and keeps the `(topic, producer_name)` registration,
+    /// so every later open under that name is rejected with
+    /// `ProducerBusy` (code 16, broker `NamingException`) until the topic is
+    /// unloaded. `ProducerBusy` is retryable for `ProducerOpen` (ADR-0080), so
+    /// the engines' retry loop then re-hits that zombie with a fresh
+    /// producer id until the budget runs out.
+    ///
+    /// This method therefore emits a best-effort
+    /// [`Self::close_producer_forget`] for the abandoned producer id whenever
+    /// the broker may still hold a registration for it. Pulsar processes
+    /// commands in order per connection, so a `CommandCloseProducer` written
+    /// after the `CommandProducer` on the same stream reaps the registration
+    /// whether or not the broker had completed the open; an
+    /// unknown-producer rejection is consumed in place by the forgotten-close
+    /// handlers rather than leaking an undrainable [`OpOutcome`].
+    ///
+    /// The registration may still exist exactly when either
+    ///
+    /// - a `ProducerOpen` request for `handle` is still pending — [`Self::reset`] takes
+    ///   `pending_requests` wholesale and is the only place that clears `outbound`, so a pending
+    ///   entry proves the `CommandProducer` is buffered or already flushed on **this** session and
+    ///   that no definitive reply has landed; or
+    /// - the producer is already `broker_ready` — the open completed on this session and the caller
+    ///   cancelled anyway (a `ProducerSuccess` that raced the deadline).
+    ///
+    /// A session lost to [`Self::reset`] satisfies neither (the broker reaps
+    /// every producer of a dead connection), an already-`closed` slot has its
+    /// `CommandCloseProducer` on the wire, and a second cancel finds no slot —
+    /// so none of them emits a close.
+    ///
+    /// Any detached retry leg sees the missing request/slot and exits without
+    /// re-issuing.
     pub fn cancel_producer_open(&mut self, handle: ProducerHandle) {
         let request_ids: Vec<RequestId> = self
             .pending_requests
@@ -1715,6 +1865,28 @@ impl Connection {
                     .then_some(*request_id)
             })
             .collect();
+        let broker_may_hold_registration = self.producers.get(&handle).is_some_and(|slot| {
+            let state = slot.state.lock();
+            !state.closed && (!request_ids.is_empty() || state.broker_ready)
+        });
+        if broker_may_hold_registration {
+            let close_request_id = self.close_producer_forget(handle);
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                request_id = ?close_request_id,
+                "cancelled producer open: emitted fire-and-forget CommandCloseProducer so the broker cannot keep a zombie registration (issue #406)"
+            );
+            // That close may still lose its race with the broker's own
+            // producer creation, which is asynchronous and which the client
+            // cannot observe. Remember the id under its pinned name so a later
+            // `ProducerBusy` can reclaim the registration instead of retrying
+            // into it forever (ADR-0100 § "Recovering a registration the close
+            // did not reap").
+            if let Some(key) = self.abandoned_open_key_of(handle) {
+                self.remember_abandoned_producer_open(handle, key);
+            }
+        }
         for request_id in request_ids {
             self.cancel_request(request_id);
         }
@@ -1897,11 +2069,9 @@ impl Connection {
     /// the reconnect — once each returned [`RequestId`] surfaces an [`OpOutcome::Success`], the
     /// consumer's receive queue is "live" again and the broker resumes dispatching messages.
     ///
-    /// When a consumer has acknowledged at least one message before the reconnect, the
-    /// replayed `CommandSubscribe` uses the highest acked id as `start_message_id` so the
-    /// broker resumes from the post-ack position. This avoids double-delivery of pre-reconnect
-    /// messages on subscriptions where the cursor was not yet persisted broker-side. Mirrors
-    /// Java `ConsumerImpl#connectionOpened`.
+    /// An established durable subscription omits `start_message_id`: the broker's persisted
+    /// cursor is authoritative across reconnects. Fresh and non-durable subscriptions retain only
+    /// the caller's explicit original start position.
     ///
     /// Consumers explicitly closed via [`Self::close_consumer`] / [`Self::unsubscribe`] (or by
     /// the broker via `CommandCloseConsumer`) are skipped — their `closed` flag is honoured.
@@ -1915,17 +2085,18 @@ impl Connection {
                 if state.closed || state.unsubscribe_request_id.is_some() {
                     return None;
                 }
-                Some((*handle, req.clone(), state.last_acked_message_id))
+                let resume = Self::consumer_reattach_start_message_id(req, &state);
+                Some((*handle, req.clone(), resume))
             })
             .collect();
         let mut request_ids = Vec::with_capacity(pending.len());
         for (handle, req, resume_from) in pending {
-            // Resume position: prefer the post-ack id when known, else fall back to the
-            // original `start_message_id` from the subscribe request (broker uses its
-            // persisted cursor if both are absent).
-            let resume = resume_from.or(req.start_message_id);
-            let subscribe_request_id =
-                self.emit_command_subscribe(handle, &req, resume, SubscribeAckAction::ReleaseFlow);
+            let subscribe_request_id = self.emit_command_subscribe(
+                handle,
+                &req,
+                resume_from,
+                SubscribeAckAction::ReleaseFlow,
+            );
             request_ids.push(subscribe_request_id);
         }
         request_ids
@@ -2275,7 +2446,7 @@ impl Connection {
                     sequence_id = receipt.sequence_id,
                     "send receipt received"
                 );
-                let resolved: Vec<(SequenceId, MessageId, Option<Waker>)> =
+                let resolved: Vec<(OpSend, MessageId)> =
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
                         // Batched sends now mint a per-message `OpSend` (`add_to_batch`); a
@@ -2297,7 +2468,7 @@ impl Connection {
                         } else {
                             lowest
                         };
-                        let mut resolved: Vec<(SequenceId, MessageId, Option<Waker>)> = Vec::new();
+                        let mut resolved: Vec<(OpSend, MessageId)> = Vec::new();
                         for seq in lowest..=highest {
                             let mut synth = receipt.clone();
                             synth.sequence_id = seq;
@@ -2316,7 +2487,11 @@ impl Connection {
                         Vec::new()
                     };
                 if !resolved.is_empty() {
-                    for (seq, mid, waker) in resolved {
+                    // The per-slot guard is gone: each op's memory reservation is released
+                    // when it drops at the end of its iteration (ADR-0111).
+                    for (mut op, mid) in resolved {
+                        let seq = op.sequence_id;
+                        let waker = op.waker.take();
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
                             key,
@@ -2330,7 +2505,7 @@ impl Connection {
                         } else if let Some(w) = self.wakers.remove(&key) {
                             w.wake();
                         }
-                        self.events.push_back(ConnectionEvent::SendReceipt {
+                        self.push_observational_event(ConnectionEvent::SendReceipt {
                             handle,
                             sequence_id: seq,
                             message_id: mid,
@@ -2343,7 +2518,7 @@ impl Connection {
                     "missing CommandSendError",
                 ))?;
                 let handle = ProducerHandle(err.producer_id);
-                let resolved: Option<(SequenceId, Option<Waker>, i32, String)> = if let Some(slot) =
+                let resolved: Option<(OpSend, i32, String)> = if let Some(slot) =
                     self.producers.get(&handle)
                 {
                     let mut producer = slot.state.lock();
@@ -2355,7 +2530,11 @@ impl Connection {
                 } else {
                     None
                 };
-                if let Some((seq, waker, code, message)) = resolved {
+                // The op drops (releasing its memory reservation) at the end of this block,
+                // after the per-slot guard is gone (ADR-0111).
+                if let Some((mut op, code, message)) = resolved {
+                    let seq = op.sequence_id;
+                    let waker = op.waker.take();
                     let key = PendingOpKey::Send(handle, seq);
                     self.outcomes.insert(
                         key,
@@ -2370,7 +2549,7 @@ impl Connection {
                     } else if let Some(w) = self.wakers.remove(&key) {
                         w.wake();
                     }
-                    self.events.push_back(ConnectionEvent::SendError {
+                    self.push_observational_event(ConnectionEvent::SendError {
                         handle,
                         sequence_id: seq,
                         code,
@@ -2481,7 +2660,7 @@ impl Connection {
                         (Vec::new(), None)
                     };
                 for ev in staged_events {
-                    self.events.push_back(ev);
+                    self.push_observational_event(ev);
                 }
                 if let Some(flow_command) = flow_command {
                     self.stage_flow(flow_command);
@@ -2494,6 +2673,15 @@ impl Connection {
                         "missing CommandProducerSuccess",
                     ))?;
                 let request_id = RequestId(ok.request_id);
+                // A `ProducerSuccess` with no pending entry is a reply to an
+                // open [`Self::cancel_producer_open`] already abandoned. It is
+                // dropped here — no outcome, no waker, no slot resurrection.
+                // That leaves no zombie: cancellation emitted a
+                // `CommandCloseProducer` for the same producer id on the same
+                // ordered connection, so the broker registration this success
+                // announces is already reaped by the time the client sees it
+                // (issue #406). A session that died instead of acking took its
+                // producers with it, and its bytes never reach this decoder.
                 if let Some(PendingRequestKind::ProducerOpen { handle }) =
                     self.pending_requests.remove(&request_id)
                 {
@@ -2510,6 +2698,9 @@ impl Connection {
                         );
                         return Ok(());
                     }
+                    // The name attached: this client owns the registration,
+                    // so nothing is left to reclaim under it (issue #406).
+                    self.forget_abandoned_producer_opens(handle);
                     let snapshots = self.in_flight_publish_snapshots.remove(&handle);
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
@@ -2530,7 +2721,7 @@ impl Connection {
                         if let Some(snapshots) = snapshots {
                             producer.replay_snapshots(snapshots);
                         }
-                        producer.broker_ready = true;
+                        slot.set_broker_ready(&mut producer, true, self.is_connected());
                         producer.has_ever_attached = true;
                         // The re-attach succeeded — clear the transient-retry
                         // budget so a future bundle reshuffle starts its backoff
@@ -2593,6 +2784,14 @@ impl Connection {
                             "fire-and-forget consumer close acked by broker"
                         );
                     }
+                    Some(PendingRequestKind::ConsumerCloseForReattach { .. }) => {
+                        // Phase 2 runs below, after this `match` has consumed the ack —
+                        // it re-enters `self` mutably (permit mirrors, ack sweep, a fresh
+                        // `CommandSubscribe`), which this arm cannot do while `kind` is
+                        // still borrowed. No waiter exists for a recovery close either, so
+                        // recording an outcome here would leak one permanent `outcomes`
+                        // entry per recovery attempt (the issue #241 shape).
+                    }
                     Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
                     Some(PendingRequestKind::ConsumerUnsubscribe { .. })
                         if !unsubscribe_has_waiter =>
@@ -2610,6 +2809,13 @@ impl Connection {
                         self.wake_for_request(request_id);
                     }
                     None => {}
+                }
+                if let Some(
+                    PendingRequestKind::ProducerClose { handle }
+                    | PendingRequestKind::ProducerCloseForgotten { handle },
+                ) = kind
+                {
+                    self.fail_sends_of_closed_producer(handle, request_id);
                 }
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     let (waiter_id, flow_now) = self
@@ -2671,6 +2877,11 @@ impl Connection {
                     if let Some(slot) = self.consumers.get(&handle) {
                         let _ = slot.state.lock().seek_acked();
                     }
+                }
+                // Issue #414 phase 2: the broker has confirmed it dropped this consumer's
+                // dispatcher slot, so the re-attach may now land on a genuinely empty one.
+                if let Some(PendingRequestKind::ConsumerCloseForReattach { handle }) = kind {
+                    self.complete_consumer_close_for_reattach(handle);
                 }
             }
             pb::base_command::Type::Error => {
@@ -2751,6 +2962,29 @@ impl Connection {
                             "broker rejected fire-and-forget consumer close (consumer dropped without explicit close)"
                         );
                     }
+                    Some(PendingRequestKind::ConsumerCloseForReattach { handle }) => {
+                        // Issue #414 phase 1 rejected: the broker still holds this
+                        // consumer exactly as it was, so the re-attach must NOT go out —
+                        // a `CommandSubscribe` for a live consumer id is the broker-side
+                        // no-op ADR-0108 exists to stop emitting. Nothing was mutated in
+                        // phase 1 either, so the consumer is left precisely as the caller
+                        // found it: still wedged, but still holding the positive
+                        // `permit_balance` the stall watchdog needs to report it, and
+                        // eligible for another attempt. No waiter exists, so this
+                        // rejection is surfaced as a `warn!` (ADR-0054) rather than an
+                        // undrainable `OpOutcome`.
+                        let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
+                        tracing::warn!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            code = err.error,
+                            message = %bounded_message,
+                            "broker rejected the in-place recovery close; the consumer is \
+                             NOT re-subscribed and is left untouched — escalate to \
+                             pulsar-admin topics unload if it stays wedged (#414)"
+                        );
+                    }
                     Some(
                         PendingRequestKind::ProducerOpen { .. }
                         | PendingRequestKind::ConsumerSubscribe { .. },
@@ -2816,6 +3050,13 @@ impl Connection {
                             crate::OperationKind::ProducerOpen,
                             err.error,
                         );
+                        // Issue #406: a `ProducerBusy` under a name this
+                        // connection abandoned an open for proves the
+                        // registration completed broker-side AFTER the
+                        // cancel-time close. Re-close it now, while its state
+                        // is unambiguous, so the caller's retry lands on a
+                        // free name.
+                        let _ = self.reclaim_busy_producer_name(handle, err.error);
                         let established = self
                             .producers
                             .get(&handle)
@@ -2834,22 +3075,14 @@ impl Connection {
                             // forever — and install a TERMINAL failure so the
                             // parked `send()` future surfaces `Err(PeerClosed)`
                             // instead of hanging.
-                            let attempts = {
-                                let mut slot_state =
-                                    self.producers.get(&handle).map(|slot| slot.state.lock());
-                                match slot_state.as_mut() {
-                                    Some(s) => {
-                                        s.broker_ready = false;
-                                        s.last_open_error = Some((err.error, err.message.clone()));
-                                        s.transient_open_attempts =
-                                            s.transient_open_attempts.saturating_add(1);
-                                        s.transient_open_attempts
-                                    }
-                                    // Producer already gone (closed between the
-                                    // broker error and here) — nothing to retry.
-                                    None => u32::MAX,
-                                }
-                            };
+                            let attempts = self.producers.get(&handle).map_or(u32::MAX, |slot| {
+                                let mut producer = slot.state.lock();
+                                slot.set_broker_ready(&mut producer, false, false);
+                                producer.last_open_error = Some((err.error, err.message.clone()));
+                                producer.transient_open_attempts =
+                                    producer.transient_open_attempts.saturating_add(1);
+                                producer.transient_open_attempts
+                            });
                             if self.operation_retry.should_retry_after_failure(attempts) {
                                 self.driver_retries.push_back(crate::DriverRetry::Producer {
                                     handle,
@@ -3011,18 +3244,27 @@ impl Connection {
                             }
                         }
                     }
-                    self.outcomes.insert(
-                        PendingOpKey::Request(rid),
-                        match &result {
-                            Ok(()) => OpOutcome::Success { request_id: rid },
-                            Err(msg) => OpOutcome::Error {
-                                request_id: rid,
-                                code: ack.error.unwrap_or(0),
-                                message: msg.clone(),
+                    // Issue #241 leak shape (mirrors the `Success` arm's `None => {}`):
+                    // `pending_requests.remove` returning `None` means this ack was
+                    // already resolved elsewhere — the #346 orphan sweep above or the
+                    // `ack_response_timeout` backstop already removed it and woke (or
+                    // never had) its waiter. Recording a second `outcomes` entry here
+                    // for the broker's late reply would leak it permanently, since
+                    // nothing is left to `take_outcome` it.
+                    if kind.is_some() {
+                        self.outcomes.insert(
+                            PendingOpKey::Request(rid),
+                            match &result {
+                                Ok(()) => OpOutcome::Success { request_id: rid },
+                                Err(msg) => OpOutcome::Error {
+                                    request_id: rid,
+                                    code: ack.error.unwrap_or(0),
+                                    message: msg.clone(),
+                                },
                             },
-                        },
-                    );
-                    self.wake_for_request(rid);
+                        );
+                        self.wake_for_request(rid);
+                    }
                 }
                 self.events
                     .push_back(ConnectionEvent::AckResponse { request_id, result });
@@ -3146,39 +3388,102 @@ impl Connection {
                     ))?;
                 let handle = ProducerHandle(close.producer_id);
                 // Broker reasons for `CommandCloseProducer`:
-                //   - PIP-188 topic migration (`assigned_broker_service_url` set): producer is
-                //     supposed to reconnect on the new URL.
+                //   - Same-broker bundle unload / reassignment on a LIVE socket (`pulsar-admin
+                //     topics unload`, bundle split, load shedding): no TCP drop follows, so no
+                //     supervised reconnect ever runs.
+                //   - PIP-188 topic migration or an Extensible-Load-Manager multi-phase unload
+                //     (`assigned_broker_service_url` set): the URL is a dial hint.
                 //   - Broker restart / failover / cluster swap via `ServiceUrlProvider`: TCP drops
-                //     next; supervised reconnect re-attaches via `rebuild_producers`.
-                //   - Admin-initiated forced delete: a subsequent send will surface a broker-side
-                //     rejection (`ProducerFenced`, etc.) which is the right place to surface the
-                //     error.
+                //     next; the supervised reconnect re-attaches via `rebuild_producers`.
+                //   - Admin-initiated forced delete: the re-attach below is rejected non-retryably
+                //     (`ProducerFenced`, `TopicNotFound`), which terminalizes the slot — the right
+                //     place to surface the error.
                 //
-                // All cases are *transient at the protocol level* — the
-                // user-facing producer handle keeps being valid. Mirroring
-                // Java's `ProducerImpl.connectionClosed`, we surface the
-                // event for observability but do NOT permanently mark
-                // `closed=true`. Marking it closed would cause
-                // `rebuild_producers` to filter it out (`!p.closed` at
-                // conn.rs:933), so the supervised reconnect would never
-                // re-establish the producer and the next user `send()`
-                // would surface `ProducerError::Closed →
-                // InvariantViolation("producer rejected send")` even
-                // though the broker is willing to re-accept it.
+                // All cases are *transient at the protocol level* — the user-facing
+                // producer handle keeps being valid. Mirroring Java's
+                // `ProducerImpl.connectionClosed`, we never permanently mark
+                // `closed=true`. Marking it closed would cause `rebuild_producers` to
+                // filter it out (`!p.closed`), so the supervised reconnect would never
+                // re-establish the producer and the next user `send()` would surface
+                // `ProducerError::Closed → InvariantViolation("producer rejected send")`
+                // even though the broker is willing to re-accept it.
                 //
-                // Refs: Task #56.
-                // The broker detached the producer — close the drain gate so no
-                // staged send reaches the wire before the re-attachment's
-                // `ProducerSuccess` (send-to-detached-producer closes the whole
-                // connection broker-side).
-                if let Some(slot) = self.producers.get(&handle) {
-                    slot.state.lock().broker_ready = false;
+                // Issue #451 ROOT CAUSE: keeping the handle valid was only ever HALF the
+                // recovery. `rebuild_producers` runs exclusively after a new-session
+                // handshake, and the ADR-0080 retry leg is armed only by a `CommandError`
+                // for a still-pending open — a close creates neither. So a close that
+                // arrives while the connection STAYS UP left the slot at
+                // `closed=false, broker_ready=false, open_request_id=None` for the life of
+                // the connection: `drain_producer_outbound` skips it forever and every
+                // `send()` routed to it resolved `code=-1 "send timeout"` until the process
+                // restarted. Re-attach it IN PLACE on this socket instead, exactly like the
+                // `CommandCloseConsumer` twin below does for issue #307.
+                //
+                // Unlike the consumer twin, `assigned_broker_service_url = Some(url)` takes
+                // the SAME in-place path: no existing path owns
+                // `ProducerClosedByBroker { assigned_broker_service_url: Some(_) }` on a
+                // live socket (the driver's migration arm keys on
+                // `ConnectionEvent::TopicMigrated`), and on an Extensible-Load-Manager
+                // cluster `Some(url)` is the DEFAULT shape of a plain unload
+                // (`PersistentTopic.close` attaches the assigned lookup data whenever
+                // multi-phase bundle unload is on). Java uses the URL only as a dial hint
+                // and re-sends `CommandProducer` regardless; when it names this
+                // connection's broker the in-place open succeeds, otherwise it fails
+                // bounded through the ADR-0080 retry leg.
+                //
+                // Refs: Task #56, issue #451, ADR-0106.
+                let url = close.assigned_broker_service_url;
+                match self.emit_in_place_producer_reattach(handle) {
+                    Some(request_id) => {
+                        let (topic, epoch) = self
+                            .producers
+                            .get(&handle)
+                            .map(|slot| (slot.identity.topic.clone(), slot.state.lock().epoch))
+                            .unwrap_or_default();
+                        // Bounded outside the macro: a `tracing` field expression only runs
+                        // when a subscriber enables the level, and the sim-coverage gate
+                        // runs with none.
+                        let assigned_broker_service_url =
+                            url.as_deref().map(crate::log_fields::truncate_broker_str);
+                        tracing::warn!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            topic = %topic,
+                            request_id = ?request_id,
+                            epoch,
+                            assigned_broker_service_url,
+                            "broker closed attached producer on a live connection; \
+                             re-attaching in place (#451)"
+                        );
+                        // Transparent to the runtime: NO `ProducerClosedByBroker` event,
+                        // mirroring the #307 consumer re-subscribe. A parked runtime wait
+                        // future would otherwise mistake it for a terminal close.
+                    }
+                    None => {
+                        // Not eligible. Close the drain gate anyway — the broker has
+                        // detached this producer id and Pulsar closes the WHOLE connection
+                        // on a `CommandSend` for a producer that is not ready.
+                        //
+                        // Keep surfacing the event ONLY while an open is in flight: its
+                        // parked waiter (`EventWaitFut` / `ProducerReadyFut`, armed just
+                        // inside the open operation) is the sole reader in the tree, and it
+                        // owns that open's outcome. For a user-closed or unknown handle
+                        // nobody can ever consume the event, so pushing one would only grow
+                        // the queue — one per partition under bundle churn.
+                        let open_in_flight = self.producers.get(&handle).is_some_and(|slot| {
+                            let mut producer = slot.state.lock();
+                            slot.set_broker_ready(&mut producer, false, false);
+                            producer.open_request_id.is_some()
+                        });
+                        if open_in_flight {
+                            self.events
+                                .push_back(ConnectionEvent::ProducerClosedByBroker {
+                                    handle,
+                                    assigned_broker_service_url: url,
+                                });
+                        }
+                    }
                 }
-                self.events
-                    .push_back(ConnectionEvent::ProducerClosedByBroker {
-                        handle,
-                        assigned_broker_service_url: close.assigned_broker_service_url,
-                    });
             }
             pb::base_command::Type::CloseConsumer => {
                 let close = command
@@ -3215,7 +3520,7 @@ impl Connection {
                 // MIRRORS to 0 here so they track broker reality. Without this
                 // `granted_permits` stays stale (it is purely additive on the
                 // client side; it is never decremented as messages arrive).
-                // Issue #349: `permit_balance` (the REAL, decrementing balance)
+                // Issue #349: `permit_balance` (the client-accounted, decrementing balance)
                 // is zeroed in lock-step for the same reason — this is a churn
                 // boundary, not a natural drain, so both mirrors reset together.
                 // `consumed_since_flow` is reset in lock-step so the
@@ -3275,46 +3580,21 @@ impl Connection {
                     // `flow_on_subscribe_ack`, any of which would otherwise skip
                     // this sweep entirely on some re-attach paths.
                     //
-                    // Two-phase collect-then-mutate (mirrors the send-timeout sweep
-                    // shape in `handle_timeout`) avoids mutating `pending_requests`
-                    // while iterating it.
-                    let orphaned_acks: Vec<RequestId> = self
-                        .pending_requests
-                        .iter()
-                        .filter_map(|(rid, kind)| match kind {
-                            PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
-                            _ => None,
-                        })
-                        .collect();
-                    for rid in orphaned_acks {
-                        self.pending_requests.remove(&rid);
-                        let message = "ack orphaned by broker consumer close".to_owned();
-                        self.outcomes.insert(
-                            PendingOpKey::Request(rid),
-                            OpOutcome::Error {
-                                request_id: rid,
-                                code: -1,
-                                message: message.clone(),
-                            },
-                        );
-                        self.wake_for_request(rid);
-                        if let Some(slot) = self.consumers.get(&handle) {
-                            let mut consumer = slot.state.lock();
-                            consumer.total_acks_failed =
-                                consumer.total_acks_failed.saturating_add(1);
-                        }
-                        self.events.push_back(ConnectionEvent::AckResponse {
-                            request_id: Some(rid),
-                            result: Err(message),
-                        });
-                    }
+                    self.fail_acks_orphaned_by_consumer_reattach(handle);
                     // Same-broker bundle reassignment: re-subscribe in place and
                     // DO NOT surface a `ConsumerClosedByBroker` event — the
                     // re-attach is transparent to the runtime (which would
                     // otherwise either drop the event or, if a `SubscribeAcked`
                     // wait is parked, mistake it for a terminal close). The
                     // method drains any older stale close events for this handle.
-                    self.resubscribe_consumer_after_broker_close(handle);
+                    if self.emit_in_place_consumer_resubscribe(handle).is_some() {
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            "broker closed running consumer (same-broker, url=None); \
+                             re-subscribed in place (#307)"
+                        );
+                    }
                 } else {
                     // PIP-188 topic migration (`assigned_broker_service_url`
                     // set): the supervised reconnect / migration path owns the
@@ -3386,11 +3666,29 @@ impl Connection {
                 // gate at the `Success` arm owns that flow). The predicate read
                 // takes only the per-slot lock and is dropped before
                 // `initial_flow` re-acquires it (ADR-0038 lock ordering).
+                //
+                // Issue #427: on a FRESH Exclusive/Failover subscribe this arm runs
+                // inside `handle_bytes` on the frame a real broker sends right behind
+                // the subscribe `Success`, while the runtime's own post-ack
+                // `initial_flow` is still parked on the resolving subscribe future.
+                // `granted_permits` is legitimately `0` at that instant, so this gate
+                // passes and the re-arm grants first. That is fine and deliberate: the
+                // grant is owed either way, and `Self::initial_flow` is idempotent per
+                // attach, so whichever of the two callers arrives second is a no-op
+                // rather than a second `receiver_queue_size` the broker would hold.
+                // Starved-corner extension (#331 lineage): `granted_permits` is the
+                // ADDITIVE mirror, so a consumer that was fed once and then drained
+                // to a client-accounted balance of zero — with too little queued to ever cross
+                // the `maybe_flow` threshold again — fails the `== 0` gate forever.
+                // Promotion is its only exit: `maybe_flow` is provably unreachable
+                // (nothing left to pop), and the #414 stall watchdog requires
+                // `permit_balance > 0` for candidacy. `is_flow_starved` is that
+                // exact predicate, computed against the client-accounted balance (#349).
                 let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
                     let mut consumer = slot.state.lock();
                     consumer.record_active_change(active);
                     active
-                        && consumer.granted_permits == 0
+                        && (consumer.granted_permits == 0 || consumer.is_flow_starved())
                         && !consumer.closed
                         && !consumer.paused
                         && consumer.pending_seek.is_none()
@@ -3697,8 +3995,8 @@ impl Connection {
                 self.handle_tc_assignments_update(upd);
             }
             _ => {
-                // Unhandled command — we tolerate them silently for forward compatibility, but
-                // we DO push an event for the driver to log.
+                // Unhandled command — tolerated for forward compatibility: no error, no event,
+                // no reply. The only trace is the `trace!` below.
                 tracing::trace!(target: "magnetar_proto", cmd_type = ?cmd_type, "unhandled command type");
             }
         }
@@ -3826,6 +4124,48 @@ impl Connection {
         let out = self.outbound.split().freeze();
         self.outbound = BytesMut::with_capacity(4 * 1024);
         crate::Transmit::Contiguous(&self.pending_vectored_drain.insert(out)[..])
+    }
+
+    /// Queue an OBSERVATIONAL event — one emitted per message, either received
+    /// (`Message` / `MessageReceivedFromShadow`) or acknowledged by the broker
+    /// (`SendReceipt` / `SendError`) — dropping it instead when the queue
+    /// already holds [`EVENT_QUEUE_OBSERVATIONAL_CAP`] entries.
+    /// Issues #413 and #423: nothing in the production runtime consumes these
+    /// events, so an unbounded queue grows for the life of the connection —
+    /// until OOM on a busy consumer, and equally on a busy producer. Dropping
+    /// is always safe: delivery goes through `pop_message` and send completion
+    /// through the operation outcome and its waker, both settled before the
+    /// event is queued. Non-observational events must keep going through
+    /// `self.events.push_back` directly (they are never dropped).
+    fn push_observational_event(&mut self, event: ConnectionEvent) {
+        debug_assert!(matches!(
+            event,
+            ConnectionEvent::Message { .. }
+                | ConnectionEvent::MessageReceivedFromShadow { .. }
+                | ConnectionEvent::SendReceipt { .. }
+                | ConnectionEvent::SendError { .. }
+        ));
+        // O(1) proxy: compare the TOTAL queue length against the cap rather
+        // than counting observational entries. Non-observational events are
+        // rare lifecycle signals, so past the cap the queue is observational
+        // for all practical purposes; the proxy at worst drops an
+        // observational event slightly early, which is harmless, and it never
+        // blocks a non-observational push (those bypass this helper).
+        if self.events.len() >= EVENT_QUEUE_OBSERVATIONAL_CAP {
+            self.dropped_observational_events = self.dropped_observational_events.saturating_add(1);
+            return;
+        }
+        self.events.push_back(event);
+    }
+
+    /// Number of observational per-message events dropped at the
+    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`] bound since the connection was
+    /// created. A nonzero value means message events are being emitted faster
+    /// than anything drains them — harmless (they are observability-only),
+    /// but a signal that no listener is consuming what the queue produces.
+    #[must_use]
+    pub fn dropped_observational_events(&self) -> u64 {
+        self.dropped_observational_events
     }
 
     /// Pull the next [`ConnectionEvent`], if any.
@@ -3965,6 +4305,17 @@ impl Connection {
             if let Some(d) = consumer.next_adjust_deadline() {
                 consider(d);
             }
+            // Issue #414: surface the per-consumer stall deadline so the driver wakes us
+            // deterministically for `handle_timeout`'s watchdog tick. `None` when the
+            // knob is disabled (the default) — no spurious wakeups, the same load-bearing
+            // determinism rationale the `ack_response_timeout` / `stats_interval` arms
+            // below carry — and `None` for a candidate whose window has not been seeded
+            // yet or has already reported.
+            if let Some(window) = self.config.consumer_stall_timeout {
+                if let Some(d) = consumer.next_stall_deadline(window) {
+                    consider(d);
+                }
+            }
         }
         for slot in self.producers.values() {
             let producer = slot.state.lock();
@@ -4096,6 +4447,12 @@ impl Connection {
         // re-borrowing `self.config` while `self.consumers` / `self.producers`
         // are borrowed.
         let stats_interval = self.config.stats_interval;
+        // Issue #414: hoisted for the same reason `stats_interval` is — one `Copy` read
+        // instead of re-borrowing `self.config` while `self.consumers` is borrowed.
+        let consumer_stall_timeout = self.config.consumer_stall_timeout;
+        // Stall reports staged inside the per-slot loop and pushed onto the event queue
+        // after it, under `&mut self` (same collect-then-mutate shape as `adjust_flows`).
+        let mut stall_reports: Vec<(ConsumerHandle, u32, std::time::Duration)> = Vec::new();
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -4191,6 +4548,135 @@ impl Connection {
             {
                 consumer.record_rate_window(now);
             }
+            // ---- BEGIN issue #414: per-consumer stall watchdog (CONSUMER slot) ----
+            // Progress-based, modelled on ADR-0058's keepalive but scoped to ONE
+            // consumer: the keepalive's `last_activity` is refreshed by every decoded
+            // frame, so a connection whose broker-side dispatcher wedged for a single
+            // subscription keeps it fresh forever. `poll_stall` runs entirely under the
+            // per-slot lock this loop already holds, with the injected `now` (ADR-0038
+            // lock ordering, ADR-0011 clock injection), and returns `Some` on exactly the
+            // one tick that closes a stall episode. No-op when the knob is disabled, in
+            // which case `poll_timeout` never arms the matching deadline either.
+            if let Some(window) = consumer_stall_timeout
+                && let Some(stalled_for) = consumer.poll_stall(window, now)
+            {
+                stall_reports.push((*handle, consumer.permit_balance, stalled_for));
+            }
+            // ---- END issue #414 ----
+        }
+        for (handle, permit_balance, stalled_for) in stall_reports {
+            // Computed BEFORE the macro, not inside it. `tracing` evaluates field
+            // expressions lazily behind its level check, so an expression written inline
+            // never runs when no subscriber is installed — which is every coverage run
+            // (ADR-0024's sim-coverage gate would report the line as dead). Hoisting also
+            // drops the lossy `as u64` cast.
+            let stalled_for_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX);
+            // ADR-0054 single-owner rule: `magnetar-proto` is the point of detection and
+            // holds the richest context, so it owns the log line; the engines drain the
+            // event without re-logging it.
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                permit_balance,
+                stalled_for_ms,
+                "consumer has a positive client-accounted permit balance over an empty queue \
+                 but received no dispatch for the stall window; correlate actual delivery \
+                 and broker per-consumer statistics before attributing a stall (#414)"
+            );
+            self.events.push_back(ConnectionEvent::ConsumerStalled {
+                handle,
+                permit_balance,
+                stalled_for,
+            });
+            // ---- BEGIN issue #414 / ADR-0103: bounded automatic recovery ----
+            // Opt-in. `None` (the default) leaves the watchdog exactly as ADR-0101 shipped
+            // it: report and stop. The event above is pushed either way, so arming this
+            // never suppresses the diagnosis — it only adds the first rung of the recovery
+            // ladder ahead of the operator having to climb it by hand.
+            //
+            // The rate limit is structural rather than a separate knob: `poll_stall`
+            // returns `Some` at most once per stall episode, and an episode cannot close
+            // more often than once per `consumer_stall_timeout`, so this can emit at most
+            // one `CommandSubscribe` per consumer per window. The bound then caps the
+            // total, which keeps a dispatcher-wide stall (as reported in issue #414)
+            // from turning into an unbounded re-subscribe loop. The incident's
+            // `-177300` was one ghost consumer's counter, not a measured aggregate.
+            if let Some(max_attempts) = self.config.consumer_stall_auto_recovery {
+                let (attempts, is_active) = self.consumers.get(&handle).map_or((0, None), |slot| {
+                    let consumer = slot.state.lock();
+                    (consumer.stall_recovery_attempts, consumer.is_active)
+                });
+                // Failover standby (issue #348's `is_active`): the broker is CORRECT not to
+                // dispatch here, so there is nothing to recover and a re-subscribe would be
+                // pure noise against a healthy consumer. A standby satisfies the stall
+                // predicate exactly as a wedged consumer does — it holds its initial grant
+                // over an empty queue, in a dispatch-eligible state, forever — and it never
+                // receives a dispatch unit, which is the only thing that resets the budget.
+                // Left unguarded, an armed recovery therefore spends its ENTIRE budget on
+                // every standby in a failover group and never gets it back.
+                //
+                // Checked before the exhausted arm on purpose: a consumer that spent its
+                // budget while active and was then demoted gets this skip rather than the
+                // `topics unload` escalation, which would be misleading operator guidance
+                // about a consumer whose silence the broker is producing deliberately.
+                //
+                // `None` — the broker never announced, i.e. every `Shared` / `Exclusive`
+                // subscription and a `Failover` one before its first
+                // `CommandActiveConsumerChange` — and `Some(true)` both fall through to the
+                // normal path. Only a *reported* standby is skipped.
+                if is_active == Some(false) {
+                    tracing::debug!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        permit_balance,
+                        attempts,
+                        max_attempts,
+                        "stall watchdog skipped automatic recovery for a Failover standby; \
+                         the broker is not dispatching to it by design, so no attempt is \
+                         made and no budget is spent (#414)"
+                    );
+                } else if attempts < max_attempts {
+                    // The budget is spent only on an attempt that actually went out.
+                    // `resubscribe_consumer_in_place` returns `None` — mutating nothing —
+                    // for a consumer whose next `CommandSubscribe` has another owner
+                    // (closing, unsubscribing, terminal, mid-seek, re-attach in flight),
+                    // and charging that to the budget would let an unrelated close race
+                    // exhaust the recovery a genuinely wedged consumer still needs.
+                    if let Some(request_id) = self.resubscribe_consumer_in_place(handle) {
+                        let attempt = attempts.saturating_add(1);
+                        if let Some(slot) = self.consumers.get(&handle) {
+                            slot.state.lock().stall_recovery_attempts = attempt;
+                        }
+                        tracing::info!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            attempt,
+                            max_attempts,
+                            "stall watchdog re-subscribed this consumer in place automatically; \
+                             the budget resets on the next dispatch unit (#414)"
+                        );
+                    }
+                } else {
+                    // Terminal for this streak, and emitted exactly once: the last attempt
+                    // was the last thing that re-armed the window, so no further episode
+                    // can open for this consumer without a dispatch unit first — and a
+                    // dispatch unit would have reset the budget.
+                    tracing::warn!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        permit_balance,
+                        attempts,
+                        max_attempts,
+                        "stall watchdog exhausted its automatic in-place re-subscribe budget \
+                         and is giving up on this consumer; the broker-side dispatcher is \
+                         possibly stalled subscription-wide — check broker backlog, \
+                         per-consumer availablePermits, and actual delivery before \
+                         escalating to `pulsar-admin topics unload` (#414)"
+                    );
+                }
+            }
+            // ---- END issue #414 / ADR-0103 ----
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked_data(handle, ids);
@@ -4251,12 +4737,12 @@ impl Connection {
         // Per-producer send-timeout sweep. Surface each timed-out send as an
         // `OpOutcome::SendError` so the caller's send future resolves with the configured
         // timeout error.
-        let mut send_timeouts: Vec<(ProducerHandle, SequenceId, Option<Waker>)> = Vec::new();
+        let mut send_timeouts: Vec<(ProducerHandle, OpSend)> = Vec::new();
         for (handle, slot) in &self.producers {
             let mut producer = slot.state.lock();
-            for (seq, waker) in producer.drain_timed_out_sends(now) {
+            for op in producer.drain_timed_out_sends(now) {
                 producer.total_send_failed = producer.total_send_failed.saturating_add(1);
-                send_timeouts.push((*handle, seq, waker));
+                send_timeouts.push((*handle, op));
             }
             // ADR-0089: rolling-rate sample for this producer — the PRODUCER-side
             // twin of the tick in the CONSUMER loop above, taken under the
@@ -4267,11 +4753,18 @@ impl Connection {
                 producer.record_rate_window(now);
             }
         }
-        for (handle, seq, waker) in send_timeouts {
+        for (handle, mut op) in send_timeouts {
             // Pulsar's ServerError enum has no TimeoutError; use the same `-1` sentinel
             // Java surfaces as TimeoutException with a descriptive message so callers can
-            // pattern-match on the error string.
-            self.resolve_send_error(handle, seq, SEND_TIMEOUT_CODE, SEND_TIMEOUT_MESSAGE, waker);
+            // pattern-match on the error string. Dropping the op afterwards releases its
+            // memory reservation, outside every per-slot lock (ADR-0111).
+            self.resolve_send_error(
+                handle,
+                op.sequence_id,
+                SEND_TIMEOUT_CODE,
+                SEND_TIMEOUT_MESSAGE,
+                op.waker.take(),
+            );
         }
 
         // Issue #369: send-timeout sweep for publishes RELOCATED by `reset()` into
@@ -4352,6 +4845,12 @@ impl Connection {
         // send-timeout sweep above. Skipped entirely when the knob is
         // disabled (`None`) — `poll_timeout` never arms a deadline in that
         // case either, so this loop is then a guaranteed no-op.
+        //
+        // Same issue #241 leak shape as `fail_acks_orphaned_by_consumer_reattach`:
+        // only records an `outcomes` entry when a waker is still parked, since a
+        // dropped `ack()` future (never calling `cancel_request`, see that
+        // function's doc comment) reaches this deadline sweep exactly the same
+        // way it reaches the close-triggered one.
         if let Some(timeout) = self.config.ack_response_timeout {
             let expired_acks: Vec<(RequestId, ConsumerHandle)> = self
                 .pending_requests
@@ -4369,15 +4868,17 @@ impl Connection {
             for (rid, handle) in expired_acks {
                 self.pending_requests.remove(&rid);
                 let message = "ack timeout".to_owned();
-                self.outcomes.insert(
-                    PendingOpKey::Request(rid),
-                    OpOutcome::Error {
-                        request_id: rid,
-                        code: -1,
-                        message: message.clone(),
-                    },
-                );
-                self.wake_for_request(rid);
+                if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(rid),
+                        OpOutcome::Error {
+                            request_id: rid,
+                            code: -1,
+                            message: message.clone(),
+                        },
+                    );
+                    self.wake_for_request(rid);
+                }
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
                     consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
@@ -4387,6 +4888,62 @@ impl Connection {
                     result: Err(message),
                 });
             }
+        }
+    }
+
+    /// Install an `OpOutcome::Terminal` for each op drained out of `handle`'s pending queue and
+    /// wake its future — through the op's own waker when it still carries one, through the
+    /// connection-wide slab otherwise. Each op is dropped after its wake, which releases its
+    /// memory reservation (ADR-0111); the caller has already released the per-slot lock.
+    ///
+    /// Shared by [`Self::fail_all_pending`], [`Self::fail_producer_open_with_broker_error`]
+    /// and [`Self::fail_sends_of_closed_producer`].
+    fn terminalize_drained_sends(
+        &mut self,
+        handle: ProducerHandle,
+        drained: Vec<OpSend>,
+        reason: &str,
+    ) {
+        for mut op in drained {
+            let key = PendingOpKey::Send(handle, op.sequence_id);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            // Prefer the producer-stored waker; drop any connection-level slab waker for
+            // this key too so it is not double-fired by a later sweep.
+            let slab_waker = self.wakers.remove(&key);
+            if let Some(w) = op.waker.take().or(slab_waker) {
+                w.wake();
+            }
+        }
+    }
+
+    /// Fail every publish of a producer whose `CommandCloseProducer` the broker acknowledged.
+    ///
+    /// Once the broker has acknowledged the close, the producer id is gone on its side, so
+    /// no receipt can ever arrive for whatever is still pending here — typically messages
+    /// still in the batch container, which `close` stops flushing. Mirrors Java
+    /// `ProducerImpl#closeAndClearPendingMessages`: the futures fail and the memory
+    /// reservations are released (issue #867, ADR-0111), instead of both lingering for as
+    /// long as the connection keeps the closed slot.
+    ///
+    /// Only the acknowledgement of the close this client last issued for the slot
+    /// (`close_request`) drains it: the fire-and-forget re-close of an abandoned producer id
+    /// (issue #406) can be acknowledged after [`Self::create_producer`] re-attached a new
+    /// producer under the same id — open, or since closed by its own user — and that
+    /// producer's sends must not be failed by the old id's close.
+    fn fail_sends_of_closed_producer(&mut self, handle: ProducerHandle, acked: RequestId) {
+        let drained = self.producers.get(&handle).and_then(|slot| {
+            let mut state = slot.state.lock();
+            (state.close_request == Some(acked)).then(|| state.drain_pending_sends())
+        });
+        if let Some(drained) = drained {
+            self.terminalize_drained_sends(handle, drained, PRODUCER_CLOSED_REASON);
+            self.terminalize_snapshot_bucket(handle, PRODUCER_CLOSED_REASON);
         }
     }
 
@@ -4451,9 +5008,10 @@ impl Connection {
                 message: message.to_owned(),
             },
         );
+        let slab_waker = self.wakers.remove(&key);
         if let Some(w) = waker {
             w.wake();
-        } else if let Some(w) = self.wakers.remove(&key) {
+        } else if let Some(w) = slab_waker {
             w.wake();
         }
         self.events.push_back(ConnectionEvent::SendError {
@@ -4574,12 +5132,189 @@ impl Connection {
         self.wakers.len()
     }
 
+    /// The `(topic, producer_name)` a request registers under for the issue
+    /// #406 recovery, or `None` when the open carries no user-provided name
+    /// (the broker assigns a unique one, which cannot collide).
+    fn abandoned_open_key(req: &CreateProducerRequest) -> Option<(String, String)> {
+        req.producer_name
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .map(|name| (req.topic.clone(), name.clone()))
+    }
+
+    /// The `(topic, producer_name)` an open handle registers under, if it has
+    /// a user-provided name.
+    fn abandoned_open_key_of(&self, handle: ProducerHandle) -> Option<(String, String)> {
+        self.producer_create_requests
+            .get(&handle)
+            .and_then(Self::abandoned_open_key)
+    }
+
+    /// Remember `handle` as an abandoned open under `key` so a later
+    /// `ProducerBusy` can be recovered from (issue #406, ADR-0100).
+    ///
+    /// The store is a fixed ring, so this is an unconditional overwrite: no
+    /// capacity test, no eviction choice, no growth.
+    fn remember_abandoned_producer_open(&mut self, handle: ProducerHandle, key: (String, String)) {
+        let slot = self.abandoned_producer_opens_next % MAX_ABANDONED_PRODUCER_OPENS;
+        self.abandoned_producer_opens_next = self.abandoned_producer_opens_next.wrapping_add(1);
+        self.abandoned_producer_opens[slot] = Some(AbandonedProducerOpen {
+            topic: key.0,
+            producer_name: key.1,
+            handle,
+            reclosed: false,
+            next_epoch: 1,
+        });
+    }
+
+    /// Drop every record for `handle`'s name — its open attached, so this
+    /// client owns the registration and nothing is left to reclaim.
+    fn forget_abandoned_producer_opens(&mut self, handle: ProducerHandle) {
+        let Some((topic, producer_name)) = self.abandoned_open_key_of(handle) else {
+            return;
+        };
+        for slot in &mut self.abandoned_producer_opens {
+            let matches = slot
+                .as_ref()
+                .is_some_and(|rec| rec.topic == topic && rec.producer_name == producer_name);
+            if matches {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Issue #406 recovery: the broker answered `ProducerBusy` for a name this
+    /// connection previously abandoned an open under.
+    ///
+    /// That answer is the unambiguous moment the cancel-time close never had.
+    /// Cancellation emits its `CommandCloseProducer` while the broker's own
+    /// producer creation may still be in flight — Pulsar completes a
+    /// close-before-creation by failing the pending creation future and acking
+    /// Success, and whether the registration that creation goes on to make is
+    /// then reaped is not something the client can observe or control. A
+    /// `ProducerBusy` proves it was not. By then the registration is complete
+    /// and addressable, so:
+    ///
+    /// 1. **first busy** — re-close every remembered id that has not been re-closed yet, and mark
+    ///    it. This lands on the broker's completed-producer path (`producer.close()`), which
+    ///    releases the name, and the caller's retry (ADR-0080 makes `ProducerBusy` retryable)
+    ///    re-issues the open behind it on the same ordered connection.
+    /// 2. **still busy afterwards** — the broker no longer maps that id to anything, so no close
+    ///    can reach the registration. Recovery escalates in [`Self::create_producer`], which
+    ///    re-attaches under the abandoned id itself.
+    ///
+    /// Returns `true` when a re-close was emitted.
+    fn reclaim_busy_producer_name(&mut self, handle: ProducerHandle, code: i32) -> bool {
+        if !matches!(
+            pb::ServerError::try_from(code),
+            Ok(pb::ServerError::ProducerBusy)
+        ) {
+            return false;
+        }
+        let Some((topic, producer_name)) = self.abandoned_open_key_of(handle) else {
+            return false;
+        };
+        let stale: Vec<ProducerHandle> =
+            self.abandoned_producer_opens
+                .iter_mut()
+                .filter_map(|slot| {
+                    let rec = slot.as_mut()?;
+                    (!rec.reclosed && rec.topic == topic && rec.producer_name == producer_name)
+                        .then(|| {
+                            rec.reclosed = true;
+                            rec.handle
+                        })
+                })
+                .collect();
+        for abandoned in &stale {
+            let close_request_id = self.close_producer_forget(*abandoned);
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                abandoned_handle = ?abandoned,
+                request_id = ?close_request_id,
+                topic = %topic,
+                producer_name = %producer_name,
+                "producer name reported busy; re-closing an abandoned producer id whose broker-side registration outlived its cancellation (issue #406)"
+            );
+        }
+        !stale.is_empty()
+    }
+
+    /// Issue #406 recovery, escalation: pick the abandoned producer id this
+    /// open should re-attach under, and the epoch that makes it a strict
+    /// successor of the registration it is reclaiming.
+    ///
+    /// Only ids already re-closed once qualify. A re-close that did not free
+    /// the name means the broker no longer maps the id, which is exactly the
+    /// state in which re-sending `CommandProducer` under it reaches Pulsar's
+    /// successor path instead of colliding with a live entry on the
+    /// connection. Doing this before the re-close would instead collide with
+    /// the broker's own record of that id.
+    ///
+    /// Limited to `Shared` producers: for the exclusive access modes the epoch
+    /// participates in topic-epoch fencing, and those modes have broker-side
+    /// ownership arbitration of their own.
+    fn reattach_abandoned_producer_open(
+        &mut self,
+        req: &CreateProducerRequest,
+    ) -> Option<(ProducerHandle, u64)> {
+        if req.access_mode != pb::ProducerAccessMode::Shared {
+            return None;
+        }
+        let (topic, producer_name) = Self::abandoned_open_key(req)?;
+        // One name can carry several abandoned ids — a caller-visible open
+        // retries — and only one of them owns the surviving registration.
+        // Picking the LEAST-TRIED candidate round-robins across them, since
+        // each attempt bumps only the id it used, so every candidate is tried
+        // before any is tried twice. Taking the first match instead would
+        // re-attach under the same wrong id until the retry budget ran out.
+        let rec = self
+            .abandoned_producer_opens
+            .iter_mut()
+            .filter_map(|slot| {
+                let rec = slot.as_mut()?;
+                (rec.reclosed && rec.topic == topic && rec.producer_name == producer_name)
+                    .then_some(rec)
+            })
+            .min_by_key(|rec| rec.next_epoch)?;
+        let epoch = rec.next_epoch;
+        rec.next_epoch = rec.next_epoch.saturating_add(1);
+        Some((rec.handle, epoch))
+    }
+
     /// Open a producer. The state machine emits a `CommandProducer` and assigns a
     /// [`ProducerHandle`]. The corresponding [`ConnectionEvent::ProducerReady`] arrives on the
     /// next `poll_event` cycle after the broker responds.
+    ///
+    /// **Issue #406 re-attach.** When this connection previously abandoned an
+    /// open for the same `(topic, producer_name)`, the newest abandoned
+    /// producer id is REUSED instead of allocating a fresh one, and the open
+    /// carries a strictly higher epoch. That is Pulsar's own re-attach shape —
+    /// the same one [`Self::rebuild_producers`] uses after a reconnect — and it
+    /// is what lets the broker recognise the open as a successor of the
+    /// registration it is reclaiming rather than as a stranger colliding with
+    /// it. Allocating a fresh id every retry, as this method used to do
+    /// unconditionally, makes every attempt a stranger and is why the retry
+    /// loop could never recover the name on its own.
     pub fn create_producer(&mut self, req: CreateProducerRequest) -> ProducerHandle {
-        let handle = ProducerHandle(self.next_producer_id);
-        self.next_producer_id = self.next_producer_id.wrapping_add(1);
+        let (handle, reattach_epoch) = match self.reattach_abandoned_producer_open(&req) {
+            Some((handle, epoch)) => {
+                tracing::warn!(
+                    target: "magnetar_proto::conn",
+                    handle = ?handle,
+                    epoch,
+                    topic = %req.topic,
+                    "reusing an abandoned producer id to re-attach a pinned producer name (issue #406)"
+                );
+                (handle, epoch)
+            }
+            None => {
+                let handle = ProducerHandle(self.next_producer_id);
+                self.next_producer_id = self.next_producer_id.wrapping_add(1);
+                (handle, 0)
+            }
+        };
         let max_size = self
             .broker_max_message_size
             .unwrap_or(self.config.default_max_message_size);
@@ -4595,6 +5330,12 @@ impl Connection {
         state.send_timeout = req.send_timeout;
         state.batching_max_publish_delay = req.batching_max_publish_delay;
         state.access_mode = req.access_mode;
+        // Issue #406: a re-attach stamps a strictly higher epoch than the
+        // abandoned open it is reclaiming, so `emit_command_producer` puts a
+        // non-zero `CommandProducer.epoch` on the wire and the broker can
+        // recognise this open as that registration's successor. A fresh open
+        // keeps epoch 0 and omits the field, exactly as before.
+        state.epoch = reattach_epoch;
         seed_rate_window_baseline(
             &mut state.last_rate_snapshot,
             self.config.stats_interval,
@@ -4775,6 +5516,9 @@ impl Connection {
                 })
                 .collect(),
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
+            // PIP-486 entry-bucket dispatch is for scalable-topic segment
+            // sharing only; a plain Key_Shared subscription leaves it unset.
+            entry_bucket_dispatch: None,
         });
         let start_message_id = resume_from.map(MessageId::to_pb);
         let consumer_metadata: Vec<pb::KeyValue> = req
@@ -4816,6 +5560,26 @@ impl Connection {
             .insert(request_id, PendingRequestKind::ConsumerSubscribe { handle });
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
+            // Issue #427: the broker creates its dispatcher slot for this consumer id at
+            // `availablePermits = 0`, so this attach owes exactly one initial
+            // `CommandFlow` whichever site ends up issuing it — the `Success` arm below on
+            // `ReleaseFlow`, the runtime's post-ack call on `NotifyWaiter`, or the #307
+            // promotion re-arm when a `CommandActiveConsumerChange` beats the runtime to
+            // it. `Self::initial_flow` clears the flag as it grants, which is what makes
+            // the second of those two racing callers a no-op instead of a double grant.
+            //
+            // "Creates" is exact, and every caller of this helper is responsible for
+            // making it true. `ServerCnx.handleSubscribe` checks its own per-connection
+            // `consumers` map FIRST, and a `consumers.putIfAbsent` hit on an
+            // already-completed consumer answers `sendSuccessResponse(requestId)` without
+            // constructing a `Consumer` or touching `availablePermits` (identical at
+            // v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414`, master
+            // `:2037-2044`). For such an id the grant below is a second window the broker
+            // never agreed to, which is why ADR-0108's recovery closes the consumer before
+            // it re-subscribes. Every other caller — the first attach, `rebuild_consumers`
+            // after a reset, the post-seek re-attach, the issue #307 broker-close arm —
+            // reaches a broker that is not holding this id.
+            consumer.initial_grant_due = true;
             match ack_action {
                 SubscribeAckAction::NotifyWaiter => {
                     consumer.subscribe_waiter_id = Some(request_id);
@@ -4863,12 +5627,65 @@ impl Connection {
     ///
     /// Both the flow command and the arming happen under a single per-slot lock
     /// acquisition, dropped before the connection-wide encode (ADR-0038).
+    ///
+    /// # Grants at most once per attach (issue #427)
+    ///
+    /// Two independent sites can each decide this consumer needs its initial grant, and on
+    /// a fresh `Exclusive` / `Failover` subscribe a real broker makes both fire: it sends
+    /// `CommandActiveConsumerChange { is_active: true }` immediately behind the subscribe
+    /// `Success`, so the #307 promotion re-arm runs inside `handle_bytes` while the
+    /// runtime's own post-ack call is still parked on the resolving subscribe future. Both
+    /// granted, and the broker held `2 × receiver_queue_size` for a consumer whose client
+    /// mirrors recorded one (measured 32 against a configured 16).
+    ///
+    /// So this method grants only when the current attach has not been granted yet:
+    ///
+    /// - `initial_grant_due` — a `CommandSubscribe` has gone out since the last grant, so the
+    ///   broker's freshly (re-)created dispatcher slot starts at zero permits. This is the only
+    ///   signal on the post-seek resubscribe path, which re-attaches without zeroing the additive
+    ///   `granted_permits` mirror.
+    /// - `granted_permits == 0` — the client holds no outstanding grant at all, which is the churn
+    ///   boundary the #307 re-arm exists for: a promoted standby whose mirrors a reset / terminal
+    ///   failure / same-broker `CommandCloseConsumer` zeroed still gets its flow back here.
+    ///
+    /// Neither being true means this attach's grant already reached the broker, and a
+    /// second one would be the double grant above — so the call is a no-op. `maybe_flow`
+    /// and `adjust_receiver_queue` are untouched: replenishment and growth are incremental
+    /// top-ups that do not route through here.
     pub fn initial_flow(&mut self, handle: ConsumerHandle, now: Instant) -> Option<RequestId> {
-        let flow_cmd = {
+        let Some(flow_cmd) = ({
             let mut consumer = self.consumers.get(&handle)?.state.lock();
-            let flow_cmd = consumer.initial_flow();
-            consumer.arm_adjust_clock(now);
-            flow_cmd
+            // `is_flow_starved` (issue #331 lineage): a previously-fed consumer whose
+            // client-accounted balance drained to zero with no way to reach `maybe_flow` again is
+            // owed a grant exactly as much as an untouched one — the additive
+            // `granted_permits` mirror alone cannot see the difference between "fed
+            // and healthy" and "fed and starved". The predicate is `false` whenever
+            // any queued-or-counted progress can still trigger replenishment, so the
+            // #427 no-double-grant contract is preserved: a consumer with permits
+            // in flight or a viable pop path is still refused here.
+            if consumer.initial_grant_due
+                || consumer.granted_permits == 0
+                || consumer.is_flow_starved()
+            {
+                let flow_cmd = consumer.initial_flow();
+                consumer.arm_adjust_clock(now);
+                // Issue #414: the same injected `now` opens the stall window. A full grant is
+                // where a wedge starts — the broker has acknowledged permits it may never
+                // spend — and it is the only grant site with a clock, so seeding here is what
+                // keeps detection at `consumer_stall_timeout` rather than that plus a
+                // keepalive interval waiting for the first sweep to find a baseline.
+                consumer.arm_stall_watch(now);
+                Some(flow_cmd)
+            } else {
+                None
+            }
+        }) else {
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                "initial flow already granted for this attach; skipping redundant grant (#427)"
+            );
+            return None;
         };
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
@@ -4892,20 +5709,50 @@ impl Connection {
         publish_time_ms: u64,
         now: Instant,
     ) -> Result<SequenceId, ProtocolError> {
+        self.send_reserved(
+            handle,
+            msg,
+            MemoryReservation::default(),
+            publish_time_ms,
+            now,
+        )
+    }
+
+    /// [`Self::send`] for a publish that already holds `reservation` against the client-wide
+    /// memory budget (issue #867, ADR-0111). The reservation moves into the publish's
+    /// [`OpSend`] and is released when that op leaves the client; on rejection it is released
+    /// here, after the per-slot guard is gone.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::send`].
+    pub fn send_reserved(
+        &mut self,
+        handle: ProducerHandle,
+        msg: crate::producer::OutgoingMessage,
+        reservation: MemoryReservation,
+        publish_time_ms: u64,
+        now: Instant,
+    ) -> Result<SequenceId, ProtocolError> {
+        let mut reservation = reservation;
         let slot = self
             .producers
             .get(&handle)
             .ok_or(ProtocolError::InvariantViolation("unknown producer handle"))?;
-        let seq_id = {
+        let queued = {
             let mut producer = slot.state.lock();
-            let decision = producer
-                .queue_send(msg, publish_time_ms, now)
-                .map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
-            match decision {
-                SendDecision::Emit { .. } | SendDecision::Batched => {}
-            }
-            SequenceId(producer.last_sequence_id_pushed.max(0) as u64)
+            producer
+                .queue_send_reserved(msg, &mut reservation, publish_time_ms, now)
+                .map(|decision| {
+                    match decision {
+                        SendDecision::Emit { .. } | SendDecision::Batched => {}
+                    }
+                    SequenceId(producer.last_sequence_id_pushed.max(0) as u64)
+                })
         };
+        drop(reservation);
+        let seq_id =
+            queued.map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
         self.drain_producer_outbound();
         Ok(seq_id)
     }
@@ -5086,22 +5933,33 @@ impl Connection {
             .map_or(0, |slot| slot.state.lock().queue_len())
     }
 
-    /// Number of dispatch permits the consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push without an explicit `CommandFlow`. Returns `0`
-    /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    /// Client-accounted unspent dispatch permits: grants recorded locally minus dispatch
+    /// units received. Returns `0` for unknown handles. Mirrors the arithmetic of Java
+    /// `ConsumerBase#getAvailablePermits`, not broker admin `consumers[].availablePermits`.
     ///
-    /// Issue #349 scope note: this reads [`crate::consumer::ConsumerState::granted_permits`]
-    /// (the additive grant mirror), unchanged by the permit-balance split — out of scope per
-    /// the issue's four locked design items, which name only
-    /// [`crate::receiver_queue::FlowStats::available_permits`]. For the REAL, decrementing
-    /// balance see [`crate::consumer::ConsumerState::permit_balance`]; extending Java-parity
-    /// (a genuinely decrementing counter) to this public accessor is a separate, unscoped
-    /// change.
+    /// Reads [`crate::consumer::ConsumerState::permit_balance`], the local decrementing
+    /// estimate: one unit off per received dispatch unit (plain message, batch member,
+    /// buffered chunk, PIP-33 marker), topped back up at every grant, and force-zeroed at
+    /// every churn boundary.
+    ///
+    /// **Semantic change (issue #414).** Until this change the accessor read
+    /// `granted_permits`, the purely-ADDITIVE grant mirror — ADR-0082 split the two
+    /// counters but deliberately left this accessor on the additive one as out of scope.
+    /// The additive value makes the wedge issue #414 reports undetectable from the
+    /// client: it sits at the receiver-queue size forever whether the broker is
+    /// dispatching or has gone silent, so polling it cannot reveal dispatch silence.
+    /// `permit_balance` moves under real dispatch and supplies a client-side silence
+    /// signal; correlate it with broker stats and delivery before attributing a wedge.
+    /// ADR-0101 amends ADR-0082 §Consequences accordingly.
+    ///
+    /// For "how much have we told the broker it may use" — the question the #307
+    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta ask — read
+    /// [`crate::consumer::ConsumerState::granted_permits`] directly; it is unchanged.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
         self.consumers
             .get(&handle)
-            .map_or(0, |slot| slot.state.lock().granted_permits)
+            .map_or(0, |slot| slot.state.lock().permit_balance)
     }
 
     /// Last broker-reported Failover active/standby state for `handle`
@@ -5287,6 +6145,26 @@ impl Connection {
         now: Instant,
     ) -> RequestId {
         let request_id = self.alloc_request_id();
+        if matches!(ack.ack_type, pb::command_ack::AckType::Individual)
+            && ack.message_ids.iter().any(|id| {
+                id.batch_index >= 0 && (id.batch_size <= 0 || id.batch_index >= id.batch_size)
+            })
+        {
+            let key = PendingOpKey::Request(request_id);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Error {
+                    request_id,
+                    code: INVALID_BATCH_ACK_CODE,
+                    message: INVALID_BATCH_ACK_MESSAGE.to_owned(),
+                },
+            );
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+            }
+            return request_id;
+        }
         let n_ids = ack.message_ids.len() as u64;
         let ack_type = ack.ack_type;
         let txn_id = ack.txn_id;
@@ -6186,7 +7064,11 @@ impl Connection {
         };
         let _ = self.encode_command(&base);
         if let Some(slot) = self.producers.get(&handle) {
-            slot.state.lock().close();
+            let mut state = slot.state.lock();
+            state.close();
+            state.close_request = Some(request_id);
+            drop(state);
+            slot.set_routing_ready(false);
         }
         let kind = if forget {
             PendingRequestKind::ProducerCloseForgotten { handle }
@@ -6747,6 +7629,22 @@ impl Connection {
     /// `topic` may be a `topic://`, a `persistent://`, or a short name; the
     /// broker normalises it and returns the canonical identity in the update.
     ///
+    /// `create_if_missing` is written to the command **explicitly**, whichever
+    /// value it has (ADR-0093 amendment 2026-10-12), so the request means the
+    /// same thing whatever the peer's version. Pulsar 5.0.0 added the field with
+    /// a default of `true`: a lookup of a missing `topic://` topic then
+    /// auto-creates it, subject to the broker's auto-creation policy, where
+    /// 5.0.0-M1 answered not-found and had no such field. An M1 broker skips the
+    /// unknown field.
+    ///
+    /// The caller chooses. `true` is for a lookup that opens a consumer or
+    /// producer on an explicit single topic, which is what the Java v5 client
+    /// sends on every such path (`DagWatchClient.java:77-79`,
+    /// `Commands.java:1793-1799` at `v5.0.0`). `false` is for a read-only
+    /// lookup and for a namespace (multi-topic) consumer, so that a lookup, or a
+    /// reconnecting per-topic watch, never creates or resurrects a topic
+    /// (`MultiTopicQueueConsumer.java:169`). An existing topic ignores the flag.
+    ///
     /// # Errors
     ///
     /// [`crate::dag_watch::ScalableTopicError::BrokerUnsupported`] when the peer did not
@@ -6756,6 +7654,7 @@ impl Connection {
     pub fn open_scalable_topic_session(
         &mut self,
         topic: &str,
+        create_if_missing: bool,
     ) -> Result<u64, crate::dag_watch::ScalableTopicError> {
         if !self.broker_supports_scalable_topics() {
             return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
@@ -6767,6 +7666,7 @@ impl Connection {
             scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
                 session_id,
                 topic: topic.to_owned(),
+                create_if_missing: Some(create_if_missing),
             }),
             ..Default::default()
         };
@@ -7344,6 +8244,66 @@ impl Connection {
         Some(request_id)
     }
 
+    /// Re-attach a producer the broker closed on a still-live socket: re-emit
+    /// `CommandProducer` for the SAME producer id with a bumped `epoch`, keeping the
+    /// send-drain gate shut until the broker's fresh `CommandProducerSuccess` (issue
+    /// #451, ADR-0106).
+    ///
+    /// This is the producer twin of [`Self::emit_in_place_consumer_resubscribe`] (issue
+    /// #307). Unlike [`Self::rebuild_producers`] (whole-connection sweep, runs only after
+    /// a `reset` + new handshake) it re-attaches exactly one producer without a transport
+    /// reconnect, the way [`Self::retry_producer_open_if_current`] does after a transient
+    /// open rejection.
+    ///
+    /// Returns the new open [`RequestId`], or `None` (no wire traffic, no state mutated)
+    /// when the slot is not eligible — see
+    /// [`Self::producer_reattach_in_place_is_eligible`]. Drains any stale
+    /// `ProducerClosedByBroker` event for this handle first, so a runtime wait future
+    /// cannot trip on a close the re-attach has already superseded.
+    ///
+    /// The staged/pending sends are left in the slot: their replay is owned by the
+    /// `ProducerSuccess` arm (`replay_pending_outbound`), because Pulsar closes the whole
+    /// connection on a `CommandSend` that arrives before the attach completes. Each keeps
+    /// its ORIGINAL `enqueued_at` deadline, so a `send_timeout` keeps ticking across the
+    /// re-attach exactly as Java's does.
+    fn emit_in_place_producer_reattach(&mut self, handle: ProducerHandle) -> Option<RequestId> {
+        if !self.producer_create_requests.contains_key(&handle) {
+            // Never created here (e.g. a close naming a producer id we do not own, or one
+            // whose create request a user close already forgot) — nothing to replay.
+            return None;
+        }
+        {
+            let slot = self.producers.get(&handle)?;
+            let mut producer = slot.state.lock();
+            if !Self::producer_reattach_in_place_is_eligible(&producer) {
+                return None;
+            }
+            // The broker detached this producer id: shut the drain gate until the
+            // re-attach is acked. Pulsar closes the WHOLE connection on a `CommandSend`
+            // for a producer that is not ready.
+            slot.set_broker_ready(&mut producer, false, false);
+        }
+        self.events.retain(
+            |ev| !matches!(ev, ConnectionEvent::ProducerClosedByBroker { handle: h, .. } if *h == handle),
+        );
+        self.retry_producer_open_inner(handle)
+    }
+
+    /// Whether an in-place re-attach may be emitted for this producer.
+    ///
+    /// Each rejected state has an owner that would otherwise be raced: `closed` means the
+    /// user is closing the producer and owns the handle, `!has_ever_attached` means the
+    /// routing-aware client open loop still owns the first attachment, and
+    /// `open_request_id.is_some()` means an open is already in flight (a second
+    /// `CommandProducer` for the same id would leave one of the two replies unmatched and
+    /// the drain gate stuck).
+    ///
+    /// Pure read of an already-locked slot — the caller holds `slot.state.lock()`, so this
+    /// must never reach back for the connection mutex (ADR-0038 lock ordering).
+    fn producer_reattach_in_place_is_eligible(p: &crate::producer::ProducerState) -> bool {
+        !p.closed && p.has_ever_attached && p.open_request_id.is_none()
+    }
+
     /// Whether this failed wire request still owns the consumer's active
     /// subscribe generation.
     ///
@@ -7404,67 +8364,60 @@ impl Connection {
             if c.closed {
                 return None;
             }
-            // Resume from the last acked id when we have one (same logic
-            // `rebuild_consumers` uses). The broker treats an unset
-            // `start_message_id` as "from the configured initial position".
-            c.last_acked_message_id
+            Self::consumer_reattach_start_message_id(&req, &c)
         };
         let request_id =
             self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
         Some(request_id)
     }
 
-    /// Re-subscribe a single consumer in place after the broker tore its
-    /// dispatcher down via a same-broker `CommandCloseConsumer`
-    /// (`assigned_broker_service_url = None`) on a still-live socket — issue
-    /// #307's proven root cause.
+    /// Re-subscribe a single consumer in place on the still-live socket: re-emit
+    /// `CommandSubscribe` for the SAME consumer id and defer the initial `CommandFlow` to
+    /// the broker's re-subscribe `Success`.
     ///
-    /// Unlike [`Self::rebuild_consumers`] (whole-connection sweep, runs after a
-    /// `reset`) this re-attaches exactly one consumer without a transport
-    /// reconnect, the way [`Self::resubscribe_consumer_after_seek`] does after a
-    /// seek and [`Self::retry_consumer_subscribe`] does after a transient
-    /// subscribe rejection. It reuses the same machinery: re-emit
-    /// `CommandSubscribe` (resuming from the last acked id so the broker picks
-    /// up where draining stopped) and set `flow_on_subscribe_ack` so the initial
-    /// `CommandFlow` is deferred to the broker's re-subscribe `Success` (Pulsar
-    /// silently drops `CommandFlow` for a consumer id whose subscribe is still
-    /// being processed — `ServerCnx.handleFlow` "Couldn't find consumer").
+    /// This is the shared emit half of issue #307's proven same-broker
+    /// `CommandCloseConsumer` fix (`assigned_broker_service_url = None`) and of phase 2
+    /// of issue #414's caller-driven [`Self::resubscribe_consumer_in_place`]. **Both
+    /// callers reach it only once the broker has really dropped the consumer** — #307
+    /// because the broker closed it, ADR-0108 because it asked the broker to and waited
+    /// for the ack. That is the precondition, not an incidental property: a
+    /// `CommandSubscribe` naming a consumer id the broker still holds is answered
+    /// `CommandSuccess` and changes nothing (`ServerCnx.java:1320-1326`), so emitting one
+    /// from anywhere else would repair nothing while the deferred grant below took a
+    /// second window the broker never agreed to. Unlike
+    /// [`Self::rebuild_consumers`] (whole-connection sweep, runs after a `reset`) it
+    /// re-attaches exactly one consumer without a transport reconnect, the way
+    /// [`Self::resubscribe_consumer_after_seek`] does after a seek and
+    /// [`Self::retry_consumer_subscribe`] does after a transient subscribe rejection.
     ///
-    /// Skips (no-op) when the consumer is unknown, was never subscribed, is
-    /// user-closed, terminal, mid-seek (the seek's own
-    /// [`Self::resubscribe_consumer_after_seek`] owns re-attach), or already has
-    /// a re-attach pending (`flow_on_subscribe_ack` — `rebuild_consumers` /
-    /// transient-retry in flight). Drains any stale `ConsumerClosedByBroker`
-    /// event for this handle first so a runtime wait-future cannot trip on it
-    /// before the fresh `SubscribeAcked` (mirrors
+    /// The deferral is load-bearing: Pulsar silently drops `CommandFlow` for a consumer id
+    /// whose subscribe is still being processed (`ServerCnx.handleFlow` "Couldn't find
+    /// consumer"), so `SubscribeAckAction::ReleaseFlow` makes the `Success` arm issue the
+    /// grant against a live consumer id.
+    ///
+    /// Returns `None` (no wire traffic, nothing mutated) when the consumer is unknown, was
+    /// never subscribed, is user-closed, unsubscribing, terminal, mid-seek (the seek's own
+    /// [`Self::resubscribe_consumer_after_seek`] owns re-attach), or already has a
+    /// re-attach pending (`flow_on_subscribe_ack` — `rebuild_consumers` / transient-retry
+    /// in flight). Drains any stale `ConsumerClosedByBroker` event for this handle first so
+    /// a runtime wait-future cannot trip on it before the fresh `SubscribeAcked` (mirrors
     /// `resubscribe_consumer_after_seek`).
     ///
     /// The receiver queue is left intact — already-dispatched messages stay
     /// user-visible (the #65 / `duringSeek` invariant).
-    fn resubscribe_consumer_after_broker_close(&mut self, handle: ConsumerHandle) {
+    fn emit_in_place_consumer_resubscribe(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
         let Some(req) = self.consumer_subscribe_requests.get(&handle).cloned() else {
             // Never subscribed (e.g. the broker closed a consumer whose
             // subscribe never landed) — nothing to replay.
-            return;
+            return None;
         };
         let resume_from = {
-            let Some(slot) = self.consumers.get(&handle) else {
-                return;
-            };
+            let slot = self.consumers.get(&handle)?;
             let c = slot.state.lock();
-            if c.closed
-                || c.unsubscribe_request_id.is_some()
-                || c.terminal_failure.is_some()
-                || c.pending_seek.is_some()
-                || c.flow_on_subscribe_ack
-            {
-                return;
+            if !Self::consumer_reattach_in_place_is_eligible(&c) {
+                return None;
             }
-            // Resume from the last acked id when known (same logic
-            // `rebuild_consumers` / `retry_consumer_subscribe` use); the broker
-            // treats an unset `start_message_id` as "from the configured initial
-            // position" and otherwise resumes from its persisted cursor.
-            c.last_acked_message_id
+            Self::consumer_reattach_start_message_id(&req, &c)
         };
         // Drop the stale close-by-broker event(s) for this handle: the runtime's
         // `EventWaitFut` only consumes them while parked on the initial
@@ -7474,13 +8427,321 @@ impl Connection {
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
-        let _ =
-            self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
-        tracing::debug!(
+        Some(self.emit_command_subscribe(
+            handle,
+            &req,
+            resume_from,
+            SubscribeAckAction::ReleaseFlow,
+        ))
+    }
+
+    /// Whether an in-place re-subscribe may be emitted for this consumer.
+    ///
+    /// Each rejected state has an owner that would otherwise be raced: `closed` and
+    /// `unsubscribe_request_id` mean the consumer is going away, `terminal_failure` means
+    /// it is already dead, `pending_seek` means the seek's own re-attach owns the next
+    /// `CommandSubscribe`, and `flow_on_subscribe_ack` means a re-attach is already in
+    /// flight (a second `CommandSubscribe` for the same id would leave one of the two
+    /// `Success` replies unmatched and the flow gate stuck).
+    ///
+    /// Pure read of an already-locked slot — the caller holds `slot.state.lock()`, so
+    /// this must never reach back for the connection mutex (ADR-0038 lock ordering).
+    fn consumer_reattach_in_place_is_eligible(c: &crate::consumer::ConsumerState) -> bool {
+        !(c.closed
+            || c.unsubscribe_request_id.is_some()
+            || c.terminal_failure.is_some()
+            || c.pending_seek.is_some()
+            || c.flow_on_subscribe_ack)
+    }
+
+    /// Fail every in-flight ack for `handle` immediately (issue #346).
+    ///
+    /// An ack in flight when this consumer's broker-side dispatcher is torn down is
+    /// orphaned: the old consumer id is gone, so no `CommandAckResponse` for it will EVER
+    /// arrive on this connection — the re-attach carries a fresh `CommandSubscribe`. Fail
+    /// them here so the caller's `ack().await` resolves immediately instead of parking
+    /// until the `ack_response_timeout` backstop (or, if that knob is disabled, forever).
+    ///
+    /// MUST run before the re-subscribe emit: that helper early-returns on several states,
+    /// any of which would otherwise skip this sweep entirely on some re-attach paths.
+    ///
+    /// Two-phase collect-then-mutate (mirrors the send-timeout sweep shape in
+    /// [`Self::handle_timeout`]) avoids mutating `pending_requests` while iterating it.
+    ///
+    /// Only records an `outcomes` entry when a waker is still parked for the request
+    /// (mirrors the `Success` arm's `unsubscribe_has_waiter` guard, issue #241's
+    /// continuous-eviction fix). Both runtime engines' `RequestFut::drop` clear the waker
+    /// and take any outcome that already landed but never call `cancel_request`
+    /// (`magnetar-runtime-moonpool/src/consumer.rs`, `magnetar-runtime-tokio/src/consumer.rs`),
+    /// so a caller that dropped its `ack()` future before it resolved — a `select!` timeout,
+    /// a cancelled task — leaves this `pending_requests` entry with no waker. Recording an
+    /// outcome nobody is left to `take_outcome` would leak it permanently, since nothing
+    /// ever prunes `outcomes` wholesale. `pending_requests.remove`, the `total_acks_failed`
+    /// accounting, and the emitted [`ConnectionEvent::AckResponse`] stay unconditional —
+    /// they are not the leak. This narrows an already-accepted race: a sweep that lands in
+    /// the gap between a live `ack()` releasing the connection lock and its future's first
+    /// poll (which is when the waker registers) also finds no waker yet and skips recording
+    /// — the same shape `unsubscribe_has_waiter` already carries, here without a broker
+    /// round trip.
+    fn fail_acks_orphaned_by_consumer_reattach(&mut self, handle: ConsumerHandle) {
+        let orphaned_acks: Vec<RequestId> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(rid, kind)| match kind {
+                PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
+                _ => None,
+            })
+            .collect();
+        for rid in orphaned_acks {
+            self.pending_requests.remove(&rid);
+            let message = "ack orphaned by broker consumer close".to_owned();
+            if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::Error {
+                        request_id: rid,
+                        code: -1,
+                        message: message.clone(),
+                    },
+                );
+                self.wake_for_request(rid);
+            }
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+            }
+            self.events.push_back(ConnectionEvent::AckResponse {
+                request_id: Some(rid),
+                result: Err(message),
+            });
+        }
+    }
+
+    /// Recovery for a consumer whose broker-side dispatch has wedged (issue #414):
+    /// close THIS consumer id and re-attach it, on the live socket, without a transport
+    /// reconnect.
+    ///
+    /// Two callers: the application, directly or through `Consumer::resubscribe()`; and —
+    /// only when [`ConnectionConfig::consumer_stall_auto_recovery`](crate::ConnectionConfig)
+    /// is armed — [`Self::handle_timeout`]'s stall watchdog, bounded to that many attempts
+    /// per stall streak (ADR-0103).
+    ///
+    /// # Why the close is not optional
+    ///
+    /// A bare `CommandSubscribe` for a consumer id that is STILL LIVE on this connection
+    /// is a broker-side no-op. `ServerCnx.handleSubscribe` looks the id up in its own
+    /// per-connection `consumers` map before it does anything else, and a
+    /// `putIfAbsent` hit on an already-completed consumer logs a warning, calls
+    /// `sendSuccessResponse(requestId)` and returns — no new `Consumer`, no dispatcher or
+    /// subscription touch, and nothing that reads `MESSAGE_PERMITS` / `availablePermits`.
+    /// Verified identical at v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and
+    /// master `:2037-2044`. (Its sibling branches are not no-ops: a still-pending creation
+    /// gets `ServiceNotReady`, an exceptionally-completed one a mapped error.)
+    ///
+    /// So the pre-ADR-0108 shape — zero the mirrors, re-`CommandSubscribe` the live id,
+    /// re-grant a full `receiver_queue_size` window on the `Success` — did the opposite of
+    /// what it documented: the broker kept its slot and its permit balance untouched and
+    /// then took a SECOND full window it had never agreed to, once per attempt, while the
+    /// wedge it was called to clear could not move.
+    ///
+    /// # The two phases
+    ///
+    /// 1. emit `CommandCloseConsumer` for this id, registered as
+    ///    `PendingRequestKind::ConsumerCloseForReattach`. The client slot is deliberately NOT
+    ///    marked closed — this consumer is being repaired, not retired — and no ack tracker is
+    ///    flushed, so nothing about the caller-visible consumer changes yet;
+    /// 2. on that close's `Success`, and only then, `complete_consumer_close_for_reattach` zeroes
+    ///    the permit mirrors, drops any open stall window, fails every in-flight ack (issue #346)
+    ///    and re-emits `CommandSubscribe` with the initial `CommandFlow` deferred to ITS `Success`.
+    ///
+    /// Deferring every mutation to phase 2 is what makes a rejected close harmless: the
+    /// broker still holds the consumer exactly as it was, so the client's mirrors must
+    /// still describe it. Zeroing them up front would leave a consumer we failed to close
+    /// with `permit_balance == 0`, which is strictly worse than the stall it was in —
+    /// `is_stall_candidate` requires `permit_balance > 0`, so it would be wedged AND
+    /// undetectable.
+    ///
+    /// # Refusals
+    ///
+    /// Returns `None` — no wire traffic, nothing mutated — when the consumer is unknown,
+    /// was never subscribed, is user-closed, unsubscribing, terminal, mid-seek (the seek's
+    /// own [`Self::resubscribe_consumer_after_seek`] owns re-attach), already re-attaching
+    /// (`flow_on_subscribe_ack`), already has a close-for-re-attach in flight, or is one of
+    /// the two shapes this recovery must not apply to:
+    ///
+    /// - **`Failover`** — the close really detaches this consumer, so the broker runs an election.
+    ///   An active consumer would hand its partition to a standby and come back at the end of the
+    ///   priority order; a standby's re-attach re-enters that order. That is a subscription-wide
+    ///   reshuffle to repair one slot, and the caller asked for a repair, not a failover.
+    /// - **non-durable** — a non-durable subscription's cursor lives only as long as the consumer.
+    ///   Closing it discards that cursor, and the re-attach restarts from the subscribe request's
+    ///   `start_message_id` (ADR-0099), silently skipping or replaying the backlog. There is no
+    ///   in-place repair for a cursor the close destroys.
+    ///
+    /// Both refusals are made HERE rather than in
+    /// `consumer_reattach_in_place_is_eligible`, which is shared with issue #307's
+    /// broker-initiated `CommandCloseConsumer` arm and with phase 2's own re-attach: there
+    /// the broker has ALREADY closed the consumer, so refusing a Failover standby or a
+    /// non-durable consumer would only leave it detached forever.
+    ///
+    /// The receiver queue is left intact: already-dispatched messages stay user-visible.
+    ///
+    /// # Cost of the real close
+    ///
+    /// The broker genuinely drops the consumer, so everything it was holding un-acked
+    /// returns to the subscription's redelivery pool and is dispatched again — to this
+    /// consumer after its re-attach, or to a `Shared` sibling meanwhile. Acks the grouping
+    /// tracker emits inside the close → re-subscribe window are dropped by the broker
+    /// ("Cannot find consumer") and their messages redelivered; at-least-once is preserved,
+    /// duplicates are not. In-flight acks are genuinely orphaned, which is why phase 2
+    /// fails them.
+    ///
+    /// Returns the `RequestId` of the **close**, not of the re-subscribe, which does not
+    /// exist yet at call time.
+    ///
+    /// # Scope
+    ///
+    /// This repairs **this client's own slot** in the broker's dispatcher. Issue #414
+    /// observed `availablePermits = -177300` on one ghost consumer with an empty name,
+    /// while all fresh consumers stopped progressing; it did not measure an aggregate.
+    /// This operation alone cannot prove subscription-wide recovery; the escalation
+    /// is an operator-side `pulsar-admin topics unload`.
+    /// See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    pub fn resubscribe_consumer_in_place(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        // Eligibility first: nothing is emitted for a consumer whose next
+        // `CommandSubscribe` has another owner.
+        let req = self.consumer_subscribe_requests.get(&handle)?;
+        if req.sub_type == pb::command_subscribe::SubType::Failover || !req.durable {
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                sub_type = ?req.sub_type,
+                durable = req.durable,
+                "refused an in-place re-subscribe: closing this consumer would trigger a \
+                 failover election or discard a non-durable cursor, so there is no \
+                 in-place repair for it (#414)"
+            );
+            return None;
+        }
+        let eligible = self
+            .consumers
+            .get(&handle)
+            .is_some_and(|slot| Self::consumer_reattach_in_place_is_eligible(&slot.state.lock()));
+        if !eligible || self.consumer_close_for_reattach_is_pending(handle) {
+            return None;
+        }
+        let request_id = self.emit_consumer_close_for_reattach(handle);
+        tracing::info!(
             target: "magnetar_proto::conn",
             handle = ?handle,
-            "broker closed running consumer (same-broker, url=None); re-subscribed in place (#307)"
+            request_id = ?request_id,
+            "closing this consumer so the broker really drops its dispatcher slot; the \
+             re-subscribe is emitted on the close Success (#414)"
         );
+        Some(request_id)
+    }
+
+    /// Whether a phase-1 `CommandCloseConsumer` for `handle` is still awaiting its ack.
+    ///
+    /// Read out of `pending_requests` rather than out of a `ConsumerState` flag on
+    /// purpose: [`Self::reset`] and [`Self::fail_all_pending`] both take that map
+    /// wholesale, so the marker clears itself exactly when the session that carried the
+    /// close dies — which is also when `rebuild_consumers` takes the re-attach over.
+    fn consumer_close_for_reattach_is_pending(&self, handle: ConsumerHandle) -> bool {
+        self.pending_requests.values().any(
+            |kind| matches!(kind, PendingRequestKind::ConsumerCloseForReattach { handle: h } if *h == handle),
+        )
+    }
+
+    /// Phase 1 of the issue #414 recovery: `CommandCloseConsumer` for a consumer the
+    /// client intends to keep.
+    ///
+    /// Deliberately NOT [`Self::close_consumer`]: that marks the slot closed and flushes
+    /// the ack-grouping tracker, both of which belong to a consumer that is going away.
+    /// Here the consumer survives its own close — the client keeps its queue, its
+    /// registration and its handle, and only the broker-side slot is recreated — exactly
+    /// as the issue #307 `CommandCloseConsumer` arm keeps `closed = false` for a
+    /// broker-initiated close it is about to re-attach.
+    fn emit_consumer_close_for_reattach(&mut self, handle: ConsumerHandle) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::CommandCloseConsumer {
+            consumer_id: handle.0,
+            request_id: request_id.0,
+            assigned_broker_service_url: None,
+            assigned_broker_service_url_tls: None,
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::ConsumerCloseForReattach { handle },
+        );
+        request_id
+    }
+
+    /// Phase 2 of the issue #414 recovery, run from the `Success` arm once the broker has
+    /// confirmed the close.
+    ///
+    /// Only now is the broker's dispatcher slot really gone, so only now do the three
+    /// mutations the pre-ADR-0108 shape ran up front become true:
+    ///
+    /// 1. zero the permit mirrors (`granted_permits`, `permit_balance`, `consumed_since_flow`) and
+    ///    drop any open stall window — the broker has released this consumer's permits, so the
+    ///    client's mirrors must follow or the want-have delta and the starvation signal both read a
+    ///    grant that no longer exists;
+    /// 2. fail every in-flight ack for this handle (issue #346) — the consumer id they were
+    ///    correlated against is gone, so no `CommandAckResponse` for them will ever arrive;
+    /// 3. re-emit `CommandSubscribe`, deferring the initial `CommandFlow` to ITS `Success` (Pulsar
+    ///    drops `CommandFlow` for a consumer id whose subscribe is still being processed —
+    ///    `ServerCnx.handleFlow` "Couldn't find consumer").
+    ///
+    /// Step 3 re-runs [`Self::consumer_reattach_in_place_is_eligible`], so a consumer the
+    /// application closed, unsubscribed or seeked while the close was in flight is left
+    /// alone, and a re-attach some other path already started (issue #307's broker-close
+    /// arm winning the race, for instance) is not duplicated — `flow_on_subscribe_ack`
+    /// refuses the second `CommandSubscribe` for the same id.
+    fn complete_consumer_close_for_reattach(&mut self, handle: ConsumerHandle) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            consumer.granted_permits = 0;
+            consumer.permit_balance = 0;
+            consumer.consumed_since_flow = 0;
+            consumer.clear_stall_watch();
+        }
+        self.fail_acks_orphaned_by_consumer_reattach(handle);
+        let Some(request_id) = self.emit_in_place_consumer_resubscribe(handle) else {
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                "broker acked the recovery close but this consumer is no longer eligible \
+                 for the re-attach; it stays detached until a reconnect rebuilds it (#414)"
+            );
+            return;
+        };
+        tracing::info!(
+            target: "magnetar_proto::conn",
+            handle = ?handle,
+            request_id = ?request_id,
+            "broker confirmed the recovery close; re-subscribed this consumer id against a \
+             genuinely empty dispatcher slot, initial flow deferred to the re-subscribe \
+             Success (#414)"
+        );
+    }
+
+    fn consumer_reattach_start_message_id(
+        req: &SubscribeRequest,
+        state: &crate::consumer::ConsumerState,
+    ) -> Option<MessageId> {
+        if req.durable && state.has_ever_attached {
+            None
+        } else {
+            req.start_message_id
+        }
     }
 
     fn encode_command(&mut self, cmd: &pb::BaseCommand) -> Result<(), ProtocolError> {
@@ -7526,6 +8787,96 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandConnected");
         buf
+    }
+
+    #[test]
+    fn two_consumer_dead_letters_drain_independently_with_preserved_projection() {
+        let now = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let mut handles = Vec::new();
+        for partition in 0..2 {
+            handles.push(conn.subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/aggregate-dlq-partition-{partition}"),
+                subscription: "aggregate-dlq".to_owned(),
+                max_redeliver_count: 1,
+                ..Default::default()
+            }));
+        }
+
+        for (handle, ledger, entries) in [(handles[0], 11, 1), (handles[1], 22, 2)] {
+            for entry in 0..entries {
+                let command = pb::CommandMessage {
+                    consumer_id: handle.0,
+                    message_id: pb::MessageIdData {
+                        ledger_id: ledger,
+                        entry_id: entry,
+                        partition: Some(i32::from(ledger != 11)),
+                        ..Default::default()
+                    },
+                    redelivery_count: Some(2),
+                    ..Default::default()
+                };
+                let metadata = pb::MessageMetadata {
+                    producer_name: "aggregate-dlq-producer".to_owned(),
+                    sequence_id: entry,
+                    publish_time: 1_700_000_000_000,
+                    partition_key: Some(format!("key-{ledger}-{entry}")),
+                    ordering_key: Some(bytes::Bytes::from(format!("order-{ledger}-{entry}"))),
+                    event_time: Some(1_700_000_001_000 + entry),
+                    properties: vec![pb::KeyValue {
+                        key: "custom".to_owned(),
+                        value: format!("value-{ledger}-{entry}"),
+                    }],
+                    ..Default::default()
+                };
+                conn.consumer(handle)
+                    .expect("consumer slot")
+                    .state
+                    .lock()
+                    .deliver(
+                        &command,
+                        metadata,
+                        None,
+                        bytes::Bytes::from(format!("poison-{ledger}-{entry}")),
+                        now,
+                    )
+                    .expect("route poison message");
+            }
+        }
+
+        let first = conn.drain_dead_letter(handles[0]);
+        let second = conn.drain_dead_letter(handles[1]);
+        assert_eq!(first.len() + second.len(), 3);
+        assert_eq!(first.len(), 1, "first child owns only its dead letter");
+        assert_eq!(second.len(), 2, "second child state is independent");
+        let projection: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|message| {
+                (
+                    message.payload.clone(),
+                    message.message_id,
+                    message.metadata.partition_key.clone(),
+                    message.metadata.ordering_key.clone(),
+                    message.metadata.event_time,
+                    message.metadata.properties.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(projection[0].0.as_ref(), b"poison-11-0");
+        assert_eq!(
+            (projection[0].1.ledger_id, projection[0].1.entry_id),
+            (11, 0)
+        );
+        assert_eq!(projection[0].2.as_deref(), Some("key-11-0"));
+        assert_eq!(projection[0].3.as_deref(), Some(b"order-11-0".as_slice()));
+        assert_eq!(projection[0].4, Some(1_700_000_001_000));
+        assert_eq!(projection[0].5[0].value, "value-11-0");
+        assert!(conn.drain_dead_letter(handles[0]).is_empty());
+        assert!(conn.drain_dead_letter(handles[1]).is_empty());
     }
 
     #[test]
@@ -9241,8 +10592,9 @@ mod conn_state_tests {
         assert!(conn.consume_initial_consumer_subscribe_completion(c_handle));
         while conn.poll_event().is_some() {}
 
-        // Simulate the consumer having acked a message before the disconnect, so the rebuild
-        // should resume from the post-ack id (not from `start_message_id == None`).
+        // Simulate a locally submitted higher individual ack before disconnect. A durable Shared
+        // subscription must still defer to the broker cursor rather than stamping this unconfirmed,
+        // potentially non-contiguous watermark onto the reattach.
         let acked = MessageId {
             ledger_id: 42,
             entry_id: 17,
@@ -9286,14 +10638,10 @@ mod conn_state_tests {
             pb::command_subscribe::SubType::Shared as i32
         );
         assert_eq!(subscribe_cmd.priority_level, Some(7));
-        // Resume from post-ack: the start_message_id field must carry the acked id, not
-        // None (which is what the original subscribe used).
-        let smid = subscribe_cmd
-            .start_message_id
-            .as_ref()
-            .expect("start_message_id stamped from last_acked_message_id");
-        assert_eq!(smid.ledger_id, acked.ledger_id);
-        assert_eq!(smid.entry_id, acked.entry_id);
+        assert!(
+            subscribe_cmd.start_message_id.is_none(),
+            "an established durable reattach must use the broker cursor, never the highest local ack"
+        );
 
         // NO CommandFlow may ride alongside the subscribe: the broker
         // silently drops flow for a consumer id whose subscribe is still
@@ -9535,6 +10883,337 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    #[test]
+    fn initial_flow_grants_the_receiver_queue_size_exactly_once() {
+        // Issue #426: both runtime subscribe paths used to follow `initial_flow`
+        // with a raw `Connection::flow(handle, receiver_queue_size)`, so the broker
+        // was granted `2 × receiver_queue_size` on a fresh subscribe while the
+        // client-side mirrors (`granted_permits` / `permit_balance`, and therefore
+        // `available_permits()` and `FlowStats`) only ever accounted for `1 ×`.
+        // `initial_flow` is the single owner of the initial grant: ONE frame whose
+        // permits equal the receiver-queue size, and mirrors that agree with it.
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/initial-grant".to_owned(),
+            subscription: "initial-grant-sub".to_owned(),
+            receiver_queue_size: 128,
+            durable: true,
+            ..Default::default()
+        });
+        // Drop the `CommandSubscribe`; only the post-ack grant is under test.
+        let _initial = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        // The ack alone grants nothing on a fresh subscribe: the engine owns the
+        // call, which is what makes a second grant from the engine observable here.
+        let post_ack = drain_outbound_commands(&mut conn);
+        assert!(
+            post_ack
+                .iter()
+                .all(|c| c.r#type != pb::base_command::Type::Flow as i32),
+            "a fresh subscribe ack must not grant permits by itself: {post_ack:?}"
+        );
+
+        let _ = conn.initial_flow(handle, Instant::now());
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "initial_flow must put EXACTLY one CommandFlow on the wire: {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, 128);
+
+        let slot = conn.consumer(handle).expect("consumer slot").clone();
+        let state = slot.state.lock();
+        assert_eq!(
+            state.granted_permits, 128,
+            "the grant mirror must match the single frame that reached the broker"
+        );
+        assert_eq!(
+            state.permit_balance, 128,
+            "the live balance must match the single frame that reached the broker"
+        );
+    }
+
+    #[test]
+    fn active_consumer_change_behind_subscribe_ack_grants_the_queue_size_once() {
+        // Issue #427: a real broker answers an Exclusive/Failover subscribe with
+        // `CommandSuccess` and then `CommandActiveConsumerChange { is_active: true }`
+        // immediately behind it. Both frames are decoded inside the SAME `handle_bytes`
+        // call, so the #307 promotion re-arm runs while the runtime engine's own post-ack
+        // `initial_flow` is still parked on the resolving subscribe future — and at that
+        // instant `granted_permits` is legitimately `0`, so the re-arm's gate passes.
+        //
+        // Both then granted, and the broker held `2 × receiver_queue_size` for a fresh
+        // consumer whose mirrors recorded `1 ×` (measured 32 against a configured 16).
+        // Exactly one grant of the receiver-queue size must reach the wire whichever of
+        // the two callers gets there first.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/active-change-grant".to_owned(),
+            subscription: "active-change-grant-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        // Drop the `CommandSubscribe`; only the grants are under test.
+        let _initial = drain_outbound_commands(&mut conn);
+
+        // The broker's two frames, back to back on one read — the production ordering.
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle ActiveConsumerChange");
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        // …and the engine's post-ack call, which the runtime issues once the subscribe
+        // future resolves (tokio `client.rs`, moonpool `consumer.rs`).
+        let _ = conn.initial_flow(handle, Instant::now());
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "an active announcement behind the subscribe ack must not add a second grant \
+             (issue #427): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
+
+        let slot = conn.consumer(handle).expect("consumer slot").clone();
+        let state = slot.state.lock();
+        assert_eq!(
+            state.granted_permits, RQ as u32,
+            "the grant mirror must match the single frame that reached the broker"
+        );
+        assert_eq!(
+            state.permit_balance, RQ as u32,
+            "the live balance must match the single frame that reached the broker"
+        );
+    }
+
+    #[test]
+    fn established_standby_promotion_still_rearms_flow_at_zero_grant() {
+        // The other half of issue #427: closing the fresh-subscribe window must NOT cost
+        // the issue #307 re-arm its real case. An ESTABLISHED consumer — attached, its
+        // subscribe-ack grant already issued and accounted — whose permit mirrors were
+        // zeroed at a churn boundary (`reset`, terminal subscribe failure, a same-broker
+        // `CommandCloseConsumer` whose in-place re-attach was declined) and which is then
+        // promoted still has nothing to dispatch against. `maybe_flow` cannot help it: it
+        // only fires once messages have been consumed, and none can arrive at zero
+        // permits. So the promotion must re-arm exactly one full grant.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/standby-promotion".to_owned(),
+            subscription: "standby-promotion-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        // The engine's post-ack grant: this consumer is now established, and the attach's
+        // initial grant is spent.
+        let _ = conn.initial_flow(handle, Instant::now());
+        let subscribe_and_grant = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            subscribe_and_grant
+                .iter()
+                .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+                .count(),
+            1,
+            "the established consumer must have been granted exactly once: \
+             {subscribe_and_grant:?}"
+        );
+
+        // Churn boundary: the broker tore its dispatcher slot down and the client's
+        // mirrors followed it to zero, with no re-subscribe of its own.
+        {
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let mut state = slot.state.lock();
+            state.granted_permits = 0;
+            state.permit_balance = 0;
+            state.consumed_since_flow = 0;
+        }
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle ActiveConsumerChange");
+        while conn.poll_event().is_some() {}
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "promoting an established consumer that holds no grant must re-arm flow \
+             exactly once (issue #307): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "the re-arm must restore the client-side balance too"
+        );
+    }
+
+    #[test]
+    fn post_seek_resubscribe_still_grants_although_the_grant_mirror_is_non_zero() {
+        // The issue #427 once-per-attach guard must not cost the post-seek re-attach its
+        // grant. `resubscribe_consumer_after_seek` emits a fresh `CommandSubscribe` WITHOUT
+        // zeroing the additive `granted_permits` mirror, so at the runtime's post-ack call
+        // the mirror still reads the previous attach's grant — and a guard keyed on
+        // `granted_permits == 0` alone would swallow the frame. The broker recreated its
+        // dispatcher slot at `availablePermits = 0` on that re-subscribe, so swallowing it
+        // is exactly issue #67: the broker confirms the backlog after the cursor reset and
+        // dispatches nothing forever. `ConsumerState::initial_grant_due` is what keeps this
+        // attach distinguishable from a consumer that is already fed.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/post-seek-grant".to_owned(),
+            subscription: "post-seek-grant-sub".to_owned(),
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            conn.consumer(handle)
+                .expect("consumer slot")
+                .state
+                .lock()
+                .granted_permits,
+            RQ as u32,
+            "the first attach's grant leaves the additive mirror non-zero"
+        );
+
+        // Post-seek re-attach: `CommandSubscribe` only, the grant deferred to the runtime
+        // (the tokio engine's seek path, `consumer.rs`).
+        let resubscribe_request_id = conn
+            .resubscribe_consumer_after_seek(handle)
+            .expect("post-seek resubscribe request");
+        feed_subscribe_success(&mut conn, resubscribe_request_id.0);
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let _ = conn.initial_flow(handle, Instant::now());
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "the post-seek re-attach must still receive its grant (issue #67): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
+    }
+
+    #[test]
+    fn reattach_position_uses_only_authoritative_start_points() {
+        let original = MessageId {
+            ledger_id: 1,
+            entry_id: 2,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let mut request = SubscribeRequest {
+            durable: true,
+            start_message_id: Some(original),
+            ..Default::default()
+        };
+        let mut state = crate::consumer::ConsumerState::new(
+            ConsumerHandle(7),
+            "persistent://public/default/t".to_owned(),
+            "s".to_owned(),
+            10,
+        );
+
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            Some(original),
+            "a never-attached durable subscription retains its explicit initial position"
+        );
+
+        state.has_ever_attached = true;
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            None,
+            "an established durable subscription defers to the broker cursor"
+        );
+
+        request.durable = false;
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            Some(original),
+            "a non-durable consumer restarts from the caller's original position"
         );
     }
 
@@ -10554,6 +12233,45 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandSendReceipt");
         buf
+    }
+
+    fn batched_send_receipt_bytes(
+        producer: ProducerHandle,
+        lowest: SequenceId,
+        highest: SequenceId,
+    ) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::SendReceipt as i32,
+            send_receipt: Some(pb::CommandSendReceipt {
+                producer_id: producer.0,
+                sequence_id: lowest.0,
+                message_id: Some(pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: lowest.0,
+                    ..Default::default()
+                }),
+                highest_sequence_id: Some(highest.0),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode batched CommandSendReceipt");
+        buf
+    }
+
+    fn assert_batch_reset_error(conn: &mut Connection, producer: ProducerHandle, seq: SequenceId) {
+        match conn.take_outcome(PendingOpKey::Send(producer, seq)) {
+            Some(OpOutcome::SendError {
+                sequence_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(code, BATCH_RESET_ERROR_CODE);
+                assert_eq!(message, BATCH_RESET_ERROR_MESSAGE);
+            }
+            other => panic!("expected reset SendError for batched sequence {seq:?}, got {other:?}"),
+        }
     }
 
     /// ADR-0086: `handle_frame(now, …)` must forward its injected `now` into
@@ -11999,6 +13717,560 @@ mod conn_state_tests {
         ));
     }
 
+    /// Decode every `BaseCommand` sitting in a drained transmit buffer, so a
+    /// test can assert on what the state machine actually put on the wire.
+    fn decode_transmitted(bytes: &bytes::Bytes) -> Vec<pb::BaseCommand> {
+        let mut rest = bytes.clone();
+        let mut commands = Vec::new();
+        while !rest.is_empty() {
+            let Ok(frame) = crate::frame::decode_one(&mut rest) else {
+                break;
+            };
+            commands.push(frame.command);
+        }
+        commands
+    }
+
+    /// Every `CommandCloseProducer` in a drained transmit buffer.
+    fn transmitted_producer_closes(bytes: &bytes::Bytes) -> Vec<pb::CommandCloseProducer> {
+        decode_transmitted(bytes)
+            .into_iter()
+            .filter_map(|command| command.close_producer)
+            .collect()
+    }
+
+    fn feed_producer_success(conn: &mut Connection, request_id: u64, producer_name: &str) {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id,
+                producer_name: producer_name.to_owned(),
+                last_sequence_id: Some(-1),
+                producer_ready: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode ProducerSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle ProducerSuccess");
+    }
+
+    fn feed_command_success(conn: &mut Connection, request_id: u64) {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode Success");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle Success");
+    }
+
+    fn handshaked_connection() -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+        conn
+    }
+
+    /// Issue #406: cancelling a producer open whose `CommandProducer` already
+    /// entered the current session's stream must emit a best-effort
+    /// `CommandCloseProducer` for the abandoned producer id. Without it the
+    /// broker completes the open on its own schedule and keeps the
+    /// `(topic, producer_name)` registration forever, so every later open under
+    /// that name is rejected with `ProducerBusy` (broker `NamingException`).
+    #[test]
+    fn cancelled_producer_open_emits_fire_and_forget_close_producer() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cancel-then-close".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let opened = decode_transmitted(&conn.poll_transmit());
+        assert!(
+            opened
+                .iter()
+                .any(|command| command.r#type == pb::base_command::Type::Producer as i32),
+            "the open must reach the wire before the cancellation under test"
+        );
+
+        conn.cancel_producer_open(handle);
+
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "cancelling a written producer open must emit exactly one CommandCloseProducer"
+        );
+        assert_eq!(
+            closes[0].producer_id, handle.0,
+            "the close must target the abandoned producer id"
+        );
+        let close_request_id = closes[0].request_id;
+        assert!(
+            !conn.has_pending_request_for_test(RequestId(open_request_id)),
+            "the cancelled open must leave no pending request behind"
+        );
+
+        // Idempotent: a second cancellation finds no slot and must not enqueue
+        // a duplicate close for a producer id the broker already released.
+        conn.cancel_producer_open(handle);
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a repeated cancellation must not emit a second CommandCloseProducer"
+        );
+
+        // The close is fire-and-forget: its broker ack is consumed in place, so
+        // no undrainable `OpOutcome` accumulates (the issue #241 leak shape).
+        feed_command_success(&mut conn, close_request_id);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(RequestId(close_request_id)))
+                .is_none(),
+            "the forgotten close must not record an outcome nobody drains"
+        );
+    }
+
+    /// The broker may ack an open the client already gave up on. That late
+    /// `ProducerSuccess` must resurrect nothing — and needs no second close,
+    /// because cancellation already wrote a `CommandCloseProducer` for the same
+    /// producer id onto the same ordered connection.
+    #[test]
+    fn late_producer_success_after_cancel_recreates_no_state() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/late-success-after-cancel".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(handle);
+        assert_eq!(
+            transmitted_producer_closes(&conn.poll_transmit()).len(),
+            1,
+            "cancellation emits the reaping close before the late success lands"
+        );
+
+        feed_producer_success(&mut conn, open_request_id, "pinned-406");
+
+        assert!(
+            conn.producer(handle).is_none(),
+            "a late producer success must not resurrect the cancelled slot"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(RequestId(open_request_id)))
+                .is_none(),
+            "a late producer success must not record an outcome nobody drains"
+        );
+        assert!(
+            !conn.events.iter().any(|event| matches!(
+                event,
+                ConnectionEvent::ProducerReady { handle: event_handle, .. }
+                    if *event_handle == handle
+            )),
+            "a late producer success must not queue a ProducerReady for a cancelled open"
+        );
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "the late success needs no second close — cancellation already sent one"
+        );
+    }
+
+    /// The open completed and the caller cancelled anyway (a `ProducerSuccess`
+    /// that raced the operation deadline). The registration exists broker-side,
+    /// so the cancellation must still reap it.
+    #[test]
+    fn cancelling_an_acked_producer_open_still_closes_the_registration() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/acked-then-cancelled".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        feed_producer_success(&mut conn, open_request_id, "pinned-406");
+
+        conn.cancel_producer_open(handle);
+
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "cancelling an already-acked open must reap the broker registration"
+        );
+        assert_eq!(closes[0].producer_id, handle.0);
+    }
+
+    fn feed_producer_busy(conn: &mut Connection, request_id: u64, producer_name: &str) {
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ProducerBusy as i32,
+                message: format!(
+                    "org.apache.pulsar.broker.service.BrokerServiceException$NamingException: \
+                     Producer with name '{producer_name}' is already connected to topic"
+                ),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+    }
+
+    /// Every `CommandProducer` in a drained transmit buffer.
+    fn transmitted_producer_opens(bytes: &bytes::Bytes) -> Vec<pb::CommandProducer> {
+        decode_transmitted(bytes)
+            .into_iter()
+            .filter_map(|command| command.producer)
+            .collect()
+    }
+
+    /// Issue #406, the interleaving the cancel-time close cannot cover: the
+    /// broker completes the producer creation AFTER consuming the close, so the
+    /// `(topic, producer_name)` registration outlives its cancellation and the
+    /// retry is answered `ProducerBusy` forever.
+    ///
+    /// Recovery is two-phase, and this pins both phases plus their order.
+    #[test]
+    fn producer_busy_after_a_cancelled_open_recloses_then_reattaches() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/busy-after-cancel";
+        let mut conn = handshaked_connection();
+
+        // Attempt 1: abandoned on its deadline. The broker keeps the
+        // registration regardless.
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        assert_eq!(
+            transmitted_producer_closes(&conn.poll_transmit()).len(),
+            1,
+            "cancellation emits its close first — the recovery is what happens when it misses"
+        );
+
+        // Attempt 2 must NOT re-attach yet: the broker still maps the
+        // abandoned id, so re-sending `CommandProducer` under it would collide
+        // with the broker's own record instead of reaching its successor path.
+        let retry = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_ne!(
+            retry, abandoned,
+            "the first retry after a cancellation must use a fresh producer id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0].epoch, None,
+            "a first retry is not a successor claim and must not stamp an epoch"
+        );
+        let retry_request_id = opens[0].request_id;
+
+        // Phase 1: the busy answer proves the abandoned registration completed,
+        // so it is re-closed now — when the broker can address it.
+        feed_producer_busy(&mut conn, retry_request_id, NAME);
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "ProducerBusy must re-close the abandoned producer id"
+        );
+        assert_eq!(
+            closes[0].producer_id, abandoned.0,
+            "the re-close must name the abandoned id, not the rejected retry"
+        );
+
+        // Phase 2: the name is STILL busy, so the broker no longer maps that
+        // id and no close can reach it. The next open re-attaches under the
+        // abandoned id itself, as a strict successor.
+        let reattach = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            reattach, abandoned,
+            "the escalation must re-attach under the abandoned producer id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0].producer_id, abandoned.0,
+            "the re-attach rides the abandoned producer id"
+        );
+        assert_eq!(
+            opens[0].epoch,
+            Some(1),
+            "the re-attach must out-rank the registration it reclaims"
+        );
+
+        // Success clears the record: the name is ours, nothing is left to
+        // reclaim, and a later open under it starts fresh.
+        feed_producer_success(&mut conn, opens[0].request_id, NAME);
+        assert!(
+            conn.abandoned_producer_opens
+                .iter()
+                .all(std::option::Option::is_none),
+            "attaching the name must drop every record kept for reclaiming it"
+        );
+    }
+
+    /// A second `ProducerBusy` must not re-close the same abandoned id twice —
+    /// the id is consumed by phase 1 and the recovery escalates instead.
+    #[test]
+    fn a_reclosed_abandoned_producer_id_is_not_closed_again() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/busy-twice";
+        let mut conn = handshaked_connection();
+
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        let _ = conn.poll_transmit();
+
+        for expected_closes in [1, 0] {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let opens = transmitted_producer_opens(&conn.poll_transmit());
+            feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+            assert_eq!(
+                transmitted_producer_closes(&conn.poll_transmit()).len(),
+                expected_closes,
+                "an abandoned id is re-closed exactly once"
+            );
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+        }
+    }
+
+    /// Several abandoned ids can share one pinned name — a caller-visible open
+    /// retries — and only one of them owns the surviving registration. The
+    /// escalation must round-robin across them instead of re-attaching under
+    /// the same wrong id until the retry budget runs out.
+    #[test]
+    fn reattach_rotates_across_every_abandoned_producer_id() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/reattach-rotation";
+        let mut conn = handshaked_connection();
+
+        // Abandon three opens under the same name.
+        let mut abandoned = Vec::new();
+        for _ in 0..3 {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+            abandoned.push(handle);
+        }
+
+        // One busy answer re-closes all three at once — any of them may own the
+        // registration, and a close is cheap.
+        let retry = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            !abandoned.contains(&retry),
+            "the first retry after a cancellation uses a fresh id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+        let closed: Vec<u64> = transmitted_producer_closes(&conn.poll_transmit())
+            .into_iter()
+            .map(|close| close.producer_id)
+            .collect();
+        let mut expected: Vec<u64> = abandoned.iter().map(|h| h.0).collect();
+        expected.sort_unstable();
+        let mut closed_sorted = closed.clone();
+        closed_sorted.sort_unstable();
+        assert_eq!(
+            closed_sorted, expected,
+            "every abandoned id under the busy name must be re-closed"
+        );
+
+        // Each escalation picks a different candidate, so three attempts cover
+        // all three ids before any is tried twice.
+        let mut reattached = Vec::new();
+        for _ in 0..3 {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let opens = transmitted_producer_opens(&conn.poll_transmit());
+            assert_eq!(
+                opens[0].epoch,
+                Some(1),
+                "each id's first re-attach is epoch 1"
+            );
+            reattached.push(handle);
+            feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+            let _ = conn.poll_transmit();
+        }
+        reattached.sort_unstable();
+        let mut abandoned_sorted = abandoned.clone();
+        abandoned_sorted.sort_unstable();
+        assert_eq!(
+            reattached, abandoned_sorted,
+            "the escalation must try every candidate before repeating one"
+        );
+    }
+
+    /// A rejected open owns no registration, so a busy answer for a name this
+    /// connection never abandoned an open under emits nothing.
+    #[test]
+    fn producer_busy_without_an_abandoned_open_emits_no_close() {
+        const NAME: &str = "never-abandoned";
+        const TOPIC: &str = "persistent://public/default/busy-without-abandon";
+        let mut conn = handshaked_connection();
+
+        conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a busy name this connection never abandoned an open under has nothing to reclaim"
+        );
+    }
+
+    /// The reclaim store is a fixed ring: it never grows, and the oldest record
+    /// is what an overflowing insert overwrites.
+    #[test]
+    fn abandoned_producer_open_store_is_bounded() {
+        let mut conn = handshaked_connection();
+        for i in 0..(MAX_ABANDONED_PRODUCER_OPENS + 4) {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/bounded".to_owned(),
+                producer_name: Some(format!("pinned-{i}")),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+        }
+        assert_eq!(
+            conn.abandoned_producer_opens
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            MAX_ABANDONED_PRODUCER_OPENS,
+            "the reclaim store must stay at its fixed capacity"
+        );
+        assert!(
+            !conn
+                .abandoned_producer_opens
+                .iter()
+                .flatten()
+                .any(|rec| rec.producer_name == "pinned-0"),
+            "an overflowing insert overwrites the oldest record"
+        );
+    }
+
+    /// Producer ids are session-scoped: a reset must drop every reclaim record,
+    /// or a rebuilt connection would re-attach under an id the broker never
+    /// registered and claim to succeed a registration that no longer exists.
+    #[test]
+    fn reset_clears_the_abandoned_producer_open_store() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/reset-clears-reclaim";
+        let mut conn = handshaked_connection();
+
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        let _ = conn.poll_transmit();
+        assert!(
+            conn.abandoned_producer_opens.iter().any(Option::is_some),
+            "the cancellation must have left a reclaim record to clear"
+        );
+
+        conn.reset();
+
+        assert!(
+            conn.abandoned_producer_opens
+                .iter()
+                .all(std::option::Option::is_none),
+            "reset must drop every session-scoped reclaim record"
+        );
+        let fresh = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_ne!(
+            fresh, abandoned,
+            "a rebuilt session must not re-attach under a dead session's producer id"
+        );
+    }
+
+    /// A session lost to [`Connection::reset`] took its producers with it: the
+    /// broker reaps every producer of a dead connection, and the buffered
+    /// `CommandProducer` was dropped with the outbound bytes. Emitting a close
+    /// on the rebuilt session would name a producer id it never registered.
+    #[test]
+    fn cancelling_producer_open_after_session_loss_emits_no_close() {
+        let mut conn = handshaked_connection();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cancel-after-session-loss".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.reset();
+        let _ = conn.poll_transmit();
+
+        conn.cancel_producer_open(handle);
+
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a producer whose session died needs no close on the rebuilt connection"
+        );
+    }
+
     #[test]
     fn cancel_request_removes_an_uninitialised_topic_watcher() {
         let mut conn = Connection::new(
@@ -12739,12 +15011,18 @@ mod conn_state_tests {
         );
     }
 
-    /// Batch cleared on reset: messages buffered in the producer's batch container (i.e.
-    /// not yet flushed to a wire frame) do not survive the reset — caller is responsible
-    /// for re-sending those (matches Java `ProducerImpl#connectionClosed` which drops the
-    /// in-progress batch). Only frames that already hit the wire's pending queue replay.
+    /// A reset terminalizes every unflushed batched send instead of orphaning its future.
     #[test]
-    fn reset_clears_batch_container_does_not_replay_unbatched_stragglers() {
+    fn reset_resolves_unflushed_batched_sends() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWake(AtomicUsize);
+        impl std::task::Wake for CountingWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
@@ -12763,9 +15041,10 @@ mod conn_state_tests {
         let _ = drain_outbound_commands(&mut conn);
 
         // Two batched (un-flushed) sends — neither hits the wire.
+        let mut sequences = Vec::new();
         for payload in [&b"a"[..], &b"b"[..]] {
-            let _ = conn
-                .send(
+            sequences.push(
+                conn.send(
                     producer,
                     crate::producer::OutgoingMessage {
                         payload: bytes::Bytes::from_static(payload),
@@ -12778,7 +15057,8 @@ mod conn_state_tests {
                     0,
                     Instant::now(),
                 )
-                .expect("queue");
+                .expect("queue"),
+            );
         }
         // Batched: each send now mints its own per-message `OpSend` so the user-side
         // `SendFut` has a unique key to wait on. The batch container also still holds the
@@ -12787,17 +15067,165 @@ mod conn_state_tests {
         assert_eq!(conn.producer_pending_count(producer), 2);
         assert_eq!(conn.producer_batch_len(producer), 2);
 
-        // Reset: the batch is dropped; the per-message `OpSend` entries are also dropped
-        // and carry no `replay_frames`, so `in_flight_publish_snapshot` is empty —
-        // matching Java `ProducerImpl#connectionClosed` which fails an in-progress batch
-        // rather than re-emitting the partial bytes.
+        let wake = std::sync::Arc::new(CountingWake(AtomicUsize::new(0)));
+        conn.register_waker(
+            PendingOpKey::Send(producer, sequences[0]),
+            std::task::Waker::from(wake.clone()),
+        );
+
         conn.reset();
         assert_eq!(
             conn.in_flight_publish_snapshot_len(producer),
             0,
-            "unflushed batched sends are NOT replayed — caller's responsibility"
+            "unflushed batched sends are not replayable"
         );
         assert_eq!(conn.producer_batch_len(producer), 0);
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "registered future wakes once"
+        );
+        for seq in sequences {
+            assert_batch_reset_error(&mut conn, producer, seq);
+        }
+        assert_eq!(
+            conn.producer_stats(producer)
+                .expect("producer stats")
+                .total_send_failed,
+            2,
+        );
+    }
+
+    #[test]
+    fn reset_resolves_flushed_batched_sends_before_receipt() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-flushed-batch".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+        let _ = drain_outbound_commands(&mut conn);
+
+        let mut sequences = Vec::new();
+        for payload in [&b"a"[..], &b"b"[..]] {
+            sequences.push(
+                conn.send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::from_static(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 1,
+                        num_messages: 1,
+                        txn_id: None,
+                        source_message_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue"),
+            );
+        }
+        assert_eq!(conn.flush_producer(producer, 0, Instant::now()), 1);
+        let sent = drain_outbound_commands(&mut conn);
+        let batch = sent
+            .iter()
+            .find_map(|command| command.send.as_ref())
+            .expect("ranged CommandSend");
+        assert_eq!(batch.sequence_id, sequences[0].0);
+        assert_eq!(batch.highest_sequence_id, Some(sequences[1].0));
+
+        conn.reset();
+        for seq in sequences {
+            assert_batch_reset_error(&mut conn, producer, seq);
+        }
+    }
+
+    #[test]
+    fn reset_after_batched_receipt_does_not_create_send_errors() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/received-batch".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+        let _ = drain_outbound_commands(&mut conn);
+        let first = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"a"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("first");
+        let second = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"b"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("second");
+        assert_eq!(conn.flush_producer(producer, 0, Instant::now()), 1);
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(
+            Instant::now(),
+            &batched_send_receipt_bytes(producer, first, second),
+        )
+        .expect("receipt");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, first)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, second)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+
+        conn.reset();
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(producer, first))
+                .is_none()
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(producer, second))
+                .is_none()
+        );
     }
 
     // -------------------------------------------------------------------
@@ -12826,7 +15254,6 @@ mod conn_state_tests {
             producer_name: "producer".to_owned(),
             sequence_id: 1,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         }
     }
@@ -13679,6 +16106,151 @@ mod conn_state_tests {
         );
     }
 
+    /// Complementary to `ack_orphaned_by_same_broker_close_fails_fast`: a
+    /// caller that dropped its `ack()` future before it resolved — a
+    /// `select!` timeout, a cancelled task — leaves this `pending_requests`
+    /// entry with no waker, because both runtime engines' `RequestFut::drop`
+    /// clear the waker and take any already-landed outcome but never call
+    /// `cancel_request` (`magnetar-runtime-moonpool/src/consumer.rs`,
+    /// `magnetar-runtime-tokio/src/consumer.rs`). The sweep must not write an
+    /// `outcomes` entry for it — the same issue #241 leak shape the
+    /// `Success` arm's `ProducerCloseForgotten` / `ConsumerCloseForgotten` /
+    /// `unsubscribe_has_waiter` guards already cover, on the ack sweep this
+    /// time. This is NOT issue #414: no `resubscribe_consumer_in_place` call
+    /// is involved — the same-broker `CommandCloseConsumer` sweep alone
+    /// reaches the leak.
+    #[test]
+    fn ack_sweep_must_not_leak_an_outcome_for_an_unwaited_ack() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.pending_waker_count(),
+            0,
+            "precondition: no ack future is parked on this request — dropped before its \
+             first poll, or dropped after being polled and cancelled; both leave no waker"
+        );
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        let key = PendingOpKey::Request(rid);
+        let leaked = conn.take_outcome(key);
+        assert!(
+            leaked.is_none(),
+            "the sweep wrote an outcomes entry for an ack with no waiter: {leaked:?}. \
+             Nothing is left to take_outcome it — that is one permanent outcomes entry \
+             per swept ack with a dropped future."
+        );
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the orphaned ack must still drain out of pending_requests even when \
+             nothing consumes its outcome"
+        );
+    }
+
+    /// The `AckResponse` arm's own leak site: unlike the sweep above, this one
+    /// fires on the broker's OWN late reply, after a waited ack already
+    /// consumed a synthetic error from that same sweep and its future
+    /// completed. `pending_requests.remove` returns `None` here (the sweep
+    /// already removed the entry), but the arm inserted an `outcomes` entry
+    /// unconditionally regardless — the same issue #241 leak shape, on the
+    /// broker's real reply instead of the synthetic sweep error.
+    #[test]
+    fn late_ack_response_must_not_leak_an_outcome_after_the_waiter_is_gone() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        let key = PendingOpKey::Request(rid);
+        // A real ack().await parks a waker on its first poll; simulate that.
+        conn.register_waker(key, std::task::Waker::noop().clone());
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        // The future's poll() consumes the sweep's synthetic error and
+        // completes; nothing re-registers a waker afterward.
+        let consumed = conn.take_outcome(key);
+        assert!(
+            matches!(consumed, Some(OpOutcome::Error { .. })),
+            "precondition: the sweep recorded an outcome for the waited ack: {consumed:?}"
+        );
+        assert_eq!(
+            conn.pending_waker_count(),
+            0,
+            "precondition: the sweep's wake_for_request already drained the waker"
+        );
+
+        // The broker's own real reply for the same request id lands late.
+        let ack_response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack_response).expect("encode CommandAckResponse");
+        conn.handle_bytes(t0 + Duration::from_millis(2), &buf)
+            .expect("handle AckResponse");
+
+        let leaked = conn.take_outcome(key);
+        assert!(
+            leaked.is_none(),
+            "a late CommandAckResponse wrote an outcomes entry after its waiter was \
+             already gone: {leaked:?}. The AckResponse arm inserted unconditionally \
+             even when `pending_requests.remove` returned `None`."
+        );
+    }
+
     /// Backstop deadline: an ack whose `CommandAckResponse` never arrives (the
     /// broker goes silent without ever tearing the consumer down) must not
     /// hang the caller's `ack().await` forever. Once the INJECTED clock
@@ -13984,7 +16556,7 @@ mod conn_state_tests {
 
     #[test]
     fn auto_policy_grows_target_under_starvation_and_emits_incremental_flow() {
-        // Issue #349: the broker's real permit BALANCE is drained by genuine
+        // Issue #349: the client-accounted permit balance is drained by genuine
         // dispatch (not a synthetic field write) and the byte budget is wide
         // open — the adjust tick doubles the target and emits an incremental
         // flow for the delta.
@@ -13992,7 +16564,7 @@ mod conn_state_tests {
         let t0 = Instant::now();
         let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
 
-        // Drain the broker-side permit BALANCE via real dispatch — 100
+        // Drain the client-accounted permit balance via real dispatch — 100
         // single-message deliveries against the 100-permit initial grant —
         // so `available_permits == 0` is the genuine starvation signal at
         // tick time, not a manually-zeroed mirror.
@@ -14029,8 +16601,21 @@ mod conn_state_tests {
         );
         assert_eq!(
             conn.consumer_available_permits(handle),
+            100,
+            "issue #414: the accessor now reports the client-accounted balance — dispatch drained the \
+             initial 100-permit grant to 0, so after the incremental top-up of 100 the \
+             client accounts for exactly 100 un-spent permits, not the 200-permit cumulative \
+             grant the additive `granted_permits` mirror still records"
+        );
+        assert_eq!(
+            conn.consumers
+                .get(&handle)
+                .expect("consumer registered")
+                .state
+                .lock()
+                .granted_permits,
             200,
-            "available permits track the new target after the incremental grant"
+            "the additive grant mirror is unchanged by #414 and still tracks the target"
         );
     }
 
@@ -14094,7 +16679,7 @@ mod conn_state_tests {
         // starvation never registered as zero and `Auto` could never
         // observe the starvation signal it needs to grow. This test drives
         // genuine message deliveries — not a synthetic field write — until
-        // the broker-side permit balance is truly exhausted, then asserts
+        // the client-accounted permit balance reaches zero, then asserts
         // the adjust tick grows the target and emits an incremental flow.
         let interval = Duration::from_secs(1);
         let t0 = Instant::now();
@@ -14405,6 +16990,49 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn observational_event_queue_is_capped_and_delivery_unaffected() {
+        // Issue #413: nothing in the production runtime consumes the
+        // per-message observational events, so without a cap the queue
+        // retains every payload until OOM. Deliver more messages than the
+        // cap WITHOUT draining events: the queue must stay bounded, the
+        // drop counter must account for the excess, and — critically —
+        // pop_message must still return every message (the cap concerns
+        // observability only, never delivery).
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let total = EVENT_QUEUE_OBSERVATIONAL_CAP + 100;
+        for i in 0..total {
+            let frame = message_frame(handle.0, &regular_metadata(), format!("m-{i}").as_bytes());
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle regular message");
+        }
+
+        assert!(
+            conn.events.len() <= EVENT_QUEUE_OBSERVATIONAL_CAP,
+            "event queue exceeded the observational cap: {}",
+            conn.events.len()
+        );
+        assert!(
+            conn.dropped_observational_events() >= 100,
+            "expected >= 100 dropped observational events, got {}",
+            conn.dropped_observational_events()
+        );
+
+        // Delivery is untouched by the cap: every message is still poppable.
+        let mut popped = 0usize;
+        while conn.pop_message(handle, Instant::now()).is_some() {
+            popped += 1;
+        }
+        assert_eq!(
+            popped, total,
+            "pop_message must yield every delivered message"
+        );
+    }
+
+    #[test]
     fn consumer_passes_through_non_marker_messages() {
         // Regression guard: regular messages (no marker_type) must still surface as
         // ConnectionEvent::Message.
@@ -14445,8 +17073,7 @@ mod conn_state_tests {
         let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
-        let mut meta = marker_metadata(21); // TXN_COMMIT
-        meta.num_messages_in_batch = Some(1);
+        let meta = marker_metadata(21); // TXN_COMMIT
         let frame = message_frame(handle.0, &meta, b"txn-payload");
         conn.handle_bytes(Instant::now(), &frame)
             .expect("handle txn marker frame");
@@ -14972,7 +17599,6 @@ mod conn_state_tests {
             producer_name: "magnetar-test-prod".to_owned(),
             sequence_id: 1,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         };
         let cmd = deliver_cmd(handle, ledger, entry);
@@ -15184,6 +17810,87 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn individual_batch_ack_reconstructs_conservative_tracker_after_reset() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        deliver_batch(&mut conn, handle, t0, 11, 7, 4);
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(11, 7)]);
+        let _ = drain_outbound_commands(&mut conn);
+
+        conn.reset();
+        assert!(
+            batch_tracker_keys(&conn, handle).is_empty(),
+            "reset must discard unconfirmed session-local ack bits"
+        );
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 11,
+                    entry_id: 7,
+                    partition: -1,
+                    batch_index: 1,
+                    batch_size: 4,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+
+        let commands = drain_outbound_commands(&mut conn);
+        let ack = commands
+            .iter()
+            .find_map(|command| command.ack.as_ref())
+            .expect("individual CommandAck");
+        assert_eq!(ack.message_id.len(), 1);
+        assert_eq!(
+            ack.message_id[0].ack_set,
+            vec![0b1101],
+            "only index 1 is acknowledged; every sibling remains conservatively unacked"
+        );
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(11, 7)]);
+    }
+
+    #[test]
+    fn invalid_batch_ack_is_rejected_without_wire_output() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let _ = drain_outbound_commands(&mut conn);
+        let request_id = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 11,
+                    entry_id: 7,
+                    partition: -1,
+                    batch_index: 4,
+                    batch_size: 4,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+
+        assert!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .all(|command| command.ack.is_none()),
+            "malformed batch coordinates must not reach the broker"
+        );
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(request_id)),
+            Some(OpOutcome::Error {
+                code: INVALID_BATCH_ACK_CODE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cumulative_ack_prunes_batch_ack_tracker_entries_at_and_below_the_acked_position() {
         let t0 = Instant::now();
         let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
@@ -15369,8 +18076,10 @@ mod conn_state_tests {
         {
             let state = conn.consumers[&handle].state.lock();
             assert_eq!(
-                state.last_acked_message_id, None,
-                "broker acceptance into a transaction must not advance reconnect state"
+                Connection::consumer_reattach_start_message_id(
+                    &conn.consumer_subscribe_requests[&handle], &state,
+                ), None,
+                "broker acceptance into a transaction must not override the durable broker cursor"
             );
         }
         conn.settle_transactional_acks(handle, txn_id, false);
@@ -15410,8 +18119,12 @@ mod conn_state_tests {
         conn.settle_transactional_acks(handle, txn_id, true);
 
         assert_eq!(
-            conn.consumers[&handle].state.lock().last_acked_message_id,
-            Some(message_id)
+            Connection::consumer_reattach_start_message_id(
+                &conn.consumer_subscribe_requests[&handle],
+                &conn.consumers[&handle].state.lock(),
+            ),
+            None,
+            "committed acknowledgements still defer to the durable broker cursor"
         );
         conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
         assert_eq!(
@@ -15519,6 +18232,1532 @@ mod conn_state_tests {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Issue #451 — a broker `CommandCloseProducer` that arrives on a LIVE
+    // connection (no TCP drop) must re-attach the producer in place, exactly
+    // like the #307 consumer twin, instead of leaving it detached until the
+    // process restarts.
+    // ---------------------------------------------------------------------
+
+    /// Broker-initiated `CommandCloseProducer` for `handle`. `url = None` is a
+    /// same-broker bundle unload (ModularLoadManager / standalone); `Some(_)` is
+    /// the shape an Extensible-Load-Manager multi-phase unload puts on the wire.
+    fn close_producer_frame(handle: ProducerHandle, url: Option<String>) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseProducer as i32,
+            close_producer: Some(pb::CommandCloseProducer {
+                producer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: url,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseProducer");
+        buf
+    }
+
+    /// One `OutgoingMessage` carrying `payload`.
+    fn reattach_outgoing(payload: &'static [u8]) -> crate::producer::OutgoingMessage {
+        crate::producer::OutgoingMessage {
+            payload: bytes::Bytes::from_static(payload),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: payload.len() as u32,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        }
+    }
+
+    /// Handshake + open one attached producer. Returns the handle.
+    fn reattach_attached_producer(conn: &mut Connection, topic: &str) -> ProducerHandle {
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(conn);
+        ack_producer_success(conn, open_rid);
+        while conn.poll_event().is_some() {}
+        handle
+    }
+
+    /// #463: the per-slot gate exposed through both runtime producer handles
+    /// must distinguish a detached child from its still-live connection, then
+    /// reopen only when the broker acknowledges the new attachment.
+    #[test]
+    fn partition_child_gate_tracks_close_and_reattach_on_live_connection() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = reattach_attached_producer(
+            &mut conn,
+            "persistent://public/default/router-readiness-463",
+        );
+        assert!(conn.is_connected());
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(state.broker_ready);
+            assert!(
+                slot.is_routing_ready(),
+                "the routing read cannot take the held slot lock"
+            );
+        }
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("broker close");
+        assert!(conn.is_connected(), "only the child attachment closed");
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(!state.broker_ready);
+            assert!(
+                !slot.is_routing_ready(),
+                "a detached child cannot take a route"
+            );
+        }
+
+        ack_producer_success(&mut conn, reattach_rid);
+        assert!(conn.is_connected());
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(state.broker_ready);
+            assert!(
+                slot.is_routing_ready(),
+                "ProducerSuccess restores the route"
+            );
+        }
+
+        conn.mark_disconnected();
+        assert!(
+            !conn.producer(handle).expect("slot").is_routing_ready(),
+            "a connection loss invalidates even a previously attached child"
+        );
+        conn.reset();
+        assert!(!conn.producer(handle).expect("slot").is_routing_ready());
+    }
+
+    /// Every `CommandProducer` in `commands` naming `handle`, as
+    /// `(request_id, epoch)` pairs in wire order.
+    fn reattach_producer_opens(
+        commands: &[pb::BaseCommand],
+        handle: ProducerHandle,
+    ) -> Vec<(u64, Option<u64>)> {
+        commands
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Producer as i32)
+            .filter_map(|c| c.producer.as_ref())
+            .filter(|p| p.producer_id == handle.0)
+            .map(|p| (p.request_id, p.epoch))
+            .collect()
+    }
+
+    /// How many `CommandSend` frames in `commands` name `handle`.
+    fn reattach_send_frames(commands: &[pb::BaseCommand], handle: ProducerHandle) -> usize {
+        commands
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Send as i32)
+            .filter_map(|c| c.send.as_ref())
+            .filter(|s| s.producer_id == handle.0)
+            .count()
+    }
+
+    /// Whether a `ProducerClosedByBroker` for `handle` surfaced (drains the queue).
+    fn drain_producer_close_event(conn: &mut Connection, handle: ProducerHandle) -> bool {
+        let mut saw = false;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ProducerClosedByBroker { handle: h, .. } = ev {
+                if h == handle {
+                    saw = true;
+                }
+            }
+        }
+        saw
+    }
+
+    /// #451 root cause: a `CommandCloseProducer` on a live socket re-emits
+    /// `CommandProducer` with a bumped epoch, keeps the drain gate shut until
+    /// the fresh `ProducerSuccess`, and surfaces NO event (the re-attach is
+    /// transparent to the runtime, mirroring #307).
+    #[test]
+    fn broker_close_of_attached_producer_reattaches_in_place_without_event() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451");
+
+        // A first send goes out normally on the healthy attachment.
+        let t0 = Instant::now();
+        let _ = conn
+            .send(handle, reattach_outgoing(b"before"), 0, t0)
+            .expect("queue first send");
+        let before = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&before, handle),
+            1,
+            "the pre-close send must reach the wire on the healthy attachment"
+        );
+
+        // Broker closes the attached producer on the LIVE socket.
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(t0, &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            vec![(reattach_rid, Some(1))],
+            "the close must re-emit exactly one CommandProducer with epoch 1"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "the in-place re-attach is transparent: no ProducerClosedByBroker event"
+        );
+        {
+            let slot = conn.producer(handle).expect("producer slot");
+            let p = slot.state.lock();
+            assert!(
+                !p.broker_ready,
+                "the drain gate stays shut until the fresh ProducerSuccess"
+            );
+            assert_eq!(
+                p.open_request_id,
+                Some(RequestId(reattach_rid)),
+                "the re-attach owns the producer's active open generation"
+            );
+            assert!(
+                !p.closed,
+                "an in-place re-attach must not close the producer"
+            );
+        }
+
+        // A send staged behind the shut gate must not reach the wire.
+        let _ = conn
+            .send(handle, reattach_outgoing(b"staged"), 0, t0)
+            .expect("queue staged send");
+        let gated = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&gated, handle),
+            0,
+            "Pulsar closes the whole connection on a send to a not-ready producer: \
+             the staged send must wait for the re-attach ack"
+        );
+
+        // The broker acks the re-attach: the gate opens and BOTH publishes reach
+        // the wire — the staged one, plus the pre-close publish the broker never
+        // receipted (`replay_pending_outbound`, Java `resendMessages`). That
+        // replay is the documented at-least-once shape of every re-attach path.
+        ack_producer_success(&mut conn, reattach_rid);
+        let flushed = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&flushed, handle),
+            2,
+            "the re-attach ack flushes the staged send and replays the still-unacked \
+             pre-close publish"
+        );
+        assert!(
+            conn.producer(handle)
+                .expect("slot")
+                .state
+                .lock()
+                .broker_ready,
+            "ProducerSuccess re-opens the drain gate"
+        );
+    }
+
+    /// #451: an `assigned_broker_service_url` on the close takes the SAME
+    /// in-place path. No existing path owns `ProducerClosedByBroker{Some(url)}`
+    /// on a live socket (the driver migration arm keys on `TopicMigrated`), and
+    /// an Extensible-Load-Manager multi-phase unload makes `Some(url)` the
+    /// default close shape. Java uses the URL only as a dial hint and re-sends
+    /// `CommandProducer` regardless.
+    #[test]
+    fn broker_close_with_assigned_url_takes_the_same_in_place_path() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-url");
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(
+            Instant::now(),
+            &close_producer_frame(handle, Some("pulsar://other-broker:6650".to_owned())),
+        )
+        .expect("handle CommandCloseProducer with an assigned url");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            vec![(reattach_rid, Some(1))],
+            "an assigned-url close re-attaches in place, exactly like url=None"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "an assigned-url close must not surface ProducerClosedByBroker either"
+        );
+        assert!(
+            !conn
+                .producer(handle)
+                .expect("slot")
+                .state
+                .lock()
+                .broker_ready,
+            "the drain gate stays shut until the fresh ProducerSuccess"
+        );
+    }
+
+    /// #451 refusal: a close that lands while the producer's FIRST open is
+    /// still in flight is left to that open's parked waiter — no second
+    /// `CommandProducer` (which would leave one of the two replies unmatched),
+    /// and the event still surfaces because a waiter can consume it.
+    #[test]
+    fn broker_close_during_in_flight_open_surfaces_event_without_second_open() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/reattach-451-in-flight".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        // The close arrives BEFORE the first ProducerSuccess.
+        let next_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer mid-open");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            Vec::<(u64, Option<u64>)>::new(),
+            "the open already in flight owns the next ProducerSuccess: no second CommandProducer"
+        );
+        assert!(
+            drain_producer_close_event(&mut conn, handle),
+            "while an open is in flight its parked waiter owns the outcome, so the event \
+             must still surface"
+        );
+        {
+            let slot = conn.producer(handle).expect("producer slot");
+            let p = slot.state.lock();
+            assert!(!p.broker_ready, "the drain gate is shut");
+            assert_eq!(
+                p.open_request_id,
+                Some(RequestId(open_rid)),
+                "the in-flight open keeps owning the active generation"
+            );
+        }
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            next_rid,
+            "a refused close allocates no request id"
+        );
+    }
+
+    /// #451 refusal: a close naming a producer we never created, or one the
+    /// user already closed, puts nothing on the wire and pushes no event —
+    /// there is no waiter that could consume it, so pushing one would only
+    /// grow the event queue under bundle churn.
+    #[test]
+    fn broker_close_for_unknown_or_user_closed_producer_emits_nothing() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-gone");
+
+        // (a) unknown producer id.
+        let ghost = ProducerHandle(4242);
+        let next_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(ghost, None))
+            .expect("a close for an unknown producer is not a protocol error");
+        let after_ghost = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_ghost, ghost),
+            Vec::<(u64, Option<u64>)>::new(),
+            "nothing to replay for a producer we never created"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, ghost),
+            "an unknown handle has no waiter: push no event"
+        );
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            next_rid,
+            "a refused close allocates no request id"
+        );
+        assert!(conn.is_connected(), "a refusal is not a protocol error");
+
+        // (b) the user closed the producer first.
+        let _ = conn.close_producer(handle);
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+        let before_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("a close for a user-closed producer is not a protocol error");
+        let after_closed = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_closed, handle),
+            Vec::<(u64, Option<u64>)>::new(),
+            "a user close owns the handle: never re-attach it"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "a user-closed producer has no waiter: push no event"
+        );
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            before_rid,
+            "a refused close allocates no request id"
+        );
+    }
+
+    /// #451 primary real-world path: the broker fences the topic before writing
+    /// the close, so the immediate re-issue is typically answered
+    /// `ServiceNotReady`. That rides the existing ADR-0080 operation-retry leg
+    /// (`DriverRetry::Producer`) rather than terminalizing.
+    #[test]
+    fn in_place_reattach_rejected_service_not_ready_arms_driver_retry() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-retry");
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        feed_transient_error(&mut conn, RequestId(reattach_rid));
+        let retry = conn
+            .poll_driver_retry()
+            .expect("a transient rejection arms the retry leg");
+        match retry {
+            crate::DriverRetry::Producer {
+                handle: h,
+                failed_request_id,
+                ..
+            } => {
+                assert_eq!(h, handle, "the retry leg names the closed producer");
+                assert_eq!(
+                    failed_request_id,
+                    RequestId(reattach_rid),
+                    "the leg is bound to the re-attach generation it must supersede"
+                );
+            }
+            other => panic!("unexpected driver retry: {other:?}"),
+        }
+        assert_eq!(
+            conn.producer_transient_open_attempts(handle),
+            1,
+            "one ADR-0080 attempt is consumed per rejected re-attach"
+        );
+
+        let retry_rid = conn
+            .retry_producer_open_if_current(handle, RequestId(reattach_rid))
+            .expect("the leg still owns the active generation");
+        let retried = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&retried, handle),
+            vec![(retry_rid.0, Some(2))],
+            "the retry re-issues with a strictly newer epoch"
+        );
+    }
+
+    /// #451: sends staged across an in-place re-attach keep their ORIGINAL
+    /// `send_timeout` deadline (Java parity: `sendTimeout` keeps ticking while
+    /// the producer is re-attaching), so a re-attach the broker never acks
+    /// still resolves the send instead of hanging forever.
+    #[test]
+    fn sends_staged_across_in_place_reattach_keep_their_original_send_timeout() {
+        let send_timeout = Duration::from_secs(5);
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/reattach-451-timeout".to_owned(),
+            send_timeout: Some(send_timeout),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, open_rid);
+        while conn.poll_event().is_some() {}
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(handle, reattach_outgoing(b"across-reattach"), 0, t0)
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // The broker closes the producer one second into the send's budget; the
+        // re-attach is never acked.
+        conn.handle_bytes(
+            t0 + Duration::from_secs(1),
+            &close_producer_frame(handle, None),
+        )
+        .expect("handle CommandCloseProducer");
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        conn.handle_timeout(t0 + send_timeout);
+        let outcome = conn
+            .take_outcome(PendingOpKey::Send(handle, seq))
+            .expect("the send-timeout sweep must resolve the staged send at its ORIGINAL deadline");
+        match outcome {
+            OpOutcome::SendError { code, .. } => assert_eq!(
+                code, -1,
+                "the synthetic send-timeout sentinel resolves the staged send"
+            ),
+            other => panic!("unexpected send outcome: {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #414 — connection-level wiring of the per-consumer stall watchdog and
+// of the caller-driven in-place re-subscribe recovery.
+//
+// `consumer::stall_watchdog_tests` pins the state machine in isolation; this
+// module pins the four things only `Connection` can own: that `poll_timeout`
+// arms the deadline (so a moonpool driver wakes deterministically rather than
+// opportunistically), that `handle_timeout` surfaces exactly one
+// `ConsumerStalled`, that `resubscribe_consumer_in_place` reproduces the
+// #307 same-broker re-attach on demand, and that ADR-0103's opt-in automatic
+// recovery drives that re-attach a BOUNDED number of times per stall streak.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod consumer_stall_and_recovery_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(30);
+    const RQ: usize = 8;
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    fn feed_success(conn: &mut Connection, request_id: u64, at: Instant) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandSuccess");
+        conn.handle_bytes(at, &buf).expect("handle Success");
+    }
+
+    fn message_frame(consumer_id: u64, entry_id: u64, payload: &[u8]) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "producer".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, &meta, payload).expect("encode_payload");
+        buf.to_vec()
+    }
+
+    /// Drain the outbound buffer once, bucketing this consumer's subscribe
+    /// request ids and flow grants (`poll_transmit` empties the buffer, so a
+    /// second call would see nothing — classify in one pass).
+    fn drain_outbound(conn: &mut Connection, handle: ConsumerHandle) -> (Vec<u64>, Vec<u32>) {
+        let (subs, grants, _closes) = drain_outbound_all(conn, handle);
+        (subs, grants)
+    }
+
+    /// [`drain_outbound`] plus this consumer's `CommandCloseConsumer` request ids —
+    /// ADR-0108's recovery emits one of those BEFORE its `CommandSubscribe`, so a test
+    /// that only buckets subscribes and grants cannot see the first phase at all.
+    fn drain_outbound_all(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+    ) -> (Vec<u64>, Vec<u32>, Vec<u64>) {
+        let mut out = conn.poll_transmit();
+        let (mut subs, mut grants, mut closes) = (Vec::new(), Vec::new(), Vec::new());
+        while !out.is_empty() {
+            let frame = crate::frame::decode_one(&mut out).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Subscribe as i32 {
+                if let Some(sub) = frame.command.subscribe {
+                    if sub.consumer_id == handle.0 {
+                        subs.push(sub.request_id);
+                    }
+                }
+            } else if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                if let Some(flow) = frame.command.flow {
+                    if flow.consumer_id == handle.0 {
+                        grants.push(flow.message_permits);
+                    }
+                }
+            } else if frame.command.r#type == pb::base_command::Type::CloseConsumer as i32 {
+                if let Some(close) = frame.command.close_consumer {
+                    if close.consumer_id == handle.0 {
+                        closes.push(close.request_id);
+                    }
+                }
+            }
+        }
+        (subs, grants, closes)
+    }
+
+    /// The broker's `CommandError` for `request_id`.
+    fn feed_error(conn: &mut Connection, request_id: u64, code: pb::ServerError, at: Instant) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: code as i32,
+                message: "broker says no".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandError");
+        conn.handle_bytes(at, &buf).expect("handle Error");
+    }
+
+    fn drain_stall_events(conn: &mut Connection) -> Vec<(ConsumerHandle, u32, Duration)> {
+        let mut out = Vec::new();
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ConsumerStalled {
+                handle,
+                permit_balance,
+                stalled_for,
+            } = ev
+            {
+                out.push((handle, permit_balance, stalled_for));
+            }
+        }
+        out
+    }
+
+    /// A handshaked connection with one acked, flowed Shared consumer — the
+    /// steady state a #414 wedge strikes from.
+    fn shared_consumer(
+        stall_timeout: Option<Duration>,
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle) {
+        shared_consumer_with_recovery(stall_timeout, None, t0)
+    }
+
+    /// [`shared_consumer`] with ADR-0103's automatic recovery budget also set.
+    fn shared_consumer_with_recovery(
+        stall_timeout: Option<Duration>,
+        auto_recovery: Option<u32>,
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                consumer_stall_timeout: stall_timeout,
+                consumer_stall_auto_recovery: auto_recovery,
+                // Off so the only deadlines in play are the keepalive and the
+                // watchdog — otherwise the assertions on `poll_timeout` would be
+                // reading whichever sweep happens to be nearer.
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/shared-stall".to_owned(),
+            subscription: "sub-shared-stall".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Shared,
+            receiver_queue_size: RQ,
+            ..Default::default()
+        });
+        feed_success(&mut conn, subscribe_rid, t0);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, t0);
+        let _ = drain_outbound(&mut conn, handle);
+        (conn, handle)
+    }
+
+    /// [`shared_consumer`] with an explicit subscription type and durability — the two
+    /// properties ADR-0108's recovery refuses on, and the only two a `SubscribeRequest`
+    /// carries that it reads.
+    fn consumer_with(
+        sub_type: pb::command_subscribe::SubType,
+        durable: bool,
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/shared-stall".to_owned(),
+            subscription: "sub-shared-stall".to_owned(),
+            sub_type,
+            durable,
+            receiver_queue_size: RQ,
+            ..Default::default()
+        });
+        feed_success(&mut conn, subscribe_rid, t0);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, t0);
+        let _ = drain_outbound(&mut conn, handle);
+        (conn, handle)
+    }
+
+    #[test]
+    fn available_permits_reports_the_real_decrementing_balance() {
+        // The #414 detection premise: an application polling this accessor must
+        // see the balance fall under dispatch. On the additive mirror it stayed
+        // pinned at the receiver-queue size forever, which is exactly why a
+        // wedged consumer was indistinguishable from a healthy one.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        assert_eq!(conn.consumer_available_permits(handle), RQ as u32);
+        for entry in 0..3u64 {
+            conn.handle_bytes(t0, &message_frame(handle.0, entry, b"x"))
+                .expect("deliver");
+        }
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32 - 3,
+            "three dispatch units spent three of the broker's permits"
+        );
+        assert_eq!(
+            conn.consumers
+                .get(&handle)
+                .expect("registered")
+                .state
+                .lock()
+                .granted_permits,
+            RQ as u32,
+            "the additive grant mirror is untouched by dispatch — that is the #414 problem"
+        );
+    }
+
+    #[test]
+    fn disabled_watchdog_arms_no_deadline_and_emits_nothing() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        // Only the keepalive deadline may be armed; the watchdog must not add
+        // one, because an armed-but-never-firing deadline still perturbs the
+        // moonpool engine's simulated wake schedule.
+        let keepalive_deadline = t0 + ConnectionConfig::default().keepalive_interval;
+        assert_eq!(conn.poll_timeout(), Some(keepalive_deadline));
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + Duration::from_mins(10));
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the watchdog ships disarmed; ten minutes of silence must stay silent"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and nothing about the permit state changed"
+        );
+    }
+
+    #[test]
+    fn a_silent_broker_surfaces_exactly_one_consumer_stalled_event() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+
+        // First tick seeds the window; `poll_timeout` must then advertise it so
+        // the driver schedules a deterministic wake for the firing tick.
+        conn.handle_timeout(t0);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the seeding tick reports nothing"
+        );
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(t0 + WINDOW),
+            "the stall deadline is nearer than the keepalive and must win"
+        );
+
+        conn.handle_timeout(t0 + WINDOW);
+        let events = drain_stall_events(&mut conn);
+        assert_eq!(
+            events,
+            vec![(handle, RQ as u32, WINDOW)],
+            "one event carrying the un-spent balance and the silence duration"
+        );
+
+        // Every later tick in the same episode stays silent.
+        for extra in [1u64, 30, 300] {
+            conn.handle_timeout(t0 + WINDOW + Duration::from_secs(extra));
+        }
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "exactly one event per stall episode"
+        );
+    }
+
+    #[test]
+    fn dispatch_re_arms_the_watchdog_for_a_second_episode() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "first episode");
+
+        // The broker resumes for one message, the user drains it, then it goes
+        // silent again.
+        let resumed = t0 + WINDOW + Duration::from_secs(1);
+        conn.handle_bytes(resumed, &message_frame(handle.0, 1, b"x"))
+            .expect("deliver");
+        let _ = conn.pop_message(handle, resumed);
+        let _ = conn.poll_transmit();
+        while conn.poll_event().is_some() {}
+
+        conn.handle_timeout(resumed);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the dispatch re-seeded the window"
+        );
+        conn.handle_timeout(resumed + WINDOW);
+        let events = drain_stall_events(&mut conn);
+        assert_eq!(
+            events.len(),
+            1,
+            "a consumer that wedges twice reports twice, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_paused_consumer_never_stalls() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        conn.set_paused(handle, true);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW * 4);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the user asked the broker to stop; reporting that back is noise"
+        );
+    }
+
+    #[test]
+    fn resubscribe_in_place_closes_first_then_zeroes_permits_and_defers_flow() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        // Drive it into a reported stall first — this is the recovery ladder's
+        // entry point, so the two halves are exercised in the order a caller
+        // would run them.
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "stall reported");
+
+        // Phase 1: a CommandCloseConsumer and NOTHING else. The mirrors are still
+        // intact, because the broker has not yet agreed to drop anything.
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("a live, acked, un-gated durable non-Failover consumer is eligible");
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "phase 1 must not touch the mirrors: no close has been accepted, and a \
+             close the broker goes on to reject must leave a consumer \
+             the watchdog can still see (is_stall_candidate needs permit_balance > 0)"
+        );
+        let (subs, grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(closes, vec![close_rid.0], "one CommandCloseConsumer");
+        assert!(
+            subs.is_empty() && grants.is_empty(),
+            "the re-subscribe is owed to the close ack, not to this call: a \
+             CommandSubscribe for a consumer id the broker still holds is answered \
+             CommandSuccess and changes nothing (ServerCnx.java:1320-1326)"
+        );
+
+        // Phase 2: the broker confirms the close, and only now does the slot really
+        // exist at availablePermits = 0 for the mirrors to follow.
+        let resub_rid = conn.peek_next_request_id_for_test();
+        feed_success(&mut conn, close_rid.0, t0 + WINDOW);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "the broker has now really dropped the dispatcher slot, so the client's \
+             mirrors must follow it to zero"
+        );
+        let (subs, grants_before_ack, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(subs, vec![resub_rid], "one fresh CommandSubscribe");
+        assert!(closes.is_empty(), "exactly one close per recovery");
+        assert!(
+            grants_before_ack.is_empty(),
+            "pre-ack flow is dropped broker-side (ServerCnx.handleFlow 'Couldn't find \
+             consumer'), so it must be deferred"
+        );
+
+        feed_success(&mut conn, resub_rid, t0 + WINDOW);
+        let (_subs, grants_after_ack) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            grants_after_ack,
+            vec![RQ as u32],
+            "the Success arm re-arms the full receiver-queue grant"
+        );
+        assert_eq!(conn.consumer_available_permits(handle), RQ as u32);
+        assert!(!conn.consumer_is_closed(handle), "the consumer stays open");
+
+        // And the re-arm restarted the watchdog rather than inheriting the
+        // reported window: a fresh episode has to run its full length.
+        conn.handle_timeout(t0 + WINDOW);
+        assert!(drain_stall_events(&mut conn).is_empty(), "re-seed only");
+        conn.handle_timeout(t0 + WINDOW + WINDOW.saturating_sub(Duration::from_millis(1)));
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "still one millisecond short of the new window"
+        );
+    }
+
+    #[test]
+    fn resubscribe_in_place_fails_in_flight_acks() {
+        // Issue #346's contract, reached through the #414 entry point. Since
+        // ADR-0108 the recovery really closes the consumer, so this is no longer a
+        // claim about a generation the broker only might have retired: the broker
+        // has acked the close, the consumer id those acks were correlated against
+        // is gone, and no CommandAckResponse for them can arrive. A parked
+        // `ack().await` would otherwise hang to the backstop.
+        //
+        // The sweep runs in phase 2, with the close, and NOT in phase 1 — an ack is
+        // orphaned by the close landing, not by the client deciding to send one.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let ack_rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound(&mut conn, handle);
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the sweep's waiter guard (issue #241 leak fix) sees a live caller
+        // and still records the synthetic error for it to consume.
+        conn.register_waker(
+            PendingOpKey::Request(ack_rid),
+            std::task::Waker::noop().clone(),
+        );
+
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(ack_rid)).is_none(),
+            "phase 1 must not fail the ack: the broker has not agreed to close \
+             anything yet, so this ack is still correlated and still answerable"
+        );
+
+        feed_success(&mut conn, close_rid.0, t0);
+        match conn.take_outcome(PendingOpKey::Request(ack_rid)) {
+            Some(OpOutcome::Error { code, message, .. }) => {
+                assert_eq!(code, -1);
+                assert_eq!(message, "ack orphaned by broker consumer close");
+            }
+            other => panic!("the close ack must fail the in-flight ack, got {other:?}"),
+        }
+    }
+
+    /// The mirror image of the test above, and the reason every mutation moved to
+    /// phase 2: a close the broker REJECTS must leave the consumer exactly as the
+    /// caller found it.
+    ///
+    /// Zeroing the mirrors up front would have left a consumer that is still wedged
+    /// AND invisible to the watchdog — `is_stall_candidate` requires
+    /// `permit_balance > 0` — which is strictly worse than the stall it was called
+    /// to repair. And failing its acks up front would have handed the caller an
+    /// error for acks the broker is still going to answer.
+    #[test]
+    fn a_rejected_recovery_close_mutates_nothing_and_sends_no_resubscribe() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        let ack_rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound(&mut conn, handle);
+
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        let (_subs, _grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(
+            closes,
+            vec![close_rid.0],
+            "phase 1 put its close on the wire"
+        );
+
+        feed_error(&mut conn, close_rid.0, pb::ServerError::ServiceNotReady, t0);
+
+        let (subs, grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert!(
+            subs.is_empty() && grants.is_empty() && closes.is_empty(),
+            "a rejected close must not be followed by a CommandSubscribe — that is \
+             exactly the live-id no-op ADR-0108 exists to stop emitting"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "the rejected close must leave the client permit mirrors unchanged — \
+             and the watchdog needs permit_balance > 0 to \
+             report the consumer at all"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(ack_rid)).is_none(),
+            "the broker never closed the consumer, so this ack is not orphaned"
+        );
+        assert!(!conn.consumer_is_closed(handle), "the consumer stays open");
+        assert!(
+            !conn
+                .outcomes
+                .contains_key(&PendingOpKey::Request(close_rid)),
+            "no waiter exists for a recovery close, so recording an outcome would \
+             leak one permanent entry per attempt (the issue #241 shape)"
+        );
+
+        // And the consumer is eligible again: a rejected close is a retryable
+        // attempt, not a terminal state.
+        let retry = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("a rejected close leaves the consumer recoverable");
+        assert_ne!(retry, close_rid, "a fresh close, not the rejected one");
+    }
+
+    /// A second call while phase 1 is still in flight must not emit a second close.
+    ///
+    /// Two `CommandCloseConsumer` frames for one consumer id would leave the second
+    /// answered against a consumer the first already removed, and its `Success`
+    /// would drive a second `CommandSubscribe` behind the re-attach the first one
+    /// already made — the double-attach `flow_on_subscribe_ack` exists to prevent.
+    #[test]
+    fn a_second_recovery_is_refused_while_the_close_is_in_flight() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        assert_eq!(
+            conn.resubscribe_consumer_in_place(handle),
+            None,
+            "a recovery close is already awaiting its ack"
+        );
+        let (_subs, _grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(closes, vec![close_rid.0], "exactly one close on the wire");
+    }
+
+    /// Losing the connection between the two phases hands the re-attach to the
+    /// reconnect path, which is the only correct owner: the session that carried the
+    /// close is gone, so the broker reaped that consumer with it.
+    ///
+    /// `reset` takes `pending_requests` wholesale, which is what clears the
+    /// in-flight marker — and it must consume the entry WITHOUT recording an
+    /// outcome, because nothing will ever drain one.
+    #[test]
+    fn a_session_lost_between_the_two_phases_defers_to_rebuild_consumers() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        let _ = drain_outbound_all(&mut conn, handle);
+
+        conn.reset();
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(close_rid))
+                .is_none(),
+            "a recovery close has no waiter, so reset must consume it rather than \
+             leak a SessionLost outcome nothing can drain (issue #241)"
+        );
+
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0 + WINDOW, &handshake_response_bytes())
+            .expect("Connected");
+        let rebuilt = conn.rebuild_consumers();
+        assert_eq!(
+            rebuilt.len(),
+            1,
+            "the reconnect path owns the re-attach now"
+        );
+        let (subs, _grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(subs, vec![rebuilt[0].0], "exactly one CommandSubscribe");
+        assert!(
+            closes.is_empty(),
+            "the dead session's close is not replayed onto the new one"
+        );
+
+        // And the consumer is recoverable again on the new session: the marker
+        // lived in `pending_requests`, which `reset` emptied.
+        feed_success(&mut conn, rebuilt[0].0, t0 + WINDOW);
+        let _ = drain_outbound_all(&mut conn, handle);
+        assert!(
+            conn.resubscribe_consumer_in_place(handle).is_some(),
+            "nothing from the dead session may keep gating the live one"
+        );
+    }
+
+    /// `Failover` and non-durable subscriptions have no in-place repair, because the
+    /// close this recovery depends on is not one: it triggers an election, or it
+    /// discards a cursor that lives only as long as the consumer (ADR-0099).
+    ///
+    /// Refused with no wire traffic and no mutation, exactly like every other
+    /// ineligible state.
+    #[test]
+    fn failover_and_non_durable_subscriptions_have_no_in_place_recovery() {
+        let t0 = Instant::now();
+        for (label, sub_type, durable) in [
+            ("failover", pb::command_subscribe::SubType::Failover, true),
+            ("non-durable", pb::command_subscribe::SubType::Shared, false),
+        ] {
+            let (mut conn, handle) = consumer_with(sub_type, durable, t0);
+            assert_eq!(
+                conn.resubscribe_consumer_in_place(handle),
+                None,
+                "{label}: closing this consumer is not a repair, so refuse it"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                RQ as u32,
+                "{label}: a refused recovery must not touch the permit mirrors"
+            );
+            let (subs, grants, closes) = drain_outbound_all(&mut conn, handle);
+            assert!(
+                subs.is_empty() && grants.is_empty() && closes.is_empty(),
+                "{label}: a refused recovery must put nothing on the wire"
+            );
+        }
+    }
+
+    /// The shared eligibility predicate must NOT carry the Failover / non-durable
+    /// refusal: issue #307's arm and ADR-0108's own phase 2 both call it AFTER the
+    /// broker has already closed the consumer, where refusing would strand it.
+    #[test]
+    fn a_broker_closed_failover_consumer_is_still_re_attached_in_place() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = consumer_with(pb::command_subscribe::SubType::Failover, true, t0);
+        let _ = drain_outbound_all(&mut conn, handle);
+
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 9999,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseConsumer");
+        conn.handle_bytes(t0, &buf).expect("handle CloseConsumer");
+
+        let (subs, _grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(
+            subs.len(),
+            1,
+            "the broker already closed this standby; not re-attaching it would leave \
+             it out of the failover group forever (#307)"
+        );
+        assert!(
+            closes.is_empty(),
+            "the broker's own close needs no close of ours in front of it"
+        );
+    }
+
+    /// The ineligible states must be refused BEFORE anything is mutated —
+    /// zeroing the permit mirrors for a consumer we then decline to re-subscribe
+    /// would leave it strictly worse off than the stall it was in.
+    #[test]
+    fn an_ineligible_consumer_is_refused_without_being_touched() {
+        let t0 = Instant::now();
+        for (label, mutate) in [
+            (
+                "closed",
+                (|c: &mut crate::consumer::ConsumerState| c.closed = true)
+                    as fn(&mut crate::consumer::ConsumerState),
+            ),
+            (
+                "terminal_failure",
+                |c: &mut crate::consumer::ConsumerState| {
+                    c.terminal_failure = Some("dead".to_owned());
+                },
+            ),
+            ("pending_seek", |c: &mut crate::consumer::ConsumerState| {
+                c.pending_seek = Some(RequestId(99));
+            }),
+            (
+                "flow_on_subscribe_ack",
+                |c: &mut crate::consumer::ConsumerState| c.flow_on_subscribe_ack = true,
+            ),
+            (
+                "unsubscribe_request_id",
+                |c: &mut crate::consumer::ConsumerState| {
+                    c.unsubscribe_request_id = Some(RequestId(98));
+                },
+            ),
+        ] {
+            let (mut conn, handle) = shared_consumer(None, t0);
+            mutate(
+                &mut conn
+                    .consumers
+                    .get(&handle)
+                    .expect("registered")
+                    .state
+                    .lock(),
+            );
+            assert_eq!(
+                conn.resubscribe_consumer_in_place(handle),
+                None,
+                "{label} must refuse an in-place re-subscribe"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                RQ as u32,
+                "{label}: a refused re-subscribe must not zero the permit mirrors"
+            );
+            let (subs, grants) = drain_outbound(&mut conn, handle);
+            assert!(
+                subs.is_empty() && grants.is_empty(),
+                "{label}: a refused re-subscribe must put nothing on the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn resubscribe_in_place_refuses_an_unknown_handle() {
+        let t0 = Instant::now();
+        let (mut conn, _handle) = shared_consumer(None, t0);
+        assert_eq!(
+            conn.resubscribe_consumer_in_place(ConsumerHandle(4242)),
+            None,
+            "an unknown handle has no subscribe request to replay"
+        );
+    }
+
+    /// This consumer's recovery-attempt counter.
+    fn recovery_attempts(conn: &Connection, handle: ConsumerHandle) -> u32 {
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .stall_recovery_attempts
+    }
+
+    #[test]
+    fn a_watchdog_without_auto_recovery_emits_no_wire_traffic() {
+        // ADR-0101's contract, unchanged: the watchdog alone reports and stops. ADR-0103
+        // is opt-in, so a consumer that stalls under `consumer_stall_timeout` with no
+        // budget configured must still produce exactly the report and nothing else — no
+        // `CommandSubscribe`, no `CommandFlow`, no mirror mutation.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer_with_recovery(Some(WINDOW), None, t0);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "reported");
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty() && grants.is_empty(),
+            "recovery is opt-in: an unset budget must put nothing on the wire, got \
+             subs={subs:?} grants={grants:?}"
+        );
+        assert_eq!(recovery_attempts(&conn, handle), 0);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and the permit mirrors are untouched"
+        );
+    }
+
+    #[test]
+    fn auto_recovery_resubscribes_at_most_the_configured_number_of_times() {
+        // The bound is what separates ADR-0103 from the unconditional automatic
+        // re-subscribe ADR-0101 rejected. A dispatcher-WIDE wedge (issue #414's
+        // production shape) cannot be repaired by this client at all, so an unbounded
+        // watchdog would re-subscribe once per window forever against a fault it cannot
+        // fix; the budget turns that into a fixed, small number of attempts followed by a
+        // documented escalation to `pulsar-admin topics unload`.
+        const MAX_ATTEMPTS: u32 = 3;
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            shared_consumer_with_recovery(Some(WINDOW), Some(MAX_ATTEMPTS), t0);
+
+        let mut at = t0;
+        let mut emitted: Vec<u64> = Vec::new();
+        // Four episodes for a budget of three: the fourth must be reported and refused.
+        for episode in 1..=(MAX_ATTEMPTS + 1) {
+            at += WINDOW;
+            let expected_rid = conn.peek_next_request_id_for_test();
+            conn.handle_timeout(at);
+            assert_eq!(
+                drain_stall_events(&mut conn).len(),
+                1,
+                "episode {episode}: the event is emitted whether or not recovery acts"
+            );
+            let (subs, grants, closes) = drain_outbound_all(&mut conn, handle);
+            assert!(
+                grants.is_empty() && subs.is_empty(),
+                "episode {episode}: ADR-0108's phase 1 is a CommandCloseConsumer alone — \
+                 the re-subscribe is owed to its ack and the flow to the re-subscribe's, \
+                 got subs={subs:?} grants={grants:?}"
+            );
+            if episode <= MAX_ATTEMPTS {
+                assert_eq!(
+                    closes,
+                    vec![expected_rid],
+                    "episode {episode}: one automatic in-place recovery"
+                );
+                assert_eq!(
+                    conn.consumer_available_permits(handle),
+                    RQ as u32,
+                    "episode {episode}: phase 1 mutates nothing — the broker has not \
+                     agreed to drop the slot yet"
+                );
+                assert_eq!(recovery_attempts(&conn, handle), episode);
+                emitted.push(expected_rid);
+                // Phase 2: the broker confirms the close, the re-subscribe goes out, and
+                // its own ack releases the deferred grant and re-arms the window. The
+                // broker never dispatches, so nothing resets the budget.
+                let resub_rid = conn.peek_next_request_id_for_test();
+                feed_success(&mut conn, expected_rid, at);
+                assert_eq!(
+                    conn.consumer_available_permits(handle),
+                    0,
+                    "episode {episode}: the mirrors follow the slot the broker really \
+                     dropped"
+                );
+                let (subs, grants, _closes) = drain_outbound_all(&mut conn, handle);
+                assert_eq!(subs, vec![resub_rid], "episode {episode}: the re-attach");
+                assert!(grants.is_empty(), "episode {episode}: flow still deferred");
+                feed_success(&mut conn, resub_rid, at);
+                let (_subs, grants) = drain_outbound(&mut conn, handle);
+                assert_eq!(grants, vec![RQ as u32], "episode {episode}: grant re-armed");
+            } else {
+                assert!(
+                    closes.is_empty(),
+                    "episode {episode}: the budget is spent, got {closes:?}"
+                );
+                assert_eq!(recovery_attempts(&conn, handle), MAX_ATTEMPTS);
+            }
+        }
+        assert_eq!(
+            emitted.len() as u32,
+            MAX_ATTEMPTS,
+            "exactly `max_attempts` recoveries across the whole streak, got {emitted:?}"
+        );
+
+        // And it stays stopped. The last attempt was the last thing that re-armed the
+        // window, so with no dispatch no further episode can open at all.
+        for extra in [1u64, 600, 86_400] {
+            conn.handle_timeout(at + Duration::from_secs(extra));
+            assert_eq!(
+                drain_stall_events(&mut conn),
+                [] as [(ConsumerHandle, u32, std::time::Duration); 0]
+            );
+            let (subs, _) = drain_outbound(&mut conn, handle);
+            assert!(subs.is_empty(), "no recovery traffic resumes on its own");
+        }
+    }
+
+    #[test]
+    fn auto_recovery_skips_a_reported_failover_standby_and_spends_no_budget() {
+        // A `Failover` standby is the one shape that satisfies the stall predicate
+        // PERMANENTLY and legitimately: it holds the initial grant the broker acked at
+        // subscribe time over an empty queue, in a dispatch-eligible state, and the broker
+        // correctly never dispatches to it because the active consumer owns the
+        // subscription. It also never receives the one thing that resets the budget — a
+        // dispatch unit — so an unguarded recovery spends its whole budget on every
+        // healthy standby in a failover group, once per window, and never gets it back.
+        const MAX_ATTEMPTS: u32 = 2;
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            shared_consumer_with_recovery(Some(WINDOW), Some(MAX_ATTEMPTS), t0);
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .record_active_change(false);
+
+        // Four episodes' worth of ticks: every one is reported, none spends a thing.
+        conn.handle_timeout(t0);
+        for episode in 1..=4u64 {
+            conn.handle_timeout(t0 + WINDOW * u32::try_from(episode).expect("fits"));
+            let (subs, grants) = drain_outbound(&mut conn, handle);
+            assert!(
+                subs.is_empty() && grants.is_empty(),
+                "episode {episode}: a standby must produce no recovery traffic at all, \
+                 got subs={subs:?} grants={grants:?}"
+            );
+            assert_eq!(
+                recovery_attempts(&conn, handle),
+                0,
+                "episode {episode}: a skipped standby must spend no budget"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                RQ as u32,
+                "episode {episode}: and must not be mutated"
+            );
+        }
+        // The report itself is untouched — ADR-0101's event means SILENCE, not fault, and
+        // a standby is genuinely silent. Exactly one episode closed (the latch holds after
+        // the first, since nothing re-arms the window).
+        assert_eq!(
+            drain_stall_events(&mut conn).len(),
+            1,
+            "the standby is still reported; only the recovery is skipped"
+        );
+
+        // Promotion needs no repair, because the skip spent nothing: the full budget is
+        // still there for a genuine wedge after the broker hands this consumer the
+        // subscription.
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .record_active_change(true);
+        // Lose and regain candidacy so a fresh episode can open — promotion alone does
+        // not restart the window (ADR-0102 makes `initial_flow` a no-op for a consumer
+        // that already holds its grant, so nothing re-arms the stall watch).
+        conn.set_paused(handle, true);
+        let promoted = t0 + WINDOW * 5;
+        conn.handle_timeout(promoted);
+        conn.set_paused(handle, false);
+        conn.handle_timeout(promoted);
+        let expected_rid = conn.peek_next_request_id_for_test();
+        conn.handle_timeout(promoted + WINDOW);
+        let (_subs, _grants, closes) = drain_outbound_all(&mut conn, handle);
+        assert_eq!(
+            closes,
+            vec![expected_rid],
+            "a promoted consumer recovers normally — ADR-0108's phase-1 close — on a \
+             budget the standby episodes never touched"
+        );
+        assert_eq!(recovery_attempts(&conn, handle), 1);
+    }
+
+    #[test]
+    fn auto_recovery_spends_no_budget_on_a_consumer_it_may_not_re_subscribe() {
+        // `unsubscribe_request_id` is the one state that is a stall candidate AND an
+        // ineligible re-attach: the watchdog still reports it, but the re-subscribe is
+        // refused because the pending unsubscribe owns this consumer's fate. Charging
+        // that refusal to the budget would let an unrelated teardown race burn the
+        // recovery a genuinely wedged consumer still needs.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer_with_recovery(Some(WINDOW), Some(2), t0);
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .unsubscribe_request_id = Some(RequestId(98));
+
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "still reported");
+        let (subs, _grants) = drain_outbound(&mut conn, handle);
+        assert!(subs.is_empty(), "the re-subscribe is refused, got {subs:?}");
+        assert_eq!(
+            recovery_attempts(&conn, handle),
+            0,
+            "a refused attempt spends no budget"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and mutates nothing — the refusal path must leave the consumer exactly as it \
+             was, not strictly worse off than the stall it was in"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "scalable-topics"))]
@@ -15580,6 +19819,7 @@ mod scalable_conn_tests {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
         }
     }
 
@@ -15602,6 +19842,7 @@ mod scalable_conn_tests {
             created_at_ms: 0,
             sealed_at_ms: Some(0),
             legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
         }
     }
 
@@ -15662,6 +19903,7 @@ mod scalable_conn_tests {
                     let range = crate::KeyRange::new(*start, *end).expect("test range");
                     pb::ScalableAssignedSegment {
                         segment_id: *id,
+                        bucket_ranges: Vec::new(),
                         hash_start: *start,
                         hash_end: *end,
                         segment_topic: crate::canonical_segment_topic(
@@ -15689,7 +19931,7 @@ mod scalable_conn_tests {
     fn conn_encodes_scalable_topic_lookup_as_base_command() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
 
         let mut out = conn.poll_transmit();
@@ -15706,6 +19948,101 @@ mod scalable_conn_tests {
         assert_eq!(lookup.topic, "topic://public/default/scaled");
     }
 
+    /// Layer (a) test (ADR-0093 amendment 2026-10-12): every lookup states the
+    /// caller's `create_if_missing` on the wire — `true` and `false` alike — instead
+    /// of leaving the field to the schema default.
+    ///
+    /// The default is `true`, so on a 5.0.0 broker an unset field would mean
+    /// `true`; on 5.0.0-M1 the field does not exist at all. Writing the value the
+    /// caller chose keeps the request's meaning independent of the peer's version,
+    /// and `false` is what makes a lookup read-only: it is what the Java v5 client
+    /// sends from its namespace consumer (`MultiTopicQueueConsumer.java:169`),
+    /// while its single-topic paths send `true` (`DagWatchClient.java:77-79`,
+    /// `Commands.java:1793-1799`).
+    ///
+    /// The assertion is on the **decoded `Option`** — `Some(true)` / `Some(false)`,
+    /// never `None` — because `Message::create_if_missing()` would answer `true`
+    /// for an absent field too and prove nothing. The raw-tail check pins the
+    /// encoding itself: field 3, varint wire type, value 1 or 0.
+    #[test]
+    fn conn_scalable_topic_lookup_states_create_if_missing_explicitly() {
+        let mut conn = connected_conn();
+        for create_if_missing in [true, false] {
+            for topic in [
+                "topic://public/default/scaled",
+                "persistent://public/default/scaled",
+                "scaled",
+            ] {
+                let session_id = conn
+                    .open_scalable_topic_session(topic, create_if_missing)
+                    .expect("broker supports scalable topics");
+
+                let mut out = conn.poll_transmit();
+                assert!(
+                    out.ends_with(&[0x18, u8::from(create_if_missing)]),
+                    "lookup for {topic} must end with field 3 (create_if_missing) = \
+                     {create_if_missing}, got {:02x?}",
+                    &out[..]
+                );
+                let frame =
+                    crate::frame::decode_one(&mut out).expect("decodes as a v5 BaseCommand");
+                let lookup = frame
+                    .command
+                    .scalable_topic_lookup
+                    .expect("lookup payload present");
+                assert_eq!(lookup.session_id, session_id);
+                assert_eq!(
+                    lookup.create_if_missing,
+                    Some(create_if_missing),
+                    "the field is present on the wire, not left to the schema default"
+                );
+            }
+        }
+    }
+
+    /// Layer (a) test: a `CommandScalableTopicUnsubscribe` (type 82, new in
+    /// 5.0.0) arriving on a connection is skipped — no error, no event, no
+    /// reply — and the connection keeps serving.
+    ///
+    /// The command is client→broker; a broker never sends it. It is still a
+    /// vendored `BaseCommand` type this client has no arm for, so this pins that
+    /// the catch-all arm tolerates it rather than ending the connection. Sending
+    /// it is a known gap (ADR-0093 amendment 2026-10-12, `docs/follow-ups.md`).
+    #[test]
+    fn conn_skips_scalable_topic_unsubscribe_frame() {
+        let mut conn = connected_conn();
+        let unsubscribe = pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+            scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                request_id: 7,
+                consumer_id: 3,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &unsubscribe).expect("encode unsubscribe");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("an unacted-on command type must not error the connection");
+        assert!(
+            conn.poll_event().is_none(),
+            "no event for a skipped command"
+        );
+        assert!(conn.poll_transmit().is_empty(), "and no reply");
+
+        // The connection is still serving: a Ping is answered with a Pong.
+        let ping = pb::BaseCommand {
+            r#type: pb::base_command::Type::Ping as i32,
+            ping: Some(pb::CommandPing {}),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &ping).expect("encode ping");
+        conn.handle_bytes(Instant::now(), &buf).expect("ping");
+        let mut out = conn.poll_transmit();
+        let frame = crate::frame::decode_one(&mut out).expect("pong decodes");
+        assert_eq!(frame.command.r#type, pb::base_command::Type::Pong as i32);
+    }
+
     /// Layer (a) test: the first `CommandScalableTopicUpdate` resolves the
     /// session and emits `ScalableTopicLookupResolved` with the layout, its
     /// epoch, and the canonical topic identity.
@@ -15713,7 +20050,7 @@ mod scalable_conn_tests {
     fn conn_emits_scalable_topic_lookup_resolved() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("persistent://public/default/scaled")
+            .open_scalable_topic_session("persistent://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 
@@ -16198,7 +20535,7 @@ mod scalable_conn_tests {
     fn conn_emits_dag_changed_on_split() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 
@@ -16264,7 +20601,7 @@ mod scalable_conn_tests {
 
         assert!(!conn.broker_supports_scalable_topics());
         let err = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect_err("v4 broker refuses the scalable surface");
         assert_eq!(err, crate::dag_watch::ScalableTopicError::BrokerUnsupported);
         assert!(
@@ -16306,7 +20643,7 @@ mod scalable_conn_tests {
     fn conn_close_scalable_session_is_idempotent() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 
@@ -17317,5 +21654,650 @@ mod otel_property_round_trip_tests {
 
         assert_eq!(conn.retry_consumer_subscribe(handle), None);
         assert!(conn.poll_transmit().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #437: the flow permit of a dead-lettered dispatch unit.
+//
+// `consumer::tests` pins the ledger arithmetic in isolation; this module pins
+// the one thing only `Connection` can own — that the refund reaches the WIRE on
+// the same inbound frame that crosses the half-queue threshold, through the
+// `maybe_flow()` call the `Message` arm already makes after every `deliver`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod dead_letter_flow_refund_tests {
+    use super::*;
+
+    /// Receiver queue for the consumer under test. `maybe_flow`'s threshold is
+    /// `max(RQ / 2, 1)` = 4.
+    const RQ: usize = 8;
+    /// `SubscribeRequest::max_redeliver_count`: a frame whose `redelivery_count`
+    /// exceeds this routes to the dead-letter pending list instead of the queue.
+    const MAX_REDELIVER: u32 = 1;
+    /// Redelivery counter stamped on the synthetic frames — strictly greater than
+    /// [`MAX_REDELIVER`], so every one of them dead-letters.
+    const OVER_REDELIVERED: u32 = 2;
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(crate::SUPPORTED_PROTOCOL_VERSION),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// Handshake, subscribe a `Shared` consumer with a dead-letter threshold, ack the
+    /// subscribe, grant the initial flow, and drain the outbound buffer so later wire
+    /// assertions see only what the scenario produces.
+    fn dlq_consumer(t0: Instant) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/dlq-flow-refund".to_owned(),
+            subscription: "sub-dlq-flow-refund".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Shared,
+            receiver_queue_size: RQ,
+            max_redeliver_count: MAX_REDELIVER,
+            ..Default::default()
+        });
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: subscribe_rid,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &success).expect("encode CommandSuccess");
+        conn.handle_bytes(t0, &buf).expect("Success");
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, t0);
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    /// One synthetic broker `CommandMessage` + payload addressed to `handle`, with an
+    /// explicit `redelivery_count` so a test can push it over the dead-letter threshold.
+    fn message_frame(handle: ConsumerHandle, entry_id: u64, redelivery_count: u32) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 7,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(redelivery_count),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "dlq-flow-refund-producer".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, &meta, b"poison").expect("encode_payload");
+        buf.to_vec()
+    }
+
+    /// Every `CommandFlow` this consumer emitted, in wire order.
+    fn drain_flow_grants(conn: &mut Connection, handle: ConsumerHandle) -> Vec<u32> {
+        let mut out = conn.poll_transmit();
+        let mut grants = Vec::new();
+        while !out.is_empty() {
+            let frame = crate::frame::decode_one(&mut out).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                if let Some(flow) = frame.command.flow {
+                    if flow.consumer_id == handle.0 {
+                        grants.push(flow.message_permits);
+                    }
+                }
+            }
+        }
+        grants
+    }
+
+    #[test]
+    fn a_half_queue_of_dead_letters_re_grants_on_the_same_inbound_frame() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = dlq_consumer(t0);
+        for entry in 0..(RQ as u64 / 2) {
+            conn.handle_bytes(t0, &message_frame(handle, entry, OVER_REDELIVERED))
+                .expect("Message frame");
+        }
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            drain_flow_grants(&mut conn, handle),
+            vec![RQ as u32 / 2],
+            "the frame that crosses the half-queue threshold must carry the re-grant, \
+             emitted by the `maybe_flow()` the Message arm already calls after `deliver`",
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and the client-accounted balance is back to the full window",
+        );
+        assert_eq!(
+            conn.drain_dead_letter(handle).len(),
+            RQ / 2,
+            "every refunded unit is still buffered for the application to republish",
+        );
+    }
+
+    #[test]
+    fn a_full_window_of_dead_letters_never_starves_the_consumer() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = dlq_consumer(t0);
+        for entry in 0..RQ as u64 {
+            conn.handle_bytes(t0, &message_frame(handle, entry, OVER_REDELIVERED))
+                .expect("Message frame");
+        }
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            drain_flow_grants(&mut conn, handle),
+            vec![RQ as u32 / 2, RQ as u32 / 2],
+            "a whole receiver queue of poison re-grants twice, half a window each time",
+        );
+        assert!(
+            !conn
+                .consumer(handle)
+                .expect("consumer slot")
+                .state
+                .lock()
+                .is_flow_starved(),
+            "permits alone must no longer wedge a poison-fed Shared consumer (#437)",
+        );
+    }
+}
+
+/// Issue #867 / ADR-0111: a publish's client-wide memory reservation lives
+/// in its `OpSend` and is released exactly once, when the op leaves the
+/// client — receipt, send error, send timeout, producer close, producer-open
+/// failure, terminal connection failure, or a non-replayable batch reset —
+/// while a reset snapshot keeps it.
+#[cfg(test)]
+mod memory_limit_release_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::MemoryLimitController;
+    use crate::producer::OutgoingMessage;
+
+    fn feed(conn: &mut Connection, at: Instant, cmd: &pb::BaseCommand) {
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, cmd).expect("encode");
+        conn.handle_bytes(at, &buf).expect("handle");
+    }
+
+    fn handshaked(at: Instant) -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(SystemTime::now),
+        );
+        conn.begin_handshake().expect("begin");
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        conn
+    }
+
+    fn open_producer(
+        conn: &mut Connection,
+        at: Instant,
+        request: CreateProducerRequest,
+    ) -> ProducerHandle {
+        let rid = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(request);
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: rid.0,
+                    producer_name: format!("p-{}", handle.0),
+                    last_sequence_id: Some(-1),
+                    schema_version: None,
+                    topic_epoch: None,
+                    producer_ready: Some(true),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+        handle
+    }
+
+    fn request(topic: &str) -> CreateProducerRequest {
+        CreateProducerRequest {
+            topic: format!("persistent://public/default/{topic}"),
+            send_timeout: None,
+            ..Default::default()
+        }
+    }
+
+    fn msg(len: usize) -> OutgoingMessage {
+        OutgoingMessage {
+            payload: bytes::Bytes::from(vec![7; len]),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: len as u32,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        }
+    }
+
+    fn budget(limit: u64) -> Arc<MemoryLimitController> {
+        MemoryLimitController::new(limit, MemoryLimitPolicy::FailImmediately)
+    }
+
+    fn send(
+        conn: &mut Connection,
+        handle: ProducerHandle,
+        budget: &Arc<MemoryLimitController>,
+        len: usize,
+        at: Instant,
+    ) -> SequenceId {
+        let reservation = budget.try_reserve(len as u64).expect("fits the budget");
+        conn.send_reserved(handle, msg(len), reservation, 0, at)
+            .expect("queued")
+    }
+
+    fn success(request_id: RequestId) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: request_id.0,
+                schema: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn receipt_and_send_error_release_through_the_connection() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("mem-receipt"));
+        let budget = budget(100);
+        let s0 = send(&mut conn, handle, &budget, 10, at);
+        let s1 = send(&mut conn, handle, &budget, 20, at);
+        assert_eq!(budget.used_bytes(), 30);
+
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: s0.0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 0,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 20, "the receipt released s0");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, s0)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: s1.0,
+                    error: pb::ServerError::PersistenceError as i32,
+                    message: "rejected".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 0, "the send error released s1");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, s1)),
+            Some(OpOutcome::SendError { .. })
+        ));
+    }
+
+    #[test]
+    fn send_reserved_releases_a_rejected_reservation() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let budget = budget(100);
+        let unknown = conn.send_reserved(
+            ProducerHandle(4242),
+            msg(8),
+            budget.try_reserve(8).expect("fits"),
+            0,
+            at,
+        );
+        assert!(unknown.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+
+        let handle = open_producer(&mut conn, at, request("mem-rejected"));
+        let _close = conn.close_producer(handle);
+        let closed =
+            conn.send_reserved(handle, msg(8), budget.try_reserve(8).expect("fits"), 0, at);
+        assert!(closed.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn close_ack_fails_pending_sends_and_releases_them() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let batching = |topic: &str| CreateProducerRequest {
+            enable_batching: true,
+            ..request(topic)
+        };
+        let closed = open_producer(&mut conn, at, batching("mem-close"));
+        let forgotten = open_producer(&mut conn, at, batching("mem-close-forget"));
+        let budget = budget(100);
+        // Batched with no publish delay: the bytes are reserved and nothing
+        // reaches the wire on its own.
+        let s_closed = send(&mut conn, closed, &budget, 30, at);
+        let s_forgotten = send(&mut conn, forgotten, &budget, 40, at);
+        assert_eq!(budget.used_bytes(), 70);
+
+        let close = conn.close_producer(closed);
+        assert_eq!(
+            budget.used_bytes(),
+            70,
+            "nothing is released before the broker acks"
+        );
+        feed(&mut conn, at, &success(close));
+        assert_eq!(budget.used_bytes(), 40);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(closed, s_closed)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(conn.producer_pending_count(closed), 0);
+
+        let forget = conn.close_producer_forget(forgotten);
+        feed(&mut conn, at, &success(forget));
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(forgotten, s_forgotten)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    /// Every command the connection has staged for the wire, decoded.
+    fn transmitted(conn: &mut Connection) -> Vec<pb::BaseCommand> {
+        let mut wire = conn.poll_transmit();
+        let mut commands = Vec::new();
+        while !wire.is_empty() {
+            commands.push(decode_one(&mut wire).expect("decode").command);
+        }
+        commands
+    }
+
+    /// Request ids of the `CommandCloseProducer`s staged for `handle`.
+    fn closes_of(commands: &[pb::BaseCommand], handle: ProducerHandle) -> Vec<RequestId> {
+        commands
+            .iter()
+            .filter_map(|c| c.close_producer.as_ref())
+            .filter(|c| c.producer_id == handle.0)
+            .map(|c| RequestId(c.request_id))
+            .collect()
+    }
+
+    /// Request id of the single `CommandProducer` staged in `commands`.
+    fn open_of(commands: &[pb::BaseCommand]) -> RequestId {
+        let opens: Vec<_> = commands
+            .iter()
+            .filter_map(|c| c.producer.as_ref())
+            .collect();
+        assert_eq!(opens.len(), 1, "one CommandProducer");
+        RequestId(opens[0].request_id)
+    }
+
+    /// Drive issue #406's recovery for real: an open is abandoned (its
+    /// cancel-time fire-and-forget close goes out), the retry is answered
+    /// `ProducerBusy` (the abandoned id is re-closed, fire-and-forget again),
+    /// and the next open re-attaches a NEW producer under the abandoned id.
+    /// Returns the re-attached handle and the two unacknowledged old closes.
+    fn reattach_under_an_abandoned_id(
+        conn: &mut Connection,
+        at: Instant,
+    ) -> (ProducerHandle, [RequestId; 2]) {
+        let pinned = || CreateProducerRequest {
+            producer_name: Some("pinned-867".to_owned()),
+            ..request("mem-close-reused")
+        };
+        let abandoned = conn.create_producer(pinned());
+        let _ = transmitted(conn);
+        conn.cancel_producer_open(abandoned);
+        let cancel_close = closes_of(&transmitted(conn), abandoned);
+        assert_eq!(
+            cancel_close.len(),
+            1,
+            "cancellation closes the abandoned id"
+        );
+
+        let retry = conn.create_producer(pinned());
+        assert_ne!(retry, abandoned);
+        let retry_open = open_of(&transmitted(conn));
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: retry_open.0,
+                    error: pb::ServerError::ProducerBusy as i32,
+                    message: "Producer with name 'pinned-867' is already connected".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        let reclose = closes_of(&transmitted(conn), abandoned);
+        assert_eq!(reclose.len(), 1, "ProducerBusy re-closes the abandoned id");
+
+        let reattached = conn.create_producer(pinned());
+        assert_eq!(
+            reattached, abandoned,
+            "the escalation re-attaches under the abandoned id"
+        );
+        let open = open_of(&transmitted(conn));
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: open.0,
+                    producer_name: "pinned-867".to_owned(),
+                    last_sequence_id: Some(-1),
+                    schema_version: None,
+                    topic_epoch: None,
+                    producer_ready: Some(true),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        (reattached, [cancel_close[0], reclose[0]])
+    }
+
+    /// The old id's fire-and-forget closes (issue #406) may be acknowledged
+    /// after a new producer re-attached under the same id; their acks must not
+    /// fail that producer's sends.
+    #[test]
+    fn close_ack_for_a_reused_open_producer_id_fails_nothing() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let (handle, old_closes) = reattach_under_an_abandoned_id(&mut conn, at);
+        let budget = budget(100);
+        let seq = send(&mut conn, handle, &budget, 25, at);
+        for old in old_closes {
+            feed(&mut conn, at, &success(old));
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            1,
+            "the send stays pending"
+        );
+        assert_eq!(budget.used_bytes(), 25, "and keeps its reservation");
+        assert!(conn.take_outcome(PendingOpKey::Send(handle, seq)).is_none());
+    }
+
+    /// A producer re-attached under a reused id and then closed by the user
+    /// is drained by the ack of ITS close, never by the late ack of an old
+    /// close for the same id.
+    #[test]
+    fn only_the_ack_of_the_producers_own_close_fails_its_sends() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let (handle, old_closes) = reattach_under_an_abandoned_id(&mut conn, at);
+        let budget = budget(100);
+        let seq = send(&mut conn, handle, &budget, 25, at);
+        let own_close = conn.close_producer(handle);
+        for old in old_closes {
+            feed(&mut conn, at, &success(old));
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            1,
+            "an old close's ack must not fail the re-attached producer's sends"
+        );
+        assert_eq!(budget.used_bytes(), 25);
+
+        feed(&mut conn, at, &success(own_close));
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert_eq!(budget.used_bytes(), 0, "its own close's ack releases them");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, seq)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    #[test]
+    fn reset_releases_unreplayable_batches_and_keeps_retained_publishes() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let batched = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-reset-batched")
+            },
+        );
+        let plain = open_producer(&mut conn, at, request("mem-reset-plain"));
+        let budget = budget(100);
+        let s_batched = send(&mut conn, batched, &budget, 30, at);
+        let _ = conn.flush_producer(batched, 0, at);
+        let _s_plain = send(&mut conn, plain, &budget, 20, at);
+        assert_eq!(budget.used_bytes(), 50);
+
+        conn.reset();
+        assert_eq!(
+            budget.used_bytes(),
+            20,
+            "the non-replayable batch is failed and released; the retained publish keeps its bytes"
+        );
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(batched, s_batched)),
+            Some(OpOutcome::SendError { .. })
+        ));
+        assert_eq!(conn.in_flight_publish_snapshot_len(plain), 1);
+
+        conn.fail_all_pending("gave up");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "terminal failure releases the snapshot"
+        );
+    }
+
+    #[test]
+    fn terminal_failures_and_timeouts_release_live_sends() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let timed = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                send_timeout: Some(Duration::from_secs(1)),
+                ..request("mem-timeout")
+            },
+        );
+        let failed = open_producer(&mut conn, at, request("mem-open-failed"));
+        let live = open_producer(&mut conn, at, request("mem-terminal"));
+        let budget = budget(100);
+        let s_timed = send(&mut conn, timed, &budget, 10, at);
+        let _ = send(&mut conn, failed, &budget, 20, at);
+        let _ = send(&mut conn, live, &budget, 30, at);
+        assert_eq!(budget.used_bytes(), 60);
+
+        conn.handle_timeout(at + Duration::from_secs(2));
+        assert_eq!(budget.used_bytes(), 50, "the send timeout released its op");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(timed, s_timed)),
+            Some(OpOutcome::SendError { .. })
+        ));
+
+        conn.fail_producer_open(failed, "open failed");
+        assert_eq!(
+            budget.used_bytes(),
+            30,
+            "a terminal producer failure releases its ops"
+        );
+
+        conn.fail_all_pending("connection gone");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "a terminal connection failure releases every op"
+        );
     }
 }

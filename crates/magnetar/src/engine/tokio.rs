@@ -282,6 +282,10 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
         magnetar_runtime_tokio::Producer::is_connected(self)
     }
 
+    fn is_ready(&self) -> bool {
+        magnetar_runtime_tokio::Producer::is_ready(self)
+    }
+
     fn topic(&self) -> String {
         magnetar_runtime_tokio::Producer::topic(self)
     }
@@ -349,9 +353,15 @@ impl super::ScalableTopicsApi for magnetar_runtime_tokio::Client {
     fn scalable_topic_lookup<'a>(
         &'a self,
         topic: &'a str,
+        create_if_missing: bool,
     ) -> Pin<Box<dyn Future<Output = Result<super::ScalableLookup, Self::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let l = magnetar_runtime_tokio::Client::scalable_topic_lookup(self, topic).await?;
+            let l = magnetar_runtime_tokio::Client::scalable_topic_lookup(
+                self,
+                topic,
+                create_if_missing,
+            )
+            .await?;
             Ok(super::ScalableLookup {
                 session_id: l.session_id,
                 resolved_topic_name: l.resolved_topic_name,

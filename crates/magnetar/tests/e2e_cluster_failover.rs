@@ -49,30 +49,12 @@ use std::time::Duration;
 use magnetar::proto::ControlledClusterFailover;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
+use common::pulsar::{Broker, Pulsar};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -90,41 +72,26 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Start a Pulsar 4.x standalone container and return
+/// Start a Pulsar standalone container and return
 /// (`service_url`, `admin_url`, `container_handle`). Each call provisions
 /// a fresh container with Docker-assigned host ports, so spinning two of
 /// them in parallel yields two independent brokers.
+///
+/// The shared fixture's JVM cap (`PULSAR_MEM`) shrinks the JVM off Pulsar's
+/// stock ~2GB heap. This test needs it doubly: the `test` CI job runs two of
+/// these standalone containers alongside the PIP-33 docker-compose fixture
+/// (zookeeper + 2 bookkeepers + 2 brokers), and at stock heap sizes a GitHub
+/// Actions runner OOM-kills a broker mid-test, surfacing as `io error:
+/// Connection refused` ~60s after the failover swap (run [26763302599]
+/// diagnostic tracing: producer.send succeeds against broker-b, then
+/// consumer.receive blocks on a supervisor reconnect that finds broker-b
+/// unreachable).
 async fn start_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    // `PULSAR_MEM_LIMIT` shrinks the JVM off Pulsar's stock ~2GB heap. This
-    // test needs it doubly: the `test` CI job runs two of these standalone
-    // containers alongside the PIP-33 docker-compose fixture (zookeeper + 2
-    // bookkeepers + 2 brokers), and at stock heap sizes a GitHub Actions
-    // runner OOM-kills a broker mid-test, surfacing as `io error: Connection
-    // refused` ~60s after the failover swap (run [26763302599] diagnostic
-    // tracing: producer.send succeeds against broker-b, then
-    // consumer.receive blocks on a supervisor reconnect that finds
-    // broker-b unreachable).
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+    Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
 
 /// Generous reconnect budget — broker-B is a separate container that's

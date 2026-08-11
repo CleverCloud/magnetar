@@ -370,7 +370,9 @@ impl SegmentDescriptor {
     /// this client only ever reads, so the encode side emits `0` / `None` for them
     /// rather than inventing a clock — `magnetar-proto` holds no clock at all
     /// (ADR-0011). Round-tripping a decoded descriptor therefore does not preserve
-    /// them; nothing in the client reads them back.
+    /// them; nothing in the client reads them back. `entry_bucket_splits`
+    /// (PIP-486) is likewise emitted empty — one bucket spanning the whole ring
+    /// — because the descriptor does not carry it.
     #[must_use]
     pub fn to_pb(
         &self,
@@ -390,6 +392,7 @@ impl SegmentDescriptor {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: self.legacy_topic_name.clone(),
+            entry_bucket_splits: Vec::new(),
         };
         let address = self
             .broker_url
@@ -627,6 +630,7 @@ mod tests {
     #[test]
     fn segment_descriptor_rejects_mismatched_placement_identity() {
         let info = pb::SegmentInfoProto {
+            entry_bucket_splits: Vec::new(),
             segment_id: 1,
             hash_start: 0,
             hash_end: 65_535,

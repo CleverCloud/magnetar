@@ -14,7 +14,7 @@ use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{CreateProducerRequest, MessageId, SubscribeRequest};
 use magnetar_runtime_tokio::{Client, ClientError, Consumer, Producer};
 
-use crate::trace::{Event, EventStream, Op, Trace};
+use crate::trace::{Event, EventStream, Op, SharedConsumerWindow, Trace};
 
 /// Build the per-partition topic name for a given base topic.
 /// Mirrors Java `PartitionedProducerImpl`'s topic-naming convention.
@@ -41,6 +41,36 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
         pulsar_url,
         trace,
         magnetar_proto::ConnectionConfig::default(),
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run `trace` with `ack_timeout` armed on every `Op::OpenSharedConsumer` consumer
+/// (issue #436).
+///
+/// `ack_timeout` is a per-subscription setting rather than a `ConnectionConfig` one, so it
+/// arrives as a runner parameter instead of through a `ConnectionConfig` field the way
+/// [`run_with_stall_timeout`] does — but it plays the same role: the trace stays a pure
+/// sequence of operations and the scenario knob lives at the invocation.
+///
+/// Keep the window SHORT. Both differential legs run on the real tokio clock, so this is
+/// wall-clock time the test actually spends waiting for the unacked-message tracker to fire.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_ack_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    ack_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig::default(),
+        None,
+        Some(ack_timeout),
     )
     .await
 }
@@ -67,6 +97,8 @@ pub async fn run_supervised(
             supervisor: Some(supervisor),
             ..Default::default()
         },
+        None,
+        None,
     )
     .await
 }
@@ -95,6 +127,124 @@ pub async fn run_supervised_with_operation_timeout(
             operation_timeout,
             ..Default::default()
         },
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run `trace` against the tokio engine with a caller-supplied
+/// `operation_timeout` and NO supervisor. The producer-open cancellation
+/// scenario (issue #406 / ADR-0100) needs a short deadline so a withheld
+/// `CommandProducerSuccess` gives up quickly, and a plain client so the only
+/// thing that can free the pinned name is the engine's own close-before-retry.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_operation_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            operation_timeout,
+            ..Default::default()
+        },
+        Some(fast_operation_retry()),
+        None,
+    )
+    .await
+}
+
+/// Retry policy the producer-open cancellation scenario installs. The default
+/// 2 s initial backoff does not fit inside that scenario's short
+/// `operation_timeout`, and what it exercises is the SEQUENCE of recovery
+/// attempts, not the wait between them. Shared by both runners so the two legs
+/// retry in lockstep.
+pub(crate) fn fast_operation_retry() -> magnetar_proto::OperationRetryConfig {
+    magnetar_proto::OperationRetryConfig {
+        initial_backoff: Duration::from_millis(5),
+        max_backoff: Duration::from_millis(20),
+        max_retries: Some(8),
+    }
+}
+
+/// Run `trace` with the issue #414 per-consumer stall watchdog armed at
+/// `consumer_stall_timeout`.
+///
+/// The window is deliberately tiny here: a Shared consumer that is granted
+/// permits and then handed nothing crosses it while the trace is still running,
+/// so the driver's control-event pump has a real `ConsumerStalled` to drain —
+/// which is the whole point, since draining it silently is the engine behaviour
+/// ADR-0101 specifies and the only way it can go wrong is by escaping as an
+/// error or piling up. Nothing in the resulting `EventStream` is timing-derived:
+/// the watchdog only ever emits an event the engine consumes, so both legs
+/// compare equal regardless of exactly when it fires.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            consumer_stall_timeout: Some(consumer_stall_timeout),
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run `trace` with the issue #414 stall watchdog armed at `consumer_stall_timeout`
+/// AND ADR-0103's bounded automatic recovery armed at `max_attempts` in-place
+/// re-subscribes per stall streak.
+///
+/// Pair it with [`crate::broker::ScriptedBroker::leak_shared_permits_on_consumer_churn`]:
+/// the broker wedges its Shared dispatcher on the first churn event, and the watchdog
+/// notices the survivor holding un-spent permits over an empty queue.
+///
+/// What each attempt then does to the leaked aggregate is **nothing**, and that is the
+/// point since ADR-0108. The recovery closes the consumer before re-subscribing it, so
+/// the close returns the consumer's remaining permits and the re-subscribe's
+/// `CommandFlow` takes them back: one attempt is permit-neutral. (Before ADR-0108 it
+/// re-subscribed a still-live consumer id — a broker-side no-op — and granted a full
+/// window on top, so the aggregate rose by `receiver_queue_size` per attempt. That credit
+/// had no matching debit anywhere; it was the over-commit, not a repair.) The recovery's
+/// own `CommandCloseConsumer` is itself a churn event, so under the double-subtraction
+/// this harness models the aggregate moves the wrong way.
+///
+/// So `max_attempts` changes the frame counts and not the outcome: a subscription-wide
+/// leak stays wedged at every budget, identically on both engines, since the whole
+/// mechanism lives in the shared sans-io layer. `pulsar-admin topics unload` is the
+/// escalation, which is what ADR-0101 always scoped this repair to.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_auto_recovery(
+    pulsar_url: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+    max_attempts: u32,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            consumer_stall_timeout: Some(consumer_stall_timeout),
+            consumer_stall_auto_recovery: Some(max_attempts),
+            ..Default::default()
+        },
+        None,
+        None,
     )
     .await
 }
@@ -103,10 +253,15 @@ async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,
     config: magnetar_proto::ConnectionConfig,
+    operation_retry: Option<magnetar_proto::OperationRetryConfig>,
+    shared_ack_timeout: Option<Duration>,
 ) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
-    let client = Client::connect(pulsar_url, config).await?;
+    let mut client = Client::connect(pulsar_url, config).await?;
+    if let Some(retry) = operation_retry {
+        client = client.with_operation_retry(retry);
+    }
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
     // (issue #241 last-clone drop guard). `None` afterwards makes
@@ -136,6 +291,26 @@ async fn run_with_config(
     let mut part_producers: HashMap<i32, Producer> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer> = HashMap::new();
 
+    // Producers opened by `Op::OpenNamedProducer`, held for the whole trace.
+    // Releasing one mid-trace would fire ADR-0057's last-clone drop guard and
+    // put a second, asynchronous `CommandCloseProducer` on the wire, which is
+    // exactly the frame the issue #406 scenario is counting.
+    let mut named_producers: Vec<Producer> = Vec::new();
+
+    // Issue #414: additional `SubType::Shared` consumers opened by
+    // `Op::OpenSharedConsumer`, keyed by their harness-local name. They all
+    // land on ONE broker-side dispatcher for `(topic, subscription)`, so
+    // detaching one mid-drain redelivers its un-acked entries to the survivors.
+    let mut shared_consumers: HashMap<String, Consumer> = HashMap::new();
+
+    // Issue #436: the harness application's own state. `last_received` is what
+    // `Op::AckLastReceivedShared` acknowledges — whatever the named consumer was handed
+    // last, not an id the trace author guessed — and `acked` is its dedup set, because an
+    // application does not acknowledge the same message twice. Shared verbatim with the
+    // moonpool runner's `replay`.
+    let mut last_received: HashMap<String, MessageId> = HashMap::new();
+    let mut acked: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+
     // PIP-31: the current open txn id, if any. `NewTxn` populates it;
     // `EndTxn` consumes it. The harness supports one in-flight
     // transaction per trace at a time — matches the scripted broker's
@@ -150,6 +325,44 @@ async fn run_with_config(
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send(p, bytes).await,
+                    None => producer_dropped_send_error(),
+                };
+                stream.push(event);
+            }
+            Op::SendBatch { payloads } => {
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_batch(p, payloads).await,
+                    None => producer_dropped_send_error(),
+                };
+                stream.push(event);
+            }
+            Op::SendThroughBatchingProducer {
+                payloads,
+                max_batch_bytes,
+            } => {
+                let req = crate::trace::batching_producer_request(&trace.topic, *max_batch_bytes);
+                let batching = client.open_producer_with(req, None).await?;
+                let sends: Vec<_> = payloads
+                    .iter()
+                    .map(|p| batching.send(crate::trace::plain_message(p)))
+                    .collect();
+                let mut outcomes = Vec::with_capacity(sends.len());
+                for send in sends {
+                    outcomes.push(send.await.map_err(|e| classify(&e)));
+                }
+                stream.push(Event::SentAll { outcomes });
+            }
+            Op::SendCompressedBatch {
+                payloads,
+                codec,
+                layout,
+            } => {
+                let msg = crate::trace::compressed_batch_message(payloads, *codec, *layout);
+                let event = match producer.as_ref() {
+                    Some(p) => match p.send(msg).await {
+                        Ok(message_id) => Event::Sent { message_id },
+                        Err(e) => Event::SendError { kind: classify(&e) },
+                    },
                     None => producer_dropped_send_error(),
                 };
                 stream.push(event);
@@ -328,6 +541,103 @@ async fn run_with_config(
                     }),
                 }
             }
+            Op::OpenNamedProducer { name } => {
+                stream.push(
+                    run_open_named_producer(&client, &trace.topic, name, &mut named_producers)
+                        .await,
+                );
+            }
+            Op::OpenSharedConsumer {
+                name,
+                receiver_queue_size,
+                max_redeliver_count,
+            } => {
+                stream.push(
+                    open_shared_consumer(
+                        &client,
+                        &mut shared_consumers,
+                        name,
+                        &trace.topic,
+                        &trace.subscription,
+                        SharedConsumerWindow {
+                            receiver_queue_size: *receiver_queue_size,
+                            max_redeliver_count: *max_redeliver_count,
+                        },
+                        shared_ack_timeout,
+                    )
+                    .await?,
+                );
+            }
+            Op::RecvShared { name, timeout } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                let event = run_recv(consumer, *timeout).await;
+                if let Event::Received { message_id, .. } = &event {
+                    last_received.insert(name.clone(), *message_id);
+                }
+                stream.push(event);
+            }
+            Op::AckShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                let event = run_ack(consumer, *message_id).await;
+                if matches!(event, Event::Acked) {
+                    acked.insert(*message_id);
+                }
+                stream.push(event);
+            }
+            Op::AckLastReceivedShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                let message_id = *last_received
+                    .get(name)
+                    .expect("trace acks a shared consumer that never received anything");
+                if acked.contains(&message_id) {
+                    stream.push(Event::AckSkippedDuplicate);
+                } else {
+                    let event = run_ack(consumer, message_id).await;
+                    if matches!(event, Event::Acked) {
+                        acked.insert(message_id);
+                    }
+                    stream.push(event);
+                }
+            }
+            Op::NackShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                consumer.negative_ack(*message_id);
+                stream.push(Event::Nacked);
+            }
+            Op::DrainDeadLettersShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(Event::DeadLettersDrained {
+                    count: consumer.drain_dead_letter().len(),
+                });
+            }
+            Op::CloseSharedConsumer { name } => {
+                // `close` consumes the handle, so close a clone and keep the
+                // map entry: later ops must still be able to address the
+                // consumer that LEFT the subscription — that is exactly what a
+                // #414 caller does when it tries to recover the wrong one.
+                let departing = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened")
+                    .clone();
+                let _ = departing.close().await;
+                stream.push(Event::SharedConsumerClosed);
+            }
+            Op::ResubscribeShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_resubscribe_shared(consumer));
+            }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
                 // the engines' last-clone drop guard (issue #241). The
@@ -350,6 +660,9 @@ async fn run_with_config(
             }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
+                for (_, c) in shared_consumers.drain() {
+                    let _ = c.close().await;
+                }
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
@@ -378,6 +691,9 @@ async fn run_with_config(
     }
 
     // Implicit close if no Close op present.
+    for (_, c) in shared_consumers.drain() {
+        let _ = c.close().await;
+    }
     if let Some(c) = consumer.take() {
         let _ = c.close().await;
     }
@@ -542,6 +858,34 @@ async fn run_send(producer: &Producer, payload: Bytes) -> Event {
     }
 }
 
+/// Issue #436: publish `payloads` as ONE batched broker entry.
+///
+/// The producer's own batching stays off (`CreateProducerRequest::enable_batching` defaults
+/// to `false`), so the body is framed here by [`crate::trace::pack_batch_body`] and declared
+/// through `MessageMetadata.num_messages_in_batch` — the same two things a batching producer
+/// would put on the wire, and the pair the scripted broker stores and echoes back. One entry
+/// in, one [`Event::Sent`] out. Shared verbatim with the moonpool runner so both legs publish
+/// byte-identical frames.
+async fn run_send_batch(producer: &Producer, payloads: &[Vec<u8>]) -> Event {
+    let body = crate::trace::pack_batch_body(payloads);
+    let num_messages = i32::try_from(payloads.len()).unwrap_or(i32::MAX);
+    let msg = OutgoingMessage {
+        payload: body.clone(),
+        metadata: magnetar_proto::pb::MessageMetadata {
+            num_messages_in_batch: Some(num_messages),
+            ..Default::default()
+        },
+        uncompressed_size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+        num_messages,
+        txn_id: None,
+        source_message_id: None,
+    };
+    match producer.send(msg).await {
+        Ok(message_id) => Event::Sent { message_id },
+        Err(e) => Event::SendError { kind: classify(&e) },
+    }
+}
+
 /// PIP-180 / ADR-0033: replicator-style send. The scripted broker echoes the
 /// source id back on `CommandSendReceipt` so the resulting `Event::Sent`
 /// carries `message_id == source_msg_id`.
@@ -575,6 +919,64 @@ async fn run_ack(consumer: &Consumer, message_id: MessageId) -> Event {
     match consumer.ack(message_id).await {
         Ok(()) => Event::Acked,
         Err(e) => Event::AckError { kind: classify(&e) },
+    }
+}
+
+/// Issue #414: open one more `SubType::Shared` consumer on the trace's
+/// `(topic, subscription)`, held under a harness-local name.
+///
+/// [`SharedConsumerWindow::receiver_queue_size`] is the initial permit grant,
+/// and reading it straight back through `Consumer::available_permits()` is the
+/// point of the returned event: that accessor now reports the REAL decrementing
+/// balance, so both engines must agree on it before any dispatch lands.
+async fn open_shared_consumer(
+    client: &Client,
+    map: &mut HashMap<String, Consumer>,
+    name: &str,
+    topic: &str,
+    subscription: &str,
+    window: SharedConsumerWindow,
+    ack_timeout: Option<Duration>,
+) -> Result<Event, ClientError> {
+    let SharedConsumerWindow {
+        receiver_queue_size,
+        max_redeliver_count,
+    } = window;
+    let consumer = client
+        .subscribe_with(
+            SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: subscription.to_owned(),
+                sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
+                receiver_queue_size,
+                // Issue #437: `0` — what every pre-#437 trace passes — disables the
+                // dead-letter branch and leaves the subscribe frame byte-identical.
+                max_redeliver_count,
+                // Issue #436: `None` (the default) leaves the unacked-message tracker
+                // unbuilt, which is the shape every other Shared trace runs in.
+                ack_timeout,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+    let permits = consumer.available_permits();
+    map.insert(name.to_owned(), consumer);
+    Ok(Event::SharedConsumerOpened { permits })
+}
+
+/// Issue #414: the caller-driven in-place recovery.
+///
+/// `resubscribe()` only stages the `CommandSubscribe` and wakes the driver, so
+/// there is nothing here to wait on: the event reports whether the ENGINE
+/// accepted the call. That the broker's `Success` actually re-armed the grant is
+/// proved by the trace, which publishes after the recovery and receives the
+/// message — impossible without a live permit. A consumer that has already been
+/// closed is refused, and both engines must refuse it the same way.
+fn run_resubscribe_shared(consumer: &Consumer) -> Event {
+    match consumer.resubscribe() {
+        Ok(()) => Event::SharedConsumerResubscribed,
+        Err(e) => Event::SharedConsumerResubscribeError { kind: classify(&e) },
     }
 }
 
@@ -622,6 +1024,32 @@ async fn run_ack_in_txn(
     match consumer.ack_with_txn(message_id, txn_id).await {
         Ok(()) => Event::AckedInTxn,
         Err(e) => Event::AckInTxnError { kind: classify(&e) },
+    }
+}
+
+/// Issue #406 / ADR-0100: open one extra producer under a pinned name. The
+/// event is the open's verdict — that is the differential claim — and a
+/// successful handle is parked in `held` so it keeps holding the name for the
+/// rest of the trace instead of firing a drop-close mid-run.
+async fn run_open_named_producer(
+    client: &Client,
+    topic: &str,
+    name: &str,
+    held: &mut Vec<Producer>,
+) -> Event {
+    match client
+        .open_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            producer_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(producer) => {
+            held.push(producer);
+            Event::NamedProducerOpened
+        }
+        Err(e) => Event::NamedProducerOpenError { kind: classify(&e) },
     }
 }
 

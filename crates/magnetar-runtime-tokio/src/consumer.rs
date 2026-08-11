@@ -248,18 +248,107 @@ impl Consumer {
         out
     }
 
-    /// Number of dispatch permits this consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
-    /// Java `ConsumerBase#getAvailablePermits`.
+    /// Client-accounted unspent dispatch permits: locally recorded grants minus
+    /// received dispatch units. Mirrors the arithmetic of Java
+    /// `ConsumerBase#getAvailablePermits`, not broker admin `availablePermits`.
     ///
-    /// Issue #349 scope note: reads `ConsumerState::granted_permits` (the additive grant
-    /// mirror), unchanged by the permit-balance split — out of scope per the issue's four
-    /// locked design items, which name only `FlowStats::available_permits`.
+    /// Reads `ConsumerState::permit_balance`: the initial / replenishment grants, minus
+    /// one per received dispatch unit (plain message, batch
+    /// member, buffered chunk, PIP-33 marker), force-zeroed at every churn boundary.
+    ///
+    /// **Semantic change (issue #414).** This used to read the purely-ADDITIVE
+    /// `granted_permits` mirror, which never moves under dispatch and therefore made a
+    /// consumer receiving messages indistinguishable from a silent one when polling.
+    /// Poll this to see the local balance fall and refill; a balance pinned high while
+    /// messages stop arriving signals silence to correlate with broker stats and actual
+    /// delivery before attributing a stall. See
+    /// [ADR-0101](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md),
+    /// which amends ADR-0082's deferral of exactly this accessor.
     ///
     /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
-        self.slot.state.lock().granted_permits
+        self.slot.state.lock().permit_balance
+    }
+
+    /// Re-attach this consumer id in place, on the live connection, and re-arm its
+    /// dispatch permits — the caller-driven recovery for a consumer whose broker-side
+    /// dispatch has gone silent (issue #414).
+    ///
+    /// Two phases on the same socket (ADR-0108): emit `CommandCloseConsumer` for this
+    /// consumer id and, on the broker's `Success` for it, zero the permit mirrors, fail
+    /// every in-flight ack (issue #346 — the consumer id they were correlated against is
+    /// gone), re-emit `CommandSubscribe` for the same consumer id, and let ITS `Success`
+    /// release the initial `CommandFlow`. No transport reconnect, no other consumer
+    /// disturbed, and the client-side consumer survives its own close: the handle, the
+    /// registration and the receiver queue are all kept, so already-buffered messages stay
+    /// receivable.
+    ///
+    /// The close is not optional. `ServerCnx.handleSubscribe` answers a `CommandSubscribe`
+    /// naming a consumer id that is already live on the connection with a bare
+    /// `sendSuccessResponse(requestId)`, touching neither the dispatcher nor
+    /// `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414`, master
+    /// `:2037-2044`), so a bare re-subscribe repairs nothing and its fresh grant is a
+    /// second full window the broker never agreed to.
+    ///
+    /// **It costs redelivery.** The broker really drops the consumer, so everything it was
+    /// holding un-acked returns to the subscription's redelivery pool — to this consumer
+    /// after its re-attach, or to a `Shared` sibling meanwhile. At-least-once is preserved;
+    /// duplicates are not.
+    ///
+    /// Returns once the `CommandCloseConsumer` is staged and the driver has been woken; the
+    /// re-arm completes two broker replies later. Poll [`Self::available_permits`] to
+    /// observe the grant land. A close the broker REJECTS mutates nothing and sends no
+    /// re-subscribe; it is recorded as a `warn!` and the consumer stays eligible for
+    /// another attempt.
+    ///
+    /// # What this does and does not repair
+    ///
+    /// It repairs **this client's own slot** in the broker's dispatcher. Issue #414
+    /// observed broker-side `availablePermits = -177300` on one ghost consumer with
+    /// an empty name; every fresh consumer then stopped progressing, but no aggregate
+    /// value was captured. One consumer re-attaching does not necessarily clear that. The
+    /// escalation is an operator-side `pulsar-admin topics unload`, which is what
+    /// recovered the production incident. See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Other`] when the consumer is not eligible for an in-place re-attach:
+    /// it is closed, unsubscribing, terminally failed, mid-seek (the seek owns its own
+    /// re-attach), already has a re-attach or a recovery close in flight, or is a
+    /// `Failover` or non-durable subscription — for those two the close would trigger an
+    /// election or discard a cursor that lives only as long as the consumer, so there is no
+    /// in-place repair (ADR-0108, ADR-0099). Nothing is mutated in any of those cases.
+    pub fn resubscribe(&self) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.resubscribe_consumer_in_place(self.handle)
+        };
+        let Some(request_id) = request_id else {
+            return Err(ClientError::Other(
+                "consumer is not eligible for an in-place re-subscribe (closed, \
+                 unsubscribing, terminal, mid-seek, a re-attach or recovery close is \
+                 already in flight, or the subscription is Failover or non-durable)"
+                    .to_owned(),
+            ));
+        };
+        self.shared.driver_waker.notify_one();
+        // Borrowed BEFORE the macro, not formatted inside it: `tracing` evaluates field
+        // expressions lazily behind its level check, so an inline `%`-formatted field
+        // never runs when no subscriber is installed — which is every coverage run
+        // (ADR-0024's sim-coverage gate would report the line as dead).
+        let topic = self.slot.identity.topic.as_str();
+        let subscription = self.slot.identity.subscription.as_str();
+        tracing::info!(
+            topic,
+            subscription,
+            handle = ?self.handle,
+            request_id = ?request_id,
+            "consumer close staged for an in-place re-subscribe; the re-attach follows the \
+             close ack and permits re-arm on the re-subscribe ack"
+        );
+        Ok(())
     }
 
     /// This consumer's CURRENT receiver-queue target (issue #301). For the
@@ -1506,6 +1595,10 @@ pub(crate) enum PostProcessOutcome {
 ///
 /// `crypto_failure_action` governs what happens when the decryption step fails (see
 /// [`magnetar_proto::CryptoFailureAction`]).
+///
+/// A member of a compressed batch arrives with `compression = None`: the state machine decoded
+/// the whole batch before splitting it (ADR-0112), so the decompression step below only ever
+/// runs for an unbatched message.
 fn post_process_message(
     msg: &mut IncomingMessage,
     decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
@@ -3168,6 +3261,152 @@ mod tests {
         assert_eq!(closed.available_permits(), 0);
     }
 
+    /// Issue #414: `Consumer::resubscribe()` is the caller-driven recovery for a
+    /// consumer whose broker-side dispatch has gone silent. Since ADR-0108 it
+    /// re-attaches THIS consumer id in two phases on the live socket —
+    /// `CommandCloseConsumer` first, then on its `Success` the permit-mirror
+    /// zeroing and a fresh `CommandSubscribe` whose own `Success` releases the
+    /// deferred grant — and it refuses, without touching anything, a consumer
+    /// that is not eligible.
+    /// Mirrors the moonpool engine test 1:1 (ADR-0024).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resubscribe_reattaches_in_place_and_refuses_an_ineligible_consumer() {
+        /// Drain the outbound buffer once, bucketing this consumer's closes,
+        /// subscribes and flow grants. `poll_transmit` empties the buffer, so a
+        /// second call would see nothing — classify in one pass.
+        fn drain(
+            shared: &std::sync::Arc<ConnectionShared>,
+        ) -> (Vec<u64>, Vec<(u64, u64)>, Vec<u32>) {
+            let mut out = shared.inner.lock().poll_transmit();
+            let (mut closes, mut subscribes, mut flows) = (Vec::new(), Vec::new(), Vec::new());
+            while !out.is_empty() {
+                let frame = magnetar_proto::decode_one(&mut out).expect("decode outbound");
+                if let Some(close) = frame.command.close_consumer {
+                    closes.push(close.request_id);
+                } else if let Some(sub) = frame.command.subscribe {
+                    subscribes.push((sub.request_id, sub.consumer_id));
+                } else if let Some(flow) = frame.command.flow {
+                    flows.push(flow.message_permits);
+                }
+            }
+            (closes, subscribes, flows)
+        }
+
+        /// Feed the broker's `CommandSuccess` for `request_id`.
+        fn ack(shared: &std::sync::Arc<ConnectionShared>, request_id: u64) {
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode success");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("handle success");
+        }
+
+        const RQ: usize = 8;
+        let shared = handshake_complete_shared();
+        let (handle, subscribe_request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/resub-in-place".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Shared,
+                receiver_queue_size: RQ,
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        // Ack the subscribe and arm the initial flow: the steady state a #414
+        // wedge strikes from.
+        {
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: subscribe_request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode subscribe success");
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("subscribe success");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+            let _ = conn.initial_flow(handle, Instant::now());
+            let _ = conn.poll_transmit();
+        }
+        let consumer = Consumer::assemble(
+            shared.clone(),
+            handle,
+            consumer_slot_for(&shared, handle),
+            None,
+        );
+        assert_eq!(consumer.available_permits(), RQ as u32);
+
+        // Phase 1 (ADR-0108): a `CommandCloseConsumer` and nothing else. Nothing is
+        // mutated — the broker still holds this consumer exactly as it was.
+        let close_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        consumer.resubscribe().expect("a live consumer is eligible");
+        assert_eq!(
+            consumer.available_permits(),
+            RQ as u32,
+            "phase 1 must not touch the mirror: a `CommandSubscribe` for a consumer id \
+             the broker still holds is answered `CommandSuccess` and changes nothing \
+             broker-side, so the close is what makes the re-attach real"
+        );
+        let (closes, subscribes, flows) = drain(&shared);
+        assert_eq!(closes, vec![close_request_id], "one CommandCloseConsumer");
+        assert!(
+            subscribes.is_empty() && flows.is_empty(),
+            "the re-attach is owed to the close ack, not to this call"
+        );
+
+        // Phase 2: the broker confirms the close, so the slot really is gone and the
+        // mirror follows it to zero. A fresh `CommandSubscribe` for the SAME consumer
+        // id goes out, with no flow ahead of it (Pulsar drops flow for a consumer
+        // whose subscribe is in flight).
+        let resub_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        ack(&shared, close_request_id);
+        assert_eq!(
+            consumer.available_permits(),
+            0,
+            "the broker has now really dropped the dispatcher slot, so the client's \
+             mirror must follow until the re-subscribe is acked"
+        );
+        let (closes, subscribes, flows) = drain(&shared);
+        assert_eq!(subscribes, vec![(resub_request_id, handle.0)]);
+        assert!(closes.is_empty(), "exactly one close per recovery");
+        assert!(flows.is_empty(), "the grant is deferred to the ack");
+
+        // The broker acks the re-attach: the grant comes back on its own.
+        ack(&shared, resub_request_id);
+        assert_eq!(
+            consumer.available_permits(),
+            RQ as u32,
+            "the re-subscribe ack re-arms the full receiver-queue grant"
+        );
+
+        // An unknown handle has no subscribe request to replay, so the call is
+        // refused rather than silently doing nothing observable.
+        let bogus = magnetar_proto::ConsumerHandle(9999);
+        let orphan = Consumer::assemble(shared, bogus, stub_consumer_slot_for_test(bogus), None);
+        assert!(
+            orphan.resubscribe().is_err(),
+            "an unknown consumer must be refused"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn auto_receiver_queue_policy_grows_target_under_starvation() {
         // Issue #301: an `Auto`-policy consumer driven through the tokio engine's
@@ -3196,7 +3435,7 @@ mod tests {
             let _ = conn.initial_flow(handle, t0);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
-            // Issue #349: drain the broker-side permit BALANCE via real
+            // Issue #349: drain the client-accounted permit balance via real
             // dispatch — 100 single-message deliveries against the
             // 100-permit initial grant — so the tick observes genuine
             // starvation, not a synthetic field write.
@@ -3214,8 +3453,10 @@ mod tests {
             );
             assert_eq!(
                 conn.consumer_available_permits(handle),
-                200,
-                "the incremental flow tops the broker grant up to the new target"
+                100,
+                "issue #414: the accessor reports the client-accounted balance — dispatch drained the \
+                 100-permit initial grant to 0, so the incremental top-up of 100 leaves \
+                 exactly 100 un-spent, not the 200-permit cumulative grant"
             );
         }
     }
@@ -4293,6 +4534,111 @@ mod tests {
             super::PostProcessOutcome::Deliver
         ));
         assert_eq!(uncompressed.payload.as_ref(), b"plain");
+    }
+
+    /// Subscribe a consumer on a handshaken connection and feed it one inbound entry carrying
+    /// `metadata` over `body`. Returns the assembled tokio `Consumer`.
+    fn consumer_fed_with(topic: &str, metadata: &pb::MessageMetadata, body: &[u8]) -> Consumer {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: topic.to_owned(),
+            subscription: "s".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 0,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, metadata, body).expect("encode inbound entry");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &buf)
+            .expect("handle inbound entry");
+        let slot = consumer_slot_for(&shared, handle);
+        Consumer::assemble(shared, handle, slot, None)
+    }
+
+    /// Issue #860 / ADR-0112: a NON-batched compressed message is still decompressed after the
+    /// pop, exactly as before — only batched entries moved into `ConsumerState::deliver`.
+    /// Tokio-only: the moonpool consumer has no post-pop decompression (its producer refuses
+    /// every codec), so there is no branch to mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decompresses_an_unbatched_compressed_message() {
+        use magnetar_proto::types::CompressionKind;
+
+        let plaintext = b"unbatched-compressed|".repeat(16);
+        let body = crate::compress::compress(CompressionKind::Snappy, &plaintext).expect("snappy");
+        let consumer = consumer_fed_with(
+            "persistent://public/default/unbatched-860",
+            &pb::MessageMetadata {
+                producer_name: "java".to_owned(),
+                compression: Some(pb::CompressionType::Snappy as i32),
+                uncompressed_size: Some(plaintext.len() as u32),
+                ..Default::default()
+            },
+            &body,
+        );
+        let msg = consumer.receive().await.expect("decompressed receive");
+        assert_eq!(msg.payload.as_ref(), plaintext.as_slice());
+    }
+
+    /// Issue #860 / ADR-0112: a Java-layout compressed batch — the WHOLE packed body compressed
+    /// once — reaches `receive_batch` as plaintext members, through both post-pop paths
+    /// (`ReceiveFut` for the first, `post_process_message` for the rest), neither of which may
+    /// decompress a member a second time. Before ADR-0112 nothing surfaced at all.
+    /// Tokio-only: the skipped branch is the tokio post-pop decompression moonpool lacks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_hands_back_java_layout_members_decoded_once() {
+        use magnetar_proto::types::CompressionKind;
+        use prost::Message as _;
+
+        let members: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("java-member-{i}|").repeat(12).into_bytes())
+            .collect();
+        let mut packed = BytesMut::new();
+        for member in &members {
+            let single = pb::SingleMessageMetadata {
+                payload_size: member.len() as i32,
+                ..Default::default()
+            };
+            packed.extend_from_slice(&(single.encoded_len() as u32).to_be_bytes());
+            single
+                .encode(&mut packed)
+                .expect("encode SingleMessageMetadata");
+            packed.extend_from_slice(member);
+        }
+        let body = crate::compress::compress(CompressionKind::Lz4, &packed).expect("lz4");
+        let consumer = consumer_fed_with(
+            "persistent://public/default/java-batch-860",
+            &pb::MessageMetadata {
+                producer_name: "java".to_owned(),
+                num_messages_in_batch: Some(4),
+                compression: Some(pb::CompressionType::Lz4 as i32),
+                uncompressed_size: Some(packed.len() as u32),
+                ..Default::default()
+            },
+            &body,
+        );
+        let batch = consumer
+            .receive_batch(8, std::time::Duration::from_secs(1))
+            .await
+            .expect("receive_batch");
+        let payloads: Vec<Vec<u8>> = batch.iter().map(|m| m.payload.to_vec()).collect();
+        assert_eq!(payloads, members, "every member, once decoded, in order");
     }
 
     #[tokio::test(flavor = "current_thread")]

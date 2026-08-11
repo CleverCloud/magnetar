@@ -4,8 +4,8 @@
 //! `magnetar-runtime-moonpool/tests/message_listener_delivery.rs`.
 //!
 //! Maintains the tokio <-> moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): two `#[test]` functions here mirror the
-//! moonpool file's two.
+//! (`check-runtime-test-parity`): three `#[test]` functions here mirror the
+//! moonpool file's three.
 //!
 //! ## What this pins
 //!
@@ -28,6 +28,9 @@
 //!    ack-free;
 //! 3. once the consumer is closed (broker `CloseConsumer`), the drain seam reports closed and
 //!    yields no further message — the clean-shutdown signal the poller breaks its loop on.
+//! 4. driving that same never-`poll_event` drain past `EVENT_QUEUE_OBSERVATIONAL_CAP` leaves the
+//!    observational event queue bounded (the excess is dropped and counted) while `pop_message`
+//!    still yields every message — issue #413, the cap buys memory safety and costs no delivery.
 //!
 //! No driver task, no TCP listener, no wall clock — same shape as
 //! `consumer_flow_control_edge.rs`. The moonpool sibling pins the identical
@@ -286,5 +289,76 @@ fn listener_drain_stops_cleanly_on_consumer_close() {
         conn.pop_message(handle, std::time::Instant::now())
             .is_none(),
         "a closed consumer yields no further message to the listener drain",
+    );
+}
+
+/// Issue #413, engine-side: the per-message OBSERVATIONAL events
+/// (`ConnectionEvent::Message`) are full payload clones that no production
+/// consumer drains — the listener poller loops over `receive()` / `pop_message`
+/// and never calls `poll_event`. Before the cap that exact listener shape grew
+/// the connection's event queue by one payload per message for the lifetime of
+/// the connection, OOM-killing the consumer fleet.
+///
+/// Drive the listener's real drain discipline — deliver
+/// `EVENT_QUEUE_OBSERVATIONAL_CAP + 100` messages and **never** call
+/// `poll_event` — then assert the excess was dropped and counted, and that
+/// delivery is untouched: `pop_message` still yields every message, in order.
+/// The cap is observability-only; it must never cost a message.
+#[test]
+fn listener_drain_caps_observational_events_without_losing_messages() {
+    /// Messages delivered beyond the cap — every one of them must be dropped
+    /// from the event queue and counted, and none may be lost to delivery.
+    const EXCESS: usize = 100;
+    let total = magnetar_proto::conn::EVENT_QUEUE_OBSERVATIONAL_CAP + EXCESS;
+
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let handle = open_consumer(
+        &shared,
+        "persistent://public/default/listener-observational-cap",
+        total,
+        t0,
+    );
+
+    // The broker pushes past the cap. Critically, nothing here drains
+    // `poll_event`: that omission *is* the production listener's shape and the
+    // whole point of the regression.
+    for i in 0..total {
+        let frame = message_frame(handle, 13, i as u64, format!("m{i}").as_bytes());
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &frame).expect("deliver message");
+    }
+
+    {
+        let conn = shared.inner.lock();
+        let dropped = conn.dropped_observational_events();
+        assert!(
+            dropped >= EXCESS as u64,
+            "expected at least {EXCESS} observational events dropped at the cap, got {dropped}",
+        );
+        assert_eq!(
+            conn.consumer_queue_len(handle),
+            total,
+            "the cap bounds the event queue, never the receiver queue",
+        );
+    }
+
+    // Delivery is untouched by the cap: every message still pops, in order.
+    let mut popped = 0usize;
+    loop {
+        let msg = {
+            let mut conn = shared.inner.lock();
+            conn.pop_message(handle, std::time::Instant::now())
+        };
+        let Some(msg) = msg else { break };
+        assert_eq!(
+            msg.metadata.sequence_id, popped as u64,
+            "capping observational events must not reorder delivery",
+        );
+        popped += 1;
+    }
+    assert_eq!(
+        popped, total,
+        "the observational cap must never drop a delivered message",
     );
 }

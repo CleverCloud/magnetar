@@ -15,64 +15,11 @@
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
-use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use magnetar::{MessageRoutingMode, OutgoingMessage, PulsarClient};
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
-}
+use common::pulsar::start_pulsar;
 
 /// PIP-22 DLQ routing: once a message has been redelivered past
 /// `max_redeliver_count`, the consumer flags it as dead-letter; we then republish
@@ -269,6 +216,327 @@ async fn e2e_dlq_explicit_ack_terminates() -> Result<(), Box<dyn std::error::Err
         "DLQ message reappeared after explicit ack"
     );
 
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn e2e_partitioned_consumer_aggregate_republishes_every_child_dead_letter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, admin_url, _container) = start_pulsar().await?;
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-partitioned-dlq-{id}");
+    let dlq_topic = format!("{topic}-DLQ");
+    let subscription = format!("magnetar-partitioned-dlq-{id}");
+
+    let admin = magnetar_admin::AdminClient::builder()
+        .service_url(admin_url.parse()?)
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    admin.topic_create_partitioned(&topic, 2).await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let producer = client
+        .partitioned_producer(&topic)
+        .routing(MessageRoutingMode::RoundRobin)
+        .create()
+        .await?;
+    let expected = [
+        (
+            "poison-0",
+            "key-0",
+            b"order-0".as_slice(),
+            1_700_000_001_000,
+            "value-0",
+        ),
+        (
+            "poison-1",
+            "key-1",
+            b"order-1".as_slice(),
+            1_700_000_001_001,
+            "value-1",
+        ),
+    ];
+    for (payload, key, ordering_key, event_time, property) in expected {
+        producer
+            .send(
+                OutgoingMessage::with_payload(payload.as_bytes().to_vec())
+                    .key(key)
+                    .ordering_key(ordering_key.to_vec())
+                    .event_time_ms(event_time)
+                    .property("custom", property),
+            )
+            .await?;
+    }
+    producer.close().await?;
+
+    let consumer = client
+        .partitioned_consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
+        .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .subscribe()
+        .await?;
+
+    let mut source_correlation = std::collections::BTreeMap::new();
+    for delivery_round in 0..2 {
+        for index in 0..expected.len() {
+            let received = tokio::time::timeout(Duration::from_secs(15), consumer.receive())
+                .await
+                .map_err(|_| {
+                    format!("timed out receiving poison message {index} in round {delivery_round}")
+                })??;
+            let payload = String::from_utf8(received.message.payload.to_vec())?;
+            if delivery_round == 0 {
+                source_correlation.insert(
+                    payload,
+                    (
+                        received.topic.clone(),
+                        received.message.message_id.to_string(),
+                    ),
+                );
+            }
+        }
+        consumer.redeliver_unacked();
+    }
+    let source_topics: std::collections::BTreeSet<_> = source_correlation
+        .values()
+        .map(|(source_topic, _)| source_topic.as_str())
+        .collect();
+    assert_eq!(
+        source_topics.len(),
+        2,
+        "round-robin poison messages must exercise both real partition children"
+    );
+
+    let dlq_producer = client.producer(&dlq_topic).create().await?;
+    let classified = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let classified = consumer.aggregate_stats().total_msgs_dead_lettered;
+            if classified >= expected.len() as u64 {
+                break classified;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "timed out waiting for both partition children to classify dead letters")?;
+    assert_eq!(
+        classified,
+        expected.len() as u64,
+        "partition children classified an unexpected number of source originals"
+    );
+    assert_eq!(
+        consumer.republish_dead_letters(&dlq_producer).await?,
+        expected.len(),
+        "one aggregate drain must republish every partition child's dead letter"
+    );
+    assert_eq!(
+        consumer.republish_dead_letters(&dlq_producer).await?,
+        0,
+        "a second aggregate drain must be empty"
+    );
+
+    let dlq_consumer = client
+        .consumer(&dlq_topic)
+        .subscription(format!("magnetar-partitioned-dlq-tail-{id}"))
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let mut replacements = std::collections::BTreeMap::new();
+    for index in 0..expected.len() {
+        let message = tokio::time::timeout(Duration::from_secs(15), dlq_consumer.receive())
+            .await
+            .map_err(|_| format!("timed out receiving DLQ replacement {index}"))??;
+        let payload = String::from_utf8(message.payload.to_vec())?;
+        let property = |key: &str| {
+            message
+                .metadata
+                .properties
+                .iter()
+                .find(|property| property.key == key)
+                .map(|property| property.value.clone())
+        };
+        assert!(
+            replacements
+                .insert(
+                    payload,
+                    (
+                        message.metadata.partition_key.clone(),
+                        message.metadata.ordering_key.clone(),
+                        message.metadata.event_time,
+                        property("custom"),
+                        property("REAL_TOPIC"),
+                        property("ORIGINAL_MESSAGE_ID"),
+                    ),
+                )
+                .is_none(),
+            "duplicate DLQ replacement payload"
+        );
+        dlq_consumer.ack(message.message_id).await?;
+    }
+    let extra_replacement =
+        tokio::time::timeout(Duration::from_secs(2), dlq_consumer.receive()).await;
+    assert!(
+        extra_replacement.is_err(),
+        "unexpected additional DLQ replacement: {extra_replacement:?}"
+    );
+    for (payload, key, ordering_key, event_time, custom) in expected {
+        let replacement = replacements
+            .get(payload)
+            .ok_or_else(|| format!("missing DLQ replacement for {payload}"))?;
+        assert_eq!(replacement.0.as_deref(), Some(key));
+        assert_eq!(replacement.1.as_deref(), Some(ordering_key));
+        assert_eq!(replacement.2, Some(event_time));
+        assert_eq!(replacement.3.as_deref(), Some(custom));
+        let (source_topic, source_message_id) = source_correlation
+            .get(payload)
+            .ok_or_else(|| format!("missing source correlation for {payload}"))?;
+        assert_eq!(replacement.4.as_deref(), Some(source_topic.as_str()));
+        assert_eq!(replacement.5.as_deref(), Some(source_message_id.as_str()));
+    }
+
+    dlq_consumer.close().await?;
+    dlq_producer.close().await?;
+    consumer.close().await?;
+    let resumed = client
+        .partitioned_consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let redelivery = tokio::time::timeout(Duration::from_secs(2), resumed.receive()).await;
+    assert!(
+        redelivery.is_err(),
+        "source originals reappeared after replacement publication and aggregate ACK: {redelivery:?}"
+    );
+    resumed.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+/// Issue #437: a receiver queue's worth of dead letters must not wedge the subscription.
+///
+/// The broker charges a permit for every dispatch unit, dead-letter-bound ones included. The
+/// client mirrors that debit, and before this fix it never credited the permit back — a
+/// dead-lettered unit is never queued, so it is never popped, and `consumed_since_flow` (the
+/// counter `maybe_flow` compares against the half-queue threshold) only moved on a pop. Net
+/// `-1` per dead-lettered unit, one-way. A poison-heavy `Shared` subscription therefore
+/// parked at `availablePermits=0` with `msgRateOut=0`, no error and no reconnect: the issue
+/// #414 stall watchdog needs `permit_balance > 0` to consider the consumer a candidate, and
+/// the issue #307 promotion re-arm only fires on a `Failover` election.
+///
+/// Java refunds at routing time — `ConsumerImpl.messageReceived` calls
+/// `increaseAvailablePermits(cnx)` straight after it skips an over-redelivered message — and
+/// so does magnetar now. This is that claim against a real broker: drive a small receiver
+/// queue's worth of poison past `max_redeliver_count`, publish one sentinel behind it, and
+/// require the sentinel WITHOUT the application having drained the dead letters first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_dlq_flow_survives_a_receiver_queue_of_dead_letters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-dlq-flow-{id}");
+    let dlq_topic = format!("persistent://public/default/magnetar-e2e-dlq-flow-{id}-DLQ");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // Three poison payloads, published before the consumer attaches so the dispatch order is
+    // the broker's and not a race with the subscribe.
+    let producer = client.producer(topic.clone()).create().await?;
+    for index in 0..3u8 {
+        producer
+            .send(OutgoingMessage::with_payload(format!("poison-{index}").into_bytes()).into())
+            .await?;
+    }
+
+    // A two-permit window: `maybe_flow`'s threshold is `max(2 / 2, 1)` = 1, so every refund
+    // is its own `CommandFlow` and two un-refunded dispatch units are enough to empty it.
+    let consumer = client
+        .consumer(topic.clone())
+        .subscription("magnetar-dlq-flow-sub")
+        .subscription_type(SubType::Shared)
+        .receiver_queue_size(2)
+        .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    // Drain-and-redeliver rounds. Nothing is ever acked, so each round bumps every entry's
+    // broker-side redelivery count; at `redelivery_count > 1` the client stops queueing them
+    // and routes them to the dead-letter buffer instead. Repeated rounds re-dispatch the
+    // still-unacked dead letters, which is exactly the traffic that used to drain the window
+    // to zero for good.
+    for _ in 0..6 {
+        while let Ok(Ok(message)) =
+            tokio::time::timeout(Duration::from_millis(400), consumer.receive()).await
+        {
+            // Deliberately unacked: the redelivery count is the whole mechanism here.
+            let _ = message;
+        }
+        consumer.redeliver_unacked();
+    }
+
+    // The sentinel goes out behind the poison, after the window has been spent on units the
+    // client will never hand to the application.
+    producer
+        .send(OutgoingMessage::with_payload(b"sentinel".to_vec()).into())
+        .await?;
+    producer.close().await?;
+
+    // The load-bearing assertion. Before the fix the broker holds zero permits for this
+    // consumer and never dispatches the sentinel, so this times out — `msgRateOut = 0` with
+    // a non-empty backlog, seen from the application. No `republish_dead_letters` call is
+    // allowed to precede it: the point is that the consumer recovers its own flow.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut sentinel_seen = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, consumer.receive()).await {
+            Ok(Ok(message)) => {
+                if message.payload.as_ref() == b"sentinel" {
+                    consumer.ack(message.message_id).await?;
+                    sentinel_seen = true;
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        sentinel_seen,
+        "a message published behind a receiver queue of dead letters must still be \
+         dispatched: every dead-lettered unit returns its flow permit at routing time \
+         (available_permits() reads {})",
+        consumer.available_permits(),
+    );
+
+    // And the poison really did go to the dead-letter buffer rather than the queue. `>=`, not
+    // `==`: every `redeliver_unacked` round re-dispatched the still-unacked dead letters and
+    // the routing path does not de-duplicate ids, so the buffer holds at least one entry per
+    // poison payload and usually several.
+    let dlq_producer = client.producer(dlq_topic.clone()).create().await?;
+    let republished = consumer.republish_dead_letters(&dlq_producer).await?;
+    assert!(
+        republished >= 3,
+        "each poison payload must have been routed to the dead-letter buffer at least once, \
+         got {republished}",
+    );
+
+    dlq_producer.close().await?;
     consumer.close().await?;
     client.close().await;
     Ok(())

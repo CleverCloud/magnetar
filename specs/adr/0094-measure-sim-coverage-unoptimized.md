@@ -5,6 +5,27 @@
 - **Decider**: Florentin Dubois
 - **Tags**: sim-coverage, xtask, coverage, llvm-cov, opt-level, mir-inlining, fail-open, ci
 
+> **Amendment (2026-10-13).** The measurement also pins **one codegen unit per crate**: `SIM_COVERAGE_CODEGEN_UNITS = "1"`, exported as `CARGO_PROFILE_TEST_CODEGEN_UNITS` beside `CARGO_PROFILE_TEST_OPT_LEVEL` on both the execution and the re-export command, through the one `SIM_COVERAGE_PROFILE_ENV` list.
+> Fixing the optimization level made the verdict independent of inlining, not of codegen-unit partitioning, and partitioning still decided which coverage records reached the report.
+> `llvm-cov export` reads mappings out of the executed test binaries; a library is linked as an archive of one object per codegen unit, and the linker extracts only the members that resolve a referenced symbol.
+> A unit nothing references therefore takes its records with it: those of a module the sim binaries never call into, and every _unused_ function of the crate — the coroutine body of an `async fn` nobody polls, an uninstantiated generic — which rustc emits into one designated unit ([rust-lang/rust#92165](https://github.com/rust-lang/rust/issues/92165), open).
+> A missing record reads as a non-executable line, so the gate failed **open**.
+>
+> PR #877 hit it: CI job 114793099056 failed on four added lines of the never-called `magnetar-runtime-tokio` `async fn` `Client::next_topic_list_change`, while every local run passed.
+> Measured 2026-10-13 at its head `d5834ee` against base `50b6702`, `rustc 1.99.0 (b940084d7 2026-09-28)` and cargo-llvm-cov 0.9.1 — CI's toolchain — varying only the unit count:
+>
+> | build                                 | tokio rlib objects | verdict                       | `DA:` in `client.rs:1456-1470` |
+> | ------------------------------------- | ------------------ | ----------------------------- | ------------------------------ |
+> | incremental, Cargo's local default    | 205                | **passes**                    | `1456,0` only                  |
+> | `CARGO_INCREMENTAL=0`, as CI runs     | 16                 | fails: 1458, 1459, 1460, 1468 | whole body, zero hits          |
+> | incremental, one unit (this decision) | 1                  | fails: 1458, 1459, 1460, 1468 | whole body, zero hits          |
+>
+> A minimal two-crate workspace isolates the unit count from incremental compilation: `CARGO_INCREMENTAL=0` with 256 units drops the same records and incremental with one unit keeps them.
+> CI's 16 is no guarantee either, since which unit is designated and which units get linked follow the crate's partitioning; one unit is, because a crate linked at all brings its whole mapping and a crate linked not at all already hard-fails the gate.
+> Toolchain skew and the workstation's `mbx` build cache were both tested and are not the cause: the first row reproduces with plain Cargo on CI's toolchain.
+> **Harder**: every crate the run compiles, dependencies included, codegens as one unit at `opt-level = 0`, and the first run after this lands rebuilds them all. At `d5834ee` on a 20-core host the one-unit cell took 206 s end to end, in a target directory the preceding cells had partly warmed; a cold run on CI's runner is unmeasured, against the job's `timeout-minutes: 180`.
+> **Stricter, not weaker, on CI**: lines CI's 16 units happened to drop now fail there too.
+
 ## Context
 
 [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md) made `check-sim-coverage` enforcing and gave it a per-PR home in `.github/workflows/ci.yml`.

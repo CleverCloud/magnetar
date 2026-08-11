@@ -318,6 +318,7 @@ impl M1Segment {
 
     fn to_pb(&self) -> pb::SegmentInfoProto {
         pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
             segment_id: self.id,
             hash_start: self.hash_start,
             hash_end: self.hash_end,
@@ -4097,6 +4098,7 @@ impl M1FakeCluster {
                 ))
             })?;
             assigned.push(pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                 segment_id: *segment_id,
                 hash_start: segment.hash_start,
                 hash_end: segment.hash_end,
@@ -5451,6 +5453,7 @@ mod tests {
         pb::BaseCommand {
             r#type: pb::base_command::Type::ScalableTopicLookup as i32,
             scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
+    create_if_missing: Some(true),
                 session_id,
                 topic: topic.to_owned(),
             }),
@@ -7218,7 +7221,7 @@ mod tests {
 
         let topic = cluster.topic().to_owned();
         let session_id = client
-            .open_scalable_topic_session(&topic)
+            .open_scalable_topic_session(&topic, true)
             .expect("client queues M1 lookup");
         let layout = adapter
             .exchange(&mut cluster, &mut client, now)

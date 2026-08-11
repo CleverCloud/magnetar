@@ -65,8 +65,7 @@ moonpool-core  = { workspace = true }
 parking_lot    = { workspace = true }
 rustls         = { workspace = true }
 rustls-openssl = { workspace = true, optional = true }
-slab           = { workspace = true }
-tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util"] }
+tokio          = { workspace = true, features = ["sync"] }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 
@@ -84,7 +83,7 @@ tokio-util     = { workspace = true }
 moonpool-sim   = { workspace = true }
 async-trait    = { workspace = true }
 # The provider-native scalable aggregate integration drives the same independent
-# stateful M1 broker model as the differential suites over SimProviders sockets.
+# stateful PIP-460 broker model as the differential suites over SimProviders sockets.
 magnetar-fakes = { workspace = true, features = ["scalable-topics"] }
 # Moonpool 0.8 captures named, flat `tracing` events inside actor spans and
 # exposes them through `TraceQuery`; no unstable tracing cfg or Valuable/Serde
@@ -108,7 +107,7 @@ prost          = { workspace = true }
 # `rcgen` mints a self-signed cert at fixture build time so the suite has
 # no on-disk PEM dependency. Both crates are dev-only — neither leaks
 # into the published crate's surface.
-rcgen          = { version = "^0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen          = { version = "^0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-rustls   = { workspace = true, features = ["aws_lc_rs"] }
 # Global capturing subscriber for the ADR-0054 secret-scan test
 # (tests/logging_no_secrets.rs). Dev-only — the library itself never

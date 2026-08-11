@@ -194,7 +194,6 @@ fn dispatch_script(
                     producer_name: "scripted".to_owned(),
                     sequence_id: entry_id,
                     publish_time: 1_700_000_000_000,
-                    num_messages_in_batch: Some(1),
                     ..Default::default()
                 };
                 let _ = encode_payload(out, &cmd, &meta, b"user-payload");

@@ -38,60 +38,19 @@ use magnetar::runtime_moonpool::{
 use magnetar::{OutgoingMessage, PulsarClient};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::BROKER_BINARY_PORT;
+
 const PORTLESS_BROKER_HOST: &str = "resolved-broker.internal";
-
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
 
 async fn start_pulsar()
 -> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
+    let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }
 
@@ -264,6 +223,26 @@ fn portless_lookup_stub_answers_partition_metadata() {
     assert_eq!(metadata.error, None);
 }
 
+/// Topic of the second scenario, whose lookups the stub bootstrap answers itself.
+const PORTLESS_TOPIC: &str = "persistent://public/default/magnetar-e2e-moonpool-portless-direct";
+
+/// Open and close a producer on `topic` through `client`, which looks it up through the real
+/// broker, so that the broker owns the topic's namespace bundle.
+///
+/// The stub bootstrap of the second scenario answers lookups itself, so the broker never sees one
+/// for that topic. Pulsar 5.0.0 does not acquire the bundle when a producer attaches directly: it
+/// logs `Namespace bundle (…) … not served by this instance … Please redo the lookup.`
+/// (`FAILED_CHECK_OWNERSHIP`) and answers `ServiceUnitNotReady` (code 6). Pulsar 4.0.14 and 4.2.5
+/// log `Trying to acquire ownership of …` on that attach and succeed (ADR-0116). The assertions of
+/// the scenario are unchanged.
+async fn open_and_close_producer_through_a_lookup(
+    client: &PulsarClient<magnetar::MoonpoolEngine<TokioProviders>>,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    client.producer(topic).create().await?.close().await?;
+    Ok(())
+}
+
 /// Pulsar 4 standalone advertises its own well-formed `pulsar://host:port`
 /// URL on every lookup response's `broker_service_url`. The moonpool
 /// engine's `Client::resolve_direct_broker` feeds that value through
@@ -329,6 +308,7 @@ async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
         consumer.ack(msg.message_id).await?;
     }
     consumer.close().await?;
+    open_and_close_producer_through_a_lookup(&client, PORTLESS_TOPIC).await?;
     client.close().await;
 
     assert_eq!(
@@ -373,10 +353,7 @@ async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
     )
     .await?;
     let client = PulsarClient::from_runtime_client(runtime_client);
-    let producer = client
-        .producer("persistent://public/default/magnetar-e2e-moonpool-portless-direct")
-        .create()
-        .await?;
+    let producer = client.producer(PORTLESS_TOPIC).create().await?;
     producer
         .send(OutgoingMessage::with_payload(b"portless-direct".to_vec()).into())
         .await?;

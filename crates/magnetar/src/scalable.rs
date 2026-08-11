@@ -1145,12 +1145,25 @@ where
         self.inner.close_tc_assignments_watch(watch_id);
     }
 
-    /// Resolve and retain a low-level scalable DAG session.
+    /// **Experimental** (PIP-460, ADR-0093). Resolve a `topic://...`
+    /// scalable topic without opening a consumer — returns the current segment
+    /// DAG + controller broker. Powers the CLI `topic-info` subcommand.
+    ///
+    /// **Read-only**: the lookup carries `create_if_missing = false`, so a
+    /// topic that does not exist is reported as not found on every broker
+    /// version instead of being auto-created by a Pulsar 5.0.0 broker.
+    /// [`Self::scalable_stream_consumer`], which opens a consumer, is the path
+    /// that may create it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime client error if the lookup fails, including when the
+    /// topic does not exist.
     pub async fn lookup_scalable_topic(
         &self,
         topic: &str,
     ) -> Result<ScalableLookup, <E::ClientState as ScalableTopicsApi>::Error> {
-        self.inner.scalable_topic_lookup(topic).await
+        self.inner.scalable_topic_lookup(topic, false).await
     }
 }
 
@@ -1703,6 +1716,7 @@ mod tests {
         let dag = magnetar_proto::pb::ScalableTopicDag {
             epoch: 1,
             segments: vec![magnetar_proto::pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
                 segment_id: 1,
                 hash_start: 0,
                 hash_end: 65_535,
@@ -1741,6 +1755,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: 1,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,

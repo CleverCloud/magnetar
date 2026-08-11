@@ -1,75 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PIP-180 / ADR-0033 — end-to-end shadow topic tests against a real
-//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:latest`).
+//! Apache Pulsar 4.x standalone broker (the shared fixture's default image).
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires
 //! Docker on the host. PIP-180 is available against the baseline broker
-//! (Pulsar 4.0+, ADR-0009). No new container, no docker-compose helper
-//! — uses the same single-broker fixture as `e2e_pulsar.rs`.
+//! (Pulsar 4.0+, ADR-0009), but is opt-in on the releases the CI matrix runs
+//! (ADR-0116): the suite enables it explicitly, see below. No new container, no
+//! docker-compose helper — uses the same single-broker fixture as `e2e_pulsar.rs`.
 
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::AdminClient;
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
-}
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// PIP-180 e2e — admin REST + produce / consume cycle:
 /// 1. Bootstrap the source topic by producing once.
@@ -81,7 +29,16 @@ async fn start_pulsar() -> Result<
 /// 6. Delete the shadow topic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_shadow_topic_full_cycle() -> Result<(), Box<dyn std::error::Error>> {
-    let (service_url, admin_url, _container) = start_pulsar().await?;
+    init_tracing();
+    // `enableShadowTopics` is `false` in the `standalone.conf` of Pulsar 4.0.14, 4.2.5 and 5.0.0,
+    // and the admin REST then answers `405 {"reason":"Shadow topics are disabled"}`. The key is
+    // absent from 4.0.13 and 4.2.4 (and earlier), where the suite passed without it. Enabling it
+    // keeps the suite meaningful on every version of the CI matrix (ADR-0116).
+    let (service_url, admin_url, _container) = Pulsar::new(Broker::Default)
+        .config("enableShadowTopics", "true")
+        .start()
+        .await?
+        .into_parts();
 
     let admin = AdminClient::builder()
         .service_url(admin_url.parse()?)

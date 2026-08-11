@@ -321,6 +321,37 @@ pub enum ConnectionEvent {
         active: bool,
     },
 
+    /// A consumer has held client-accounted unspent permits over an empty receive queue, in a
+    /// dispatch-eligible state, for
+    /// [`ConnectionConfig::consumer_stall_timeout`](crate::conn::ConnectionConfig)
+    /// without a single dispatch unit arriving (issue #414).
+    ///
+    /// Emitted at most **once per stall episode**: the next dispatch unit re-arms the
+    /// watchdog, so a consumer that recovers and wedges again reports twice. None of
+    /// the checked local gates explains the silence — not `pause`, not an in-flight seek,
+    /// not end-of-topic, not a re-attach in progress; all of those suppress the watchdog.
+    ///
+    /// `CommandFlow` carries non-negative grants, but dispatch, detach and client timing
+    /// also affect broker counters. This event reports observed delivery silence; it
+    /// does not attribute issue #414's negative ghost-consumer counter to either side.
+    /// The connection is otherwise healthy — ADR-0058's keepalive keeps passing, which is
+    /// precisely why it cannot detect this.
+    ///
+    /// Purely diagnostic. Recovery is the caller's explicit choice:
+    /// [`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place)
+    /// repairs this client's own dispatcher slot; a dispatcher-wide broker corruption
+    /// needs an operator-side `pulsar-admin topics unload`.
+    ConsumerStalled {
+        /// The consumer whose dispatch went silent.
+        handle: ConsumerHandle,
+        /// Permits the broker still had un-spent at the moment the stall was reported —
+        /// the client-side mirror of the broker's `availablePermits` for this consumer.
+        permit_balance: u32,
+        /// How long the silence had lasted when the watchdog fired. At least
+        /// `consumer_stall_timeout`; longer when the tick that noticed it ran late.
+        stalled_for: std::time::Duration,
+    },
+
     /// Broker requested the producer or consumer to migrate to a different broker URL.
     TopicMigrated {
         /// Producer handle if the resource type was `Producer`.
@@ -360,6 +391,14 @@ pub enum ConnectionEvent {
     },
 
     /// The broker asked us to close a producer (e.g. fenced).
+    ///
+    /// Surfaced ONLY while that producer's open is still in flight (issue #451,
+    /// [ADR-0106](../../specs/adr/0106-reattach-broker-closed-producer-in-place.md)):
+    /// the parked open waiter — `EventWaitFut` on tokio, `ProducerReadyFut` on
+    /// moonpool — is the one reader in the tree, and it owns that open's outcome.
+    /// An ESTABLISHED producer is re-attached in place on the same socket
+    /// instead, transparently to the runtime, and a closed or unknown handle
+    /// pushes nothing at all.
     ProducerClosedByBroker {
         /// The producer that was closed.
         handle: ProducerHandle,
@@ -648,12 +687,18 @@ pub struct IncomingMessage {
     /// the same parsed metadata instead of `clone()`-ing it N times per
     /// batch (a 100-message batch was 100 metadata deep-clones; with the
     /// `Arc` it is 100 refcount bumps).
+    ///
+    /// A member of a compressed batch carries `compression = None` (ADR-0112):
+    /// `deliver` decoded the batch before splitting it, so the member's payload
+    /// is already plaintext and no engine decompresses it again. The
+    /// producer's `uncompressed_size` stamp is left as it arrived.
     pub metadata: std::sync::Arc<pb::MessageMetadata>,
     /// Optional single-message metadata if the message was part of a batch.
     pub single_metadata: Option<pb::SingleMessageMetadata>,
-    /// The payload bytes (post-decompression by the consumer driver; the state machine itself
-    /// surfaces raw bytes — decompression happens above us because the codec lives in the
-    /// runtime crate to avoid pulling compression algorithm crates into `magnetar-proto`).
+    /// The payload bytes. A batch member is surfaced already decompressed — the state machine
+    /// decodes a compressed batched entry before it splits it (ADR-0112). An unbatched message
+    /// is surfaced as it arrived, and the engine decrypts and then decompresses it after the
+    /// pop (PIP-4 puts the compressed bytes inside the encryption envelope).
     pub payload: Bytes,
     /// Broker-supplied redelivery count.
     pub redelivery_count: u32,

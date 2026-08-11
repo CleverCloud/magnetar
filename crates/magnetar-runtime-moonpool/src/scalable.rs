@@ -273,7 +273,7 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         let (session_id, route) = {
             let mut conn = self.bootstrap.inner.lock();
             let session_id = conn
-                .open_scalable_topic_session(topic)
+                .open_scalable_topic_session(topic, true)
                 .map_err(|error| ClientError::Other(error.to_string()))?;
             let session_epoch = conn.session_epoch();
             let key = ScalableRouteKey::dag(
@@ -3835,6 +3835,7 @@ mod tests {
         let dag = magnetar_proto::pb::ScalableTopicDag {
             epoch,
             segments: vec![magnetar_proto::pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
                 segment_id: 1,
                 hash_start: 0,
                 hash_end: 65_535,
@@ -3860,6 +3861,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: epoch,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,
@@ -3886,6 +3888,7 @@ mod tests {
         let parent = "topic://public/default/scaled";
         let segment = |segment_id, hash_start, hash_end, state, parents, children, sealed| {
             magnetar_proto::pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
                 segment_id,
                 hash_start,
                 hash_end,
@@ -3945,6 +3948,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: 2,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,

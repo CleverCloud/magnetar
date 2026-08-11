@@ -371,15 +371,16 @@ By convention, magnetar treats `ConnectionEvent` as `#[non_exhaustive]`, so the 
 
 ### Shadow replicator-role e2e setup
 
-The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised against a real Apache Pulsar 4.0.4 broker by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference).
+The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference). The test runs on the default broker of the shared e2e fixture (`crates/magnetar/tests/common/pulsar.rs`, [ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); `MAGNETAR_PULSAR_IMAGE_TAG` can select an explicit compatibility image. The earlier 4.0.4 description is historical, not the image selected by the current default or CI.
+Shadow topics are opt-in on Pulsar 4.0.14, 4.2.5 and 5.0.0 (`enableShadowTopics=false` in `standalone.conf`, the admin REST answers `405 Shadow topics are disabled`), so both shadow-topic e2e suites enable them with `.config("enableShadowTopics", "true")` ([ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)); a broker you run yourself needs `enableShadowTopics=true` before `create-shadow-topic` works.
 The fixture is **self-hosting** — one standalone container via `testcontainers-rs`, no external broker dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster geo-replication is PIP-33, covered by [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)).
 
 #### Shadow fixture (`start_pulsar_with_token_auth_and_replicator_role`)
 
-1. Boot a single `apachepulsar/pulsar:4.0.4` standalone container with token auth turned on via `PULSAR_PREFIX_*` env overrides (`authenticationEnabled=true`, `authenticationProviders=…AuthenticationProviderToken`, `authorizationEnabled=true`, `superUserRoles=admin`).
+1. Boot one standalone container of the shared fixture's default image, or the `MAGNETAR_PULSAR_IMAGE_TAG` image when set, with token auth turned on through the fixture's `.config(…)` calls (`authenticationEnabled=true`, `authenticationProviders=…AuthenticationProviderToken`, `authorizationEnabled=true`, `superUserRoles=admin`), which the fixture applies to `conf/standalone.conf` with `bin/apply-config-from-env.py` before the broker starts and whose admin token authenticates its readiness probe. Before ADR-0115 these were exported as `PULSAR_PREFIX_*` variables to a plain `bin/pulsar standalone`, which ignores them, so this suite ran against a broker with authentication off. CI does not set the image-tag override; this documents the selected image, not a compatibility result for 4.0.4.
    The HS256 signing secret is seeded inline as `tokenSecretKey=data:;base64,<b64>` — no bind-mount.
 2. Mint three HS256 JWTs in-process (`sub` claim = role), hand-encoded with `aws-lc-rs::hmac`: `admin` (super-user), `replicator`, `magnetar-test-user`.
-3. Pre-seed the namespace by exec'ing `pulsar-admin namespaces grant-permission public/default --role replicator --actions produce,consume` inside the container (waits for exit).
+3. Pre-seed the namespace by exec'ing `pulsar-admin --auth-plugin … --auth-params token:<admin> namespaces grant-permission public/default --role replicator --actions produce,consume` inside the container (waits for exit and requires exit zero). The CLI reads `client.conf`, which the broker configuration does not touch, so it authenticates as the admin role explicitly.
    The non-replicator role is deliberately left **un-granted**.
 
 #### Shadow broker contract pinned
@@ -546,7 +547,7 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
 - **Differential**: 2 equivalence tests at `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs` assert tokio ↔ moonpool produce the same `EventStream` + byte-identical `CommandSubscribe`.
 - **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture: cursor-resume across a cluster failover, and remote materialization of the replicated subscription once the acked position crosses a snapshot window.
   The client-side marker observation channel is exercised by the scripted sim suites only — real Pulsar dispatchers filter `REPLICATED_SUBSCRIPTION_*` marker entries off consumer delivery, so an e2e can never observe one.
-  Runs as a regular `cargo test` per ADR-0046: the two-cluster fixture comes up in the per-PR `test` job of [`ci.yml`](../.github/workflows/ci.yml) (every PR and push), and additionally on a weekly schedule in [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) as a dedicated standalone gate retained per ADR-0075.
+  Runs as a regular `cargo test` per ADR-0046: the two-cluster fixture comes up in the default-broker run of the per-PR `e2e` job of [`ci.yml`](../.github/workflows/ci.yml) (every PR and push; [ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)), and additionally on a weekly schedule in [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) as a dedicated standalone gate retained per ADR-0075.
 
 ### Replicated subscriptions references
 
@@ -605,7 +606,7 @@ The policy is threaded through partitioned, multi-topics, and pattern consumers 
 
 `Auto { min, max_bytes }` recomputes the target from the observed [`FlowStats`](../crates/magnetar-proto/src/receiver_queue.rs) on each adjust tick:
 
-- **Grow** (bounded doubling) while the broker has drained every permit (`available_permits == 0`, the starvation signal) and the byte budget still has room.
+- **Grow** (bounded doubling) while received dispatch units have drained the client-accounted balance to zero (`available_permits == 0`, the starvation signal) and the byte budget still has room.
   A grown target emits an incremental `CommandFlow` so the broker is fed more.
 - **Shrink** (gentle halving toward `min`) when the buffered-queue bytes reach the byte budget (the OOM guard).
   Permits already granted cannot be un-granted, so the surplus drains naturally and the next refill asks for less.
@@ -634,9 +635,10 @@ This keeps the production tokio engine and the deterministic moonpool simulation
 ## Scalable topics (PIP-460) — experimental
 
 > **⚠️ EXPERIMENTAL.** This surface lives behind the default-off `scalable-topics` feature.
-> It speaks the wire protocol vendored from Apache Pulsar **5.0.0-M1**, the first published release carrying [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md).
-> M1 is a milestone, not a GA release, so the surface may still move before Pulsar 5.0 final. Against a **Pulsar 4.x** broker the client negotiates the capability away and refuses to emit a scalable-topic command — see [Broker compatibility](#scalable-topics-broker-compatibility) below.
-> [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) governs the vendored wire, [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) governs duplicate layout snapshots, and [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) governs the assignment-driven data plane.
+> It speaks the wire protocol vendored from Apache Pulsar **5.0.0** (GA), the release that carries [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md); the surface was first vendored from the 5.0.0 milestone and moved to GA by an [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment on 2026-10-12.
+> It stays experimental because QueueConsumer and CheckpointConsumer, type-82 unsubscribe, and PIP-486 bucket dispatch remain incomplete (see [Scalable topics out of scope](#scalable-topics-out-of-scope)).
+> Against a **Pulsar 4.x** broker the client negotiates the capability away and refuses to emit a scalable-topic command — see [Broker compatibility](#scalable-topics-broker-compatibility) below.
+> See [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which supersedes [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
 
 ### What PIP-460 is
 
@@ -651,14 +653,12 @@ The default-off feature provides a bounded, assignment-driven typed aggregate ra
 
 - **`topic://...` URL scheme** recognition (`is_scalable_topic_url`), routed to the scalable lookup path.
   The `persistent://` / `non-persistent://` paths are untouched.
-- **Three layout-session commands** among PIP-460's nine `BaseCommand` variants 70-78, vendored from upstream and encoded as ordinary frames: `CommandScalableTopicLookup` (which is also the subscribe), `CommandScalableTopicUpdate` (the initial layout and every pushed one), and `CommandScalableTopicClose`.
-- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types.
-  `SegmentState` is `Active` or `Sealed`; upstream has no split/merge _state_, only topology edges.
-  Placement arrives in a parallel `SegmentBrokerAddress` list and may be absent for a sealed segment.
-- **`DagWatchSession` and `DagSnapshot`** — sans-io whole-layout tracking, complete atomic graph validation, and ordering eligibility.
-  The watch orders updates by the monotonic layout `epoch` and derives split/merge from `parent_ids` / `child_ids`.
+- **Three wire commands**, vendored from upstream and encoded as ordinary `BaseCommand` frames: `CommandScalableTopicLookup` (which is also the subscribe), `CommandScalableTopicUpdate` (the initial layout and every pushed one), and `CommandScalableTopicClose`.
+  Every lookup carries the caller's `create_if_missing` **explicitly**; see [Lookup auto-creation](#scalable-topics-lookup-auto-creation).
+- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types. `SegmentState` is `Active` or `Sealed` — upstream has no split/merge _state_, only topology edges. `broker_url` is optional: placement arrives in a parallel `SegmentBrokerAddress` list and a sealed segment may carry none. `MessageId` is **not** extended — Pulsar 5.0.0's `MessageIdData` has no segment field, and segment identity travels in the `segment://` topic name.
+- **`DagWatchSession`** — a sans-io state machine that tracks the current layout, orders updates by the **monotonic layout `epoch`**, replaces the layout wholesale on each _advancing_ update, and derives split / merge from the incoming segments' `parent_ids` / `child_ids` edges.
   An update whose `epoch` does **not** advance is ignored — `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open.
-  That is not a detail: Pulsar 5.0.0-M1 answers the lookup with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup just opened, so treating a duplicate as a protocol error ended the watch before it had ever seen a change ([ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)).
+  That is not a detail: Pulsar 5.0.0 answers the lookup with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup just opened, so treating a duplicate as a protocol error ended the watch before it had ever seen a change ([ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)).
   A duplicate or reordered epoch is the no-op; a session-id mismatch, broker-side error, bodyless update, or invalid forward snapshot rejects the raw update without partially replacing the graph and closes that raw session.
 - **`scalable::StreamConsumer<S, E>`** on the façade, schema-generic and available on both Tokio and Moonpool.
   Public runtime clients remain non-`Clone`; each runtime gives the aggregate an internal owned `SegmentSubscriber`, while the aggregate itself is cheap to clone over shared state.
@@ -724,7 +724,7 @@ Neither the schema, owned value, message, nor runtime client needs `Clone`.
 
 ### DAG validation and ordering
 
-M1 hash ranges are inclusive `[start,end]` within `0..=65535`.
+GA hash ranges are inclusive `[start,end]` within `0..=65535`.
 There is no half-open `65536` sentinel.
 
 A replacement snapshot applies atomically only after validating unique segment and placement ids, placement-set agreement, lifecycle states and epochs, dangling/conflicting/reciprocal edges, acyclicity, bounded nodes/edges/depth/serialized size, canonical assignment attachment identity, split containment and exact parent coverage, merge union coverage, and non-overlapping active leaves covering the key space.
@@ -735,7 +735,7 @@ It withholds descendant FLOW until retained local ownership history proves every
 Cross-member or otherwise unknown ancestry is observable as `OrderingUnprovable` and blocks only the affected descendant.
 
 `OrderingMode::BrokerManaged` is an explicit compatibility mode.
-It keeps every locally provable barrier but relies on the M1 controller for an ancestor owned by another group member and therefore promises no cross-member parent-before-child order.
+It keeps every locally provable barrier but relies on the GA controller for an ancestor owned by another group member and therefore promises no cross-member parent-before-child order.
 Neither mode defines a total order between independent branches; broker FIFO remains per segment.
 
 ### Aggregate receive budget
@@ -797,7 +797,7 @@ Once the coordinator confirms commit or abort, an owned completion task records 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.
 It rejects an omitted source and any live receive, batch, delivery, or transactional-ack reservation.
 It cannot cross a layout transition, rewind a sealed or remote ancestor, or infer earliest/latest for an omitted segment.
-A chunk position is projected to its first chunk, while a batch position is projected to the residual suffix in `ack_set`; M1 ignores the richer batch/chunk fields on `CommandSeek`, so they are not transmitted as authority.
+A chunk position is projected to its first chunk, while a batch position is projected to the residual suffix in `ack_set`; The wire handler ignores the richer batch/chunk fields on `CommandSeek`, so they are not transmitted as authority.
 Both runtimes stage every child SEEK before awaiting any child response.
 A successful seek clears pre-seek buffers and invalidates old tokens; any child failure leaves the aggregate resynchronization-required.
 
@@ -807,7 +807,7 @@ When assignment removes a source, the aggregate stops new FLOW and receive reser
 That drain is bounded by the aggregate memory budget and unbounded in time: if the application never resolves a delivery, handoff may wait forever.
 The replacement opens only after the old `Exclusive` child confirms release.
 When an assigned active parent becomes sealed without replacement placement, its existing connected child instead drains under the same generation until terminal and retained work settle.
-M1 emits that shape for sealed segments, so the aggregate does not attempt an unrouteable parent reopen; every other routeable descriptor change uses the replacement fence.
+The broker may emit that shape for sealed segments, so the aggregate does not attempt an unrouteable parent reopen; every other routeable descriptor change uses the replacement fence.
 If the retained connection fails before completion, normal child-failure resynchronization applies and no sealed authority is synthesized.
 Once locally complete, a sealed segment can remain or reappear in a complete assignment without reopening an ordinary child or claiming pending ownership; active gains in that assignment still attach.
 
@@ -816,12 +816,11 @@ Each subscribe attempt is bounded by the ordinary operation deadline, while `Con
 
 Direct controller and segment routing selects the broker-authored authority matching the bootstrap transport: plaintext remains plaintext and TLS remains TLS.
 Every target passes the existing redirect allow-list before credentials are reused.
-M1 may omit the controller URL before leader election publishes one; only then does registration reuse the already-authenticated direct bootstrap, matching the official V5 client.
+GA may omit the controller URL before leader election publishes one; only then does registration reuse the already-authenticated direct bootstrap, matching the official V5 client.
 Missing segment authority, a transport mismatch, a rejected published target, or proxy-any-broker controller registration still fails closed; the client neither guesses another target nor downgrades TLS.
 
 Explicit close through any clone is globally definitive locally and awaits typed-route, task, and child cleanup; final drop fences synchronously on a best-effort basis and never blocks or spawns.
-M1 has no scalable-consumer unregister command.
-Logical close therefore may leave durable broker membership while another pool user keeps the physical controller connection open, and no ordinary close/unsubscribe/layout command is repurposed to pretend otherwise.
+GA defines `CommandScalableTopicUnsubscribe` (type 82), and Java sends it when the scalable consumer closes. The current client still needs to send this command after in-flight registration settles; until then, logical close may leave broker membership while another pool user keeps the physical controller connection open.
 
 ### Scalable topics consumer registration
 
@@ -837,7 +836,7 @@ Within one controller incarnation they apply in wire order; exact duplicates are
 On reconnect the validated subscribe response is the replacement incarnation's baseline, buffered pre-response pushes replay on top, and old-incarnation work is fenced.
 
 The low-level wire enum offers `Stream` and `Checkpoint`, but the public aggregate implements only StreamConsumer.
-`QueueConsumer` and `CheckpointConsumer` remain out of scope under ADR-0098.
+`QueueConsumer` and `CheckpointConsumer` remain out of scope under ADR-0120.
 
 ### Scalable topics namespace watch
 
@@ -855,14 +854,38 @@ The `scalable` routing bit PIP-473 adds to the PIP-31 transaction commands is se
 
 The assignment-driven aggregate does not drop on a split, merge, add, or removal. It validates the replacement DAG atomically, reconciles the authoritative assignment, opens gained children, drains lost children, and applies the selected ancestry barrier before granting FLOW.
 Controller loss starts an incarnation-fenced replacement lookup/registration flow; an invalid regression or unrouteable replacement moves the aggregate to observable resynchronization-required state rather than accepting stale authority.
-Resynchronization marks reconnect intent before old-child teardown, waits for confirmed children and in-flight opens to finish, and retries a rejected replacement registration while M1 retains the previous member on its physical controller connection.
+Resynchronization marks reconnect intent before old-child teardown, waits for confirmed children and in-flight opens to finish, and retries a rejected replacement registration while the broker retains the previous member on its physical controller connection.
 
 The low-level raw layout-session API still emits `DagUpdated` and `DagChangedDuringConsume` classifications for diagnostics and `magnetarctl topic-info`-style tooling.
 Those raw events are not the high-level `StreamConsumer` lifecycle contract and are never duplicated into an owned aggregate route.
 
+### Scalable topics lookup auto-creation
+
+Pulsar 5.0.0 added `create_if_missing` (field 3, default `true`) to `CommandScalableTopicLookup`.
+On the 5.0.0 milestone a lookup of a missing `topic://` topic failed with "Scalable topic not found" (`DagWatchSession.java:127-137` at `v5.0.0`); on 5.0.0 a lookup that leaves the field unset creates the topic, gated by the broker's and namespace's topic auto-creation policy (`DagWatchSession.java:138-157` at `v5.0.0`).
+An existing topic ignores the flag.
+Measured on 2026-10-12 against standalone brokers, `magnetarctl topic-info topic://public/default/never-created` resolves a one-segment layout on `apachepulsar/pulsar:5.0.0` and an admin `GET /admin/v2/scalable/public/default/never-created`, 404 before the lookup, then returns the persisted topic; on `apachepulsar/pulsar:5.0.0` the command fails with "Scalable topic not found".
+
+The caller chooses, and magnetar writes the choice **explicitly** on every lookup, `true` and `false` alike, so a lookup means the same thing to a 5.0.0 broker whether or not the field's default moves again.
+A 5.0.0 broker skips the unknown field.
+
+- **`PulsarClient::scalable_stream_consumer` sends `true`.**
+  It opens a consumer on an explicit single topic, which is what the Java v5 client does on every such path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799`, at `v5.0.0`).
+- **`PulsarClient::lookup_scalable_topic` sends `false`.**
+  It is the read-only path behind `magnetarctl topic-info`, and a diagnostic lookup of a mistyped name must not create a topic.
+  A missing topic is reported as not found on M1 and GA alike.
+  The upstream schema comment limits the `true` default to explicit single-topic producers and consumers.
+- **`scalable_topic_subscribe` is unchanged.**
+  It sends `CommandScalableTopicSubscribe`, which has no such field.
+- **A namespace (multi-topic) consumer must send `false`** too, as the Java client's does (`MultiTopicQueueConsumer.java:169`), so a reconnecting per-topic watch cannot resurrect a deleted topic.
+  magnetar has no such consumer yet.
+
+The flag is a `create_if_missing: bool` parameter of `Connection::open_scalable_topic_session`, of `Client::scalable_topic_lookup` on both runtimes, and of the `ScalableTopicsApi::scalable_topic_lookup` trait method ([ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment 2026-10-12).
+`scalable_stream_consumer` is bound `where E::ClientState: Clone` and neither engine's client is `Clone` ([`follow-ups.md` §11](follow-ups.md#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)), so only its engine-level `true` path is exercised today.
+
 ### Scalable topics out of scope
 
-`QueueConsumer`, `CheckpointConsumer`, PIP-486 bucket ranges and sticky children, read fan-out beyond segment count, multi-topic scalable aggregates, cross-layout vector seek, a distributed assignment generation/controller term, explicit scalable unregister, and GA wire compatibility remain out of scope.
+`QueueConsumer`, `CheckpointConsumer`, PIP-486 bucket ranges and sticky children, read fan-out beyond segment count, multi-topic scalable aggregates, cross-layout vector seek, a distributed assignment generation/controller term, multi-topic scalable aggregates and cross-layout vector seek remain out of scope.
 Proxy-any-broker controller registration also remains unsupported until upstream defines leader routing and a real proxy StreamConsumer e2e passes.
 
 The implementation does not claim these upstream contracts are solved:
@@ -874,6 +897,14 @@ The implementation does not claim these upstream contracts are solved:
 | [apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274) | No complete cross-member/deep-DAG completion contract           | Strict requires local proof; BrokerManaged names its weaker cross-member guarantee. |
 | [apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275) | Proxy-any-broker registration does not establish leader routing | Direct validated routing is supported; proxy registration fails closed.             |
 
+Two pieces of the 5.0.0 wire are vendored but not used, both tracked in [`follow-ups.md` §12](follow-ups.md#12-pip-460-remaining-ga-wire-and-api-gaps):
+
+- **`CommandScalableTopicUnsubscribe`** (type 82, acknowledged by `CommandSuccess`) is the clean leave of a scalable consumer.
+  It is decoded and never sent, so a registration is released by the broker only when the connection goes away.
+  An inbound frame of that type is skipped without an error.
+- **PIP-486 entry bucketing** (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`) is decoded and ignored.
+  A segment assigned with a non-empty `bucket_ranges` is shared by entry bucket, so a consumer attaching to it must subscribe `Key_Shared` sticky with `entryBucketDispatch = true` instead of `Exclusive`.
+
 ### Scalable topics broker compatibility
 
 The surface is negotiated **per connection**, in both directions:
@@ -884,14 +915,14 @@ The surface is negotiated **per connection**, in both directions:
    Against a peer that did not advertise support, opening a session returns `ScalableTopicError::BrokerUnsupported` and **writes nothing to the wire**.
 
 That covers a **Pulsar 4.x** broker, which has no PIP-460 surface at all, and a **5.x** broker started with `scalableTopicsEnabled=false`.
-The capability is a feature flag, not a protocol-version bump: upstream's `ProtocolVersion` still tops at `v21` in 5.0.0-M1, and the client advertises exactly that.
+The capability is a feature flag, not a protocol-version bump: upstream's `ProtocolVersion` still tops at `v21` in 5.0.0, and the client advertises exactly that.
 
 There is also a wire-level compatibility path in the other direction.
 For a regular, unmigrated topic the broker answers with a **synthetic single-segment layout** whose segment carries `legacy_topic_name`, wrapping the ordinary `persistent://...` topic; `SegmentDescriptor::is_legacy()` surfaces it.
 
 ### Scalable topics vendored wire commands
 
-The commands are vendored, not hand-written: `crates/magnetar-proto/proto/PulsarApi.proto` is pinned at `apache/pulsar` `8dae0236` (`v5.0.0-M1`) and `pb/pulsar.proto.rs` is generated from it, so there is no separate module and no bespoke envelope — a scalable-topic frame is an ordinary `BaseCommand` frame.
+The commands are vendored, not hand-written: `crates/magnetar-proto/proto/PulsarApi.proto` is pinned at `apache/pulsar` `b7b03f72` (`v5.0.0`) and `pb/pulsar.proto.rs` is generated from it, so there is no separate module and no bespoke envelope — a scalable-topic frame is an ordinary `BaseCommand` frame.
 Refreshing it is a dedicated `cargo run -p xtask -- vendor-proto --rev <sha>` commit per [ADR-0026 §D4](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
 
 Before [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) these commands lived in a hand-maintained `pb/scalable_topics.rs` written against the then-`Draft` proposal. Every field number, message shape, and lifecycle assumption in it turned out to differ from what upstream shipped, and because the test fakes implemented the same projection the whole suite was green against bytes no broker could parse.
@@ -909,13 +940,13 @@ The CLI picks it up via `--features magnetarctl/scalable-topics`.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Proto            | Complete DAG, aggregate lifecycle/budget, authority, `MSTR`, transaction, and seek suites under `magnetar-proto`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Tokio + Moonpool | Matched runtime integration suites for typed routes, children, receive/ack, ownership, close, and plaintext/TLS controller routing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Stateful fake    | `magnetar-fakes::m1` models controller plus segment endpoints, assignments, ordinary data-plane commands, failures, transactions, drain, and resource counts using generated M1 frames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Stateful fake    | `magnetar-fakes::m1` models controller plus segment endpoints, assignments, ordinary data-plane commands, failures, transactions, drain, and resource counts using generated Pulsar 5.0.0 frames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Differential     | 23 public aggregate scenarios, nine baseline and fourteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Real M1 e2e      | With `--features scalable-topics`, `e2e_hardened_scalable_stream_consumer_contract` compiles and is discovered; when Docker is available it runs the public builder, typed multi-segment delivery, vector ack, broker-effective inclusive vector-seek replay, transaction commit/abort, single-member split progression in Strict mode, BrokerManaged cross-member behavior, direct-bootstrap controller fallback when M1 omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and close residue against `apachepulsar/pulsar:5.0.0-M1`. Broker-controlled assignment timing means this does not isolate client-side Strict gating or prove same-cluster multi-broker routing. |
+| Real GA e2e       | With `--features scalable-topics`, `e2e_hardened_scalable_stream_consumer_contract` compiles and is discovered; when Docker is available it runs the public builder, typed multi-segment delivery, vector ack, broker-effective inclusive vector-seek replay, transaction commit/abort, single-member split progression in Strict mode, BrokerManaged cross-member behavior, direct-bootstrap controller fallback when GA omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and close residue against `apachepulsar/pulsar:5.0.0`. Broker-controlled assignment timing means this does not isolate client-side Strict gating or prove same-cluster multi-broker routing. |
 
 Focused code, fake, proto, runtime, façade, and differential suites passed for the implementation.
 A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
-Docker was unavailable on the integration host, so this branch did not execute the real M1 e2e locally; existing CI policy runs the ordinary e2e target when Docker is available.
+Docker was unavailable on the integration host, so this branch did not execute the real GA e2e locally; existing CI policy runs the ordinary e2e target when Docker is available.
 
 Sim coverage still executes only `magnetar-runtime-moonpool` and `magnetar-differential`, but the report and hard gate now cover exactly eight crates.
 `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` join the original six because the differential public aggregate tests compile and exercise both; façade Docker e2e targets do not execute in this gate.
@@ -926,11 +957,11 @@ The complete implementation diff must be represented by `HEAD` and the enforcing
 
 ### Scalable topics references
 
-- [ADR-0098](../specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md) — the current high-level assignment, delivery, ordering, budget, authority, lifecycle, and coverage contract.
+- [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md) — the current high-level assignment, delivery, ordering, budget, authority, and lifecycle contract.
 - [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) — duplicate raw layout snapshots are idempotent.
 - [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the upstream wire surface and per-connection negotiation.
-- [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) — historical original scope, superseded first on wire by ADR-0093 and then on the surviving drop-on-change data-plane decision by ADR-0098.
-- [M1-hardened StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) — implemented aggregate map and evidence.
+- [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) — historical original scope, superseded first on wire by ADR-0093 and then on the assignment-driven data-plane decision by ADR-0120.
+- [assignment-driven StreamConsumer proposal](../specs/proposals/feat-m1-hardened-stream-consumer.md) — implemented aggregate map and evidence.
 - [Historical PIP-460 proposal](../specs/proposals/pip-460-scalable-topics.md) — projected wire delta and original test plan.
 - [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) — the four-layer test plan.
 - Upstream [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md).
@@ -1072,12 +1103,12 @@ cargo test --features auth-athenz-zts \
 The Athenz ZTS server is operationally non-trivial to spin up in testcontainers — the upstream image expects a co-deployed ZMS (manager), per-tenant public-key seeding via the ZMS admin REST, and a chained TLS server certificate (Athenz's [`make deploy-dev`](https://github.com/AthenZ/athenz/blob/master/docker/README.md) orchestrates four containers + a cert-bootstrap pre-flight that together take ~15 minutes to build).
 The test file therefore takes a hybrid shape:
 
-| Test                                                       | Fixture                                     | What it proves                                                                                                                                                                                       |
-| ---------------------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `e2e_athenz_zts_refresh_then_cached_initial`               | wiremock-stub                               | `ensure_role_token` populates the cache; `AuthProvider::initial()` returns the cached bytes; bearer header is a compact-JWS three-segment payload from the §3 signer.                                |
-| `e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry` | wiremock-stub                               | Driving the injected `now: Instant` past the cached deadline (`t0 + ttl − refresh_margin`) triggers a fresh exchange and rotates the cached bytes — no wall-clock wait.                              |
-| `e2e_athenz_zts_cached_token_used_on_auth_challenge`       | wiremock-stub                               | `AuthChallengeState::handle_challenge` routes through `respond_to_challenge`, which echoes the cached role-token bytes verbatim; no extra ZTS round-trip.                                            |
-| `e2e_athenz_zts_image_pulls_and_serves_status`             | Docker (`athenz/athenz-zts-server:1.12.41`) | The upstream image is pullable and `testcontainers-rs` port mapping works; if the host lacks a co-deployed ZMS the test surfaces the documented "expected without ZMS bootstrap" warning and passes. |
+| Test                                                       | Fixture                                     | What it proves                                                                                                                                                                                    |
+| ---------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `e2e_athenz_zts_refresh_then_cached_initial`               | wiremock-stub                               | `ensure_role_token` populates the cache; `AuthProvider::initial()` returns the cached bytes; bearer header is a compact-JWS three-segment payload from the §3 signer.                             |
+| `e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry` | wiremock-stub                               | Driving the injected `now: Instant` past the cached deadline (`t0 + ttl − refresh_margin`) triggers a fresh exchange and rotates the cached bytes — no wall-clock wait.                           |
+| `e2e_athenz_zts_cached_token_used_on_auth_challenge`       | wiremock-stub                               | `AuthChallengeState::handle_challenge` routes through `respond_to_challenge`, which echoes the cached role-token bytes verbatim; no extra ZTS round-trip.                                         |
+| `e2e_athenz_zts_image_pulls_and_serves_status`             | Docker (`athenz/athenz-zts-server:1.12.47`) | CI's required pre-pull verifies image availability. The test attempts startup and port mapping; without a co-deployed ZMS it can report the expected bootstrap failure and pass before readiness. |
 
 The wiremock tests run against a real `reqwest` client + real HTTP server (deterministic responses, no Docker dep — wiremock binds an ephemeral local port).
 They cover every behavioural assertion the follow-up `/goal` enumerates.

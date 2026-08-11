@@ -15,7 +15,7 @@
 //!
 //! ## Why double-ignored
 //!
-//! The default `apachepulsar/pulsar:latest` standalone image does NOT spin up the
+//! The default standalone image of the shared fixture does NOT spin up the
 //! transaction coordinator. Enabling it requires either a custom config that sets
 //! `transactionCoordinatorEnabled=true` plus the system namespace bootstrap, or a
 //! purpose-built image. Until we ship that harness these tests are landed as
@@ -27,96 +27,47 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::{Broker, Pulsar, init_tracing};
+
 const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ABORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Start a Pulsar 4.x standalone container with transactions enabled and return
+/// Start a Pulsar standalone container with transactions enabled and return
 /// (`service_url`, `admin_url`, `container_handle`).
 ///
-/// Sets `PULSAR_PREFIX_transactionCoordinatorEnabled=true` so the broker spins up
-/// the txn coordinator. The default standalone image does NOT enable this — if
-/// the coordinator fails to bootstrap the new-txn RPC will hang or be rejected;
-/// that's why these tests are marked
+/// Sets `transactionCoordinatorEnabled=true` so the broker spins up the txn coordinator. The
+/// default standalone image does NOT enable this — if the coordinator fails to bootstrap the
+/// new-txn RPC will hang or be rejected; that's why these tests are marked
 /// `e2e: requires transaction-coordinator-enabled broker` and stay opt-in.
 async fn start_pulsar_with_txn() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        // Transactions require three things the default standalone image
-        // does not wire up:
-        //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`,
-        //      injected via `PULSAR_PREFIX_*` after running
-        //      `apply-config-from-env-with-prefix.py` (the image's CMD is
-        //      `sh` — no entrypoint).
-        //   2. Pre-bootstrap the transaction coordinator metadata via
-        //      `bin/pulsar initialize-transaction-coordinator-metadata`
-        //      BEFORE the broker grabs the RocksDB lock; otherwise the
-        //      first `new_txn` from the client fails with
-        //      "transaction not found" (the broker doesn't lazy-create
-        //      these on demand for the standalone image).
-        //   3. Then launch `bin/pulsar standalone` as usual.
-        .with_env_var("PULSAR_PREFIX_transactionCoordinatorEnabled", "true")
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
-                 conf/standalone.conf && \
-             bin/pulsar initialize-transaction-coordinator-metadata \
+    // Transactions require three things the default standalone image does not wire up:
+    //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`, which the shared fixture
+    //      applies from the configuration given here (the image has no entrypoint that would).
+    //   2. Pre-bootstrap the transaction coordinator metadata via `bin/pulsar
+    //      initialize-transaction-coordinator-metadata` BEFORE the broker grabs the RocksDB lock;
+    //      otherwise the first `new_txn` from the client fails with "transaction not found" (the
+    //      broker doesn't lazy-create these on demand for the standalone image).
+    //   3. Then launch `bin/pulsar standalone` as usual.
+    let broker = Pulsar::new(Broker::Default)
+        .config("transactionCoordinatorEnabled", "true")
+        .pre_start(
+            "bin/pulsar initialize-transaction-coordinator-metadata \
                  --cluster standalone \
-                 --configuration-store rocksdb:///pulsar/data/metadata && \
-             bin/pulsar standalone"
-                .to_owned(),
-        ])
+                 --configuration-store rocksdb:///pulsar/data/metadata",
+        )
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+    Ok(broker.into_parts())
 }
 
 fn unique_suffix() -> String {

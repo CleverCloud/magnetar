@@ -123,12 +123,15 @@ pub trait Engine:
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Engine-injected id provider for the façade's auto-generated
-    /// subscription names (`Reader`, `TableView`). Tokio plugs in
+    /// subscription names (`Reader`, `TableView`) and for the opt-in
+    /// [`ProducerBuilder::unique_name_suffix`](crate::ProducerBuilder::unique_name_suffix)
+    /// policy (issue #406). Tokio plugs in
     /// `Uuid::new_v4().simple()` (RFC 4122 random); moonpool plugs in
     /// a process-global atomic counter so deterministic-simulation runs
     /// produce stable, reproducible names. Callers that need fully
     /// deterministic names across processes should always pass an
-    /// explicit subscription / reader name through the builder.
+    /// explicit subscription / reader / producer name through the builder and
+    /// leave the suffix policy off.
     fn random_subscription_suffix() -> String
     where
         Self: Sized;
@@ -283,6 +286,16 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// `true` while the broker connection is up. Mirrors Java
     /// `Producer#isConnected`.
     fn is_connected(&self) -> bool;
+
+    /// `true` only while this producer's broker attachment can drain sends on
+    /// the current connection. Unlike `is_connected`, this detects an
+    /// individual child waiting for `CommandProducerSuccess` after a broker
+    /// close or a reconnect. Custom engines may override this with their
+    /// broker-attachment state; the compatibility default uses transport
+    /// readiness, preserving existing external `ProducerApi` implementations.
+    fn is_ready(&self) -> bool {
+        self.is_connected()
+    }
 
     /// Topic this producer publishes to.
     fn topic(&self) -> String;
@@ -577,10 +590,15 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `Consumer#getNumMessagesInQueue`.
     fn available_in_queue(&self) -> usize;
 
-    /// Outstanding dispatch permits the consumer has granted the broker
-    /// (messages it has authorised the broker to push without an
-    /// explicit `CommandFlow`). Mirrors Java
+    /// Client-accounted outstanding dispatch permits for this
+    /// consumer — the grants it has been given, minus one per dispatch unit
+    /// that has actually arrived. Mirrors Java
     /// `ConsumerBase#getAvailablePermits`.
+    ///
+    /// Issue #414 re-pointed this from the purely-additive grant mirror to
+    /// the client-accounted decrementing balance, so a value pinned high while messages
+    /// stop arriving is now a usable stall signal (ADR-0101 amending
+    /// ADR-0082).
     fn available_permits(&self) -> u32;
 
     /// `true` once the consumer has received at least one message since
@@ -733,6 +751,7 @@ pub struct OperationDeadline {
     last_broker_error: Option<(i32, String)>,
 }
 
+#[cfg(feature = "tokio")]
 type OperationDeadlineParts<'a> = (
     Pin<&'a mut (dyn Future<Output = ()> + Send)>,
     &'a mut Option<(i32, String)>,
@@ -1001,7 +1020,7 @@ pub type OpenProducerFut<'a, P> = Pin<
 /// `Option<E::Encryptor>` (engine-typed) instead of an
 /// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` (tokio-locked).
 ///
-/// Implemented on the engine marker ([`TokioEngine`] / [`MoonpoolEngine<P>`]).
+/// Implemented on the engine marker ([`TokioEngine`] / `MoonpoolEngine<P>`, feature `moonpool`).
 /// Tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`;
 /// moonpool plugs in `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>`.
 /// The choice of `Encryptor: Clone` lets the façade fan out the encryptor
@@ -1272,9 +1291,11 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// session stays open, pushing later layouts through
     /// [`Self::next_scalable_event`], until it is closed. Owned high-level
     /// consumers must not use this queue.
+    /// `create_if_missing` permits broker auto-creation; `false` keeps the lookup read-only.
     fn scalable_topic_lookup<'a>(
         &'a self,
         topic: &'a str,
+        create_if_missing: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ScalableLookup, Self::Error>> + Send + 'a>>;
 
     /// Whether the connected broker advertised the PIP-460 capability.
@@ -1466,7 +1487,7 @@ pub enum ScalableEvent {
 
 /// Zero-sized stub for any future engine that genuinely cannot wire real
 /// encryption. Both shipped engines ([`TokioEngine`] and
-/// [`MoonpoolEngine`]) now resolve their `MessageEncryptorApi::Encryptor`
+/// `MoonpoolEngine`, feature `moonpool`) now resolve their `MessageEncryptorApi::Encryptor`
 /// / `MessageDecryptorApi::Decryptor` to their own runtime's
 /// `Arc<dyn …MessageEncryptor>` / `…MessageDecryptor`, so `NoEncryption`
 /// is no longer used by either. It is retained as the documented opt-out
@@ -1492,6 +1513,7 @@ mod tests {
     // `moonpool` submodules whose names would shadow the external
     // `tokio` crate inside this test scope and break the
     // `#[::tokio::test]` macro expansions below.
+    #[cfg(feature = "tokio")]
     use super::Engine;
     #[cfg(feature = "moonpool")]
     use super::MoonpoolEngine;

@@ -6,26 +6,436 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **PIP-460 `StreamConsumer` now consumes its assigned segment topics.** A validated scalable-consumer assignment drives ordinary segment consumers, aggregate manual flow control, source-qualified delivery, acknowledgements, transactions, seek, and resynchronization on both runtimes. The experimental surface remains default-off; QueueConsumer, CheckpointConsumer, GA unsubscribe, and PIP-486 bucket dispatch remain incomplete ([ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md)).
+
+- **`magnetarctl --format` / `-F` / `MAGNETAR_FORMAT` selects the output format: `json` (unchanged default) or `human`.**
+  `human` prints command-specific labels with unit-aware values: a two-column `LABEL  VALUE` table for `admin namespaces get-retention` and `admin topics get-retention` (durations in days/hours/minutes, sizes in `MB`, `-1` shown as `∞`) and for `admin namespaces get-persistence` and `admin topics get-persistence` (`BookKeeper` quorums, mark-delete rate cap in `ops/s` or `disabled`), aligned tables for `admin topics list` (physical partitions collapsed under their parent with the declared count), `admin clusters list`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list` (in natural host order), `admin brokers leader`, `admin bookies list` (one `BOOKIE` column in natural host order), `admin bookies racks-info` (bookies grouped under their rack), `admin clusters list-failure-domains` and `admin clusters get-failure-domain` (one row per broker, the domain named once per group), and an aggregate block followed by per-producer, per-subscription and per-consumer tables for `admin topics stats` (rates and byte sizes with two decimals, decimal SI units).
+  Labels are uppercase and blue on a terminal; a pipe or a non-empty `NO_COLOR` disables color.
+  Every other command still prints JSON whatever the flag says, and `json` output is byte-for-byte unchanged.
+
 ### Changed
 
-- **BREAKING: the experimental PIP-460 `StreamConsumer` is now an assignment-driven, message-delivering aggregate instead of a layout-only consumer that drops on DAG change.** `PulsarClient::scalable_stream_consumer(topic, Arc<S>)` now returns a schema-generic owned builder requiring `.subscription(...)`; it accepts a stable consumer name, one validated aggregate receive budget, and `OrderingMode::Strict` (the default) or explicit `BrokerManaged`, then registers with the controller and opens one ordinary `Exclusive` child for every assigned `segment://` source.
-  Public runtime clients remain non-`Clone`; the runtimes own an internal `SegmentSubscriber`, while `StreamConsumer<S, E>` is cheap to clone over aggregate state and `StreamMessage<S>` owns `S::Owned`.
-  The aggregate now supports concurrent single and atomic batch receive, source-qualified typed delivery, individual/batch/cumulative/restored-vector ack, nack, transactional ack with commit admission and poison-on-failure, M1-limited vector seek, unbounded-in-time bounded-memory ownership drain, observable pending ownership, incarnation-fenced controller reconnect, direct plaintext/TLS controller routing, and async local close.
-  Pulsar 5.0.0-M1 may omit its controller URL before leader election; controller registration now matches the official V5 client by reusing only the already-authenticated direct bootstrap connection, while missing segment authority, invalid published authority, and proxy-any-broker registration remain fail-closed.
-  Changed equal-epoch assignments apply in one controller incarnation's receive order because `layout_epoch` versions topology rather than membership; exact duplicates are ignored and lower epochs fail closed.
-  Strict mode releases descendants only after every locally provable transitive ancestor is terminal and fully resolved; cross-member ancestry is `OrderingUnprovable`.
-  `BrokerManaged` explicitly delegates only that cross-member proof to M1 and does not promise a total order between independent segments.
-  One manual-FLOW budget covers all children and retiring state, including queue/ledger nodes, canonical-id/source sidecars, position-map nodes, and right-sized selected batch payloads.
-  Tokio and Moonpool both reserve receive work before decrypting and bounded-decompressing inbound LZ4, ZSTD, Snappy, or ZLIB payloads; zlib reads borrowed input into a bounded destination and zstd caps both destination and window, while Moonpool's remaining compression gap is producer-side only.
-  Its exact minimum is `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 13,697,152 bytes`; the default and examples use 16 MiB, and arbitrary additional memory inside user-defined `S::Owned` remains outside the bound.
-  Schema-preparation cancellation restores the same live authority at its original dequeue sequence, transaction-outcome retries resume after completed participant actions without replaying FLOW, routeable descriptor changes upgrade an existing drain before close/reopen so old FLOW is fenced, and an assigned parent becoming sealed without replacement placement drains under its existing generation; once complete, that sealed parent remains assignment-visible across rebalance without reopening an ordinary child.
-  Resynchronization now fences obsolete child loops before confirmation-bearing teardown, waits for confirmed children and in-flight child opens before controller replacement, and retries replacement registration while M1 retains the old physical member.
-  **Low-level `magnetar-proto` breakage:** the new aggregate model, typed route/incarnation keys, complete atomic DAG validation, inclusive hash ranges `[start,end]` over `0..=65535`, delivery authority, transaction lifecycle, and seek generations replace the old drop-on-change scaffolding.
-  Ordinary `MessageId` has no scalable `segment_id`; scalable identity is the canonical `SegmentSource` carried by `StreamMessageId` and `PositionVector`, serialized in the strict version-1 `MSTR` envelope, while `DeliveryToken` remains process-local. M1 still has no logical unregister, distributed assignment generation, remote ancestor-completion proof, or defined proxy-any-broker controller route; apache/pulsar#26272-#26275 remain open, and close may leave broker membership until the pooled physical connection closes.
-  The sim-coverage report and hard-gated source sets grow from six to exactly eight packages by adding `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` through `magnetar-differential`'s public aggregate tests.
-  Execution remains only `magnetar-runtime-moonpool` plus `magnetar-differential`, so façade Docker e2e targets do not run under coverage and ADR-0096's isolated-artifact behavior is unchanged.
-  A gated function-bearing file with no LCOV `SF:` record now fails even when sibling files reported; genuinely non-executable files remain advisory, and a wholly record-less gated crate still fails.
-  (ADR-0098; supersedes ADR-0031/ADR-0093's surviving drop-on-change and unimplemented-data-plane scope plus ADR-0093 § D5's blanket non-advancing-assignment rejection; ADR-0093's vendored M1 wire and capability negotiation remain binding)
+- **BREAKING: the vendored `PulsarApi.proto` moves from `v5.0.0-M1` to the GA release `v5.0.0`.**
+  The revision is `apache/pulsar` `b7b03f72cd4f81d501570588fcf3433ee035629b`, taken as the "another §D4 bump" [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) §D1 foresaw; `PulsarMarkers.proto` is byte-identical and `ProtocolVersion` stays `v21`.
+  The change over M1 is purely additive: PIP-486 entry-bucketing fields (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`), `CommandScalableTopicLookup.create_if_missing`, and `BaseCommand` type 82, `CommandScalableTopicUnsubscribe`.
+  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): the generated `pb` surface follows the 5.0.0 schema, and the `magnetar` façade is unaffected. The six new fields are required in struct literals of `MessageMetadata`, `KeySharedMeta`, `SegmentInfoProto`, `ScalableAssignedSegment` and `CommandScalableTopicLookup`, `pb::base_command::Type` gains `ScalableTopicUnsubscribe` (an exhaustive `match` stops compiling), and `pb::ScalableAssignedSegment` no longer derives `Eq` or `Hash` because it now holds a message-typed field.
+  The wire bytes this client sends are unchanged by the bump itself.
+  (ADR-0093 amendment 2026-10-12)
+
+- **BREAKING: the scalable-topic lookup takes a `create_if_missing` flag and states it explicitly; the read-only lookup behind `magnetarctl topic-info` never creates a topic.**
+  On Pulsar 5.0.0-M1 a lookup of a missing `topic://` topic failed with "Scalable topic not found"; on 5.0.0 a lookup that leaves the new `create_if_missing` field unset (default `true`) auto-creates the topic, subject to the broker's auto-creation policy.
+  `Connection::open_scalable_topic_session`, `Client::scalable_topic_lookup` on both runtimes and the `ScalableTopicsApi::scalable_topic_lookup` trait method gain a `create_if_missing: bool` parameter, passed last, and the lookup command always carries it explicitly, `true` and `false` alike; an M1 broker skips the unknown field.
+  **BREAKING CHANGE** (`magnetar-proto`, re-exported as `magnetar::proto`, plus the two runtime `Client`s and the `ScalableTopicsApi` engine hook): any direct caller of those entries must pass the flag. The `PulsarClient` signatures are unchanged.
+  `PulsarClient::scalable_stream_consumer` opens a consumer, so it passes `true` as the Java v5 client does on every explicit single-topic path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799` at `v5.0.0`).
+  `PulsarClient::lookup_scalable_topic` passes `false`: it is read-only, so `magnetarctl topic-info` reports "not found" for a missing topic on M1 and 5.0.0 alike instead of creating it on 5.0.0.
+  `scalable_topic_subscribe` is unchanged; `CommandScalableTopicSubscribe` has no such field.
+  `CommandScalableTopicUnsubscribe` is decoded and never sent, an inbound frame of that type is skipped without an error, and the PIP-486 fields are decoded and ignored; all three are recorded as known gaps in `docs/follow-ups.md` §12.
+  (ADR-0093 amendment 2026-10-12)
+
+- **The whole e2e suite runs on Pulsar 4.2.5 and 5.0.0 for every pull request, and on 4.0.14 every night.**
+  `4.2.5` (what Clever Cloud runs, and the last release before 5.0) is now the default broker in place of `4.2.4`; `5.0.0`, the new upstream LTS, is a second axis of the per-PR `e2e` job; `4.0.14`, the 4.0 LTS and minimum supported broker, runs in the new `e2e-nightly.yml` (05:47 UTC and on dispatch).
+  The four e2e shards are now the reusable workflow `e2e-pulsar.yml`, called once per version with `MAGNETAR_PULSAR_IMAGE_TAG` set from the matrix, so a pull request pays four more e2e cells (nine instead of five) and the version is in every cell name (`e2e (Pulsar 5.0.0) / e2e 3/4`); the required-check names change.
+  `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs`, pinned to `4.0.13` without a reason, now use `Broker::Default` and so honour `MAGNETAR_PULSAR_IMAGE_TAG` again; only the PIP-460 tests (Pulsar `5.0.0` GA, which replaces the `5.0.0-M1` milestone now that the vendored protocol is the GA release) and the test that a pre-5.0 broker refuses scalable topics (`4.2.5`, a literal of its own) still pin.
+  `e2e_replicated_subscriptions` runs only on the `4.2.5` axis: the PIP-33 two-cluster compose is a 4.2.5 fixture, so only that run brings it up and selects the target, and porting it to 5.0 and 4.0 is separate work.
+  `check-e2e-fixture` reads the `pulsar:` axis: it fails when the axis, the tag constants, the pre-pulls, `FIXTURE_TAGS`, the compose pin or the `MAGNETAR_PULSAR_IMAGE_TAG` wiring disagree, when the default broker is not an axis value of `ci.yml`, or when no workflow other than `ci.yml` runs `MIN_SUPPORTED_TAG` (4.0.14, the minimum supported broker), and it rejects a `pulsar` axis written as a block list or in a flow mapping.
+  `4.0.13` and `4.2.4` are no longer pulled by CI; `scripts/performance_campaign.py` keeps both, and `5.0.0-M1`, in `FIXTURE_TAGS` for one nightly cycle (the first nightly after this change measures against a base that still boots them), drops the unused `latest`, `4.0.4` and `4.2.3`, and reads the default image from the fixture instead of naming it.
+  Landing the axes also found three suite assumptions that releases changed: shadow topics are opt-in (`enableShadowTopics=false`) from 4.0.14, 4.2.5 and 5.0.0, so `e2e_shadow_topic` and `e2e_shadow_topic_replicator` enable them, and Pulsar 5.0.0 does not acquire a namespace bundle on a direct producer attach, so `e2e_moonpool_direct_broker_authority` looks the topic up through the real broker first; no assertion changed.
+  ([ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md), superseding [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
+
+- **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
+  On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.
+  `magnetar_proto` gains `MemoryLimitController`, `MemoryReservation`, `MemoryWaiterId`, `MemoryLimitExceeded`, `ProducerSlot::queue_send_reserved`, `ProducerState::queue_send_reserved` and `Connection::send_reserved`.
+  `OpSend` gains a crate-private reservation, so it can no longer be constructed outside `magnetar-proto`, and a `reserved_bytes()` accessor; `ProducerState::apply_receipt`, `apply_send_error`, `drain_timed_out_sends`, `drain_pending_sends` and `snapshot_pending_sends` now return the removed `OpSend`s so the caller releases their reservations outside the per-slot lock.
+  The `magnetar` façade surface is unchanged.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **The `performance` workflow runs nightly on `main` instead of on every pull request.**
+  It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.
+  Pull requests no longer wait on its thirteen release builds; the fixed Moonpool seeds 1–32 it replayed per PR now run nightly, while `ci.yml`'s `seed-replay` keeps the open registry seeds on every PR.
+  ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md))
+- **Dependencies:** bumped workspace manifest floors — `opentelemetry` 0.32.0→0.33.0, `opentelemetry_sdk` 0.32.1→0.33.0, `tokio` 1.53.1→1.53.2, `tokio-rustls` 0.26.5→0.26.6, `rustls-openssl` 0.4.1→0.4.2, `uuid` 1.26.1→1.27.0, `zeroize` 1.9.0→1.9.1, and `thiserror` 2.0.20→2.0.21 — and refreshed `Cargo.lock`.
+  The `opentelemetry` feature's `otel::extract_context` and `otel::attach_context` families return `opentelemetry` types, so an application enabling that feature must move its own `opentelemetry` dependency to 0.33 as well.
+  `matchit` stays at 0.8.4 because `axum` 0.8.9 requires that exact version.
+- **Fuzz workspace:** `crates/magnetar-proto/fuzz` now commits its `Cargo.lock`, moves `prost` 0.13→0.14 to match the main workspace, and raises `libfuzzer-sys`, `arbitrary` and `bytes` to explicit current floors.
+
+- **Dependabot version updates are removed.**
+  `.github/dependabot.yml` is deleted: its Cargo PRs bumped `Cargo.lock` alone, which the workspace does not take, and stayed open after the manifest floors moved.
+  Dependency and action bumps land by hand, raising manifest floors and refreshing the lockfiles in the same changeset; Dependabot alerts and security updates are repository settings and unchanged.
+  ([ADR-0114](specs/adr/0114-bump-dependencies-through-manifest-floors-without-dependabot.md))
+
+- **The e2e suite boots Pulsar through one shared fixture and waits for the broker to serve `public/default` instead of for a log line.**
+  The sixty-two per-file copies of the image constants, the `PULSAR_MEM` budget and the start-up chain are replaced by `crates/magnetar/tests/common/pulsar.rs`, where a suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`) rather than a tag.
+  Readiness is `GET /admin/v2/namespaces/public/default` answering 200 — the one signal that holds on 4.0.14, 4.2.4, 4.2.5 and 5.0.0, whose structured log never prints `Created namespace public/default` — followed by a check that `GET /admin/v2/brokers/version` reports the requested tag's `MAJOR.MINOR`.
+  No tag changes: the default stays `4.2.4`, the three 4.0 LTS suites stay on `4.0.13`, the PIP-460 tests on `5.0.0-M1`; `MAGNETAR_PULSAR_IMAGE_TAG` no longer overrides `e2e_consumer_drop.rs`, whose `4.0.13` is now a pin, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` starts under the fixture (`e2e_pulsar` green).
+  `cargo run -p xtask -- check-e2e-container-memory` becomes `check-e2e-fixture` (CI job `e2e-fixture`): a Pulsar container or an `apachepulsar/pulsar:` reference outside `crates/magnetar/tests/common/` fails, and the fixture's tag constants must equal the `docker pull` list of `ci.yml`, sit in `FIXTURE_TAGS` and match the PIP-33 compose pin.
+  `e2e_batch_chunk.rs` drops its self-referential `default_image_tag_tracks_latest_pulsar_four`, and `scripts/performance_campaign.py` overlays `tests/common/` onto the nightly's base checkout.
+  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md), amending [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
+
+- **BREAKING: `AvroSchema` is opt-in behind a `schema-avro` Cargo feature, so a default build no longer compiles `apache-avro`.**
+  `magnetar-proto` gains `schema-avro = ["dep:apache-avro"]` and the `magnetar-driver` façade forwards it as `schema-avro = ["magnetar-proto/schema-avro"]`; both leave it off by default, and `magnetarctl` does not enable it.
+  Only `AvroSchema` moves behind the feature: Bytes, String, the primitive and temporal schemas, `JsonSchema`, Protobuf, ProtobufNative, KeyValue, AutoConsume and AutoProduceBytes stay always available, and the wire behaviour of `AvroSchema` is unchanged.
+  Turning the feature on adds 33 crates to a default `magnetar-proto` or `magnetar-driver` build (60 → 93 and 107 → 140 unique crate versions in `cargo tree -e normal`, measured 2026-10-13).
+  **BREAKING CHANGE** (the `magnetar-driver` façade as well as `magnetar-proto`, re-exported as `magnetar::proto`): code that names `magnetar_proto::schema::AvroSchema`, or `magnetar::proto::schema::AvroSchema`, no longer compiles until the feature is enabled, with `magnetar-driver = { version = "…", features = ["schema-avro"] }` or the same feature on a direct `magnetar-proto` dependency.
+  rustc reports the missing import and names the feature that gates it.
+  The `JsonSchema` unit test that parses `schema_data` as Avro and the Avro e2e test link `apache-avro` themselves and run in every build, and `ci.yml` now lints `magnetar-proto` and the façade library and documents `magnetar-proto` with default features, because `--all-features` always turns the feature on.
+  `magnetar-proto` builds its docs.rs documentation with the feature.
+  ([ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md), amending [ADR-0066](specs/adr/0066-release-1-0-0-first-stable.md))
+
+- **Dependencies:** removed the manifest entries and Cargo features nothing used, and `Cargo.lock` drops 17 packages (the `proptest` and `rstest` closures).
+  Workspace entries `pin-project-lite`, `http`, `proptest` and `rstest` are gone; `tracing` leaves `magnetar-admin`, `magnetar-auth-sasl`, `magnetar-fakes` and `magnetar-messagecrypto`, `http` leaves `magnetar-admin`, `pin-project-lite` and `tokio-util` leave `magnetar-runtime-tokio`, `anstream` leaves `magnetarctl`, and `proptest`, `rstest` and `tempfile` leave the `magnetar-proto` dev-dependencies.
+  `url` becomes a dev-dependency of the façade, `tracing` one of `magnetar-differential`, and `serde_json`, `thiserror` and `tracing` in `magnetar-auth-athenz` are compiled only with its `zts` feature.
+  The `tokio` features are narrowed to what each crate uses: `["sync"]` for `magnetar-runtime-moonpool`, `rt-multi-thread` alone for `magnetarctl`, and no `rt-multi-thread` for the `magnetar-differential` library.
+  `rustls` is no longer asked for its `logging` feature, so the `rustls` instance magnetar builds stops emitting `log` records unless another crate in the build enables the feature; nothing in this workspace consumes them, because no `log` to `tracing` bridge is active in any build.
+  Floors are unchanged.
+
+- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention`, `namespace_get_persistence`, `namespace_get_dispatch_rate`, `namespace_get_subscription_dispatch_rate`, `namespace_get_replicator_dispatch_rate` and `namespace_get_publish_rate` now return `Option<_>`, `None` when the policy is unset at that level.**
+  Retention, persistence, dispatch rate and publish rate used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0` while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`, and `DispatchRate::default()` is `-1` (unlimited) whatever the broker's `dispatchThrottlingRatePer*`.
+  The client therefore reported values the cluster never returned.
+  The subscription and replicator dispatch-rate getters used the strict decoder instead and failed with a decode error on the same empty body.
+  All seven now share `json_ok_unset_policy`, which folds the four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; the topic-level getters already behaved this way.
+
+### Fixed
+
+- **`check-sim-coverage` no longer passes locally on lines CI fails: a never-called function's body and a module no sim test calls now count as uncovered on every machine.**
+  `llvm-cov export` reads coverage mappings out of the executed test binaries, and the linker keeps only the codegen units something references, so with several units per crate the records of an unreferenced module, and of every function rustc never codegenned — the body of an `async fn` nobody polls, an uninstantiated generic — could vanish and their lines read as non-executable.
+  Which units survived followed partitioning: on PR #877, at CI's `rustc 1.99.0`, the default local incremental build (205 objects in `magnetar-runtime-tokio`) passed while CI's `CARGO_INCREMENTAL=0` build (16) failed on four lines of the never-called `Client::next_topic_list_change`.
+  The measurement now compiles each crate into one codegen unit via `CARGO_PROFILE_TEST_CODEGEN_UNITS=1` on both the execution and re-export commands, so any linked crate brings its whole mapping; that reproduces CI's verdict locally and makes CI's own independent of partitioning.
+  Ordinary `cargo test` is unaffected.
+  ([ADR-0094](specs/adr/0094-measure-sim-coverage-unoptimized.md) amendment of 2026-10-13)
+
+- **`magnetar-driver` builds warning-free with `default-features = false`, and its default-feature docs build under `-D warnings`.**
+  The `OperationDeadlineParts` type alias, the engine-test `Engine` import and the `assert_transaction_api_bound` unit-test helper served only `tokio`-gated code but were themselves ungated, so a `--no-default-features` build reported them as dead code, which `-D warnings` turns into an error.
+  Each now carries the same `#[cfg(feature = "tokio")]` as its users.
+  Five intra-doc links to `magnetar_admin`, `admin` and `MoonpoolEngine` resolved only when the `admin` or `moonpool` feature was on, so `cargo doc -p magnetar-driver` failed with its default features; they are now code spans that name the feature.
+  CI only compiled `--all-features`, which hid both; the `clippy` and `doc` jobs now also build the façade library with no features, its unit-test target, and its default-feature docs.
+
+- **The scalable-topic and topic-list waiters no longer lose a wakeup, so `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_scalable_event` and `next_topic_list_change` stop parking forever on an event that is already buffered.**
+  All four drained their buffer (`scalable_events`, `topic_list_changes`) and re-checked `is_closed()` before creating the `Notified` they park on, while the driver pushes the event and then calls `notify_waiters()`, which stores no permit.
+  An event pushed between the drain and the park was buffered and never woke the caller; the scripted broker sends each of these events exactly once, so nothing woke it afterwards either, which is the likely cause of the `scalable_assignment_rebalance_parity` differential test sometimes hanging until the CI job timeout; the new regression tests show that the window exists, not that it caused that CI run.
+  Each waiter now arms its `Notified` before the drain, the enroll-before-drain idiom `next_replicated_subscription_marker` already used, on both engines.
+  The `scalable_client_equivalence` differential tests also bound every `connect`, lookup and subscribe await by `HANG_GUARD`, so a regression fails in 60 seconds instead of at the job timeout.
+
+- **A parked `next_topic_list_change` or `next_replicated_subscription_marker` now returns `None` when the connection dies, as its documentation promises, instead of waiting forever.**
+  Both drivers woke parked scalable-topic waiters on each I/O-failure path (read error, end of stream, undecodable frame, write error) but never pulsed `topic_list_notify` or `replicated_subscription_marker_notify`, and a parked waiter only re-checks `is_closed()` when it is woken.
+  Each of those paths now calls one `wake_close_waiters` helper that pulses all three per-client notifies, on both engines.
+
+- **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
+  Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
+- **A detached partition no longer parks a bounded keyless producer pipeline.** Round-robin sends now scan the ready child producers and route to one that can drain a send; recovered children rejoin the rotation. Non-empty keys retain their partition for ordering, as do explicit single-partition and custom routes. If every child is unavailable, sends still receive their configured timeout or terminal error. `PartitionedProducer::not_ready_partitions()` reports child indices observed unavailable during its scan; its readiness path reads an atomic broker-attachment hint without a connection or slot lock. The protocol send-drain gate remains authoritative if an attachment changes concurrently. (issue #463; [ADR-0110](specs/adr/0110-route-around-unready-partitioned-producer-children.md))
+- **`memory_limit` is now one budget per client, shared by every physical connection, instead of one full budget per connection.**
+  `ClientBuilder::memory_limit(bytes, policy)` is documented as Java's `ClientBuilder#memoryLimit`, where one `MemoryLimitController` per `PulsarClientImpl` bounds every producer of the client.
+  Magnetar kept the counter on each runtime `ConnectionShared`, and every pool entry — each `connections_per_broker` sibling, each proxy pool entry, each replacement connection — built its own, so a client with N connections admitted N times the configured bytes.
+  One `magnetar_proto::MemoryLimitController` is now built by the bootstrap connection and shared with every connection the client opens, on both engines; `MemoryLimitExceeded.current` reports the client-wide aggregate.
+  Under `ProducerBlock`, a release on one connection now wakes sends parked for any other.
+  A connection built without a client keeps a private budget, a limit of `0` still means unlimited, and the strict `current + requested > limit` rejection is unchanged.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A publish now holds its memory reservation until it leaves the client, so a dropped send future no longer frees bytes the client still retains.**
+  The reservation used to be released when the `SendFut` completed or was dropped, so a fire-and-forget send gave its bytes back immediately while its payload stayed in the producer's pending queue for receipt correlation and reconnect replay — the budget could be exceeded without bound.
+  The reservation now travels inside the publish's `OpSend` and is released exactly once when that op leaves the client: the broker's receipt (each message of a batch on its own), the broker's send error, the send timeout, the producer's close acknowledgement, a producer-open or terminal connection failure, or the reset of a batch that cannot be replayed.
+  A reconnect that replays a retained publish neither releases nor charges it again.
+  This is Java's lifetime: `ProducerImpl` releases a publish's memory when the op leaves `pendingMessages`, never when the caller's future is cancelled.
+  What is counted is unchanged — the payload length after the runtime's compression and encryption — and it is still not a process memory limit.
+  Consequence for fire-and-forget under `ProducerBlock`: a send held back by a full budget owns its message until it reserves, so dropping its future before then cancels it — the message is never published and no error surfaces, only a `debug!`.
+  A producer that drops the futures `send` returns reaches that state once its in-flight publishes fill the budget; await the future, or use `FailImmediately` and observe `MemoryLimitExceeded`.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A `ProducerBlock` send can no longer park forever after a partial release.**
+  The parked-waker `Slab` freed its keys on every release, so a woken send whose re-check still failed re-registered under the same key and then cancelled its "previous" key — its own fresh registration — and was never woken again; the same stale cancel could evict another parked send.
+  Parked sends are now keyed by ids that are never reused, so cancelling a stale id is a no-op.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A send still pending when the broker acknowledges its producer's close now fails instead of hanging, and releases its bytes.**
+  `close()` stops batch flushing, so a message left in the batch container never reached the broker and its future never resolved.
+  On the close acknowledgement the producer's remaining sends now resolve with a terminal error (`PeerClosed` on both engines), mirroring Java's `ProducerImpl#closeAndClearPendingMessages`.
+  Only the acknowledgement of the close this client last issued for the producer does so, never the late acknowledgement of an older close for a reused producer id (issue #406).
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A consumer or `Reader` over a topic of compressed batches now reads it, instead of delivering nothing and stalling for good.**
+  A Java producer compresses the WHOLE packed batch body (`BatchMessageContainerImpl`), and a Java consumer decompresses it before it splits it into members (`ConsumerImpl.uncompressPayloadIfNeeded`, then `receiveIndividualMessagesFromBatch`).
+  `ConsumerState::deliver` split first, so it read the codec's output as member sizes, a length guard fired, and no member was queued.
+  Nothing queued meant nothing popped, so the `numMessagesInBatch` permits the broker charged for the entry were never refunded, and once the loss passed half the receiver queue no `CommandFlow` was ever sent again — with nothing logged.
+  Reproduced on `apachepulsar/pulsar:4.0.4`: `pulsar-perf produce -bm 20 -z LZ4` in, zero messages out of a `receiver_queue_size(1000)` Reader, and the broker reporting `availablePermits = -1000`.
+  The issue's first hypothesis, a permit debited per entry rather than per member, was ruled out: uncompressed batches always streamed.
+  `deliver` now decompresses a compressed batched entry as one body before splitting it, and a member surfaced that way carries `compression = None` so neither engine decompresses it a second time; an unbatched compressed message is still decompressed after the pop, as before.
+  A batched entry no layout can decode — an unknown codec, an `uncompressed_size` above the frame ceiling, a corrupt body — no longer wedges the consumer: every position the broker charged for it is debited and refunded at delivery, and the entry logs one structured `warn!`.
+  That is one permit per charged position, where Java's `discardCorruptedMessage` refunds one for the whole entry.
+  The entry is not acknowledged, so a durable subscription's mark-delete position stays behind it.
+  The moonpool consumer gains the same reading of compressed batches through the shared state machine; its producer still refuses every codec.
+  (issue #860; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A compressed batch magnetar produces is now readable by Java, and by magnetar — this changes its wire layout.**
+  The tokio engine compressed each payload in `Producer::send`, before the state machine decided to batch it, and `ProducerState::flush_batch` then stamped a batch-level `compression` and `uncompressed_size` on a concatenation nothing compressed, with `uncompressed_size` holding the sum of the compressed member sizes.
+  Java `pulsar-client consume` read 0 of 100 messages from such a topic.
+  magnetar could not read it either: each member reached `receive()` as `decompress: decompressed size mismatch`, because the post-pop decompression checked it against the batch-level size.
+  `flush_batch` now compresses the whole concatenation once and stamps its pre-compression length as `uncompressed_size`, the Java layout, and an unbatched payload is compressed in `queue_send` before the chunking decision, so the chunk count comes from the compressed size.
+  The codecs moved into `magnetar_proto::compress` for this; `magnetar_runtime_tokio::compress` re-exports them, and `magnetar-proto` now links two C libraries, `zstd-sys` and `libz-sys`.
+  The batch byte budget and the tokio memory reservation now count uncompressed bytes, as Java's do.
+  magnetar still reads the old layout, and now actually decodes it, so existing backlogs — `access-logs-forwarder` produces with LZ4 and batching — drain.
+  **A magnetar consumer at 1.7.2 or older wedges on the new layout** exactly as it wedges on Java's — nothing delivered, no `CommandFlow`, nothing logged — so in a mixed fleet upgrade every consumer before any producer.
+  (issue #860; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A one-message batch now reaches the application as its payload, not as its batch framing.**
+  `ProducerState::flush_batch` stamps `num_messages_in_batch = Some(1)` when it flushes a single message — a publish-delay flush of one send — but `ConsumerState::deliver` treated only `num_messages_in_batch > 1` as a batch, so a magnetar consumer handed `[u32][SingleMessageMetadata][payload]` to the application as the payload, with no error.
+  `deliver` now treats any entry carrying `num_messages_in_batch` as a batch, as Java's `ConsumerImpl.messageReceived` does.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A send that does not fit the pending batch no longer overtakes it on the wire.**
+  `ProducerState::queue_send` emitted such a message at once while the batch it could not join waited for its flush, so three 400-byte sends against a 1000-byte batch cap left the client as sequence 2, then 0 and 1 — reordered for every consumer, and with broker deduplication enabled the lower sequence ids arriving second would be dropped.
+  It now flushes the pending batch first and starts the next batch with the new message (Java `ProducerImpl.doBatchSendAndAdd`); a message too large for any batch is sent on its own right after the flush.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **An encrypting producer with batching enabled now sends every message as its own entry, so its consumers can decrypt it.**
+  `flush_batch` builds the batch's metadata fresh, so a batch of encrypted members went out without their `encryption_keys` and no consumer could decrypt it.
+  Until batched + encrypted is Java-compatible, a payload whose metadata already carries `encryption_keys` or names a codec is never batched and never compressed again; the engine compresses an encrypting producer's payload before it encrypts it and names the codec itself.
+  Expect more, smaller entries from such a producer.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **The replicator and scalable-topic e2e suites now run against the broker configuration they ask for.**
+  Both exported `PULSAR_PREFIX_*` variables to a plain `bin/pulsar standalone`, which ignores them: `e2e_shadow_topic_replicator.rs` ran against a broker with authentication and authorization off, and `e2e_scalable_topic.rs` left PIP-483 auto split/merge on despite `scalableTopicAutoScaleEnabled=false`.
+  The shared fixture applies the configuration with `bin/apply-config-from-env.py` before the broker starts, and the replicator suite's in-container `pulsar-admin` calls now authenticate as the admin role and must exit zero.
+  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md))
+
+- **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
+  Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.
+  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
+  **BREAKING (CLI JSON) for the single-valued getters**: TTL, deduplication, snapshot interval, compaction threshold and the max-* counts are now wrapped in an object under their Java field name (`{"source": "broker", "messageTTLInSeconds": 0}`) where they printed a bare value or `null`; the struct-valued getters keep their fields unchanged.
+  Human output renders the sentinels (`unlimited`, `disabled`) and units (durations, decimal SI sizes, `msg/s`) per policy.
+- **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
+  Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
+
+## [1.7.2] - 2026-09-21
+
+### Fixed
+
+- **`Consumer::resubscribe()` now closes the consumer before re-subscribing it, instead of handing the broker a second permit window it never agreed to.**
+  The in-place recovery re-emitted `CommandSubscribe` for the SAME, still-live consumer id, on the premise its own documentation stated: "the broker recreates its dispatcher slot at `availablePermits = 0`".
+  Apache Pulsar does not.
+  `ServerCnx.handleSubscribe` looks the consumer id up in its own per-connection `consumers` map before anything else, and a `consumers.putIfAbsent` hit on an already-completed consumer logs a warning, calls `sendSuccessResponse(requestId)`, and returns — no new `Consumer`, no dispatcher or subscription touch, and nothing on that branch reads `MESSAGE_PERMITS`, `availablePermits` or `flowPermits`.
+  Verified identical at v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and master `:2037-2044`; the sibling branches are deliberately not no-ops (a still-pending creation is answered `ServiceNotReady`, an exceptionally-completed one a mapped error), and neither `SubType` nor durability is read there at all.
+  So the client zeroed its permit mirrors against a broker state that never happened, the broker kept its slot and its balance, and the re-subscribe `Success` then granted a full fresh `receiver_queue_size` window on top of what the broker already held — once per recovery attempt, while the wedge the call exists to clear could not move.
+  Measured on the differential harness with a faithful live-id broker model: one recovery took an 8-message receiver queue's broker-observed balance from `8` to `16`.
+  Issue #414 reported `availablePermits = -177300` on one ghost consumer with an empty name, not on a measured subscription aggregate. The proven client over-grant moved a live slot's counter in the opposite direction but was not shown to cause or repair that production value.
+  The recovery is now two phases on the same live socket, with no transport reconnect: a `CommandCloseConsumer` for this consumer id, and then — on that close's `Success` only — the permit-mirror zeroing, the issue #346 in-flight-ack sweep, and the `CommandSubscribe` whose own `Success` releases the initial `CommandFlow`.
+  Every mutation moved to the second phase, so a broker that rejects the close leaves the consumer byte-for-byte as the caller found it: still wedged, but still holding the positive `permit_balance` that `is_stall_candidate` requires, so it stays visible to the watchdog and eligible for another attempt.
+  Zeroing up front and then failing to close would have produced a consumer that is wedged AND undetectable.
+  `Failover` and non-durable subscriptions are now refused outright, returning `Err` without emitting anything: the close is real, so for a `Failover` consumer it triggers an election and a priority-order reshuffle to repair one slot, and for a non-durable one it discards the cursor that lives only as long as the consumer, making the re-attach restart from the configured start position (ADR-0099).
+  Both refusals sit in `resubscribe_consumer_in_place` and not in the eligibility predicate shared with issue #307's broker-initiated `CommandCloseConsumer` arm, where the broker has already closed the consumer and refusing would only leave it detached forever.
+  Three consequences are worth planning for.
+  A recovery now costs one extra broker round trip before the grant re-arms.
+  It also costs real redelivery: the broker genuinely drops the consumer, so everything it held un-acked returns to the subscription's redelivery pool, and acks the grouping tracker emits inside the close-to-re-subscribe window are dropped and their messages redelivered — at-least-once is preserved, duplicates are not.
+  And `consumer_stall_auto_recovery` no longer pays down a dispatcher-wide leak: ADR-0103's "one attempt credits the aggregate back exactly `receiver_queue_size`" was true only because of the over-commit removed here, so one attempt is now permit-neutral on the subscription's aggregate and `pulsar-admin topics unload` remains the escalation for a negative counter.
+  A connection lost between the two phases is won by the reconnect path — `reset` and `fail_all_pending` drop the pending close without leaking an outcome, and `rebuild_consumers` owns the re-attach — and a racing issue #307 broker close leaves exactly one `CommandSubscribe`, not two.
+  (issue #414; [ADR-0108](specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md), amending ADR-0101 §3's step list and its `availablePermits = 0` premise and superseding ADR-0103's budget arithmetic)
+
+- **A dropped `ack()` future no longer leaks a permanent `outcomes` entry — same issue #241 leak shape as the producer-close fix, now on the ack bookkeeping.**
+  Both runtime engines' `RequestFut::drop` clear the parked waker and take any outcome that already landed, but neither calls `cancel_request`: `magnetar-runtime-moonpool/src/consumer.rs` and `magnetar-runtime-tokio/src/consumer.rs` both stop at `unregister_waker` + `take_outcome`.
+  So a caller that dropped its `ack()` future before it resolved — a `select!` timeout, a cancelled task — left the `pending_requests` entry behind with no waker, which is exactly the state three sweeps in `crates/magnetar-proto/src/conn.rs` then hit: `fail_acks_orphaned_by_consumer_reattach` (the same-broker `CommandCloseConsumer` sweep, issue #346), the `ack_response_timeout` backstop reap in `handle_timeout`, and the `AckResponse` command arm.
+  All three recorded an `OpOutcome` in the connection's `outcomes` map unconditionally, mirroring neither the `Success` arm's `unsubscribe_has_waiter` guard nor its `ProducerCloseForgotten` / `ConsumerCloseForgotten` fire-and-forget handling, both added for issue #241's continuous-eviction leak.
+  Nothing ever prunes `outcomes` wholesale — entries leave only via `take_outcome` or `cancel_request` — so every dropped ack whose resolution reached one of these three sites left one permanent entry.
+  The two sweep sites now record an outcome only when `self.wakers` still holds a waker for the request, mirroring `unsubscribe_has_waiter`; the `AckResponse` arm now records one only when `pending_requests.remove` actually found an entry, mirroring the `Success` arm's `None => {}` case — a late broker reply for an ack an earlier sweep already resolved no longer overwrites `outcomes` with a second, undrainable entry.
+  `pending_requests.remove`, the `total_acks_failed` accounting, and the emitted `ConnectionEvent::AckResponse` stay unconditional in all three sites; only the `outcomes` write and its paired wake are guarded.
+  A caller that still holds its `ack()` future sees no change: the guard only ever skips a record nothing is left to consume.
+  (issue #346-adjacent, same defect class as issue #241; not issue #414 — no `resubscribe_consumer_in_place` call is involved)
+
+- **A dead-lettered dispatch unit now returns its flow permit, so a poison-heavy `Shared` subscription no longer wedges at `availablePermits=0`.**
+  The broker charges one permit per dispatch unit — `Consumer#sendMessages` debits `ackedCount - totalMessages` — and a unit the client will route to its dead-letter buffer is inside `totalMessages`, because the broker has no idea what the client intends to do with the entry.
+  `ConsumerState::classify_and_queue` mirrored that debit correctly: `record_dispatch_unit()` runs unconditionally, before the queued-versus-dead-lettered branch.
+  What it never did was hand the permit back.
+  `consumed_since_flow` — the counter `maybe_flow` compares against `max(receiver_queue_size / 2, 1)` — was credited only by `pop_message`, the incomplete-chunk buffer, and the PIP-33 marker filter, and a dead-lettered unit is never queued, so it is never popped.
+  No later path compensated either: `drain_dead_letter` is a `std::mem::take`, `Connection::ack` never touches the flow ledger, and `republish_dead_letters` is drain, send, ack.
+  So each dead-lettered unit was a net `-1` permit, drifting one way by exactly the dead-letter count until a churn boundary zeroed both mirrors.
+  A receiver queue's worth of poison drove `permit_balance` to zero with `consumed_since_flow` still at zero, and nothing could recover it: `maybe_flow` was unreachable with nothing left to pop, `is_stall_candidate` requires `permit_balance > 0` so the issue #414 watchdog and ADR-0103's automatic recovery never fired, and `is_flow_starved` is read only by the Failover promotion re-arm and `Connection::initial_flow` — churn and election boundaries a `Shared` subscription never reaches on its own.
+  The broker showed `availablePermits=0` and `msgRateOut=0` with no error and no reconnect, and `Consumer::available_permits()` read `0`.
+  The dead-letter branch now calls `record_broker_permit_consumed()` before it buffers the message, which is the rule the other three refund sites already followed and the one Java follows in both dispatch shapes: `ConsumerImpl.messageReceived` calls `increaseAvailablePermits(cnx)` immediately after it skips an over-redelivered message, and `receiveIndividualMessagesFromBatch` accumulates `skippedMessages` and calls `increaseAvailablePermits(cnx, skippedMessages)` once per entry.
+  There is no new emission site: `conn.rs`'s `Message` arm already calls `maybe_flow()` after every `deliver`, so the inbound frame that crosses the half-queue threshold carries the `CommandFlow` out, batched entries whose members all dead-letter included.
+  The invariant is now uniform — `granted window == permit_balance + consumed_since_flow + queue.len()` — with `Delivered` refunded at pop, `Buffered` refunded at buffering, `Dropped` moving neither side, and an ADR-0105 ack-set-cleared position moving neither side because the broker never charged it.
+  Two consequences are worth planning for.
+  The accidental backpressure is gone, so a poison-heavy topic keeps dispatching and `dead_letter_pending` — an unbounded `Vec` — grows until the application calls `drain_dead_letter` or `republish_dead_letters`; nothing auto-drains it.
+  And permits ALONE no longer wedge the consumer: a dead-lettered unit stays unacked at the broker until `republish_dead_letters` acks it, so an application that never drains still stops at the broker's `maxUnackedMessagesPerConsumer`.
+  On upgrade, a subscription that had parked at `availablePermits=0` resumes draining and its DLQ topic may receive a burst.
+  (issue #437; ADR-0107, amending ADR-0082's "pop-driven `consumed_since_flow`" parenthetical and ADR-0105's "`consumed_since_flow` only moves on `pop_message`" clause)
+
+- **A `Failover` consumer whose permit balance was drained to zero without crossing the flow threshold is re-armed on promotion.**
+  `ConsumerState::is_flow_starved` is `true` when the broker has dispatched every granted permit and even popping the whole remaining queue could not push `consumed_since_flow` across the half-queue threshold — so `maybe_flow` is unreachable and both sides wait on each other forever.
+  It is now read by both `initial_flow` gates: the issue #307 `CommandActiveConsumerChange { is_active: true }` promotion re-arm and `Connection::initial_flow` itself, whose additive `granted_permits == 0` gate a previously-fed consumer never satisfies again outside a churn boundary.
+  A fed consumer with permits still in flight gets no grant, so the issue #427 no-double-grant contract is unchanged.
+  This was shipped before the issue #437 refund above and is retro-documented here; with the refund in place the predicate is no longer reachable through well-formed wire frames and remains as defence-in-depth for a broker-side debit the client mirror missed.
+  (issue #443, PR #444; recorded in ADR-0107)
+
+- **A broker `CommandCloseProducer` on a connection that stays up no longer leaves that producer detached until the process restarts.**
+  `pulsar-admin topics unload` of one partition of a partitioned topic makes the owning broker remove the producer and write the frame on a connection that keeps serving every other producer and consumer on it — no TCP drop, so no supervised reconnect and no `rebuild_producers`.
+  The `Type::CloseProducer` arm only shut the send-drain gate and pushed a `ProducerClosedByBroker` event that nothing reads for an already-assembled producer, so the slot sat at `closed = false, broker_ready = false, open_request_id = None` for the life of the connection and every publish the round-robin router sent to that partition failed `code=-1 send timeout` forever.
+  The producer is now re-attached in place on the same connection with a bumped `epoch`, exactly as the `CommandCloseConsumer` twin has done since issue #307, and the gate stays shut until the broker's fresh `CommandProducerSuccess` replays the staged publishes.
+  A `ServiceNotReady` answer while the bundle reloads — the expected one, since the broker fences the topic before writing the close — rides the existing operation-retry leg (2 s initial backoff plus a lookup) and gives up with a terminal error after the configured budget instead of hanging.
+  An `assigned_broker_service_url` on the close takes the same in-place path: no path owned that event shape on a live socket, and an Extensible-Load-Manager multi-phase unload makes it the default close shape.
+  A `warn!` now records every such close with the handle, topic, request id, epoch and truncated assigned URL.
+  `ProducerClosedByBroker` is surfaced only while a producer open is still in flight, where its parked waiter is the one reader that can consume it; a closed or unknown handle pushes nothing.
+  (issue #451; [ADR-0106](specs/adr/0106-reattach-broker-closed-producer-in-place.md))
+
+- **`magnetarctl` no longer rejects the `-1` sentinel when it is passed space-separated on the policy-setting commands.**
+  By default clap reads a token beginning with `-` as a flag, and none of these arguments carried one of the opt-ins that relax that, so `--time-minutes -1` was read as an unknown short flag and `magnetarctl admin namespaces set-retention acme/ns --time-minutes -1 --size-mb -1` failed with `error: unexpected argument '-1' found` — even though `-1` is the documented "infinite / unlimited" value on every one of those flags.
+  That error also carried clap's own `tip: to pass '-1' as a value, use '-- -1'`, which is wrong here: `--` ends option parsing rather than escaping the next token, so following the tip returned the same `unexpected argument '-1' found` with the tip itself removed.
+  `--flag=-1` was the only spelling that worked, and it is not the spelling the help text or the docs suggest.
+  Twenty of the affected arguments declare `default_value_t = -1`, so their own default was a value the parser refused when an operator typed it by hand.
+  `allow_negative_numbers = true` is now set on all 24 of them, covering `set-retention`, `set-backlog-quota`, `set-dispatch-rate`, `set-subscription-dispatch-rate`, `set-replicator-dispatch-rate` and `set-publish-rate` under both `admin namespaces` and `admin topics`.
+  The opt-in gates on the shape of the token rather than on the leading hyphen alone — unlike the broader `allow_hyphen_values` — so a malformed `--time-minutes -1abc` is still rejected and the `=` form keeps working unchanged.
+
+## [1.7.1] - 2026-08-27
+
+### Fixed
+
+- **A re-dispatched batched entry no longer re-delivers, re-tracks, and re-charges the positions the broker already reported as acknowledged.**
+  `pb::CommandMessage.ack_set` is the broker's per-position view of the batched entry it is dispatching — bit `i` SET ⇒ position `i` is still unacked, the same convention as the outbound `BatchAckEntry` — and the broker attaches it when `acknowledgmentAtBatchIndexLevelEnabled=true` and it is re-dispatching an entry some of whose positions have already been acked.
+  `ConsumerState::deliver`'s batched branch never read it: it exploded `0..num_messages_in_batch` unconditionally and stamped an all-unacked `BatchAckEntry::fresh`, so a 1024-message entry with 1022 positions acked re-delivered all 1024.
+  It now builds one `BatchAckEntry` from that bitset and uses it for all three decisions.
+  Positions whose bit is CLEAR are decoded and dropped — the payload cursor must still walk them for the positions behind them to parse — and skip `classify_and_queue` entirely, which is the single site that queues the message for the application, registers it with the ack-timeout tracker, and calls `record_dispatch_unit`.
+  The permit half is not an optimisation: the broker debits `MESSAGE_PERMITS_UPDATER.addAndGet(this, ackedCount - totalMessages)` as it re-dispatches (`Consumer.java:433-434`), charging only the positions it still expects to be consumed, and Java keeps those positions out of `skippedMessages` so `increaseAvailablePermits` never fires for them either (`ConsumerImpl.java:1798-1862`) — neither side moves for a skipped position, so a mirror that debited the whole entry drifted `ackedCount` further below the broker's real `availablePermits` on every redelivery, one-way and unbounded.
+  A vacant `(ledger_id, entry_id)` tracker entry is now SEEDED from the delivered bitset instead of from `BatchAckEntry::fresh`, and an existing one AND-accumulates it (`ManagedCursorImpl.java:2632-2645`), so bits only ever clear and a locally acked position is never re-asserted as unacked.
+  Together these kill the metastable loop behind the report: with `ack_timeout` armed, the sweep re-requested positions the broker had already accounted for, the broker honoured the request by re-dispatching the whole entry, the client re-registered them, and the request set grew by `ackedCount` every cycle — which is why raising `ack_timeout` past the run length, with nothing else changed, made the wedge disappear.
+  It also unpins the mark-delete position: an entry seeded all-unacked could never reach fully-acked, so its `CommandAck` carried an `ack_set` forever, the broker held the cursor behind it, and the tracker entry leaked for the lifetime of the connection.
+  A **missing or short** `ack_set` leaves every position it does not cover unacked — a truncated bitset may never acknowledge a position on the broker's behalf — and an **empty** one reduces to `BatchAckEntry::fresh` by construction, so a first dispatch and every dispatch from a broker running `acknowledgmentAtBatchIndexLevelEnabled=false` are bit-for-bit unchanged.
+  `num_messages_in_batch <= 1` ignores the field entirely.
+  The one visible behaviour change for an existing deployment is the intended one: where the broker sends the field, an application stops receiving duplicates of positions it already acknowledged.
+  ADR-0096's conservative ack-time PIP-54 reconstruction in `Connection::ack` is untouched — it governs an ack with no broker evidence, this governs a delivery that carries it.
+  (issue #436; ADR-0105, resolving ADR-0096's deferred receive-side `ack_set` gap)
+
+## [1.7.0] - 2026-08-25
+
+### Added
+
+- **`MultiTopicsConsumer::republish_dead_letters(&C::Producer)`**, inherited by the `PartitionedConsumer` alias — aggregate every child consumer's buffered dead letters into one shared producer destination and return the saturating sum of successful republishes.
+  Membership is snapshotted at call start without holding the collection lock across an await, and children run sequentially in deterministic vector/topic order.
+  The first child error stops traversal immediately and names that topic; cancellation likewise prevents future child work, while prior successful children remain published and acknowledged without rollback.
+  Each child delegates to the existing engine-generic `ConsumerApi::republish_dead_letters`, which confirms replacement publication before ACK, so the aggregate introduces no duplicate runtime logic.
+
+## [1.6.0] - 2026-08-23
+
+### Added
+
+- **`ClientBuilder::consumer_stall_auto_recovery(u32)`** / `ConnectionConfig::consumer_stall_auto_recovery` — opt-in, bounded automatic recovery for the issue #414 stall watchdog.
+  With it set, the same `handle_timeout` sweep that emits `ConnectionEvent::ConsumerStalled` also performs the in-place re-attach `Consumer::resubscribe()` performs — zero the permit mirrors, fail the orphaned in-flight acks, re-emit `CommandSubscribe` for the same consumer id, let the broker's `Success` release a fresh initial `CommandFlow` — instead of leaving that to the application.
+  This records the original 1.6.0 sequence; the 1.7.2 entry above supersedes it with a required `CommandCloseConsumer` and its `Success` before zeroing the mirrors and subscribing again.
+  **At most one attempt per stall episode**, and an episode closes at most once per `consumer_stall_timeout`, so the value caps a sequence that is already rate-limited to one re-subscribe per window: `3` at the recommended 30 s window spends three re-subscribes over ninety seconds and then stops.
+  The budget resets on **real progress only** — one broker dispatch unit actually arriving — and deliberately not at the permit-mirror churn boundaries, because the recovery's own re-subscribe is one of them and resetting there would refund every attempt that paid for it, leaving no bound at all.
+  An attempt the eligibility gate refuses (closed, unsubscribing, terminally failed, mid-seek, re-attach already in flight) spends no budget and mutates nothing.
+  Neither does a **Failover standby**, which a pre-check skips ahead of that gate: once the broker has reported a consumer as standby (`is_active == Some(false)`, issue #348) its silence is the broker behaving correctly, and since a standby never receives the dispatch unit that resets the budget, an unguarded recovery would spend the whole budget on every healthy standby in a failover group and never get it back.
+  The stall is still reported for a standby — silence semantics are unchanged — and a consumer promoted to active keeps the full budget it never spent.
+  Exhausting the budget logs one `WARN` naming `pulsar-admin topics unload` and then goes quiet, because the last attempt was also the last thing that re-armed the stall window.
+  **Default unset**, `0` disables explicitly, and it is **inert without `consumer_stall_timeout`** — no window, no stall episode, nothing to recover from.
+  The diagnosis is never suppressed: the stall `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, and each attempt logs its own `INFO` carrying `attempt` and `max_attempts`.
+  Keep the number small. This historical one-window aggregate-credit premise was superseded by ADR-0108; issue #414's `-177300` was a per-consumer ghost-entry value, and the bound exists to escalate when delivery does not resume.
+  This narrows ADR-0101's rejection of an automatic watchdog-driven re-subscribe to the unconditional unbounded form it was written about; that form is still rejected and is still the shipped default.
+  (issue #414; ADR-0103, amending ADR-0101)
+
+### Changed
+
+- **Dependencies:** bumped workspace manifest floors — `rustls-openssl` 0.3.1→0.4.0, `apache-avro` 0.21.0→0.22.0, `uuid` 1.24.0→1.24.1, `rcgen` 0.14.8→0.14.9, `futures`/`futures-util` 0.3.33→0.3.34, `rustls` 0.23.42→0.23.43, `aws-lc-rs` 1.17.3→1.18.0, `base64` 0.23.0→0.23.1, `http` 1.4.2→1.5.0, `clap` 4.6.4→4.6.6, `thiserror` 2.0.18→2.0.20, `testcontainers` 0.27.3→0.28.0, and `async-trait` 0.1.91→0.1.92 — and refreshed `Cargo.lock`.
+  `apache-avro` 0.22 deprecated the free `to_avro_datum`/`from_avro_datum` functions that `AvroSchema::encode`/`decode` called; `crates/magnetar-proto/src/schema/avro.rs` now drives the replacement `GenericDatumWriter`/`GenericDatumReader` builders instead, with the parsing-canonical-form `schema_data()` output and the encode/decode round-trip unchanged (`schema::avro::tests` exercises both).
+
+### Fixed
+
+- **A fresh `Exclusive` / `Failover` subscribe no longer grants the initial consumer permits twice when the broker announces the active consumer.**
+  A real broker answers such a subscribe with `CommandSuccess` and then `CommandActiveConsumerChange { is_active: true }` in the same write, so both frames reach the client in one read.
+  The issue #307 promotion re-arm therefore ran inside `handle_bytes` while the engine's own post-ack `Connection::initial_flow` was still parked on the resolving subscribe future, and its `granted_permits == 0` gate was legitimately still true at that instant because no grant had been issued yet.
+  Both then granted, and the broker held `2 × receiver_queue_size` for a fresh consumer whose mirrors recorded `1 ×` — measured 32 against a configured 16.
+  `Shared` subscriptions were unaffected: the broker never sends that command for them, which is why issue #426's fix left the count correct there and this one open.
+  `Connection::initial_flow` now grants at most once per attach: it emits a `CommandFlow` only when a `CommandSubscribe` has gone out since the last grant (the broker's freshly created dispatcher slot starts at zero permits) or when the client holds no outstanding grant at all (the churn boundary the #307 re-arm exists for).
+  Whichever of the two racing callers arrives first issues the grant; the other is a no-op instead of a second full window.
+  The #307 re-arm itself is unchanged and still restores flow for a promoted consumer whose permit mirrors a reset, a terminal subscribe failure, or a same-broker `CommandCloseConsumer` zeroed; `maybe_flow` and `adjust_receiver_queue` are untouched, since replenishment and growth are incremental top-ups that do not route through `initial_flow`.
+  (issue #427; ADR-0102, amending ADR-0082)
+
+## [1.5.0] - 2026-08-22
+
+### Added
+
+- **`Consumer::resubscribe()`** (both engines) and `Connection::resubscribe_consumer_in_place` — caller-driven recovery for a consumer whose broker-side dispatch has gone silent.
+  It re-attaches THIS consumer id in place on the live connection: zero the permit mirrors, fail every in-flight ack (their responses can never arrive against the retired consumer generation), re-emit `CommandSubscribe` for the same consumer id, and let the broker's `Success` release a fresh initial `CommandFlow`.
+  No transport reconnect, no other consumer or producer disturbed, and the receiver queue is left intact so buffered messages stay receivable.
+  This is issue #307's same-broker `CommandCloseConsumer` machinery, which until now had exactly one trigger — an inbound close the broker may never send — made callable.
+  Ineligible states (closed, unsubscribing, terminal, mid-seek, re-attach already in flight) return `Err` without mutating anything.
+  It repairs this client's own dispatcher slot; a dispatcher-wide broker corruption still needs `pulsar-admin topics unload`.
+  (issue #414; ADR-0101)
+- **`ClientBuilder::consumer_stall_timeout(Duration)`** / `ConnectionConfig::consumer_stall_timeout` — an opt-in per-consumer stall watchdog.
+  A consumer holding client-accounted unspent permits over an empty receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces one `WARN` and one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` — exactly once per stall episode, re-armed by the next dispatch.
+  The connection keepalive of ADR-0058 cannot see this: `PING` / `PONG` keeps flowing on a connection whose dispatcher wedged for ONE subscription, so its baseline never ages.
+  **Default `None`** (the mechanism ships disarmed): an armed deadline perturbs the moonpool engine's simulated wake schedule even when it never fires, and Java has no per-consumer dispatch watchdog to inherit a parity default from. `Duration::from_secs(30)` is the documented recommended production value; `Duration::ZERO` disables it explicitly.
+  Emitting the event is its only effect — a watchdog that re-subscribed on its own would turn a broker hiccup into a re-subscribe storm and obscure diagnosis of the unresolved stall. The event reports SILENCE, not fault: correlate it with the broker's `msgBacklog` and actual delivery before acting.
+  (issue #414; ADR-0101)
+- **`docs/consumer-stall-recovery.md`** — the operator-facing form of the above: the issue #414 symptom, why the connection keepalive misses it, detection via `available_permits()` / `ConsumerStalled` / admin `topic_stats`, and the `resubscribe()` → recreate → `topics unload` recovery ladder.
+- **`ProducerBuilder::unique_name_suffix(bool)`** — opt in to appending an engine-generated unique suffix to the name set by `ProducerBuilder::name`.
+  Default off, so a pinned name stays pinned, and a no-op with no name set.
+  It is the answer to a broker-side producer registration no `CommandCloseProducer` can ever reach — one stranded by a dead client process, or behind a proxy-mediated connection that outlived it.
+  The cost is why it is opt-in: a unique name breaks `Exclusive` / `WaitForExclusive` access-mode fencing, broker-side sequence-id dedup across a restart, and per-name dashboards and metrics.
+  (issue #406; ADR-0100)
+
+### Changed
+
+- **BREAKING (semantics): `Consumer::available_permits()` now reports the client-accounted, decrementing permit balance.**
+  It used to read `ConsumerState::granted_permits`, the purely-ADDITIVE grant mirror — a value dispatch never perturbs, so it read `receiver_queue_size` forever whether the broker was streaming or had gone silent.
+  ADR-0082 split that field from the decrementing `permit_balance` for issue #349 but deliberately left this accessor on the additive one; issue #414 exposed the deferral because polling could not detect dispatch silence.
+  The accessor now matches the arithmetic of Java's client-side `ConsumerBase#getAvailablePermits` and moves under dispatch. A balance pinned near the receiver-queue size while nothing arrives is a silence signal, requiring broker statistics and delivery evidence before attributing a wedge. It is not the broker's admin `availablePermits` measurement.
+  The change reaches `Connection::consumer_available_permits`, both engines' `Consumer::available_permits`, the façade's `ConsumerApi::available_permits`, `Reader::available_permits`, `TypedConsumer::available_permits`, and `MultiTopicsConsumer::available_permits` (which sums its children).
+  Callers that genuinely want the cumulative grant read `ConsumerState::granted_permits` directly; it is unchanged, as are its two internal callers (the #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta).
+  (issue #414; ADR-0101, amending ADR-0082)
+
+### Fixed
+
+- **A fresh subscribe no longer grants the initial consumer permits twice.**
+  Both engines followed the sans-io `Connection::initial_flow` — which emits the `CommandFlow` and updates the client-side permit mirrors — with a raw `Connection::flow(handle, receiver_queue_size)` immediately behind it.
+  That second frame was wire-only: no mirror accounted for it, so the broker held `2 × receiver_queue_size` permits for a freshly-subscribed consumer while `available_permits()` and `FlowStats` reported `1 ×`.
+  The broker could therefore hand a consumer twice the messages its receiver queue was sized for, and every client-side reading of the broker's balance was wrong from the first frame — including the issue #414 stall signature, which is measured against exactly that balance.
+  The raw call was defensive boilerplate from the founding commit, described in its own comment as a safety net for a sans-io version that gated the initial flow; no such gating ever existed.
+  `initial_flow` is now the single owner of the initial grant, which is already how every reconnect, re-attach, post-seek resubscribe and failover re-arm path issued it.
+  (issue #426)
+- **A producer open abandoned on its deadline no longer poisons its producer name.**
+  Cancelling an opening producer was local-only, so the broker completed the open on its own schedule and kept the `(topic, producer_name)` registration; every later open under that name then failed with `ProducerBusy` (code 16, the broker's `NamingException`) until the topic was unloaded.
+  Because `ProducerBusy` is retryable for producer-open, the retry loop re-hit that zombie with a fresh producer id until the budget ran out, stranding one more registration each time.
+  Cancellation now writes one best-effort fire-and-forget `CommandCloseProducer` for the abandoned producer id whenever the broker may still hold its registration.
+  Pulsar processes commands in order per connection, so the close reaps the registration whether or not the open had completed.
+  Broker-side creation is asynchronous, though, and a close consumed while it is still pending is acked without reaching the registration that creation goes on to make — reproduced against Pulsar 4.0.4.
+  A later `ProducerBusy` under the name is therefore recovered from rather than retried into: the abandoned id is re-closed while the broker can address it, and if the name is still busy the next attempt re-attaches under that id with a strictly higher epoch, which is the successor claim Pulsar accepts.
+  The abandoned ids live in a fixed 16-record ring that is cleared on reconnect.
+  (issue #406; ADR-0100, amending ADR-0080)
+- **Slow event consumers no longer OOM the process: the observational event queue is capped.**
+  Every delivered message was cloned into `Connection::events` as an observational `ConnectionEvent::Message` / `MessageReceivedFromShadow`, and nothing in the production runtime ever consumes those events — the queue grew by one full payload clone per message for the lifetime of the connection, invisible to receiver-queue permits (issue #413: multi-GB `VecDeque` growth OOM-killing a consumer fleet every ~30 minutes).
+  The two per-message events now route through `push_observational_event`, which drops them once the queue holds `EVENT_QUEUE_OBSERVATIONAL_CAP` (4096) entries and counts the drops in the read-only `dropped_observational_events`.
+  Protocol-bearing events never go through this path and are never dropped; `pop_message` still yields every message — the cap touches observability, never delivery.
+  (issue #413)
+- **The producer side of that cap: `SendReceipt` / `SendError` events are bounded too.**
+  The #413 cap only matched the consumer-side events, so a steady producer still queued one receipt event per acknowledged message for the life of the connection (~430 MB/h at ~1,860 msg/s, OOM-killing the OpenTelemetry gateway every 24-48h).
+  Both variants are observational — the send outcome lands in `self.outcomes` and its waker is woken before the event is queued — so they now route through the same capped helper.
+  (issue #423)
+
+### Security
+
+- **`h2` 0.4.15 → 0.4.17** — [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258).
+
+## [1.4.1] - 2026-08-11
+
+### Fixed
+
+- **Non-durable consumers no longer skip lower unacknowledged messages after reconnect.** Reattachment now reuses only the caller's original start position instead of the highest locally submitted ack, which may be unconfirmed and non-contiguous.
+  Established durable consumers continue to defer to the broker cursor.
+  (issue #403; ADR-0099)
+
+## [1.4.0] - 2026-08-10
+
+### Added
+
+- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
+  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
+  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
+  ADR-0098 later amends the initial epoch guard: changed equal-epoch assignments are valid membership updates, exact duplicates are ignored, and only lower epochs fail closed.
+  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
+  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
+  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
+  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
+  (ADR-0093 §D5)
+
+### Changed
 
 - **BREAKING: PIP-460 scalable topics now speak the wire surface Apache Pulsar actually ships, negotiated per connection.** The vendored proto had carried the real PIP-460 messages since rev `7735851` (2026-05-04) and `pb/pulsar.proto.rs` had been generating `SegmentInfoProto`, `ScalableTopicDag`, `CommandScalableTopicLookup` / `…Update` / `…Close` ever since — unused.
   Every consumer instead spoke `pb/scalable_topics.rs`, a hand-encoded projection written while PIP-460 was upstream `Draft`, and nothing in it matched: `BaseCommand` types 80-85 against upstream's 70-78, a `CommandScalableTopicLookupResponse` that does not exist, a separate DAG-watch handshake keyed by a `lookup_token` that does not exist, `SplitEvent` / `MergeEvent` delta frames that do not exist, four segment states against upstream's two, and a fabricated `ProtocolVersion = 22` where upstream gates the feature on `FeatureFlags.supports_scalable_topics` and still tops at `v21`.
@@ -36,20 +446,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
 
+### Removed
+
+- **Five uncalled scalable-topic accessors are removed** (behind the default-off `scalable-topics` feature).
+  `DagWatchSession::{session_id, epoch}`, `ScalableConsumerSession::consumer_id` and `ScalableTopicsWatch::{watch_id, is_resolved}` had no caller in either engine, the façade or the CLI — their only uses were assertions written to observe them, and publishing API whose sole consumer is a test that asserts it exists is not worth the surface on a module already marked experimental.
+  `ScalableTopicsWatch`'s backing `resolved` field goes with its getter.
+  `DagWatchSession::is_resolved` is kept, because `conn.rs` genuinely branches on it to tell a session's first layout from a pushed one.
+  The tests assert the observable contract instead: an unresolved watch has an empty matching set, and the delta carries the epoch it moved to.
+  They were also the bulk of what `check-sim-coverage` flagged on CI while reporting clean locally, since a trivial getter's coverage counter survives or vanishes with inlining decisions that differ between build environments.
+  (8e2cbd9, a58a5f8)
+
 ### Fixed
 
-- **Tokio driver-write deadlines now use Tokio's clock end to end.** ADR-0083 retained one fixed deadline across `select!` reconstruction, but anchored it with `std::time::Instant` and scheduled each expiry with a relative Tokio timer; under paused time the harness clock advanced while the deadline source did not, so a cancelled and reconstructed write could receive almost a fresh budget and the 90-second virtual guard could win under host load.
-  The write-local anchor is now `tokio::time::Instant`, and every reconstructed arm races against that same absolute instant with `tokio::time::timeout_at`.
-  The regression test forces a higher-priority arm to cancel the first stalled write, observes its reconstruction, advances beyond the original deadline but not a fresh one, and requires `Io(TimedOut)` plus disconnection; it passed 128 consecutive repetitions.
-  Proto-facing `std::time::Instant` values and Moonpool's injected clock are unchanged.
-  (ADR-0097; closes `docs/follow-ups.md` §15)
+- **Reconnect no longer hangs batched sends or trusts unconfirmed consumer ack state.** Every batched `SendFut` cut before its receipt now resolves with a deterministic reset error instead of being orphaned outside replay and timeout tracking, including batches already flushed to the wire.
+  An individual PIP-54 ack after reset reconstructs an all-unacked bitset and clears only the requested index, so a missing tracker cannot silently acknowledge the whole producer-batched entry.
+  Established durable consumers omit the local highest-ack watermark on every reattach and defer to the broker's persisted cursor; fresh and non-durable start positions are unchanged.
+  (issues #395, #396, #398; ADR-0096)
 
-- **`check-sim-coverage` now reports only over artifacts built by its current pass.** The execution phase runs two packages while the report re-exports six, and cargo-llvm-cov 0.8.7's `--no-report` path does not clean first-party objects; a warm local target or restored CI target could therefore contribute stale profiles or objects to an enforcing verdict.
-  Both phases now share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem.
-  Broker-independent artifact injection through LLVM coverage/profdata flag variables is rejected, locked metadata cannot rewrite `Cargo.lock`, final-component symlinks and mount roots fail safely, and the scratch directory is removed on every catchable outcome without masking a primary error.
-  The report remains at `target/sim-coverage.lcov`, but that path is output-only.
-  Cold, back-to-back warm, profile-only, object-only, `ui_test`, and trybuild poison cases prove cached inputs cannot affect the result.
-  (ADR-0096; closes `docs/follow-ups.md` §14)
+- **`ClientBuilder::memory_limit` now propagates `MemoryLimitPolicy::ProducerBlock`.** The builder previously copied only the byte limit into `ConnectionConfig`, leaving the runtime policy at its `FailImmediately` default while reporting the requested policy through the façade getter.
+  The public enum is now converted exhaustively into the proto configuration, so a saturated producer parks and progresses when budget is released.
+  (issue #397)
 
 - **A client waiting on a scalable-topic reply no longer parks forever when the connection dies.** `scalable_topic_lookup` and `scalable_topic_subscribe` re-check `is_closed()` only when a scalable event arrives, and a dying connection sends none — so the guard ran or did not depending on whether it won a race against EOF.
   Both drivers now wake the scalable waiters wherever they mark the connection disconnected, on either engine.
@@ -65,6 +481,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   All four now cover the duplicate.
   (ADR-0095, amending ADR-0093 § D2)
 
+- **A rejected scalable-topic lookup now returns an error instead of parking the caller until the connection closes.** `scalable_topic_lookup` drained only `LookupResolved` for its own session id, so a broker that refuses the session — topic not found, authorization — ended it as `DagWatchClosed`, which the loop never matched.
+  Both engines now race the two outcomes, which is the contract the sibling `scalable_topic_subscribe` always had.
+  `MergeEvent::parent_segment_ids` is sorted rather than carried in the broker's wire order: nothing in the `.proto` requires `parent_ids` to be sorted, so two engines observing the same merge could build `MergeEvent`s that compare unequal.
+  Both are behind the default-off `scalable-topics` feature.
+  (cross-review findings on #391; be1b876)
+
 - **`check-sim-coverage` no longer reports lines as uncovered that a passing test executed.** The gate inherited the workspace's `[profile.test] opt-level = 1`, and at opt-level ≥ 1 rustc enables MIR inlining: an inlined callee's coverage counter never fires, so the call site is attributed and the callee reads zero.
   `magnetar-proto`'s `ScalableConsumerSession::consumer_type()` is called twice from a plain synchronous `#[test]`, inside a run reporting 127/127 test binaries `ok`, and measured `DA:271,0` at `opt-level = 1` against `DA:271,2` — exactly the two call sites — at `0`.
   The verdict was not stable either, since inlining follows codegen-unit partitioning: one commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, and CI blamed the five signature lines of the `async fn` `Client::scalable_topic_subscribe` while its coroutine body reported hits throughout — rustc lowers an `async fn` into an inlinable outer future constructor mapped to the signature plus a coroutine that cannot be inlined.
@@ -74,17 +496,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Toolchain skew and stale object files were both tested and refuted first.
   (ADR-0094)
 
-### Added
-
-- **PIP-460 consumer registration, namespace watch, and transaction-coordinator discovery** (behind the default-off `scalable-topics` feature).
-  Resolving a scalable topic's layout says what segments exist; it does not say which of them are yours.
-  `PulsarClient::scalable_topic_subscribe` registers with the controller leader and returns the initial `ConsumerAssignment` — a `layout_epoch` plus the `segment://` topics this consumer owns — after which every rebalance arrives as an `AssignmentDelta` naming exactly what to attach to (`gained`) and detach from (`lost`).
-  ADR-0098 later amends the initial epoch guard: changed equal-epoch assignments are valid membership updates, exact duplicates are ignored, and only lower epochs fail closed.
-  `ScalableConsumerType` carries `Stream` and `Checkpoint` only — a `QueueConsumer` never registers, mirroring upstream.
-  `PulsarClient::watch_scalable_topics` opens a namespace-level watch over the scalable topics matching a set of AND property filters, delivering a snapshot then incremental diffs; a diff applies `removed` before `added`, per upstream's own note, since the reverse order drops a topic named in both lists.
-  `PulsarClient::watch_tc_assignments` opens PIP-473's metadata-driven transaction-coordinator discovery, negotiated on its **own** `supports_tc_metadata_discovery` flag — upstream advertises it independently, so a broker may serve scalable topics without it and `supports_scalable_topics` alone must not unlock the watch.
-  Every one of these is gated on the same per-connection negotiation as the rest of the surface, so none reaches a Pulsar 4.x broker.
-  (ADR-0093 §D5)
+- **The PIP-33 two-cluster test fixture now actually initializes cluster metadata.** `pulsar-init`'s `command:` was a YAML folded scalar whose continuation lines sat at a deeper indent than its first content line, so their newlines survived folding and `bash -c` received a twelve-line script: `initialize-cluster-metadata` ran with no options at all and each `--flag` line ran as its own command, while a trailing `|| true` turned that into `Exited (0)` and satisfied the downstream `service_completed_successfully` conditions.
+  The fixture had only ever worked because the post-up `configure_replicated_subs.sh` registers both clusters itself, so a local `docker compose up -d` alone left the replicated-subscription tests with nothing to replicate.
+  Every service `command:` is now an exec-form list over a literal block scalar, which has no folding semantics; the two bookkeeper services' `A && B || true && C` precedence bug no longer swallows a failing `apply-config-from-env.py`; `pulsar-init` gains the `PULSAR_MEM` cap every other service in the fixture already carried; and both workflows assert that both clusters are registered before `configure_replicated_subs.sh` runs, with a bounded 30-attempt retry so a healthy-but-not-yet-warm broker is not read as a missing cluster.
+  (issue #389; 9c231f7, cfff6cd)
 
 ## [1.3.0] - 2026-08-03
 
@@ -230,8 +645,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via a broker genuinely exhausting its grant.
-  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the REAL balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
+- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via received dispatch units consuming the locally recorded grant.
+  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the client-accounted balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
   A new churn-window guard skips the adjust tick entirely when `granted_permits == 0` (reset / terminal-failure / same-broker `CloseConsumer`), so that window is never mistaken for load starvation.
   `Auto::adjust` itself is unchanged — only the signal it was fed was wrong.
   (#349; ADR-0082)
@@ -491,6 +906,14 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.2...HEAD
+[1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2
+[1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
+[1.7.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.0
+[1.6.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.6.0
+[1.5.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.5.0
+[1.4.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.1
+[1.4.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.0
 [1.3.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.3.0
 [1.2.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.3
 [1.2.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.2

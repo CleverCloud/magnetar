@@ -28,10 +28,9 @@
 //!
 //! ## Image
 //!
-//! Uses `apachepulsar/pulsar:latest` (Pulsar 4.0 LTS, our minimum supported
-//! broker version). Override with `MAGNETAR_PULSAR_IMAGE_REPO` /
-//! `MAGNETAR_PULSAR_IMAGE_TAG` env vars if you need a different tag
-//! locally.
+//! The broker image comes from the shared fixture in `common/pulsar.rs`
+//! (ADR-0115): its `DEFAULT_TAG`, overridable with `MAGNETAR_PULSAR_IMAGE_REPO` /
+//! `MAGNETAR_PULSAR_IMAGE_TAG` if you need a different image locally.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,46 +39,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use magnetar::proto::TokenAuth;
 use magnetar::{AuthProvider, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Fixed 32-byte HS256 signing secret. Test-only. The broker is
 /// configured with the same bytes via `tokenSecretKey=data:base64,…` so a
 /// JWT signed with a *different* key is guaranteed to be rejected.
 const TOKEN_SECRET: &[u8; 32] = b"magnetar-handshake-err-e2e-bytes";
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Spin up a Pulsar 4.x standalone container with token-auth enabled.
+/// Spin up a Pulsar standalone container with token-auth enabled.
 /// The broker rejects any CONNECT carrying a malformed / unsigned token,
 /// which is exactly the condition we want to exercise the enrichment for.
 async fn start_pulsar_with_token_auth()
@@ -88,57 +59,42 @@ async fn start_pulsar_with_token_auth()
 
     let secret_b64 = URL_SAFE_NO_PAD.encode(TOKEN_SECRET);
     let token_secret_key = format!("data:;base64,{secret_b64}");
+    let admin_token = mint_internal_admin_token();
 
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        // Token-auth on. The broker's internal `brokerClient*` is given a
-        // dummy admin token signed with `TOKEN_SECRET` so the standalone
-        // bootstrap path (which creates `public/default`) can authenticate
-        // against itself; the EXTERNAL client we'll launch from this test
-        // intentionally signs with garbage so its CONNECT is rejected.
-        .with_env_var("PULSAR_PREFIX_authenticationEnabled", "true")
-        .with_env_var(
-            "PULSAR_PREFIX_authenticationProviders",
+    // Token-auth on. The broker's internal `brokerClient*` is given a
+    // dummy admin token signed with `TOKEN_SECRET` so the standalone
+    // bootstrap path (which creates `public/default`) can authenticate
+    // against itself; the EXTERNAL client we'll launch from this test
+    // intentionally signs with garbage so its CONNECT is rejected.
+    //
+    // The shared fixture applies this configuration to `conf/standalone.conf`
+    // before the broker boots; without that step the broker would run with
+    // `authenticationEnabled=false` and the `INVALID_JWT` connect below would
+    // be accepted, defeating the test. The same admin token (`superUserRoles`)
+    // authenticates the fixture's own readiness probe against the now-secured
+    // admin REST.
+    let broker = Pulsar::new(Broker::Default)
+        .config("authenticationEnabled", "true")
+        .config(
+            "authenticationProviders",
             "org.apache.pulsar.broker.authentication.AuthenticationProviderToken",
         )
-        .with_env_var("PULSAR_PREFIX_tokenSecretKey", token_secret_key)
-        .with_env_var(
-            "PULSAR_PREFIX_brokerClientAuthenticationPlugin",
+        .config("tokenSecretKey", token_secret_key)
+        .config(
+            "brokerClientAuthenticationPlugin",
             "org.apache.pulsar.client.impl.auth.AuthenticationToken",
         )
-        .with_env_var(
-            "PULSAR_PREFIX_brokerClientAuthenticationParameters",
-            format!("token:{}", mint_internal_admin_token()),
+        .config(
+            "brokerClientAuthenticationParameters",
+            format!("token:{admin_token}"),
         )
-        .with_env_var("PULSAR_PREFIX_superUserRoles", "admin")
-        // The apachepulsar image's CMD is `sh` (no entrypoint that wires
-        // `apply-config-from-env*`), so the `PULSAR_PREFIX_*` env vars above
-        // would never reach `conf/standalone.conf` if we launched the broker
-        // directly. Apply them explicitly first — same pattern as
-        // `e2e_pattern_auto_reconcile.rs`. Without this step the broker boots
-        // with `authenticationEnabled=false` and the `INVALID_JWT` connect
-        // below is accepted, defeating the test.
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
-                 conf/standalone.conf && bin/pulsar standalone \
-                 --no-functions-worker --no-stream-storage"
-                .to_owned(),
-        ])
+        .config("superUserRoles", "admin")
+        .flag("--no-functions-worker")
+        .flag("--no-stream-storage")
+        .admin_token(admin_token)
         .start()
         .await?;
-
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    Ok((service_url, container))
+    Ok((broker.service_url, broker.container))
 }
 
 /// Mint the broker's internal admin token (HS256 signed with

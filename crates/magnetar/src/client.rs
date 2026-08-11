@@ -812,7 +812,7 @@ impl PulsarClient<crate::TokioEngine> {
     /// [`crate::ClientBuilder`] — the default `E = TokioEngine` on
     /// [`PulsarClient<E>`]. Users targeting the moonpool engine open
     /// the engine directly via
-    /// [`magnetar_runtime_moonpool::MoonpoolEngine`] (see
+    /// `magnetar_runtime_moonpool::MoonpoolEngine` (feature `moonpool`; see
     /// [`PulsarClient::<MoonpoolEngine<P>>::from_moonpool`](crate::PulsarClient)
     /// for the equivalent constructor).
     #[must_use]
@@ -820,13 +820,13 @@ impl PulsarClient<crate::TokioEngine> {
         crate::client_builder::ClientBuilder::default()
     }
 
-    /// The global publish memory budget configured at build time, if any.
+    /// The client-wide publish memory budget configured at build time, if any.
     /// Mirrors Java `PulsarClient#getMemoryLimit`. `None` means no limit was
     /// configured (the Java default).
     ///
-    /// **Note**: today this is configuration-only — the runtime does not yet
-    /// enforce the limit. See [`crate::ClientBuilder::memory_limit`] for the planned
-    /// follow-up.
+    /// Both engines enforce it as one budget shared by every connection of
+    /// this client; see [`crate::ClientBuilder::memory_limit`] for what is
+    /// counted and when a reservation is released.
     #[must_use]
     pub fn memory_limit(&self) -> Option<MemoryLimit> {
         self.memory_limit
@@ -1137,13 +1137,20 @@ pub enum MemoryLimitPolicy {
     ProducerBlock,
 }
 
+impl From<MemoryLimitPolicy> for magnetar_proto::MemoryLimitPolicy {
+    fn from(policy: MemoryLimitPolicy) -> Self {
+        match policy {
+            MemoryLimitPolicy::FailImmediately => Self::FailImmediately,
+            MemoryLimitPolicy::ProducerBlock => Self::ProducerBlock,
+        }
+    }
+}
+
 /// Java parity: configured global publish memory budget. Stored verbatim on
 /// [`crate::ClientBuilder`] and exposed to consumers via [`PulsarClient::memory_limit`].
 ///
-/// **Note**: today this is configuration storage only — the actual enforcement
-/// (accounting against in-flight publish bytes per the policy) is a follow-up
-/// to land before the `0.1` release. The surface is shipped now so callers can
-/// migrate from Java without changing their builder chain.
+/// Both fields are copied into the runtime [`magnetar_proto::ConnectionConfig`]; the selected
+/// policy therefore controls whether an exhausted budget rejects or parks a send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryLimit {
     /// Upper bound in bytes. `0` disables the limit (matches Java default).
@@ -1393,7 +1400,11 @@ impl Reader<magnetar_runtime_tokio::Consumer> {
         self.consumer.available_in_queue()
     }
 
-    /// Number of dispatch permits this reader still has with the broker.
+    /// Client-accounted unspent dispatch permits for this reader: local grants
+    /// minus dispatch units received. Issue #414 re-pointed this from the
+    /// purely-additive grant mirror to the decrementing local estimate, so the
+    /// value moves under dispatch (ADR-0101 amending ADR-0082). It does not read
+    /// the broker's admin `availablePermits` statistic.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
         self.consumer.available_permits()
@@ -1505,7 +1516,7 @@ mod outgoing_message_tests {
     fn incoming_replicate_to_helpers() {
         let empty = message_with(pb::MessageMetadata::default());
         assert!(!empty.has_replicate_to());
-        assert!(empty.replicate_to().is_empty());
+        assert_eq!(empty.replicate_to(), [] as [std::string::String; 0]);
 
         let stamped = message_with(pb::MessageMetadata {
             replicate_to: vec!["a".to_owned(), "b".to_owned()],
@@ -1612,7 +1623,10 @@ mod outgoing_message_tests {
             applied: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut msg = OutgoingMessage::with_payload("hi");
-        assert!(msg.properties.is_empty());
+        assert_eq!(
+            msg.properties,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         i.before_send(&mut msg);
         assert_eq!(msg.properties.len(), 1);
         assert_eq!(msg.properties[0].0, "trace-id");

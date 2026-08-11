@@ -17,13 +17,13 @@ workspace = true
 
 [features]
 # PIP-460 scalable topics (ADR-0093, amended by ADR-0095). Default OFF.
-# The wire types are vendored from Apache Pulsar 5.0.0-M1 and generated
+# The wire types are vendored from Apache Pulsar 5.0.0 and generated
 # unconditionally into `pb/pulsar.proto.rs`, so this flag gates **client
 # logic only**: the `dag_watch` and `scalable_consumer` state machines, the
 # `Conn` entries, and the new `ConnectionEvent` variants. The hand-encoded
 # `src/pb/scalable_topics.rs` module it used to gate is deleted — it was a
 # projection of a Draft proposal that matched no broker. `MessageId` is not
-# extended: M1 carries no segment field on `MessageIdData`. No new
+# extended: 5.0.0 carries no segment field on `MessageIdData`. No new
 # dependency — `prost` is already in the dependency set.
 default          = []
 scalable-topics  = []
@@ -34,10 +34,16 @@ scalable-topics  = []
 # behaviour with zero runtime overhead. Enabling the feature turns each
 # label into a seed-controlled RNG roll routed through the engine's
 # `RandomProvider` (sans-io: the proto layer never reaches for the host
-# RNG; the engine plugs a closure in via `Connection::set_buggify_rng`
-# and `Backoff::install_buggify`). Tests opt in via the moonpool
-# integration suite.
+# RNG; the engine plugs a closure in via `Connection::set_buggify`
+# and `Backoff::install_buggify`, per-label filtered through
+# `Buggify::with_rng_and_filter` under ADR-0097 swarm configurations).
+# Tests opt in via the moonpool integration suite.
 buggify          = []
+# Apache Avro schema support (ADR-0117). Default OFF. Compiles
+# `schema::AvroSchema` and pulls in `apache-avro` with its dependency
+# closure; every other schema (Bytes, String, JSON, Protobuf, KeyValue, ...)
+# is always available. The façade forwards it as `magnetar-driver/schema-avro`.
+schema-avro = ["dep:apache-avro"]
 
 [dependencies]
 bytes        = { workspace = true }
@@ -54,7 +60,7 @@ slab         = { workspace = true }
 uuid         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-apache-avro  = { workspace = true }
+apache-avro  = { workspace = true , optional = true }
 schemars     = { workspace = true }
 hdrhistogram = { workspace = true }
 # Sync primitive only — no I/O, no async, no networking.
@@ -66,12 +72,32 @@ parking_lot  = { workspace = true }
 # `batch_ack_tracker` hot maps. SipHash is overkill on u64-shaped
 # keys we control end-to-end.
 rustc-hash   = { workspace = true }
+# Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
+# They moved here from `magnetar-runtime-tokio` with ADR-0112: the batched-entry
+# layout (one compressed body holding every member) means both `deliver`'s split
+# and `flush_batch`'s concatenation need a codec below the engine. All four are
+# in-memory transforms with no I/O — `cargo run -p xtask -- check-no-io-deps`
+# stays green — but `zstd` links the C `zstd-sys` and `flate2`'s `zlib` feature
+# the C `libz-sys`, so this crate is no longer pure Rust (recorded in ADR-0112).
+lz4_flex     = { workspace = true }
+flate2       = { workspace = true }
+zstd         = { workspace = true }
+snap         = { workspace = true }
 
 [dev-dependencies]
-proptest  = { workspace = true }
-rstest    = { workspace = true }
-tempfile  = { workspace = true }
+proptest = { workspace = true }
+schemars  = { workspace = true, features = ["derive"] }
+# `JsonSchema::schema_data` must parse as an Avro schema, because the broker
+# validates JSON schemas with its Avro parser (`schema/json.rs` unit test).
+# That invariant belongs to `JsonSchema`, not to `AvroSchema`, so the test
+# links `apache-avro` itself and keeps running when the opt-in `schema-avro`
+# feature is off.
+apache-avro = { workspace = true }
 # Capturing subscriber for the ADR-0054 log-emission unit tests
 # (`tests/log_capture.rs`). Dev-only — the production dependency graph
 # stays I/O-free (`cargo run -p xtask -- check-no-io-deps`).
 tracing-subscriber = { workspace = true }
+
+[package.metadata.docs.rs]
+# `AvroSchema` is opt-in (ADR-0117); keep it in the published API docs.
+features = ["schema-avro"]

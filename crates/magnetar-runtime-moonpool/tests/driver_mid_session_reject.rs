@@ -81,7 +81,7 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 /// regress to the original unpinned wall-clock seed that made the sweep's
 /// failures unreproducible from `MOONPOOL_SEED`.
 ///
-/// Two distinct chaos classes are pinned:
+/// Three distinct chaos classes are pinned:
 ///
 /// - **Connect-severance** (issue #290 `MOONPOOL_SEED=0x645244daaeccc7cb`, issue #291
 ///   `MOONPOOL_SEED=0x65ea4fbea60a11a6`): the `SimulationBuilder`'s **unavoidable** default-network
@@ -104,11 +104,23 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 ///   master seed that lands the *same* bit-flip → `Ok(None)` → watchdog → `CleanExit` interleaving
 ///   as #305. Confirms the reclassification is generic (not a per-seed whitelist); pinned here as
 ///   an explicit regression anchor.
-const CHAOS_REGRESSION_SEEDS: [u64; 4] = [
+/// - **Mid-session bit-flip → oversize-length reject** (issue #416
+///   `MOONPOOL_SEED=0x62be2ae39ff4cf2b`, derived sub-seed 2165939632932382826): the same
+///   `bit_flip_probability = 0.0001` chaos as #305 / #308, landing on the *other*
+///   `peek_full_frame_len` reject branch. The sim flipped exactly one bit (captured `sim_fault
+///   kind="bit_flip" flip_count=1` at `time_ms=300`, the `SETTLE_DELAY` beat that carries the
+///   injected frame), turning `[0,0,0,0]` into `[4,0,0,0]` — an announced `total_size` of 67108864,
+///   past `MAX_FRAME_SIZE` — so `peek_full_frame_len` (magnetar-proto/src/frame.rs:309-312)
+///   returned `Err(BadLength(67108864))` and the driver terminated with that instead of
+///   `BadLength(0)`. The reject still travelled the driver's error arm, so this is bounded
+///   termination — the property under test — and it is classified
+///   `DriverOutcome::CorruptedLengthReject`.
+const CHAOS_REGRESSION_SEEDS: [u64; 5] = [
     9_388_503_268_189_738_858,
     17_161_897_233_139_508_114,
     8_009_627_293_563_187_958,
     10_325_270_525_572_099_338,
+    2_165_939_632_932_382_826,
 ];
 
 /// What the client workload observed for the driver after the broker
@@ -126,6 +138,20 @@ enum DriverOutcome {
     /// under test — so the malformed-frame scenario simply never set up.
     /// Carries the stringified reason for diagnostics.
     Severed(String),
+    /// The driver terminated with a framing reject whose announced
+    /// `total_size` is **non-zero** — the injected `[0,0,0,0]` prefix reached
+    /// the client with at least one bit flipped into a value above
+    /// [`magnetar_proto::MAX_FRAME_SIZE`], so `peek_full_frame_len` rejected
+    /// on the oversize branch (`BadLength(announced)`) instead of the
+    /// zero-length branch (`BadLength(0)`). Carries the corrupted announced
+    /// length. The broker writes exactly one well-formed `CONNECTED` frame
+    /// and one all-zero 4-byte prefix, so an uncorrupted stream can never
+    /// announce a non-zero implausible length: this variant is reachable
+    /// only through the default network's bit-flip chaos. A bounded,
+    /// terminating outcome — the reject still travelled the driver's error
+    /// arm — so it stays out of `failed_runs`, and it does not set
+    /// `observed_reject`, which remains gated on the exact `BadLength(0)`.
+    CorruptedLengthReject(u32),
     /// The driver terminated with some *other* error — still bounded, but
     /// flagged so a future regression that changes the reject mapping is
     /// visible rather than silently green.
@@ -332,6 +358,9 @@ impl Workload for ClientWorkload {
                     Err(EngineError::Protocol(ProtocolError::Frame(FrameError::BadLength(0)))) => {
                         DriverOutcome::RejectedAndTerminated
                     }
+                    Err(EngineError::Protocol(ProtocolError::Frame(FrameError::BadLength(
+                        announced,
+                    )))) => DriverOutcome::CorruptedLengthReject(announced),
                     Err(other) => DriverOutcome::OtherError(format!("{other:?}")),
                     Ok(()) => DriverOutcome::CleanExit,
                 }
@@ -376,6 +405,22 @@ impl Workload for ClientWorkload {
                 tracing::info!(capture = true, trail = "clean_exit_after_chaos_bit_flip",);
                 Ok(())
             }
+            // The same bit-flip chaos, landing on the other `peek_full_frame_len`
+            // reject branch: the corrupted prefix announces a non-zero length
+            // above `MAX_FRAME_SIZE`, so the driver surfaces
+            // `BadLength(announced)` rather than `BadLength(0)`. The reject still
+            // travelled the driver's error arm and terminated the task — the
+            // property under test — so this is bounded, not the self-deadlock.
+            // Surface it for diagnostics, do not fail the run; `observed_reject`
+            // still requires a chaos-free seed to prove the exact reject.
+            DriverOutcome::CorruptedLengthReject(announced) => {
+                tracing::info!(
+                    capture = true,
+                    trail = "reject_after_chaos_bit_flip",
+                    announced = announced,
+                );
+                Ok(())
+            }
             DriverOutcome::OtherError(reason) => Err(SimulationError::InvalidState(format!(
                 "driver terminated with an unexpected error (expected a BadLength protocol \
                  reject): {reason}"
@@ -385,18 +430,22 @@ impl Workload for ClientWorkload {
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
         match self.outcome.lock().take() {
-            // `RejectedAndTerminated` is the property. The other two terminal
+            // `RejectedAndTerminated` is the property. The other three terminal
             // outcomes are bounded default-network chaos: `Severed` is a
             // connect cut before the handshake (the malformed-frame scenario
-            // never set up), and `CleanExit` is the watchdog-driven close
-            // after the bit-flip chaos corrupted the malformed frame in flight
-            // (so `peek_full_frame_len` saw `Ok(None)`, not `BadLength(0)`).
-            // All three are acceptable; the `observed_reject` gate in the
-            // sweep still requires a chaos-free seed to prove the real reject.
+            // never set up), and `CleanExit` / `CorruptedLengthReject` are the
+            // two ways the bit-flip chaos corrupts the malformed frame in
+            // flight — into a plausible-but-incomplete length that
+            // `peek_full_frame_len` answers `Ok(None)` (then the watchdog
+            // closes), or into an oversize one it rejects as
+            // `BadLength(announced)` instead of `BadLength(0)`. All four are
+            // acceptable; the `observed_reject` gate in the sweep still
+            // requires a chaos-free seed to prove the real reject.
             Some(
                 DriverOutcome::RejectedAndTerminated
                 | DriverOutcome::Severed(_)
-                | DriverOutcome::CleanExit,
+                | DriverOutcome::CleanExit
+                | DriverOutcome::CorruptedLengthReject(_),
             ) => Ok(()),
             Some(DriverOutcome::OtherError(reason)) => Err(SimulationError::InvalidState(format!(
                 "driver terminated, but with an unexpected error (the malformed frame must surface \
@@ -419,7 +468,7 @@ impl Workload for ClientWorkload {
 /// Deterministic seed sweep: 16 seeds derived from `MOONPOOL_SEED` (so the
 /// daily sweep keeps exploring this path under fresh randoms) plus the
 /// regression seeds in `CHAOS_REGRESSION_SEEDS` the sweep flagged for #290 /
-/// #291 / #305. The original test drove a single **unpinned**
+/// #291 / #305 / #308 / #416. The original test drove a single **unpinned**
 /// `SimulationBuilder::new().run()` whose seed came from the wall clock, so the
 /// daily sweep's failures were unreproducible from `MOONPOOL_SEED` — pinning
 /// the seeds fixes that.
@@ -427,14 +476,18 @@ impl Workload for ClientWorkload {
 /// The `SimulationBuilder`'s default network injects unavoidable chaos
 /// (`ConnectFailureMode::Probabilistic`, `bit_flip_probability = 0.0001`,
 /// random-close) that the builder gives no API to disable. That chaos lands on
-/// two bounded, terminating outcomes that are NOT the self-deadlock under test:
+/// three bounded, terminating outcomes that are NOT the self-deadlock under test:
 ///
 /// - a dial that exhausts the client's bounded `connect_timeout` before the handshake completes
-///   (the malformed-frame scenario never sets up) → a `Severed` outcome; and
-/// - a bit-flip that corrupts the injected malformed frame `[0,0,0,0]` in flight to a
-///   non-zero-`total_size` prefix, so `peek_full_frame_len` returns `Ok(None)` instead of
-///   `BadLength(0)`, the driver parks, and the ADR-0058 watchdog escalates the wedged socket to
-///   `Failed` → a clean `should_close` exit → a `CleanExit` outcome (issue #305).
+///   (the malformed-frame scenario never sets up) → a `Severed` outcome;
+/// - a bit-flip that corrupts the injected malformed frame `[0,0,0,0]` in flight to a prefix whose
+///   `total_size` is non-zero and within `MAX_FRAME_SIZE`, so `peek_full_frame_len` returns
+///   `Ok(None)` instead of `BadLength(0)`, the driver parks, and the ADR-0058 watchdog escalates
+///   the wedged socket to `Failed` → a clean `should_close` exit → a `CleanExit` outcome (issue
+///   #305); and
+/// - a bit-flip that corrupts the same prefix past `MAX_FRAME_SIZE`, so `peek_full_frame_len`
+///   rejects on its oversize branch and the driver terminates with `BadLength(announced)` rather
+///   than `BadLength(0)` → a `CorruptedLengthReject` outcome (issue #416).
 ///
 /// The resilience claim is therefore bounded termination (no run hangs ⇒
 /// `failed_runs == 0`) **plus** the exact `BadLength(0)` reject being observed

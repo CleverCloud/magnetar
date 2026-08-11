@@ -20,6 +20,7 @@ const TOPIC: &str = "topic://public/default/scaled";
 
 fn info(id: u64, start: u32, end: u32, parents: &[u64], children: &[u64]) -> pb::SegmentInfoProto {
     pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -44,6 +45,7 @@ fn sealed_info(
     sealed: u64,
 ) -> pb::SegmentInfoProto {
     pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -125,6 +127,7 @@ fn assignment(epoch: u64, id: u64, start: u32, end: u32) -> ConsumerAssignment {
         &pb::ScalableConsumerAssignment {
             layout_epoch: epoch,
             segments: vec![pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                 segment_id: id,
                 hash_start: start,
                 hash_end: end,

@@ -39,7 +39,7 @@ env:
 jobs:
   fmt:
     name: fmt (nightly)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min covers `--workspace --all-features` clippy on a cold
     # cache (aws-lc-fips-sys + bindgen for libgssapi dominate, ~15 min
     # alone) plus the lint pass on every test binary the admin /
@@ -71,10 +71,38 @@ jobs:
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      # `--all-features` above enables `buggify`, which cfg-strips every
+      # `#[cfg(not(feature = "buggify"))]` stub — so it never lints the
+      # no-buggify axis that `seed-replay` (below) and
+      # `moonpool-seed-sweep.yml` actually build and test. Lint that
+      # exact single-provider cell here explicitly (issue #438). Without
+      # `--no-deps`, this also lints magnetar-proto/magnetar-auth-sasl/
+      # magnetar-auth-athenz/magnetar-messagecrypto at this feature
+      # combination, which doubles as an incidental rustc-warning gate
+      # for that axis since the seed cells carry no `-D warnings`.
+      - run: cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+      # `--all-features` above also turns `schema-avro` on (ADR-0117), so it
+      # can never see a missing `#[cfg(feature = "schema-avro")]` gate or a
+      # test that links `apache-avro` without declaring it. Lint the build a
+      # user gets with no feature selected, one package per invocation so that
+      # a dev-dependency of one cannot switch the feature back on for the
+      # other: `magnetar-proto` with every test target, and the façade
+      # library (its test targets link `schema-avro` on purpose).
+      - run: cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+      - run: cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+      # `--all-features` above also turns on every façade engine, so it
+      # never sees the `magnetar-driver` library a `default-features = false`
+      # consumer builds, where every `tokio`-only item is cfg-stripped and an
+      # ungated helper they alone use becomes dead code. Lint that library,
+      # then its unit-test target. The test target links every
+      # dev-dependency, so `--no-deps` keeps that pass on the façade. Its
+      # integration tests and examples need an engine and are not built here.
+      - run: cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+      - run: cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 
   build:
     name: build (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min: same rationale as clippy — `--all-features` cold-cache
     # build on the runner takes ~20–25 min for the FIPS C build, plus
     # the workspace + every test binary's rlibs. Beta toolchain can
@@ -97,136 +125,68 @@ jobs:
       - run: cargo build --workspace --all-features --locked
 
   test:
-    name: test
-    # Per ADR-0046 the e2e suite runs as part of the regular `test` job —
-    # no separate `e2e` job, no `--features e2e`, no `#[ignore]`. The
-    # `--all-features` build pulls in the e2e tests automatically because
-    # the `#![cfg(feature = "e2e")]` gates are gone. Docker setup, image
-    # pre-pulls, and the PIP-33 two-cluster docker-compose fixture all
-    # live below.
-    runs-on: ubuntu-latest
-    # 180 min covers the cold-cache compile (~20 min of `--all-features`,
-    # heaviest in the admin surface expansion + V3 Functions/IO/Packages),
-    # the PIP-33 two-broker fixture warm-up (~1 min), the e2e suite
-    # against `apachepulsar/pulsar:latest` (~10–15 min), and the
-    # full workspace `cargo test`. The previous 120 min was triggering
-    # mid-test cancels on cold-cache runs; the extra 60 min absorbs the
-    # tail latency without masking real hangs (any individual test has
-    # its own #[tokio::test] timeout under 5 min).
+    name: test (non-e2e)
+    # ADR-0098 splits the former aggregate job into one non-e2e cell (this job)
+    # and four e2e cells per Pulsar broker version (the `e2e` job below).
+    # ADR-0046 still governs semantics: no e2e feature gate or #[ignore].
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      # The `--all-features` build (aws-lc-fips-sys's C build + every
-      # crate + every test binary, test profile) outgrew the ~14GB
-      # GitHub runner disk. Reclaim ~25GB of preinstalled SDKs first.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          # Leave Docker, the tool-cache (rust toolchain), and swap alone.
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
-      # headers. Runtime libs ship by default; the -dev package only.
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
-      # Pre-pull Docker images so the e2e suite (now part of `cargo test`)
-      # doesn't pay the pull cost inside the test wall budget. ADR-0046.
-      - name: Pre-pull Pulsar broker image
-        run: docker pull apachepulsar/pulsar:latest
-      # The PIP-460 e2e suite pins two further tags: 5.0.0-M1 is the first
-      # published release carrying the scalable-topic wire surface, and 4.0.4
-      # is the v4 broker the negotiation-refusal test needs to prove the
-      # capability is negotiated away rather than emitted blindly (ADR-0093
-      # §D3). Pre-pulled for the same reason as the tag above — testcontainers
-      # would otherwise pay the pull inside the test wall budget.
-      - name: Pre-pull PIP-460 broker images (Pulsar 5.0.0-M1 + 4.0.4)
-        run: |
-          docker pull apachepulsar/pulsar:5.0.0-M1
-          docker pull apachepulsar/pulsar:4.0.4
-      - name: Pre-pull KDC image (for the SASL Kerberos e2e)
-        run: docker pull gcavalcante8808/krb5-server:latest || true
-      # Bring up the PIP-33 two-cluster docker-compose fixture. ADR-0046
-      # folded the former weekly `e2e-replicated-subs.yml` into per-PR CI
-      # (the multi-cluster e2e_replicated_subscriptions test now runs
-      # under `cargo test` like the rest of the e2e suite). The fixture
-      # runs under `network_mode: host` with the brokers advertising
-      # `localhost` on host ports 16650/16651/18080/18081 — see the
-      # NETWORKING note in docker-compose.replicated-subs.yml for why a
-      # bridge network cannot satisfy both the host-side e2e client and
-      # cross-cluster replication. The ports stay off the default Pulsar
-      # 6650/8080 so the fixture doesn't collide with the
-      # `testcontainers`-spawned brokers other e2e tests start.
-      - name: Bring up two-cluster Pulsar fixture (PIP-33)
-        working-directory: crates/magnetar/tests/fixtures
+      - name: Run non-e2e tests
         run: |
           set -euo pipefail
-          docker compose -f docker-compose.replicated-subs.yml up -d
-          # Wait for both brokers' admin endpoints to report healthy.
-          for url in http://localhost:18080/admin/v2/brokers/health \
-                     http://localhost:18081/admin/v2/brokers/health; do
-            attempts=60
-            until curl -sf "$url" >/dev/null; do
-              attempts=$((attempts - 1))
-              if [ "$attempts" -le 0 ]; then
-                echo "broker @ $url did not become healthy in time"
-                docker compose -f docker-compose.replicated-subs.yml ps
-                docker compose -f docker-compose.replicated-subs.yml logs --tail=200
-                exit 1
-              fi
-              sleep 2
-            done
+          shopt -s nullglob
+          cargo test --workspace --exclude magnetar-driver --all-features --locked -- --nocapture
+          cargo test -p magnetar-driver --all-features --locked --lib -- --nocapture
+          cargo test -p magnetar-driver --all-features --locked --doc -- --nocapture
+          paths=(crates/magnetar/tests/*.rs)
+          for path in "${paths[@]}"; do
+            target="${path##*/}"
+            target="${target%.rs}"
+            case "$target" in
+              e2e_*) continue ;;
+            esac
+            cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
           done
-      # Runs BEFORE configure_replicated_subs.sh on purpose: that script
-      # registers the clusters itself, so asserting afterwards would prove
-      # nothing about `pulsar-init`. Both clusters can only be present at
-      # this point if the init service did its job. It had not since the
-      # fixture was written — a YAML folded-scalar bug fed
-      # `initialize-cluster-metadata` an empty argument list and `|| true`
-      # reported `Exited (0)` (issue #389).
-      # Retries rather than asserting once: the wait above polls only
-      # /admin/v2/brokers/health, and configure_replicated_subs.sh already
-      # records that broker health goes green before the metadata cache
-      # warms, which is why its wait_for_admin_ready() polls this very
-      # endpoint. A bounded retry keeps the assertion exactly as strong —
-      # a cluster that never appears still fails the job — while not
-      # turning a warm-up window into a per-PR flake.
-      - name: Assert pulsar-init registered both clusters (regression guard, issue #389)
-        run: |
-          set -euo pipefail
-          for url in http://localhost:18080 http://localhost:18081; do
-            attempts=30
-            until clusters=$(curl -sf "$url/admin/v2/clusters") \
-              && grep -q '"cluster-a"' <<<"$clusters" \
-              && grep -q '"cluster-b"' <<<"$clusters"; do
-              attempts=$((attempts - 1))
-              if [ "$attempts" -le 0 ]; then
-                echo "pulsar-init did not register both clusters at $url: ${clusters:-<no response>}"
-                exit 1
-              fi
-              sleep 2
-            done
-            echo "$url -> $clusters"
-          done
-      - name: Configure peer clusters + replicated subscription status
-        working-directory: crates/magnetar/tests/fixtures
-        run: ./configure_replicated_subs.sh
-      - name: Run full test suite (incl. e2e)
-        run: cargo test --workspace --all-features --locked -- --nocapture
-      - name: Tear down two-cluster fixture
-        if: always()
-        working-directory: crates/magnetar/tests/fixtures
-        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
-      - name: Dump two-cluster broker logs on failure
-        if: failure()
-        working-directory: crates/magnetar/tests/fixtures
-        run: docker compose -f docker-compose.replicated-subs.yml logs --tail=500 || true
+
+  e2e:
+    name: e2e (Pulsar ${{ matrix.pulsar }})
+    # The whole e2e suite once per Pulsar version (ADR-0116): `pulsar` is the
+    # tag every Broker::Default suite boots, handed to the reusable workflow as
+    # MAGNETAR_PULSAR_IMAGE_TAG. Cells render as `e2e (Pulsar 5.0.0) / e2e 3/4`.
+    # The default broker (DEFAULT_TAG of crates/magnetar/tests/common/pulsar.rs, the
+    # release Clever Cloud runs) is the one that also brings up the PIP-33
+    # two-cluster fixture, which is pinned to that same tag. 4.0.14 runs nightly in
+    # e2e-nightly.yml. No axis is allowed to fail: no `continue-on-error`, no
+    # per-version #[ignore].
+    # `cargo run -p xtask -- check-e2e-fixture` reads these `pulsar:` values.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pulsar: "4.2.5"
+            pip33: true
+          - pulsar: "5.0.0"
+            pip33: false
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: ${{ matrix.pulsar }}
+      pip33: ${{ matrix.pip33 }}
 
   seed-replay:
     # Per ADR-0047: replay every `status = "open"` seed listed in
@@ -236,7 +196,7 @@ jobs:
     # already-known regressions get caught before they can re-merge.
     # No-op (trivially green) when the registry is empty.
     name: seed-replay (regression guard)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -248,8 +208,8 @@ jobs:
         run: |
           set -euo pipefail
           # Parse the TOML; emit `<value>` per `[[seed]]` with status="open".
-          # Python 3.11+ ships `tomllib` in the stdlib; the ubuntu-latest
-          # runner image carries 3.12.
+          # Python 3.11+ ships `tomllib` in the stdlib; the pinned runner
+          # image carries a supported Python version.
           mapfile -t seeds < <(python3 - <<'PY'
           import tomllib, os, sys
           path = os.environ["REGISTRY"]
@@ -299,7 +259,7 @@ jobs:
 
   doc:
     name: doc
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 60 min: rustdoc on the workspace under `-D warnings` has the same
     # cold-cache compile cost as the build job (it depends on every
     # crate's `cargo check` graph) plus the doc generation pass.
@@ -313,10 +273,18 @@ jobs:
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo doc --workspace --all-features --no-deps --locked
+      # `AvroSchema` exists only under `schema-avro` (ADR-0117), so a plain
+      # intra-doc link to it from always-compiled docs resolves under
+      # `--all-features` and breaks the default build. Document that build too.
+      - run: cargo doc -p magnetar-proto --no-deps --locked
+      # An intra-doc link to an `admin`- or `moonpool`-gated item resolves
+      # under `--all-features` and breaks the default build. Document the
+      # façade with its default features too.
+      - run: cargo doc -p magnetar-driver --no-deps --locked
 
   deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -324,7 +292,7 @@ jobs:
 
   no-channels:
     name: no-channels
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -334,7 +302,7 @@ jobs:
 
   no-io-deps:
     name: no-io-deps (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -350,7 +318,7 @@ jobs:
     # (clock-injection-sans-io) as amended by ADR-0084. The sans-io state
     # machine must receive `now: Instant` / `wall_clock` providers from the
     # engine.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -364,7 +332,7 @@ jobs:
     # workspace code carries at least one structured field (`debug!` /
     # `trace!` exempt). Macro invocations are parsed parenthesis-balanced so
     # multi-line invocations are classified whole. Mirrors ADR-0054.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -372,21 +340,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-log-fields
 
-  e2e-container-memory:
-    name: e2e-container-memory (JVM budget)
-    # Asserts every `pulsar standalone` container the e2e suite starts caps
-    # its JVM with `.with_env_var("PULSAR_MEM", …)` before `.start()`. The
-    # image default costs ~2.3 GiB RSS per container; four uncapped
-    # standalones stall brokers past `operation_timeout` and surface as a
-    # flaky timeout in whichever unrelated test is running. Mirrors
-    # docs/testing.md § "e2e container memory budget".
-    runs-on: ubuntu-latest
+  e2e-fixture:
+    name: e2e-fixture (shared Pulsar fixture)
+    # Asserts the e2e suite boots Pulsar only through the shared fixture under
+    # crates/magnetar/tests/common/ (ADR-0115), that the fixture caps the JVM
+    # with `.with_env_var("PULSAR_MEM", …)` before `.start()` (the image
+    # default costs ~2.3 GiB RSS per container; four uncapped standalones stall
+    # brokers past `operation_timeout` and surface as a flaky timeout in
+    # whichever unrelated test is running — docs/testing.md § "e2e container
+    # memory budget"), and that the fixture's tag constants plus the `pulsar:`
+    # axis of the e2e jobs (ADR-0116) equal the `docker pull
+    # apachepulsar/pulsar:<tag>` list of e2e-pulsar.yml, sit in FIXTURE_TAGS of
+    # scripts/performance_campaign.py and match the PIP-33 compose pin.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo run --manifest-path xtask/Cargo.toml -- check-e2e-container-memory
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-e2e-fixture
 
   msrv:
     name: msrv (1.91)
@@ -396,7 +368,7 @@ jobs:
     # accidental use of newer language or `std` features fails CI rather
     # than slipping into a release. Mirrors the `build` job but with the
     # toolchain pinned exactly to the MSRV, not the rolling stable.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min: same cold-cache cost as the `build` job (FIPS C build,
     # workspace `--all-features`, bindgen via libclang).
     timeout-minutes: 90
@@ -417,7 +389,7 @@ jobs:
     # regenerating from the vendored proto files would produce. Mirrors
     # the validation chain documented in `CLAUDE.md`; without this gate
     # proto codegen drift would go silent.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -460,7 +432,7 @@ jobs:
     # and fakes are compiled and hard-gated through the differential aggregate
     # suites. The older 30/60/10 measurement predates that closure expansion
     # and is not used to characterize the current job.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
     # copy budgets. That 90 was only ever binding on a `workflow_dispatch`
@@ -490,14 +462,14 @@ jobs:
       # data over the wider report package set. Reclaim disk like the heavy
       # build jobs.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -505,7 +477,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
       # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
       # so the MIT KRB5 / libclang headers go in like every other
       # --all-features job. `clang` and `llvm` are the crypto-matrix
@@ -536,33 +508,33 @@ jobs:
   # still exercises `magnetar-runtime-moonpool` under the default seed
   # on every PR / push.
 
-  # The former standalone `e2e` job is gone per ADR-0046 — its work is
-  # folded into the `test` job above (Docker pre-pulls + two-cluster
-  # docker-compose fixture + `cargo test --workspace --all-features`).
-  # One job, one Cargo profile, one validation pass per PR.
+  # ADR-0098 splits the former aggregate test job into one non-e2e cell and
+  # four e2e cells, and ADR-0116 runs those four once per Pulsar version
+  # (e2e-pulsar.yml). The local canonical command remains one
+  # `cargo test --workspace --all-features` invocation per ADR-0046.
 
   mutants-smoke:
     name: cargo-mutants smoke (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-mutants --locked
+      - run: cargo install cargo-mutants --version 27.1.0 --locked
       - run: cargo mutants --package magnetar-proto --timeout 60 --no-shuffle
 
   fuzz-smoke:
     name: cargo-fuzz smoke (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz decode_one (60s budget)
         working-directory: crates/magnetar-proto
         run: cargo +nightly fuzz run decode_one -- -max_total_time=60 -timeout=10

@@ -52,33 +52,15 @@ use magnetar::proto::auth::TokenAuth;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{AuthProvider, OutgoingMessage, PulsarClient};
 use parking_lot::Mutex;
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::{Broker, Pulsar};
 
 /// Sentinel token carried in `CommandConnect.auth_data` (and re-served by
 /// the provider on any challenge refresh). Must never be logged.
 const TOKEN_SENTINEL: &str = "SENTINEL-E2E-TOKEN-DO-NOT-LOG-9c4f";
-
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
 
 /// Shared in-memory sink for the global fmt subscriber.
 #[derive(Clone, Default)]
@@ -109,27 +91,15 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
     }
 }
 
-/// Start an unauthenticated Pulsar 4.x standalone container and return
+/// Start an unauthenticated Pulsar standalone container and return
 /// (`service_url`, `container_handle`). Mirrors `tests/e2e_pulsar.rs`,
 /// minus the env-filter `init_tracing` — this binary installs its own
-/// global capturing subscriber before the container starts.
+/// global capturing subscriber before the container starts, which is why it
+/// calls the shared builder directly instead of `common::pulsar::start_pulsar`.
 async fn start_pulsar()
 -> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    Ok((service_url, container))
+    let broker = Pulsar::new(Broker::Default).start().await?;
+    Ok((broker.service_url, broker.container))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

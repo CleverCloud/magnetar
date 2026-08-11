@@ -17,10 +17,28 @@ Before opening a PR:
 Pick a routine feature subset that pulls in every magnetar facet EXCEPT `crypto-fips` and `auth-sasl-kerberos` (those need native FIPS / Kerberos toolchains that not every contributor has installed):
 
 ```
-FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,crypto-aws-lc-rs"
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,schema-avro,crypto-aws-lc-rs"
 
 cargo +nightly fmt --check
 cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
+# Per-package invocation needs an explicit crypto feature (see below); this
+# is the seed-replay/moonpool-seed-sweep cell, which `--all-features`
+# above never lints because it enables `buggify` and cfg-strips the
+# no-`buggify` stubs (issue #438).
+cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+# The build a user gets with no feature selected has `schema-avro` off (ADR-0117), and
+# `--features "$FEATURES"` / `--all-features` turn it on, so lint and document it
+# once per package: a dev-dependency of one must not switch it back on for another.
+cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+cargo doc -p magnetar-proto --no-deps --locked
+# Also catches a link to an `admin`/`moonpool` item, which resolves only when that feature is on.
+cargo doc -p magnetar-driver --no-deps --locked
+# The façade library with no engine, then its unit-test target: "$FEATURES"
+# above keeps `tokio` on, so it never sees an ungated helper that only
+# `tokio`-gated code uses.
+cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
@@ -61,7 +79,7 @@ MOONPOOL_SEED=0xdeadbeef cargo test -p magnetar-runtime-moonpool \
 
 (Using a single-provider feature flag here avoids pulling `crypto-fips` for the per-package run, which would otherwise need a native FIPS build toolchain locally.)
 
-E2e tests (require Docker; auto-pull suite-specific Pulsar 4.x images plus `apachepulsar/pulsar:5.0.0-M1` for the `scalable-topics` target):
+E2e tests (require Docker; auto-pull `apachepulsar/pulsar:4.2.5`, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` or `4.0.14` runs them on another broker):
 
 ```
 cargo test --workspace --all-features

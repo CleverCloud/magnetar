@@ -1,6 +1,6 @@
 # ADR-0090 — Widen the sim-coverage report to every crate the sim run compiles, and land it advisory
 
-- **Status**: Accepted (amends [ADR-0088](0088-sim-coverage-gate-scope-report-ungated-additions.md) — the report scope it measured and recorded as narrow is widened; its `not gated` reporting and its fail-open analysis remain binding). Partially superseded by [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md) — **the advisory landing below is reversed**: `SIM_COVERAGE_ENFORCES_UNCOVERED` is now `true` and the check runs on every pull request. Read **every** statement below that depends on the constant being `false` as historical, without exception — including "exits 0", "nothing is newly blocked", "not evidence of ADR-0024 patch coverage", "the tracked follow-up", and the backlog-growth argument for flipping it. [ADR-0098](0098-assignment-driven-m1-hardened-stream-consumer.md) further amends the six-package closure to eight and narrows the record-less-file advisory to files with no non-test function body. The report widening, `SIM_COVERAGE_GATED_CRATE_PREFIXES`, whole-crate record-less hard failure and clang pinning remain binding.
+- **Status**: Accepted (amends [ADR-0088](0088-sim-coverage-gate-scope-report-ungated-additions.md) — the report scope it measured and recorded as narrow is widened; its `not gated` reporting and its fail-open analysis remain binding). Partially superseded by [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md) — **the advisory landing below is reversed**: `SIM_COVERAGE_ENFORCES_UNCOVERED` is now `true` and the check runs on every pull request. Read **every** statement below that depends on the constant being `false` as historical, without exception — including "exits 0", "nothing is newly blocked", "not evidence of ADR-0024 patch coverage", "the tracked follow-up", and the backlog-growth argument for flipping it. [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md) further amends the six-package closure to eight and narrows the record-less-file advisory to files with no non-test function body. The report widening, `SIM_COVERAGE_GATED_CRATE_PREFIXES`, whole-crate record-less hard failure and clang pinning remain binding.
 - **Date**: 2026-07-31
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, xtask, moonpool, adr-0024, adr-0088
@@ -53,8 +53,8 @@ Replaying real history through the widened gate on 2026-07-31:
 | `--base HEAD~25` (merged since release 1.2.0) | 450 lines across 15 files, plus 20 files on the advisory `not gated` path — dominated by `magnetar-runtime-tokio/src/client.rs` (191), `.../src/consumer.rs` (61) and `magnetar-proto/src/conn.rs` (142) |
 
 **Why a backlog exists at all.**
-The gate has effectively never run per-PR.
-[`.github/workflows/xtask-gates.yml`](../../.github/workflows/xtask-gates.yml) runs it only on a schedule against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the diff empty and the check short-circuits with "nothing to verify".
+Before ADR-0092, the gate had effectively never run per-PR.
+At that time [`.github/workflows/xtask-gates.yml`](../../.github/workflows/xtask-gates.yml) ran it only on a schedule against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the diff empty and the check short-circuits with "nothing to verify".
 The proof that this is the cause, and not the widening, is `magnetar-runtime-moonpool` itself: gated since ADR-0024, inside the old 16-record report the whole time, and still carrying 43 uncovered added lines over `HEAD~25`.
 
 **Why the 450 is never charged to a future changeset.**

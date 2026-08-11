@@ -132,7 +132,7 @@ async fn tls_builder_options_apply_cleanly() {
         .cluster_list()
         .await
         .expect("cluster list returns 200");
-    assert!(clusters.is_empty());
+    assert_eq!(clusters, [] as [std::string::String; 0]);
 }
 
 #[cfg(not(any(

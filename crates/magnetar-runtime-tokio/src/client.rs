@@ -420,20 +420,24 @@ impl Client {
         // Clone the connect-time inputs into a `ConnectionFactory` so the proxy pool can
         // lazily open per-broker pinned connections later (ADR-0039). The bootstrap conn
         // itself does NOT set `proxy_to_broker_url` (it's the lookup-and-control plane).
-        let factory = ConnectionFactory {
-            url: url.clone(),
-            tls_config: tls_config.clone(),
-            bootstrap_config: config.clone(),
-            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
-            auth_provider: auth_provider.clone(),
-            service_url_provider: service_url_provider.clone(),
-            dns_resolver: dns_resolver.clone(),
-        };
+        let bootstrap_config = config.clone();
 
         // Snapshot the post-dial handshake budget before `config` is moved
         // into `ConnectionShared` (ADR-0052, extended to the handshake).
         let operation_timeout = config.operation_timeout;
-        let shared = ConnectionShared::with_auth(config, auth_provider);
+        let shared = ConnectionShared::with_auth(config, auth_provider.clone());
+
+        let factory = ConnectionFactory {
+            url: url.clone(),
+            tls_config: tls_config.clone(),
+            bootstrap_config,
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            // ADR-0111: every pooled connection shares the bootstrap's budget.
+            memory_limit: shared.memory_limit.clone(),
+            auth_provider,
+            service_url_provider: service_url_provider.clone(),
+            dns_resolver: dns_resolver.clone(),
+        };
 
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();
@@ -1445,15 +1449,25 @@ impl Client {
     ///
     /// The future is cancel-safe: dropping it without polling does not drop pending
     /// deltas, the next `next_topic_list_change` call still sees them.
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]: the
+    /// `Notified` is armed before the buffer drain and the `is_closed()` re-check, so a delta
+    /// the driver pushes (then `topic_list_notify.notify_waiters()`, which stores no permit)
+    /// in the gap between the check and the park wakes this waiter instead of being stranded
+    /// in the buffer.
     pub async fn next_topic_list_change(&self) -> Option<crate::TopicListChange> {
         loop {
+            let notified = self.shared.topic_list_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(change) = self.shared.topic_list_changes.lock().pop_front() {
                 return Some(change);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.topic_list_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1649,6 +1663,12 @@ impl Client {
     /// `persistent://`, or a short name — the broker returns the canonical
     /// identity in [`crate::ScalableLookup::resolved_topic_name`].
     ///
+    /// `create_if_missing` is sent to the broker verbatim: `true` lets a
+    /// Pulsar 5.0.0 broker auto-create a missing `topic://` topic (a consumer or
+    /// producer opening an explicit single topic), `false` makes the lookup
+    /// read-only, so a missing topic is reported as not found on every broker
+    /// version. See [`magnetar_proto::Connection::open_scalable_topic_session`].
+    ///
     /// # Errors
     ///
     /// Fails when the broker did not advertise `supports_scalable_topics` — a
@@ -1658,14 +1678,24 @@ impl Client {
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
+        create_if_missing: bool,
     ) -> Result<crate::ScalableLookup, ClientError> {
         let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.open_scalable_topic_session(topic)
+            conn.open_scalable_topic_session(topic, create_if_missing)
                 .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining (enroll-before-drain, see
+            // `next_replicated_subscription_marker`): `emit_scalable` pushes the
+            // event and then fires `notify_waiters()`, which stores no permit, so
+            // an event landing between the drain below and a later
+            // `notified()` would be buffered but never wake this caller.
+            let notified = self.shared.scalable_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             // Drain the first terminal event for our session id. A rejected
             // session ends as `DagWatchClosed`, not `LookupResolved` — waiting
             // only for the success variant would hang the caller until the
@@ -1720,7 +1750,9 @@ impl Client {
                     "connection closed before scalable lookup resolved".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            // Neither a resolution nor a close: park on the pre-armed waiter,
+            // then re-loop and re-arm. A spurious wake just re-drains.
+            notified.await;
         }
     }
 
@@ -1769,6 +1801,12 @@ impl Client {
         }
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining — same enroll-before-drain rule as
+            // `scalable_topic_lookup`.
+            let notified = self.shared.scalable_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
@@ -1803,7 +1841,7 @@ impl Client {
                     "connection closed before the scalable assignment landed".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1915,16 +1953,26 @@ impl Client {
     /// event (DAG update / drop-on-change / close) drained by the driver.
     /// Returns `None` once the connection closes. Cancel-safe: dropping the
     /// future without polling does not lose buffered events.
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]:
+    /// the `Notified` is armed before the buffer drain and the `is_closed()`
+    /// re-check, so an event the driver pushes (then `notify_waiters()`, which
+    /// stores no permit) in the gap between the check and the park wakes this
+    /// waiter instead of being stranded in the buffer.
     #[cfg(feature = "scalable-topics")]
     pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {
         loop {
+            let notified = self.shared.scalable_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(ev) = self.shared.scalable_events.lock().pop_front() {
                 return Some(ev);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -2037,10 +2085,6 @@ impl Client {
                         let now = std::time::Instant::now();
                         let mut conn = target_shared.inner.lock();
                         let _ = conn.initial_flow(handle, now);
-                        let initial_target = slot.state.lock().receiver_queue_size;
-                        if initial_target > 0 {
-                            conn.flow(handle, initial_target as u32);
-                        }
                     }
                     target_shared.driver_waker.notify_one();
                     tracing::info!(
@@ -2229,7 +2273,7 @@ pub(crate) fn parse_direct_broker_url(
         ))
     };
     let endpoint_scheme =
-        magnetar_proto::broker_endpoint_scheme(broker_url).ok_or_else(&unusable)?;
+        magnetar_proto::broker_endpoint_scheme(broker_url).ok_or_else(unusable)?;
     let authority =
         magnetar_proto::broker_authority(broker_url, Some(bootstrap_scheme.default_port()))
             .ok_or_else(unusable)?;

@@ -18,8 +18,8 @@ use serde::de::DeserializeOwned;
 use super::{Schema, SchemaError};
 use crate::pb;
 
-/// Avro schema that serialises `T` via `apache_avro::to_avro_datum` against a writer schema
-/// supplied at construction time.
+/// Avro schema that serialises `T` via `apache_avro::writer::datum::GenericDatumWriter` against a
+/// writer schema supplied at construction time.
 ///
 /// `schema_data()` returns the [parsing canonical form](apache_avro::Schema::canonical_form) of
 /// the writer schema — the form the broker uses for de-duplication.
@@ -83,15 +83,27 @@ where
         let resolved = avro_value
             .resolve(&self.writer)
             .map_err(|err| SchemaError::Encoding(format!("avro resolve: {err}")))?;
-        let bytes = apache_avro::to_avro_datum(&self.writer, resolved)
-            .map_err(|err| SchemaError::Encoding(format!("avro to_avro_datum: {err}")))?;
+        // `to_avro_datum` was deprecated in apache-avro 0.22 in favour of `GenericDatumWriter`;
+        // `write_value_to_vec` is its documented drop-in replacement.
+        let writer = apache_avro::writer::datum::GenericDatumWriter::builder(&self.writer)
+            .build()
+            .map_err(|err| SchemaError::Encoding(format!("avro writer build: {err}")))?;
+        let bytes = writer
+            .write_value_to_vec(resolved)
+            .map_err(|err| SchemaError::Encoding(format!("avro write_value_to_vec: {err}")))?;
         Ok(Bytes::from(bytes))
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError> {
         let mut cursor = std::io::Cursor::new(bytes);
-        let value = apache_avro::from_avro_datum(&self.writer, &mut cursor, None)
-            .map_err(|err| SchemaError::Decoding(format!("avro from_avro_datum: {err}")))?;
+        // `from_avro_datum` was deprecated in apache-avro 0.22 in favour of `GenericDatumReader`;
+        // `read_value` is its documented drop-in replacement.
+        let reader = apache_avro::reader::datum::GenericDatumReader::builder(&self.writer)
+            .build()
+            .map_err(|err| SchemaError::Decoding(format!("avro reader build: {err}")))?;
+        let value = reader
+            .read_value(&mut cursor)
+            .map_err(|err| SchemaError::Decoding(format!("avro read_value: {err}")))?;
         apache_avro::from_value::<T>(&value)
             .map_err(|err| SchemaError::Decoding(format!("avro from_value: {err}")))
     }

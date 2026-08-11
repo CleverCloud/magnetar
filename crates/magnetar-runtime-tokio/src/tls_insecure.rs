@@ -111,7 +111,7 @@ mod tests {
         assert!(Arc::strong_count(&cfg) >= 1);
         // ALPN-protocols default is empty; we just sanity-check that the
         // config was constructed without panicking.
-        assert!(cfg.alpn_protocols.is_empty());
+        assert_eq!(cfg.alpn_protocols, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]

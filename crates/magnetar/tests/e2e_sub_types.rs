@@ -24,67 +24,88 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use magnetar_admin::{AdminClient, TopicStats};
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+use common::pulsar::start_pulsar;
 
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
+/// Receiver-queue size the issue #427 Failover guard configures on both of its consumers,
+/// so the grant the broker must report back is an exact number rather than the default.
+const FAILOVER_RECEIVER_QUEUE_SIZE: usize = 16;
+
+/// How long that guard waits for both consumers' initial grants to appear in the broker's
+/// topic stats.
+const ADMIN_POLL_TIMEOUT: Duration = Duration::from_secs(15);
+const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Settle window between "the broker reports a non-zero grant" and the reading the
+/// assertion uses. A redundant second `CommandFlow` is encoded into the same connection
+/// buffer under the same lock and rides the same driver flush, so it is already on the wire
+/// — this only removes any dependence on where the broker happened to be in processing that
+/// write.
+const ADMIN_SETTLE: Duration = Duration::from_secs(1);
+
+/// The broker's own `availablePermits` for every consumer registered on `subscription`, in
+/// the order the broker lists them. Empty while the subscription is not yet in the stats
+/// response.
+fn broker_available_permits(stats: &TopicStats, subscription: &str) -> Vec<i64> {
+    stats
+        .subscriptions
+        .get(subscription)
+        .and_then(|sub| sub.get("consumers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|consumers| {
+            consumers
+                .iter()
+                .filter_map(|consumer| {
+                    consumer
+                        .get("availablePermits")
+                        .and_then(serde_json::Value::as_i64)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Start a Pulsar 4.x standalone container and return (`service_url`, `admin_url`,
-/// `container_handle`).
-///
-/// The container is held by the returned guard; dropping it stops the broker.
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+/// Poll the broker until it reports a grant for all `expected` consumers, let the reading
+/// settle, then return the settled per-consumer permits. Nothing has been published at the
+/// call site, so the broker has spent none of what it was granted and its counter is the
+/// grant itself.
+async fn settled_broker_permits(
+    admin: &AdminClient,
+    topic: &str,
+    subscription: &str,
+    expected: usize,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + ADMIN_POLL_TIMEOUT;
+    loop {
+        let observation = match admin.topic_stats(topic).await {
+            Ok(stats) => {
+                let permits = broker_available_permits(&stats, subscription);
+                if permits.len() == expected && permits.iter().all(|p| *p > 0) {
+                    tokio::time::sleep(ADMIN_SETTLE).await;
+                    return Ok(broker_available_permits(
+                        &admin.topic_stats(topic).await?,
+                        subscription,
+                    ));
+                }
+                format!("{permits:?}")
+            }
+            // The topic is created by the subscribe itself, so a stats call that races
+            // that creation 404s. Retry until the deadline.
+            Err(error) => format!("admin error: {error}"),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "broker did not report an initial grant for all {expected} consumer(s) of \
+                 `{subscription}` within {ADMIN_POLL_TIMEOUT:?}; last observation: {observation}"
+            )
+            .into());
+        }
+        tokio::time::sleep(ADMIN_POLL_INTERVAL).await;
+    }
 }
 
 /// Drain a [`magnetar::runtime_tokio::Consumer`] until it stays idle for
@@ -202,12 +223,19 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 /// backlog plus any new publishes.
 ///
 /// **Issue #307 guard**: after the stand-by is promoted, it must hold positive
-/// broker-side permits (`available_permits() > 0`) — the
+/// client-accounted permits (`available_permits() > 0`) — the
 /// `CommandActiveConsumerChange` re-arms flow on promotion. Before the fix the
 /// promoted consumer sat at zero permits and `receive()` starved forever. The
 /// test asserts the positive permit count immediately after promotion (before
 /// any phase-2 publish could lazily replenish) AND that it actually drains the
 /// post-failover backlog.
+///
+/// **Issue #427 guard**: and on the way in, each consumer must hold EXACTLY the
+/// receiver-queue size it configured — read from the broker's own `availablePermits`, the
+/// only oracle that can tell one grant from two. `Failover` is where the double grant lived:
+/// a real broker sends `CommandActiveConsumerChange` right behind the subscribe `Success`,
+/// so the #307 re-arm above and the engine's own post-ack `initial_flow` both fired for one
+/// attach and the broker held `2 ×` what the client accounted for.
 ///
 /// **Election determinism**: Pulsar's `pickAndScheduleActiveConsumer` picks
 /// by `(priorityLevel ASC, consumerName ASC)`. We register two consumers
@@ -219,8 +247,12 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::error::Error>> {
-    let (service_url, _admin_url, _container) = start_pulsar().await?;
+    let (service_url, admin_url, _container) = start_pulsar().await?;
 
+    let admin = AdminClient::builder()
+        .service_url(admin_url.parse()?)
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let client = PulsarClient::builder()
         .service_url(service_url)
         .build()
@@ -235,6 +267,7 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
         .subscription(&subscription)
         .subscription_type(SubType::Failover)
         .name("consumer-a")
+        .receiver_queue_size(FAILOVER_RECEIVER_QUEUE_SIZE)
         .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
@@ -243,6 +276,7 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
         .subscription(&subscription)
         .subscription_type(SubType::Failover)
         .name("consumer-b")
+        .receiver_queue_size(FAILOVER_RECEIVER_QUEUE_SIZE)
         .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
@@ -252,6 +286,21 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     // flag on after `activeConsumerFailoverDelayTimeMillis` (default 1 s).
     // Sleep 3 s for slow Docker hosts.
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Issue #427: before anything is published — so the broker has spent none of what it
+    // was granted — its own `availablePermits` must equal the configured receiver-queue
+    // size for BOTH consumers. The elected one is the interesting half: it received
+    // `CommandActiveConsumerChange { is_active: true }` right behind its subscribe
+    // `Success`, which is exactly the frame that used to make the sans-io #307 re-arm and
+    // the engine's post-ack `initial_flow` both grant for one attach (measured
+    // `2 × receiver_queue_size` on the broker against `1 ×` on the client).
+    let granted = settled_broker_permits(&admin, &topic, &subscription, 2).await?;
+    assert_eq!(
+        granted,
+        vec![i64::try_from(FAILOVER_RECEIVER_QUEUE_SIZE)?; 2],
+        "each Failover consumer must hold exactly one receiver-queue grant after subscribe \
+         (issue #427): configured {FAILOVER_RECEIVER_QUEUE_SIZE}, broker reports {granted:?}",
+    );
 
     let producer = client.producer(&topic).create().await?;
     let first_batch: usize = 5;
@@ -342,17 +391,17 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     // Regression guard (issue #307): on promotion to active, the broker sends
     // `CommandActiveConsumerChange { is_active: true }` and the proto layer must
     // re-arm flow. Before #307, the promoted stand-by sat at
-    // `available_permits == 0` — the broker had no permit to push the backlog
-    // and `receive()` starved forever. Assert the promoted consumer now holds a
-    // positive permit count, BEFORE any phase-2 publish drives a lazy
-    // replenishment, so this pins the on-promotion re-flow specifically.
+    // `available_permits == 0` — the client's grant mirror recorded no permit
+    // to push the backlog and `receive()` starved forever. Assert the promoted
+    // consumer now holds a positive client-accounted permit count, BEFORE any phase-2 publish
+    // drives a lazy replenishment, so this pins the on-promotion re-flow specifically.
     let promoted_permits = standby_opt
         .as_ref()
         .expect("standby was just set")
         .available_permits();
     assert!(
         promoted_permits > 0,
-        "promoted stand-by ({standby_name}) must hold positive broker permits after promotion \
+        "promoted stand-by ({standby_name}) must report positive client-accounted permits after promotion \
          (issue #307: ActiveConsumerChange must re-arm flow), got {promoted_permits}"
     );
 

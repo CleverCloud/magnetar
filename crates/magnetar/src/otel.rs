@@ -29,14 +29,14 @@
 //! When this feature is enabled, the property names `traceparent` and
 //! `tracestate` (and any other keys written by a composite or baggage
 //! propagator) are reserved for propagation.
-//! Setting them manually on an [`OutgoingMessage`](crate::OutgoingMessage)
+//! Setting them manually on an [`OutgoingMessage`]
 //! will be silently overwritten at send time.
 //!
 //! # Retry and dead-letter paths
 //!
 //! `traceparent` / `tracestate` are also re-injected on the retry-letter
 //! (`reconsume_later`) and DLQ (`republish_dead_letters`) paths of the tokio
-//! [`TypedConsumer`](crate::TypedConsumer): when the retrying/republishing
+//! [`TypedConsumer`]: when the retrying/republishing
 //! consumer has an **active span**, its context replaces the inbound trace on
 //! the republished copy, while the original trace stays reachable through the
 //! `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID` correlation properties (ADR-0053 §D2).
@@ -44,7 +44,7 @@
 //! installed propagator) nothing is written, so the inbound trace is left
 //! intact — attach the consumer's span before calling these methods (the
 //! examples show this), exactly as on the producer send path.
-//! The generic [`MultiTopicsConsumer`](crate::MultiTopicsConsumer) retry path is
+//! The generic [`MultiTopicsConsumer`] retry path is
 //! engine-agnostic (it must stay deterministic for the moonpool engine) and does
 //! **not** auto-inject; call [`inject_context`](crate::otel::inject_context)
 //! into the custom properties yourself there.

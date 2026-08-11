@@ -68,12 +68,57 @@ struct StoredMessage {
     encryption_keys: Vec<pb::EncryptionKeys>,
     encryption_algo: Option<String>,
     encryption_param: Option<Bytes>,
+    /// Number of single messages packed into this entry
+    /// (`MessageMetadata.num_messages_in_batch`), or `0` for a plain, unbatched
+    /// entry — the value the broker echoes back on the pushed frame. Issue #436:
+    /// the wedge is only expressible on a topic whose entries carry MANY
+    /// messages, because that is what makes "one entry" and "one permit" stop
+    /// being the same thing.
+    batch_size: i32,
+    /// Issue #860: the producer's `MessageMetadata.compression` stamp, echoed back on dispatch —
+    /// a real broker never decompresses or re-packs an entry.
+    compression: Option<i32>,
+    /// The producer's `MessageMetadata.uncompressed_size`, kept only alongside a
+    /// [`Self::compression`] stamp: every pre-#860 trace sends uncompressed and so still pushes
+    /// byte-identical frames.
+    uncompressed_size: Option<u32>,
+}
+
+/// One entry the broker is about to push, plus the per-dispatch framing a real
+/// broker computes at dispatch time rather than storing on the ledger record.
+///
+/// Issue #436: a partially-acked batched entry is re-dispatched as ONE entry
+/// carrying the bitset of positions that are still outstanding, and the
+/// broker-side redelivery counter for that position. Neither is a property of the
+/// stored message — both change every time the entry goes out — so they ride
+/// alongside it here instead of on [`StoredMessage`].
+#[derive(Debug, Clone)]
+struct Dispatch {
+    message: StoredMessage,
+    /// `CommandMessage.ack_set`: bit `i` SET ⇒ position `i` of the batched entry
+    /// is still unacked, so the consumer must deliver it. Empty for a plain entry
+    /// and for a batched entry no position of which has been acked yet — which is
+    /// what keeps every pre-#436 trace byte-identical.
+    ack_set: Vec<i64>,
+    /// `CommandMessage.redelivery_count` — how many times this entry has been
+    /// handed back to the subscription by a
+    /// `CommandRedeliverUnacknowledgedMessages`.
+    redelivery_count: u32,
 }
 
 #[derive(Debug, Default, Clone)]
 struct ConsumerState {
-    /// Outstanding flow permits (incremented by `CommandFlow`).
-    permits: u32,
+    /// Outstanding flow permits (credited by `CommandFlow`, spent per MESSAGE by
+    /// dispatch — see [`push_pending_shared`]).
+    ///
+    /// Signed since issue #436. A real broker's `messagePermits` is a signed int
+    /// that a forced dispatch drives below zero: a consumer holding one permit is
+    /// still handed a whole 1024-message entry, because an entry is the smallest
+    /// unit a dispatcher can send. `u32` could not express that, and the
+    /// per-consumer `permits < 0` counts are the headline number issue #436
+    /// reports. With `batch_size <= 1` every debit is exactly 1, so every
+    /// pre-#436 trace is byte-identical.
+    permits: i64,
     /// Index of the next message in `ledger` to deliver (this session's
     /// **delivery position**). In resume mode it is seeded from the durable
     /// per-subscription ack cursor at subscribe time, so the un-acked tail is
@@ -86,6 +131,193 @@ struct ConsumerState {
     /// mode, where it is the key into [`CrossSession::cursors`] so a
     /// `CommandAck` advances the right durable cursor.
     subscription: String,
+    /// `Some((topic, subscription))` when this consumer subscribed with
+    /// `SubType::Shared` and is therefore served by the cross-consumer
+    /// [`SharedDispatcher`] under that key rather than by its own `cursor`
+    /// (issue #414). `None` for every other subscription type, which keeps the
+    /// per-consumer walk every existing golden trace depends on byte-identical.
+    shared_key: Option<(String, String)>,
+}
+
+/// One Pulsar **Shared** subscription's dispatcher (issue #414).
+///
+/// The scripted broker used to give every consumer its own ledger cursor, so
+/// two consumers on one Shared subscription each walked the whole ledger — a
+/// shape the real broker never produces, and one in which the issue #414
+/// failure mode is not even expressible. This models what a Shared dispatcher
+/// actually is: ONE cursor over the ledger, shared by every attached consumer,
+/// handed out round-robin to whichever attached consumers hold permits.
+///
+/// Consumer churn is the whole point of the model. When a consumer detaches
+/// (`CommandCloseConsumer`, or the last-clone drop guard), the entries it was
+/// holding un-acked are not lost: they go back into [`Self::redelivery`] and
+/// the surviving consumers get them ahead of the cursor — which is exactly the
+/// broker behaviour the #414 scale-down / recycle window exercises.
+///
+/// Scoped to one session, keyed by `(topic, subscription)`, following the same
+/// stable-identity-key precedent the issue #406 `(topic, producer_name)`
+/// registry set.
+#[derive(Debug, Default)]
+struct SharedDispatcher {
+    /// Next index into the topic's ledger to hand out. ONE cursor for the whole
+    /// subscription — the difference between a real Shared dispatcher and the
+    /// per-consumer full-ledger walk this replaces.
+    cursor: usize,
+    /// Attached consumer ids, in attach order — the round-robin ring.
+    attached: Vec<u64>,
+    /// Index into [`Self::attached`] the next dispatch round starts scanning
+    /// from, so a consumer that is out of permits does not monopolise the ring.
+    next: usize,
+    /// Entries handed to a consumer and not yet acked, keyed by consumer id.
+    /// A detach returns this consumer's entries to [`Self::redelivery`].
+    in_flight: HashMap<u64, Vec<StoredMessage>>,
+    /// Entries returned by a detaching consumer, redelivered to the survivors
+    /// ahead of the shared cursor (FIFO, oldest first).
+    redelivery: std::collections::VecDeque<StoredMessage>,
+    /// The subscription's **aggregate** permit counter in this scripted model.
+    /// Issue #414 instead reported per-consumer `availablePermits = -177300` on a
+    /// ghost entry with an empty `consumerName`; no aggregate value was captured.
+    ///
+    /// Signed on purpose. A `u32` could not express the failure, which is the whole reason
+    /// this field exists: the model can inject a NEGATIVE aggregate by double-subtracting
+    /// on detach. This hypothesis does not attribute the production per-consumer value.
+    ///
+    /// Maintained on three sites, all of them Shared-only:
+    ///
+    /// - `CommandFlow` credits it by the granted permits;
+    /// - each dispatched entry charges it one;
+    /// - a detach charges it the departing consumer's remaining permits (the "give the pool back
+    ///   what this consumer still held" half of a real `removeConsumer`).
+    ///
+    /// In this default scripted model, re-registering an already-attached consumer id
+    /// zeroes its permits without crediting the aggregate back. A subsequent fresh
+    /// `CommandFlow` then nets `+receiver_queue_size` on this counter. That was the
+    /// historical arithmetic behind ADR-0103's attempt bound, not current client
+    /// recovery and not a real broker's live-id behavior: Pulsar answers a completed
+    /// live-id subscribe with `Success` and changes no slot or permit state. The
+    /// `subscribe_on_live_consumer_id_is_a_success_noop` mode models that behavior;
+    /// ADR-0108's current recovery closes before re-subscribing.
+    ///
+    /// [`Self::dispatch_gate_open`] is the `readMoreEntries`-style gate: a dispatcher
+    /// whose aggregate has reached zero or below hands out nothing, no matter what its
+    /// attached consumers individually hold. With correct accounting the gate can never be
+    /// the deciding factor — the counter is then the sum of the attached consumers'
+    /// permits plus a non-negative re-registration drift, so it is `<= 0` only when no
+    /// consumer holds a permit and the round-robin scan would have stopped anyway. Every
+    /// pre-existing golden trace is therefore byte-identical. Arm
+    /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`] to break that invariant
+    /// deliberately.
+    total_available_permits: i64,
+    /// Issue #436 — `acknowledgmentAtBatchIndexLevelEnabled = true`. Per-entry bitset of
+    /// positions that are STILL UNACKED, keyed by `(ledger_id, entry_id)`. Bit `i` set ⇒
+    /// position `i` of the batched entry has not been acknowledged.
+    ///
+    /// Created all-set on the first individual ack that names a position inside the entry,
+    /// then AND-accumulated with every subsequent `CommandAck.message_id[..].ack_set`
+    /// (`ManagedCursorImpl.java:2632-2645` model — the incoming set is also "still
+    /// unacked", so `and` can only ever clear bits). An entry whose bitset reaches empty is
+    /// fully acked: it moves to [`Self::fully_acked`] and the bitset is dropped.
+    ///
+    /// Only Shared subscriptions maintain it, so every other subscription type keeps the
+    /// whole-entry ack semantics it had before.
+    batch_unacked: HashMap<(u64, u64), Vec<u64>>,
+    /// Entries this subscription has acknowledged completely. A batched entry lands here
+    /// when its [`Self::batch_unacked`] bitset empties; a plain entry lands here on its
+    /// single `CommandAck`.
+    fully_acked: std::collections::HashSet<(u64, u64)>,
+    /// Index into the topic ledger of the first entry that is NOT yet fully acked — the
+    /// scripted mark-delete position. Advances only over a CONTIGUOUS run of fully-acked
+    /// entries, which is exactly why issue #436's single incomplete batched entry pins it
+    /// while every later entry is individually deleted around it.
+    mark_delete: usize,
+    /// How many times each entry has been handed back by a
+    /// `CommandRedeliverUnacknowledgedMessages`. Stamped on the pushed frame as
+    /// `CommandMessage.redelivery_count`.
+    redelivery_counts: HashMap<(u64, u64), u32>,
+}
+
+impl SharedDispatcher {
+    /// Whether the dispatcher may hand out another entry.
+    ///
+    /// The scripted stand-in for the real dispatcher's `totalAvailablePermits > 0` read
+    /// gate: a subscription whose aggregate has gone non-positive stops dispatching
+    /// entirely, which is the client-visible shape of issue #414 — every attached consumer
+    /// still holds per-consumer permits, the backlog is non-empty, and nothing moves.
+    fn dispatch_gate_open(&self) -> bool {
+        self.total_available_permits > 0
+    }
+
+    /// Positions of `key` already acknowledged broker-side, out of `batch_size`.
+    ///
+    /// Issue #436: this is the `ackedCount` a real broker subtracts from the entry's batch
+    /// size when it charges a dispatch (`Consumer.java:433-434` model), so a re-dispatched
+    /// entry costs only what it still owes. `0` for a plain entry and for a batched entry
+    /// with no partial acks — the case every pre-#436 trace is in.
+    fn acked_count(&self, key: (u64, u64), batch_size: i32) -> i32 {
+        match self.batch_unacked.get(&key) {
+            Some(bits) => batch_size.saturating_sub(bits_cardinality(bits)),
+            None => 0,
+        }
+    }
+
+    /// Advance [`Self::mark_delete`] over every contiguous fully-acked entry from its
+    /// current position. Mirrors a cursor's mark-delete, which can only move across an
+    /// unbroken run: one incomplete entry holds it however many later entries are deleted.
+    fn advance_mark_delete(&mut self, ledger: &[StoredMessage]) -> usize {
+        while let Some(entry) = ledger.get(self.mark_delete) {
+            if !self
+                .fully_acked
+                .contains(&(entry.ledger_id, entry.entry_id))
+            {
+                break;
+            }
+            self.mark_delete += 1;
+        }
+        self.mark_delete
+    }
+}
+
+/// Fresh all-unacked bitset for a batch of `batch_size` messages: bit `i` set ⇒ position
+/// `i` is still unacked. Mirrors `magnetar_proto::consumer::BatchAckEntry::fresh`, which is
+/// the client half of the same convention — the broker's stored set and the client's
+/// `ack_set` are both "still outstanding", which is what makes AND-accumulation correct.
+fn fresh_unacked_bits(batch_size: i32) -> Vec<u64> {
+    let size = batch_size.max(0) as usize;
+    let mut words = vec![0u64; size.div_ceil(64)];
+    for i in 0..size {
+        words[i / 64] |= 1u64 << (i % 64);
+    }
+    words
+}
+
+/// Number of positions still set (still unacked) in `words`.
+fn bits_cardinality(words: &[u64]) -> i32 {
+    let total: u32 = words.iter().map(|w| w.count_ones()).sum();
+    i32::try_from(total).unwrap_or(i32::MAX)
+}
+
+/// `true` when every position has been acked.
+fn bits_empty(words: &[u64]) -> bool {
+    words.iter().all(|w| *w == 0)
+}
+
+/// Borrow the bitset as the wire's `repeated int64`. Bit semantics are unchanged by the
+/// cast, exactly as on the client's `BatchAckEntry::ack_set_i64`.
+fn bits_to_i64(words: &[u64]) -> Vec<i64> {
+    #[allow(clippy::cast_possible_wrap)]
+    words.iter().map(|&w| w as i64).collect()
+}
+
+/// AND the client-supplied `ack_set` into the stored bitset
+/// (`ManagedCursorImpl.java:2632-2645` model). Both sides mean "still unacked", so the
+/// result can only lose bits — an ack that already landed stays acknowledged even when the
+/// client's own view was rebuilt from scratch.
+fn and_into(stored: &mut [u64], incoming: &[i64]) {
+    for (idx, word) in stored.iter_mut().enumerate() {
+        #[allow(clippy::cast_sign_loss)]
+        let mask = incoming.get(idx).map_or(0u64, |w| *w as u64);
+        *word &= mask;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -162,8 +394,38 @@ struct SessionState {
     ledger: HashMap<String, Vec<StoredMessage>>,
     /// Per producer id (assigned by the client).
     producers: HashMap<u64, (String, ProducerState)>,
+    /// Live `(topic, producer_name) → (producer_id, epoch)` registrations, the
+    /// broker resource issue #406 leaks. A `CommandProducer` naming a key
+    /// already present is answered with `ProducerBusy` (the broker's
+    /// `NamingException`) unless it is a SUCCESSOR of the current owner — same
+    /// producer id, strictly higher epoch — which overwrites it, mirroring
+    /// `AbstractTopic#tryOverwriteOldProducer` / `Producer#isSuccessorTo`.
+    /// A `CommandCloseProducer` releases every key the closed id holds. Only
+    /// user-provided, non-empty names register — an unnamed open is assigned a
+    /// unique name broker-side and never collides.
+    producer_names: HashMap<(String, String), (u64, u64)>,
+    /// Producer ids this connection no longer maps. A close for one is acked
+    /// and does nothing: Pulsar drops its record of a producer id when it
+    /// completes a close-before-creation, and the registration that pending
+    /// creation goes on to make is then unreachable by any close.
+    unmapped_producer_ids: std::collections::HashSet<u64>,
+    /// One withheld `(producer_id, request_id, producer_name)` whose
+    /// `CommandProducerSuccess` the session is deliberately sitting on, so a
+    /// client open races its `operation_timeout` while the registration
+    /// exists broker-side. Released — and finally flushed as a LATE success —
+    /// when the client closes that producer id. Armed by
+    /// [`ScriptedBroker::withhold_first_producer_success_for_name`].
+    withheld_producer_success: Option<(u64, u64, String)>,
+    /// One-shot latch for [`Self::withheld_producer_success`]: only the FIRST
+    /// matching open on a session is withheld, so the client's retry is
+    /// served normally.
+    withhold_fired: bool,
     /// Per consumer id (assigned by the client).
     consumers: HashMap<u64, (String, ConsumerState)>,
+    /// Live Shared-subscription dispatchers keyed by `(topic, subscription)`
+    /// (issue #414). Empty for every trace that opens no `SubType::Shared`
+    /// consumer, which is every pre-#414 golden trace.
+    shared_dispatchers: HashMap<(String, String), SharedDispatcher>,
     /// Observability view of every stored message id grouped by
     /// partition index (parsed from the topic's `-partition-N`
     /// suffix; `-1` when the topic is non-partitioned).
@@ -244,6 +506,38 @@ pub type FrameLog = Arc<Mutex<Vec<i32>>>;
 /// partition's cursor was moved by a `SeekPartition` op.
 pub type SeekedPartitionLog = Arc<Mutex<Vec<i32>>>;
 
+/// Cross-session, append-only log of every `CommandFlow` the broker received,
+/// as `(consumer_id, message_permits)` in arrival order. The per-consumer
+/// `permits` balance is spent by dispatch, so it cannot answer "how many
+/// permits was this consumer ever granted"; this log can, and it survives the
+/// redial that resets the per-session `consumers` map. Issue #426 needs exactly
+/// that: one `receiver_queue_size` grant per attach, on the fresh subscribe and
+/// again on the post-reconnect `rebuild_consumers` re-attach.
+pub type FlowGrantLog = Arc<Mutex<Vec<(u64, u32)>>>;
+
+/// Cross-session, append-only log of the broker's own per-consumer permit balance, as
+/// `(consumer_id, balance_after)` after every change — a `CommandFlow` credit and every
+/// dispatch debit.
+///
+/// Issue #436 reports the broker's `availablePermits` at `0` or NEGATIVE on every consumer
+/// of a wedged subscription while `msgRateOut` sits at zero. [`FlowGrantLog`] cannot answer
+/// that: it records what the client GRANTED, never what the broker has left. This does, and
+/// it is signed for the same reason `ConsumerState::permits` is — a forced dispatch of one
+/// whole batched entry to a consumer holding a single permit is exactly how the balance goes
+/// below zero legitimately, and "did it come back" is the question that separates a
+/// transient dip from a wedge.
+pub type ConsumerPermitLog = Arc<Mutex<Vec<(u64, i64)>>>;
+
+/// Cross-session, append-only log of every mark-delete advance on a `Shared` subscription,
+/// as `(subscription, first_entry_index_not_yet_fully_acked)` in arrival order.
+///
+/// Issue #436's second symptom: one batched entry pinned the subscription's mark-delete
+/// position for days, with the first individually-deleted range starting exactly one entry
+/// past it. The position only moves across a CONTIGUOUS run of fully-acked entries, so an
+/// entry that never completes holds it forever — and whether it completes is precisely what
+/// the client's handling of a re-dispatched partial batch decides.
+pub type MarkDeleteLog = Arc<Mutex<Vec<(String, usize)>>>;
+
 /// Cross-session, append-only log of every `CommandEndTxn` the broker
 /// observed, in arrival order. Each entry records the txn id halves,
 /// whether the end was a commit (`drained: true`) or an abort
@@ -262,6 +556,9 @@ pub type TxnDrainLog = Arc<Mutex<Vec<TxnDrainEvent>>>;
 struct SessionDeps {
     frame_log: FrameLog,
     seeked_partitions: SeekedPartitionLog,
+    flow_grants: FlowGrantLog,
+    consumer_permits: ConsumerPermitLog,
+    mark_deletes: MarkDeleteLog,
     txn_drain_log: TxnDrainLog,
     corrupt_after_connected: Arc<Mutex<bool>>,
     decode_fatal_on_send: Arc<Mutex<bool>>,
@@ -279,6 +576,30 @@ struct SessionDeps {
     /// first redial producer-open has been transiently rejected, so the retry's
     /// open (and every later open) is acked.
     transient_reject_fired: Arc<AtomicBool>,
+    /// Producer name whose FIRST open on each session has its
+    /// `CommandProducerSuccess` withheld until the client closes the
+    /// registered producer id (issue #406). `None` — the default — serves
+    /// every open normally.
+    withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
+    /// When `true`, the close that releases the withheld success does NOT
+    /// release the registration: the broker acks it, stops mapping that
+    /// producer id, and lets the creation complete anyway (issue #406's CI
+    /// reproduction). Only a successor re-attach reclaims the name.
+    withhold_registration_survives_close: Arc<Mutex<bool>>,
+    /// When `true`, every `CommandSubscribe` is answered with `CommandSuccess`
+    /// AND, immediately behind it in the same write,
+    /// `CommandActiveConsumerChange { is_active: true }` — what a real broker
+    /// does for an `Exclusive` / `Failover` subscription (issue #427).
+    announce_active_consumer: Arc<Mutex<bool>>,
+    /// When `true`, detaching a `Shared` consumer subtracts its remaining permits from
+    /// the modeled subscription aggregate counter TWICE (ADR-0103 hypothesis,
+    /// distinct from issue #414's observed per-consumer value). See
+    /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`].
+    leak_shared_permits_on_churn: Arc<Mutex<bool>>,
+    /// When `true`, a `CommandSubscribe` naming a consumer id ALREADY live on this
+    /// session is answered with a bare `CommandSuccess` and changes no broker state.
+    /// See [`ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`].
+    live_id_subscribe_is_noop: Arc<Mutex<bool>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -294,6 +615,15 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of partition indices that received a
     /// `CommandSeek`.
     seeked_partitions: SeekedPartitionLog,
+    /// Shared, append-only log of every `CommandFlow` as
+    /// `(consumer_id, message_permits)`, across every session.
+    flow_grants: FlowGrantLog,
+    /// Shared, append-only log of the broker's own per-consumer permit balance after every
+    /// credit and every dispatch debit (issue #436).
+    consumer_permits: ConsumerPermitLog,
+    /// Shared, append-only log of every `Shared`-subscription mark-delete advance
+    /// (issue #436).
+    mark_deletes: MarkDeleteLog,
     /// Shared, append-only log of every `CommandEndTxn` and its drain
     /// count. Surfaces the per-txn ack ledger's drain/drop side-effect
     /// to the golden-trace assertion path.
@@ -360,6 +690,30 @@ pub struct ScriptedBroker {
     /// One-shot latch for [`Self::transient_reject_on_redial`]. Reset by
     /// [`Self::clear_cross_session_state`].
     transient_reject_fired: Arc<AtomicBool>,
+    /// Producer name whose FIRST open on each session has its
+    /// `CommandProducerSuccess` withheld (issue #406). Armed by
+    /// [`Self::withhold_first_producer_success_for_name`]; the latch lives in
+    /// the per-session state, so both differential legs — each on its own
+    /// session — see the same one-shot behaviour with no reset between them.
+    withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
+    /// Companion to [`Self::withhold_producer_success_for_name`]: when `true`
+    /// the withheld open's registration OUTLIVES its close (issue #406).
+    withhold_registration_survives_close: Arc<Mutex<bool>>,
+    /// When `true`, every `CommandSubscribe` is answered with `CommandSuccess`
+    /// AND `CommandActiveConsumerChange { is_active: true }` right behind it —
+    /// a real broker's `Exclusive` / `Failover` announcement. Armed by
+    /// [`Self::announce_active_consumer_on_subscribe`] for the issue #427
+    /// initial-grant scenario.
+    announce_active_consumer: Arc<Mutex<bool>>,
+    /// When `true`, detaching a `Shared` consumer subtracts its remaining permits from
+    /// the subscription's aggregate permit counter TWICE, leaking that many permits per
+    /// churn event (issue #414). Armed by
+    /// [`Self::leak_shared_permits_on_consumer_churn`].
+    leak_shared_permits_on_churn: Arc<Mutex<bool>>,
+    /// When `true`, a `CommandSubscribe` naming a consumer id already live on the session
+    /// is a `CommandSuccess` no-op. Armed by
+    /// [`Self::subscribe_on_live_consumer_id_is_a_success_noop`].
+    live_id_subscribe_is_noop: Arc<Mutex<bool>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -390,6 +744,12 @@ impl ScriptedBroker {
         let frame_log_clone = frame_log.clone();
         let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
         let seeked_partitions_clone = seeked_partitions.clone();
+        let flow_grants: FlowGrantLog = Arc::new(Mutex::new(Vec::new()));
+        let flow_grants_clone = flow_grants.clone();
+        let consumer_permits: ConsumerPermitLog = Arc::new(Mutex::new(Vec::new()));
+        let consumer_permits_clone = consumer_permits.clone();
+        let mark_deletes: MarkDeleteLog = Arc::new(Mutex::new(Vec::new()));
+        let mark_deletes_clone = mark_deletes.clone();
         let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
         let txn_drain_log_clone = txn_drain_log.clone();
         let corrupt_after_connected = Arc::new(Mutex::new(false));
@@ -404,11 +764,25 @@ impl ScriptedBroker {
         let transient_reject_on_redial_clone = transient_reject_on_redial.clone();
         let transient_reject_fired = Arc::new(AtomicBool::new(false));
         let transient_reject_fired_clone = transient_reject_fired.clone();
+        let withhold_producer_success_for_name = Arc::new(Mutex::new(None));
+        let withhold_producer_success_for_name_clone = withhold_producer_success_for_name.clone();
+        let withhold_registration_survives_close = Arc::new(Mutex::new(false));
+        let withhold_registration_survives_close_clone =
+            withhold_registration_survives_close.clone();
+        let announce_active_consumer = Arc::new(Mutex::new(false));
+        let announce_active_consumer_clone = announce_active_consumer.clone();
+        let leak_shared_permits_on_churn = Arc::new(Mutex::new(false));
+        let leak_shared_permits_on_churn_clone = leak_shared_permits_on_churn.clone();
+        let live_id_subscribe_is_noop = Arc::new(Mutex::new(false));
+        let live_id_subscribe_is_noop_clone = live_id_subscribe_is_noop.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
             frame_log: frame_log_clone,
             seeked_partitions: seeked_partitions_clone,
+            flow_grants: flow_grants_clone,
+            consumer_permits: consumer_permits_clone,
+            mark_deletes: mark_deletes_clone,
             txn_drain_log: txn_drain_log_clone,
             corrupt_after_connected: corrupt_after_connected_clone,
             decode_fatal_on_send: decode_fatal_on_send_clone,
@@ -416,6 +790,11 @@ impl ScriptedBroker {
             dropped_once: dropped_once_clone,
             transient_reject_on_redial: transient_reject_on_redial_clone,
             transient_reject_fired: transient_reject_fired_clone,
+            withhold_producer_success_for_name: withhold_producer_success_for_name_clone,
+            withhold_registration_survives_close: withhold_registration_survives_close_clone,
+            announce_active_consumer: announce_active_consumer_clone,
+            leak_shared_permits_on_churn: leak_shared_permits_on_churn_clone,
+            live_id_subscribe_is_noop: live_id_subscribe_is_noop_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -440,6 +819,9 @@ impl ScriptedBroker {
             accept_task: Some(accept_task),
             frame_log,
             seeked_partitions,
+            flow_grants,
+            consumer_permits,
+            mark_deletes,
             txn_drain_log,
             corrupt_after_connected,
             decode_fatal_on_send,
@@ -447,8 +829,95 @@ impl ScriptedBroker {
             dropped_once,
             transient_reject_on_redial,
             transient_reject_fired,
+            withhold_producer_success_for_name,
+            withhold_registration_survives_close,
+            announce_active_consumer,
+            leak_shared_permits_on_churn,
+            live_id_subscribe_is_noop,
             cross_session,
         })
+    }
+
+    /// Arm the issue #414 Shared-dispatcher permit leak: every `CommandCloseConsumer` for
+    /// a `Shared` consumer subtracts that consumer's remaining permits from the
+    /// subscription's aggregate counter TWICE instead of once.
+    ///
+    /// The second subtraction removes permits no credit was ever issued for, so it is a
+    /// permanent leak of exactly the departing consumer's remaining permits per churn
+    /// event. Once the aggregate crosses zero the dispatcher's read gate closes and the
+    /// subscription stops dispatching entirely — the survivors still hold per-consumer
+    /// permits, the backlog is still non-empty, the connection is still healthy, and
+    /// nothing moves. That models the delivery stall in issue #414, but the incident's
+    /// `availablePermits = -177300` belonged to one ghost consumer, not an aggregate.
+    ///
+    /// The model injects this double-subtraction explicitly; it has not been shown to
+    /// be the production cause. `CommandFlow` carries only non-negative increments, but
+    /// dispatch, detach and the timing of client operations also affect broker counters.
+    ///
+    /// The recovery arithmetic this exposes is the point, and ADR-0108 changed it. The
+    /// recovery now closes the consumer before re-subscribing it, so the close returns the
+    /// consumer's remaining permits and the re-subscribe's `CommandFlow` takes them back:
+    /// ONE attempt is permit-NEUTRAL on the aggregate. The recovery's own
+    /// `CommandCloseConsumer` is itself a churn event, so with this knob armed it is
+    /// subtracted twice and credited once, and attempts move the aggregate the wrong way.
+    ///
+    /// Before ADR-0108 the recovery re-subscribed a still-live consumer id — which a real
+    /// broker answers with a bare `CommandSuccess`, changing nothing — and then granted a
+    /// full window on top, so the aggregate rose by `receiver_queue_size` per attempt. That
+    /// credit had no matching debit anywhere: it was the client over-committing, not a
+    /// repair, and it is why the pre-ADR-0108 arithmetic looked like it converged.
+    ///
+    /// So a leak is not client-recoverable at any budget. ADR-0103's automatic recovery is
+    /// bounded in order to reach the escalation — `pulsar-admin topics unload` — rather
+    /// than to grind toward a repair it cannot make.
+    ///
+    /// Off by default: with it disarmed the aggregate is exactly the sum of the attached
+    /// consumers' permits plus a non-negative re-registration drift, the read gate can
+    /// never be the deciding factor, and every pre-existing trace is byte-identical.
+    ///
+    /// This models a HYPOTHESIS about the broker's churn-path permit accounting, chosen
+    /// because it reproduces the reported signature exactly. It is not a verified reading
+    /// of any Apache Pulsar source.
+    pub fn leak_shared_permits_on_consumer_churn(&self) {
+        *self.leak_shared_permits_on_churn.lock() = true;
+    }
+
+    /// Model a real broker's answer to a `CommandSubscribe` that names a consumer id
+    /// **already live on this connection**: a bare `CommandSuccess`, and nothing else
+    /// changes broker-side.
+    ///
+    /// The default model recreates the dispatcher slot at zero permits — see the
+    /// `Subscribe` arm of `handle_frame`. Apache Pulsar does not: `ServerCnx
+    /// .handleSubscribe` looks the consumer id up in its own `consumers` map first and,
+    /// on a hit for an already-completed subscribe, answers `CommandSuccess` and
+    /// returns without touching the dispatcher, the cursor, or the consumer's
+    /// `availablePermits` (apache/pulsar v4.0.4 `ServerCnx.java:1319-1326`).
+    ///
+    /// **This knob encodes that premise; it does not prove it.** It is verified
+    /// separately against the Pulsar source. Everything a test built on it concludes is
+    /// conditional on the premise holding.
+    ///
+    /// Default is off, so every pre-existing scenario keeps the fresh-slot model it was
+    /// written against. Arm it only in a test that is deliberately measuring what the
+    /// live broker's permit counter would have held.
+    pub fn subscribe_on_live_consumer_id_is_a_success_noop(&self) {
+        *self.live_id_subscribe_is_noop.lock() = true;
+    }
+
+    /// Arm the active-consumer announcement: every `CommandSubscribe` is answered with
+    /// `CommandSuccess` and, immediately behind it in the same write,
+    /// `CommandActiveConsumerChange { is_active: true }`.
+    ///
+    /// That is what a real broker does for an `Exclusive` / `Failover` subscription, and
+    /// what makes issue #427 observable: both frames reach the client in one read, so the
+    /// sans-io issue #307 promotion re-arm runs inside `handle_bytes` while the engine's
+    /// own post-ack `initial_flow` is still parked on the resolving subscribe future. Both
+    /// used to grant, and [`Self::flow_grant_log_snapshot`] recorded `2 ×
+    /// receiver_queue_size` for one attach.
+    ///
+    /// Off by default, which is the shape every other differential trace relies on.
+    pub fn announce_active_consumer_on_subscribe(&self) {
+        *self.announce_active_consumer.lock() = true;
     }
 
     /// Arm the corrupted-frame injection: every subsequent session writes
@@ -535,6 +1004,40 @@ impl ScriptedBroker {
         *self.transient_reject_on_redial.lock() = true;
     }
 
+    /// Arm the withheld-`ProducerSuccess` injection for issue #406: on every
+    /// session, the FIRST `CommandProducer` carrying `producer_name` registers
+    /// its `(topic, name)` key as usual but its `CommandProducerSuccess` is
+    /// **withheld**, so the client's open races its `operation_timeout` while
+    /// the broker-side registration exists. Any later open naming the same
+    /// `(topic, name)` is rejected with `ProducerBusy` — the broker's
+    /// `NamingException` — until a `CommandCloseProducer` for the registered
+    /// producer id releases the key, at which point the withheld success is
+    /// finally flushed as the LATE ack the client must discard.
+    ///
+    /// A client that abandons a timed-out open without closing it therefore
+    /// can never reopen the name; one that emits the close (ADR-0100) reopens
+    /// it on the next try. The one-shot latch lives in the per-session state,
+    /// so the tokio and moonpool legs — each on its own session — observe the
+    /// same script with no reset in between.
+    pub fn withhold_first_producer_success_for_name(&self, producer_name: &str) {
+        *self.withhold_producer_success_for_name.lock() = Some(producer_name.to_owned());
+    }
+
+    /// Arm the harder issue #406 interleaving, the one that reproduced against
+    /// a real Pulsar 4.0.4 broker in CI after the cancel-time close landed.
+    ///
+    /// Same withheld `CommandProducerSuccess` as
+    /// [`Self::withhold_first_producer_success_for_name`], but the close that
+    /// releases it is consumed while the creation is still pending: the broker
+    /// acks it, stops mapping that producer id, and completes the registration
+    /// anyway. No close can address that registration afterwards, so a client
+    /// that only re-closes stays wedged — reclaiming the name requires
+    /// re-attaching under the abandoned id as a strict successor.
+    pub fn withhold_first_producer_success_surviving_close(&self, producer_name: &str) {
+        *self.withhold_producer_success_for_name.lock() = Some(producer_name.to_owned());
+        *self.withhold_registration_survives_close.lock() = true;
+    }
+
     /// Number of `(topic, message)` entries persisted in the cross-session
     /// ledger. `0` whenever the drop knob has never been armed (every other
     /// differential trace stays on per-session isolation). Used by
@@ -599,6 +1102,50 @@ impl ScriptedBroker {
     /// the same broker instance.
     pub fn clear_seeked_partitions(&self) {
         self.seeked_partitions.lock().clear();
+    }
+
+    /// Snapshot every `CommandFlow` the broker received, as
+    /// `(consumer_id, message_permits)` in arrival order across all sessions.
+    /// The per-consumer `permits` balance is spent by dispatch and is reset by
+    /// the redial that replaces the session state, so this log is what answers
+    /// "how many permits was this consumer granted, per attach" (issue #426).
+    #[must_use]
+    pub fn flow_grant_log_snapshot(&self) -> Vec<(u64, u32)> {
+        self.flow_grants.lock().clone()
+    }
+
+    /// Snapshot the broker's own per-consumer permit balance after every change, as
+    /// `(consumer_id, balance_after)` in arrival order across all sessions (issue #436).
+    ///
+    /// The signed counterpart to [`Self::flow_grant_log_snapshot`]: that log says what the
+    /// client granted, this one says what the broker had left after spending it. A run whose
+    /// balances dip below zero and come back is a forced dispatch doing its job; one that
+    /// ends below zero is the wedge issue #436 reports.
+    #[must_use]
+    pub fn consumer_permit_log_snapshot(&self) -> Vec<(u64, i64)> {
+        self.consumer_permits.lock().clone()
+    }
+
+    /// Clear the per-consumer permit log. Mirrors [`Self::clear_frame_log`] for isolating
+    /// per-engine snapshots when both legs run against the same broker instance.
+    pub fn clear_consumer_permit_log(&self) {
+        self.consumer_permits.lock().clear();
+    }
+
+    /// Snapshot every `Shared`-subscription mark-delete advance, as
+    /// `(subscription, first_entry_index_not_yet_fully_acked)` in arrival order across all
+    /// sessions (issue #436). Empty when no entry has ever been acknowledged completely —
+    /// which is itself the assertion, for a subscription whose leading batched entry never
+    /// finishes.
+    #[must_use]
+    pub fn mark_delete_log_snapshot(&self) -> Vec<(String, usize)> {
+        self.mark_deletes.lock().clone()
+    }
+
+    /// Clear the mark-delete log. Mirrors [`Self::clear_frame_log`] for isolating per-engine
+    /// snapshots when both legs run against the same broker instance.
+    pub fn clear_mark_delete_log(&self) {
+        self.mark_deletes.lock().clear();
     }
 
     /// Snapshot every txn-drain event observed so far, in arrival order
@@ -772,7 +1319,7 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
         }
 
         // Push any queued messages to consumers with outstanding permits.
-        push_pending(&state, &mut out_buf, resume);
+        push_pending(&state, &mut out_buf, resume, &deps);
 
         if !out_buf.is_empty() {
             if stream.write_all(&out_buf).await.is_err() {
@@ -862,7 +1409,17 @@ fn handle_frame(
                 // A topic whose name ends in `-missing` is the scripted
                 // rejection: the broker answers with an error and no layout, so
                 // both engines exercise the lookup-refused path.
-                if l.topic.ends_with("-missing") {
+                //
+                // A topic ending in `-absent` does not exist yet. Like a 5.0.0
+                // broker's `DagWatchSession` (`DagWatchSession.java:138-157`) it
+                // is auto-created — answered with the layout — only when the
+                // lookup asks for creation, and refused with the same not-found
+                // otherwise. `create_if_missing()` applies the schema default,
+                // so a lookup that leaves the field unset also creates, as
+                // upstream does.
+                if l.topic.ends_with("-missing")
+                    || (l.topic.ends_with("-absent") && !l.create_if_missing())
+                {
                     emit_scalable_layout_rejection(out, l.session_id, true);
                 } else if l.topic.ends_with("-terse") {
                     // Rejection with no `message`, so the client's fallback
@@ -942,10 +1499,7 @@ fn handle_frame(
                 if reject {
                     emit_transient_producer_error(out, p.request_id);
                 } else {
-                    let mut g = state.lock();
-                    g.producers
-                        .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
-                    emit_producer_success(out, p.request_id, &p.topic);
+                    answer_producer_open(state, p, deps, out);
                 }
             }
         }
@@ -977,6 +1531,16 @@ fn handle_frame(
                         encryption_keys: payload.metadata.encryption_keys.clone(),
                         encryption_algo: payload.metadata.encryption_algo.clone(),
                         encryption_param: payload.metadata.encryption_param.clone(),
+                        // Issue #436: a real broker stores whatever the producer declared
+                        // and echoes it back on dispatch — it never re-packs the body. An
+                        // unbatched send leaves the field absent, which stores `0` and keeps
+                        // the pushed frame byte-identical to every pre-#436 trace.
+                        batch_size: payload.metadata.num_messages_in_batch.unwrap_or(0),
+                        compression: payload.metadata.compression,
+                        uncompressed_size: payload
+                            .metadata
+                            .compression
+                            .and(payload.metadata.uncompressed_size),
                     };
                     let partition = partition_index_of(&topic);
                     // PIP-180 / ADR-0033: if the client asserted a source-topic
@@ -1044,7 +1608,13 @@ fn handle_frame(
                         .entry(partition)
                         .or_default()
                         .push((ledger_id, entry_id));
-                    emit_send_receipt(out, s.producer_id, s.sequence_id, ledger_id, entry_id);
+                    emit_send_receipt(
+                        out,
+                        s.producer_id,
+                        (s.sequence_id, s.highest_sequence_id),
+                        ledger_id,
+                        entry_id,
+                    );
                 }
             }
         }
@@ -1060,25 +1630,107 @@ fn handle_frame(
                 } else {
                     0
                 };
-                state.lock().consumers.insert(
-                    s.consumer_id,
-                    (
-                        s.topic.clone(),
-                        ConsumerState {
-                            cursor,
-                            subscription: s.subscription.clone(),
-                            ..ConsumerState::default()
-                        },
-                    ),
-                );
+                // Issue #414: a `SubType::Shared` consumer joins the ONE
+                // dispatcher for its `(topic, subscription)` instead of walking
+                // the ledger on its own cursor. Every other subscription type
+                // keeps the historical per-consumer walk verbatim.
+                let shared_key = (s.sub_type == pb::command_subscribe::SubType::Shared as i32)
+                    .then(|| (s.topic.clone(), s.subscription.clone()));
+                // A `CommandSubscribe` for a consumer id that is ALREADY live on this
+                // session. The default model below recreates the slot; a real broker
+                // answers `CommandSuccess` and mutates nothing (see
+                // [`ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`],
+                // which is where that premise is stated and scoped).
+                let live_id_subscribe_is_noop = *deps.live_id_subscribe_is_noop.lock()
+                    && state.lock().consumers.contains_key(&s.consumer_id);
+                if !live_id_subscribe_is_noop {
+                    let mut g = state.lock();
+                    g.consumers.insert(
+                        s.consumer_id,
+                        (
+                            s.topic.clone(),
+                            ConsumerState {
+                                cursor,
+                                subscription: s.subscription.clone(),
+                                shared_key: shared_key.clone(),
+                                ..ConsumerState::default()
+                            },
+                        ),
+                    );
+                    if let Some(key) = shared_key {
+                        let dispatcher = g.shared_dispatchers.entry(key).or_default();
+                        // A re-subscribe of the SAME consumer id (issue #307's
+                        // same-broker re-attach, issue #414's caller-driven
+                        // recovery) must not double-register it in the ring.
+                        // Its in-flight entries stay with it: the client id is
+                        // unchanged, so the broker has not detached anything.
+                        if !dispatcher.attached.contains(&s.consumer_id) {
+                            dispatcher.attached.push(s.consumer_id);
+                        }
+                        // This arm recreates the dispatcher slot at zero permits
+                        // broker-side. That is faithful for a `CommandSubscribe`
+                        // arriving for a consumer id the broker does NOT already
+                        // hold — a reconnect rebuild, a post-seek re-attach, or
+                        // the re-subscribe behind ADR-0108's recovery close.
+                        //
+                        // It is NOT faithful for a re-subscribe naming a consumer
+                        // id that is still live on this session: `ServerCnx
+                        // .handleSubscribe` answers that with a bare
+                        // `CommandSuccess` and touches neither the dispatcher nor
+                        // `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`).
+                        // `ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`
+                        // selects that model explicitly, and the branch above is
+                        // what skips this block when it is armed.
+                        //
+                        // Deliberately NOT credited back to
+                        // `total_available_permits`: the aggregate is credited
+                        // only by `CommandFlow`, and a slot recreated here is
+                        // about to receive one. Since ADR-0108 a recovery closes
+                        // the consumer first, so the aggregate is debited by the
+                        // `CloseConsumer` arm and credited by the re-subscribe's
+                        // grant — one attempt is permit-NEUTRAL, not
+                        // `+receiver_queue_size`.
+                        if let Some((_, c)) = g.consumers.get_mut(&s.consumer_id) {
+                            c.permits = 0;
+                        }
+                    }
+                }
                 emit_success(out, s.request_id);
+                // Issue #427: a real broker follows the subscribe `Success` with
+                // `CommandActiveConsumerChange { is_active: true }` for an
+                // `Exclusive` / `Failover` subscription, in the same write. Both frames
+                // then reach the client in one read, which is what races the sans-io
+                // issue #307 promotion re-arm against the engine's own post-ack
+                // `initial_flow`.
+                if *deps.announce_active_consumer.lock() {
+                    emit_active_consumer_change(out, s.consumer_id, true);
+                }
             }
         }
         pb::base_command::Type::Flow => {
             if let Some(f) = &frame.command.flow {
+                deps.flow_grants
+                    .lock()
+                    .push((f.consumer_id, f.message_permits));
                 let mut g = state.lock();
-                if let Some((_, c)) = g.consumers.get_mut(&f.consumer_id) {
-                    c.permits = c.permits.saturating_add(f.message_permits);
+                let shared_key = g
+                    .consumers
+                    .get_mut(&f.consumer_id)
+                    .map(|(_, c)| {
+                        c.permits = c.permits.saturating_add(i64::from(f.message_permits));
+                        deps.consumer_permits
+                            .lock()
+                            .push((f.consumer_id, c.permits));
+                        c.shared_key.clone()
+                    })
+                    .unwrap_or_default();
+                // ADR-0103's modeled Shared aggregate is credited by the same grant.
+                // This is the only site that raises it; ADR-0108's close-then-re-subscribe
+                // does not make a net repair to a corrupted aggregate.
+                if let Some(key) = shared_key
+                    && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
+                {
+                    dispatcher.total_available_permits += i64::from(f.message_permits);
                 }
             }
         }
@@ -1111,6 +1763,85 @@ fn handle_frame(
                                 let cur = c.cursors.entry(sub).or_insert(0);
                                 *cur = (*cur).max(next);
                             }
+                        }
+                    }
+                }
+                // Issue #414: a Shared dispatcher only redelivers what is still
+                // un-acked, so an ack retires the entry from this consumer's
+                // in-flight set. Without this a consumer that acked everything
+                // and then detached would still hand its whole history back to
+                // the survivors.
+                //
+                // Issue #436 refines "acked" for a BATCHED entry, mirroring a broker with
+                // `acknowledgmentAtBatchIndexLevelEnabled = true`: an individual ack that
+                // names a position inside the entry carries the client's own bitset of
+                // still-unacked positions, which is AND-accumulated into the broker's
+                // (`ManagedCursorImpl.java:2632-2645`). The entry is retired — and the
+                // mark-delete position may advance over it — only once that bitset empties.
+                // A plain entry, and an ack with no `ack_set`, still acknowledge the WHOLE
+                // entry, so every pre-#436 Shared trace behaves exactly as before.
+                {
+                    let mut g = state.lock();
+                    let key = g
+                        .consumers
+                        .get(&a.consumer_id)
+                        .and_then(|(_, c)| c.shared_key.clone());
+                    if let Some(key) = key {
+                        let ledger = topic_ledger(&g, resume, &key.0);
+                        // `entry(..).or_default()` rather than `if let Some(..)`: a consumer
+                        // carries a `shared_key` only because the subscribe path created the
+                        // dispatcher under exactly that key, so the absent arm is unreachable
+                        // — and an `if let` with no `else` makes `cargo llvm-cov` record its
+                        // closing brace as an added never-hit line, failing the ADR-0024
+                        // patch-coverage gate on a line no test could ever green. Same map,
+                        // same idiom as the subscribe path.
+                        let dispatcher = g.shared_dispatchers.entry(key.clone()).or_default();
+                        for id in &a.message_id {
+                            let entry_key = (id.ledger_id, id.entry_id);
+                            let batch_size = ledger
+                                .iter()
+                                .find(|m| m.ledger_id == id.ledger_id && m.entry_id == id.entry_id)
+                                .map_or(0, |m| m.batch_size);
+                            // Written as a value rather than an early `continue`: the
+                            // fall-through of a `{ continue; }` block is a region no execution
+                            // can ever reach, so `cargo llvm-cov` records its closing brace as
+                            // an added never-hit line and the same gate fails on it. Same
+                            // semantics, every line executed.
+                            let entry_fully_acked = if batch_size > 1 && !id.ack_set.is_empty() {
+                                let stored = dispatcher
+                                    .batch_unacked
+                                    .entry(entry_key)
+                                    .or_insert_with(|| fresh_unacked_bits(batch_size));
+                                and_into(stored, &id.ack_set);
+                                bits_empty(stored)
+                            } else {
+                                // A plain entry, and an individual ack carrying no `ack_set`,
+                                // acknowledge the WHOLE entry.
+                                true
+                            };
+                            if entry_fully_acked {
+                                dispatcher.batch_unacked.remove(&entry_key);
+                                dispatcher.fully_acked.insert(entry_key);
+                            }
+                        }
+                        let SharedDispatcher {
+                            in_flight,
+                            fully_acked,
+                            ..
+                        } = &mut *dispatcher;
+                        // Same `entry(..).or_default()` reasoning, and the same idiom the
+                        // redelivery and dispatch paths below already use for this map: a
+                        // Shared ack always comes from an attached consumer, and an empty
+                        // entry is inert because every reader takes it with
+                        // `remove(..).unwrap_or_default()`.
+                        in_flight
+                            .entry(a.consumer_id)
+                            .or_default()
+                            .retain(|m| !fully_acked.contains(&(m.ledger_id, m.entry_id)));
+                        let before = dispatcher.mark_delete;
+                        let after = dispatcher.advance_mark_delete(&ledger);
+                        if after != before {
+                            deps.mark_deletes.lock().push((key.1.clone(), after));
                         }
                     }
                 }
@@ -1256,7 +1987,47 @@ fn handle_frame(
             // RedeliverUnacknowledgedMessages with explicit message ids.
             if let Some(r) = &frame.command.redeliver_unacknowledged_messages {
                 let mut g = state.lock();
-                if let Some((topic, _c)) = g.consumers.get(&r.consumer_id).cloned() {
+                // Issue #436: a `Shared` consumer is served by the subscription's ONE
+                // dispatcher, so its redeliveries belong in that dispatcher's pool — the
+                // per-consumer `nacked` queue below is never read on the Shared path
+                // (`push_pending` skips those consumers), which made an ack-timeout
+                // redelivery a silent no-op and the whole scenario inexpressible.
+                //
+                // Each explicit id maps to its `(ledger, entry)` with the batch index
+                // DROPPED — an entry is the smallest unit a dispatcher redelivers — and the
+                // first id that hits an entry this consumer is actually holding claims it,
+                // removing it from the pending set so the sibling ids of the same batch
+                // collapse into ONE redelivery (`Consumer.java:1266-1292` +
+                // `PendingAcksMap.removeAndGetRemainingUnacked` model). The request itself
+                // changes no permit: it hands work back, it does not grant any.
+                let shared_key = g
+                    .consumers
+                    .get(&r.consumer_id)
+                    .and_then(|(_, c)| c.shared_key.clone());
+                if let Some(key) = shared_key {
+                    // `entry(..).or_default()` for the same reason the ack path above uses it:
+                    // the key exists because the subscribe path created the dispatcher under
+                    // it, and an `if let` with no `else` leaves its closing brace as an added
+                    // never-hit line under `cargo llvm-cov`.
+                    let dispatcher = g.shared_dispatchers.entry(key).or_default();
+                    for id in &r.message_ids {
+                        let entry_key = (id.ledger_id, id.entry_id);
+                        let held = dispatcher.in_flight.entry(r.consumer_id).or_default();
+                        let position = held
+                            .iter()
+                            .position(|m| (m.ledger_id, m.entry_id) == entry_key);
+                        // As a value rather than a `let … else { continue }`, so no
+                        // never-reachable fall-through region is emitted: an id naming an
+                        // entry this consumer is not holding claims nothing, which is what
+                        // collapses the sibling ids of one batch into a single redelivery.
+                        if let Some(position) = position {
+                            let entry = held.remove(position);
+                            let count = dispatcher.redelivery_counts.entry(entry_key).or_insert(0);
+                            *count = count.saturating_add(1);
+                            dispatcher.redelivery.push_back(entry);
+                        }
+                    }
+                } else if let Some((topic, _c)) = g.consumers.get(&r.consumer_id).cloned() {
                     // Pull the matching stored messages and queue them
                     // for redelivery (front-loaded, ahead of cursor).
                     let ledger = g.ledger.get(&topic).cloned().unwrap_or_default();
@@ -1277,13 +2048,94 @@ fn handle_frame(
         }
         pb::base_command::Type::CloseProducer => {
             if let Some(c) = &frame.command.close_producer {
-                state.lock().producers.remove(&c.producer_id);
+                // Issue #406: releasing the `(topic, producer_name)` keys the
+                // closed id holds is the whole point of the close — that is
+                // what frees the name for the next open. A withheld success
+                // for the same id is flushed here as the LATE ack the client
+                // must discard without resurrecting anything.
+                let survives_close = *deps.withhold_registration_survives_close.lock();
+                let released = {
+                    let mut g = state.lock();
+                    if g.unmapped_producer_ids.contains(&c.producer_id) {
+                        None
+                    } else {
+                        g.producers.remove(&c.producer_id);
+                        let creation_pending = g
+                            .withheld_producer_success
+                            .as_ref()
+                            .is_some_and(|(producer_id, _, _)| *producer_id == c.producer_id);
+                        if creation_pending && survives_close {
+                            g.unmapped_producer_ids.insert(c.producer_id);
+                        } else {
+                            g.producer_names.retain(|_, (id, _)| *id != c.producer_id);
+                        }
+                        match g.withheld_producer_success.as_ref() {
+                            Some((producer_id, _, _)) if *producer_id == c.producer_id => {
+                                g.withheld_producer_success.take()
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((_, request_id, producer_name)) = released {
+                    emit_named_producer_success(out, request_id, &producer_name);
+                }
                 emit_success(out, c.request_id);
             }
         }
         pb::base_command::Type::CloseConsumer => {
             if let Some(c) = &frame.command.close_consumer {
-                state.lock().consumers.remove(&c.consumer_id);
+                let mut g = state.lock();
+                let removed = g.consumers.remove(&c.consumer_id);
+                // Issue #414: detaching a Shared consumer returns everything it
+                // was holding un-acked to the subscription's redelivery pool, so
+                // a survivor picks it up. This is the broker half of the
+                // scale-down / mid-drain-recycle window the issue reports.
+                let leak_on_churn = *deps.leak_shared_permits_on_churn.lock();
+                if let Some((_, state)) = removed
+                    && let Some(key) = state.shared_key
+                    && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
+                {
+                    dispatcher.attached.retain(|id| *id != c.consumer_id);
+                    // ADR-0103's model: the subscription aggregate gives
+                    // back what the departing consumer still held. Correct accounting
+                    // subtracts it ONCE — the counter then stays equal to the sum of the
+                    // attached consumers' permits and the dispatch gate never binds.
+                    //
+                    // Armed, the detach subtracts it TWICE. The second subtraction is a
+                    // permit removal for which no credit was ever issued, so it is a
+                    // permanent, unrecoverable-by-the-client leak of exactly the departing
+                    // consumer's remaining permits, per churn event — and once the
+                    // aggregate crosses zero the dispatcher stops serving the survivors
+                    // even though they hold permits and the backlog is non-empty. That is
+                    // the client-visible shape issue #414 reports, and the accounting
+                    // asymmetry the upstream draft asks Pulsar's maintainers to check on
+                    // the Shared-dispatcher churn path. It is a HYPOTHESIS this harness
+                    // makes reproducible, not a verified reading of any broker source.
+                    let returned = state.permits;
+                    dispatcher.total_available_permits -= returned;
+                    if leak_on_churn {
+                        dispatcher.total_available_permits -= returned;
+                    }
+                    // `unwrap_or_default` rather than `if let Some`: a consumer that never
+                    // received anything simply has nothing to hand back, and that is not a
+                    // separate case worth branching on — a dispatcher that redelivered on
+                    // an empty detach would duplicate the backlog on every scale-down.
+                    for m in dispatcher
+                        .in_flight
+                        .remove(&c.consumer_id)
+                        .unwrap_or_default()
+                    {
+                        dispatcher.redelivery.push_back(m);
+                    }
+                    // Keep the round-robin start inside the shrunken ring.
+                    if dispatcher.attached.is_empty() {
+                        dispatcher.next = 0;
+                    } else {
+                        dispatcher.next %= dispatcher.attached.len();
+                    }
+                }
+                drop(g);
                 emit_success(out, c.request_id);
             }
         }
@@ -1295,23 +2147,46 @@ fn handle_frame(
     true
 }
 
+/// The ledger this session serves for `topic`.
+///
+/// In **resume mode** (the drop + redial knob armed) a topic's messages live in
+/// the cross-session store so they survive the redial; in **isolated mode** —
+/// the default for every other trace — they live on this session alone. Both
+/// [`push_pending`]'s per-consumer walk and [`push_pending_shared`]'s Shared
+/// dispatcher make the identical choice, so it is made once here.
+fn topic_ledger(
+    state: &SessionState,
+    resume: Option<&Arc<Mutex<CrossSession>>>,
+    topic: &str,
+) -> Vec<StoredMessage> {
+    match resume {
+        Some(cross) => cross.lock().ledger.get(topic).cloned().unwrap_or_default(),
+        None => state.ledger.get(topic).cloned().unwrap_or_default(),
+    }
+}
+
 fn push_pending(
     state: &Arc<Mutex<SessionState>>,
     out: &mut BytesMut,
     resume: Option<&Arc<Mutex<CrossSession>>>,
+    deps: &SessionDeps,
 ) {
     // Build a snapshot of which consumer is owed how many sends, then
     // emit; this avoids holding the lock across the encode loop.
-    let mut to_push: Vec<(u64, Vec<StoredMessage>)> = Vec::new();
+    let mut to_push: Vec<(u64, Vec<Dispatch>)> = Vec::new();
     {
         let mut g = state.lock();
+        // Issue #414: Shared subscriptions are served by their own dispatcher
+        // (one cursor, round-robin over attached consumers) before the
+        // per-consumer walk below, which then skips them.
+        push_pending_shared(&mut g, resume, deps, &mut to_push);
         // Avoid `clone_into_iter`-style traps: collect ids first.
         let ids: Vec<u64> = g.consumers.keys().copied().collect();
         for cid in ids {
             let Some((topic, c)) = g.consumers.get_mut(&cid) else {
                 continue;
             };
-            if c.permits == 0 {
+            if c.permits <= 0 || c.shared_key.is_some() {
                 continue;
             }
             let topic = topic.clone();
@@ -1319,19 +2194,15 @@ fn push_pending(
             // Drain nacked redeliveries first.
             while c.permits > 0 && !c.nacked.is_empty() {
                 let m = c.nacked.remove(0);
-                batch.push(m);
+                batch.push(plain_dispatch(m));
                 c.permits -= 1;
             }
-            // Then deliver from the cursor. In resume mode the topic's
-            // messages live in the cross-session ledger (so they survive a
-            // redial); in isolated mode they live on this session.
-            let ledger = match resume {
-                Some(cross) => cross.lock().ledger.get(&topic).cloned().unwrap_or_default(),
-                None => g.ledger.get(&topic).cloned().unwrap_or_default(),
-            };
+            // Then deliver from the cursor, out of whichever ledger this
+            // session is serving (see `topic_ledger`).
+            let ledger = topic_ledger(&g, resume, &topic);
             let (_, c) = g.consumers.get_mut(&cid).expect("present");
             while c.permits > 0 && c.cursor < ledger.len() {
-                batch.push(ledger[c.cursor].clone());
+                batch.push(plain_dispatch(ledger[c.cursor].clone()));
                 c.cursor += 1;
                 c.permits -= 1;
             }
@@ -1341,8 +2212,152 @@ fn push_pending(
         }
     }
     for (cid, batch) in to_push {
-        for m in batch {
-            emit_message(out, cid, &m);
+        for dispatch in batch {
+            emit_message(out, cid, &dispatch);
+        }
+    }
+}
+
+/// A first-delivery dispatch of an entry no position of which has been acked: no `ack_set`,
+/// redelivery count zero. Every non-`Shared` subscription type takes this shape
+/// unconditionally, which is what keeps the per-consumer walk's pushed frames byte-identical
+/// to the pre-#436 harness.
+fn plain_dispatch(message: StoredMessage) -> Dispatch {
+    Dispatch {
+        message,
+        ack_set: Vec::new(),
+        redelivery_count: 0,
+    }
+}
+
+/// Dispatch one round for every live Shared subscription (issue #414).
+///
+/// One cursor per `(topic, subscription)`, handed out round-robin to whichever
+/// attached consumers still hold permits, with a detaching consumer's un-acked
+/// entries redelivered ahead of the cursor. Loops until either no attached
+/// consumer has a permit left or the ledger and the redelivery pool are both
+/// exhausted, so one call drains as much as the granted permits allow — exactly
+/// what the per-consumer walk below it does for the other subscription types.
+///
+/// Appends into the caller's `to_push` list so the encode loop stays outside the
+/// state lock, matching [`push_pending`]'s existing shape.
+fn push_pending_shared(
+    g: &mut SessionState,
+    resume: Option<&Arc<Mutex<CrossSession>>>,
+    deps: &SessionDeps,
+    to_push: &mut Vec<(u64, Vec<Dispatch>)>,
+) {
+    let keys: Vec<(String, String)> = g.shared_dispatchers.keys().cloned().collect();
+    for key in keys {
+        let ledger = topic_ledger(g, resume, &key.0);
+        // Pick the next attached consumer holding a permit, starting from where
+        // the previous round stopped so no consumer monopolises the ring.
+        while let Some(dispatcher) = g.shared_dispatchers.get(&key) {
+            if dispatcher.attached.is_empty() {
+                break;
+            }
+            // ADR-0103's modeled aggregate read gate. With correct accounting this can never
+            // be the deciding break — the counter is the sum of the attached consumers'
+            // permits plus a non-negative re-registration drift, so it is non-positive
+            // only when the round-robin scan below would have found nobody anyway. Under
+            // `ScriptedBroker::leak_shared_permits_on_consumer_churn` it becomes the whole
+            // failure: survivors hold permits, the backlog is non-empty, and the
+            // subscription still dispatches nothing.
+            if !dispatcher.dispatch_gate_open() {
+                break;
+            }
+            let ring = dispatcher.attached.clone();
+            let start = dispatcher.next % ring.len();
+            let chosen = (0..ring.len()).find_map(|offset| {
+                let slot = (start + offset) % ring.len();
+                let cid = ring[slot];
+                g.consumers
+                    .get(&cid)
+                    .is_some_and(|(_, c)| c.permits > 0)
+                    .then_some(((slot + 1) % ring.len(), cid))
+            });
+            let Some((next_start, cid)) = chosen else {
+                break;
+            };
+            // Redeliveries (returned by a detached consumer) go out ahead of the
+            // shared cursor; a real broker replays the un-acked backlog first.
+            let dispatch = {
+                let dispatcher = g
+                    .shared_dispatchers
+                    .get_mut(&key)
+                    .expect("checked present above");
+                dispatcher.next = next_start;
+                let entry = if let Some(m) = dispatcher.redelivery.pop_front() {
+                    Some(m)
+                } else if dispatcher.cursor < ledger.len() {
+                    let m = ledger[dispatcher.cursor].clone();
+                    dispatcher.cursor += 1;
+                    Some(m)
+                } else {
+                    None
+                };
+                entry.map(|message| {
+                    let entry_key = (message.ledger_id, message.entry_id);
+                    // Issue #436: a partially-acked entry goes back out as ONE entry
+                    // carrying the positions that are still outstanding, so the consumer
+                    // can skip what it already acknowledged. An entry with no partial-ack
+                    // state carries no `ack_set` at all — the pre-#436 shape.
+                    let ack_set = dispatcher
+                        .batch_unacked
+                        .get(&entry_key)
+                        .map(|bits| bits_to_i64(bits))
+                        .unwrap_or_default();
+                    let redelivery_count = dispatcher
+                        .redelivery_counts
+                        .get(&entry_key)
+                        .copied()
+                        .unwrap_or(0);
+                    Dispatch {
+                        message,
+                        ack_set,
+                        redelivery_count,
+                    }
+                })
+            };
+            let Some(dispatch) = dispatch else {
+                break;
+            };
+            // Issue #436: a dispatch costs one permit per MESSAGE the consumer still owes
+            // for this entry — `batch_size - ackedCount` (`Consumer.java:433-434` model),
+            // and exactly 1 for a plain entry, which is what keeps every pre-#436 trace
+            // byte-identical. The consumer was only required to hold ONE permit to be
+            // eligible, so an entry wider than the balance drives it NEGATIVE: an entry is
+            // the smallest unit a dispatcher can send, and it sends it whole
+            // (`PersistentDispatcherMultipleConsumers.java:910-922` model). That forced
+            // dispatch is legitimate, and the balance is expected to come back as the
+            // consumer's flow catches up — issue #436 is the case where it never does.
+            let debit = {
+                let dispatcher = g
+                    .shared_dispatchers
+                    .get(&key)
+                    .expect("checked present above");
+                let entry_key = (dispatch.message.ledger_id, dispatch.message.entry_id);
+                let batch_size = dispatch.message.batch_size.max(1);
+                i64::from(batch_size - dispatcher.acked_count(entry_key, batch_size))
+            };
+            if let Some((_, c)) = g.consumers.get_mut(&cid) {
+                c.permits -= debit;
+                deps.consumer_permits.lock().push((cid, c.permits));
+            }
+            let dispatcher = g
+                .shared_dispatchers
+                .get_mut(&key)
+                .expect("checked present above");
+            dispatcher.total_available_permits -= debit;
+            dispatcher
+                .in_flight
+                .entry(cid)
+                .or_default()
+                .push(dispatch.message.clone());
+            match to_push.iter_mut().find(|(id, _)| *id == cid) {
+                Some((_, batch)) => batch.push(dispatch),
+                None => to_push.push((cid, vec![dispatch])),
+            }
         }
     }
 }
@@ -1361,6 +2376,7 @@ fn scalable_segment(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::Segme
         created_at_ms: 0,
         sealed_at_ms: None,
         legacy_topic_name: None,
+        entry_bucket_splits: Vec::new(),
     }
 }
 
@@ -1470,6 +2486,7 @@ fn scalable_assignment(epoch: u64, segs: &[u64], topic: &str) -> pb::ScalableCon
                     _ => panic!("unsupported scripted assignment segment {id}"),
                 };
                 pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
                     segment_id: id,
                     hash_start,
                     hash_end,
@@ -1732,15 +2749,93 @@ fn emit_pong(out: &mut BytesMut) {
 }
 
 fn emit_producer_success(out: &mut BytesMut, request_id: u64, _topic: &str) {
+    emit_named_producer_success(out, request_id, "diff-broker");
+}
+
+fn emit_named_producer_success(out: &mut BytesMut, request_id: u64, producer_name: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ProducerSuccess as i32,
         producer_success: Some(pb::CommandProducerSuccess {
             request_id,
-            producer_name: "diff-broker".to_owned(),
+            producer_name: producer_name.to_owned(),
             last_sequence_id: Some(-1),
             schema_version: None,
             topic_epoch: Some(0),
             producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Register a producer open, enforcing `(topic, producer_name)` exclusivity
+/// the way a real broker's `Topic#addProducer` does, and honouring the
+/// withheld-success injection (issue #406).
+///
+/// An unnamed open (`producer_name` absent or empty) is never registered by
+/// name: the broker assigns a unique one, so it cannot collide. A named open
+/// whose key is already held is rejected with `ProducerBusy` and registers
+/// nothing.
+fn answer_producer_open(
+    state: &Arc<Mutex<SessionState>>,
+    p: &pb::CommandProducer,
+    deps: &SessionDeps,
+    out: &mut BytesMut,
+) {
+    let name = p
+        .producer_name
+        .clone()
+        .filter(|candidate| !candidate.is_empty());
+    let epoch = p.epoch.unwrap_or(0);
+    let withhold_name = deps.withhold_producer_success_for_name.lock().clone();
+    let mut g = state.lock();
+    if let Some(name) = name.as_ref() {
+        let key = (p.topic.clone(), name.clone());
+        if let Some(&(owner_id, owner_epoch)) = g.producer_names.get(&key) {
+            if owner_id != p.producer_id || epoch <= owner_epoch {
+                drop(g);
+                emit_producer_busy(out, p.request_id, name);
+                return;
+            }
+            // Successor re-attach: same producer id, strictly higher epoch.
+            // The owner is overwritten in place and the connection maps the id
+            // again.
+            g.producer_names.insert(key, (p.producer_id, epoch));
+            g.unmapped_producer_ids.remove(&p.producer_id);
+            g.producers
+                .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
+            drop(g);
+            emit_named_producer_success(out, p.request_id, name);
+            return;
+        }
+        g.producer_names.insert(key, (p.producer_id, epoch));
+    }
+    g.producers
+        .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
+    if withhold_name.is_some() && withhold_name == name && !g.withhold_fired {
+        g.withhold_fired = true;
+        let effective = name.unwrap_or_default();
+        g.withheld_producer_success = Some((p.producer_id, p.request_id, effective));
+        return;
+    }
+    drop(g);
+    match name {
+        Some(name) => emit_named_producer_success(out, p.request_id, &name),
+        None => emit_producer_success(out, p.request_id, &p.topic),
+    }
+}
+
+/// Encode the broker's `NamingException` — `ProducerBusy` correlated with a
+/// producer-open `request_id`. ADR-0080 classifies it as retryable for
+/// `ProducerOpen`, so an engine that never frees the name burns its retry
+/// budget against a registration that outlives every attempt (issue #406).
+fn emit_producer_busy(out: &mut BytesMut, request_id: u64, producer_name: &str) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Error as i32,
+        error: Some(pb::CommandError {
+            request_id,
+            error: pb::ServerError::ProducerBusy as i32,
+            message: format!("Producer with name '{producer_name}' is already connected to topic"),
         }),
         ..Default::default()
     };
@@ -1790,6 +2885,21 @@ fn emit_lookup_response(out: &mut BytesMut, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
+/// Emit `CommandActiveConsumerChange` for `consumer_id` — the broker's
+/// active/standby election report for an `Exclusive` / `Failover` subscription
+/// (issue #427).
+fn emit_active_consumer_change(out: &mut BytesMut, consumer_id: u64, is_active: bool) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+        active_consumer_change: Some(pb::CommandActiveConsumerChange {
+            consumer_id,
+            is_active: Some(is_active),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
 fn emit_success(out: &mut BytesMut, request_id: u64) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Success as i32,
@@ -1802,10 +2912,14 @@ fn emit_success(out: &mut BytesMut, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
+/// `(sequence_id, highest_sequence_id)` is echoed from the `CommandSend`, as a real broker
+/// does: a batching producer's frame covers `sequence_id..=highest_sequence_id`, and its receipt
+/// must too (issue #860 review). An unbatched send carries no `highest_sequence_id` and keeps
+/// the `Some(0)` every pre-#860 trace was recorded with.
 fn emit_send_receipt(
     out: &mut BytesMut,
     producer_id: u64,
-    sequence_id: u64,
+    (sequence_id, highest_sequence_id): (u64, Option<u64>),
     ledger_id: u64,
     entry_id: u64,
 ) {
@@ -1823,7 +2937,7 @@ fn emit_send_receipt(
                 batch_size: Some(0),
                 first_chunk_message_id: None,
             }),
-            highest_sequence_id: Some(0),
+            highest_sequence_id: Some(highest_sequence_id.unwrap_or(0)),
         }),
         ..Default::default()
     };
@@ -1924,7 +3038,16 @@ fn emit_ack_response(out: &mut BytesMut, consumer_id: u64, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
-fn emit_message(out: &mut BytesMut, consumer_id: u64, stored: &StoredMessage) {
+fn emit_message(out: &mut BytesMut, consumer_id: u64, dispatch: &Dispatch) {
+    let stored = &dispatch.message;
+    // Issue #436: a batched entry is announced the way a real broker announces one — the
+    // packed-message count on the metadata, the same count on the id's `batch_size`, and
+    // `batch_index = -1` because the id addresses the WHOLE entry. `batch_size == 0` (an
+    // unbatched send) reproduces the pre-#436 frame exactly: no `num_messages_in_batch`,
+    // `batch_size: Some(0)`.
+    // Issue #860 review: any declared count is echoed — a one-member batch included, which a
+    // real broker forwards verbatim and a Java consumer reads as a batch.
+    let batched = stored.batch_size > 0;
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Message as i32,
         message: Some(pb::CommandMessage {
@@ -1935,11 +3058,13 @@ fn emit_message(out: &mut BytesMut, consumer_id: u64, stored: &StoredMessage) {
                 partition: Some(-1),
                 batch_index: Some(-1),
                 ack_set: Vec::new(),
-                batch_size: Some(0),
+                batch_size: Some(if batched { stored.batch_size } else { 0 }),
                 first_chunk_message_id: None,
             },
-            redelivery_count: Some(0),
-            ack_set: Vec::new(),
+            redelivery_count: Some(dispatch.redelivery_count),
+            // Bit `i` SET ⇒ position `i` is still unacked, so the consumer must deliver it
+            // and skip the rest. Empty unless this entry has partial-ack state.
+            ack_set: dispatch.ack_set.clone(),
             consumer_epoch: None,
         }),
         ..Default::default()
@@ -1953,6 +3078,9 @@ fn emit_message(out: &mut BytesMut, consumer_id: u64, stored: &StoredMessage) {
         encryption_keys: stored.encryption_keys.clone(),
         encryption_algo: stored.encryption_algo.clone(),
         encryption_param: stored.encryption_param.clone(),
+        num_messages_in_batch: batched.then_some(stored.batch_size),
+        compression: stored.compression,
+        uncompressed_size: stored.uncompressed_size,
         ..Default::default()
     };
     // payload encoding will compute the CRC over [meta_size][meta][payload].

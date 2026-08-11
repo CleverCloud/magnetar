@@ -223,17 +223,20 @@ pub struct ConnectionConfig {
     /// exits on the first I/O error. Mirrors Java's `PulsarClientImpl` reconnect
     /// loop.
     pub supervisor: Option<crate::supervisor::SupervisorConfig>,
-    /// Global publish memory budget in bytes. `0` (the default) disables
-    /// the limit. Runtime engines that honour this enforce a CAS-reserve on
-    /// every `Producer::send` before queueing into the sans-io state
-    /// machine; sends that would push the in-flight bytes past the limit
-    /// are gated by [`memory_limit_policy`](Self::memory_limit_policy).
+    /// Client-wide publish memory budget in bytes. `0` (the default)
+    /// disables the limit. The runtime client builds one
+    /// [`MemoryLimitController`](crate::MemoryLimitController) from this
+    /// field and shares it with every connection it opens (ADR-0111); every
+    /// `Producer::send` reserves against it before queueing into the sans-io
+    /// state machine, and sends that would push the pending bytes past the
+    /// limit are gated by [`memory_limit_policy`](Self::memory_limit_policy).
     /// Mirrors Java `ClientBuilder#memoryLimit`.
     pub memory_limit_bytes: u64,
-    /// Policy applied when the global publish memory budget is exhausted.
-    /// Defaults to [`MemoryLimitPolicy::FailImmediately`] to match the Java
-    /// client default. [`MemoryLimitPolicy::ProducerBlock`] makes the
-    /// runtime park the offending send future on a waker slab until enough
+    /// Policy applied when the client-wide publish memory budget is
+    /// exhausted. Defaults to [`MemoryLimitPolicy::FailImmediately`] to match
+    /// the Java client default. [`MemoryLimitPolicy::ProducerBlock`] makes
+    /// the runtime park the offending send future on the client's
+    /// [`MemoryLimitController`](crate::MemoryLimitController) until enough
     /// budget frees up. Ignored when
     /// [`memory_limit_bytes`](Self::memory_limit_bytes) is `0`.
     pub memory_limit_policy: MemoryLimitPolicy,
@@ -318,9 +321,95 @@ pub struct ConnectionConfig {
     /// `statsIntervalSeconds` later), so this is parity-correct rather
     /// than a rounding artefact.
     pub stats_interval: Option<Duration>,
+    /// Per-consumer stall watchdog window (issue #414). `handle_timeout` surfaces one
+    /// [`ConsumerStalled`](crate::event::ConnectionEvent::ConsumerStalled) event for a
+    /// consumer whose client-accounted balance remained positive over an empty receive queue, in a
+    /// dispatch-eligible state, for this long without a single dispatch unit arriving —
+    /// and exactly one per stall episode, re-armed by the next dispatch. See
+    /// [`ConsumerState::poll_stall`](crate::consumer::ConsumerState::poll_stall).
+    ///
+    /// The connection keepalive of ADR-0058 cannot cover this: a broker whose Shared
+    /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`, so
+    /// `last_activity` never ages and no connection-level deadline ever fires. Issue #414
+    /// is exactly that shape — survivors of a consumer-churn window receive ~20 messages
+    /// then nothing, one ghost consumer with an empty name has broker-reported
+    /// `availablePermits = -177300`, `acks_failed` stays 0, and the client reports no error.
+    ///
+    /// **Default `None` — the mechanism ships disarmed.** Two reasons, both precedented
+    /// here: an armed deadline that never fires still perturbs the moonpool engine's
+    /// simulated wake schedule (the rationale [`Self::ack_response_timeout`] and
+    /// [`Self::stats_interval`] both carry), and ADR-0089 landed its sweep off for exactly
+    /// this reason so the flip could be its own bisectable commit with its own seed sweep.
+    /// There is no Java counterpart forcing a parity value either — the Java client has no
+    /// per-consumer dispatch watchdog.
+    ///
+    /// `Some(Duration::from_secs(30))` is the recommended production value: it matches
+    /// [`Self::keepalive_interval`] and [`Self::ack_response_timeout`], so a stall is
+    /// reported on roughly the cadence at which every other silence on the connection is
+    /// already judged, and it is far longer than any legitimate broker dispatch gap on a
+    /// subscription that holds permits over an empty queue. Shorter windows start
+    /// reporting ordinary idle backlogs; much longer ones defeat the point of a watchdog.
+    ///
+    /// Emitting the event is the only effect **unless**
+    /// [`Self::consumer_stall_auto_recovery`] is also set; otherwise recovery stays an
+    /// explicit
+    /// [`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place).
+    pub consumer_stall_timeout: Option<Duration>,
+    /// Bounded automatic recovery for the stall watchdog (issue #414, ADR-0103):
+    /// the maximum number of in-place re-subscribes
+    /// ([`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place))
+    /// the watchdog may drive **per consumer, per stall streak**.
+    ///
+    /// At most one attempt is made per stall episode, and an episode can only close once
+    /// per [`Self::consumer_stall_timeout`] window, so the bound is a cap on a sequence
+    /// that is already rate-limited to one re-subscribe per window. The counter resets to
+    /// zero on **real progress only** — one broker dispatch unit actually arriving
+    /// (`ConsumerState::record_dispatch_unit`). It deliberately does NOT reset at the
+    /// churn boundaries that zero the permit mirrors, because the recovery's own
+    /// close-and-re-subscribe is one of them and resetting there would make the bound
+    /// infinite.
+    ///
+    /// **Default `None` — off, exactly like [`Self::consumer_stall_timeout`].** It is also
+    /// inert without that knob: no stall window means no stall episode means nothing to
+    /// recover from. `Some(0)` is the same as `None` (a budget of zero attempts).
+    ///
+    /// A consumer the broker has reported as a **Failover standby**
+    /// (`ConsumerState::is_active == Some(false)`, issue #348) is skipped entirely: the
+    /// stall is still reported, but no attempt is made and no budget is spent. A standby
+    /// satisfies the stall predicate exactly as a wedged consumer does and never receives
+    /// the dispatch unit that would reset the budget, so without that skip an armed
+    /// recovery would spend its whole budget on every healthy standby in a failover group.
+    ///
+    /// Each attempt closes this consumer id and re-attaches it on the live socket (ADR-0108
+    /// — a `CommandSubscribe` for a consumer id the broker still holds is a broker-side
+    /// no-op, so the close is what makes the re-attach real), which repairs **this client's
+    /// own slot** in the broker's dispatcher and costs redelivery of whatever it was holding
+    /// un-acked. Issue #414 observed `availablePermits = -177300` on one ghost consumer
+    /// with an empty name while all fresh consumers stopped progressing; no aggregate
+    /// value was captured. An attempt does not lift a corrupted aggregate at all: the close
+    /// returns this consumer's remaining permits and the re-subscribe's grant takes them back,
+    /// so one recovery is permit-NEUTRAL. That is why the bound exists and why it stays small:
+    /// once it is exhausted the client stops and logs the escalation (`pulsar-admin topics
+    /// unload`) rather than acting forever against a fault it cannot repair. A `Failover` or
+    /// non-durable subscription is refused outright, so an armed budget never spends
+    /// anything on one. See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    pub consumer_stall_auto_recovery: Option<u32>,
+    /// Engine-arming slot for the ADR-0048 buggify fault-injection helper
+    /// (ADR-0097 swarm configurations). Default [`crate::Buggify::disabled`]
+    /// — a zero-sized no-op unless the `buggify` Cargo feature is enabled
+    /// AND an engine chooses to honour the slot.
+    ///
+    /// Only the **moonpool** engine reads this field: it installs the
+    /// helper on every connection it constructs (initial dial and every
+    /// supervised re-dial share the config, so the fire-counter map
+    /// survives resets). The tokio engine deliberately ignores the slot,
+    /// preserving ADR-0048's guarantee that production binaries never see
+    /// synthetic faults; `buggify_off_is_nop.rs` pins that contract.
+    pub buggify: crate::Buggify,
 }
 
-/// Policy applied when the configured global publish memory budget is
+/// Policy applied when the configured client-wide publish memory budget is
 /// exhausted. Mirrors Java `org.apache.pulsar.client.api.MemoryLimitPolicy`.
 ///
 /// The proto crate exposes this enum so the runtime engines can read the
@@ -333,14 +422,18 @@ pub enum MemoryLimitPolicy {
     /// Java `MemoryLimitPolicy.FAIL_IMMEDIATELY` (the Java default).
     #[default]
     FailImmediately,
-    /// Park the send future until enough budget frees up. Releases are
-    /// observed via a waker-slab fan-out on the runtime's
-    /// `ConnectionShared`. Mirrors Java `MemoryLimitPolicy.PRODUCER_BLOCK`.
+    /// Park the send future until enough budget frees up. Every release
+    /// anywhere in the client wakes every parked send through the client's
+    /// [`MemoryLimitController`](crate::MemoryLimitController). Mirrors Java
+    /// `MemoryLimitPolicy.PRODUCER_BLOCK`.
     ///
     /// Implemented per
     /// [ADR-0020](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
-    /// — the wait uses a `parking_lot::Mutex<Slab<Waker>>` (not a channel)
-    /// honouring [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
+    /// as amended by
+    /// [ADR-0111](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0111-share-one-memory-limit-controller-per-client.md)
+    /// — the wait uses wakers keyed by never-reused ids behind a
+    /// `parking_lot::Mutex` (not a channel), honouring
+    /// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
     ProducerBlock,
 }
 
@@ -373,7 +466,37 @@ impl Default for ConnectionConfig {
             // the sweep off so this flip could be its own one-line commit,
             // bisectable on its own moonpool seed sweep.
             stats_interval: Some(Duration::from_mins(1)),
+            // Issue #414: the watchdog ships disarmed. It has no Java-parity default to
+            // inherit, and an armed deadline perturbs the moonpool wake schedule even
+            // when it never fires — ADR-0089's precedent is to land the mechanism off so
+            // the flip is its own bisectable commit with its own seed sweep. The
+            // recommended production value is documented on the field.
+            consumer_stall_timeout: None,
+            // Issue #414 / ADR-0103: automatic recovery ships off for the same reason the
+            // watchdog above does, plus one of its own — it acts on the broker, and an
+            // action nobody asked for is not a default. It is inert anyway while
+            // `consumer_stall_timeout` is `None`.
+            consumer_stall_auto_recovery: None,
+            buggify: crate::Buggify::disabled(),
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_limit_config_tests {
+    use super::{ConnectionConfig, MemoryLimitPolicy};
+
+    #[test]
+    fn producer_block_policy_survives_connection_config_clone() {
+        let config = ConnectionConfig {
+            memory_limit_bytes: 64,
+            memory_limit_policy: MemoryLimitPolicy::ProducerBlock,
+            ..ConnectionConfig::default()
+        };
+
+        let cloned = config.clone();
+        assert_eq!(cloned.memory_limit_bytes, 64);
+        assert_eq!(cloned.memory_limit_policy, MemoryLimitPolicy::ProducerBlock,);
     }
 }
 
@@ -392,6 +515,19 @@ mod redirect_url_allow_list_tests {
         assert!(
             cfg.redirect_url_allow_list.is_none(),
             "default must be permissive (None) to preserve pre-allow-list behaviour",
+        );
+    }
+
+    /// ADR-0097: the buggify engine-arming slot defaults to the disarmed
+    /// helper on every build axis, so a config that never touches the
+    /// field cannot inject faults — the ADR-0048 disabled-is-NOP
+    /// contract holds through the new slot.
+    #[test]
+    fn default_buggify_slot_is_disarmed() {
+        let cfg = ConnectionConfig::default();
+        assert!(
+            !cfg.buggify.is_armed(),
+            "ConnectionConfig::default() must carry a disarmed Buggify slot",
         );
     }
 

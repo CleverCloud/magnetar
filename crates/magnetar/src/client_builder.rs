@@ -46,6 +46,12 @@ pub struct ClientBuilder {
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `stats_interval`.
     /// `Some(Duration::ZERO)` is the Java `statsIntervalSeconds = 0` disable.
     stats_interval: Option<Duration>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `None` (watchdog off).
+    /// `Some(Duration::ZERO)` disables it explicitly (issue #414).
+    consumer_stall_timeout: Option<Duration>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `None` (automatic recovery
+    /// off). `Some(0)` disables it explicitly (issue #414, ADR-0103).
+    consumer_stall_auto_recovery: Option<u32>,
     operation_timeout: Option<Duration>,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `Some(30s)`.
@@ -72,6 +78,8 @@ impl Default for ClientBuilder {
             client_version: None,
             keepalive: None,
             stats_interval: None,
+            consumer_stall_timeout: None,
+            consumer_stall_auto_recovery: None,
             operation_timeout: None,
             operation_retry: None,
             ack_response_timeout: None,
@@ -116,23 +124,38 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the global publish memory budget for the client. Mirrors Java
+    /// Set the publish memory budget for the client. Mirrors Java
     /// `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. `bytes = 0`
     /// disables the limit (matches Java default).
     ///
-    /// **Enforcement**: under `MemoryLimitPolicy::FailImmediately`, every
-    /// `Producer::send` reserves the payload bytes against the budget via
-    /// an `AtomicU64` CAS loop on `ConnectionShared::memory_used` BEFORE
-    /// the payload reaches the sans-io state machine. Sends that would
-    /// push past the limit are rejected synchronously with
-    /// [`magnetar_runtime_tokio::ClientError::MemoryLimitExceeded`]. The
-    /// reservation is released on `SendFut` completion (success or
-    /// error) and on cancellation (via `Drop`).
+    /// **One budget per client**: every producer, partition and topic of
+    /// the built client draws on the same bytes, whichever physical
+    /// connection it rides — the bootstrap connection, every
+    /// [`Self::connections_per_broker`] sibling, every proxy pool entry and
+    /// every replacement connection. Separately built clients do not share
+    /// a budget.
     ///
-    /// Under `MemoryLimitPolicy::ProducerBlock`, the send future parks
-    /// on a `Notify`-based wait until the budget frees up — both engines
-    /// (`TokioEngine`, `MoonpoolEngine<P>`) implement this policy; see
-    /// [`docs/memory-limit.md`](https://github.com/FlorentinDUBOIS/magnetar/blob/main/docs/memory-limit.md).
+    /// **Enforcement**: every `Producer::send` reserves the payload bytes
+    /// (after compression and encryption) against the budget with a
+    /// lock-free compare-and-swap BEFORE the payload reaches the sans-io
+    /// state machine. The reservation is held for as long as the client
+    /// retains the publish and released when the broker acknowledges or
+    /// rejects it, when its send times out, or when its producer or
+    /// connection fails it — not when the send future completes or is
+    /// dropped. This is not a limit on the process's memory.
+    ///
+    /// Under `MemoryLimitPolicy::FailImmediately`, a send that would push
+    /// the client past the limit is rejected synchronously with
+    /// [`magnetar_runtime_tokio::ClientError::MemoryLimitExceeded`]. Under
+    /// `MemoryLimitPolicy::ProducerBlock`, the send future parks until a
+    /// release anywhere in the client makes room. A parked send whose future
+    /// is dropped before it reserved is cancelled and never published, and a
+    /// fire-and-forget producer (dropping the futures `send` returns) reaches
+    /// that state once its in-flight publishes fill the budget: await the
+    /// future, or use `FailImmediately` and observe the error — both engines
+    /// (`TokioEngine`, `MoonpoolEngine<P>`) implement both policies; see
+    /// [`docs/memory-limit.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/memory-limit.md)
+    /// and [ADR-0111](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0111-share-one-memory-limit-controller-per-client.md).
     #[must_use]
     pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
         self.memory_limit = Some(MemoryLimit { bytes, policy });
@@ -219,6 +242,83 @@ impl ClientBuilder {
     #[must_use]
     pub fn stats_interval(mut self, dur: Duration) -> Self {
         self.stats_interval = Some(dur);
+        self
+    }
+
+    /// Arm the per-consumer stall watchdog (issue #414).
+    ///
+    /// A consumer whose client-accounted balance remains positive over an empty receive queue, in a
+    /// dispatch-eligible state, for `dur` without a single dispatch unit arriving surfaces
+    /// one `warn!` and one
+    /// [`ConnectionEvent::ConsumerStalled`](magnetar_proto::event::ConnectionEvent::ConsumerStalled)
+    /// — exactly one per stall episode, re-armed by the next dispatch. That is its only
+    /// effect unless [`Self::consumer_stall_auto_recovery`] is also set; otherwise
+    /// recovery stays an explicit call to `Consumer::resubscribe()`, escalating to an
+    /// operator-side `pulsar-admin topics unload` for a dispatcher-wide broker fault.
+    ///
+    /// This is the one silence the ADR-0058 connection keepalive cannot see: a broker whose
+    /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`.
+    ///
+    /// **Unset by default** — the mechanism ships disarmed, since an armed deadline
+    /// perturbs the moonpool engine's simulated wake schedule even when it never fires, and
+    /// Java has no per-consumer dispatch watchdog to inherit a parity value from.
+    /// `Duration::from_secs(30)` is the recommended production value: it matches the
+    /// keepalive and ack-response cadences, and is far longer than any legitimate dispatch
+    /// gap on a subscription that holds permits over an empty queue.
+    ///
+    /// `Duration::ZERO` disables it explicitly, mirroring how
+    /// [`Self::stats_interval`] spells its disable.
+    #[must_use]
+    pub fn consumer_stall_timeout(mut self, dur: Duration) -> Self {
+        self.consumer_stall_timeout = Some(dur);
+        self
+    }
+
+    /// Let the stall watchdog attempt an in-place re-attach after reporting consumer
+    /// silence, at most `max_attempts` times per stall streak (issue #414, ADR-0103).
+    ///
+    /// Each attempt follows `Consumer::resubscribe()` and ADR-0108 on the live connection:
+    /// send `CommandCloseConsumer` and wait for its broker `Success`; only then zero this
+    /// client's permit mirrors, fail orphaned in-flight acks, and send `CommandSubscribe`
+    /// for the same consumer id. Its separate `Success` releases the initial `CommandFlow`.
+    /// A rejected close leaves the client state unchanged. No transport reconnect or other
+    /// consumer or producer is disturbed; the receiver queue stays intact, while the
+    /// broker may redeliver unacked entries detached with the old slot.
+    ///
+    /// The `ConsumerStalled` event and its `warn!` are emitted either way, so arming this
+    /// adds a recovery attempt without ever hiding the diagnosis.
+    ///
+    /// **Requires [`Self::consumer_stall_timeout`]** — with no window there is no stall
+    /// episode, and this knob is inert. **Unset by default**, and `0` disables it
+    /// explicitly, mirroring how [`Self::consumer_stall_timeout`] spells its disable.
+    ///
+    /// # Choosing the bound
+    ///
+    /// At most one attempt is made per stall episode and an episode closes at most once
+    /// per `consumer_stall_timeout`, so `max_attempts` caps a sequence already limited to
+    /// one re-subscribe per window: with a 30 s window, `3` spends at most three
+    /// re-subscribes over ninety seconds before giving up. The counter resets on **real
+    /// progress only** — one broker dispatch unit actually arriving — so a consumer that
+    /// recovers and later wedges again gets its full budget back, while a consumer the
+    /// broker acks but never dispatches to does not.
+    ///
+    /// Keep it small. An attempt repairs **this client's own slot** in the broker's
+    /// dispatcher and nothing wider: since ADR-0108 it closes the consumer id and
+    /// re-attaches it, which is permit-NEUTRAL on the subscription's aggregate counter —
+    /// the close returns this consumer's remaining permits and the re-subscribe's grant
+    /// takes them back. Attempts therefore do not accumulate toward repairing a
+    /// dispatcher-wide failure. Issue #414 observed `-177300` on one ghost consumer,
+    /// not on the subscription aggregate. When the budget
+    /// is exhausted the client stops and logs the escalation — `pulsar-admin topics
+    /// unload` — instead of acting forever against a fault it cannot repair.
+    ///
+    /// It is also no longer free: the close is real, so anything the consumer was holding
+    /// un-acked is redelivered. Arm it where a duplicate is cheaper than a wedge. A
+    /// `Failover` or non-durable subscription is refused outright and never spends any of
+    /// the budget. See [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    #[must_use]
+    pub fn consumer_stall_auto_recovery(mut self, max_attempts: u32) -> Self {
+        self.consumer_stall_auto_recovery = Some(max_attempts);
         self
     }
 
@@ -437,6 +537,17 @@ impl ClientBuilder {
         if let Some(d) = self.stats_interval {
             config.stats_interval = (d != Duration::ZERO).then_some(d);
         }
+        // Issue #414: same zero-disables shape as `stats_interval` above. Unset leaves
+        // `ConnectionConfig::default()`'s `None` — the watchdog is opt-in.
+        if let Some(d) = self.consumer_stall_timeout {
+            config.consumer_stall_timeout = (d != Duration::ZERO).then_some(d);
+        }
+        // ADR-0103: the same zero-disables shape one knob up, spelled in attempts rather
+        // than in a `Duration`. Unset leaves `ConnectionConfig::default()`'s `None`, and
+        // the whole mechanism is inert anyway without `consumer_stall_timeout`.
+        if let Some(n) = self.consumer_stall_auto_recovery {
+            config.consumer_stall_auto_recovery = (n != 0).then_some(n);
+        }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;
         }
@@ -456,16 +567,17 @@ impl ClientBuilder {
         if let Some(sv) = self.supervisor {
             config.supervisor = Some(sv);
         }
-        // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime so
-        // `Producer::send` reserves payload bytes against `ConnectionShared::memory_limit_bytes`
-        // before queueing. Both `FailImmediately` and `ProducerBlock` are honored by the
-        // tokio and moonpool engines (the latter parks the send future on a `Notify` wait
-        // until the budget frees up).
+        // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime. The
+        // bootstrap connection builds the client-wide `MemoryLimitController` from these two
+        // fields and the runtime client shares it with every pooled connection (ADR-0111), so
+        // `Producer::send` reserves payload bytes against one budget before queueing. Both
+        // `FailImmediately` and `ProducerBlock` are honored by the tokio and moonpool engines.
         if let Some(limit) = self.memory_limit {
             // Cast saturates rather than truncates so a 64-bit limit on a 32-bit usize host
             // (effectively impossible — magnetar requires 64-bit pointers — but cheap to
             // future-proof) stays correct.
             config.memory_limit_bytes = limit.bytes as u64;
+            config.memory_limit_policy = limit.policy.into();
         }
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;
@@ -579,7 +691,19 @@ mod tests {
     use magnetar_proto::{AuthError, AuthProvider, OperationRetryConfig};
 
     use super::ClientBuilder;
-    use crate::PulsarError;
+    use crate::{MemoryLimitPolicy, PulsarError};
+
+    #[test]
+    fn memory_limit_policy_converts_exhaustively_to_proto() {
+        assert_eq!(
+            magnetar_proto::MemoryLimitPolicy::from(MemoryLimitPolicy::FailImmediately),
+            magnetar_proto::MemoryLimitPolicy::FailImmediately,
+        );
+        assert_eq!(
+            magnetar_proto::MemoryLimitPolicy::from(MemoryLimitPolicy::ProducerBlock),
+            magnetar_proto::MemoryLimitPolicy::ProducerBlock,
+        );
+    }
 
     /// Stub provider whose `initial()` returns `Err(AuthError::Invalid)`.
     /// Models an unwarmed `OAuth2` cache, a missing token file, or any other

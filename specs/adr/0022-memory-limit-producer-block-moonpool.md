@@ -1,6 +1,6 @@
 # ADR-0022 — `MemoryLimitPolicy::ProducerBlock` on the moonpool engine
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0111](0111-share-one-memory-limit-controller-per-client.md): the moonpool engine now drives the same client-wide `magnetar_proto::MemoryLimitController` as the tokio engine, which wakes parked sends in registration order — the eventual-progress test contract remains binding)
 - **Date**: 2026-05-22
 - **Decider**: Florentin Dubois
 - **Tags**: memory-limit, back-pressure, moonpool, sans-io, no-channels, java-parity

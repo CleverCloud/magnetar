@@ -122,7 +122,7 @@ Any change that alters runtime behavior, public API, wire format, or touches `ma
    Owning product features still gate feature-specific targets (`e2e_scalable_topic.rs` requires `scalable-topics`); `cargo test --workspace --all-features` activates them all on every CI push, and a host without Docker fails instead of skipping ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)).
 
 **Sim coverage** — every line the diff (`merge-base origin/main HEAD`) adds inside the gate's reported scope must be executed by the moonpool run: **100% line coverage on the diff**. Measured by `cargo run -p xtask -- check-sim-coverage`, which drives `cargo llvm-cov` to the LCOV report `target/sim-coverage.lcov` and intersects it with the merge-base diff.
-Execution and report share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem; `target/sim-coverage.lcov` is output-only, and no profile or object input is reused across passes ([ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md)).
+Execution and report share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem; `target/sim-coverage.lcov` is output-only, and no profile or object input is reused across passes ([ADR-0118](specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md)).
 The requirement on the author is hard, and since [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) the gate's enforcement of it is too — see **Enforcing landing** below.
 
 Execution scope and report scope are two different sets, and the distinction is binding:
@@ -139,14 +139,14 @@ Execution scope and report scope are two different sets, and the distinction is 
 
 The `magnetar` façade library and `magnetar-fakes` are in the reported and hard-gated set because `magnetar-differential` now compiles and exercises both.
 Execution still selects only the Moonpool and differential test targets, so the façade's Docker-bound `crates/magnetar/tests/e2e_*.rs` targets do not run under coverage.
-Additions in `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and any other uncompiled package still print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) as amended by [ADR-0098](specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md).
+Additions in `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and any other uncompiled package still print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) as amended by [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md).
 That holds under `--enforce` too: the ungated report is a scope limit, not a verdict, so no flag turns it fatal. See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the policy the gate serves.
 
 **Enforcing landing** — `SIM_COVERAGE_ENFORCES_UNCOVERED = true` in `xtask/src/main.rs`, so an uncovered added line inside the reported scope is printed in full, with a count, and **fails** the check ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)).
 A green `check-sim-coverage` is therefore evidence of the 100%-on-the-diff requirement above, for the lines in the reported scope — and still says nothing about anything outside it, which is what the `not gated` lines are for.
 The gate ran advisory from [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) until ADR-0092, for one reason worth remembering: it had no per-PR home, so enforcing it would have changed nothing.
 `.github/workflows/xtask-gates.yml` ran it on a daily cron against `main`, where the merge-base is `HEAD`, the diff is empty and the check short-circuits with "nothing to verify" before building anything.
-ADR-0092 landed both halves together — the flip, and a `check-sim-coverage` job in [`ci.yml`](.github/workflows/ci.yml) on every `pull_request`.
+ADR-0092 landed both halves together — the flip, and a `check-sim-coverage` job in [`ci.yml`](.github/workflows/ci.yml). It covers pull requests targeting `main`; [`xtask-gates.yml`](.github/workflows/xtask-gates.yml) covers other PR targets, daily cron and manual dispatch. Runtime test parity and the 16-cell crypto build matrix run in `xtask-gates.yml` on every PR; the crypto gate is build-only.
 Making that job actually block a merge is a branch-protection step in repository settings, not in this tree; `main` had no protection at all as of 2026-08-01, so treat a red run as a real verdict that a human can still merge past (ADR-0092 § Required check).
 `--enforce` now only ORs into the constant, so it is redundant; it is retained because existing invocations keep working, the CI job passes it to state its own intent, and it stays the explicit way to ask for the verdict if the constant is ever flipped back.
 Because the flag would mask exactly that regression, the constant is pinned outside the CI job by a `const` assertion in `sim_coverage_enforces_uncovered_by_default`: reverting the flip stops the `xtask` **test** build compiling (`cargo test` / `clippy --all-targets`, both of which CI runs workspace-wide), while a plain `cargo build` is unaffected since the assertion lives in a `#[cfg(test)]` module.
@@ -163,8 +163,7 @@ A record-less file with no non-test function body stays advisory because module/
   Hard requirement.
 
 **Seed sweep** — the local validation pass runs `MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for `seed ∈ 1..32` to catch seed-dependent flakiness in the deterministic-simulation suite.
-**CI cadence is different**: per [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md), the sweep runs **daily** with **128 freshly-rolled random seeds in parallel** in [`.github/workflows/moonpool-seed-sweep.yml`](.github/workflows/moonpool-seed-sweep.yml), not on every PR / push.
-Reason: fixed `(commit, seed)` pairs are bit-for-bit reproducible, so re-running them on every PR is wasted compute — random seeds rolled daily cover the seed space far better over time.
+[performance.yml](.github/workflows/performance.yml) replays the complete no-buggify Moonpool package for fixed seeds 1..32 plus the deduplicated open anchors from both exact references nightly on `main` and on manual dispatch ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md)); `ci.yml`'s `seed-replay` replays the open anchors on every PR. The daily 128-random-seed sweep remains additive discovery, as amended in [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md). Coverage, resource scope and execution limits are documented in [performance.md](docs/performance.md).
 
 **Exemptions** — docs-only, comment-only, formatter-only, and dependency bumps with no functional impact.
 Author justifies in the commit message; reviewer enforces.

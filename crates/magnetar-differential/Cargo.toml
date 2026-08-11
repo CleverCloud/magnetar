@@ -41,14 +41,19 @@ buggify = [
 ]
 
 [dependencies]
-magnetar-proto            = { workspace = true }
+magnetar-proto            = { workspace = true , features = ["schema-avro"] }
 magnetar-runtime-tokio    = { workspace = true }
 magnetar-runtime-moonpool = { workspace = true }
 bytes                     = { workspace = true }
 moonpool-core             = { workspace = true }
+# Issue #436: `trace::pack_batch_body` frames a batched entry's packed
+# `SingleMessageMetadata` body the way a real producer does, so both runners can
+# publish one from an `Op::SendBatch`. Already in this crate's graph — it was a
+# `[dev-dependencies]` entry here (PIP-33 marker encoding) and is a hard dependency
+# of `magnetar-proto`; this promotes the existing entry rather than adding a crate.
+prost                     = { workspace = true }
 parking_lot               = { workspace = true }
-tokio                     = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
-tracing                   = { workspace = true }
+tokio                     = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 
 [dev-dependencies]
 magnetar-driver = { workspace = true, default-features = false, features = ["tokio", "moonpool", "crypto-aws-lc-rs"] }
@@ -85,3 +90,4 @@ zstd = { workspace = true }
 # CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).
 # Dev-only; never compiled into the harness library itself.
 tracing-subscriber = { workspace = true }
+tracing            = { workspace = true }

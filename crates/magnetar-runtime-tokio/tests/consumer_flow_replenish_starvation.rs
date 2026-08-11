@@ -67,6 +67,14 @@ const BACKLOG: u64 = (RECEIVER_QUEUE_SIZE as u64) * 10;
 /// genuinely starved.
 const RECV_GUARD: Duration = Duration::from_secs(10);
 
+/// How long the issue #426 regression lets the socket settle once the FIRST
+/// initial-grant `CommandFlow` has landed, before it reads the broker's permit
+/// total. A redundant second grant is encoded into the same connection buffer
+/// under the same lock and rides the same driver flush, so it is already on the
+/// wire when the first one becomes observable — the window only removes any
+/// dependence on how the kernel happened to segment that one write.
+const GRANT_SETTLE: Duration = Duration::from_millis(250);
+
 /// Connection config with a keepalive far longer than the test runtime, so the
 /// keepalive timer never wakes the driver to flush a stranded flow (see module
 /// docs).
@@ -93,7 +101,7 @@ struct BrokerStats {
 /// - CONNECT  -> CONNECTED
 /// - PING     -> PONG
 /// - LOOKUP   -> Connect (serve here)
-/// - SUBSCRIBE-> Success, then `ActiveConsumerChange{is_active:true}` (active)
+/// - SUBSCRIBE-> Success, then (when `announce_active`) `ActiveConsumerChange{is_active:true}`
 /// - FLOW     -> add `message_permits` to the budget, then dispatch backlog entries one-per-permit
 ///   until the budget hits zero or the backlog drains.
 /// - ACK      -> (when `ack_response`) reply `CommandAckResponse` echoing the request id, so the
@@ -102,10 +110,17 @@ struct BrokerStats {
 /// The broker NEVER dispatches without a positive permit budget — so if the
 /// client stops sending `CommandFlow`, the broker goes quiet and the consumer
 /// wedges.
+///
+/// `announce_active` is off in the issue #426 grant-count regression and on in the issue
+/// #427 one. The issue #307 promotion re-arm (`Connection`'s `ActiveConsumerChange` arm) is
+/// a second, independent grant site, so counting permits with it in play would have
+/// measured two bugs at once while #426 was still open; with #426 fixed, turning it on is
+/// exactly how #427's own double grant becomes visible.
 async fn serve_failover_flow_strict_broker(
     mut stream: TcpStream,
     backlog: u64,
     ack_response: bool,
+    announce_active: bool,
     stats: Arc<BrokerStats>,
 ) {
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -186,15 +201,17 @@ async fn serve_failover_flow_strict_broker(
                         };
                         let _ = encode_command(&mut out, &success);
                         // Failover: tell the client it is the ACTIVE consumer.
-                        let active = pb::BaseCommand {
-                            r#type: pb::base_command::Type::ActiveConsumerChange as i32,
-                            active_consumer_change: Some(pb::CommandActiveConsumerChange {
-                                consumer_id,
-                                is_active: Some(true),
-                            }),
-                            ..Default::default()
-                        };
-                        let _ = encode_command(&mut out, &active);
+                        if announce_active {
+                            let active = pb::BaseCommand {
+                                r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+                                active_consumer_change: Some(pb::CommandActiveConsumerChange {
+                                    consumer_id,
+                                    is_active: Some(true),
+                                }),
+                                ..Default::default()
+                            };
+                            let _ = encode_command(&mut out, &active);
+                        }
                     }
                 }
                 pb::base_command::Type::Flow => {
@@ -264,7 +281,6 @@ async fn serve_failover_flow_strict_broker(
                     producer_name: "backlog".to_owned(),
                     sequence_id: entry,
                     publish_time: 0,
-                    num_messages_in_batch: Some(1),
                     ..Default::default()
                 };
                 let _ = encode_payload(&mut out, &msg, &meta, format!("entry-{entry}").as_bytes());
@@ -304,7 +320,7 @@ async fn failover_no_ack_drains_full_backlog_without_wedge() {
     let port = listener.local_addr().expect("local_addr").port();
     let broker = tokio::spawn(async move {
         if let Ok((stream, _peer)) = listener.accept().await {
-            serve_failover_flow_strict_broker(stream, BACKLOG, false, broker_stats).await;
+            serve_failover_flow_strict_broker(stream, BACKLOG, false, true, broker_stats).await;
         }
     });
 
@@ -376,7 +392,7 @@ async fn failover_with_ack_drains_full_backlog_without_wedge() {
     let port = listener.local_addr().expect("local_addr").port();
     let broker = tokio::spawn(async move {
         if let Ok((stream, _peer)) = listener.accept().await {
-            serve_failover_flow_strict_broker(stream, BACKLOG, true, broker_stats).await;
+            serve_failover_flow_strict_broker(stream, BACKLOG, true, true, broker_stats).await;
         }
     });
 
@@ -425,6 +441,161 @@ async fn failover_with_ack_drains_full_backlog_without_wedge() {
     assert_eq!(
         received, BACKLOG,
         "the Failover consumer must drain the entire backlog",
+    );
+
+    client.close().await;
+    broker.abort();
+}
+
+/// Block until the broker has counted at least one `CommandFlow`, or panic at
+/// `RECV_GUARD`. The initial grant is queued while `subscribe()` is resolving
+/// and flushed by the driver task afterwards, so "subscribe resolved" is not
+/// yet "the broker has seen the grant".
+async fn wait_for_first_grant(stats: &BrokerStats) {
+    let deadline = tokio::time::Instant::now() + RECV_GUARD;
+    while stats.flow_permits_granted.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the broker never observed the initial CommandFlow within {RECV_GUARD:?}",
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// REGRESSION (issue #426 — the initial grant is issued EXACTLY once).
+///
+/// Both fresh-subscribe paths used to grant the initial permits TWICE: the
+/// sans-io `Connection::initial_flow` emitted the `CommandFlow` and updated the
+/// client-side mirrors, and a raw `Connection::flow(handle, receiver_queue_size)`
+/// immediately behind it emitted a second, wire-only frame that no mirror
+/// accounted for. The broker therefore held `2 × receiver_queue_size` permits
+/// while `available_permits()` and `FlowStats` reported `1 ×`, so the consumer
+/// could be handed twice the messages its own queue was sized for and the
+/// client's view of the broker's balance was wrong from the first frame.
+///
+/// The broker here holds an EMPTY backlog, so it never spends a permit and its
+/// running total is exactly what the client granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_grants_initial_permits_exactly_once() {
+    let stats = Arc::new(BrokerStats::default());
+    let broker_stats = stats.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
+    let port = listener.local_addr().expect("local_addr").port();
+    let broker = tokio::spawn(async move {
+        if let Ok((stream, _peer)) = listener.accept().await {
+            serve_failover_flow_strict_broker(stream, 0, false, false, broker_stats).await;
+        }
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("client connect");
+    let client = Client::from_socket(stream, long_keepalive_config())
+        .await
+        .expect("handshake");
+
+    let consumer = tokio::time::timeout(
+        RECV_GUARD,
+        client.subscribe(magnetar_proto::SubscribeRequest {
+            topic: "persistent://public/default/initial-grant-once".to_owned(),
+            subscription: "initial-grant-once-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            receiver_queue_size: RECEIVER_QUEUE_SIZE,
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe ok");
+
+    wait_for_first_grant(&stats).await;
+    tokio::time::sleep(GRANT_SETTLE).await;
+
+    assert_eq!(
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+        RECEIVER_QUEUE_SIZE as u64,
+        "a fresh subscribe must grant the receiver-queue size EXACTLY once (issue #426); \
+         the broker observed {} permit(s) against a configured {RECEIVER_QUEUE_SIZE}",
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        u64::from(consumer.available_permits()),
+        RECEIVER_QUEUE_SIZE as u64,
+        "the client-side balance must equal what the broker was actually granted",
+    );
+
+    client.close().await;
+    broker.abort();
+}
+
+/// REGRESSION (issue #427 — the active announcement does not add a second grant).
+///
+/// A real broker answers an `Exclusive` / `Failover` subscribe with `CommandSuccess` and
+/// then `CommandActiveConsumerChange { is_active: true }` right behind it — which is what
+/// `announce_active` turns on here, and what the issue #426 test above deliberately left
+/// off to isolate one bug at a time.
+///
+/// Both frames arrive in one read, so the sans-io layer's issue #307 promotion re-arm runs
+/// inside `handle_bytes` while this task is still parked on `subscribe()`; `granted_permits`
+/// is legitimately `0` at that instant, so its gate passes. The engine then issued its own
+/// post-ack `initial_flow` on top, and the broker held `2 × receiver_queue_size` for a fresh
+/// consumer — measured 32 against a configured 16 — while `available_permits()` reported
+/// `1 ×`.
+///
+/// The broker holds an EMPTY backlog, so it never spends a permit and its running total is
+/// exactly what the client granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_active_announcement_does_not_double_the_initial_grant() {
+    let stats = Arc::new(BrokerStats::default());
+    let broker_stats = stats.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
+    let port = listener.local_addr().expect("local_addr").port();
+    let broker = tokio::spawn(async move {
+        if let Ok((stream, _peer)) = listener.accept().await {
+            serve_failover_flow_strict_broker(stream, 0, false, true, broker_stats).await;
+        }
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("client connect");
+    let client = Client::from_socket(stream, long_keepalive_config())
+        .await
+        .expect("handshake");
+
+    let consumer = tokio::time::timeout(
+        RECV_GUARD,
+        client.subscribe(magnetar_proto::SubscribeRequest {
+            topic: "persistent://public/default/active-change-grant-once".to_owned(),
+            subscription: "active-change-grant-once-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RECEIVER_QUEUE_SIZE,
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe ok");
+
+    wait_for_first_grant(&stats).await;
+    tokio::time::sleep(GRANT_SETTLE).await;
+
+    assert_eq!(
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+        RECEIVER_QUEUE_SIZE as u64,
+        "a Failover subscribe whose ack is followed by ActiveConsumerChange{{active}} must \
+         still grant the receiver-queue size EXACTLY once (issue #427); the broker observed \
+         {} permit(s) against a configured {RECEIVER_QUEUE_SIZE}",
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        u64::from(consumer.available_permits()),
+        RECEIVER_QUEUE_SIZE as u64,
+        "the client-side balance must equal what the broker was actually granted",
     );
 
     client.close().await;
@@ -644,7 +815,6 @@ async fn serve_failover_broker_close_midstream(
                     producer_name: "backlog".to_owned(),
                     sequence_id: entry,
                     publish_time: 0,
-                    num_messages_in_batch: Some(1),
                     ..Default::default()
                 };
                 let _ = encode_payload(&mut out, &msg, &meta, format!("entry-{entry}").as_bytes());

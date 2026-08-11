@@ -373,7 +373,6 @@ async fn serve_single_message_broker_conn(stream: &mut TcpStream) {
                         producer_name: "stats-hist-live-broker".to_owned(),
                         sequence_id: 1,
                         publish_time: 0,
-                        num_messages_in_batch: Some(1),
                         ..Default::default()
                     };
                     let _ = encode_payload(&mut out_buf, &msg_cmd, &metadata, b"live-hist-payload");

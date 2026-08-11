@@ -47,6 +47,13 @@
 //! send futures stay pending across the reset until the replayed
 //! `CommandSendReceipt` lands (at-least-once publish parity with the Java client).
 //!
+//! Stage 3 is the RECONNECT path only. A broker `CommandCloseConsumer` or
+//! `CommandCloseProducer` that arrives on a connection which stays up never
+//! reaches it: the sans-io layer re-attaches that single handle in place on the
+//! same socket (issue #307 for consumers, issue #451 / ADR-0106 for producers)
+//! and this driver only flushes the frames that re-attach encoded during
+//! `handle_bytes`.
+//!
 //! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 //! [`Transport`]: crate::transport::Transport
 
@@ -111,6 +118,25 @@ fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
 fn notify_scalable_waiters(shared: &ConnectionShared) {
     shared.scalable_notify.notify_waiters();
     shared.scalable_routes.notify_waiters();
+}
+
+/// Wake every accessor that parks on a per-client buffer's `Notify` and promises
+/// `None` or an error once the connection closes (`next_scalable_event`,
+/// `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_topic_list_change`,
+/// `next_replicated_subscription_marker`).
+///
+/// Such a waiter only re-checks `is_closed()` when it is woken, and a dead
+/// connection pushes no further event, so every path that marks the connection
+/// disconnected must call this or the waiter parks forever. Keeping the pulses
+/// in one place is what stops a new waiter's `Notify` from being left out of
+/// one of those paths.
+fn wake_close_waiters(shared: &ConnectionShared) {
+    #[cfg(feature = "scalable-topics")]
+    notify_scalable_waiters(shared);
+    shared.topic_list_notify.notify_waiters();
+    shared
+        .replicated_subscription_marker_notify
+        .notify_waiters();
 }
 
 /// Drain the connection's semantic event queue of events the *driver* must
@@ -197,6 +223,7 @@ fn handle_pending_events(
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
                     | ConnectionEvent::ActiveConsumerChanged { .. }
+                    | ConnectionEvent::ConsumerStalled { .. }
                     | ConnectionEvent::LookupResponse {
                         result: magnetar_proto::LookupOutcome::Redirected { .. },
                         ..
@@ -473,8 +500,24 @@ fn handle_pending_events(
             // `record_active_change` under the per-slot lock, NOT by this
             // event queue — draining it here only stops it from piling up
             // unbounded in the proto queue, which nothing else polls.
+            //
+            // `ConsumerStalled` (issue #414) is drained the same way: the proto
+            // layer's `handle_timeout` watchdog holds the full context (permit
+            // balance, silence duration) and emits the `warn!` at the point of
+            // detection, so a second log here would double-report. Draining
+            // stops it accumulating in the proto queue, which nothing else
+            // polls; the event stays observable to a caller driving the state
+            // machine directly, and the recovery surface a user reaches for is
+            // `Consumer::available_permits` + `Consumer::resubscribe`.
+            //
+            // ADR-0103's bounded automatic recovery does NOT live here either:
+            // `ClientBuilder::consumer_stall_auto_recovery` drives it inside the
+            // same proto `handle_timeout` sweep that raised the event, so both
+            // engines inherit identical behaviour with no per-engine attempt
+            // bookkeeping to drift. This arm stays a pure drain.
             ConnectionEvent::ChecksumMismatch { .. } => {}
             ConnectionEvent::ActiveConsumerChanged { .. } => {}
+            ConnectionEvent::ConsumerStalled { .. } => {}
             ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }
@@ -1291,7 +1334,15 @@ where
         // so the two share one definition of "the last reconnect counted as
         // stable". A socket that died inside `drop_grace` (or never handshaked
         // at all, behind a TCP-accepting proxy) resets neither.
-        let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
+        let backoff = backoff.get_or_insert_with(|| {
+            let mut b = cfg.build_backoff(seed);
+            // ADR-0097: share the connection's buggify helper (armed from the
+            // ConnectionConfig slot, or the disabled default) so the
+            // `retry_clock.skew` label draws from the same RNG + fire-counter
+            // map as the connection's three choice points, per ADR-0048.
+            b.install_buggify(shared.inner.lock().buggify().clone());
+            b
+        });
         // ADR-0011: route the elapsed-duration computation through the
         // engine-supplied clock instead of `Instant::elapsed()` (which
         // implicitly reads the host `Instant::now`). Under `SimProviders`
@@ -1646,11 +1697,10 @@ where
                     Ok(n) => n,
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
-                        // Wake anything parked on a scalable wait loop: those only
-                        // re-check `is_closed()` when a scalable event arrives, so a
-                        // dead connection would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        notify_scalable_waiters(&shared);
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         return Err(err.into());
                     }
                 };
@@ -1662,11 +1712,10 @@ where
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();
-                        // Wake anything parked on a scalable wait loop: those only
-                        // re-check `is_closed()` when a scalable event arrives, so a
-                        // dead connection would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        notify_scalable_waiters(&shared);
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1713,11 +1762,10 @@ where
                 let handle_result = shared.inner.lock().handle_bytes_owned(now, chunk);
                 if let Err(err) = handle_result {
                     shared.inner.lock().mark_disconnected();
-                    // Wake anything parked on a scalable wait loop: those only
-                    // re-check `is_closed()` when a scalable event arrives, so a
-                    // dead connection would park them forever.
-                    #[cfg(feature = "scalable-topics")]
-                    notify_scalable_waiters(&shared);
+                    // Wake anything parked on a per-client buffer: those only re-check
+                    // `is_closed()` when an event arrives, so a dead connection would park
+                    // them forever.
+                    wake_close_waiters(&shared);
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1826,11 +1874,10 @@ where
                     }
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
-                        // Wake anything parked on a scalable wait loop: those only
-                        // re-check `is_closed()` when a scalable event arrives, so a
-                        // dead connection would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        notify_scalable_waiters(&shared);
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         return Err(err.into());
                     }
                 }

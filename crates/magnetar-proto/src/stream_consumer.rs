@@ -1908,7 +1908,7 @@ fn expand_batch(
             ));
         }
         let payload = cursor.split_to(payload_size);
-        if ack_state.is_unacked(index) {
+        if ack_state.is_unacked(index as i32) {
             let mut ordinary = message_id_data.clone();
             ordinary.batch_index = Some(
                 i32::try_from(index).map_err(|_| StreamConsumerModelError::ReceiveSizeOverflow)?,
@@ -4946,6 +4946,7 @@ mod tests {
         sealed: Option<u64>,
     ) -> pb::SegmentInfoProto {
         pb::SegmentInfoProto {
+            entry_bucket_splits: Vec::new(),
             segment_id: id,
             hash_start: start,
             hash_end: end,
@@ -5091,6 +5092,7 @@ mod tests {
                 };
                 let range = KeyRange::new(start, end).expect("range");
                 pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
                     segment_id: *id,
                     hash_start: start,
                     hash_end: end,
@@ -7032,6 +7034,7 @@ mod tests {
             &pb::ScalableConsumerAssignment {
                 layout_epoch: 1,
                 segments: vec![pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: range.start(),
                     hash_end: range.end(),

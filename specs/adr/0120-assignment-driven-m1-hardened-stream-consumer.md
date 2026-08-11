@@ -1,4 +1,4 @@
-# ADR-0098 — Adopt the assignment-driven M1-hardened scalable StreamConsumer
+# ADR-0120 — Adopt the assignment-driven M1-hardened scalable StreamConsumer
 
 - **Status**: Accepted
 - **Date**: 2026-08-05
@@ -6,7 +6,7 @@
 - **Tags**: pip-460, scalable-topics, stream-consumer, assignment, ordering, flow-control, transactions, coverage
 - **Supersedes**: The drop-on-DAG-change and unimplemented-data-plane scope decisions that survived [ADR-0031](0031-pip-460-scalable-subscription-scope.md) and were repeated in [ADR-0093](0093-pip-460-upstream-wire-surface.md), plus ADR-0093 § D5's blanket rejection of non-advancing consumer assignments and [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s preserved assignment-side contrast
 - **Preserves**: ADR-0093's vendored Pulsar 5.0.0-M1 wire surface and per-connection capability negotiation, plus [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
-- **Amends**: The compiled coverage closure and record-less-file treatment recorded by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) and retained by [ADR-0096](0096-isolate-sim-coverage-current-pass-artifacts.md)
+- **Amends**: The compiled coverage closure and record-less-file treatment recorded by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) and retained by [ADR-0118](0118-isolate-sim-coverage-current-pass-artifacts.md)
 
 ## Context
 

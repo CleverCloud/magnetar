@@ -99,8 +99,7 @@ async fn spawn_attacker_redirecting_broker(
                         // the malicious `CommandTopicMigrated` exactly
                         // once and continue serving the same channel.
                         let is_producer = pb::base_command::Type::try_from(frame.command.r#type)
-                            .ok()
-                            .is_some_and(|k| k == pb::base_command::Type::Producer);
+                            .is_ok_and(|k| k == pb::base_command::Type::Producer);
                         if !migrated && is_producer {
                             migrated = true;
                             if let Some(p) = &frame.command.producer {

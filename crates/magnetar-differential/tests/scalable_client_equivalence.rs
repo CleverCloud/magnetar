@@ -775,31 +775,37 @@ async fn scalable_assignment_rebalance_parity() {
 
     let tokio_delta = {
         let client = connect_tokio_facade(&url).await;
-        client
-            .scalable_topic_subscribe(
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("tokio subscribe");
+            ),
+        )
+        .await
+        .expect("tokio subscribe did not time out")
+        .expect("tokio subscribe");
         wait_for_rebalance_tokio(&client).await
     };
 
     let moonpool_delta = {
         let client = connect_moonpool_facade(&host_port).await;
-        client
-            .scalable_topic_subscribe(
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("moonpool subscribe");
+            ),
+        )
+        .await
+        .expect("moonpool subscribe did not time out")
+        .expect("moonpool subscribe");
         wait_for_rebalance_moonpool(&client).await
     };
 
@@ -879,17 +885,20 @@ async fn scalable_rejection_and_tc_discovery_parity() {
     // Consumer id 99 is the scripted rejection.
     let tokio_outcome = {
         let client = connect_tokio_facade(&url).await;
-        let rejected = client
-            .scalable_topic_subscribe(
+        let rejected = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-denied",
                 99,
                 ScalableConsumerType::Checkpoint,
-            )
-            .await
-            .expect_err("tokio registration rejected")
-            .to_string();
+            ),
+        )
+        .await
+        .expect("tokio subscribe did not time out")
+        .expect_err("tokio registration rejected")
+        .to_string();
         let watch_id = client
             .watch_tc_assignments()
             .expect("tokio TC discovery opened");
@@ -900,17 +909,20 @@ async fn scalable_rejection_and_tc_discovery_parity() {
 
     let moonpool_outcome = {
         let client = connect_moonpool_facade(&host_port).await;
-        let rejected = client
-            .scalable_topic_subscribe(
+        let rejected = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-denied",
                 99,
                 ScalableConsumerType::Checkpoint,
-            )
-            .await
-            .expect_err("moonpool registration rejected")
-            .to_string();
+            ),
+        )
+        .await
+        .expect("moonpool subscribe did not time out")
+        .expect_err("moonpool registration rejected")
+        .to_string();
         let watch_id = client
             .watch_tc_assignments()
             .expect("moonpool TC discovery opened");
@@ -997,13 +1009,17 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
     let host_port = broker.host_port();
 
     let tokio_err = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
         // The timeout is the assertion: before the fix this call never returned.
         tokio::time::timeout(
             HANG_GUARD,
-            client.scalable_topic_lookup("topic://public/default/e2e-missing"),
+            client.scalable_topic_lookup("topic://public/default/e2e-missing", true),
         )
         .await
         .expect("tokio lookup returned rather than hanging")
@@ -1013,13 +1029,16 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
 
     let moonpool_err = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
         tokio::time::timeout(
             HANG_GUARD,
-            client.scalable_topic_lookup("topic://public/default/e2e-missing"),
+            client.scalable_topic_lookup("topic://public/default/e2e-missing", true),
         )
         .await
         .expect("moonpool lookup returned rather than hanging")
@@ -1034,6 +1053,195 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
     assert!(
         tokio_err.contains("scripted: topic does not exist"),
         "the broker's reason reaches the caller: {tokio_err}"
+    );
+
+    broker.shutdown().await;
+}
+
+/// (d) — a lookup of a scalable topic that does not exist yet **creates** it on
+/// both engines (ADR-0093 amendment 2026-10-12).
+///
+/// The scripted broker's `-absent` topic mirrors a 5.0.0 broker's
+/// `DagWatchSession`: the layout is answered only when the lookup asks for
+/// creation, and the same not-found as `-missing` otherwise. Both engines
+/// resolve it — and see the same layout — only because each was asked to send
+/// `create_if_missing = true`; a client that sent `false` would be refused here
+/// (see the sibling test), and a regression that dropped the field would still
+/// resolve (the schema default is `true`), which is why the proto and runtime
+/// layers assert the encoded field separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_lookup_creates_an_absent_topic_on_both_engines() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_seen = {
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect returned rather than hanging")
+        .expect("tokio connect");
+        let lookup = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-absent", true),
+        )
+        .await
+        .expect("tokio lookup returned rather than hanging")
+        .expect("tokio lookup creates the absent topic");
+        (lookup.epoch, lookup.segments.len())
+    };
+
+    let moonpool_seen = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        let lookup = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-absent", true),
+        )
+        .await
+        .expect("moonpool lookup returned rather than hanging")
+        .expect("moonpool lookup creates the absent topic");
+        (lookup.epoch, lookup.segments.len())
+    };
+
+    assert_eq!(
+        tokio_seen, moonpool_seen,
+        "engine absent-topic lookup observations diverged"
+    );
+    assert_eq!(tokio_seen, (1, 2), "the created topic's layout is returned");
+
+    broker.shutdown().await;
+}
+
+/// (d) — a lookup that opts out of creation (`create_if_missing = false`, the
+/// read-only lookup behind `magnetarctl topic-info`) is refused with not-found
+/// for an absent topic, identically on both engines, instead of creating it
+/// (ADR-0093 amendment 2026-10-12).
+///
+/// Together with the sibling test this pins the flag end to end through each
+/// engine's `Client::scalable_topic_lookup`: the same topic resolves with `true`
+/// and is refused with `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scalable_lookup_does_not_create_an_absent_topic_on_both_engines() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    let tokio_err = {
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect returned rather than hanging")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-absent", false),
+        )
+        .await
+        .expect("tokio lookup returned rather than hanging")
+        .expect_err("a read-only lookup of an absent topic is refused")
+        .to_string()
+    };
+
+    let moonpool_err = {
+        let engine = MoonpoolEngine::new(TokioProviders::new());
+        let client =
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
+                .await
+                .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-absent", false),
+        )
+        .await
+        .expect("moonpool lookup returned rather than hanging")
+        .expect_err("a read-only lookup of an absent topic is refused")
+        .to_string()
+    };
+
+    assert_eq!(
+        tokio_err, moonpool_err,
+        "engine read-only lookup observations diverged"
+    );
+    assert!(
+        tokio_err.contains("scripted: topic does not exist"),
+        "the broker's not-found reaches the caller: {tokio_err}"
+    );
+
+    broker.shutdown().await;
+}
+
+/// The scripted broker honours `create_if_missing` the way a 5.0.0 broker does
+/// (`DagWatchSession.java:138-157`): an **absent** topic is created for a lookup
+/// that asks for it or leaves the field unset (the schema default is `true`),
+/// refused with not-found for one that opts out, and an **existing** topic
+/// ignores the flag. Driven with raw frames because neither engine ever leaves
+/// the field unset; the `true` and `false` paths through the engines are the two
+/// sibling tests above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_broker_honours_create_if_missing_for_an_absent_topic() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let mut sock = tokio::net::TcpStream::connect(broker.host_port())
+        .await
+        .expect("raw connect");
+
+    let mut session_id = 0_u64;
+    let mut lookup = async |topic: &str, create_if_missing: Option<bool>| {
+        session_id += 1;
+        let cmd = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::ScalableTopicLookup as i32,
+            scalable_topic_lookup: Some(magnetar_proto::pb::CommandScalableTopicLookup {
+    create_if_missing: Some(true),
+                session_id,
+                topic: topic.to_owned(),
+                create_if_missing,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        magnetar_proto::encode_command(&mut buf, &cmd).expect("encode lookup");
+        sock.write_all(&buf).await.expect("write lookup");
+        sock.flush().await.expect("flush");
+
+        let mut len = [0_u8; 4];
+        sock.read_exact(&mut len).await.expect("reply length");
+        let mut reply = vec![0_u8; 4 + u32::from_be_bytes(len) as usize];
+        reply[..4].copy_from_slice(&len);
+        sock.read_exact(&mut reply[4..]).await.expect("reply body");
+        let frame = magnetar_proto::decode_one(&mut bytes::Bytes::from(reply))
+            .expect("the reply decodes as a BaseCommand");
+        frame
+            .command
+            .scalable_topic_update
+            .expect("a lookup is answered by a CommandScalableTopicUpdate")
+    };
+
+    let created = lookup("topic://public/default/e2e-absent", Some(true)).await;
+    assert!(
+        created.dag.is_some() && created.error.is_none(),
+        "asked to create"
+    );
+    let defaulted = lookup("topic://public/default/e2e-absent", None).await;
+    assert!(defaulted.dag.is_some(), "an unset field means create");
+    let refused = lookup("topic://public/default/e2e-absent", Some(false)).await;
+    assert!(refused.dag.is_none(), "opted out, and the topic is absent");
+    assert_eq!(
+        refused.error,
+        Some(magnetar_proto::pb::ServerError::TopicNotFound as i32)
+    );
+    let existing = lookup("topic://public/default/scaled", Some(false)).await;
+    assert!(
+        existing.dag.is_some(),
+        "an existing topic ignores create_if_missing"
     );
 
     broker.shutdown().await;
@@ -1054,25 +1262,35 @@ async fn scalable_pushed_layout_reaches_the_client() {
     let host_port = broker.host_port();
 
     let tokio_seen = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        client
-            .scalable_topic_lookup("topic://public/default/scaled-split")
-            .await
-            .expect("tokio lookup resolves");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio pushed-layout connect returned rather than hanging")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/scaled-split", true),
+        )
+        .await
+        .expect("tokio pushed-layout lookup returned rather than hanging")
+        .expect("tokio lookup resolves");
         // The registration is what makes `scalable_consumer_assignment`
         // meaningful; assert through it as well as through the event.
-        client
-            .scalable_topic_subscribe(
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled-split",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("tokio subscribe");
+            ),
+        )
+        .await
+        .expect("tokio pushed-layout subscribe returned rather than hanging")
+        .expect("tokio subscribe");
         // The scripted broker follows every subscribe with a rebalance, so the
         // held epoch races that push — assert the assignment is readable and
         // non-empty, and leave the epoch to `scalable_assignment_rebalance_parity`.
@@ -1084,24 +1302,33 @@ async fn scalable_pushed_layout_reaches_the_client() {
 
     let moonpool_seen = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        client
-            .scalable_topic_lookup("topic://public/default/scaled-split")
-            .await
-            .expect("moonpool lookup resolves");
-        client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool pushed-layout connect returned rather than hanging")
+        .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/scaled-split", true),
+        )
+        .await
+        .expect("moonpool pushed-layout lookup returned rather than hanging")
+        .expect("moonpool lookup resolves");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled-split",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("moonpool subscribe");
+            ),
+        )
+        .await
+        .expect("moonpool pushed-layout subscribe returned rather than hanging")
+        .expect("moonpool subscribe");
         let held = client
             .scalable_consumer_assignment(42)
             .map(|a| !a.segments().is_empty());
@@ -1231,26 +1458,39 @@ async fn scalable_lookup_rejection_without_message_still_reports() {
     let host_port = broker.host_port();
 
     let tokio_err = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        client
-            .scalable_topic_lookup("topic://public/default/e2e-terse")
-            .await
-            .expect_err("terse rejection is an error")
-            .to_string()
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-terse", true),
+        )
+        .await
+        .expect("tokio lookup did not time out")
+        .expect_err("terse rejection is an error")
+        .to_string()
     };
     let moonpool_err = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        client
-            .scalable_topic_lookup("topic://public/default/e2e-terse")
-            .await
-            .expect_err("terse rejection is an error")
-            .to_string()
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-terse", true),
+        )
+        .await
+        .expect("moonpool lookup did not time out")
+        .expect_err("terse rejection is an error")
+        .to_string()
     };
 
     assert_eq!(tokio_err, moonpool_err);
@@ -1421,9 +1661,13 @@ async fn scalable_subscribe_errors_when_the_connection_closes() {
         // Drop closes the socket.
     });
 
-    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
-        .await
-        .expect("handshake completes before the hang-up");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("handshake completes before the hang-up");
 
     let err = tokio::time::timeout(
         HANG_GUARD,
@@ -1446,10 +1690,13 @@ async fn scalable_subscribe_errors_when_the_connection_closes() {
     // Same contract on the moonpool engine, against a second hang-up socket.
     let addr = spawn_hangup_broker().await;
     let engine = MoonpoolEngine::new(TokioProviders::new());
-    let mp_client =
-        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
-            .await
-            .expect("moonpool handshake completes before the hang-up");
+    let mp_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool handshake completes before the hang-up");
 
     let mp_err = tokio::time::timeout(
         HANG_GUARD,
@@ -1540,12 +1787,16 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 
     // The broker must still be serving: a fresh client completes a handshake and
     // a lookup after the malformed traffic.
-    let client = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
-        .await
-        .expect("broker still accepts connections");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("broker still accepts connections");
     let lookup = tokio::time::timeout(
         HANG_GUARD,
-        client.scalable_topic_lookup("topic://public/default/scaled"),
+        client.scalable_topic_lookup("topic://public/default/scaled", true),
     )
     .await
     .expect("lookup did not hang")
@@ -1567,9 +1818,13 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 async fn scalable_subscribe_errors_when_the_connection_resets() {
     let _serial = scalable_client_socket_test_guard();
     let addr = spawn_resetting_broker().await;
-    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
-        .await
-        .expect("handshake completes before the reset");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("handshake completes before the reset");
     let err = tokio::time::timeout(
         HANG_GUARD,
         client.scalable_topic_subscribe(
@@ -1590,10 +1845,13 @@ async fn scalable_subscribe_errors_when_the_connection_resets() {
 
     let addr = spawn_resetting_broker().await;
     let engine = MoonpoolEngine::new(TokioProviders::new());
-    let mp_client =
-        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
-            .await
-            .expect("moonpool handshake completes before the reset");
+    let mp_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool handshake completes before the reset");
     let mp_err = tokio::time::timeout(
         HANG_GUARD,
         mp_client.scalable_topic_subscribe(

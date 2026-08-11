@@ -201,6 +201,7 @@ fn scalable_lookup_command(session_id: u64, topic: &str) -> pb::BaseCommand {
     pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicLookup as i32,
         scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
+    create_if_missing: Some(true),
             session_id,
             topic: topic.to_owned(),
         }),

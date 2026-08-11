@@ -3,11 +3,10 @@
 //! PIP-460 / ADR-0093 — scalable-topic end-to-end coverage against a real
 //! Apache Pulsar broker.
 //!
-//! Runs against `apachepulsar/pulsar:5.0.0-M1`, the first published release
-//! carrying PIP-460. Its `ServiceConfiguration` defaults
-//! `scalableTopicsEnabled` to `true`; the fixture sets it explicitly anyway so
-//! the test does not silently depend on an upstream default that may move
-//! before Pulsar 5.0 final.
+//! Runs against the shared fixture's `Broker::Scalable` image (`common/pulsar.rs`,
+//! ADR-0115), Pulsar 5.0.0 GA, the release that carries PIP-460. Its `standalone.conf` sets
+//! `scalableTopicsEnabled=true`; the test sets it explicitly anyway so it does not silently depend
+//! on an upstream default that may move.
 //!
 //! Per [ADR-0046] these are ordinary tests — no `#[ignore]`, no `feature =
 //! "e2e"` — gated only on `feature = "scalable-topics"` like the rest of the
@@ -33,6 +32,10 @@
 //!    rather than emitting a command the peer cannot parse. That is the guarantee that lets this
 //!    surface ship without breaking existing deployments, and it is only provable against a real v4
 //!    broker.
+//! 5. [`e2e_scalable_topic_read_only_lookup_does_not_create_the_topic`] — `lookup_scalable_topic`
+//!    is read-only: on a never-created topic it reports "not found", and the broker's admin REST
+//!    still answers 404 for that topic afterwards. Pulsar 5.0.0 auto-creates the topic for a lookup
+//!    that leaves `create_if_missing` unset, so this is what the explicit `false` is for.
 //!
 //! [ADR-0046]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md
 
@@ -54,26 +57,12 @@ use magnetar::scalable::{
     OrderingMode, PositionVector, ReceiverBudget, SegmentSource, StreamConsumer,
     StreamConsumerError, StreamConsumerEvent, StreamMessage, TransactionOutcome,
 };
-use testcontainers::core::{CmdWaitFor, ContainerPort, ExecCommand, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
+use testcontainers::core::{CmdWaitFor, ExecCommand};
 
-const IMAGE_REPO: &str = "apachepulsar/pulsar";
-/// The first published Pulsar release carrying PIP-460. A milestone, not GA —
-/// see ADR-0093 §D1. Overridable so a later RC can be tried without an edit.
-const DEFAULT_SCALABLE_IMAGE_TAG: &str = "5.0.0-M1";
-/// A v4 broker, for the negotiation-refusal test. Matches the tag the rest of
-/// the e2e suite pins (`CLAUDE.md` § Validation chain).
-const V4_IMAGE_TAG: &str = "4.0.4";
+mod common;
 
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
-
-/// JVM budget for the `pulsar standalone` container — the image default costs
-/// ~2.3 GiB RSS and libtest runs e2e tests in parallel. Enforced by
-/// `cargo run -p xtask -- check-e2e-container-memory`; see
-/// `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 const TENANT_NS: &str = "public/default";
 const STREAM_BUDGET_BYTES: usize = 16 * 1024 * 1024;
@@ -134,11 +123,6 @@ fn spawn_host_port_proxy(listener: tokio::net::TcpListener, target: String) -> H
     HostPortProxy { task }
 }
 
-fn scalable_image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG")
-        .unwrap_or_else(|_| DEFAULT_SCALABLE_IMAGE_TAG.to_owned())
-}
-
 /// Locate the compiled `magnetarctl` binary.
 ///
 /// `CARGO_BIN_EXE_magnetarctl` is only injected for tests in the `magnetarctl`
@@ -160,185 +144,82 @@ fn magnetarctl_binary() -> std::path::PathBuf {
     exe
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Bring up one unauthenticated standalone broker at `tag`.
+/// Bring up one unauthenticated standalone broker.
 ///
-/// `scalable_topics` selects whether PIP-460 is enabled. It is passed
-/// explicitly rather than relying on the upstream default, so the negative
-/// (v4) case and the positive case differ only in the image.
+/// PIP-460 is configured only for [`Broker::Scalable`]; it is passed explicitly
+/// rather than relying on the upstream default, so the negative (v4) case and
+/// the positive case differ only in the image.
+///
+/// The shared fixture waits for the broker to serve `public/default` by asking
+/// the broker itself (ADR-0115) and applies the `PULSAR_PREFIX_*` configuration
+/// to `conf/standalone.conf` before it boots. This suite used to export these
+/// two keys without ever running the helper that applies them, so neither took
+/// effect.
 async fn start_broker(
-    tag: &str,
-    scalable_topics: bool,
+    broker: Broker,
 ) -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-
-    // Readiness is polled below rather than matched on a startup log line.
-    // `apachepulsar/pulsar:5.0.0-M1` does not print 4.x's "Created namespace
-    // public/default", so a log-string wait times out with `StartupTimeout` and
-    // says nothing about why — measured on CI run 30843979377. Waiting on the
-    // container being up and then asking the broker itself keeps the fixture
-    // working across broker versions and makes a genuine startup failure
-    // report the broker's own logs instead of an opaque timeout.
-    //
-    // The two arms are spelled out rather than assembled conditionally so each
-    // keeps `PULSAR_MEM` and `.start()` on one chain — `cargo run -p xtask --
-    // check-e2e-container-memory` can only verify the cap when it can see both
-    // in the same expression.
-    let container = if scalable_topics {
-        GenericImage::new(IMAGE_REPO, tag)
-            .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-            .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-            .with_wait_for(WaitFor::Nothing)
-            .with_startup_timeout(Duration::from_mins(3))
-            .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-            // Defaults to `true` in 5.0.0-M1's ServiceConfiguration; set
-            // explicitly so the test does not depend on an upstream default
-            // holding through to Pulsar 5.0 final.
-            .with_env_var("PULSAR_PREFIX_scalableTopicsEnabled", "true")
+    let mut pulsar = Pulsar::new(broker)
+        .flag("--no-functions-worker")
+        .flag("--no-stream-storage");
+    if broker == Broker::Scalable {
+        pulsar = pulsar
+            // `standalone.conf` of Pulsar 5.0.0 sets this to `true`; set it
+            // explicitly so the test does not depend on an upstream default.
+            .config("scalableTopicsEnabled", "true")
             // PIP-483 auto split/merge also defaults on. Disable it so the only
             // layout change in these tests is the one the admin API triggers —
             // otherwise a background split could race the assertions.
-            .with_env_var("PULSAR_PREFIX_scalableTopicAutoScaleEnabled", "false")
-            .with_cmd(vec![
-                "bin/pulsar".to_owned(),
-                "standalone".to_owned(),
-                "--no-functions-worker".to_owned(),
-                "--no-stream-storage".to_owned(),
-            ])
-            .start()
-            .await?
-    } else {
-        GenericImage::new(IMAGE_REPO, tag)
-            .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-            .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-            .with_wait_for(WaitFor::Nothing)
-            .with_startup_timeout(Duration::from_mins(3))
-            .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-            .with_cmd(vec![
-                "bin/pulsar".to_owned(),
-                "standalone".to_owned(),
-                "--no-functions-worker".to_owned(),
-                "--no-stream-storage".to_owned(),
-            ])
-            .start()
-            .await?
-    };
-
-    await_broker_ready(&container).await?;
-
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    Ok((
-        format!("pulsar://{host}:{binary_port}"),
-        format!("http://{host}:{http_port}"),
-        container,
-    ))
+            .config("scalableTopicAutoScaleEnabled", "false");
+    }
+    Ok(pulsar.start().await?.into_parts())
 }
 
-/// Start the positive M1 fixture with direct routing and transactions enabled.
-///
-/// M1 writes its advertised broker authority into every segment placement, but
-/// may omit the controller URL until leader election publishes one. Reserve an ephemeral loopback
-/// listener before container startup and proxy that advertised port to Docker's random host
-/// mapping, so concurrent test runs cannot race for one global host port.
+/// Reserve a reachable direct authority without sharing a fixed host port.
+/// The common fixture owns startup, readiness, version checks and JVM limits;
+/// this proxy only forwards the broker-advertised port to Docker's mapping.
 async fn start_hardened_broker() -> TestResult<(String, PulsarContainer, HostPortProxy)> {
     init_tracing();
-    let image_tag = scalable_image_tag();
     let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let broker_port = proxy_listener.local_addr()?.port();
-    let container = GenericImage::new(IMAGE_REPO, image_tag.as_str())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_exposed_port(ContainerPort::Tcp(broker_port))
-        .with_wait_for(WaitFor::Nothing)
-        .with_startup_timeout(Duration::from_mins(4))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_env_var("PULSAR_PREFIX_scalableTopicsEnabled", "true")
-        .with_env_var("PULSAR_PREFIX_scalableTopicAutoScaleEnabled", "false")
-        .with_env_var("PULSAR_PREFIX_transactionCoordinatorEnabled", "true")
-        .with_env_var("PULSAR_PREFIX_advertisedAddress", "127.0.0.1")
-        .with_env_var("PULSAR_PREFIX_brokerServicePort", broker_port.to_string())
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
-                 conf/standalone.conf && \
-             bin/pulsar initialize-transaction-coordinator-metadata \
-                 --cluster standalone \
-                 --configuration-store rocksdb:///pulsar/data/metadata && \
-             exec bin/pulsar standalone \
-                 --no-functions-worker \
-                 --no-stream-storage"
-                .to_owned(),
-        ])
+    let running = Pulsar::new(Broker::Scalable)
+        .binary_port(broker_port)
+        .config("scalableTopicsEnabled", "true")
+        .config("scalableTopicAutoScaleEnabled", "false")
+        .config("transactionCoordinatorEnabled", "true")
+        .config("advertisedAddress", "127.0.0.1")
+        .pre_start(
+            "bin/pulsar initialize-transaction-coordinator-metadata \
+             --cluster standalone --configuration-store rocksdb:///pulsar/data/metadata",
+        )
+        .flag("--no-functions-worker")
+        .flag("--no-stream-storage")
         .start()
         .await?;
-
-    await_broker_ready(&container).await?;
-    let host = container.get_host().await?;
-    let loopback = match &host {
-        url::Host::Ipv4(address) => address.is_loopback(),
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv6(_) => false,
-    };
+    let loopback = running
+        .host
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|address| address.is_loopback())
+        || running.host.eq_ignore_ascii_case("localhost");
     if !loopback {
         return Err(format!(
-            "hardened scalable e2e requires a local IPv4 Docker host because M1 advertises \
-             pulsar://127.0.0.1:{broker_port}; testcontainers reported `{host}`"
+            "direct-routing scalable e2e requires a local IPv4 Docker host, got `{}`",
+            running.host
         )
         .into());
     }
-    let mapped = container.get_host_port_ipv4(broker_port).await?;
-    let proxy = spawn_host_port_proxy(proxy_listener, format!("{host}:{mapped}"));
+    let proxy = spawn_host_port_proxy(
+        proxy_listener,
+        format!("{}:{}", running.host, running.binary_port),
+    );
     Ok((
         format!("pulsar://127.0.0.1:{broker_port}"),
-        container,
+        running.container,
         proxy,
     ))
-}
-
-/// Poll the broker's own health endpoint until it answers, then confirm the
-/// bootstrap namespace exists.
-///
-/// On timeout this returns the broker's last log lines, so a startup failure is
-/// diagnosable from the CI log rather than surfacing as a bare timeout.
-async fn await_broker_ready(
-    container: &testcontainers::ContainerAsync<GenericImage>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_mins(4);
-    let mut last = String::new();
-    while tokio::time::Instant::now() < deadline {
-        // `pulsar-admin` exits non-zero until the broker serves; the namespace
-        // probe additionally proves standalone finished bootstrapping, which is
-        // what the topic-create calls below depend on. A non-zero exit is the
-        // normal state of this loop, not a failure, so the raw form is used and
-        // the code deliberately ignored — the loop's own deadline is the failure
-        // condition, and `last` carries the final output into its message.
-        let (_code, out) = pulsar_admin_raw(container, &["namespaces", "list", "public"]).await?;
-        last = out;
-        if last.contains("public/default") {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-    let logs = String::from_utf8_lossy(&container.stdout_to_vec().await?).into_owned();
-    let tail: String = logs.lines().rev().take(40).collect::<Vec<_>>().join("\n");
-    Err(format!(
-        "broker did not become ready within 4 min.\n--- last pulsar-admin output ---\n{last}\n--- broker log tail ---\n{tail}"
-    )
-    .into())
 }
 
 /// Run `pulsar-admin` inside the container, returning its exit code alongside
@@ -1604,7 +1485,7 @@ async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
 /// the two cannot drift without this failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_scalable_topic_info_cli_round_trip() {
-    let (service_url, _admin_url, container) = start_broker(&scalable_image_tag(), true)
+    let (service_url, _admin_url, container) = start_broker(Broker::Scalable)
         .await
         .expect("pulsar 5.0 broker starts");
 
@@ -1664,6 +1545,76 @@ async fn e2e_scalable_topic_info_cli_round_trip() {
     }
 }
 
+/// HTTP status of the broker's admin REST for the scalable topic `name` of [`TENANT_NS`]:
+/// `GET /admin/v2/scalable/{tenant}/{namespace}/{name}` answers 200 with the topic's metadata
+/// when it exists and 404 with `Scalable topic not found` when it does not (Pulsar 5.0.0).
+async fn scalable_topic_admin_status(admin_url: &str, name: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{admin_url}/admin/v2/scalable/{TENANT_NS}/{name}"))
+        .send()
+        .await
+        .expect("admin REST answers")
+        .status()
+}
+
+/// (5) A read-only lookup never creates the topic it looks up.
+///
+/// A Pulsar 5.0.0 broker auto-creates a scalable topic for a lookup that leaves
+/// `create_if_missing` unset (it defaults to `true`), where 5.0.0-M1 failed with "Scalable topic
+/// not found". `PulsarClient::lookup_scalable_topic` sends `false` explicitly, so on a
+/// never-created topic it must report "not found" and the topic must still not exist afterwards;
+/// `magnetarctl topic-info` relies on exactly that. The broker's admin REST is the oracle, with a
+/// positive control proving the endpoint really distinguishes the two states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_scalable_topic_read_only_lookup_does_not_create_the_topic() {
+    let (service_url, admin_url, container) = start_broker(Broker::Scalable)
+        .await
+        .expect("pulsar 5.0 broker starts");
+
+    // Positive control: the admin endpoint answers 200 for a topic that exists.
+    create_scalable_topic(
+        &container,
+        &format!("topic://{TENANT_NS}/e2e-scaled-control"),
+        1,
+    )
+    .await
+    .expect("control topic created");
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, "e2e-scaled-control").await,
+        reqwest::StatusCode::OK,
+        "the admin endpoint reports an existing scalable topic"
+    );
+
+    let name = "e2e-scaled-never-created";
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, name).await,
+        reqwest::StatusCode::NOT_FOUND,
+        "the topic does not exist before the lookup"
+    );
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await
+        .expect("client connects");
+    let err = client
+        .lookup_scalable_topic(&format!("topic://{TENANT_NS}/{name}"))
+        .await
+        .expect_err("a read-only lookup of a never-created topic fails");
+    let rendered = err.to_string();
+    assert!(
+        rendered.to_lowercase().contains("not found"),
+        "the lookup reports the topic as not found, got `{rendered}`"
+    );
+
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, name).await,
+        reqwest::StatusCode::NOT_FOUND,
+        "a read-only lookup must not auto-create the topic (create_if_missing = false); the lookup \
+         failed with `{rendered}`"
+    );
+}
+
 /// (3) Drop-on-DAG-change observed against a broker-driven segment split.
 ///
 /// PIP-483 auto-scale is disabled on this broker, so the only layout change is
@@ -1671,7 +1622,7 @@ async fn e2e_scalable_topic_info_cli_round_trip() {
 /// assertion is about the client's reaction, not about a timing window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_scalable_topic_drops_on_broker_split() {
-    let (service_url, _admin_url, container) = start_broker(&scalable_image_tag(), true)
+    let (service_url, _admin_url, container) = start_broker(Broker::Scalable)
         .await
         .expect("pulsar 5.0 broker starts");
 
@@ -1806,7 +1757,7 @@ async fn e2e_scalable_topic_drops_on_broker_split() {
 /// deployments, and it is only provable against a real v4 broker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_scalable_topic_unsupported_on_v4_broker() {
-    let (service_url, _admin_url, _container) = start_broker(V4_IMAGE_TAG, false)
+    let (service_url, _admin_url, _container) = start_broker(Broker::V4Lts)
         .await
         .expect("pulsar 4.x broker starts");
 

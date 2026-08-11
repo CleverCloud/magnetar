@@ -68,8 +68,9 @@ experimental-v5-client = ["tokio"]
 # flag is on. Propagates to the proto wire surface and to whichever engine(s)
 # are enabled. The e2e tests in `tests/e2e_scalable_topic.rs` are gated on
 # `scalable-topics` alone (no `e2e` flag — see ADR-0046) and run against a
-# real `apachepulsar/pulsar:5.0.0-M1` broker, plus a `:4.0.4` broker for the
-# negotiated-refusal case, on every push. Does NOT block release.
+# real PIP-460 broker (`Broker::Scalable` in `tests/common/pulsar.rs`), plus a
+# pre-5.0 broker (`Broker::V4Lts`, 4.2.5) for the negotiated-refusal case, on
+# every push. Does NOT block release.
 scalable-topics = [
     "magnetar-proto/scalable-topics",
     "magnetar-runtime-tokio?/scalable-topics",
@@ -124,6 +125,15 @@ crypto-fips = [
     "magnetar-auth-oauth2?/crypto-fips",
 ]
 
+# --- Pulsar schemas (`magnetar_proto::schema`). Always available, no
+# extra dependency: Bytes, String, the primitive / temporal schemas, JSON,
+# PROTOBUF, PROTOBUF_NATIVE, KeyValue, AutoConsume and AutoProduceBytes. ---
+#
+# AVRO (`AvroSchema`): advertises the Avro parsing canonical form as
+# `schema_data` so the broker registry dedups logically-identical schemas.
+# Pulls in `apache-avro`. Default OFF.
+schema-avro = ["magnetar-proto/schema-avro"]
+
 [dependencies]
 magnetar-proto             = { workspace = true }
 magnetar-runtime-tokio     = { workspace = true, optional = true }
@@ -147,7 +157,6 @@ parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, optional = true, features = ["rt", "sync", "test-util"] }
 tracing                    = { workspace = true }
-url                        = { workspace = true }
 uuid                       = { workspace = true }
 
 [dev-dependencies]
@@ -162,6 +171,10 @@ aws-lc-rs          = { workspace = true }
 base64             = { workspace = true }
 magnetar-admin      = { workspace = true }
 magnetar-fakes     = { workspace = true }
+# `tests/e2e_schemas_extended.rs` round-trips an `AvroSchema` against a real
+# broker. The façade's own `schema-avro` feature stays off by default, so the
+# test target enables the sans-io feature itself and runs on every build.
+magnetar-proto     = { workspace = true, features = ["schema-avro"] }
 opentelemetry      = { workspace = true }
 opentelemetry_sdk  = { workspace = true }
 reqwest            = { workspace = true }
@@ -171,6 +184,7 @@ serde_json         = { workspace = true }
 testcontainers     = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
+url                = { workspace = true }
 # `wiremock` powers the `e2e_oauth2` IDP stub. Pure dev-dep — not pulled
 # in for non-test builds.
 wiremock           = { workspace = true }

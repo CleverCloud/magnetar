@@ -1,0 +1,202 @@
+name: performance
+
+# Nightly: main against the main revision the last successful nightly
+# measured; skipped when main has not moved (ADR-0113). Manual dispatch: the
+# dispatched ref against main, for any branch that needs a measurement.
+# Costs are informative. Functional failures and invalid collection fail CI.
+on:
+  schedule:
+    # 01:17 UTC daily. Off the hour, and ahead of the 03:17 seed sweep and
+    # the 04:17 xtask gates; a full campaign runs for several hours.
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Nightly and manual runs use separate groups, so a dispatch on main never
+# cancels a running nightly; a nightly still running when the next one fires
+# makes it wait instead of cancelling it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  prepare:
+    name: performance inputs and contracts
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    # actions:read lets a nightly find the head its last successful run measured.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.prepare.outputs.run }}
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      main_sha: ${{ steps.prepare.outputs.main_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          docker-images: false
+          preinstalled-runtimes: false
+          swap-storage: false
+      - name: Resolve the base revision and prepare exact inputs
+        id: prepare
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main
+          BASE_SHA=$(git rev-parse FETCH_HEAD)
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          if [ "$EVENT_NAME" = schedule ]; then
+            # The head the last successful nightly measured, so consecutive
+            # nights cover main without a gap; a failed night widens the next.
+            BASE_SHA=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow performance.yml \
+              --event schedule --branch main --status success --limit 1 \
+              --json headSha --jq '.[0].headSha // ""')
+            if [ -z "$BASE_SHA" ] || ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+              BASE_SHA=$(git rev-list -1 --first-parent --before='24 hours ago' "$HEAD_SHA")
+            fi
+            if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "main has not moved since $BASE_SHA; nothing to measure." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          python3 scripts/performance.py campaign ci prepare \
+            --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
+            --expected-base-sha "$BASE_SHA" --expected-candidate-sha "$HEAD_SHA" \
+            --output "$RUNNER_TEMP/performance-prepared" --shards 8 --seed-workers 4
+      - name: Upload frozen tools image, plans, contracts and provenance
+        if: always() && steps.prepare.outputs.run != 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  workers:
+    name: performance (${{ matrix.kind }} ${{ matrix.worker }})
+    needs: prepare
+    if: needs.prepare.result == 'success' && needs.prepare.outputs.run == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          docker-images: false
+          preinstalled-runtimes: false
+          swap-storage: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+      # Dependency sources only. Every ref uses its own Cargo.lock --locked;
+      # CARGO_TARGET_DIR stays outside checkouts and distinct for each ref.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/performance-cargo
+          key: performance-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/performance/Dockerfile') }}
+          restore-keys: performance-cargo-${{ runner.os }}-
+      - name: Execute all assigned families or all assigned replay seeds
+        env:
+          WORKER_KIND: ${{ matrix.kind }}
+          WORKER_INDEX: ${{ matrix.worker }}
+        run: |
+          set -euo pipefail
+          python3 scripts/performance.py campaign ci worker \
+            --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
+            --prepared "$RUNNER_TEMP/performance-prepared" \
+            --kind "$WORKER_KIND" --worker "$WORKER_INDEX" --cpu-count 2 \
+            --cargo-cache "$RUNNER_TEMP/performance-cargo" \
+            --build-cache "$RUNNER_TEMP/performance-targets" \
+            --output "$RUNNER_TEMP/performance-output"
+      - name: Preserve raw permissions, execution closures and sources in one archive
+        if: always()
+        env:
+          WORKER_KIND: ${{ matrix.kind }}
+          WORKER_INDEX: ${{ matrix.worker }}
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP/performance-output" -czf \
+            "$RUNNER_TEMP/performance-worker-$WORKER_KIND-$WORKER_INDEX.tar.gz" .
+      - name: Upload immutable raw observations even after a functional failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-worker-${{ matrix.kind }}-${{ matrix.worker }}
+          path: ${{ runner.temp }}/performance-worker-${{ matrix.kind }}-${{ matrix.worker }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  reconcile:
+    name: performance coverage and report
+    if: always() && needs.prepare.outputs.run == 'true'
+    needs: [prepare, workers]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download exact input plans
+        uses: actions/download-artifact@v8
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+      - name: Download available raw shards (absence is checked by reconciliation)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: performance-worker-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/performance-workers
+      - name: Verify exhaustive union, completed work and collection validity
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/performance.py campaign ci reconcile \
+            --prepared "$RUNNER_TEMP/performance-prepared" \
+            --workers "$RUNNER_TEMP/performance-workers" \
+            --output "$RUNNER_TEMP/performance-report"
+      - name: Upload base / candidate / absolute delta / relative delta / scope tables
+        id: report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-report
+          path: ${{ runner.temp }}/performance-report
+          if-no-files-found: error
+          retention-days: 7
+      - name: Link complete tables and raw artifacts from the compact summary
+        if: always()
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '\n[Complete comparison tables](%s) · [Raw worker and image artifacts](%s)\n' \
+            "$REPORT_URL" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"

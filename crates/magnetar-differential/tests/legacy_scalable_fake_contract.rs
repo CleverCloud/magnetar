@@ -52,6 +52,7 @@ fn legacy_scalable_fake_emits_initial_split_and_merge_layouts() {
     let mut lookup = encoded(&pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicLookup as i32,
         scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
+    create_if_missing: Some(true),
             session_id: 42,
             topic: "topic://public/default/scaled".to_owned(),
         }),

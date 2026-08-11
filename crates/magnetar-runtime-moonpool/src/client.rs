@@ -320,6 +320,8 @@ impl<P: Providers> Client<P> {
             addr: addr.to_owned(),
             bootstrap_config: config,
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            // ADR-0111: every pooled connection shares the bootstrap's budget.
+            memory_limit: shared.memory_limit.clone(),
             providers: engine.providers().clone(),
             tls_config: None,
             service_url_provider,
@@ -1233,15 +1235,25 @@ impl<P: Providers> Client<P> {
     /// subscription. The future is cancel-safe: dropping it without polling
     /// does not lose pending deltas (they stay in the
     /// [`ConnectionShared::topic_list_changes`] queue).
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]: the
+    /// `Notified` is armed before the buffer drain and the `is_closed()` re-check, so a delta
+    /// the driver pushes (then `topic_list_notify.notify_waiters()`, which stores no permit)
+    /// in the gap between the check and the park wakes this waiter instead of being stranded
+    /// in the buffer.
     pub async fn next_topic_list_change(&self) -> Option<TopicListChange> {
         loop {
+            let notified = self.shared.topic_list_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(change) = self.shared.topic_list_changes.lock().pop_front() {
                 return Some(change);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.topic_list_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1270,6 +1282,12 @@ impl<P: Providers> Client<P> {
     /// `persistent://`, or a short name — the broker returns the canonical
     /// identity in [`crate::ScalableLookup::resolved_topic_name`].
     ///
+    /// `create_if_missing` is sent to the broker verbatim: `true` lets a
+    /// Pulsar 5.0.0 broker auto-create a missing `topic://` topic (a consumer or
+    /// producer opening an explicit single topic), `false` makes the lookup
+    /// read-only, so a missing topic is reported as not found on every broker
+    /// version. See [`magnetar_proto::Connection::open_scalable_topic_session`].
+    ///
     /// # Errors
     ///
     /// Fails when the broker did not advertise `supports_scalable_topics` — a
@@ -1279,14 +1297,24 @@ impl<P: Providers> Client<P> {
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
+        create_if_missing: bool,
     ) -> Result<crate::ScalableLookup, ClientError> {
         let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.open_scalable_topic_session(topic)
+            conn.open_scalable_topic_session(topic, create_if_missing)
                 .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining (enroll-before-drain, see
+            // `next_replicated_subscription_marker`): `emit_scalable` pushes the
+            // event and then fires `notify_waiters()`, which stores no permit, so
+            // an event landing between the drain below and a later
+            // `notified()` would be buffered but never wake this caller.
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             // Drain the first terminal event for our session id. A rejected
             // session ends as `DagWatchClosed`, not `LookupResolved` — waiting
             // only for the success variant would hang the caller until the
@@ -1341,7 +1369,9 @@ impl<P: Providers> Client<P> {
                     "connection closed before scalable lookup resolved".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            // Neither a resolution nor a close: park on the pre-armed waiter,
+            // then re-loop and re-arm. A spurious wake just re-drains.
+            notified.await;
         }
     }
 
@@ -1390,6 +1420,12 @@ impl<P: Providers> Client<P> {
         }
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining — same enroll-before-drain rule as
+            // `scalable_topic_lookup`.
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
@@ -1424,7 +1460,7 @@ impl<P: Providers> Client<P> {
                     "connection closed before the scalable assignment landed".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1534,16 +1570,26 @@ impl<P: Providers> Client<P> {
 
     /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
     /// event. Mirrors the tokio engine's `Client::next_scalable_event`.
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]:
+    /// the `Notified` is armed before the buffer drain and the `is_closed()`
+    /// re-check, so an event the driver pushes (then `notify_waiters()`, which
+    /// stores no permit) in the gap between the check and the park wakes this
+    /// waiter instead of being stranded in the buffer.
     #[cfg(feature = "scalable-topics")]
     pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {
         loop {
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(ev) = self.shared.scalable_events.lock().pop_front() {
                 return Some(ev);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 

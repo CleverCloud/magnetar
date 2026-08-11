@@ -161,7 +161,7 @@ async fn get_shadow_topics_returns_empty_for_non_shadow_topic() {
         .get_shadow_topics("public/default/regular")
         .await
         .unwrap();
-    assert!(shadows.is_empty());
+    assert_eq!(shadows, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn get_shadow_topics_returns_empty_for_no_content_response() {
         .get_shadow_topics("public/default/regular")
         .await
         .unwrap();
-    assert!(shadows.is_empty());
+    assert_eq!(shadows, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]

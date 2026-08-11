@@ -59,6 +59,9 @@ pub struct ProducerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     /// `MessageEncryptorApi` is a supertrait of [`crate::Engine`], so the
     /// resolution is automatic — no extra bound needed at the use site.
     encryptor: Option<<E as crate::MessageEncryptorApi>::Encryptor>,
+    /// Opt-in unique-suffix policy for [`Self::name`] (issue #406).
+    /// `false` — the default — keeps the pinned name the caller asked for.
+    unique_name_suffix: bool,
 }
 
 impl<E: crate::Engine> std::fmt::Debug for ProducerBuilder<'_, E> {
@@ -80,14 +83,63 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
             client,
             req,
             encryptor: None,
+            unique_name_suffix: false,
         }
     }
 
     /// Set the optional producer name.
+    ///
+    /// The name is advertised verbatim unless [`Self::unique_name_suffix`] is
+    /// enabled.
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.req.producer_name = Some(name.into());
         self
+    }
+
+    /// Append an engine-generated unique suffix to the name set by
+    /// [`Self::name`]. **Off by default** — a pinned producer name stays
+    /// pinned.
+    ///
+    /// A pinned name is what makes a leaked broker-side producer fatal
+    /// (issue #406): the broker rejects every later open under a name it still
+    /// holds with `ProducerBusy` / `NamingException`, and a client that died
+    /// mid-open — or behind a proxy that outlives it — cannot send the
+    /// `CommandCloseProducer` that would free it. Enabling this makes each open
+    /// claim its own name, so a stranded registration can never collide with
+    /// the next one.
+    ///
+    /// The cost is the reason it is opt-in: a unique name breaks every
+    /// behaviour keyed on producer identity — `Exclusive` /
+    /// `WaitForExclusive` access-mode fencing, broker-side sequence-id dedup
+    /// across a restart, and dashboard/metric continuity. Enable it only for
+    /// `Shared` producers whose identity is disposable.
+    ///
+    /// With no [`Self::name`] set this is a no-op: the broker already assigns a
+    /// unique name of its own.
+    ///
+    /// The suffix comes from
+    /// [`crate::Engine::random_subscription_suffix`] — the same seam
+    /// [`ReaderBuilder`] uses for auto-generated subscription names — so the
+    /// tokio engine draws a UUID and the moonpool engine a deterministic
+    /// counter. Randomness stays out of `magnetar-proto`
+    /// (`ARCHITECTURE.md` § known non-determinism leaks).
+    #[must_use]
+    pub fn unique_name_suffix(mut self, enable: bool) -> Self {
+        self.unique_name_suffix = enable;
+        self
+    }
+
+    /// Apply the [`Self::unique_name_suffix`] policy to the request just
+    /// before it leaves the builder. Shared by [`Self::create`] and both
+    /// engine-specialised `create_with_encryption` entries.
+    fn resolve_producer_name(&mut self) {
+        if self.unique_name_suffix
+            && let Some(name) = self.req.producer_name.as_mut()
+        {
+            name.push('-');
+            name.push_str(&E::random_subscription_suffix());
+        }
     }
 
     /// Enable batching with the given limits.
@@ -202,11 +254,12 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
     ///   `create_with_encryption()` instead.
     /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
     pub async fn create(
-        self,
+        mut self,
     ) -> Result<<E::ClientState as crate::CreateProducerApi>::Producer, PulsarError>
     where
         E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
     {
+        self.resolve_producer_name();
         if self.encryptor.is_some() {
             return Err(PulsarError::Other(
                 "ProducerBuilder::create() refuses a configured encryptor — \
@@ -282,7 +335,8 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
     ///
     /// # Errors
     /// - [`PulsarError::Client`] on broker rejection or wire failure.
-    pub async fn create_with_encryption(self) -> Result<magnetar_runtime_tokio::Producer> {
+    pub async fn create_with_encryption(mut self) -> Result<magnetar_runtime_tokio::Producer> {
+        self.resolve_producer_name();
         Ok(self
             .client
             .inner
@@ -320,7 +374,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static>
     ///
     /// # Errors
     /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
-    pub async fn create_with_encryption(self) -> Result<magnetar_runtime_moonpool::Producer<P>> {
+    pub async fn create_with_encryption(
+        mut self,
+    ) -> Result<magnetar_runtime_moonpool::Producer<P>> {
+        self.resolve_producer_name();
         self.client
             .inner
             .open_producer_with(self.req, self.encryptor)

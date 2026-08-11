@@ -157,6 +157,14 @@ impl<S: Schema, P: crate::ProducerApi> TypedProducer<S, P> {
         crate::ProducerApi::is_connected(&self.inner)
     }
 
+    /// `true` while this producer's broker attachment can drain sends.
+    /// Unlike [`Self::is_connected`], this detects a detached producer on a
+    /// still-live connection.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        crate::ProducerApi::is_ready(&self.inner)
+    }
+
     /// `true` once [`Self::close`] has been called.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -887,7 +895,10 @@ impl<S: Schema> TypedConsumer<S, Consumer> {
         self.inner.available_in_queue()
     }
 
-    /// Outstanding broker permits. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    /// Client-accounted outstanding permits — grants issued locally, minus one per dispatch unit
+    /// that has actually arrived. Mirrors Java `ConsumerBase#getAvailablePermits`. Issue #414
+    /// re-pointed this from the purely-additive grant mirror to the client-accounted decrementing
+    /// balance, so the value moves under dispatch (ADR-0101 amending ADR-0082).
     #[must_use]
     pub fn available_permits(&self) -> u32 {
         self.inner.available_permits()

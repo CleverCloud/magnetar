@@ -13,14 +13,14 @@
 //!
 //! Issue #349 split the consumer's permit mirror into `granted_permits` (a
 //! purely additive record of every grant sent to the broker) and
-//! `permit_balance` (the REAL balance, decremented once per broker dispatch
+//! `permit_balance` (the client-accounted balance, decremented once per broker dispatch
 //! unit as it arrives). This file drives that split through the tokio
 //! engine's public [`magnetar_runtime_tokio::ConnectionShared`] surface (no
 //! driver task, no TCP listener — the same synthetic-clock pattern the
 //! sibling `consumer_flow_control_edge.rs` uses):
 //!
 //! 1. `auto_receiver_queue_grows_under_real_dispatch_starvation` — real message deliveries (not a
-//!    synthetic field write) drain the broker-side permit balance to zero across a sustained
+//!    synthetic field write) drain the client-accounted permit balance to zero across a sustained
 //!    multi-tick ramp; the target must double on each tick that observes genuine starvation.
 //! 2. `auto_receiver_queue_skips_growth_during_churn_window` — a same-broker `CommandCloseConsumer`
 //!    zeroes the permit mirror as part of the #307 re-attach dance; an adjust tick landing in that

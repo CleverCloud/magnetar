@@ -6,8 +6,12 @@
 //!
 //! - Bounded receiver queue (`max_receiver_queue_size`).
 //! - Permit accounting → emit `CommandFlow` when the receiver queue drains below the threshold.
-//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch > 1` is split into N
-//!   [`IncomingMessage`]s with `batch_index` set.
+//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch` — `Some(1)` included, as
+//!   Java reads it — is decompressed as one body when it is compressed (ADR-0112), then split into
+//!   one [`IncomingMessage`] per position the broker still lists as unacked in
+//!   [`pb::CommandMessage::ack_set`], each with `batch_index` set. A first dispatch carries no
+//!   `ack_set` and therefore surfaces all N; a re-dispatch of a partially-acked entry surfaces only
+//!   the positions that still owe an acknowledgement (ADR-0105, issue #436).
 //! - Chunk reassembly: messages with `num_chunks_from_msg > 1` are buffered until all chunks
 //!   arrive, then surfaced as one logical message.
 //! - Dead-letter routing: when redelivery count exceeds `max_redeliver_count`, the consumer records
@@ -179,16 +183,17 @@ pub struct ConsumerState {
     /// reset, terminal subscribe failure, same-broker `CloseConsumer`). Issue #349: this is a
     /// purely ADDITIVE mirror — it is bumped at every grant site (`initial_flow`, `maybe_flow`,
     /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
-    /// actually arrive, so it does not track the broker's REAL outstanding grant. It is still
+    /// actually arrive, so it does not track the client's decrementing estimate. It is still
     /// the right register for "how much have we told the broker it may use": the #307
     /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
-    /// that question answered, and this additive counter answers it correctly. For the REAL,
-    /// decrementing balance — the starvation signal
+    /// that question answered, and this additive counter answers it correctly. For the
+    /// decrementing client-accounted balance — the starvation signal
     /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
     /// [`Self::permit_balance`].
     pub granted_permits: u32,
-    /// REAL broker-side permit balance: `granted_permits` minus one unit per broker dispatch
-    /// unit that has actually arrived (issue #349). Incremented at the same three grant sites
+    /// Client-accounted permit balance: `granted_permits` minus one unit per broker dispatch
+    /// unit received (issue #349). This is a local estimate, not the broker's admin
+    /// `consumers[].availablePermits` statistic. Incremented at the same three grant sites
     /// as `granted_permits` (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth
     /// branch) by the identical delta. Decremented by exactly one (saturating) per dispatch
     /// unit as it arrives:
@@ -201,6 +206,9 @@ pub struct ConsumerState {
     ///   `classify_and_queue` — reassembly is still pending — but the broker already dispatched
     ///   it).
     /// - Once per PIP-33 marker in [`Self::record_marker_consumed`].
+    /// - Once per batch position the broker charged but no batch layout could decode, in
+    ///   [`Self::deliver`] (issue #860, ADR-0112): it never reaches `classify_and_queue`, but the
+    ///   broker spent the permit all the same.
     ///
     /// Force-zeroed everywhere `granted_permits` is zeroed so the two counters never drift apart
     /// at a churn boundary. `flow_stats` feeds this — not `granted_permits` — into
@@ -213,9 +221,57 @@ pub struct ConsumerState {
     /// caller-owned authority and must survive a supervised transport rebuild
     /// until the caller observes the corresponding delivery.
     pub(crate) manual_flow_permits: u32,
-    /// Number of permits we've consumed since the last flow command. Visible to the
+    /// Monotonic count of broker dispatch units this consumer has observed since it
+    /// was constructed (issue #414). Bumped by [`Self::record_dispatch_unit`], the single
+    /// helper that also decrements [`Self::permit_balance`], so the two can never drift:
+    /// one unit per plain message, per batch member, per buffered chunk, and per PIP-33
+    /// marker.
+    ///
+    /// This is the stall watchdog's **progress signal**. It carries no clock, so the
+    /// dispatch sites need no `now` parameter (ADR-0011): the watchdog compares the mark
+    /// it latched at the start of a silence window against the current value, exactly the
+    /// way ADR-0058's keepalive compares `last_activity` against the deadline it armed.
+    /// Never reset — a wrapped `u64` would need ~584 years of continuous 1 GHz dispatch.
+    pub(crate) dispatch_units_received: u64,
+    /// Live per-consumer stall window (issue #414), or `None` when this consumer is not
+    /// currently a stall candidate ([`Self::is_stall_candidate`]). Seeded, advanced, and
+    /// cleared exclusively by [`Self::poll_stall`], which
+    /// [`crate::Connection::handle_timeout`] drives; the matching deadline is surfaced
+    /// through [`Self::next_stall_deadline`] so
+    /// [`crate::Connection::poll_timeout`] schedules a deterministic wake.
+    ///
+    /// Cleared at every grant site too ([`Self::initial_flow`], [`Self::maybe_flow`],
+    /// [`Self::adjust_receiver_queue`]'s growth branch): a fresh grant is a fresh promise
+    /// from the broker and deserves a fresh silence window rather than inheriting the
+    /// previous one's start instant.
+    pub(crate) stall_watch: Option<StallWatch>,
+    /// In-place re-subscribes the stall watchdog has driven for this consumer in the
+    /// current stall streak (issue #414, ADR-0103). Compared against
+    /// [`crate::ConnectionConfig::consumer_stall_auto_recovery`] in
+    /// [`crate::Connection::handle_timeout`], and bumped only when a re-subscribe was
+    /// actually emitted — a consumer the eligibility gate refuses spends no budget, and
+    /// neither does one the standby pre-check skips ([`Self::is_active`] reported
+    /// `Some(false)`, ADR-0103).
+    ///
+    /// Reset to zero in exactly ONE place: [`Self::record_dispatch_unit`], i.e. a broker
+    /// dispatch unit genuinely arriving. Resetting it at the churn boundaries that zero
+    /// the permit mirrors would be wrong rather than merely generous — the recovery's own
+    /// [`crate::Connection::resubscribe_consumer_in_place`] is one of those boundaries, so
+    /// the counter would clear itself on every attempt and the bound would not exist.
+    pub(crate) stall_recovery_attempts: u32,
+    /// Number of permits the client owes the broker back since the last flow command: one
+    /// per dispatch unit whose fate the client has decided. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
+    ///
+    /// Written in exactly one place, [`Self::record_broker_permit_consumed`], from five
+    /// callers — [`Self::pop_message`], the incomplete-chunk buffer in [`Self::deliver`],
+    /// [`Self::record_marker_consumed`], the dead-letter branch of
+    /// `classify_and_queue` (issue #437), and the undecodable batch members in
+    /// [`Self::deliver`] (issue #860, ADR-0112) — and zeroed by [`Self::maybe_flow`] when it
+    /// grants, plus at the churn boundaries that zero the permit mirrors. It is
+    /// refund-driven, not pop-driven: the invariant it holds up is
+    /// `granted window == permit_balance + consumed_since_flow + queue.len()`.
     pub(crate) consumed_since_flow: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
@@ -332,6 +388,22 @@ pub struct ConsumerState {
     /// initial flow. Request-id correlation prevents an older overlapping
     /// subscribe success from sending flow before the latest subscribe lands.
     pub(crate) flow_on_subscribe_ack_request: Option<RequestId>,
+    /// A `CommandSubscribe` has been emitted for this consumer and the initial
+    /// `CommandFlow` for that attach has not been issued yet (issue #427).
+    ///
+    /// Set by every `CommandSubscribe` emission — fresh subscribe, reconnect rebuild,
+    /// transient-subscribe retry, post-seek resubscribe, in-place re-attach — and cleared
+    /// by [`Self::initial_flow`], the single funnel every initial grant routes through.
+    /// It is what lets [`crate::Connection::initial_flow`] grant **once** per attach: the
+    /// broker (re-)creates its dispatcher slot at `availablePermits = 0`, so an attach with
+    /// no grant yet always needs one, and an attach that already has one never needs a
+    /// second.
+    ///
+    /// It is deliberately NOT the same question as `granted_permits == 0`. A post-seek
+    /// resubscribe leaves the additive `granted_permits` mirror alone (nothing zeroes it on
+    /// that path) while the broker's new dispatcher slot genuinely starts empty, so only
+    /// this flag can tell that attach apart from a consumer that is already fed.
+    pub(crate) initial_grant_due: bool,
     /// Configured max redelivery before DLQ routing kicks in (`0` disables DLQ routing).
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
@@ -410,12 +482,6 @@ pub struct ConsumerState {
     /// not be initialised (impossible in any non-broken hdrhistogram build); stats helpers
     /// report zero percentiles when `None` or empty.
     pub receive_latency_hist: Option<hdrhistogram::Histogram<u64>>,
-    /// Highest message id whose ack the runtime has surfaced via
-    /// [`crate::Connection::ack`] / `ack_grouped_individual` / `ack_grouped_cumulative`. Used by
-    /// [`crate::Connection::rebuild_consumers`] to set the `start_message_id` on the replayed
-    /// `CommandSubscribe` so the broker resumes from the post-ack position after a reconnect
-    /// (avoids double-delivery of pre-reconnect messages). `None` until the first ack lands.
-    pub last_acked_message_id: Option<MessageId>,
     /// Last rolling-window stats snapshot: `(msgs_at_snapshot, bytes_at_snapshot, taken_at)`.
     /// Updated by [`Self::record_rate_window`] to compute msgs/sec + bytes/sec rates.
     /// Mirrors Java `ConsumerStatsRecorder` rolling-window rate calculation. `None` until
@@ -467,6 +533,34 @@ pub struct ConsumerState {
     /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
     /// no-channel wake pattern (ADR-0003).
     pub active_change_wakers: Slab<Waker>,
+}
+
+/// One open silence window on a consumer that currently satisfies
+/// [`ConsumerState::is_stall_candidate`] (issue #414).
+///
+/// Progress-based, exactly like ADR-0058's connection keepalive: the window survives
+/// only while no broker dispatch unit arrives. Any dispatch bumps the consumer's monotonic
+/// dispatch-unit counter past the mark this window latched, which makes the next
+/// [`ConsumerState::poll_stall`] tick discard the window and open a fresh one.
+///
+/// The keepalive watchdog cannot cover this failure mode: `PING` / `PONG` keeps flowing
+/// on a connection whose broker-side dispatcher has stopped serving ONE subscription, so
+/// `last_activity` never ages and no connection-level deadline ever fires (issue #414's
+/// production symptom — survivors receive ~20 messages, then silence, with the broker's
+/// `availablePermits` hugely negative and no client-visible error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallWatch {
+    /// [`ConsumerState::dispatch_units_received`] as of the tick that opened this window.
+    /// A later tick observing a different value has seen progress and restarts the window.
+    pub(crate) mark: u64,
+    /// Injected-clock instant the window opened (never `Instant::now()` — ADR-0011).
+    /// The stall fires once `now >= since + consumer_stall_timeout`.
+    pub(crate) since: std::time::Instant,
+    /// Whether this window has already surfaced its
+    /// [`crate::event::ConnectionEvent::ConsumerStalled`]. Latched so one stall episode
+    /// emits exactly one event however many ticks run past the deadline; a dispatch (new
+    /// `mark`) or a state change that ends candidacy replaces the window and re-arms.
+    pub(crate) reported: bool,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -558,6 +652,57 @@ impl BatchAckEntry {
         }
     }
 
+    /// Construct the entry a broker-delivered `CommandMessage.ack_set` describes for a batch of
+    /// `batch_size` messages (issue #436, ADR-0105).
+    ///
+    /// The delivered bitset uses the same convention as the outbound one: bit `i` SET ⇒ position
+    /// `i` is still unacked. A word the broker did not send says nothing about the positions it
+    /// would have covered, so those read as unacked (`u64::MAX`) — a short or malformed `ack_set`
+    /// must never acknowledge a position on the broker's behalf. An EMPTY `ack_set`, which is what
+    /// a first dispatch and a broker with `acknowledgmentAtBatchIndexLevelEnabled=false` both
+    /// carry, therefore reduces to exactly [`Self::fresh`] with no special case.
+    ///
+    /// Bits at or above `batch_size` are never set by [`Self::fresh`] and this only ever clears
+    /// bits, so the tail stays zero and [`Self::is_fully_acked`] remains reachable.
+    #[must_use]
+    pub fn from_delivered_ack_set(batch_size: i32, ack_set: &[i64]) -> Self {
+        let mut entry = Self::fresh(batch_size);
+        for (index, word) in entry.unacked.iter_mut().enumerate() {
+            *word &= ack_set
+                .get(index)
+                .map_or(u64::MAX, |delivered| *delivered as u64);
+        }
+        entry
+    }
+
+    /// AND-accumulate a freshly delivered bitset into this one (issue #436, ADR-0105).
+    ///
+    /// Mirrors the broker's own accumulation in `ManagedCursorImpl.java:2632-2645`: bits only ever
+    /// clear, so a position this session already acked locally can never be re-asserted as unacked
+    /// by a later re-dispatch, and a position the broker reports as acked clears even if this
+    /// session never acked it (another consumer of the same `Shared` subscription did). A
+    /// delivered bitset narrower than this one leaves the uncovered words untouched, for the same
+    /// reason [`Self::from_delivered_ack_set`] treats a missing word as all-unacked.
+    pub fn intersect_delivered(&mut self, delivered: &Self) {
+        for (index, word) in self.unacked.iter_mut().enumerate() {
+            *word &= delivered.unacked.get(index).copied().unwrap_or(u64::MAX);
+        }
+    }
+
+    /// `true` when `position` is still listed as unacked in this bitset.
+    ///
+    /// Out-of-range positions — negative, past `batch_size`, past the allocated words — read as
+    /// ACKED: a bitset only ever describes `batch_size` positions, and [`Self::fresh`] never sets
+    /// a bit beyond them. No panic on any input (invariant #6): the negative case saturates to a
+    /// word index no bitset can hold, and the shift is masked to `0..64` by construction.
+    #[must_use]
+    pub fn is_unacked(&self, position: i32) -> bool {
+        let position = usize::try_from(position).unwrap_or(usize::MAX);
+        self.unacked
+            .get(position / 64)
+            .is_some_and(|word| word & (1u64 << (position % 64)) != 0)
+    }
+
     /// Clear the bit at `position`. Returns `true` once *every* position has been acked
     /// (bitset all-zero), which means the caller can drop this entry and send a "full"
     /// ack (no `ack_set`) so the broker advances the cursor past the batch.
@@ -570,16 +715,6 @@ impl BatchAckEntry {
     pub fn ack_cumulative(&mut self, position: i32) -> bool {
         self.clear_before(position.saturating_add(1));
         self.is_fully_acked()
-    }
-
-    /// Whether the broker selected this member for delivery.
-    #[must_use]
-    pub fn is_unacked(&self, position: usize) -> bool {
-        position < self.batch_size.max(0) as usize
-            && self
-                .unacked
-                .get(position / 64)
-                .is_some_and(|word| word & (1u64 << (position % 64)) != 0)
     }
 
     /// Number of selected members whose dispatch consumed broker permits.
@@ -886,6 +1021,9 @@ impl ConsumerState {
             granted_permits: 0,
             permit_balance: 0,
             manual_flow_permits: 0,
+            dispatch_units_received: 0,
+            stall_watch: None,
+            stall_recovery_attempts: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             #[cfg(feature = "scalable-topics")]
@@ -914,6 +1052,7 @@ impl ConsumerState {
             subscribe_waiter_completed: false,
             flow_on_subscribe_ack: false,
             flow_on_subscribe_ack_request: None,
+            initial_grant_due: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
             paused: false,
@@ -936,7 +1075,6 @@ impl ConsumerState {
             // its ConsumerStatsRecorder. See [`crate::producer::new_latency_histogram`] for
             // the invariant-#6 (no panics) safety chain.
             receive_latency_hist: crate::producer::new_latency_histogram(),
-            last_acked_message_id: None,
             last_rate_snapshot: None,
             current_msgs_per_sec: 0.0,
             current_bytes_per_sec: 0.0,
@@ -1116,6 +1254,40 @@ impl ConsumerState {
         self.receive_latency_hist.clone()
     }
 
+    /// The half-queue permit count [`Self::maybe_flow`] replenishes at. Shared with
+    /// [`Self::is_flow_starved`] so the starvation predicate can never drift from the
+    /// replenishment trigger it reasons about.
+    fn flow_threshold(&self) -> u32 {
+        (self.receiver_queue_size / 2).max(1) as u32
+    }
+
+    /// `true` when this consumer can NEVER emit another flow on its own: the broker has
+    /// dispatched every granted permit (`permit_balance == 0`, issue #349's client-accounted
+    /// balance), and even popping everything still queued cannot push `consumed_since_flow`
+    /// across the half-queue `flow_threshold` — so [`Self::maybe_flow`] is unreachable, the
+    /// broker sits at zero permits, and both sides wait on each other forever.
+    ///
+    /// Defence-in-depth since issue #437. What opens the gap between "charged" and
+    /// "refunded" is a dispatch unit debited from `permit_balance` that never credits
+    /// `consumed_since_flow`, and every client-side path that used to do that is closed:
+    /// a dead-lettered unit refunds in `classify_and_queue`'s DLQ branch and an incomplete
+    /// chunk refunds in `deliver`, both at buffering time (ADR-0107), and a batch member no
+    /// layout could decode refunds in `deliver` at delivery (ADR-0112). What remains is a
+    /// broker-side debit the client mirror missed, which no well-formed wire frame
+    /// produces — hence the twin `failover_starved_reflow.rs` tests manufacturing the state
+    /// by direct slot mutation rather than by feeding frames.
+    ///
+    /// Read by the two `initial_flow` gates (the #307 Failover promotion re-arm and
+    /// [`crate::Connection::initial_flow`]) so a starved-but-previously-fed consumer —
+    /// refused by the additive `granted_permits == 0` gate, invisible to the #414 stall
+    /// watchdog (`permit_balance > 0` candidacy), and unable to reach `maybe_flow` — has
+    /// exactly one exit.
+    pub fn is_flow_starved(&self) -> bool {
+        self.permit_balance == 0
+            && (self.consumed_since_flow as usize).saturating_add(self.queue.len())
+                < self.flow_threshold() as usize
+    }
+
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
@@ -1127,7 +1299,7 @@ impl ConsumerState {
         {
             return None;
         }
-        let threshold = (self.receiver_queue_size / 2).max(1) as u32;
+        let threshold = self.flow_threshold();
         if self.consumed_since_flow < threshold {
             return None;
         }
@@ -1135,14 +1307,189 @@ impl ConsumerState {
         self.consumed_since_flow = 0;
         self.granted_permits = self.granted_permits.saturating_add(permits);
         self.permit_balance = self.permit_balance.saturating_add(permits);
+        self.clear_stall_watch();
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
         })
     }
 
+    /// Credit the flow ledger for ONE dispatch unit the broker charged and the client will
+    /// not (or no longer) hold against the receiver queue.
+    ///
+    /// Five callers, one rule: a unit is refunded the moment the client decides it will
+    /// never be popped, or the moment it actually is. [`Self::pop_message`] refunds a
+    /// delivered message at the pop; the incomplete-chunk buffer in [`Self::deliver`] and
+    /// the dead-letter branch of `classify_and_queue` (issue #437) refund at buffering,
+    /// because neither will ever reach a pop; [`Self::record_marker_consumed`] refunds a
+    /// PIP-33 marker the conn-level filter drops; and [`Self::deliver`] refunds every charged
+    /// position of a batched entry no layout could decode (issue #860, ADR-0112). Nothing else may
+    /// call it — a `DeliverOutcome::Dropped` frame moves neither side of the mirror, and
+    /// neither does an ADR-0105 `ack_set`-cleared batch position, which the broker never
+    /// charged.
+    ///
+    /// Deliberately does NOT touch [`Self::permit_balance`]: that is the live arrival mirror
+    /// and belongs to [`Self::record_dispatch_unit`]. A site that owes both calls both.
     fn record_broker_permit_consumed(&mut self) {
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+    }
+
+    /// Account for exactly ONE broker dispatch unit arriving on this consumer.
+    ///
+    /// Issue #349 owns the first half — decrement the REAL
+    /// [`Self::permit_balance`] once per unit the broker actually spent a permit on.
+    /// Issue #414 owns the second — bump the monotonic
+    /// [`Self::dispatch_units_received`] progress mark the stall watchdog reads.
+    /// They are one call precisely so a future dispatch site cannot update one and
+    /// forget the other: a missed balance decrement mis-reports starvation, a missed
+    /// progress bump makes the watchdog cry stall on a perfectly healthy consumer.
+    ///
+    /// ADR-0103 hangs a third off the same call for the same reason: one dispatch unit
+    /// arriving is the ONLY definition of progress that clears
+    /// [`Self::stall_recovery_attempts`], so the automatic-recovery budget is restored
+    /// exactly when — and only when — the broker demonstrably started dispatching again.
+    /// A re-subscribe that the broker acked but never dispatched against is not progress
+    /// and must not refund the attempt that bought it.
+    ///
+    /// Carries no clock (ADR-0011): the mark is a counter, so the three call sites keep
+    /// their existing signatures.
+    fn record_dispatch_unit(&mut self) {
+        self.permit_balance = self.permit_balance.saturating_sub(1);
+        self.dispatch_units_received = self.dispatch_units_received.saturating_add(1);
+        self.stall_recovery_attempts = 0;
+    }
+
+    /// Drop any open stall window (issue #414). Called at every permit-grant site and by
+    /// [`crate::Connection::resubscribe_consumer_in_place`]: a fresh grant, or a fresh
+    /// broker-side dispatcher slot, restarts the silence window from the next tick rather
+    /// than inheriting a start instant that predates it.
+    pub(crate) fn clear_stall_watch(&mut self) {
+        self.stall_watch = None;
+    }
+
+    /// Open the stall window at `now` (issue #414), discarding any older one.
+    ///
+    /// Called by [`crate::Connection::initial_flow`], the one grant site that is handed an
+    /// injected clock (ADR-0011) — subscribe ack, reconnect rebuild, post-seek resubscribe,
+    /// the #307 Failover re-arm, and the #414 caller-driven recovery all route through it.
+    /// Seeding here rather than waiting for the first sweep is what makes detection take
+    /// `consumer_stall_timeout` instead of `consumer_stall_timeout + keepalive_interval`:
+    /// `poll_timeout` has no instant to arm from until a window exists, and on an otherwise
+    /// idle connection the keepalive deadline is the only thing that would produce that
+    /// first sweep. A full grant also starts the observation window for the
+    /// silence reported in #414; it does not identify which side caused that stall.
+    ///
+    /// Unconditional: a fresh grant is a fresh promise and always deserves a fresh window.
+    /// The other grant sites ([`Self::maybe_flow`], [`Self::adjust_receiver_queue`]) carry
+    /// no clock and only [`Self::clear_stall_watch`], which the next sweep re-seeds.
+    pub(crate) fn arm_stall_watch(&mut self, now: std::time::Instant) {
+        self.stall_watch = Some(StallWatch {
+            mark: self.dispatch_units_received,
+            since: now,
+            reported: false,
+        });
+    }
+
+    /// `true` while this consumer is in a state that can expose issue #414's silence:
+    /// the client has granted permits it has not observed being spent
+    /// (`permit_balance > 0`), the local queue is empty so nothing is waiting on
+    /// the user, and the consumer is dispatch-eligible.
+    ///
+    /// The eligibility set is deliberately the SAME one the #307 Failover re-arm gate uses
+    /// (`ActiveConsumerChange` arm in [`crate::Connection`]): not closed, not paused, no
+    /// in-flight seek freezing the queue, not terminally failed, not end-of-topic, and not
+    /// mid-re-attach. Each of those can explain silence without a broker fault, and a
+    /// watchdog that fired on them could report the user's own gating back at them.
+    ///
+    /// Pure read — no clock, no mutation.
+    #[must_use]
+    pub fn is_stall_candidate(&self) -> bool {
+        self.permit_balance > 0
+            && self.queue.is_empty()
+            && !self.closed
+            && !self.paused
+            && !self.reached_end_of_topic
+            && self.pending_seek.is_none()
+            && self.terminal_failure.is_none()
+            && !self.flow_on_subscribe_ack
+    }
+
+    /// Deadline at which an open, not-yet-reported stall window becomes due, or `None`
+    /// when the watchdog is disabled, no window is open, or this window already fired.
+    ///
+    /// Surfaced through [`crate::Connection::poll_timeout`] so the driver schedules a
+    /// deterministic wake — without it the sweep would only fire opportunistically on an
+    /// unrelated deadline, which is seed-divergent under the moonpool engine (the same
+    /// rationale [`Self::next_adjust_deadline`] and `next_chunk_expiry_deadline` carry).
+    ///
+    /// A candidate with no window yet arms nothing here: there is no instant to arm from.
+    /// [`crate::Connection::initial_flow`] seeds one at grant time, so in practice a
+    /// granted consumer is armed from the moment the broker was told it may dispatch. A consumer
+    /// that regains candidacy some other way — its queue draining empty after `maybe_flow`
+    /// topped the grant up — waits for the next sweep to seed it, and the keepalive deadline
+    /// guarantees one (ADR-0058).
+    #[must_use]
+    pub fn next_stall_deadline(&self, window: std::time::Duration) -> Option<std::time::Instant> {
+        let watch = self.stall_watch.as_ref()?;
+        if watch.reported {
+            return None;
+        }
+        Some(crate::time::deadline_with_clamp(watch.since, window))
+    }
+
+    /// Run one stall-watchdog tick against the injected `now` (ADR-0011).
+    ///
+    /// Returns `Some(silent_for)` exactly once per stall episode — on the first tick at or
+    /// after `window` has elapsed with no dispatch unit — so the caller can surface one
+    /// [`crate::event::ConnectionEvent::ConsumerStalled`]. Every later tick in the same
+    /// episode returns `None`.
+    ///
+    /// Emitting the event is the only effect **this method** has, and the only effect the
+    /// watchdog has at all while `consumer_stall_auto_recovery` is unset: recovery is then
+    /// explicit ([`crate::Connection::resubscribe_consumer_in_place`], or an operator-side
+    /// `topics unload`). ADR-0101 rejected an unconditional automatic re-subscribe because
+    /// a broker hiccup would become a re-subscribe storm across every partition at once
+    /// and would obscure diagnosis of the unresolved issue #414 stall; ADR-0103 admits
+    /// it only opt-in and only bounded, driven by
+    /// [`crate::Connection::handle_timeout`] from the `Some` this returns — one attempt
+    /// per episode, at most `consumer_stall_auto_recovery` attempts per stall streak, and
+    /// the event is emitted either way so the defect is still reported rather than
+    /// papered over.
+    pub fn poll_stall(
+        &mut self,
+        window: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if !self.is_stall_candidate() {
+            // Progress, user gating, or a terminal transition ended candidacy — drop the
+            // window so the next candidacy opens a fresh one (this is what re-arms the
+            // once-per-episode latch).
+            self.stall_watch = None;
+            return None;
+        }
+        let mark = self.dispatch_units_received;
+        match self.stall_watch {
+            // Same silence window, still running.
+            Some(watch) if watch.mark == mark => {
+                if watch.reported || now < crate::time::deadline_with_clamp(watch.since, window) {
+                    return None;
+                }
+                self.stall_watch = Some(StallWatch {
+                    reported: true,
+                    ..watch
+                });
+                Some(now.saturating_duration_since(watch.since))
+            }
+            // No window yet, or a dispatch landed since the last tick: (re-)open one.
+            _ => {
+                self.stall_watch = Some(StallWatch {
+                    mark,
+                    since: now,
+                    reported: false,
+                });
+                None
+            }
+        }
     }
 
     /// Account for one broker-side ledger entry that the conn-level filter has decided to
@@ -1157,10 +1504,12 @@ impl ConsumerState {
     pub fn record_marker_consumed(&mut self) {
         self.record_broker_permit_consumed();
         // Issue #349: a marker is one broker-dispatched unit too — decrement the
-        // REAL balance directly (not through `record_broker_permit_consumed`,
-        // which only tracks the pop-driven `consumed_since_flow` counter, the
-        // wrong site for the live balance).
-        self.permit_balance = self.permit_balance.saturating_sub(1);
+        // client-accounted balance directly (not through `record_broker_permit_consumed`,
+        // which credits the `consumed_since_flow` refund ledger, the wrong site
+        // for the live arrival mirror). Issue #414: the same call bumps the
+        // watchdog's progress mark, so a marker-only stream (a replicated
+        // subscription with no user traffic) counts as broker liveness.
+        self.record_dispatch_unit();
     }
 
     /// Force an initial flow for the current receiver-queue target.
@@ -1180,6 +1529,16 @@ impl ConsumerState {
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
+        // Issue #427: this attach's initial grant is now on its way to the broker, so no
+        // other grant site owes it one. `Connection::initial_flow` reads the flag back to
+        // stay idempotent per attach.
+        self.initial_grant_due = false;
+        // Issue #414: a fresh full grant (subscribe ack, reconnect rebuild, post-seek
+        // resubscribe, #307 re-arm, #414 caller-driven resubscribe) restarts the stall
+        // window. Keeping the old window would let a consumer that was already silent
+        // fire a stall the instant it is re-armed, before the broker had any chance to
+        // dispatch against the new grant.
+        self.clear_stall_watch();
         pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -1200,7 +1559,7 @@ impl ConsumerState {
         crate::receiver_queue::FlowStats {
             current_queue_size: self.receiver_queue_size,
             queued_messages: self.queue.len(),
-            // Issue #349: feed the REAL decrementing balance, not the
+            // Issue #349: feed the client-accounted decrementing balance, not the
             // purely-additive `granted_permits` mirror, so `0` here is a
             // genuine starvation signal (see `Self::permit_balance`'s doc).
             available_permits: self.permit_balance,
@@ -1272,6 +1631,7 @@ impl ConsumerState {
         }
         self.granted_permits = self.granted_permits.saturating_add(delta);
         self.permit_balance = self.permit_balance.saturating_add(delta);
+        self.clear_stall_watch();
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: delta,
@@ -1732,11 +2092,13 @@ impl ConsumerState {
                     self.record_broker_permit_consumed();
                     // Issue #349: this chunk is one dispatch unit even though
                     // it never reaches `classify_and_queue` (reassembly is
-                    // still pending) — decrement the REAL balance directly
+                    // still pending) — decrement the client-accounted balance directly
                     // rather than through `record_broker_permit_consumed`
-                    // (which only tracks the pop-driven `consumed_since_flow`
-                    // counter, the wrong site for the live balance).
-                    self.permit_balance = self.permit_balance.saturating_sub(1);
+                    // (which credits the `consumed_since_flow` refund ledger,
+                    // the wrong site for the live arrival mirror). Issue
+                    // #414: a consumer mid-reassembly is receiving, so the
+                    // same call bumps the watchdog's progress mark.
+                    self.record_dispatch_unit();
                     return Ok(DeliverOutcome::Buffered);
                 }
                 // All chunks present — assemble. Take the buffer out by value
@@ -1797,18 +2159,52 @@ impl ConsumerState {
             }
         }
 
-        // Batched message path.
-        let num_in_batch = metadata.num_messages_in_batch.unwrap_or(1);
-        if num_in_batch > 1 {
-            let incoming_ack_set = BatchAckEntry::from_ack_set(num_in_batch, &cmd.ack_set);
+        // Batched message path. Java takes the single-message path only when the field is
+        // ABSENT (`numMessages == 1 && !hasNumMessagesInBatch()` in
+        // `ConsumerImpl.messageReceived`): `num_messages_in_batch = Some(1)` — what
+        // `ProducerState::flush_batch` stamps on a one-message flush — is a batch of one
+        // whose body still carries the `[u32][SingleMessageMetadata]` framing (ADR-0112).
+        if let Some(num_in_batch) = metadata.num_messages_in_batch {
+            // Issue #436 / ADR-0105: the broker re-dispatches a partially-acked batched entry as
+            // ONE entry and names the positions that are still outstanding in
+            // `CommandMessage.ack_set` (bit SET ⇒ still unacked — the same convention as the
+            // outbound `BatchAckEntry`). Read it once, up front: the same bitset decides which
+            // positions reach the application below AND what the PIP-54 tracker holds for the
+            // entry. A first dispatch carries no `ack_set`, and so does every dispatch from a
+            // broker running `acknowledgmentAtBatchIndexLevelEnabled=false`; both reduce to the
+            // all-unacked bitset this branch has always built, so neither changes behaviour.
+            let delivered_ack_set =
+                BatchAckEntry::from_delivered_ack_set(num_in_batch, &cmd.ack_set);
             // PIP-54: stamp the per-batch ack tracker once. Subsequent acks of individual
             // positions in this batch clear bits in the bitset; the broker sees the partial
             // ack state and only advances the cursor once every position is acked.
-            if !incoming_ack_set.is_fully_acked() {
-                self.batch_ack_tracker
-                    .entry((message_id.ledger_id, message_id.entry_id))
-                    .or_insert_with(|| incoming_ack_set.clone());
-            }
+            //
+            // A vacant entry is SEEDED from the delivered bitset rather than from
+            // `BatchAckEntry::fresh`: a session whose first sight of this entry is a re-dispatch
+            // would otherwise re-assert the positions the broker has already accounted for as
+            // unacked on every partial ack, so the entry could never reach "fully acked", its
+            // `CommandAck` would carry an `ack_set` forever, and the subscription's mark-delete
+            // position would stay pinned behind it (issue #436) while the tracker entry leaked
+            // for the lifetime of the connection (the issue #326 growth class).
+            //
+            // An occupied entry AND-accumulates instead of being overwritten, mirroring
+            // `ManagedCursorImpl.java:2632-2645`: bits only ever clear, so an ack this session
+            // issued between the dispatch and the re-dispatch is never undone by the broker's
+            // older view of the entry.
+            self.batch_ack_tracker
+                .entry((message_id.ledger_id, message_id.entry_id))
+                .and_modify(|existing| existing.intersect_delivered(&delivered_ack_set))
+                .or_insert_with(|| delivered_ack_set.clone());
+            // ADR-0112: resolve the batch layout BEFORE splitting. A Java producer compresses the
+            // WHOLE packed body (`BatchMessageContainerImpl`), so the split has to run over the
+            // decompressed bytes, exactly as `ConsumerImpl.uncompressPayloadIfNeeded` runs before
+            // `receiveIndividualMessagesFromBatch`. Splitting the compressed bytes read codec
+            // output as member sizes, a guard fired, and no member was ever queued (issue #860).
+            // Members surfaced from a decoded body carry `compression = None`, which is what
+            // keeps both engines' post-pop decompression off them.
+            let mut metadata = metadata;
+            let members = unpack_batch_members(&mut metadata, body, num_in_batch);
+            let decoded = members.len();
             // Wrap the per-batch metadata once so every sub-message shares
             // a refcount instead of deep-cloning. For a 100-message batch
             // this collapses 100 `MessageMetadata::clone()` calls (each of
@@ -1816,30 +2212,34 @@ impl ConsumerState {
             // into 100 Arc bumps.
             let shared_meta = std::sync::Arc::new(metadata);
             let shared_bem = broker_entry_metadata.map(std::sync::Arc::new);
-            let mut cursor = body;
             let mut delivered = 0usize;
-            for idx in 0..num_in_batch {
-                if cursor.remaining() < 4 {
-                    break;
+            for (idx, (single, payload)) in (0..num_in_batch).zip(members) {
+                // Issue #436 / ADR-0105: a position whose delivered bit is CLEAR was already
+                // acknowledged, so it is decoded (the payload cursor has to keep advancing for
+                // the positions behind it to parse at all) and then dropped. Skipping means
+                // skipping `classify_and_queue` entirely, which is the single site that queues
+                // the message for the application, registers it with the ack-timeout tracker,
+                // and calls `record_dispatch_unit`. All three are correct to skip:
+                //
+                // - the application already acked it and must never see it twice;
+                // - re-registering it in the unacked tracker makes the ack-timeout sweep re-request
+                //   it forever — the self-sustaining redelivery loop of issue #436;
+                // - the broker debited `MESSAGE_PERMITS_UPDATER.addAndGet(this, ackedCount -
+                //   totalMessages)` when it re-dispatched the entry (apache/pulsar master 3bf3ec2,
+                //   `Consumer.java:433-434`), i.e. it charged only the positions it still expects
+                //   to be consumed, so debiting the mirror for an already-acked position would
+                //   drive it below the broker's real `availablePermits` by `ackedCount` on every
+                //   re-dispatch. Java keeps them out of `skippedMessages` for the mirror-image
+                //   reason — "Broker … did not decrease the permits in the broker-side. So do not
+                //   acquire more permits for this message" (`ConsumerImpl.java:1798-1862`) — so
+                //   neither side moves for them.
+                if !delivered_ack_set.is_unacked(idx) {
+                    continue;
                 }
-                let single_size = cursor.get_u32() as usize;
-                if cursor.remaining() < single_size {
-                    break;
-                }
-                let single_bytes = cursor.split_to(single_size);
-                let single = match pb::SingleMessageMetadata::decode(single_bytes) {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let payload_size = single.payload_size as usize;
-                if cursor.remaining() < payload_size {
-                    break;
-                }
-                let payload = cursor.split_to(payload_size);
                 let mut single_mid = message_id;
                 single_mid.batch_index = idx;
                 single_mid.batch_size = num_in_batch;
-                if incoming_ack_set.is_unacked(idx as usize) {
+                {
                     let im = IncomingMessage {
                         message_id: single_mid,
                         metadata: shared_meta.clone(),
@@ -1852,6 +2252,36 @@ impl ConsumerState {
                     self.classify_and_queue(im, redelivery, now);
                     delivered += 1;
                 }
+            }
+            // ADR-0112: every position the broker charged and no layout could decode is debited
+            // AND refunded here, at delivery, like a dead-lettered unit (ADR-0107): it will
+            // never be popped, so `pop_message` would never refund it, and once the loss passed
+            // half the receiver queue `maybe_flow` became unreachable and the consumer wedged
+            // with nothing logged (issue #860). An ADR-0105 `ack_set`-cleared position is skipped
+            // as above — the broker never charged it. Java refunds ONE permit when it discards a
+            // corrupted entry (`ConsumerImpl.discardCorruptedMessage`) although the broker
+            // charged `numMessagesInBatch`; refunding every charged position is the deliberate
+            // deviation ADR-0112 records.
+            let undecoded = (0..num_in_batch)
+                .skip(decoded)
+                .filter(|idx| delivered_ack_set.is_unacked(*idx))
+                .count();
+            if undecoded > 0 {
+                for _ in 0..undecoded {
+                    self.record_dispatch_unit();
+                    self.record_broker_permit_consumed();
+                }
+                tracing::warn!(
+                    target: "magnetar_proto::consumer",
+                    consumer_id = self.handle.0,
+                    ledger_id = message_id.ledger_id,
+                    entry_id = message_id.entry_id,
+                    num_messages_in_batch = num_in_batch,
+                    decoded,
+                    undecoded,
+                    compression = shared_meta.compression.unwrap_or(0),
+                    "dropped the undecodable members of a batched entry and refunded their permits",
+                );
             }
             self.wake_receivers();
             return Ok(DeliverOutcome::Delivered { count: delivered });
@@ -1888,12 +2318,30 @@ impl ConsumerState {
         // Issue #349: `classify_and_queue` is called exactly once per
         // broker dispatch unit — once for a plain message, once per batch
         // member (the `deliver` batch loop), and once for the chunk-
-        // completing logical message. Decrement the REAL balance
+        // completing logical message. Decrement the client-accounted balance
         // unconditionally, before the queued-vs-dead-lettered branch below:
         // the broker already spent one permit dispatching this entry
-        // regardless of which branch the client routes it into.
-        self.permit_balance = self.permit_balance.saturating_sub(1);
+        // regardless of which branch the client routes it into. Issue #414:
+        // the same call bumps the watchdog's progress mark — a dead-lettered
+        // entry is still evidence the broker is dispatching to us.
+        self.record_dispatch_unit();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
+            // Issue #437: a unit the broker charged is refunded to the flow
+            // ledger the moment the client decides it will never be popped.
+            // All five refund sites follow that one rule — `pop_message`, the
+            // incomplete-chunk buffer, `record_marker_consumed`, the undecodable
+            // batch members (ADR-0112), and this branch — and it mirrors
+            // `ConsumerImpl.messageReceived`, which
+            // calls `increaseAvailablePermits(cnx)` straight after it skips an
+            // over-redelivered message, and `receiveIndividualMessagesFromBatch`,
+            // which accumulates `skippedMessages` and calls
+            // `increaseAvailablePermits(cnx, skippedMessages)` once per entry
+            // (apache/pulsar master 2c3133a5:1555-1565 and :1865-1866). This
+            // was the only debit site without its refund: a dead-lettered unit
+            // is never queued, so no `pop_message` would ever count it, and the
+            // ledger drifted one-way by exactly the dead-letter count until a
+            // churn boundary zeroed both mirrors. See ADR-0107.
+            self.record_broker_permit_consumed();
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
             DeliverOutcome::Buffered
@@ -2053,12 +2501,127 @@ pub(crate) struct PendingTransactionalAcks {
     pub(crate) acknowledgements: Vec<PendingTransactionalAck>,
 }
 
+/// One member of a batched entry: its `SingleMessageMetadata` and its payload bytes.
+type BatchMember = (pb::SingleMessageMetadata, Bytes);
+
+/// Resolve the members of a batched entry (ADR-0112), trying the two layouts a compressed
+/// batch can arrive in.
+///
+/// An uncompressed entry is split as it always was, and keeps the members that parsed before
+/// the first malformed one. A compressed entry is tried as:
+///
+/// 1. **Java layout** — the whole packed body compressed once, `uncompressed_size` naming its
+///    decompressed length (`BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload`). The
+///    body must decompress to EXACTLY that length and split into all `num_in_batch` members; the
+///    exact-size check is what tells this layout from the next one, so it is never relaxed.
+/// 2. **magnetar ≤ 1.7.2 layout** — a raw packed body whose members were each compressed on their
+///    own, with `uncompressed_size` holding the sum of the COMPRESSED member sizes. No field names
+///    a member's real size, so each member is decoded by [`crate::compress::decompress_within`]
+///    under one [`crate::MAX_FRAME_SIZE`] budget shared by the whole entry. No client could read
+///    this layout before ADR-0112: the post-pop decompression checked every member against the
+///    batch-level size and rejected it.
+///
+/// Members are committed only when a layout decodes in full, so a Java attempt that fails
+/// halfway can never surface a member twice; only when the legacy layout fails too does a Java
+/// body that decoded to exactly `uncompressed_size` but split short surface the members before
+/// the malformed one, as Java's split does. On success `metadata.compression` is cleared:
+/// the surfaced payloads are plaintext, and that is what keeps both engines' post-pop
+/// decompression off them. An unknown codec, or a body neither layout decodes, yields no
+/// member and leaves `metadata` untouched; the caller refunds every charged position.
+fn unpack_batch_members(
+    metadata: &mut pb::MessageMetadata,
+    body: Bytes,
+    num_in_batch: i32,
+) -> Vec<BatchMember> {
+    let codec = match metadata.compression.map(pb::CompressionType::try_from) {
+        None | Some(Ok(pb::CompressionType::None)) => {
+            return split_batch_body(body, num_in_batch).0;
+        }
+        Some(Ok(codec)) => crate::compress::kind_from_pb(codec),
+        Some(Err(_)) => return Vec::new(),
+    };
+    let java = metadata
+        .uncompressed_size
+        .and_then(|size| crate::compress::decompress(codec, &body, size as usize).ok())
+        .map(|whole| split_batch_body(whole, num_in_batch));
+    let members = match java {
+        Some((members, true)) => members,
+        // A body that decoded to exactly `uncompressed_size` but split short is still the Java
+        // layout: like `receiveIndividualMessagesFromBatch`, deliver what parsed.
+        java => legacy_batch_members(codec, body, num_in_batch)
+            .or_else(|| java.map(|(prefix, _)| prefix))
+            .unwrap_or_default(),
+    };
+    if !members.is_empty() {
+        metadata.compression = None;
+    }
+    members
+}
+
+/// Decode the magnetar ≤ 1.7.2 batch layout: a raw packed body whose every member payload was
+/// compressed on its own with `codec`. `None` unless the body splits into all `num_in_batch`
+/// members AND every member decodes within the entry's shared [`crate::MAX_FRAME_SIZE`] budget.
+fn legacy_batch_members(
+    codec: crate::types::CompressionKind,
+    body: Bytes,
+    num_in_batch: i32,
+) -> Option<Vec<BatchMember>> {
+    let (members, complete) = split_batch_body(body, num_in_batch);
+    let mut budget = crate::MAX_FRAME_SIZE;
+    complete
+        .then_some(members)?
+        .into_iter()
+        .map(|(single, payload)| {
+            let plain = crate::compress::decompress_within(codec, &payload, budget).ok()?;
+            budget = budget.saturating_sub(plain.len());
+            Some((single, plain))
+        })
+        .collect()
+}
+
+/// Split a packed batch body into its `[u32 BE size][SingleMessageMetadata][payload]` members —
+/// the layout `BatchMessageContainerImpl` writes. Returns the members that parsed before the
+/// first malformed one, and whether all `num_in_batch` did.
+fn split_batch_body(mut body: Bytes, num_in_batch: i32) -> (Vec<BatchMember>, bool) {
+    let wanted = usize::try_from(num_in_batch).unwrap_or(0);
+    let members: Vec<BatchMember> = std::iter::from_fn(|| next_batch_member(&mut body))
+        .take(wanted)
+        .collect();
+    let complete = members.len() == wanted;
+    (members, complete)
+}
+
+/// Pop one `[u32 BE size][SingleMessageMetadata][payload]` member off the front of `body`, or
+/// `None` when what is left is too short or does not decode. Never panics on any input
+/// (invariant #6): every `get_u32` / `split_to` is preceded by its own length check.
+fn next_batch_member(body: &mut Bytes) -> Option<BatchMember> {
+    let single_size = (body.remaining() >= 4).then(|| body.get_u32() as usize)?;
+    let single_bytes = (body.remaining() >= single_size).then(|| body.split_to(single_size))?;
+    let single = pb::SingleMessageMetadata::decode(single_bytes).ok()?;
+    let payload_size = usize::try_from(single.payload_size).ok()?;
+    let payload = (body.remaining() >= payload_size).then(|| body.split_to(payload_size))?;
+    Some((single, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
 
     use super::*;
 
+    /// Metadata of a plain, unbatched message: no `num_messages_in_batch` at all, the shape
+    /// Java's `ConsumerImpl.messageReceived` reads as a single message.
+    fn single_metadata() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        }
+    }
+
+    /// Metadata of a batched entry declaring `num_in_batch` members — `Some(1)` included,
+    /// which is a batch of one (ADR-0112).
     fn metadata(num_in_batch: i32) -> pb::MessageMetadata {
         pb::MessageMetadata {
             producer_name: "p".to_owned(),
@@ -2101,7 +2664,7 @@ mod tests {
         for _ in 0..2 {
             c.deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"x"),
                 std::time::Instant::now(),
@@ -2120,7 +2683,7 @@ mod tests {
         let outcome = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2294,7 +2857,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(5),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2319,7 +2882,7 @@ mod tests {
         assert_eq!(c.permit_balance, 100);
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             std::time::Instant::now(),
@@ -2442,7 +3005,7 @@ mod tests {
         assert_eq!(c.permit_balance, 100);
         c.deliver(
             &message_cmd(5),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"poison"),
             std::time::Instant::now(),
@@ -2460,13 +3023,213 @@ mod tests {
     }
 
     #[test]
+    fn dlq_routed_units_refill_flow_at_half_queue() {
+        // Issue #437: the broker spent a permit dispatching the entry, and the client
+        // decides on arrival that it will never be popped. The refund therefore belongs
+        // at routing time, exactly where Java puts it
+        // (`ConsumerImpl.messageReceived` -> `increaseAvailablePermits`).
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        for _ in 0..4 {
+            c.deliver(
+                &message_cmd(2),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert!(c.queue.is_empty(), "every unit dead-lettered, none queued");
+        assert_eq!(c.dead_letter_pending.len(), 4);
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "a dead-lettered unit must credit the flow ledger the moment it is buffered",
+        );
+        assert_eq!(c.permit_balance, 4, "four of eight permits spent");
+        let flow = c
+            .maybe_flow()
+            .expect("four dead-lettered units cross the half-queue threshold");
+        assert_eq!(flow.message_permits, 4);
+        assert_eq!(c.permit_balance, 8, "the grant restores the full window");
+        assert_eq!(c.granted_permits, 12);
+    }
+
+    #[test]
+    fn eight_dlq_units_do_not_starve() {
+        // The wedge issue #437 reports: a full receiver queue of poison drains the real
+        // balance to zero with nothing ever queued, so `maybe_flow` was unreachable and
+        // `is_flow_starved` became true with no exit for a Shared consumer.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        let mut grants = Vec::new();
+        for _ in 0..8 {
+            c.deliver(
+                &message_cmd(2),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+            if let Some(flow) = c.maybe_flow() {
+                grants.push(flow.message_permits);
+            }
+        }
+        assert_eq!(
+            grants,
+            vec![4, 4],
+            "each half-queue of dead-lettered units must re-grant its own width",
+        );
+        assert!(
+            !c.is_flow_starved(),
+            "permits alone must no longer wedge a poison-fed consumer",
+        );
+        assert_eq!(c.dead_letter_pending.len(), 8);
+    }
+
+    #[test]
+    fn mixed_pop_and_dlq_units_share_one_flow_ledger() {
+        // One ledger, four refund sites: pop, incomplete chunk, PIP-33 marker, dead letter.
+        // A stream mixing popped and dead-lettered units crosses the threshold on their sum.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &message_cmd(0),
+            single_metadata(),
+            None,
+            Bytes::from_static(b"good"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let _ = c
+            .pop_message(std::time::Instant::now())
+            .expect("the well-behaved unit is queued");
+        for _ in 0..3 {
+            c.deliver(
+                &message_cmd(2),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "one popped plus three dead-lettered"
+        );
+        let flow = c.maybe_flow().expect("the sum crosses the threshold");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn dead_lettered_batch_members_refill_flow() {
+        // Java's batched path accumulates `skippedMessages` and calls
+        // `increaseAvailablePermits(cnx, skippedMessages)` once per entry
+        // (`receiveIndividualMessagesFromBatch`). The per-member refund here adds up to
+        // the same grant.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &message_cmd(2),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(c.queue.is_empty(), "every batch member dead-lettered");
+        assert_eq!(c.dead_letter_pending.len(), 4);
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "each dead-lettered batch member is one dispatch unit to refund",
+        );
+        let flow = c
+            .maybe_flow()
+            .expect("a wholly dead-lettered four-member entry crosses the threshold");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn paused_consumer_accrues_dlq_refund_without_emitting() {
+        // `maybe_flow` already honours `paused`, matching Java's `!paused` gate inside
+        // `increaseAvailablePermits`. The refund still accrues, so un-pausing grants it.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        c.paused = true;
+        let _ = c.initial_flow();
+        for _ in 0..4 {
+            c.deliver(
+                &message_cmd(2),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "the refund accrues even while the consumer is paused",
+        );
+        assert!(
+            c.maybe_flow().is_none(),
+            "a paused consumer emits no flow — the broker is meant to stop dispatching",
+        );
+        c.paused = false;
+        let flow = c
+            .maybe_flow()
+            .expect("un-pausing releases the accrued refund");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn a_dead_lettered_batch_refunds_only_the_positions_the_broker_charged() {
+        // ADR-0105 boundary: a re-dispatched entry whose `ack_set` clears positions was
+        // charged only for the ones it still lists unacked, so only those may be refunded
+        // — dead-lettered or not. Both sides of the mirror stay still for the rest.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &pb::CommandMessage {
+                ack_set: vec![0b1010],
+                ..message_cmd(2)
+            },
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.dead_letter_pending.len(),
+            2,
+            "only the still-unacked positions are routed anywhere",
+        );
+        assert_eq!(
+            c.permit_balance, 6,
+            "the broker charged two of the four positions",
+        );
+        assert_eq!(
+            c.consumed_since_flow, 2,
+            "and exactly those two are refunded — never a position the broker never charged",
+        );
+    }
+
+    #[test]
     fn consumer_stats_count_delivered_messages_only() {
         let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
         let _ = c.initial_flow();
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2475,7 +3238,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hello"),
                 std::time::Instant::now(),
@@ -2490,7 +3253,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(5),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"DROPPED"),
                 std::time::Instant::now(),
@@ -2509,7 +3272,7 @@ mod tests {
             let _ = c
                 .deliver(
                     &message_cmd(5),
-                    metadata(1),
+                    single_metadata(),
                     None,
                     Bytes::from_static(b"poison"),
                     std::time::Instant::now(),
@@ -2569,6 +3332,396 @@ mod tests {
         assert!(entry.ack_cumulative(4));
     }
 
+    // -------------------------------------------------------------------
+    // Issue #436 / ADR-0105 — the delivered `CommandMessage.ack_set`.
+    //
+    // The broker re-dispatches a partially-acked batched entry as ONE entry
+    // and names the positions that still owe an acknowledgement (bit SET ⇒
+    // still unacked). Those positions — and only those — reach the
+    // application, enter the ack-timeout tracker, and cost a permit; the
+    // delivered bitset is also the authoritative seed / AND-accumulator for
+    // the PIP-54 tracker entry.
+    // -------------------------------------------------------------------
+
+    /// Pack `payloads` into the `(u32 single_size)(SingleMessageMetadata)(payload)` wire shape
+    /// the batch branch of [`ConsumerState::deliver`] explodes.
+    fn batch_body(payloads: &[&[u8]]) -> Bytes {
+        let mut buf = bytes::BytesMut::new();
+        for payload in payloads {
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = sm.encoded_len();
+            buf.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            sm.encode(&mut buf).unwrap();
+            buf.extend_from_slice(payload);
+        }
+        buf.freeze()
+    }
+
+    /// Four packed sub-messages, distinct payloads so a mis-advanced cursor is visible.
+    fn four_message_batch() -> Bytes {
+        batch_body(&[
+            b"p0".as_ref(),
+            b"p1".as_ref(),
+            b"p2".as_ref(),
+            b"p3".as_ref(),
+        ])
+    }
+
+    /// A batched `CommandMessage` on `(1, 1)` carrying `ack_set`.
+    fn batch_cmd_with_ack_set(ack_set: Vec<i64>) -> pb::CommandMessage {
+        pb::CommandMessage {
+            ack_set,
+            ..message_cmd(0)
+        }
+    }
+
+    /// Batch positions currently sitting in the receiver queue, in order.
+    fn queued_positions(c: &ConsumerState) -> Vec<i32> {
+        c.queue.iter().map(|m| m.message_id.batch_index).collect()
+    }
+
+    #[test]
+    fn batch_ack_entry_from_empty_delivered_ack_set_is_all_unacked() {
+        // A first dispatch — and every dispatch from a broker running
+        // `acknowledgmentAtBatchIndexLevelEnabled=false` — carries no `ack_set` at all, and
+        // must reduce to exactly the all-unacked entry this branch has always built.
+        assert_eq!(
+            BatchAckEntry::from_delivered_ack_set(5, &[]).unacked,
+            BatchAckEntry::fresh(5).unacked,
+            "an absent ack_set says nothing, so every position stays unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_from_delivered_ack_set_keeps_only_the_set_bits() {
+        let e = BatchAckEntry::from_delivered_ack_set(8, &[0b1100_0000]);
+        assert_eq!(e.unacked, vec![0b1100_0000]);
+        assert_eq!(e.batch_size, 8);
+        assert!(!e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_from_delivered_ack_set_masks_bits_past_the_batch() {
+        // A broker word covers 64 positions whatever the batch is wide; bits at or above
+        // `batch_size` must stay clear or `is_fully_acked` could never fire and the tracker
+        // entry would leak for the lifetime of the connection.
+        let e = BatchAckEntry::from_delivered_ack_set(3, &[i64::from(-1i32)]);
+        assert_eq!(e.unacked, vec![0b111]);
+    }
+
+    #[test]
+    fn batch_ack_entry_from_short_delivered_ack_set_leaves_uncovered_words_unacked() {
+        // 70 positions need two words; the broker sent one. The uncovered positions must read
+        // as UNACKED — a truncated bitset may never acknowledge a position on the broker's
+        // behalf.
+        let e = BatchAckEntry::from_delivered_ack_set(70, &[0b1010]);
+        assert_eq!(e.unacked.len(), 2);
+        assert_eq!(e.unacked[0], 0b1010);
+        assert_eq!(
+            e.unacked[1], 0b11_1111,
+            "the six positions of the second word that exist (64..70) stay unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_from_all_clear_delivered_ack_set_is_fully_acked() {
+        let e = BatchAckEntry::from_delivered_ack_set(4, &[0]);
+        assert!(e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_intersect_delivered_never_resets_a_cleared_bit() {
+        let mut e = BatchAckEntry::fresh(4);
+        assert!(!e.ack_position(0));
+        assert_eq!(e.unacked, vec![0b1110]);
+        // The broker's older view still lists position 0 as unacked. AND-accumulation must
+        // NOT re-set it (`ManagedCursorImpl.java:2632-2645`).
+        e.intersect_delivered(&BatchAckEntry::from_delivered_ack_set(4, &[0b1111]));
+        assert_eq!(e.unacked, vec![0b1110]);
+        // And a bit the broker reports as acked clears even though this session never acked
+        // it — a sibling consumer of the same Shared subscription did.
+        e.intersect_delivered(&BatchAckEntry::from_delivered_ack_set(4, &[0b1100]));
+        assert_eq!(e.unacked, vec![0b1100]);
+    }
+
+    #[test]
+    fn batch_ack_entry_intersect_delivered_keeps_words_the_delivered_set_does_not_cover() {
+        let mut e = BatchAckEntry::fresh(70);
+        let narrow = BatchAckEntry::from_delivered_ack_set(4, &[0b0001]);
+        e.intersect_delivered(&narrow);
+        assert_eq!(e.unacked[0], 0b0001, "the covered word intersects");
+        assert_eq!(
+            e.unacked[1], 0b11_1111,
+            "an uncovered word is left untouched, exactly as a missing word reads as unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_is_unacked_reads_out_of_range_positions_as_acked() {
+        let e = BatchAckEntry::from_delivered_ack_set(4, &[0b1010]);
+        assert!(!e.is_unacked(0));
+        assert!(e.is_unacked(1));
+        assert!(!e.is_unacked(2));
+        assert!(e.is_unacked(3));
+        // Out of range in every direction — no panic (invariant #6), and never "unacked".
+        assert!(!e.is_unacked(-1));
+        assert!(!e.is_unacked(4));
+        assert!(!e.is_unacked(i32::MAX));
+        assert!(!e.is_unacked(i32::MIN));
+    }
+
+    #[test]
+    fn delivered_ack_set_skips_the_positions_it_reports_as_acked() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                // Positions 1 and 3 still unacked; 0 and 2 already acknowledged.
+                &batch_cmd_with_ack_set(vec![0b1010]),
+                metadata(4),
+                None,
+                four_message_batch(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
+            other => panic!("expected Delivered(2), got {other:?}"),
+        }
+        assert_eq!(
+            queued_positions(&c),
+            vec![1, 3],
+            "only the positions the broker still lists as unacked may reach the application",
+        );
+        assert_eq!(
+            c.queue
+                .iter()
+                .map(|m| m.payload.as_ref().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"p1".to_vec(), b"p3".to_vec()],
+            "a skipped position is decoded and dropped, so the payload cursor stays aligned \
+             and the positions behind it carry their own payloads",
+        );
+    }
+
+    #[test]
+    fn delivered_ack_set_charges_a_permit_only_for_the_positions_it_lists_unacked() {
+        // Ground truth: the broker debits `ackedCount - totalMessages` when it re-dispatches
+        // the entry (`Consumer.java:433-434`), so it charged 2 of the 4 positions here. A
+        // mirror that debits all 4 drifts 2 below the broker's real `availablePermits` on
+        // every re-dispatch, which is the unbounded drift of issue #436.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.permit_balance, 98,
+            "a re-dispatched K=4 entry whose ack_set lists 2 positions unacked consumes \
+             exactly 2 dispatch units, not 4",
+        );
+    }
+
+    #[test]
+    fn skipped_positions_never_enter_the_ack_timeout_tracker() {
+        // Re-registering an already-acked position is what makes the ack-timeout redelivery
+        // loop self-sustaining: the sweep re-requests it, the broker re-dispatches the entry,
+        // the client re-registers it, forever (issue #436).
+        let ack_timeout = std::time::Duration::from_secs(2);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        c.unacked_tracker = Some(crate::trackers::UnackedMessageTracker::new(
+            ConsumerHandle(1),
+            ack_timeout,
+        ));
+        let _ = c.initial_flow();
+        let at = std::time::Instant::now();
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            at,
+        )
+        .unwrap();
+
+        let expired: Vec<i32> = c
+            .unacked_tracker
+            .as_mut()
+            .expect("tracker configured")
+            .poll(at + ack_timeout + std::time::Duration::from_millis(1))
+            .into_iter()
+            .flat_map(|action| match action {
+                crate::trackers::UnackedAction::RedeliverExpired { message_ids, .. } => message_ids,
+            })
+            .map(|id| id.batch_index)
+            .collect();
+        assert_eq!(
+            expired,
+            vec![1, 3],
+            "only the genuinely outstanding positions may expire into a redelivery request",
+        );
+    }
+
+    #[test]
+    fn delivered_ack_set_seeds_a_vacant_batch_ack_tracker_entry() {
+        // A session whose FIRST sight of the entry is a re-dispatch. Seeding from
+        // `BatchAckEntry::fresh` would re-assert positions 0 and 2 as unacked on every partial
+        // ack, so the entry could never reach "fully acked" and the subscription's mark-delete
+        // position would stay pinned behind it (issue #436).
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let entry = c
+            .batch_ack_tracker
+            .get(&(1, 1))
+            .expect("the batched entry stamps a tracker entry");
+        assert_eq!(entry.unacked, vec![0b1010]);
+        assert_eq!(entry.batch_size, 4);
+    }
+
+    #[test]
+    fn a_redispatch_and_merges_into_the_existing_batch_ack_tracker_entry() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // First dispatch: no ack_set, so every position is unacked.
+        c.deliver(
+            &batch_cmd_with_ack_set(Vec::new()),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.batch_ack_tracker.get(&(1, 1)).map(|e| e.unacked.clone()),
+            Some(vec![0b1111]),
+            "a first dispatch seeds the all-unacked bitset, exactly as before",
+        );
+        // This session acknowledges position 3 locally.
+        let fully = c
+            .batch_ack_tracker
+            .get_mut(&(1, 1))
+            .expect("entry present")
+            .ack_position(3);
+        assert!(!fully);
+
+        // The broker re-dispatches with its own (older) view: 0 and 2 acked, 1 and 3 unacked.
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.batch_ack_tracker.get(&(1, 1)).map(|e| e.unacked.clone()),
+            Some(vec![0b0010]),
+            "AND-accumulation only ever clears bits: position 3 stays acked even though the \
+             broker still listed it as unacked, and 0 and 2 clear from the delivered view",
+        );
+    }
+
+    #[test]
+    fn a_short_delivered_ack_set_delivers_the_positions_it_does_not_cover() {
+        // A malformed / truncated bitset must fail towards delivery, never towards silently
+        // dropping a message that has not been acknowledged.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // 68 positions span two words; the broker sends one, and it clears every position it
+        // covers. Positions 64..68 are uncovered and must still be delivered.
+        let payloads: Vec<Vec<u8>> = (0..68).map(|i| format!("p{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(std::vec::Vec::as_slice).collect();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                metadata(68),
+                None,
+                batch_body(&refs),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 4),
+            other => panic!("expected Delivered(4), got {other:?}"),
+        }
+        assert_eq!(queued_positions(&c), vec![64, 65, 66, 67]);
+        assert_eq!(
+            c.permit_balance, 96,
+            "and the mirror is debited for exactly those four",
+        );
+    }
+
+    #[test]
+    fn an_all_clear_delivered_ack_set_delivers_nothing_and_charges_nothing() {
+        // Every position acknowledged. The entry still parses (the wire body is walked
+        // position by position), nothing reaches the application, no permit moves, and the
+        // tracker entry is immediately fully-acked.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                metadata(4),
+                None,
+                four_message_batch(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 0),
+            other => panic!("expected Delivered(0), got {other:?}"),
+        }
+        assert!(c.queue.is_empty());
+        assert_eq!(c.permit_balance, 100);
+        assert!(
+            c.batch_ack_tracker
+                .get(&(1, 1))
+                .expect("entry present")
+                .is_fully_acked(),
+        );
+    }
+
+    #[test]
+    fn an_ack_set_on_an_unbatched_entry_is_ignored() {
+        // `num_messages_in_batch <= 1` never reaches the batched branch, so a stray `ack_set`
+        // cannot suppress a plain message.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"plain"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 1),
+            other => panic!("expected Delivered(1), got {other:?}"),
+        }
+        assert_eq!(queued_positions(&c), vec![-1]);
+        assert_eq!(c.permit_balance, 99);
+        assert!(c.batch_ack_tracker.is_empty());
+    }
+
     /// Drive a synthetic distribution through `receive_latency_hist` and confirm the snapshot
     /// percentiles + accessors line up with the input. Mirrors the Java
     /// `ConsumerStatsRecorderTest#testGetLatencyPercentiles` smoke test.
@@ -2624,7 +3777,7 @@ mod tests {
         let _ = c.initial_flow();
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             arrived,
@@ -2666,7 +3819,7 @@ mod tests {
             let _ = c.initial_flow();
             c.deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"x"),
                 arrived,
@@ -2701,7 +3854,7 @@ mod tests {
         let _ = c.initial_flow();
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             arrived,
@@ -3628,7 +4781,7 @@ mod tests {
         let outcome = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -3676,7 +4829,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -3962,5 +5115,760 @@ mod tests {
             "chunk_id == total_chunks must be Dropped, got {outcome:?}",
         );
         assert!(c.chunk_reassembly.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #860 / ADR-0112 — compressed batched entries.
+    //
+    // A Java producer compresses the WHOLE packed batch body
+    // (`BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload`), so `deliver` has to
+    // decompress a batched entry before it can split it. Every body below is packed and
+    // compressed by hand — never by magnetar's own producer — so no test can pass because both
+    // ends share the same mistake.
+    // -------------------------------------------------------------------
+
+    /// The four Pulsar codecs.
+    const ALL_CODECS: [crate::types::CompressionKind; 4] = [
+        crate::types::CompressionKind::Lz4,
+        crate::types::CompressionKind::Zlib,
+        crate::types::CompressionKind::Zstd,
+        crate::types::CompressionKind::Snappy,
+    ];
+
+    /// `n` distinct, compressible payloads.
+    fn compressible_payloads(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| format!("member-{i}|").repeat(16).into_bytes())
+            .collect()
+    }
+
+    fn payload_refs(payloads: &[Vec<u8>]) -> Vec<&[u8]> {
+        payloads.iter().map(Vec::as_slice).collect()
+    }
+
+    /// Java layout: the packed body compressed ONCE, `uncompressed_size` = packed length.
+    fn java_layout(
+        codec: crate::types::CompressionKind,
+        payloads: &[Vec<u8>],
+    ) -> (pb::MessageMetadata, Bytes) {
+        let packed = batch_body(&payload_refs(payloads));
+        let body = crate::compress::compress(codec, &packed).unwrap();
+        let mut meta = metadata(payloads.len() as i32);
+        meta.compression = Some(codec.to_pb() as i32);
+        meta.uncompressed_size = Some(packed.len() as u32);
+        (meta, body)
+    }
+
+    /// magnetar ≤ 1.7.2 layout: every payload compressed on its own, the packed body raw, and
+    /// `uncompressed_size` = the sum of the COMPRESSED member sizes.
+    fn legacy_layout(
+        codec: crate::types::CompressionKind,
+        payloads: &[Vec<u8>],
+    ) -> (pb::MessageMetadata, Bytes) {
+        let members: Vec<Bytes> = payloads
+            .iter()
+            .map(|p| crate::compress::compress(codec, p).unwrap())
+            .collect();
+        let refs: Vec<&[u8]> = members.iter().map(Bytes::as_ref).collect();
+        let mut meta = metadata(payloads.len() as i32);
+        meta.compression = Some(codec.to_pb() as i32);
+        meta.uncompressed_size = Some(members.iter().map(Bytes::len).sum::<usize>() as u32);
+        (meta, batch_body(&refs))
+    }
+
+    /// Pop everything queued and return the payloads, asserting each surfaced member is
+    /// plaintext-marked (`compression` cleared) so no engine decompresses it a second time.
+    fn drain_plaintext(c: &mut ConsumerState) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(msg) = c.pop_message(std::time::Instant::now()) {
+            assert_eq!(
+                msg.metadata.compression, None,
+                "a member surfaced from a decoded batch must not be decompressed again"
+            );
+            out.push(msg.payload.to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn java_layout_compressed_batch_surfaces_every_member_and_reflows() {
+        const RQ: usize = 8;
+        let payloads = compressible_payloads(RQ);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), RQ);
+            let _ = c.initial_flow();
+            let (meta, body) = java_layout(codec, &payloads);
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(
+                matches!(outcome, DeliverOutcome::Delivered { count: RQ }),
+                "{codec:?}: a Java-layout batch must surface all {RQ} members, got {outcome:?}"
+            );
+            assert_eq!(c.permit_balance, 0, "{codec:?}: one entry spent the window");
+            // `maybe_flow`'s threshold is RQ / 2 = 4: three pops stay quiet, the fourth
+            // replenishes. Before ADR-0112 nothing was queued, so nothing could be popped and
+            // this flow never existed — the issue #860 Reader stall.
+            for _ in 0..3 {
+                assert!(c.pop_message(std::time::Instant::now()).is_some());
+                assert!(
+                    c.maybe_flow().is_none(),
+                    "{codec:?}: below the half-queue threshold"
+                );
+            }
+            assert!(c.pop_message(std::time::Instant::now()).is_some());
+            let flow = c
+                .maybe_flow()
+                .expect("half the queue popped must re-arm flow");
+            assert_eq!(flow.message_permits, 4, "{codec:?}");
+            let rest = drain_plaintext(&mut c);
+            assert_eq!(
+                rest,
+                payloads[4..].to_vec(),
+                "{codec:?}: plaintext, in order"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_layout_compressed_batch_surfaces_every_member_decoded() {
+        let payloads = compressible_payloads(4);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let (meta, body) = legacy_layout(codec, &payloads);
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(
+                matches!(outcome, DeliverOutcome::Delivered { count: 4 }),
+                "{codec:?}: got {outcome:?}"
+            );
+            assert_eq!(
+                drain_plaintext(&mut c),
+                payloads,
+                "{codec:?}: a legacy member must be decoded on its own, not handed over compressed"
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_compressed_batch_debits_and_refunds_every_charged_member() {
+        const RQ: usize = 8;
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), RQ);
+        let _ = c.initial_flow();
+        let mut meta = metadata(RQ as i32);
+        meta.compression = Some(pb::CompressionType::Lz4 as i32);
+        meta.uncompressed_size = Some(512);
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                meta,
+                None,
+                Bytes::from(vec![0xA5u8; 96]),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DeliverOutcome::Delivered { count: 0 }),
+            "garbage decodes in neither layout, got {outcome:?}"
+        );
+        assert_eq!(c.queue_len(), 0);
+        assert_eq!(
+            c.permit_balance, 0,
+            "every member the broker charged is debited from the live mirror"
+        );
+        let flow = c
+            .maybe_flow()
+            .expect("the refund alone must re-arm flow — nothing will ever be popped");
+        assert_eq!(flow.message_permits, RQ as u32);
+        assert_eq!(c.permit_balance, RQ as u32, "the grant restores the window");
+    }
+
+    #[test]
+    fn undecodable_batch_refund_skips_ack_set_cleared_positions() {
+        // ADR-0105: the broker charged only the still-unacked positions of a re-dispatched
+        // entry, so only those are refunded. Positions 0..=5 cleared, 6 and 7 outstanding.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let mut cmd = message_cmd(1);
+        cmd.ack_set = vec![0b1100_0000];
+        let mut meta = metadata(8);
+        meta.compression = Some(pb::CompressionType::Zstd as i32);
+        meta.uncompressed_size = Some(512);
+        c.deliver(
+            &cmd,
+            meta,
+            None,
+            Bytes::from(vec![0x5Au8; 64]),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(c.permit_balance, 6, "two charged positions debited");
+        assert_eq!(c.consumed_since_flow, 2, "and the same two refunded");
+    }
+
+    #[test]
+    fn unknown_codec_batch_is_refunded_not_surfaced() {
+        let payloads = compressible_payloads(4);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Lz4, &payloads);
+        meta.compression = Some(99);
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 0 }));
+        assert_eq!(c.permit_balance, 4);
+        assert_eq!(c.consumed_since_flow, 4);
+    }
+
+    #[test]
+    fn oversized_uncompressed_size_is_refused_before_decoding() {
+        // `uncompressed_size = u32::MAX` must be refused before any codec allocates for it;
+        // the entry is then undecodable and refunded rather than wedging the consumer.
+        let payloads = compressible_payloads(4);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Zlib, &payloads);
+        meta.uncompressed_size = Some(u32::MAX);
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 0 }));
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "all four charged members refunded"
+        );
+    }
+
+    #[test]
+    fn truncated_uncompressed_batch_surfaces_its_prefix_and_refunds_the_rest() {
+        // An uncompressed body declaring 8 members but carrying 3: the 3 surface as they
+        // always did, and the 5 the broker charged for but no parser can reach are refunded.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                metadata(8),
+                None,
+                batch_body(&[b"a".as_ref(), b"b".as_ref(), b"c".as_ref()]),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 3 }));
+        assert_eq!(c.permit_balance, 0, "8 members charged, 8 debited");
+        assert_eq!(c.consumed_since_flow, 5, "the 5 unreachable ones refunded");
+        assert_eq!(c.queue_len(), 3);
+    }
+
+    /// The bytes a popped payload keeps alive: its `Bytes` handed back as the unique owner of
+    /// its buffer, whose capacity is what the allocation really holds.
+    fn retained_capacity(payload: Bytes) -> usize {
+        payload
+            .try_into_mut()
+            .expect("a decoded legacy member owns its buffer")
+            .capacity()
+    }
+
+    #[test]
+    fn legacy_member_holds_only_its_decoded_length() {
+        // ADR-0112 review: the legacy decoder sizes LZ4's output buffer from the entry budget
+        // (up to 255 x the member) and the streaming codecs grow theirs by doubling; a queued
+        // member must not keep that headroom alive — a 1000-message legacy queue held GBs.
+        let payloads = compressible_payloads(4);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let (meta, body) = legacy_layout(codec, &payloads);
+            c.deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            while let Some(msg) = c.pop_message(std::time::Instant::now()) {
+                let len = msg.payload.len();
+                assert_eq!(
+                    retained_capacity(msg.payload),
+                    len,
+                    "{codec:?}: a legacy member must hold exactly its decoded bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_member_batch_is_unframed() {
+        // Java takes the single-message path only when `numMessagesInBatch == 1` is ABSENT
+        // (`ConsumerImpl.messageReceived`); `num_messages_in_batch = Some(1)` — what
+        // `flush_batch` stamps on a one-message flush — is a batch of one, uncompressed or not.
+        let only = vec![b"only-member".repeat(4)];
+        let uncompressed = batch_body(&payload_refs(&only));
+        let (java_meta, java_body) = java_layout(crate::types::CompressionKind::Lz4, &only);
+        for (meta, body) in [(metadata(1), uncompressed), (java_meta, java_body)] {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(matches!(outcome, DeliverOutcome::Delivered { count: 1 }));
+            let msg = c.pop_message(std::time::Instant::now()).unwrap();
+            assert_eq!(
+                msg.payload.to_vec(),
+                only[0],
+                "the member, without its [u32][SingleMessageMetadata] framing"
+            );
+            assert_eq!(
+                (msg.message_id.batch_index, msg.message_id.batch_size),
+                (0, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn java_layout_batch_that_splits_short_surfaces_its_prefix() {
+        // A Java-layout body that decompresses to exactly `uncompressed_size` but packs 3 of
+        // the 8 members it declares: like Java's `receiveIndividualMessagesFromBatch`, the 3
+        // that parse are delivered, and the 5 the broker charged for are refunded.
+        let members = compressible_payloads(3);
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Zstd, &members);
+        meta.num_messages_in_batch = Some(8);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 3 }));
+        assert_eq!(c.consumed_since_flow, 5, "the 5 missing members refunded");
+        assert_eq!(drain_plaintext(&mut c), members);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #414 — per-consumer stall watchdog state machine.
+//
+// The failure this models: a Pulsar Shared subscription whose broker-side
+// dispatcher wedges after consumer churn. The survivors hold the permits the
+// broker acknowledged, their local queues are empty, and nothing ever arrives
+// again — while the connection keepalive keeps passing, so ADR-0058's
+// connection watchdog never fires.
+//
+// The whole machine lives on `ConsumerState`: a monotonic dispatch counter as
+// the progress signal, and one `StallWatch` opened / advanced / discarded by
+// `poll_stall`. These tests pin every arm of it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stall_watchdog_tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn metadata() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        }
+    }
+
+    fn message_cmd() -> pb::CommandMessage {
+        pb::CommandMessage {
+            consumer_id: 1,
+            message_id: pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: 1,
+                ..Default::default()
+            },
+            redelivery_count: Some(0),
+            ack_set: Vec::new(),
+            consumer_epoch: None,
+        }
+    }
+
+    /// A granted consumer with an empty queue — precisely the shape issue #414
+    /// wedges in.
+    fn granted() -> ConsumerState {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c
+    }
+
+    fn deliver_one(c: &mut ConsumerState, at: std::time::Instant) {
+        c.deliver(
+            &message_cmd(),
+            metadata(),
+            None,
+            Bytes::from_static(b"x"),
+            at,
+        )
+        .expect("deliver");
+    }
+
+    #[test]
+    fn granted_consumer_with_empty_queue_is_a_stall_candidate() {
+        assert!(
+            granted().is_stall_candidate(),
+            "un-spent permits over an empty queue is exactly the #414 shape"
+        );
+    }
+
+    #[test]
+    fn fresh_consumer_is_not_a_candidate_before_any_grant() {
+        let c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert!(
+            !c.is_stall_candidate(),
+            "no grant means the broker was never asked to dispatch — silence is correct"
+        );
+    }
+
+    #[test]
+    fn queued_messages_suppress_candidacy() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        deliver_one(&mut c, t0);
+        assert!(
+            !c.is_stall_candidate(),
+            "a non-empty queue means the user, not the broker, owes the progress"
+        );
+    }
+
+    /// Every state that has its own explanation for the silence must suppress
+    /// the watchdog — otherwise it reports the caller's own gating back at them.
+    #[test]
+    fn user_and_protocol_gating_suppress_candidacy() {
+        for (label, mutate) in [
+            (
+                "closed",
+                (|c: &mut ConsumerState| c.closed = true) as fn(&mut ConsumerState),
+            ),
+            ("paused", |c: &mut ConsumerState| c.paused = true),
+            ("reached_end_of_topic", |c: &mut ConsumerState| {
+                c.reached_end_of_topic = true;
+            }),
+            ("pending_seek", |c: &mut ConsumerState| {
+                c.pending_seek = Some(crate::types::RequestId(7));
+            }),
+            ("terminal_failure", |c: &mut ConsumerState| {
+                c.terminal_failure = Some("dead".to_owned());
+            }),
+            ("flow_on_subscribe_ack", |c: &mut ConsumerState| {
+                c.flow_on_subscribe_ack = true;
+            }),
+        ] {
+            let mut c = granted();
+            assert!(c.is_stall_candidate(), "{label}: candidate before mutation");
+            mutate(&mut c);
+            assert!(
+                !c.is_stall_candidate(),
+                "{label} must suppress the stall watchdog"
+            );
+        }
+    }
+
+    #[test]
+    fn first_tick_only_seeds_the_window_and_arms_the_deadline() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "no window yet: there is no instant to arm a deadline from"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0),
+            None,
+            "the seeding tick never reports — the window starts here"
+        );
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            Some(t0 + WINDOW),
+            "poll_timeout must now be able to schedule the deterministic wake"
+        );
+    }
+
+    #[test]
+    fn stall_fires_once_at_the_window_and_never_again_in_the_same_episode() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                t0 + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "a tick one millisecond short of the window must not fire"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + WINDOW),
+            Some(WINDOW),
+            "the tick at the deadline reports the exact silence duration"
+        );
+        for extra in [1u64, 5, 60] {
+            assert_eq!(
+                c.poll_stall(WINDOW, t0 + WINDOW + std::time::Duration::from_secs(extra)),
+                None,
+                "one event per stall episode, however many ticks run past the deadline"
+            );
+        }
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "a reported window arms no further wake"
+        );
+    }
+
+    #[test]
+    fn a_late_tick_reports_the_real_silence_not_the_configured_window() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        let late = std::time::Duration::from_secs(95);
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + late),
+            Some(late),
+            "the event carries how long the silence actually lasted"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_restarts_the_window_and_re_arms_the_episode_latch() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + WINDOW),
+            Some(WINDOW),
+            "first stall"
+        );
+
+        // Recovery: one message arrives and the user drains it.
+        let recovered_at = t0 + WINDOW + std::time::Duration::from_secs(1);
+        deliver_one(&mut c, recovered_at);
+        let _ = c.pop_message(recovered_at);
+        assert!(
+            c.is_stall_candidate(),
+            "back to un-spent permits over an empty queue"
+        );
+
+        // The dispatch moved the progress mark, so the next tick opens a FRESH
+        // window rather than re-reporting the old one.
+        assert_eq!(c.poll_stall(WINDOW, recovered_at), None, "re-seed");
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                recovered_at + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "the new window is measured from the dispatch, not from the first stall"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, recovered_at + WINDOW),
+            Some(WINDOW),
+            "a consumer that wedges twice reports twice"
+        );
+    }
+
+    /// The regression this guards: a consumer draining a long backlog holds a
+    /// queue for minutes, so candidacy is false throughout; the instant it
+    /// empties and `maybe_flow` re-grants, a stale window would fire a stall
+    /// immediately even though the broker has done nothing wrong.
+    #[test]
+    fn losing_and_regaining_candidacy_restarts_the_window_from_scratch() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+
+        // A message arrives: candidacy drops while it sits in the queue.
+        let arrived = t0 + std::time::Duration::from_secs(5);
+        deliver_one(&mut c, arrived);
+        assert_eq!(
+            c.poll_stall(WINDOW, arrived),
+            None,
+            "not a candidate — the window is discarded"
+        );
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "and no deadline is armed while the user owes the progress"
+        );
+
+        // The user drains it much later than the window.
+        let drained = arrived + std::time::Duration::from_mins(10);
+        let _ = c.pop_message(drained);
+        assert_eq!(
+            c.poll_stall(WINDOW, drained),
+            None,
+            "regaining candidacy only re-seeds — it must NOT inherit the pre-queue window"
+        );
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                drained + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "the new window runs from the drain, so a stall is still one millisecond away"
+        );
+    }
+
+    #[test]
+    fn a_fresh_grant_restarts_the_window() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        // A re-attach re-arms the full grant: the broker has a brand-new promise
+        // to honour and deserves a brand-new window.
+        let rearmed = t0 + std::time::Duration::from_secs(29);
+        let _ = c.initial_flow();
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "initial_flow drops the open window"
+        );
+        assert_eq!(c.poll_stall(WINDOW, rearmed), None, "re-seed at the re-arm");
+        assert_eq!(
+            c.poll_stall(WINDOW, rearmed + WINDOW),
+            Some(WINDOW),
+            "and the new window is measured from the re-arm"
+        );
+    }
+
+    /// ADR-0103: the automatic-recovery budget is restored by a broker dispatch unit and
+    /// by nothing else.
+    ///
+    /// The two negative halves matter more than the positive one. `initial_flow` and
+    /// `clear_stall_watch` are exactly what an automatic recovery attempt performs on its
+    /// way out, so a reset hanging off either would refund every attempt that bought it
+    /// and the bound would not exist at all; `record_marker_consumed` is the PIP-33
+    /// filtered-marker path, which IS a spent broker permit and therefore IS progress.
+    #[test]
+    fn only_a_dispatch_unit_restores_the_auto_recovery_budget() {
+        let t0 = std::time::Instant::now();
+
+        // Neither half of a recovery attempt refunds the budget.
+        let mut recovering = granted();
+        recovering.stall_recovery_attempts = 3;
+        recovering.clear_stall_watch();
+        assert_eq!(
+            recovering.stall_recovery_attempts, 3,
+            "dropping the stall window is not progress"
+        );
+        let _ = recovering.initial_flow();
+        assert_eq!(
+            recovering.stall_recovery_attempts, 3,
+            "a fresh grant is a fresh promise, not a kept one: the broker acking a \
+             re-subscribe must not refund the attempt that paid for it"
+        );
+
+        // A dispatch unit does.
+        let mut dispatched = granted();
+        dispatched.stall_recovery_attempts = 3;
+        deliver_one(&mut dispatched, t0);
+        assert_eq!(
+            dispatched.stall_recovery_attempts, 0,
+            "one message actually arriving is the definition of progress"
+        );
+
+        // Including a PIP-33 marker the user never sees — the broker spent a permit on it.
+        let mut marked = granted();
+        marked.stall_recovery_attempts = 2;
+        marked.record_marker_consumed();
+        assert_eq!(marked.stall_recovery_attempts, 0);
+    }
+
+    /// Every dispatch shape the broker can spend a permit on must count as
+    /// progress. A shape that decremented `permit_balance` without bumping the
+    /// mark would make the watchdog cry stall on a healthy consumer.
+    #[test]
+    fn every_dispatch_unit_shape_bumps_the_progress_mark() {
+        let t0 = std::time::Instant::now();
+
+        // Plain message.
+        let mut plain = granted();
+        deliver_one(&mut plain, t0);
+        assert_eq!(plain.dispatch_units_received, 1);
+
+        // Batch member: one mark per exploded member.
+        let mut batched = granted();
+        let mut batch_meta = metadata();
+        batch_meta.num_messages_in_batch = Some(3);
+        let mut body = bytes::BytesMut::new();
+        for i in 0..3u8 {
+            let single = pb::SingleMessageMetadata {
+                payload_size: 1,
+                ..Default::default()
+            };
+            let encoded = single.encode_to_vec();
+            body.extend_from_slice(&(u32::try_from(encoded.len()).expect("fits")).to_be_bytes());
+            body.extend_from_slice(&encoded);
+            body.extend_from_slice(&[i]);
+        }
+        batched
+            .deliver(&message_cmd(), batch_meta, None, body.freeze(), t0)
+            .expect("deliver batch");
+        assert_eq!(
+            batched.dispatch_units_received, 3,
+            "each batch member is one broker dispatch unit"
+        );
+
+        // PIP-33 marker: filtered off the user stream but still a spent permit.
+        let mut marked = granted();
+        marked.record_marker_consumed();
+        assert_eq!(marked.dispatch_units_received, 1);
+    }
+
+    #[test]
+    fn an_incomplete_chunk_counts_as_progress() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        let chunk_meta = pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            uuid: Some("chunked-progress".to_owned()),
+            num_chunks_from_msg: Some(2),
+            chunk_id: Some(0),
+            total_chunk_msg_size: Some(2),
+            ..Default::default()
+        };
+        let outcome = c
+            .deliver(
+                &message_cmd(),
+                chunk_meta,
+                None,
+                Bytes::from_static(b"a"),
+                t0,
+            )
+            .expect("buffer chunk");
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        assert_eq!(
+            c.dispatch_units_received, 1,
+            "a consumer mid-reassembly is receiving; the broker is not silent"
+        );
+        assert!(
+            !c.is_stall_candidate() || c.queue.is_empty(),
+            "candidacy is unaffected by reassembly state; only progress matters"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0),
+            None,
+            "the seeding tick latches the post-chunk mark"
+        );
+    }
+
+    #[test]
+    fn a_disabled_or_zero_permit_consumer_never_arms_a_deadline() {
+        let t0 = std::time::Instant::now();
+        // Zero balance: the broker owes us nothing.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert_eq!(c.poll_stall(WINDOW, t0), None);
+        assert_eq!(c.next_stall_deadline(WINDOW), None);
+        // And a candidate whose window is dropped by `clear_stall_watch` arms
+        // nothing until the next tick re-seeds it.
+        let mut granted = granted();
+        assert_eq!(granted.poll_stall(WINDOW, t0), None);
+        granted.clear_stall_watch();
+        assert_eq!(granted.next_stall_deadline(WINDOW), None);
     }
 }

@@ -45,6 +45,7 @@ fn segment_info(
     sealed: Option<u64>,
 ) -> pb::SegmentInfoProto {
     pb::SegmentInfoProto {
+    entry_bucket_splits: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -117,6 +118,7 @@ fn assignment_at(epoch: u64, ids: &[u64]) -> ConsumerAssignment {
             };
             let range = KeyRange::new(start, end).expect("segment range");
             pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                 segment_id: *id,
                 hash_start: start,
                 hash_end: end,
@@ -149,6 +151,7 @@ fn foreign_assignment() -> ConsumerAssignment {
         &pb::ScalableConsumerAssignment {
             layout_epoch: 1,
             segments: vec![pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
                 segment_id: 1,
                 hash_start: range.start(),
                 hash_end: range.end(),

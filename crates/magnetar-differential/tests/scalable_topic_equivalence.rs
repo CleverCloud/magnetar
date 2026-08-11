@@ -86,6 +86,7 @@ fn seg(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
         created_at_ms: 0,
         sealed_at_ms: None,
         legacy_topic_name: None,
+        entry_bucket_splits: Vec::new(),
     }
 }
 
@@ -151,7 +152,7 @@ fn run_lookup_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) 
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     let buf = layout_frame(
@@ -168,7 +169,7 @@ fn run_split_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     // First layout resolves the session; drop its events so the transcript
@@ -324,7 +325,7 @@ fn run_duplicate_epoch_transcript(
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     conn.handle_bytes(
@@ -411,6 +412,7 @@ fn consumer_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignme
                     _ => (0, 32_767),
                 };
                 pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
                     segment_id: id,
                     hash_start,
                     hash_end,
@@ -544,7 +546,7 @@ fn run_merge_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     conn.handle_bytes(
@@ -614,7 +616,7 @@ fn run_rejection_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/missing")
+        .open_scalable_topic_session("topic://public/default/missing", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     conn.handle_bytes(
@@ -635,7 +637,7 @@ fn run_bodyless_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     conn.handle_bytes(Instant::now(), &bodyless_update_frame(session_id))
@@ -649,7 +651,7 @@ fn run_legacy_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) 
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let session_id = conn
-        .open_scalable_topic_session("persistent://public/default/plain")
+        .open_scalable_topic_session("persistent://public/default/plain", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
     let mut legacy = seg(0, 0, 65_535, &[]);
@@ -831,7 +833,7 @@ fn session_guards_and_accessors_parity() {
         );
 
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
         conn.handle_bytes(
@@ -916,7 +918,7 @@ fn scalable_stale_frames_are_dropped_and_accessors_read() {
         connected(&mut conn);
 
         let session_id = conn
-            .open_scalable_topic_session("persistent://public/default/scaled")
+            .open_scalable_topic_session("persistent://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
         assert_eq!(
@@ -1088,7 +1090,7 @@ fn scalable_consumer_session_and_watch_accessors() {
         watch.topics().is_empty(),
         "no matching set before the first update"
     );
-    assert!(watch.topics().is_empty());
+    assert_eq!(watch.topics(), [] as [std::string::String; 0]);
     watch
         .handle_update(&pb::CommandWatchScalableTopicsUpdate {
             watch_id: 3,
@@ -1107,6 +1109,7 @@ fn scalable_consumer_session_and_watch_accessors() {
     // encode side is what the fakes hand back.
     let seg = magnetar_proto::AssignedSegment::try_from_pb(
         &pb::ScalableAssignedSegment {
+            bucket_ranges: Vec::new(),
             segment_id: 4,
             hash_start: 0,
             hash_end: 128,
@@ -1322,4 +1325,82 @@ fn scalable_session_and_watch_reject_foreign_updates() {
         })
         .expect_err("bodyless watch update refused");
     assert_eq!(err, magnetar_proto::TopicsWatchError::Empty { watch_id: 3 });
+}
+
+/// Drive a `Connection` built the way an engine builds it through the outbound
+/// commands the 5.0.0 vendoring touches — a scalable lookup with each
+/// `create_if_missing` value, and a plain `Key_Shared` subscribe — and return the
+/// exact bytes written for each.
+fn run_outbound_transcript(
+    wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+) -> (bytes::Bytes, bytes::Bytes, bytes::Bytes) {
+    let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
+    connected(&mut conn);
+    let _ = conn.poll_transmit();
+
+    conn.open_scalable_topic_session("topic://public/default/scaled", true)
+        .expect("broker supports scalable topics");
+    let creating_lookup = conn.poll_transmit();
+    conn.open_scalable_topic_session("topic://public/default/scaled", false)
+        .expect("broker supports scalable topics");
+    let read_only_lookup = conn.poll_transmit();
+
+    let _consumer = conn.subscribe(magnetar_proto::SubscribeRequest {
+        topic: "persistent://public/default/key-shared".to_owned(),
+        subscription: "ks".to_owned(),
+        sub_type: pb::command_subscribe::SubType::KeyShared,
+        key_shared: Some(magnetar_proto::KeySharedConfig {
+            allow_out_of_order_delivery: true,
+            ..magnetar_proto::KeySharedConfig::default()
+        }),
+        ..Default::default()
+    });
+    let subscribe = conn.poll_transmit();
+    (creating_lookup, read_only_lookup, subscribe)
+}
+
+/// Both engine shapes write byte-identical lookup and `Key_Shared` subscribe
+/// frames (ADR-0093 amendment 2026-10-12): a lookup states the caller's
+/// `create_if_missing` explicitly — `true` for a consumer, `false` for the
+/// read-only lookup — and a plain `Key_Shared` subscription leaves PIP-486's
+/// `entryBucketDispatch` unset so the broker keeps dispatching by key.
+#[test]
+fn outbound_lookup_and_key_shared_subscribe_parity() {
+    let (tokio_creating, tokio_read_only, tokio_subscribe) =
+        run_outbound_transcript(tokio_wall_clock());
+    let (moonpool_creating, moonpool_read_only, moonpool_subscribe) =
+        run_outbound_transcript(moonpool_wall_clock());
+    assert_eq!(
+        tokio_creating, moonpool_creating,
+        "engine creating-lookup bytes diverged"
+    );
+    assert_eq!(
+        tokio_read_only, moonpool_read_only,
+        "engine read-only-lookup bytes diverged"
+    );
+    assert_eq!(
+        tokio_subscribe, moonpool_subscribe,
+        "engine Key_Shared subscribe bytes diverged"
+    );
+
+    for (mut bytes, expected) in [(tokio_creating, true), (tokio_read_only, false)] {
+        let lookup = magnetar_proto::decode_one(&mut bytes)
+            .expect("lookup decodes")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup payload present");
+        assert_eq!(lookup.create_if_missing, Some(expected));
+    }
+
+    let mut subscribe_bytes = tokio_subscribe;
+    let subscribe = magnetar_proto::decode_one(&mut subscribe_bytes)
+        .expect("subscribe decodes")
+        .command
+        .subscribe
+        .expect("subscribe payload present");
+    let meta = subscribe
+        .key_shared_meta
+        .expect("a Key_Shared subscribe carries its meta");
+    assert_eq!(meta.allow_out_of_order_delivery, Some(true));
+    assert_eq!(meta.entry_bucket_dispatch, None);
 }

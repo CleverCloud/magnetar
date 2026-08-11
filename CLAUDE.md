@@ -59,11 +59,14 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
 9. **Cross-runtime test + coverage policy.** Every behavioral change (runtime behavior, public API, wire format) and every change inside `magnetar-proto` ships with **all four** test layers in the same commit: (a) `magnetar-proto` unit test, (b) `magnetar-runtime-tokio` integration test, (c) `magnetar-runtime-moonpool` integration test, (d) `magnetar-differential` equivalence test asserting tokio ↔ moonpool `EventStream` parity, plus an end-to-end test under `crates/magnetar/tests/e2e_*.rs`.
    Moonpool sim coverage is **100% on the diff** (`cargo run -p xtask -- check-sim-coverage`, `cargo-llvm-cov` patch-coverage style).
    Its LCOV report covers exactly eight crates the run compiles: `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl`, `magnetar-driver` (directory `crates/magnetar`), and `magnetar-fakes`.
-   The original six-crate widening measured 63 `SF:` records on 2026-07-31 (`magnetar-proto` 28, `magnetar-runtime-tokio` 12, `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5, `magnetar-differential` 4, `magnetar-auth-sasl` 2); ADR-0098 adds the façade and fakes through `magnetar-differential`'s public aggregate tests without inventing a later record total. The measurement runs at `opt-level = 0` ([ADR-0094](specs/adr/0094-measure-sim-coverage-unoptimized.md)), overriding the workspace's `[profile.test] opt-level = 1` for its duration.
+   The original six-crate widening measured 63 `SF:` records on 2026-07-31 (`magnetar-proto` 28, `magnetar-runtime-tokio` 12, `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5, `magnetar-differential` 4, `magnetar-auth-sasl` 2); ADR-0098 adds the façade and fakes through `magnetar-differential`'s public aggregate tests without inventing a later record total ([ADR-0120]). The measurement runs at `opt-level = 0` ([ADR-0094](specs/adr/0094-measure-sim-coverage-unoptimized.md)), overriding the workspace's `[profile.test] opt-level = 1` for its duration.
    Above zero the MIR inliner folds a callee into its caller and the callee's coverage counter never fires, so the report shows zero hits for a line a passing test provably executed — and, in the other direction, can credit a line that never ran.
    Because inlining follows codegen-unit partitioning that verdict was not even stable: the same commit produced 63, 70 and 81 `SF:` records warm, cold and on CI, with three different uncovered sets, which is why the record counts above are historical rather than a target to reproduce.
+   It also compiles every crate into **one codegen unit** (`CARGO_PROFILE_TEST_CODEGEN_UNITS=1`, ADR-0094 amendment of 2026-10-13).
+   With more, the linker drops each unit the sim test binaries never reference, and with it the coverage records of unreferenced modules and of every function the crate never codegenned — a never-polled `async fn` body, an uninstantiated generic — so those lines read as non-executable and pass.
+   That is why a local run, incremental with Cargo's default cap of 256 units (205 objects in `magnetar-runtime-tokio`), passed PR #877 while CI, at `CARGO_INCREMENTAL=0` and 16 units, failed it on the body of the never-called `next_topic_list_change`.
    Execution is unchanged and still runs only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries, so a `magnetar-proto` or `magnetar-runtime-tokio` line counts as covered only when a sim test reaches it transitively; those crates' own unit tests never run under the gate and can never satisfy it.
-   Execution and report share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem; `target/sim-coverage.lcov` is output-only, injected LLVM artifact flags are rejected, and no first-party profile or object input is reused across passes ([ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md)).
+   Execution and report share one locked, invocation-owned Cargo/llvm-cov target outside the cached target and build trees on the configured build filesystem; `target/sim-coverage.lcov` is output-only, injected LLVM artifact flags are rejected, and no first-party profile or object input is reused across passes ([ADR-0096](specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md)).
    **The uncovered-line verdict is enforced**: `SIM_COVERAGE_ENFORCES_UNCOVERED` is `true`, so an uncovered added line inside the reported scope is printed in full with a count and **fails** the check.
    It ran advisory from ADR-0090 until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), which flipped the constant and gave the gate a per-PR home in the same changeset — a flip alone would have changed nothing, because the scheduled `main` run diffs `main` against itself and short-circuits with "nothing to verify".
    `.github/workflows/ci.yml` now runs `check-sim-coverage --enforce` on every `pull_request`, so the verdict reaches every change rather than only a local run — though `main` carries no branch protection as of 2026-08-01, so a red job does not yet mechanically block a merge (ADR-0092 § Required check records the admin step that would).
@@ -71,17 +74,18 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
    A second case hard-fails at any setting: a gated file with no `SF:` record when its crate is wholly absent or the file contains a non-test function body, which means the gate could not measure rather than that a test is merely missing. A module/export/constant/bodyless-declaration-only file remains advisory because it has no executable mapping.
    The façade library and `magnetar-fakes` are now measured because `magnetar-differential` declares both as dev-dependencies and its tests exercise the public aggregate; the façade's Docker-bound `crates/magnetar/tests/e2e_*.rs` targets still do not run because execution remains limited to the two roots above.
    What stays ungated is everything those roots never compile — `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and similar packages — plus generated `crates/magnetar-proto/src/pb/`, which is excluded outright.
-   Those additions print as `not gated` and do **not** fail the check, `--enforce` included; the ungated report is a scope limit, not a verdict ([ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0098](specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md)).
+   Those additions print as `not gated` and do **not** fail the check, `--enforce` included; the ungated report is a scope limit, not a verdict ([ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md)).
    `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep a **strict 1:1 test count** (`cargo run -p xtask -- check-runtime-test-parity`).
    Both `check-runtime-test-parity` and `check-sim-coverage` are hard-failing in the local + CI validation chain.
    Exemptions: docs-only, comment-only, formatter-only, and dependency bumps with no functional impact — justify in the commit message.
    The gate excludes `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/` and every `/tests/`, `/benches/`, `/examples/` path, so a change confined to those short-circuits before it builds anything.
-   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), [ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md), [ADR-0098](specs/adr/0098-assignment-driven-m1-hardened-stream-consumer.md))
+   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), [ADR-0090](specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), [ADR-0096](specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md), [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md))
 10. **Lock-ordering: global → per-slot, never the reverse.** `Connection` is wrapped in a `parking_lot::Mutex` by the runtime engines; every `ProducerSlot` / `ConsumerSlot` carries its own `parking_lot::Mutex`.
     A holder of `slot.state.lock()` MUST NOT then take the connection-wide mutex.
     The hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection buffer under the global lock via `poll_transmit`.
     The reverse acquisition order deadlocks under contention.
-    ([ADR-0038](specs/adr/0038-split-connection-mutex.md))
+    The client-wide `MemoryLimitController`'s waiter mutex sits below both as a leaf lock: nothing is acquired while it is held, no waker runs under it, and a memory reservation is never dropped under a per-slot mutex.
+    ([ADR-0038](specs/adr/0038-split-connection-mutex.md), [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
 
 ## Workflow
 
@@ -146,12 +150,25 @@ Run before declaring a task done (in this order):
 cargo +nightly fmt --all
 cargo build --workspace --all-features
 cargo clippy --workspace --all-features --all-targets -- -D warnings
+# no-buggify axis of the moonpool engine — the seed-replay/sweep cell;
+# --all-features cfg-strips its stubs, so this is the only lint pass over it
+cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+# default-feature axis — `--all-features` always turns the opt-in `schema-avro` on (ADR-0117),
+# so these are the only lint and doc passes over a build without it; one package per command
+cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+cargo doc -p magnetar-proto --no-deps --locked
+cargo doc -p magnetar-driver --no-deps --locked  # also catches links to admin/moonpool items, which resolve only under --all-features
+# the façade library with no engine, then its unit-test target — --all-features
+# never cfg-strips the tokio-only items, so it cannot see what they leave dead
+cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
-# deterministic-simulation suite. Local-only per ADR-0036 (fixed seeds
-# in per-PR CI were wasted compute since each (commit, seed) pair is
-# bit-for-bit reproducible). CI runs a 128-random-seed sweep daily in
-# `.github/workflows/moonpool-seed-sweep.yml`.
+# deterministic-simulation suite. performance.yml also replays fixed
+# seeds 1..32 plus open registry anchors nightly on main, without buggify
+# (ADR-0113); ci.yml's seed-replay replays open registry seeds on every PR.
+# The daily 128-random-seed workflow remains additive discovery.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --no-default-features --features crypto-aws-lc-rs \
@@ -166,26 +183,35 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps
 cargo run -p xtask -- check-no-internal-clock   # no Instant::now() / SystemTime::now() / .elapsed() in proto
 cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
-cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container caps PULSAR_MEM (docs/testing.md)
+cargo run -p xtask -- check-e2e-fixture         # Pulsar e2e containers only via the shared fixture, which caps PULSAR_MEM; its tags and the pulsar: axis match CI, FIXTURE_TAGS and the PIP-33 compose pin (ADR-0115, ADR-0116, docs/testing.md)
 cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # patch coverage on diff over the 8 crates the sim run compiles; ENFORCING — an uncovered added line fails (ADR-0024, ADR-0088, ADR-0090, ADR-0092, ADR-0098)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo run -p xtask -- check-known-failing-seeds # replay every open registry seed — the local mirror of CI's per-PR `seed-replay` job (ADR-0047 §5, landed by ADR-0097)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
-# (known-failing seed replay runs in CI via the per-PR `seed-replay` job; ADR-0047)
 ```
 
-Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no dedicated `e2e` feature and no `--include-ignored`; owning product features such as `scalable-topics` still gate their targets).
-The local run still needs Docker; stable targets use suite-specific Pulsar 4.x images and the scalable target uses both `apachepulsar/pulsar:5.0.0-M1` and `apachepulsar/pulsar:4.0.4`.
+Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).
+The local run still needs Docker + the published Pulsar images the e2e tests use reachable.
+Every e2e suite boots its broker through the one shared fixture, [`crates/magnetar/tests/common/pulsar.rs`](crates/magnetar/tests/common/pulsar.rs) ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); its `DEFAULT_TAG` / `V4_LTS_TAG` / `SCALABLE_TAG` constants are the only place an image tag appears in the Rust tests, and `cargo run -p xtask -- check-e2e-fixture` fails any other `apachepulsar/` image reference there.
+A suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`), never a tag: `Default` is the matrix broker (`4.2.5`, [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)) that `MAGNETAR_PULSAR_IMAGE_TAG` overrides, `Scalable` is pinned to Pulsar `5.0.0` GA (PIP-460) and takes `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG`, and `V4Lts` is pinned (to `4.2.5`) with no override.
+CI runs the whole e2e suite on `4.2.5` and `5.0.0` for every pull request and on `4.0.14` nightly, through the reusable `.github/workflows/e2e-pulsar.yml`; a suite uses `Broker::Default` unless it truly needs a 4.x-only or 5.x-only broker, so it runs on every axis.
+An axis lands green: no `continue-on-error`, no per-version `#[ignore]`, no skipped test (the one exception, `e2e_replicated_subscriptions`, runs only on the `4.2.5` axis because its PIP-33 compose is a 4.2.5 fixture; ADR-0116 decision 4).
+`MIN_SUPPORTED_TAG` (`4.0.14`) in `common/pulsar.rs` is the minimum supported broker; the gate requires a workflow other than `ci.yml` to run it.
+Changing a broker version means changing the constants, the `pulsar:` axis of `ci.yml` / `e2e-nightly.yml`, the literal `docker pull` pins of `e2e-pulsar.yml`, `FIXTURE_TAGS` in `scripts/performance_campaign.py` and the PIP-33 compose pins together; the gate fails until all agree.
+A new e2e test never writes an image, a tag, `PULSAR_MEM` or a startup log wait: it calls `Pulsar::new(Broker::…)` and adds only its own `.config(…)` / `.flag(…)` / `.pre_start(…)`.
 The PIP-33 two-cluster tests additionally require the `crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml` fixture to be up before `cargo test` — CI brings it up automatically.
 Locally that is **two** steps, not one: `docker compose -f docker-compose.replicated-subs.yml up -d` **and then** `./configure_replicated_subs.sh`.
 `up -d` alone leaves both brokers healthy but not registered as each other's peers, and the replicated-subscription tests then have nothing to replicate between.
 
 The auto-format hook handles `cargo fmt` / `gofmt` / `ruff format` on edited files; lints and tests stay manual.
 
-Two of the three heavy / diff-shaped xtask gates (`check-runtime-test-parity`, `check-crypto-matrix`) are local-first but also run in CI via the scheduled [`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml) (daily cron + `workflow_dispatch`), which keeps per-PR [`ci.yml`](.github/workflows/ci.yml) fast.
-`check-sim-coverage` runs in both places: [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) added a per-PR `check-sim-coverage` job to `ci.yml`, and the scheduled copy stays for dispatching against a branch with no PR open.
+`check-runtime-test-parity` and `check-crypto-matrix` run locally and on every pull request in [`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml), which also retains daily cron and `workflow_dispatch`.
+The crypto gate checks 16 isolated build cells; it does not execute a crypto test matrix.
+`check-sim-coverage` runs in [`ci.yml`](.github/workflows/ci.yml) for pull requests targeting `main`, and in `xtask-gates.yml` for other pull-request targets, daily cron and manual dispatch.
+Every pull request gets the existing 180-minute sim budget; cron/manual retain 90 minutes. The sim diff uses the PR target as its comparison base; scheduled/manual runs use `main`.
 It is a diff gate, so its scheduled `main` run short-circuits ("nothing to verify"), and so does any PR whose added production `.rs` lines are all excluded — that is why a job this heavy can sit on every pull request.
-The bail is keyed on the exclusion lists, **not** on the gated crates: a PR touching only `magnetar-admin`, `magnetarctl`, or another uncompiled package still pays the full instrumented build and then prints those files as advisory `not gated`; façade and fakes changes are now gated through the differential aggregate tests (ADR-0098).
+The bail is keyed on the exclusion lists, **not** on the gated crates: a PR touching only `magnetar-admin`, `magnetarctl`, or another uncompiled package still pays the full instrumented build and then prints those files as advisory `not gated`; façade and fakes changes are now gated through the differential aggregate tests (ADR-0120).
 Every invocation now enforces, the chain entry above included; `--enforce` is redundant and kept only as an explicit override.
 
 ## Common slash workflows

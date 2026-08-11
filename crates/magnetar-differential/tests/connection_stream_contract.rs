@@ -76,6 +76,7 @@ fn handshaked_scalable_connection() -> Connection {
 fn assigned(id: u64, start: u32, end: u32) -> pb::ScalableAssignedSegment {
     let range = KeyRange::new(start, end).expect("valid range");
     pb::ScalableAssignedSegment {
+    bucket_ranges: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
