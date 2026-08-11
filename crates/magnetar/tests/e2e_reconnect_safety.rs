@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Real Pulsar regressions for reconnect safety issues #395, #396, and #398.
+//! Real Pulsar regressions for reconnect safety issues #395, #396, #398, and #403.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,13 +31,25 @@ const WAIT: Duration = Duration::from_secs(30);
 struct Observations {
     subscribe_start_ids: Vec<Option<pb::MessageIdData>>,
     ack_sets: Vec<Vec<i64>>,
+    redeliveries: usize,
 }
 
 struct ReconnectGate {
     url: String,
     cut: Arc<Notify>,
     drop_next_receipt: Arc<AtomicBool>,
+    block_broker_frames: Arc<AtomicBool>,
+    broker_frames_released: Arc<Notify>,
     sessions: Arc<AtomicUsize>,
+    observations: Arc<Mutex<Observations>>,
+    changed: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct RelayState {
+    drop_next_receipt: Arc<AtomicBool>,
+    block_broker_frames: Arc<AtomicBool>,
+    broker_frames_released: Arc<Notify>,
     observations: Arc<Mutex<Observations>>,
     changed: Arc<Notify>,
 }
@@ -48,12 +60,16 @@ impl ReconnectGate {
         let address = listener.local_addr()?;
         let cut = Arc::new(Notify::new());
         let drop_next_receipt = Arc::new(AtomicBool::new(false));
+        let block_broker_frames = Arc::new(AtomicBool::new(false));
+        let broker_frames_released = Arc::new(Notify::new());
         let sessions = Arc::new(AtomicUsize::new(0));
         let observations = Arc::new(Mutex::new(Observations::default()));
         let changed = Arc::new(Notify::new());
 
         let task_cut = cut.clone();
         let task_drop = drop_next_receipt.clone();
+        let task_block = block_broker_frames.clone();
+        let task_released = broker_frames_released.clone();
         let task_sessions = sessions.clone();
         let task_observations = observations.clone();
         let task_changed = changed.clone();
@@ -67,27 +83,32 @@ impl ReconnectGate {
                 task_changed.notify_waiters();
                 let session_cut = task_cut.clone();
                 let session_drop = task_drop.clone();
+                let session_block = task_block.clone();
+                let session_released = task_released.clone();
                 let session_observations = task_observations.clone();
                 let session_changed = task_changed.clone();
                 tokio::spawn(async move {
                     let (client_read, client_write) = client.into_split();
                     let (broker_read, broker_write) = broker.into_split();
+                    let relay_state = RelayState {
+                        drop_next_receipt: session_drop,
+                        block_broker_frames: session_block,
+                        broker_frames_released: session_released,
+                        observations: session_observations,
+                        changed: session_changed,
+                    };
                     tokio::select! {
                         _ = relay_frames(
                             client_read,
                             broker_write,
                             Direction::ClientToBroker,
-                            session_drop.clone(),
-                            session_observations.clone(),
-                            session_changed.clone(),
+                            relay_state.clone(),
                         ) => {}
                         _ = relay_frames(
                             broker_read,
                             client_write,
                             Direction::BrokerToClient,
-                            session_drop,
-                            session_observations,
-                            session_changed,
+                            relay_state,
                         ) => {}
                         () = session_cut.notified() => {}
                     }
@@ -99,6 +120,8 @@ impl ReconnectGate {
             url: format!("pulsar://{address}"),
             cut,
             drop_next_receipt,
+            block_broker_frames,
+            broker_frames_released,
             sessions,
             observations,
             changed,
@@ -111,6 +134,15 @@ impl ReconnectGate {
 
     fn drop_next_receipt_and_cut(&self) {
         self.drop_next_receipt.store(true, Ordering::SeqCst);
+    }
+
+    fn block_broker_frames(&self) {
+        self.block_broker_frames.store(true, Ordering::SeqCst);
+    }
+
+    fn release_broker_frames(&self) {
+        self.block_broker_frames.store(false, Ordering::SeqCst);
+        self.broker_frames_released.notify_waiters();
     }
 
     async fn wait_for_sessions(&self, count: usize) {
@@ -160,6 +192,25 @@ impl ReconnectGate {
         .await
         .expect("expected CommandAck was not observed")
     }
+
+    async fn wait_for_redeliveries(&self, count: usize) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if self
+                    .observations
+                    .lock()
+                    .expect("observation lock")
+                    .redeliveries
+                    >= count
+                {
+                    return;
+                }
+                self.changed.notified().await;
+            }
+        })
+        .await
+        .expect("expected CommandRedeliverUnacknowledgedMessages was not observed");
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -172,9 +223,7 @@ async fn relay_frames<R, W>(
     mut reader: R,
     mut writer: W,
     direction: Direction,
-    drop_next_receipt: Arc<AtomicBool>,
-    observations: Arc<Mutex<Observations>>,
-    changed: Arc<Notify>,
+    state: RelayState,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -196,11 +245,21 @@ where
             };
             let consumed = before - candidate.len();
             let raw = buffered.split_to(consumed);
+            if matches!(direction, Direction::BrokerToClient) {
+                while state.block_broker_frames.load(Ordering::SeqCst) {
+                    let released = state.broker_frames_released.notified();
+                    if !state.block_broker_frames.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
+                }
+            }
             match direction {
                 Direction::ClientToBroker => {
                     let mut observed = false;
                     if let Some(subscribe) = frame.command.subscribe {
-                        observations
+                        state
+                            .observations
                             .lock()
                             .expect("observation lock")
                             .subscribe_start_ids
@@ -208,19 +267,27 @@ where
                         observed = true;
                     }
                     if let Some(ack) = frame.command.ack {
-                        let mut state = observations.lock().expect("observation lock");
+                        let mut observations = state.observations.lock().expect("observation lock");
                         for message_id in ack.message_id {
-                            state.ack_sets.push(message_id.ack_set);
+                            observations.ack_sets.push(message_id.ack_set);
                         }
                         observed = true;
                     }
+                    if frame.command.redeliver_unacknowledged_messages.is_some() {
+                        state
+                            .observations
+                            .lock()
+                            .expect("observation lock")
+                            .redeliveries += 1;
+                        observed = true;
+                    }
                     if observed {
-                        changed.notify_waiters();
+                        state.changed.notify_waiters();
                     }
                 }
                 Direction::BrokerToClient => {
                     if frame.command.send_receipt.is_some()
-                        && drop_next_receipt.swap(false, Ordering::SeqCst)
+                        && state.drop_next_receipt.swap(false, Ordering::SeqCst)
                     {
                         return Ok(());
                     }
@@ -503,12 +570,115 @@ async fn e2e_partial_batch_ack_and_durable_cursor_survive_reconnect()
         .await;
     let resumed = subscribes[non_durable_subscribe_index + 1]
         .as_ref()
-        .expect("a non-durable reattach must retain its client-side resume watermark");
-    assert_eq!(resumed.ledger_id, non_durable_message.message_id.ledger_id);
-    assert_eq!(resumed.entry_id, non_durable_message.message_id.entry_id);
+        .expect("a non-durable reattach must retain its original start position");
+    assert_eq!((resumed.ledger_id, resumed.entry_id), (u64::MAX, u64::MAX));
 
     non_durable.close().await?;
     plain_producer.close().await?;
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_unconfirmed_high_ack_never_skips_nacked_lower_message()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (upstream, _container) = start_pulsar().await?;
+    exercise_unconfirmed_high_ack_reconnect(upstream.clone(), false).await?;
+    exercise_unconfirmed_high_ack_reconnect(upstream, true).await?;
+    Ok(())
+}
+
+async fn exercise_unconfirmed_high_ack_reconnect(
+    upstream: String,
+    durable: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gate = ReconnectGate::spawn(upstream).await?;
+    let client = PulsarClient::builder()
+        .service_url(&gate.url)
+        .enable_reconnect(supervisor())
+        .build()
+        .await?;
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-unconfirmed-ack-{}",
+        Uuid::new_v4()
+    );
+    let consumer = client
+        .consumer(&topic)
+        .subscription(format!("magnetar-e2e-unconfirmed-ack-{}", Uuid::new_v4()))
+        .subscription_type(SubType::Shared)
+        .durable(durable)
+        .negative_ack_redelivery_delay(Duration::from_millis(1))
+        .start_message_id(magnetar::proto::MessageId::EARLIEST)
+        .subscribe()
+        .await?;
+    let producer = client.producer(&topic).create().await?;
+
+    producer
+        .send(OutgoingMessage::with_payload(b"lower".to_vec()).into())
+        .await?;
+    producer
+        .send(OutgoingMessage::with_payload(b"higher".to_vec()).into())
+        .await?;
+    let lower = tokio::time::timeout(WAIT, consumer.receive()).await??;
+    let higher = tokio::time::timeout(WAIT, consumer.receive()).await??;
+    assert!(
+        higher.message_id > lower.message_id,
+        "the regression requires the acknowledged message to be above the nacked message"
+    );
+
+    let ack_count = gate
+        .observations
+        .lock()
+        .expect("observation lock")
+        .ack_sets
+        .len();
+    let redelivery_count = gate
+        .observations
+        .lock()
+        .expect("observation lock")
+        .redeliveries;
+    gate.block_broker_frames();
+    let ack_consumer = consumer.clone();
+    let higher_id = higher.message_id;
+    let ack_task = tokio::spawn(async move { ack_consumer.ack(higher_id).await });
+    let _ = gate.wait_for_acks(ack_count + 1).await;
+    consumer.negative_ack(lower.message_id);
+    gate.wait_for_redeliveries(redelivery_count + 1).await;
+
+    gate.cut_current();
+    gate.release_broker_frames();
+    gate.wait_for_sessions(2).await;
+    let ack_result = tokio::time::timeout(WAIT, ack_task).await??;
+    assert!(
+        ack_result.is_err(),
+        "the held CommandAckResponse must leave the local ack unconfirmed"
+    );
+    let subscribes = gate.wait_for_subscribes(2).await;
+    if durable {
+        assert!(
+            subscribes[1].is_none(),
+            "the durable control must defer to the broker cursor"
+        );
+    } else {
+        let start = subscribes[1]
+            .as_ref()
+            .expect("the non-durable reattach must retain its original start position");
+        assert_eq!((start.ledger_id, start.entry_id), (u64::MAX, u64::MAX));
+    }
+
+    let lower_id = lower.message_id;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let message = consumer.receive().await?;
+            if message.message_id == lower_id {
+                return Ok::<(), ClientError>(());
+            }
+        }
+    })
+    .await??;
+
+    consumer.close().await?;
     producer.close().await?;
     client.close().await;
     Ok(())

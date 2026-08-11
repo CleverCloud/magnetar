@@ -1786,8 +1786,8 @@ impl Connection {
     /// consumer's receive queue is "live" again and the broker resumes dispatching messages.
     ///
     /// An established durable subscription omits `start_message_id`: the broker's persisted
-    /// cursor is authoritative across reconnects. Fresh subscriptions retain their explicit start
-    /// position, while non-durable consumers retain their client-side resume position.
+    /// cursor is authoritative across reconnects. Fresh and non-durable subscriptions retain only
+    /// the caller's explicit original start position.
     ///
     /// Consumers explicitly closed via [`Self::close_consumer`] / [`Self::unsubscribe`] (or by
     /// the broker via `CommandCloseConsumer`) are skipped — their `closed` flag is honoured.
@@ -5140,9 +5140,7 @@ impl Connection {
         }
         let n_ids = ack.message_ids.len() as u64;
         // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
-        // (caller may have nacked then acked the same id). Also remember the highest acked
-        // id so [`Self::rebuild_consumers`] resumes from the post-ack position after a
-        // reconnect.
+        // (caller may have nacked then acked the same id).
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
             for id in &ack.message_ids {
@@ -5151,12 +5149,6 @@ impl Connection {
                 }
                 if let Some(t) = consumer.nack_tracker.as_mut() {
                     t.remove(id);
-                }
-                // Track the highest acked id. `MessageId` derives `Ord` and orders on
-                // `(ledger_id, entry_id, partition, batch_index, batch_size)`, which matches the
-                // broker's cursor order on the leading `(ledger_id, entry_id)` pair.
-                if consumer.last_acked_message_id.is_none_or(|prev| *id > prev) {
-                    consumer.last_acked_message_id = Some(*id);
                 }
             }
         }
@@ -7164,7 +7156,7 @@ impl Connection {
         if req.durable && state.has_ever_attached {
             None
         } else {
-            state.last_acked_message_id.or(req.start_message_id)
+            req.start_message_id
         }
     }
 
@@ -9021,19 +9013,10 @@ mod conn_state_tests {
     }
 
     #[test]
-    fn reattach_position_preserves_fresh_and_non_durable_start_points() {
+    fn reattach_position_uses_only_authoritative_start_points() {
         let original = MessageId {
             ledger_id: 1,
             entry_id: 2,
-            partition: -1,
-            batch_index: -1,
-            batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
-        };
-        let local_ack = MessageId {
-            ledger_id: 3,
-            entry_id: 4,
             partition: -1,
             batch_index: -1,
             batch_size: 0,
@@ -9059,7 +9042,6 @@ mod conn_state_tests {
         );
 
         state.has_ever_attached = true;
-        state.last_acked_message_id = Some(local_ack);
         assert_eq!(
             Connection::consumer_reattach_start_message_id(&request, &state),
             None,
@@ -9069,8 +9051,8 @@ mod conn_state_tests {
         request.durable = false;
         assert_eq!(
             Connection::consumer_reattach_start_message_id(&request, &state),
-            Some(local_ack),
-            "a non-durable consumer retains its client-side resume position"
+            Some(original),
+            "a non-durable consumer restarts from the caller's original position"
         );
     }
 

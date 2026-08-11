@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Differential regressions for reconnect safety issues #395-#398.
+//! Differential regressions for reconnect safety issues #395-#398 and #403.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -214,14 +214,28 @@ fn stale_batch_ack_projection(conn: &mut Connection, at: Instant) -> Vec<i64> {
         .clone()
 }
 
-fn durable_resume_projection(conn: &mut Connection, at: Instant) -> Option<pb::MessageIdData> {
+fn resume_projection(
+    conn: &mut Connection,
+    at: Instant,
+    durable: bool,
+) -> Option<pb::MessageIdData> {
     connect(conn, at);
+    let original_start = MessageId {
+        ledger_id: 1,
+        entry_id: 2,
+        partition: -1,
+        batch_index: -1,
+        batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
+    };
     let request_id = conn.peek_next_request_id_for_test();
     let consumer = conn.subscribe(SubscribeRequest {
-        topic: "persistent://public/default/diff-durable-resume".to_owned(),
-        subscription: "diff-durable-resume".to_owned(),
+        topic: "persistent://public/default/diff-resume".to_owned(),
+        subscription: "diff-resume".to_owned(),
         sub_type: pb::command_subscribe::SubType::KeyShared,
-        durable: true,
+        durable,
+        start_message_id: Some(original_start),
         ..Default::default()
     });
     let _ = conn.poll_transmit();
@@ -340,11 +354,17 @@ fn engines_agree_on_conservative_stale_batch_ack() {
 }
 
 #[test]
-fn engines_agree_that_durable_resume_uses_broker_cursor() {
-    let tokio = tokio_projection(durable_resume_projection);
-    let moonpool = moonpool_projection(durable_resume_projection);
-    assert_eq!(tokio, moonpool);
-    assert!(tokio.is_none());
+fn engines_agree_that_reattach_uses_only_authoritative_start_positions() {
+    let tokio_durable = tokio_projection(|conn, at| resume_projection(conn, at, true));
+    let moonpool_durable = moonpool_projection(|conn, at| resume_projection(conn, at, true));
+    assert_eq!(tokio_durable, moonpool_durable);
+    assert!(tokio_durable.is_none());
+
+    let tokio_non_durable = tokio_projection(|conn, at| resume_projection(conn, at, false));
+    let moonpool_non_durable = moonpool_projection(|conn, at| resume_projection(conn, at, false));
+    assert_eq!(tokio_non_durable, moonpool_non_durable);
+    let start = tokio_non_durable.expect("non-durable original start position");
+    assert_eq!((start.ledger_id, start.entry_id), (1, 2));
 }
 
 #[test]
