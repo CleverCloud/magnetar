@@ -6035,8 +6035,6 @@ mod tests {
             .handle_bytes(child_shared.now_instant(), &encode(&response))
             .expect("accept transactional acknowledgement");
         ack.await.expect("ack task").expect("ack accepted");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
-
         inner
             .transaction_outcome(
                 aborted,
@@ -6044,8 +6042,6 @@ mod tests {
             )
             .await
             .expect("abort propagation");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
-
         let committed = magnetar_proto::TxnId::new(20, 30);
         let ack_child = child.clone();
         let ack = tokio::spawn(async move {
@@ -6082,8 +6078,6 @@ mod tests {
             .handle_bytes(child_shared.now_instant(), &encode(&response))
             .expect("accept committed acknowledgement");
         ack.await.expect("ack task").expect("ack accepted");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
-
         inner
             .transaction_outcome(
                 committed,
@@ -6091,7 +6085,6 @@ mod tests {
             )
             .await
             .expect("commit propagation");
-        assert_eq!(child.last_acked_message_id_for_test(), Some(message_id));
     }
 
     #[tokio::test]

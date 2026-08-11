@@ -98,12 +98,6 @@ fn apply_local_ack_state(
         }
         #[cfg(feature = "scalable-topics")]
         consumer.canonical_nack_ids.remove(id);
-        if consumer
-            .last_acked_message_id
-            .is_none_or(|previous| *id > previous)
-        {
-            consumer.last_acked_message_id = Some(*id);
-        }
     }
     apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
 }
@@ -397,6 +391,18 @@ const SEND_TIMEOUT_CODE: i32 = -1;
 
 /// Error message paired with [`SEND_TIMEOUT_CODE`]. Callers match on this exact string.
 const SEND_TIMEOUT_MESSAGE: &str = "send timeout";
+
+/// Error surfaced when a batched publish cannot be replayed after a connection reset.
+const BATCH_RESET_ERROR_CODE: i32 = -1;
+
+/// Message paired with [`BATCH_RESET_ERROR_CODE`].
+const BATCH_RESET_ERROR_MESSAGE: &str = "batched send cannot be replayed after connection reset";
+
+/// Local error used when a caller supplies inconsistent producer-batch coordinates.
+const INVALID_BATCH_ACK_CODE: i32 = -1;
+
+/// Message paired with [`INVALID_BATCH_ACK_CODE`].
+const INVALID_BATCH_ACK_MESSAGE: &str = "invalid batched message id";
 
 /// Whether a producer or consumer slot's rolling rate window is due for a
 /// re-sample at `now`, given the slot's existing `last_rate_snapshot` baseline
@@ -932,13 +938,15 @@ impl Connection {
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
     ///    round-trip, …). The corresponding user futures are woken with that outcome.
-    /// 3. Snapshot every in-flight producer publish into `in_flight_publish_snapshots` (key =
-    ///    `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each original
-    ///    send-future waker exactly once — but do *not* install a `SessionLost` outcome on the
-    ///    publish key. The user future re-polls, finds no outcome, re-registers, and stays pending
-    ///    until the replayed [`crate::producer::OpSend`] surfaces its eventual `CommandSendReceipt`
-    ///    (transparent at-least-once replay). Clear every producer's batch container so unflushed
-    ///    partial batches do not survive the reconnect — the caller is responsible for those.
+    /// 3. Snapshot every replayable in-flight producer publish into `in_flight_publish_snapshots`
+    ///    (key = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
+    ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
+    ///    the publish key. The user future re-polls, finds no outcome, re-registers, and stays
+    ///    pending until the replayed [`crate::producer::OpSend`] surfaces its eventual
+    ///    `CommandSendReceipt` (transparent at-least-once replay). Batched sends have no
+    ///    per-message replay frame, even after flush, so resolve them with [`OpOutcome::SendError`]
+    ///    before waking their futures. Clear every producer's batch container so partial batches do
+    ///    not survive the reconnect.
     /// 4. Reset every consumer's queue + pending seek + ack tracker. Producers and consumers
     ///    themselves are *not* removed — [`Self::rebuild_producers`] and
     ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
@@ -974,7 +982,11 @@ impl Connection {
             }
         }
 
-        // (3) Snapshot every in-flight publish so [`rebuild_producers`] can replay it on
+        // Events queued before reset belong to the dead session. Clear them before producing any
+        // local reset outcomes so a non-replayable batch's SendError remains observable.
+        self.events.clear();
+
+        // (3) Snapshot every replayable in-flight publish so [`rebuild_producers`] can replay it on
         // the freshly-handshaked session. We pluck the wakers out of each `OpSend` (so we
         // wake the user's future without double-firing on the replayed receipt) and stash
         // the now-wakerless `OpSend` under its producer's snapshot bucket. We deliberately
@@ -997,8 +1009,8 @@ impl Connection {
                 .producers
                 .get(&handle)
                 .map(|slot| slot.state.lock().snapshot_pending_sends());
-            if let Some((wakers, snapshots)) = snap {
-                for (seq, waker_opt) in wakers {
+            if let Some((replay_wakers, dropped, snapshots)) = snap {
+                for (seq, waker_opt) in replay_wakers {
                     // Prefer the producer-stored waker (registered via
                     // ProducerState::register_waker); fall back to the connection-level
                     // slab when no producer-stored waker was set. Wake exactly once —
@@ -1014,6 +1026,15 @@ impl Connection {
                     } else if let Some(w) = self.wakers.remove(&key) {
                         w.wake();
                     }
+                }
+                for (seq, waker_opt) in dropped {
+                    self.resolve_send_error(
+                        handle,
+                        seq,
+                        BATCH_RESET_ERROR_CODE,
+                        BATCH_RESET_ERROR_MESSAGE,
+                        waker_opt,
+                    );
                 }
                 if !snapshots.is_empty() {
                     self.in_flight_publish_snapshots
@@ -1072,7 +1093,6 @@ impl Connection {
 
         // (4) Drop queued events + raw bytes. Anything not yet observed by the runtime
         // belongs to the dead session.
-        self.events.clear();
         self.driver_retries.clear();
         self.outbound.clear();
         self.inbound.clear();
@@ -1897,11 +1917,9 @@ impl Connection {
     /// the reconnect — once each returned [`RequestId`] surfaces an [`OpOutcome::Success`], the
     /// consumer's receive queue is "live" again and the broker resumes dispatching messages.
     ///
-    /// When a consumer has acknowledged at least one message before the reconnect, the
-    /// replayed `CommandSubscribe` uses the highest acked id as `start_message_id` so the
-    /// broker resumes from the post-ack position. This avoids double-delivery of pre-reconnect
-    /// messages on subscriptions where the cursor was not yet persisted broker-side. Mirrors
-    /// Java `ConsumerImpl#connectionOpened`.
+    /// An established durable subscription omits `start_message_id`: the broker's persisted
+    /// cursor is authoritative across reconnects. Fresh and non-durable subscriptions retain only
+    /// the caller's explicit original start position.
     ///
     /// Consumers explicitly closed via [`Self::close_consumer`] / [`Self::unsubscribe`] (or by
     /// the broker via `CommandCloseConsumer`) are skipped — their `closed` flag is honoured.
@@ -1915,17 +1933,18 @@ impl Connection {
                 if state.closed || state.unsubscribe_request_id.is_some() {
                     return None;
                 }
-                Some((*handle, req.clone(), state.last_acked_message_id))
+                let resume = Self::consumer_reattach_start_message_id(req, &state);
+                Some((*handle, req.clone(), resume))
             })
             .collect();
         let mut request_ids = Vec::with_capacity(pending.len());
         for (handle, req, resume_from) in pending {
-            // Resume position: prefer the post-ack id when known, else fall back to the
-            // original `start_message_id` from the subscribe request (broker uses its
-            // persisted cursor if both are absent).
-            let resume = resume_from.or(req.start_message_id);
-            let subscribe_request_id =
-                self.emit_command_subscribe(handle, &req, resume, SubscribeAckAction::ReleaseFlow);
+            let subscribe_request_id = self.emit_command_subscribe(
+                handle,
+                &req,
+                resume_from,
+                SubscribeAckAction::ReleaseFlow,
+            );
             request_ids.push(subscribe_request_id);
         }
         request_ids
@@ -3246,8 +3265,11 @@ impl Connection {
                 // Re-subscribe the single running consumer in place, on the same
                 // connection, exactly like `rebuild_consumers` does per consumer
                 // on a reset and `resubscribe_consumer_after_seek` does after a
-                // seek: re-emit `CommandSubscribe` (resuming from the last acked
-                // id) and defer the initial `CommandFlow` to the broker's
+                // seek: re-emit `CommandSubscribe`. An established durable
+                // reattach omits `start_message_id`, making the broker cursor
+                // authoritative; all other attachments and reconnects reuse the
+                // original requested start position. Defer the initial
+                // `CommandFlow` to the broker's
                 // re-subscribe `Success` (the re-attach gate at the `Success`
                 // arm), so flow lands on a live consumer id rather than being
                 // dropped mid-subscribe.
@@ -4451,9 +4473,10 @@ impl Connection {
                 message: message.to_owned(),
             },
         );
+        let slab_waker = self.wakers.remove(&key);
         if let Some(w) = waker {
             w.wake();
-        } else if let Some(w) = self.wakers.remove(&key) {
+        } else if let Some(w) = slab_waker {
             w.wake();
         }
         self.events.push_back(ConnectionEvent::SendError {
@@ -4743,11 +4766,11 @@ impl Connection {
     }
 
     /// Emit a `CommandSubscribe` carrying `req`'s parameters for the consumer identified by
-    /// `handle`. `resume_from` overrides `req.start_message_id` — used by
-    /// [`Self::rebuild_consumers`] to point the broker at the post-ack position after a
-    /// reconnect. `ack_action` transfers acknowledgement ownership to the new
-    /// request while preserving an existing user waiter across driver-owned
-    /// retries and reconnect rebuilds.
+    /// `handle`. `resume_from` overrides `req.start_message_id`: established durable
+    /// reattach omits it so the broker cursor is authoritative, while all other attachments and
+    /// reconnects reuse the original requested start position. `ack_action` transfers
+    /// acknowledgement ownership to the new request while preserving an existing user waiter
+    /// across driver-owned retries and reconnect rebuilds.
     fn emit_command_subscribe(
         &mut self,
         handle: ConsumerHandle,
@@ -5287,6 +5310,26 @@ impl Connection {
         now: Instant,
     ) -> RequestId {
         let request_id = self.alloc_request_id();
+        if matches!(ack.ack_type, pb::command_ack::AckType::Individual)
+            && ack.message_ids.iter().any(|id| {
+                id.batch_index >= 0 && (id.batch_size <= 0 || id.batch_index >= id.batch_size)
+            })
+        {
+            let key = PendingOpKey::Request(request_id);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Error {
+                    request_id,
+                    code: INVALID_BATCH_ACK_CODE,
+                    message: INVALID_BATCH_ACK_MESSAGE.to_owned(),
+                },
+            );
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+            }
+            return request_id;
+        }
         let n_ids = ack.message_ids.len() as u64;
         let ack_type = ack.ack_type;
         let txn_id = ack.txn_id;
@@ -7404,10 +7447,7 @@ impl Connection {
             if c.closed {
                 return None;
             }
-            // Resume from the last acked id when we have one (same logic
-            // `rebuild_consumers` uses). The broker treats an unset
-            // `start_message_id` as "from the configured initial position".
-            c.last_acked_message_id
+            Self::consumer_reattach_start_message_id(&req, &c)
         };
         let request_id =
             self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
@@ -7424,8 +7464,8 @@ impl Connection {
     /// reconnect, the way [`Self::resubscribe_consumer_after_seek`] does after a
     /// seek and [`Self::retry_consumer_subscribe`] does after a transient
     /// subscribe rejection. It reuses the same machinery: re-emit
-    /// `CommandSubscribe` (resuming from the last acked id so the broker picks
-    /// up where draining stopped) and set `flow_on_subscribe_ack` so the initial
+    /// `CommandSubscribe` (using the broker cursor for an established durable subscription) and
+    /// set `flow_on_subscribe_ack` so the initial
     /// `CommandFlow` is deferred to the broker's re-subscribe `Success` (Pulsar
     /// silently drops `CommandFlow` for a consumer id whose subscribe is still
     /// being processed — `ServerCnx.handleFlow` "Couldn't find consumer").
@@ -7460,11 +7500,7 @@ impl Connection {
             {
                 return;
             }
-            // Resume from the last acked id when known (same logic
-            // `rebuild_consumers` / `retry_consumer_subscribe` use); the broker
-            // treats an unset `start_message_id` as "from the configured initial
-            // position" and otherwise resumes from its persisted cursor.
-            c.last_acked_message_id
+            Self::consumer_reattach_start_message_id(&req, &c)
         };
         // Drop the stale close-by-broker event(s) for this handle: the runtime's
         // `EventWaitFut` only consumes them while parked on the initial
@@ -7481,6 +7517,17 @@ impl Connection {
             handle = ?handle,
             "broker closed running consumer (same-broker, url=None); re-subscribed in place (#307)"
         );
+    }
+
+    fn consumer_reattach_start_message_id(
+        req: &SubscribeRequest,
+        state: &crate::consumer::ConsumerState,
+    ) -> Option<MessageId> {
+        if req.durable && state.has_ever_attached {
+            None
+        } else {
+            req.start_message_id
+        }
     }
 
     fn encode_command(&mut self, cmd: &pb::BaseCommand) -> Result<(), ProtocolError> {
@@ -9241,8 +9288,9 @@ mod conn_state_tests {
         assert!(conn.consume_initial_consumer_subscribe_completion(c_handle));
         while conn.poll_event().is_some() {}
 
-        // Simulate the consumer having acked a message before the disconnect, so the rebuild
-        // should resume from the post-ack id (not from `start_message_id == None`).
+        // Simulate a locally submitted higher individual ack before disconnect. A durable Shared
+        // subscription must still defer to the broker cursor rather than stamping this unconfirmed,
+        // potentially non-contiguous watermark onto the reattach.
         let acked = MessageId {
             ledger_id: 42,
             entry_id: 17,
@@ -9286,14 +9334,10 @@ mod conn_state_tests {
             pb::command_subscribe::SubType::Shared as i32
         );
         assert_eq!(subscribe_cmd.priority_level, Some(7));
-        // Resume from post-ack: the start_message_id field must carry the acked id, not
-        // None (which is what the original subscribe used).
-        let smid = subscribe_cmd
-            .start_message_id
-            .as_ref()
-            .expect("start_message_id stamped from last_acked_message_id");
-        assert_eq!(smid.ledger_id, acked.ledger_id);
-        assert_eq!(smid.entry_id, acked.entry_id);
+        assert!(
+            subscribe_cmd.start_message_id.is_none(),
+            "an established durable reattach must use the broker cursor, never the highest local ack"
+        );
 
         // NO CommandFlow may ride alongside the subscribe: the broker
         // silently drops flow for a consumer id whose subscribe is still
@@ -9535,6 +9579,48 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    #[test]
+    fn reattach_position_uses_only_authoritative_start_points() {
+        let original = MessageId {
+            ledger_id: 1,
+            entry_id: 2,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let mut request = SubscribeRequest {
+            durable: true,
+            start_message_id: Some(original),
+            ..Default::default()
+        };
+        let mut state = crate::consumer::ConsumerState::new(
+            ConsumerHandle(7),
+            "persistent://public/default/t".to_owned(),
+            "s".to_owned(),
+            10,
+        );
+
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            Some(original),
+            "a never-attached durable subscription retains its explicit initial position"
+        );
+
+        state.has_ever_attached = true;
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            None,
+            "an established durable subscription defers to the broker cursor"
+        );
+
+        request.durable = false;
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(&request, &state),
+            Some(original),
+            "a non-durable consumer restarts from the caller's original position"
         );
     }
 
@@ -10554,6 +10640,45 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandSendReceipt");
         buf
+    }
+
+    fn batched_send_receipt_bytes(
+        producer: ProducerHandle,
+        lowest: SequenceId,
+        highest: SequenceId,
+    ) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::SendReceipt as i32,
+            send_receipt: Some(pb::CommandSendReceipt {
+                producer_id: producer.0,
+                sequence_id: lowest.0,
+                message_id: Some(pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: lowest.0,
+                    ..Default::default()
+                }),
+                highest_sequence_id: Some(highest.0),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode batched CommandSendReceipt");
+        buf
+    }
+
+    fn assert_batch_reset_error(conn: &mut Connection, producer: ProducerHandle, seq: SequenceId) {
+        match conn.take_outcome(PendingOpKey::Send(producer, seq)) {
+            Some(OpOutcome::SendError {
+                sequence_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(code, BATCH_RESET_ERROR_CODE);
+                assert_eq!(message, BATCH_RESET_ERROR_MESSAGE);
+            }
+            other => panic!("expected reset SendError for batched sequence {seq:?}, got {other:?}"),
+        }
     }
 
     /// ADR-0086: `handle_frame(now, …)` must forward its injected `now` into
@@ -12739,12 +12864,18 @@ mod conn_state_tests {
         );
     }
 
-    /// Batch cleared on reset: messages buffered in the producer's batch container (i.e.
-    /// not yet flushed to a wire frame) do not survive the reset — caller is responsible
-    /// for re-sending those (matches Java `ProducerImpl#connectionClosed` which drops the
-    /// in-progress batch). Only frames that already hit the wire's pending queue replay.
+    /// A reset terminalizes every unflushed batched send instead of orphaning its future.
     #[test]
-    fn reset_clears_batch_container_does_not_replay_unbatched_stragglers() {
+    fn reset_resolves_unflushed_batched_sends() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWake(AtomicUsize);
+        impl std::task::Wake for CountingWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
@@ -12763,9 +12894,10 @@ mod conn_state_tests {
         let _ = drain_outbound_commands(&mut conn);
 
         // Two batched (un-flushed) sends — neither hits the wire.
+        let mut sequences = Vec::new();
         for payload in [&b"a"[..], &b"b"[..]] {
-            let _ = conn
-                .send(
+            sequences.push(
+                conn.send(
                     producer,
                     crate::producer::OutgoingMessage {
                         payload: bytes::Bytes::from_static(payload),
@@ -12778,7 +12910,8 @@ mod conn_state_tests {
                     0,
                     Instant::now(),
                 )
-                .expect("queue");
+                .expect("queue"),
+            );
         }
         // Batched: each send now mints its own per-message `OpSend` so the user-side
         // `SendFut` has a unique key to wait on. The batch container also still holds the
@@ -12787,17 +12920,165 @@ mod conn_state_tests {
         assert_eq!(conn.producer_pending_count(producer), 2);
         assert_eq!(conn.producer_batch_len(producer), 2);
 
-        // Reset: the batch is dropped; the per-message `OpSend` entries are also dropped
-        // and carry no `replay_frames`, so `in_flight_publish_snapshot` is empty —
-        // matching Java `ProducerImpl#connectionClosed` which fails an in-progress batch
-        // rather than re-emitting the partial bytes.
+        let wake = std::sync::Arc::new(CountingWake(AtomicUsize::new(0)));
+        conn.register_waker(
+            PendingOpKey::Send(producer, sequences[0]),
+            std::task::Waker::from(wake.clone()),
+        );
+
         conn.reset();
         assert_eq!(
             conn.in_flight_publish_snapshot_len(producer),
             0,
-            "unflushed batched sends are NOT replayed — caller's responsibility"
+            "unflushed batched sends are not replayable"
         );
         assert_eq!(conn.producer_batch_len(producer), 0);
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "registered future wakes once"
+        );
+        for seq in sequences {
+            assert_batch_reset_error(&mut conn, producer, seq);
+        }
+        assert_eq!(
+            conn.producer_stats(producer)
+                .expect("producer stats")
+                .total_send_failed,
+            2,
+        );
+    }
+
+    #[test]
+    fn reset_resolves_flushed_batched_sends_before_receipt() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-flushed-batch".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+        let _ = drain_outbound_commands(&mut conn);
+
+        let mut sequences = Vec::new();
+        for payload in [&b"a"[..], &b"b"[..]] {
+            sequences.push(
+                conn.send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::from_static(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 1,
+                        num_messages: 1,
+                        txn_id: None,
+                        source_message_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue"),
+            );
+        }
+        assert_eq!(conn.flush_producer(producer, 0, Instant::now()), 1);
+        let sent = drain_outbound_commands(&mut conn);
+        let batch = sent
+            .iter()
+            .find_map(|command| command.send.as_ref())
+            .expect("ranged CommandSend");
+        assert_eq!(batch.sequence_id, sequences[0].0);
+        assert_eq!(batch.highest_sequence_id, Some(sequences[1].0));
+
+        conn.reset();
+        for seq in sequences {
+            assert_batch_reset_error(&mut conn, producer, seq);
+        }
+    }
+
+    #[test]
+    fn reset_after_batched_receipt_does_not_create_send_errors() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/received-batch".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+        let _ = drain_outbound_commands(&mut conn);
+        let first = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"a"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("first");
+        let second = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"b"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("second");
+        assert_eq!(conn.flush_producer(producer, 0, Instant::now()), 1);
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(
+            Instant::now(),
+            &batched_send_receipt_bytes(producer, first, second),
+        )
+        .expect("receipt");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, first)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, second)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+
+        conn.reset();
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(producer, first))
+                .is_none()
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(producer, second))
+                .is_none()
+        );
     }
 
     // -------------------------------------------------------------------
@@ -15184,6 +15465,87 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn individual_batch_ack_reconstructs_conservative_tracker_after_reset() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        deliver_batch(&mut conn, handle, t0, 11, 7, 4);
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(11, 7)]);
+        let _ = drain_outbound_commands(&mut conn);
+
+        conn.reset();
+        assert!(
+            batch_tracker_keys(&conn, handle).is_empty(),
+            "reset must discard unconfirmed session-local ack bits"
+        );
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 11,
+                    entry_id: 7,
+                    partition: -1,
+                    batch_index: 1,
+                    batch_size: 4,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+
+        let commands = drain_outbound_commands(&mut conn);
+        let ack = commands
+            .iter()
+            .find_map(|command| command.ack.as_ref())
+            .expect("individual CommandAck");
+        assert_eq!(ack.message_id.len(), 1);
+        assert_eq!(
+            ack.message_id[0].ack_set,
+            vec![0b1101],
+            "only index 1 is acknowledged; every sibling remains conservatively unacked"
+        );
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(11, 7)]);
+    }
+
+    #[test]
+    fn invalid_batch_ack_is_rejected_without_wire_output() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let _ = drain_outbound_commands(&mut conn);
+        let request_id = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 11,
+                    entry_id: 7,
+                    partition: -1,
+                    batch_index: 4,
+                    batch_size: 4,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+
+        assert!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .all(|command| command.ack.is_none()),
+            "malformed batch coordinates must not reach the broker"
+        );
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(request_id)),
+            Some(OpOutcome::Error {
+                code: INVALID_BATCH_ACK_CODE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cumulative_ack_prunes_batch_ack_tracker_entries_at_and_below_the_acked_position() {
         let t0 = Instant::now();
         let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
@@ -15368,12 +15730,19 @@ mod conn_state_tests {
 
         {
             let state = conn.consumers[&handle].state.lock();
-            assert_eq!(
-                state.last_acked_message_id, None,
-                "broker acceptance into a transaction must not advance reconnect state"
+            assert!(
+                state.pending_transactional_acks.contains_key(&txn_id),
+                "broker acceptance must remain staged until transaction outcome"
             );
         }
         conn.settle_transactional_acks(handle, txn_id, false);
+        assert!(
+            !conn.consumers[&handle]
+                .state
+                .lock()
+                .pending_transactional_acks
+                .contains_key(&txn_id)
+        );
         conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
         assert_eq!(
             count_redeliver_frames(&mut conn),
@@ -15409,9 +15778,12 @@ mod conn_state_tests {
         );
         conn.settle_transactional_acks(handle, txn_id, true);
 
-        assert_eq!(
-            conn.consumers[&handle].state.lock().last_acked_message_id,
-            Some(message_id)
+        assert!(
+            !conn.consumers[&handle]
+                .state
+                .lock()
+                .pending_transactional_acks
+                .contains_key(&txn_id)
         );
         conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
         assert_eq!(

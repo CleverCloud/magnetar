@@ -73,6 +73,7 @@ mod pool;
 mod producer;
 #[cfg(feature = "scalable-topics")]
 mod scalable;
+pub mod swarm;
 pub mod tls;
 pub mod tls_crypto;
 mod transport;
@@ -563,7 +564,15 @@ impl ConnectionShared {
         // is fine for callers that build `ConnectionShared` directly
         // without an engine (e.g. unit tests).
         let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(Instant::now);
+        // ADR-0097: honour the config's buggify engine-arming slot. Only this
+        // engine reads the slot (the tokio engine deliberately ignores it, per
+        // ADR-0048's production-NOP guarantee), and the config is shared by
+        // every supervised re-dial, so reconnected sessions are armed
+        // identically and the fire-counter map survives resets. The default
+        // slot is `Buggify::disabled()`, a no-op install.
+        let buggify = config.buggify.clone();
         let mut conn = Connection::new(config, wall_clock_provider);
+        let _ = conn.set_buggify(buggify);
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
         // Construction postcondition: a freshly-built connection has not begun
         // the handshake, so it can be neither `Connected` nor terminal. This

@@ -1,6 +1,6 @@
-# ADR-0096 — Isolate sim-coverage artifacts to the current pass
+# ADR-0100 — Isolate sim-coverage artifacts to the current pass
 
-- **Status**: Accepted (record-less-file treatment amended by [ADR-0098](0098-assignment-driven-m1-hardened-stream-consumer.md); artifact isolation remains binding)
+- **Status**: Accepted (record-less-file treatment amended by [ADR-0102](0102-assignment-driven-m1-hardened-stream-consumer.md); artifact isolation remains binding)
 - **Date**: 2026-08-05
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, llvm, ci, artifact-provenance

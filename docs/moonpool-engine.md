@@ -209,6 +209,7 @@ Cross-event temporal invariants compare `TraceEvent::seq`, the global per-seed s
 | ADR-0028 anti-thrash policy (broker ack-then-drop cascade)                                                       | [`anti_thrash.rs`](../crates/magnetar-runtime-moonpool/tests/anti_thrash.rs)                                                                                                                |
 | Supervised redial under a drop → accept → drop → accept cycle (anti-thrash cooldown + multi-attempt redial body) | [`supervised_redial.rs`](../crates/magnetar-runtime-moonpool/tests/supervised_redial.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/supervised_redial.rs))                |
 | Stateful broker + invariant assertions (D2 chaos pack)                                                           | [`sim_chaos.rs`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)                                                                                                                    |
+| Swarm configurations — per-seed subset of buggify labels + workload operations (ADR-0097)                        | [`swarm_config.rs`](../crates/magnetar-runtime-moonpool/tests/swarm_config.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/swarm_off_is_nop.rs))                           |
 | Targeted ADR-0024 coverage closure for `src/{driver,producer,consumer,lib,transport}.rs`                         | [`coverage_close.rs`](../crates/magnetar-runtime-moonpool/tests/coverage_close.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/coverage_close.rs))                         |
 | Delayed-marker replicated-subscription harness (enroll-before-drain marker-accessor lost-wakeup race, ADR-0034)  | [`replicated_subscriptions_sim.rs`](../crates/magnetar-runtime-moonpool/tests/replicated_subscriptions_sim.rs) (moonpool-only `SimProviders`, parity-exempt)                                |
 | Bounded PIP-37 chunk reassembly — cap-eviction of the oldest incomplete buffer (ADR-0063)                        | [`chunk_reassembly_bound.rs`](../crates/magnetar-runtime-moonpool/tests/chunk_reassembly_bound.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/chunk_reassembly_bound.rs)) |
@@ -359,17 +360,18 @@ Key properties:
 
 ### Status: pattern adoption in magnetar
 
-| Pattern                                       | Source      | Status                                                                                                                                        |
-| --------------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Buggify points in `magnetar-proto`            | FDB         | **Landed** ([ADR-0048](../specs/adr/0048-buggify-fault-injection.md)).                                                                        |
-| Assertion density in `magnetar-proto`         | TigerBeetle | **Landed** ([ADR-0049](../specs/adr/0049-assertion-density-magnetar-proto.md)).                                                               |
-| Swizzle-clog workload in `sim_chaos`          | FDB         | **Landed** ([ADR-0050](../specs/adr/0050-swizzle-clog-workload.md)).                                                                          |
-| Per-handle invariant assertions               | TigerBeetle | **Landed** (`HandleResolutionInvariant`).                                                                                                     |
-| Failing-seed registry per PR                  | FDB         | **Landed** ([ADR-0047](../specs/adr/0047-failing-seed-registry-per-pr-replay.md)).                                                            |
-| Daily seed sweep 16 → 128                     | FDB         | **Landed** ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) amendment).                                                     |
-| Long-running soak (≥ 1 000 seeds)             | FDB         | **Out of scope today** — current sim runs ~50 ms per seed; 128 daily covers the seed space until a slow regression appears.                   |
-| VOPR-equivalent dedicated runner              | TigerBeetle | **Out of scope** — TigerBeetle runs VOPR on dedicated bare-metal because every seed costs hours; magnetar's seeds are sub-second.             |
-| Replacing moonpool with a different sim crate | —           | **Out of scope** — moonpool already supplies the FDB+TB primitives (single-threaded executor, seeded RNG, virtual clock, in-process network). |
+| Pattern                                       | Source      | Status                                                                                                                                            |
+| --------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Buggify points in `magnetar-proto`            | FDB         | **Landed** ([ADR-0048](../specs/adr/0048-buggify-fault-injection.md)).                                                                            |
+| Assertion density in `magnetar-proto`         | TigerBeetle | **Landed** ([ADR-0049](../specs/adr/0049-assertion-density-magnetar-proto.md)).                                                                   |
+| Swizzle-clog workload in `sim_chaos`          | FDB         | **Landed** ([ADR-0050](../specs/adr/0050-swizzle-clog-workload.md)).                                                                              |
+| Per-handle invariant assertions               | TigerBeetle | **Landed** (`HandleResolutionInvariant`).                                                                                                         |
+| Failing-seed registry per PR                  | FDB         | **Landed** ([ADR-0047](../specs/adr/0047-failing-seed-registry-per-pr-replay.md)).                                                                |
+| Daily seed sweep 16 → 128                     | FDB         | **Landed** ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) amendment).                                                         |
+| Swarm testing (per-seed feature subsets)      | ISSTA 2012  | **Landed** ([ADR-0097](../specs/adr/0097-swarm-testing-sim-configurations.md)) — labels + `ProducerConsumerWorkload` operations in the first cut. |
+| Long-running soak (≥ 1 000 seeds)             | FDB         | **Out of scope today** — current sim runs ~50 ms per seed; 128 daily covers the seed space until a slow regression appears.                       |
+| VOPR-equivalent dedicated runner              | TigerBeetle | **Out of scope** — TigerBeetle runs VOPR on dedicated bare-metal because every seed costs hours; magnetar's seeds are sub-second.                 |
+| Replacing moonpool with a different sim crate | —           | **Out of scope** — moonpool already supplies the FDB+TB primitives (single-threaded executor, seeded RNG, virtual clock, in-process network).     |
 
 ### References
 

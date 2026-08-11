@@ -97,28 +97,37 @@ jobs:
       - run: cargo build --workspace --all-features --locked
 
   test:
-    name: test
-    # Per ADR-0046 the e2e suite runs as part of the regular `test` job —
-    # no separate `e2e` job, no `--features e2e`, no `#[ignore]`. The
-    # `--all-features` build pulls in the e2e tests automatically because
-    # the `#![cfg(feature = "e2e")]` gates are gone. Docker setup, image
-    # pre-pulls, and the PIP-33 two-cluster docker-compose fixture all
-    # live below.
+    name: test (${{ matrix.name }})
+    # ADR-0098 replaces the aggregate job with one non-e2e cell and four e2e
+    # cells. ADR-0046 still governs semantics: no e2e feature gate or #[ignore].
     runs-on: ubuntu-latest
-    # 180 min covers the cold-cache compile (~20 min of `--all-features`,
-    # heaviest in the admin surface expansion + V3 Functions/IO/Packages),
-    # the PIP-33 two-broker fixture warm-up (~1 min), the e2e suite
-    # against `apachepulsar/pulsar:latest` (~10–15 min), and the
-    # full workspace `cargo test`. The previous 120 min was triggering
-    # mid-test cancels on cold-cache runs; the extra 60 min absorbs the
-    # tail latency without masking real hangs (any individual test has
-    # its own #[tokio::test] timeout under 5 min).
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: non-e2e
+            suite: non-e2e
+            shard: -1
+            pip33: false
+          - name: e2e 1/4
+            suite: e2e
+            shard: 0
+            pip33: false
+          - name: e2e 2/4
+            suite: e2e
+            shard: 1
+            pip33: false
+          - name: e2e 3/4
+            suite: e2e
+            shard: 2
+            pip33: false
+          - name: e2e 4/4 + PIP-33
+            suite: e2e
+            shard: 3
+            pip33: true
     steps:
       - uses: actions/checkout@v7
-      # The `--all-features` build (aws-lc-fips-sys's C build + every
-      # crate + every test binary, test profile) outgrew the ~14GB
-      # GitHub runner disk. Reclaim ~25GB of preinstalled SDKs first.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
@@ -126,49 +135,28 @@ jobs:
           dotnet: true
           haskell: true
           large-packages: true
-          # Leave Docker, the tool-cache (rust toolchain), and swap alone.
           docker-images: false
           tool-cache: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
-      # headers. Runtime libs ship by default; the -dev package only.
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
-      # Pre-pull Docker images so the e2e suite (now part of `cargo test`)
-      # doesn't pay the pull cost inside the test wall budget. ADR-0046.
-      - name: Pre-pull Pulsar broker image
-        run: docker pull apachepulsar/pulsar:latest
-      # The PIP-460 e2e suite pins two further tags: 5.0.0-M1 is the first
-      # published release carrying the scalable-topic wire surface, and 4.0.4
-      # is the v4 broker the negotiation-refusal test needs to prove the
-      # capability is negotiated away rather than emitted blindly (ADR-0093
-      # §D3). Pre-pulled for the same reason as the tag above — testcontainers
-      # would otherwise pay the pull inside the test wall budget.
-      - name: Pre-pull PIP-460 broker images (Pulsar 5.0.0-M1 + 4.0.4)
+      - name: Pre-pull Pulsar broker images
+        if: ${{ matrix.suite == 'e2e' }}
         run: |
+          docker pull apachepulsar/pulsar:latest
           docker pull apachepulsar/pulsar:5.0.0-M1
           docker pull apachepulsar/pulsar:4.0.4
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
+        if: ${{ matrix.suite == 'e2e' }}
         run: docker pull gcavalcante8808/krb5-server:latest || true
-      # Bring up the PIP-33 two-cluster docker-compose fixture. ADR-0046
-      # folded the former weekly `e2e-replicated-subs.yml` into per-PR CI
-      # (the multi-cluster e2e_replicated_subscriptions test now runs
-      # under `cargo test` like the rest of the e2e suite). The fixture
-      # runs under `network_mode: host` with the brokers advertising
-      # `localhost` on host ports 16650/16651/18080/18081 — see the
-      # NETWORKING note in docker-compose.replicated-subs.yml for why a
-      # bridge network cannot satisfy both the host-side e2e client and
-      # cross-cluster replication. The ports stay off the default Pulsar
-      # 6650/8080 so the fixture doesn't collide with the
-      # `testcontainers`-spawned brokers other e2e tests start.
       - name: Bring up two-cluster Pulsar fixture (PIP-33)
+        if: ${{ matrix.pip33 }}
         working-directory: crates/magnetar/tests/fixtures
         run: |
           set -euo pipefail
           docker compose -f docker-compose.replicated-subs.yml up -d
-          # Wait for both brokers' admin endpoints to report healthy.
           for url in http://localhost:18080/admin/v2/brokers/health \
                      http://localhost:18081/admin/v2/brokers/health; do
             attempts=60
@@ -183,21 +171,8 @@ jobs:
               sleep 2
             done
           done
-      # Runs BEFORE configure_replicated_subs.sh on purpose: that script
-      # registers the clusters itself, so asserting afterwards would prove
-      # nothing about `pulsar-init`. Both clusters can only be present at
-      # this point if the init service did its job. It had not since the
-      # fixture was written — a YAML folded-scalar bug fed
-      # `initialize-cluster-metadata` an empty argument list and `|| true`
-      # reported `Exited (0)` (issue #389).
-      # Retries rather than asserting once: the wait above polls only
-      # /admin/v2/brokers/health, and configure_replicated_subs.sh already
-      # records that broker health goes green before the metadata cache
-      # warms, which is why its wait_for_admin_ready() polls this very
-      # endpoint. A bounded retry keeps the assertion exactly as strong —
-      # a cluster that never appears still fails the job — while not
-      # turning a warm-up window into a per-PR flake.
       - name: Assert pulsar-init registered both clusters (regression guard, issue #389)
+        if: ${{ matrix.pip33 }}
         run: |
           set -euo pipefail
           for url in http://localhost:18080 http://localhost:18081; do
@@ -215,18 +190,73 @@ jobs:
             echo "$url -> $clusters"
           done
       - name: Configure peer clusters + replicated subscription status
+        if: ${{ matrix.pip33 }}
         working-directory: crates/magnetar/tests/fixtures
         run: ./configure_replicated_subs.sh
-      - name: Run full test suite (incl. e2e)
-        run: cargo test --workspace --all-features --locked -- --nocapture
-      - name: Tear down two-cluster fixture
-        if: always()
-        working-directory: crates/magnetar/tests/fixtures
-        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
+      - name: Run non-e2e tests
+        if: ${{ matrix.suite == 'non-e2e' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cargo test --workspace --exclude magnetar-driver --all-features --locked -- --nocapture
+          cargo test -p magnetar-driver --all-features --locked --lib -- --nocapture
+          cargo test -p magnetar-driver --all-features --locked --doc -- --nocapture
+          paths=(crates/magnetar/tests/*.rs)
+          for path in "${paths[@]}"; do
+            target="${path##*/}"
+            target="${target%.rs}"
+            case "$target" in
+              e2e_*) continue ;;
+            esac
+            cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
+          done
+      - name: Run e2e shard
+        if: ${{ matrix.suite == 'e2e' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          shard=${{ matrix.shard }}
+          regular_index=0
+          selected=0
+          paths=(crates/magnetar/tests/e2e_*.rs)
+          if [ "${#paths[@]}" -eq 0 ]; then
+            echo "no e2e test targets found"
+            exit 1
+          fi
+          mapfile -t paths < <(printf '%s\n' "${paths[@]}" | sort)
+          for path in "${paths[@]}"; do
+            target="${path##*/}"
+            target="${target%.rs}"
+            if [ "$target" = e2e_replicated_subscriptions ]; then
+              assigned=3
+            else
+              assigned=$((regular_index % 4))
+              regular_index=$((regular_index + 1))
+            fi
+            if [ "$assigned" -ne "$shard" ]; then
+              continue
+            fi
+            selected=$((selected + 1))
+            echo "::group::$target"
+            if [ "$target" = e2e_scalable_topic ]; then
+              cargo build -p magnetarctl --all-features --locked
+            fi
+            cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
+            echo "::endgroup::"
+          done
+          if [ "$selected" -eq 0 ]; then
+            echo "e2e shard $shard selected no test targets"
+            exit 1
+          fi
+          echo "e2e shard $shard ran $selected test targets"
       - name: Dump two-cluster broker logs on failure
-        if: failure()
+        if: ${{ failure() && matrix.pip33 }}
         working-directory: crates/magnetar/tests/fixtures
         run: docker compose -f docker-compose.replicated-subs.yml logs --tail=500 || true
+      - name: Tear down two-cluster fixture
+        if: ${{ always() && matrix.pip33 }}
+        working-directory: crates/magnetar/tests/fixtures
+        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
 
   seed-replay:
     # Per ADR-0047: replay every `status = "open"` seed listed in
@@ -536,10 +566,9 @@ jobs:
   # still exercises `magnetar-runtime-moonpool` under the default seed
   # on every PR / push.
 
-  # The former standalone `e2e` job is gone per ADR-0046 — its work is
-  # folded into the `test` job above (Docker pre-pulls + two-cluster
-  # docker-compose fixture + `cargo test --workspace --all-features`).
-  # One job, one Cargo profile, one validation pass per PR.
+  # ADR-0098 splits the former aggregate test job into one non-e2e cell and
+  # four e2e cells. The local canonical command remains one
+  # `cargo test --workspace --all-features` invocation per ADR-0046.
 
   mutants-smoke:
     name: cargo-mutants smoke (magnetar-proto)

@@ -1,4 +1,4 @@
-# ADR-0098 — Adopt the assignment-driven M1-hardened scalable StreamConsumer
+# ADR-0102 — Adopt the assignment-driven M1-hardened scalable StreamConsumer
 
 - **Status**: Accepted
 - **Date**: 2026-08-05
@@ -6,7 +6,7 @@
 - **Tags**: pip-460, scalable-topics, stream-consumer, assignment, ordering, flow-control, transactions, coverage
 - **Supersedes**: The drop-on-DAG-change and unimplemented-data-plane scope decisions that survived [ADR-0031](0031-pip-460-scalable-subscription-scope.md) and were repeated in [ADR-0093](0093-pip-460-upstream-wire-surface.md), plus ADR-0093 § D5's blanket rejection of non-advancing consumer assignments and [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s preserved assignment-side contrast
 - **Preserves**: ADR-0093's vendored Pulsar 5.0.0-M1 wire surface and per-connection capability negotiation, plus [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
-- **Amends**: The compiled coverage closure and record-less-file treatment recorded by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) and retained by [ADR-0096](0096-isolate-sim-coverage-current-pass-artifacts.md)
+- **Amends**: The compiled coverage closure and record-less-file treatment recorded by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) and retained by [ADR-0100](0100-isolate-sim-coverage-current-pass-artifacts.md)
 
 ## Context
 
@@ -186,7 +186,7 @@ The sim-coverage report and hard-gated prefix sets now contain exactly these eig
 
 Execution remains exactly `-p magnetar-runtime-moonpool -p magnetar-differential`, so façade Docker e2e targets do not run under coverage.
 `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and other uncompiled packages remain advisory `not gated` scope.
-ADR-0096's invocation-owned target, artifact-flag rejection, output-only LCOV, cleanup, optimization, and exclusions are unchanged.
+ADR-0100's invocation-owned target, artifact-flag rejection, output-only LCOV, cleanup, optimization, and exclusions are unchanged.
 The record-less rule is tightened: a gated file containing a non-test function body hard-fails when it has no `SF:` record even if a sibling file proves that the crate reached LCOV; a module/export/constant/bodyless-declaration-only file remains advisory, and a wholly record-less gated crate still hard-fails.
 `check-sim-coverage` computes `git diff <merge-base>..HEAD` and therefore excludes uncommitted worktree changes.
 The complete implementation diff must be represented by `HEAD` and the enforcing gate rerun before a green result can be cited as acceptance evidence for this decision.

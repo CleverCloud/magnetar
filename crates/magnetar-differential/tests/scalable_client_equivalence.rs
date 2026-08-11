@@ -1054,25 +1054,35 @@ async fn scalable_pushed_layout_reaches_the_client() {
     let host_port = broker.host_port();
 
     let tokio_seen = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        client
-            .scalable_topic_lookup("topic://public/default/scaled-split")
-            .await
-            .expect("tokio lookup resolves");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio pushed-layout connect returned rather than hanging")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/scaled-split"),
+        )
+        .await
+        .expect("tokio pushed-layout lookup returned rather than hanging")
+        .expect("tokio lookup resolves");
         // The registration is what makes `scalable_consumer_assignment`
         // meaningful; assert through it as well as through the event.
-        client
-            .scalable_topic_subscribe(
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled-split",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("tokio subscribe");
+            ),
+        )
+        .await
+        .expect("tokio pushed-layout subscribe returned rather than hanging")
+        .expect("tokio subscribe");
         // The scripted broker follows every subscribe with a rebalance, so the
         // held epoch races that push — assert the assignment is readable and
         // non-empty, and leave the epoch to `scalable_assignment_rebalance_parity`.
@@ -1084,24 +1094,33 @@ async fn scalable_pushed_layout_reaches_the_client() {
 
     let moonpool_seen = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        client
-            .scalable_topic_lookup("topic://public/default/scaled-split")
-            .await
-            .expect("moonpool lookup resolves");
-        client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool pushed-layout connect returned rather than hanging")
+        .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/scaled-split"),
+        )
+        .await
+        .expect("moonpool pushed-layout lookup returned rather than hanging")
+        .expect("moonpool lookup resolves");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled-split",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("moonpool subscribe");
+            ),
+        )
+        .await
+        .expect("moonpool pushed-layout subscribe returned rather than hanging")
+        .expect("moonpool subscribe");
         let held = client
             .scalable_consumer_assignment(42)
             .map(|a| !a.segments().is_empty());

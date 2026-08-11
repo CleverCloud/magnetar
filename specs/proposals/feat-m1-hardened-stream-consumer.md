@@ -1,7 +1,7 @@
 # M1-hardened scalable StreamConsumer and follow-up closure
 
 - **Status**: In-flight
-- **ADR**: [ADR-0098](../adr/0098-assignment-driven-m1-hardened-stream-consumer.md), preserving [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md)'s wire and negotiation decisions and [ADR-0095](../adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
+- **ADR**: [ADR-0102](../adr/0102-assignment-driven-m1-hardened-stream-consumer.md), preserving [ADR-0093](../adr/0093-pip-460-upstream-wire-surface.md)'s wire and negotiation decisions and [ADR-0095](../adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
 - **Date**: 2026-08-04
 - **Owner**: Florentin Dubois
 - **Scope**: One pull request closing `docs/follow-ups.md` sections 11, 12, 14, and 15

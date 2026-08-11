@@ -1,6 +1,6 @@
 # ADR-0095 — Ignore a re-sent scalable layout epoch instead of ending the watch
 
-- **Status**: Accepted (the consumer-assignment comparison is superseded by [ADR-0098](0098-assignment-driven-m1-hardened-stream-consumer.md); the duplicate-layout decision remains binding)
+- **Status**: Accepted (the consumer-assignment comparison is superseded by [ADR-0102](0102-assignment-driven-m1-hardened-stream-consumer.md); the duplicate-layout decision remains binding)
 - **Date**: 2026-08-04
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, epoch, watch-session, wire-format, experimental

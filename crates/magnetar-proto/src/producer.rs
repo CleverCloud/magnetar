@@ -1115,9 +1115,9 @@ impl ProducerState {
             receipt: None,
             error: None,
             enqueued_at: now,
-            // No per-message replay frame: replay on reconnect drains the still-buffered
-            // batch entries via `drain_pending_sends`, which already clears
-            // `BatchContainer`.
+            // No per-message replay frame: one eventual ranged wire frame represents the whole
+            // batch, so reconnect cannot replay it once per logical send. Reset resolves these
+            // entries with a deterministic send error instead.
             replay_frames: Vec::new(),
         };
         self.pending_index
@@ -1556,8 +1556,11 @@ impl ProducerState {
     /// Drain every in-flight [`OpSend`] but preserve the publish data for replay on the
     /// freshly-handshaked session. Returns:
     ///
-    /// - `wakers`: the user-facing send-future wakers we removed from each [`OpSend`] so the caller
-    ///   can wake them exactly once *after* the snapshot has been stashed.
+    /// - `replay_wakers`: the user-facing send-future wakers removed from replayable sends so the
+    ///   caller can wake them exactly once *after* the snapshot has been stashed.
+    /// - `dropped`: sequence ids and wakers for non-replayable sends. Batched sends use one shared
+    ///   wire frame and therefore cannot be replayed through the per-message snapshot mechanism;
+    ///   the caller must resolve each of them with a terminal send error.
     /// - `snapshots`: the drained [`OpSend`] entries, in original FIFO order, each with its `waker`
     ///   field already cleared. Sequence ids, num-messages, and the cached [`OutboundFrame`] vector
     ///   are preserved so [`Self::replay_snapshots`] can re-issue the publish verbatim on the new
@@ -1572,11 +1575,19 @@ impl ProducerState {
     /// onto the new connection. Sans-io: this state machine never reaches for a clock —
     /// `enqueued_at` on each snapshot is preserved from the original send, so the
     /// post-rebuild send-timeout sweep still uses the original deadline.
-    pub fn snapshot_pending_sends(&mut self) -> (Vec<(SequenceId, Option<Waker>)>, Vec<OpSend>) {
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot_pending_sends(
+        &mut self,
+    ) -> (
+        Vec<(SequenceId, Option<Waker>)>,
+        Vec<(SequenceId, Option<Waker>)>,
+        Vec<OpSend>,
+    ) {
         // The session is gone — the broker must re-ack the attachment before
         // any send may flow again (drain gate, see `broker_ready`).
         self.broker_ready = false;
-        let mut wakers = Vec::with_capacity(self.pending.len());
+        let mut replay_wakers = Vec::with_capacity(self.pending.len());
+        let mut dropped = Vec::new();
         let mut snapshots = Vec::with_capacity(self.pending.len());
         while let Some(mut op) = self.pending.pop_front() {
             self.pending_index.remove(&op.sequence_id);
@@ -1585,19 +1596,21 @@ impl ProducerState {
             // also prevents `apply_receipt` from later double-waking the same future
             // when the replayed receipt lands.
             let w = op.waker.take();
-            wakers.push((op.sequence_id, w));
-            // Per-message batched `OpSend` entries (created by `add_to_batch`) carry no
-            // `replay_frames` because the wire frame only materialises at `flush_batch`
-            // time. Drop them on the floor (no replay) — matching Java
-            // `ProducerImpl#connectionClosed` which fails an in-progress batch instead of
-            // re-emitting the partial bytes.
-            if !op.replay_frames.is_empty() {
+            // Per-message batched `OpSend` entries carry no `replay_frames`, even after
+            // `flush_batch`: one ranged wire frame represents the whole batch and copying it into
+            // every per-message operation would replay that batch repeatedly. Report these sends
+            // explicitly so reset can fail them instead of orphaning their futures.
+            if op.replay_frames.is_empty() {
+                dropped.push((op.sequence_id, w));
+                self.total_send_failed = self.total_send_failed.saturating_add(1);
+            } else {
+                replay_wakers.push((op.sequence_id, w));
                 snapshots.push(op);
             }
         }
         self.batch = BatchContainer::default();
         self.outbound.clear();
-        (wakers, snapshots)
+        (replay_wakers, dropped, snapshots)
     }
 
     /// Re-issue a vector of [`OpSend`] snapshots produced by
@@ -2680,8 +2693,9 @@ mod tests {
         assert_eq!(p.pending.len(), 1);
         assert_eq!(p.pending[0].replay_frames.len(), 1);
 
-        let (wakers, snapshots) = p.snapshot_pending_sends();
+        let (wakers, dropped, snapshots) = p.snapshot_pending_sends();
         assert_eq!(snapshots.len(), 1, "one OpSend captured");
+        assert!(dropped.is_empty(), "single sends remain replayable");
         assert_eq!(wakers.len(), 1, "one waker slot returned (None inside)");
         assert!(
             wakers[0].1.is_none(),
@@ -2717,7 +2731,8 @@ mod tests {
         assert_eq!(p.pending.len(), 1);
         assert_eq!(p.pending[0].replay_frames.len(), 3);
 
-        let (_wakers, snapshots) = p.snapshot_pending_sends();
+        let (_wakers, dropped, snapshots) = p.snapshot_pending_sends();
+        assert!(dropped.is_empty(), "chunked sends remain replayable");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].replay_frames.len(), 3);
 
@@ -2756,7 +2771,7 @@ mod tests {
         assert!(!p.batch.is_empty());
         assert_eq!(p.pending.len(), 2);
 
-        let (_wakers, snapshots) = p.snapshot_pending_sends();
+        let (replay_wakers, dropped, snapshots) = p.snapshot_pending_sends();
         // The pre-flush `OpSend` entries carry no `replay_frames` (the wire frame is built
         // at flush time, not per-add), so reconnect replay is correctly empty for the
         // in-progress batch — the entries surface in the wakers list so the caller can
@@ -2766,10 +2781,47 @@ mod tests {
             snapshots.is_empty(),
             "in-progress batched messages have no replay frames"
         );
+        assert!(replay_wakers.is_empty());
+        assert_eq!(
+            dropped.len(),
+            2,
+            "every non-replayable batched send must be reported for failure"
+        );
+        assert_eq!(p.total_send_failed, 2);
         assert!(
             p.batch.is_empty(),
             "the batch container is dropped on snapshot"
         );
+    }
+
+    #[test]
+    fn snapshot_reports_flushed_batch_as_non_replayable() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            4096,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 100;
+        p.max_batch_size_bytes = 4096;
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            let _ = p
+                .queue_send(small_message(payload), 100, std::time::Instant::now())
+                .unwrap();
+        }
+        assert_eq!(p.flush_batch(100, std::time::Instant::now()), 1);
+        let _ = p.next_outbound_frame().expect("flushed batch frame");
+
+        let (replay_wakers, dropped, snapshots) = p.snapshot_pending_sends();
+        assert!(replay_wakers.is_empty());
+        assert!(snapshots.is_empty());
+        assert_eq!(
+            dropped.iter().map(|(seq, _)| seq.0).collect::<Vec<_>>(),
+            vec![0, 1],
+            "a ranged batch frame cannot be replayed once per logical send"
+        );
+        assert_eq!(p.total_send_failed, 2);
     }
 
     // ---------- PIP-180 / ADR-0033: shadow-topic producer-side tests ----------

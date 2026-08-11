@@ -26,6 +26,11 @@
 //! - `check-runtime-test-parity`: assert `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
 //!   carry the same number of `#[test]` / `#[tokio::test]` / `#[moonpool::test]` items. Mirrors
 //!   ADR-0024.
+//! - `check-known-failing-seeds`: replay every `status = "open"` entry of
+//!   `crates/magnetar-runtime-moonpool/seeds/known-failing.toml` with the exact per-PR
+//!   `seed-replay` invocation from `.github/workflows/ci.yml` and fail on any reproducing seed.
+//!   Mirrors ADR-0047 §5 — "if CI's replay job would fail, this xtask fails too" (landed by
+//!   ADR-0097).
 //! - `check-crypto-matrix`: build the four `crypto-*` provider features in isolation (issue #9,
 //!   ADR-0035). Complements `cargo build --workspace --all-features` (which exercises the cfg
 //!   cascade) by proving each single-provider cell compiles cleanly.
@@ -176,6 +181,16 @@ enum Cmd {
     /// `crates/magnetar-runtime-moonpool/{src,tests}`. Strict equality
     /// required. See ADR-0024.
     CheckRuntimeTestParity,
+    /// Replay every open registry seed locally (ADR-0047 §5, ADR-0097).
+    ///
+    /// Parses `crates/magnetar-runtime-moonpool/seeds/known-failing.toml`
+    /// and runs `MOONPOOL_SEED=<value> cargo test -p
+    /// magnetar-runtime-moonpool --no-default-features --features
+    /// crypto-aws-lc-rs --locked` for each `status = "open"` entry —
+    /// the exact invocation the per-PR `seed-replay` CI job uses, so
+    /// the local invariant is "if CI's replay job would fail, this
+    /// xtask fails too".
+    CheckKnownFailingSeeds,
     /// Build the per-provider crypto matrix (issue #9, ADR-0035).
     ///
     /// Iterates the four mutually-pluggable `crypto-*` features in
@@ -220,6 +235,7 @@ fn dispatch() -> Result<()> {
             enforce,
         } => check_sim_coverage(&base, reuse_lcov, enforce),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
+        Cmd::CheckKnownFailingSeeds => check_known_failing_seeds(),
         Cmd::CheckCryptoMatrix => check_crypto_matrix(),
         Cmd::VendorProto { rev, source } => vendor_proto(&rev, source.as_deref()),
     }
@@ -2688,7 +2704,7 @@ fn create_sim_coverage_target(storage: &CargoStorage) -> Result<tempfile::TempDi
 /// Measured 2026-07-31, the original widened report carried 63 `SF:` records
 /// against 16 before: `magnetar-proto` 28, `magnetar-runtime-tokio` 12,
 /// `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5,
-/// `magnetar-differential` 4, `magnetar-auth-sasl` 2. ADR-0098 amends that
+/// `magnetar-differential` 4, `magnetar-auth-sasl` 2. ADR-0102 amends that
 /// historical six-package closure to eight after `magnetar-differential`
 /// gained public aggregate tests through `magnetar-driver` and
 /// `magnetar-fakes`; no later `SF:` total is assumed here.
@@ -2699,7 +2715,7 @@ fn create_sim_coverage_target(storage: &CargoStorage) -> Result<tempfile::TempDi
 /// records prove the crate reached the report, but do not make that executable
 /// file measurable. A genuinely non-executable module/export/constant or
 /// bodyless-declaration file remains advisory rather than silently passed
-/// (ADR-0088, ADR-0098).
+/// (ADR-0088, ADR-0102).
 ///
 /// With `reuse_lcov`, both commands are skipped and the existing
 /// `target/sim-coverage.lcov` is read as-is — sizing and debugging only. That
@@ -3203,7 +3219,7 @@ fn classify_uninstrumented(
 /// [`SIM_COVERAGE_REPORT_PACKAGES`]; a gated file can also land here when it has
 /// no non-test function body and therefore no executable coverage mapping.
 /// Reporting both keeps the scope limit visible instead of silent — see
-/// ADR-0088 and ADR-0098.
+/// ADR-0088 and ADR-0102.
 fn report_ungated(ungated: &[(String, usize)]) {
     for (path, count) in ungated {
         eprintln!("not gated (no executable LCOV file record): {path}: {count} added line(s)");
@@ -3213,7 +3229,7 @@ fn report_ungated(ungated: &[(String, usize)]) {
          A file outside the reported closure ({}) is not gated; a file inside \
          it reached this path only because it has no non-test function body. \
          ADR-0024 patch coverage was NOT enforced on their added lines \
-         (ADR-0088, ADR-0098).",
+         (ADR-0088, ADR-0102).",
         ungated.len(),
         SIM_COVERAGE_REPORT_PACKAGES.join(", ")
     );
@@ -3662,6 +3678,144 @@ fn check_runtime_test_parity() -> Result<()> {
 
     eprintln!(
         "xtask check-runtime-test-parity: tokio={tokio_count} moonpool={moonpool_count} (parity ok)."
+    );
+    Ok(())
+}
+
+/// One `[[seed]]` entry of the known-failing registry, as much of it as
+/// the replay needs: the `MOONPOOL_SEED` value and the triage status.
+#[derive(Debug, PartialEq, Eq)]
+struct RegistrySeed {
+    value: String,
+    status: String,
+}
+
+/// Parse `known-failing.toml`'s `[[seed]]` entries without a TOML
+/// dependency. The registry schema (ADR-0047) is deliberately flat —
+/// scalar `key = value` lines plus `"""`-delimited multiline `note`
+/// strings — so a line scanner that skips multiline-string bodies is
+/// exact for this file. Unknown keys are ignored; an entry missing
+/// `value` or `status` is an error rather than a silent skip.
+fn parse_known_failing_seeds(contents: &str) -> Result<Vec<RegistrySeed>> {
+    let mut seeds: Vec<RegistrySeed> = Vec::new();
+    let mut current: Option<(Option<String>, Option<String>)> = None;
+    let mut in_multiline = false;
+
+    let finish = |entry: Option<(Option<String>, Option<String>)>,
+                  seeds: &mut Vec<RegistrySeed>|
+     -> Result<()> {
+        if let Some((value, status)) = entry {
+            let value = value.ok_or_else(|| anyhow!("[[seed]] entry missing `value`"))?;
+            let status = status.ok_or_else(|| anyhow!("[[seed]] entry missing `status`"))?;
+            seeds.push(RegistrySeed { value, status });
+        }
+        Ok(())
+    };
+
+    for line in contents.lines() {
+        if in_multiline {
+            // A `"""` on its own (or ending a note) closes the string;
+            // registry notes never nest quotes, per the schema comment.
+            if line.contains("\"\"\"") {
+                in_multiline = false;
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "[[seed]]" {
+            finish(current.take(), &mut seeds)?;
+            current = Some((None, None));
+            continue;
+        }
+        let Some((key, raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let raw = raw.trim();
+        // A multiline string opens when the value starts with `"""` and
+        // does not close on the same line.
+        if raw.starts_with("\"\"\"") && raw[3..].find("\"\"\"").is_none() {
+            in_multiline = true;
+            continue;
+        }
+        let unquoted = raw.trim_matches('"').to_owned();
+        if let Some((value, status)) = current.as_mut() {
+            match key {
+                "value" => *value = Some(unquoted),
+                "status" => *status = Some(unquoted),
+                _ => {}
+            }
+        }
+    }
+    finish(current.take(), &mut seeds)?;
+    Ok(seeds)
+}
+
+/// ADR-0047 §5 (landed by ADR-0097): replay every `status = "open"`
+/// registry seed with the exact per-PR `seed-replay` CI invocation, so
+/// the local invariant is "if CI's replay job would fail, this xtask
+/// fails too". Exit is non-zero on any reproducing seed.
+fn check_known_failing_seeds() -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let registry = workspace_root.join("crates/magnetar-runtime-moonpool/seeds/known-failing.toml");
+    let contents = fs::read_to_string(&registry)
+        .with_context(|| format!("failed to read {}", registry.display()))?;
+    let seeds = parse_known_failing_seeds(&contents)?;
+    let open: Vec<&RegistrySeed> = seeds.iter().filter(|s| s.status == "open").collect();
+    if open.is_empty() {
+        eprintln!("xtask check-known-failing-seeds: no open registry entries — nothing to replay.");
+        return Ok(());
+    }
+
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut failures: Vec<String> = Vec::new();
+    for seed in &open {
+        eprintln!(
+            "xtask check-known-failing-seeds: MOONPOOL_SEED={} cargo test -p magnetar-runtime-moonpool --no-default-features --features crypto-aws-lc-rs --locked",
+            seed.value
+        );
+        let status = StdCommand::new(&cargo)
+            .current_dir(&workspace_root)
+            .env("MOONPOOL_SEED", &seed.value)
+            .args([
+                "test",
+                "-p",
+                "magnetar-runtime-moonpool",
+                "--no-default-features",
+                "--features",
+                "crypto-aws-lc-rs",
+                "--locked",
+            ])
+            .status()
+            .with_context(|| format!("failed to invoke `cargo test` for seed {}", seed.value))?;
+        if status.success() {
+            eprintln!(
+                "xtask check-known-failing-seeds: seed {} passed (anchor holds).",
+                seed.value
+            );
+        } else {
+            eprintln!(
+                "xtask check-known-failing-seeds: seed {} REPRODUCED a failure.",
+                seed.value
+            );
+            failures.push(seed.value.clone());
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "xtask check-known-failing-seeds: {}/{} open seed(s) reproduced: {} — \
+             fix the regression or triage per ADR-0047 §4.",
+            failures.len(),
+            open.len(),
+            failures.join(", ")
+        );
+    }
+    eprintln!(
+        "xtask check-known-failing-seeds: all {} open seed(s) replayed green.",
+        open.len()
     );
     Ok(())
 }
@@ -6125,5 +6279,71 @@ mod tests {
             vec![("crates/magnetar-proto/src/conn.rs".to_owned(), 2)],
             "the uncovered line must still be caught with the symlink on the LCOV side"
         );
+    }
+}
+
+#[cfg(test)]
+mod known_failing_seeds_tests {
+    use super::parse_known_failing_seeds;
+
+    /// The scanner extracts every `[[seed]]` entry's value + status and
+    /// is not confused by comment lines or `"""` multiline notes whose
+    /// prose could resemble `key = value` assignments.
+    #[test]
+    fn parses_registry_entries_and_skips_multiline_notes() {
+        let contents = r#"
+# Known failing seeds — header prose with status = "open" inside a comment.
+
+[[seed]]
+value        = "0x56201ccaba82dbc1"
+discovered   = "2026-06-02"
+status       = "open"
+note         = """
+Multi-line narrative. This line has value = 42 and
+status = "wontfix" inside the note body, which the scanner
+must NOT interpret as entry keys.
+"""
+
+[[seed]]
+value        = 12345
+status       = "investigating"
+note         = """single entry note"""
+"#;
+        let seeds = parse_known_failing_seeds(contents).expect("registry parses");
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].value, "0x56201ccaba82dbc1");
+        assert_eq!(seeds[0].status, "open");
+        assert_eq!(seeds[1].value, "12345");
+        assert_eq!(seeds[1].status, "investigating");
+    }
+
+    /// An entry missing its `value` or `status` is a hard error — a
+    /// registry the replay cannot act on must fail loudly rather than
+    /// silently skipping the seed (the gate-that-cannot-measure rule).
+    #[test]
+    fn missing_value_or_status_is_an_error() {
+        assert!(parse_known_failing_seeds("[[seed]]\nstatus = \"open\"\n").is_err());
+        assert!(parse_known_failing_seeds("[[seed]]\nvalue = \"0x1\"\n").is_err());
+    }
+
+    /// The real registry file parses and yields only `open` anchors —
+    /// the shape the per-PR `seed-replay` job (and this xtask) replay.
+    #[test]
+    fn real_registry_parses_with_open_entries() {
+        let root = super::workspace_root().expect("workspace root");
+        let contents = std::fs::read_to_string(
+            root.join("crates/magnetar-runtime-moonpool/seeds/known-failing.toml"),
+        )
+        .expect("registry readable");
+        let seeds = parse_known_failing_seeds(&contents).expect("registry parses");
+        assert!(!seeds.is_empty(), "registry currently carries anchors");
+        for seed in &seeds {
+            assert!(
+                ["open", "investigating", "wontfix"].contains(&seed.status.as_str()),
+                "unexpected status {:?} for seed {}",
+                seed.status,
+                seed.value
+            );
+        }
     }
 }

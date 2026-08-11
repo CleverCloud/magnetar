@@ -30,7 +30,7 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
 cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011, ADR-0086)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # patch coverage over the 8 sim-compiled crates; enforcing (ADR-0024, ADR-0088, ADR-0090, ADR-0092, ADR-0098)
+cargo run -p xtask -- check-sim-coverage        # patch coverage over the 8 sim-compiled crates; enforcing (ADR-0024, ADR-0088, ADR-0090, ADR-0092, ADR-0102)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
@@ -46,10 +46,10 @@ Note what it can and cannot be satisfied by: only the moonpool and differential 
 `--enforce` is redundant now and accepted for compatibility.
 An added gated file with no `SF:` record fails when its whole crate emitted no records or when that file contains a non-test function body, even if siblings reported; module/export/constant/bodyless-declaration-only files remain advisory.
 A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`, `/benches/`, `/examples/` path, or inside a `#[cfg(test)]` span short-circuits with "nothing to verify" and never pays the build.
-That bail is keyed on those exclusions and not on the gated crates, so a PR touching only `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, or another uncompiled package does pay the full build before printing it as `not gated`; façade and fakes changes are gated under ADR-0098.
+That bail is keyed on those exclusions and not on the gated crates, so a PR touching only `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, or another uncompiled package does pay the full build before printing it as `not gated`; façade and fakes changes are gated under ADR-0102.
 It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
 On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
-Execution and report use one locked, invocation-owned target outside cached Cargo storage, so restored or locally stale first-party objects cannot affect the verdict; `target/sim-coverage.lcov` is only the final output ([ADR-0096](specs/adr/0096-isolate-sim-coverage-current-pass-artifacts.md)).
+Execution and report use one locked, invocation-owned target outside cached Cargo storage, so restored or locally stale first-party objects cannot affect the verdict; `target/sim-coverage.lcov` is only the final output ([ADR-0100](specs/adr/0100-isolate-sim-coverage-current-pass-artifacts.md)).
 Do not set LLVM coverage/profdata flag variables around this command: the gate rejects non-empty values because cargo-llvm-cov would otherwise append arbitrary artifact paths to its tool invocations.
 
 Moonpool seed sweep: CI runs a daily 128-random-seed job per [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md); locally you can reproduce a flaky run with:

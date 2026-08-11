@@ -1099,11 +1099,6 @@ impl<P: Providers> Consumer<P> {
             .settle_transactional_acks(self.handle, txn_id, committed);
     }
 
-    #[cfg(all(test, feature = "scalable-topics"))]
-    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
-        self.slot.state.lock().last_acked_message_id
-    }
-
     fn ack_inner_with_message_id_data(
         &self,
         message_ids: Vec<MessageId>,
