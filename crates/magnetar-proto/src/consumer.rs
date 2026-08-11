@@ -389,13 +389,6 @@ pub struct ConsumerState {
     /// not be initialised (impossible in any non-broken hdrhistogram build); stats helpers
     /// report zero percentiles when `None` or empty.
     pub receive_latency_hist: Option<hdrhistogram::Histogram<u64>>,
-    /// Highest message id whose ack the runtime has surfaced via
-    /// [`crate::Connection::ack`] / `ack_grouped_individual` / `ack_grouped_cumulative`.
-    /// Non-durable consumers may use it as a client-side reattach position. Durable consumers
-    /// never use it for reconnect because their broker-persisted cursor is authoritative and a
-    /// locally submitted ack is not necessarily confirmed or contiguous. `None` until the
-    /// first ack lands.
-    pub last_acked_message_id: Option<MessageId>,
     /// Last rolling-window stats snapshot: `(msgs_at_snapshot, bytes_at_snapshot, taken_at)`.
     /// Updated by [`Self::record_rate_window`] to compute msgs/sec + bytes/sec rates.
     /// Mirrors Java `ConsumerStatsRecorder` rolling-window rate calculation. `None` until
@@ -829,7 +822,6 @@ impl ConsumerState {
             // its ConsumerStatsRecorder. See [`crate::producer::new_latency_histogram`] for
             // the invariant-#6 (no panics) safety chain.
             receive_latency_hist: crate::producer::new_latency_histogram(),
-            last_acked_message_id: None,
             last_rate_snapshot: None,
             current_msgs_per_sec: 0.0,
             current_bytes_per_sec: 0.0,

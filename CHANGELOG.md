@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Non-durable consumers no longer skip lower unacknowledged messages after reconnect.** Reattachment now reuses only the caller's original start position instead of the highest locally submitted ack, which may be unconfirmed and non-contiguous.
+  Established durable consumers continue to defer to the broker cursor.
+  (issue #403; ADR-0099)
+
 ## [1.4.0] - 2026-08-10
 
 ### Added

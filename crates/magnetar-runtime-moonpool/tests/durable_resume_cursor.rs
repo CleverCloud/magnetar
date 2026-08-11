@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Durable reconnects defer to the broker cursor instead of a local ack watermark (#398).
+//! Reconnects never resume from a locally submitted ack watermark (#398, #403).
 
 mod common;
 
@@ -15,7 +15,15 @@ use magnetar_runtime_moonpool::ConnectionShared;
 use crate::common::handshake_response_bytes;
 
 #[test]
-fn established_durable_reattach_omits_local_ack_watermark() {
+fn reattach_uses_only_authoritative_start_positions() {
+    assert_eq!(reattach_start_message_id(true), None);
+    assert_eq!(
+        reattach_start_message_id(false),
+        Some(original_start().to_pb())
+    );
+}
+
+fn reattach_start_message_id(durable: bool) -> Option<magnetar_proto::pb::MessageIdData> {
     let t0 = Instant::now();
     let shared = ConnectionShared::new(ConnectionConfig::default());
     let mut conn = shared.inner.lock();
@@ -27,7 +35,8 @@ fn established_durable_reattach_omits_local_ack_watermark() {
         topic: "persistent://public/default/durable-resume".to_owned(),
         subscription: "magnetar-test-durable-resume".to_owned(),
         sub_type: pb::command_subscribe::SubType::Shared,
-        durable: true,
+        durable,
+        start_message_id: Some(original_start()),
         ..Default::default()
     });
     let _ = conn.poll_transmit();
@@ -77,8 +86,17 @@ fn established_durable_reattach_omits_local_ack_watermark() {
     let mut wire = conn.poll_transmit();
     let frame = decode_one(&mut wire).expect("reattach CommandSubscribe");
     let subscribe = frame.command.subscribe.expect("CommandSubscribe");
-    assert!(
-        subscribe.start_message_id.is_none(),
-        "an established durable subscription must use the broker cursor"
-    );
+    subscribe.start_message_id
+}
+
+fn original_start() -> MessageId {
+    MessageId {
+        ledger_id: 1,
+        entry_id: 2,
+        partition: -1,
+        batch_index: -1,
+        batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
+    }
 }
