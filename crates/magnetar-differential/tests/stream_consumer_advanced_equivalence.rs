@@ -4136,13 +4136,27 @@ where
                 .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
                 .expect("complete first terminal-DAG-reconnect child close");
         } else {
+            cluster.hold_command(
+                Endpoint::Controller,
+                magnetar::proto::pb::base_command::Type::ScalableTopicUpdate,
+            );
+            cluster
+                .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+                .expect("complete final terminal-DAG-reconnect child close");
+            cluster
+                .wait_for("replacement terminal-DAG-reconnect controller lookup", |fake| {
+                    fake.routes().iter().any(|route| {
+                        route.endpoint == Endpoint::Controller
+                            && route.command
+                                == magnetar::proto::pb::base_command::Type::ScalableTopicLookup
+                            && route.resource.as_deref() == Some(TOPIC)
+                    })
+                })
+                .await;
             assert_eq!(
                 cluster
-                    .update(|fake| {
-                        fake.complete_pending(pending, PendingCompletion::Succeed)?;
-                        fake.disconnect_endpoint(Endpoint::Controller)
-                    })
-                    .expect("complete final child close and disconnect controller"),
+                    .update(|fake| fake.disconnect_endpoint(Endpoint::Controller))
+                    .expect("disconnect replacement terminal-DAG-reconnect controller"),
                 1
             );
         }
@@ -4173,6 +4187,10 @@ where
     assert!(!receive_error.to_string().is_empty());
     let queued_delivery_fenced = true;
     let after_close = close_and_count(consumer, cluster).await;
+    cluster.release_command(
+        Endpoint::Controller,
+        magnetar::proto::pb::base_command::Type::ScalableTopicUpdate,
+    );
     TerminalDagReconnectTrace {
         terminal_reason,
         replacement_assignment_applied,
@@ -6187,6 +6205,14 @@ async fn terminal_dag_reconnect_failure_is_equivalent() {
     let tokio_trace = run_tokio_terminal_dag_reconnect().await;
     let moonpool_trace = run_moonpool_terminal_dag_reconnect().await;
     assert_eq!(tokio_trace, moonpool_trace);
+    assert_eq!(
+        tokio_trace.terminal_reason,
+        "scalable route connection closed"
+    );
+    assert_eq!(
+        moonpool_trace.terminal_reason,
+        "scalable route connection closed"
+    );
     assert!(!tokio_trace.replacement_assignment_applied);
 }
 
