@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-11
+
 ### Fixed
 
 - **Non-durable consumers no longer skip lower unacknowledged messages after reconnect.** Reattachment now reuses only the caller's original start position instead of the highest locally submitted ack, which may be unconfirmed and non-contiguous.
@@ -496,6 +498,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.4.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.1
 [1.4.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.0
 [1.3.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.3.0
 [1.2.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.3
