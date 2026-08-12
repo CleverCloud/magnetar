@@ -129,6 +129,8 @@ enum Cmd {
     /// Enforce added executable-line coverage in separate Moonpool/shared and
     /// Tokio-adapter evidence domains. Each owns an invocation-local report;
     /// packages owned by neither remain advisory `not gated` scope.
+    /// Require all broker tests to use the shared Pulsar fixture.
+    CheckE2eFixture,
     CheckSimCoverage {
         /// Base ref to diff against. Defaults to `origin/main`.
         #[arg(long, default_value = "origin/main")]

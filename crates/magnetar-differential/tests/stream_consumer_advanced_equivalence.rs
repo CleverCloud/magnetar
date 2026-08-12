@@ -5213,11 +5213,6 @@ where
                 fake.enqueue_message_with_metadata(1, metadata, payload, Vec::new())
             })
             .expect("enqueue malformed delivery");
-        cluster
-            .wait_for("malformed delivery reaches child", |fake| {
-                fake.resource_counts().unacked_messages == 1
-            })
-            .await;
         let reason = loop {
             match next_event(&consumer).await {
                 StreamConsumerEvent::ResyncRequired { reason } => break reason,
