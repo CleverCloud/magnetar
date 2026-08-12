@@ -1200,7 +1200,6 @@ async fn scripted_broker_honours_create_if_missing_for_an_absent_topic() {
         let cmd = magnetar_proto::pb::BaseCommand {
             r#type: magnetar_proto::pb::base_command::Type::ScalableTopicLookup as i32,
             scalable_topic_lookup: Some(magnetar_proto::pb::CommandScalableTopicLookup {
-    create_if_missing: Some(true),
                 session_id,
                 topic: topic.to_owned(),
                 create_if_missing,

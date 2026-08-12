@@ -97,6 +97,8 @@ mod url_parse;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "scalable-topics")]
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;

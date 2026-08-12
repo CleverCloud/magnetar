@@ -4926,8 +4926,6 @@ impl StreamConsumerModel {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message as _;
-
     use super::*;
     use crate::dag_watch::DagSnapshot;
     use crate::pb;

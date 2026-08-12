@@ -3784,10 +3784,10 @@ mod tests {
     }
 
     fn zlib(payload: &[u8]) -> bytes::Bytes {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(payload).expect("compress test payload");
-        bytes::Bytes::from(encoder.finish().expect("finish test compression"))
+        magnetar_proto::compress::compress(
+            magnetar_proto::CompressionKind::Zlib,
+            payload,
+        ).expect("compress test payload")
     }
 
     fn connect_shared(shared: &Arc<ConnectionShared>) {
@@ -3992,6 +3992,7 @@ mod tests {
             addr: "allowed.example:6650".to_owned(),
             bootstrap_config: config,
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            memory_limit: bootstrap.memory_limit.clone(),
             providers: moonpool_core::TokioProviders::new(),
             tls_config: None,
             service_url_provider: None,
@@ -6365,6 +6366,7 @@ mod tests {
                 ..Default::default()
             },
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            memory_limit: bootstrap.memory_limit.clone(),
             providers: moonpool_core::TokioProviders::new(),
             tls_config: Some(tls_config),
             service_url_provider: None,

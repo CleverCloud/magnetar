@@ -158,11 +158,14 @@ Notable equivalence suites:
 
 ## Simulation patch coverage
 
-`cargo run -p xtask -- check-sim-coverage` executes exactly the `magnetar-runtime-moonpool` and `magnetar-differential` test binaries.
-It re-exports that one invocation-owned instrumented pass over exactly eight reported and hard-gated packages: `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl`, `magnetar-driver` at `crates/magnetar`, and `magnetar-fakes`.
+`cargo run -p xtask -- check-sim-coverage` executes two isolated hard evidence domains (ADR-0103).
+The Moonpool domain runs `magnetar-runtime-moonpool` and `magnetar-differential` tests and gates shared/proto/Moonpool/differential/façade/fakes/auth source.
+The Tokio domain separately runs `magnetar-runtime-tokio` unit/integration tests plus differential tests and gates only `magnetar-runtime-tokio` adapter source.
+One invocation-owned scratch root contains separate domain targets and profiles; neither domain's hits or artifacts can discharge the other.
 The façade and fake are reached through the differential aggregate tests; façade Docker e2e targets do not execute under this gate.
 An added production line in those packages must be reached transitively by one of the two execution roots, while `magnetar-admin`, `magnetarctl`, and other packages those roots do not compile remain advisory `not gated` scope.
-A record-less file in one of the eight packages hard-fails when it contains a non-test function body, even if sibling files emitted LCOV records.
+A record-less file in a gated package hard-fails when it contains a non-test function body, even if sibling files emitted LCOV records.
+Executable `unreachable!`, `unimplemented!`, and `todo!` lines remain gated. Missing `DA:` mappings inside an otherwise recorded file remain an unresolved follow-up rather than a lexical hard verdict.
 Module/export/constant/bodyless-declaration-only files remain advisory because they have no executable coverage mapping.
 
 The original six-package widening measured 63 `SF:` records on 2026-07-31.

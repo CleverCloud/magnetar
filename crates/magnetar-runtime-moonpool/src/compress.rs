@@ -2,10 +2,10 @@
 
 //! Shared bounded inbound Pulsar payload decompression.
 
-pub(crate) use magnetar_proto::compress::{CompressionError, decompress, kind_from_pb};
+pub(crate) use magnetar_proto::compress::{decompress, kind_from_pb};
 
 #[cfg(test)]
-use magnetar_proto::{pb, types::CompressionKind};
+use magnetar_proto::{pb, types::CompressionKind, compress::CompressionError};
 
 #[cfg(test)]
 mod tests {

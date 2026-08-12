@@ -362,6 +362,7 @@ impl<P: Providers> Client<P> {
             addr: addr.to_owned(),
             bootstrap_config: config,
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            memory_limit: shared.memory_limit.clone(),
             providers: engine.providers().clone(),
             tls_config: Some(tls_config),
             service_url_provider,
