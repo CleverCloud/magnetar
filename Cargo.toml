@@ -166,7 +166,7 @@ anyhow             = "^1.0.104"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 
 # Test infrastructure
-testcontainers = "^0.27.3"
+testcontainers = "^0.28.0"
 # Dev-only. `magnetar-differential` needs `SO_LINGER = 0` to make a fixture
 # reset a connection rather than close it cleanly, so the drivers' read-error
 # branch is exercised as well as their clean-EOF one. `tokio`'s own
