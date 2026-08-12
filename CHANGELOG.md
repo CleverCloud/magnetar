@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **`check-sim-coverage` now uses two isolated hard evidence domains.** The Moonpool+differential execution continues to gate shared/proto/Moonpool/differential/façade/fakes/auth source, while a fresh Tokio unit/integration+differential execution gates only `magnetar-runtime-tokio` adapter source.
+  The domains use separate subtargets, objects, profiles, profdata, and LCOV reports under one invocation-owned scratch root; neither can discharge the other, and the command succeeds only when both are clean.
+  Executable `unreachable!`, `unimplemented!`, and `todo!` lines are no longer lexically excluded. Same-file missing-`DA:` detection remains unresolved and this tick adds no bespoke parser or hard claim for it.
+  A pre-final uncommitted pipeline run took 321.888s and observed 27 Moonpool-domain `DA:` lines plus 32 Tokio-domain `DA:` lines, each in its runtime's `scalable.rs`; those figures are historical and explicitly non-authoritative for the current pipeline. Fresh current-HEAD timings and deficits remain pending until the implementation is committed; ADR-0103 is Accepted while the PR #399 proposal remains In-flight.
+
 - **BREAKING: the experimental PIP-460 `StreamConsumer` is now an assignment-driven, message-delivering aggregate instead of a layout-only consumer that drops on DAG change.** `PulsarClient::scalable_stream_consumer(topic, Arc<S>)` now returns a schema-generic owned builder requiring `.subscription(...)`; it accepts a stable consumer name, one validated aggregate receive budget, and `OrderingMode::Strict` (the default) or explicit `BrokerManaged`, then registers with the controller and opens one ordinary `Exclusive` child for every assigned `segment://` source.
   Public runtime clients remain non-`Clone`; the runtimes own an internal `SegmentSubscriber`, while `StreamConsumer<S, E>` is cheap to clone over aggregate state and `StreamMessage<S>` owns `S::Owned`.
   The aggregate now supports concurrent single and atomic batch receive, source-qualified typed delivery, individual/batch/cumulative/restored-vector ack, nack, transactional ack with commit admission and poison-on-failure, M1-limited vector seek, unbounded-in-time bounded-memory ownership drain, observable pending ownership, incarnation-fenced controller reconnect, direct plaintext/TLS controller routing, and async local close.
@@ -22,8 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Resynchronization now fences obsolete child loops before confirmation-bearing teardown, waits for confirmed children and in-flight child opens before controller replacement, and retries replacement registration while M1 retains the old physical member.
   **Low-level `magnetar-proto` breakage:** the new aggregate model, typed route/incarnation keys, complete atomic DAG validation, inclusive hash ranges `[start,end]` over `0..=65535`, delivery authority, transaction lifecycle, and seek generations replace the old drop-on-change scaffolding.
   Ordinary `MessageId` has no scalable `segment_id`; scalable identity is the canonical `SegmentSource` carried by `StreamMessageId` and `PositionVector`, serialized in the strict version-1 `MSTR` envelope, while `DeliveryToken` remains process-local. M1 still has no logical unregister, distributed assignment generation, remote ancestor-completion proof, or defined proxy-any-broker controller route; apache/pulsar#26272-#26275 remain open, and close may leave broker membership until the pooled physical connection closes.
-  The sim-coverage report and hard-gated source sets grow from six to exactly eight packages by adding `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` through `magnetar-differential`'s public aggregate tests.
-  Execution remains only `magnetar-runtime-moonpool` plus `magnetar-differential`, so façade Docker e2e targets do not run under coverage and ADR-0100's isolated-artifact behavior is unchanged.
+  Historically, the single sim-coverage report and hard-gated source sets grew from six to eight packages by adding `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` through `magnetar-differential`'s public aggregate tests; ADR-0103 later splits Tokio into its own evidence domain.
+  Moonpool execution remains `magnetar-runtime-moonpool` plus `magnetar-differential`, so façade Docker e2e targets do not run under coverage.
   A gated function-bearing file with no LCOV `SF:` record now fails even when sibling files reported; genuinely non-executable files remain advisory, and a wholly record-less gated crate still fails.
   (ADR-0102; supersedes ADR-0031/ADR-0093's surviving drop-on-change and unimplemented-data-plane scope plus ADR-0093 § D5's blanket non-advancing-assignment rejection; ADR-0093's vendored M1 wire and capability negotiation remain binding)
 
@@ -76,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Ordinary `cargo test` keeps `opt-level = 1`.
   Toolchain skew and stale object files were both tested and refuted first.
   (ADR-0094)
+
 ## [1.4.0] - 2026-08-10
 
 ### Added
@@ -264,7 +270,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **The moonpool sim-coverage gate now measures a real scope, enforces its verdict, and runs on every pull request.** Three changes compose, and only the third makes the gate bite.
   Its LCOV report was widened from a narrow slice to the whole closure the sim run compiles — six crates, 63 `SF:` records measured 2026-07-31 (`magnetar-proto` 28, `magnetar-runtime-tokio` 12, `magnetar-runtime-moonpool` 12, `magnetar-auth-athenz` 5, `magnetar-differential` 4, `magnetar-auth-sasl` 2) — so a `magnetar-proto` addition is now measured where before it was invisible.
-  Execution is unchanged and still runs only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries, so a `magnetar-proto` or `magnetar-runtime-tokio` line counts as covered only when a sim test reaches it transitively; those crates' own unit tests never run under the gate and can never satisfy it.
+  At that point execution still ran only `magnetar-runtime-moonpool` + `magnetar-differential`; ADR-0103 later gives private Tokio adapter source a separate Tokio-test evidence domain while retaining sim ownership of proto/shared source.
   `SIM_COVERAGE_ENFORCES_UNCOVERED` then flipped to `true`, so an uncovered added line inside the reported scope is printed in full with a count and **fails** the check rather than being advisory.
   The flip alone would have changed nothing — the gate diffs against `main`, so its scheduled `main` run compares `main` against itself and short-circuits with "nothing to verify" — so the same changeset gave it a per-PR home: `.github/workflows/ci.yml` runs `check-sim-coverage --enforce` on every `pull_request`.
   `--enforce` is now redundant (it only ORs into the constant) and is retained so existing invocations keep working.

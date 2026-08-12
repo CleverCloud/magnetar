@@ -462,7 +462,7 @@ jobs:
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
 
   check-sim-coverage:
-    name: check-sim-coverage (patch coverage, sim-instrumented crates)
+    name: check-sim-coverage (isolated Moonpool + Tokio patch coverage)
     # ADR-0024 requires 100% moonpool patch coverage on the diff. ADR-0092
     # flips the gate to enforcing and gives it the per-PR home it never had.
     # `xtask-gates.yml` still carries the same job on its daily cron and on
@@ -485,7 +485,7 @@ jobs:
     # authority). Note what that does NOT cover: the bail is not keyed on
     # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
     # sim run never compiles — magnetar-admin, magnetarctl, or another package
-    # outside the eight-package closure — still pays the full instrumented
+    # outside the seven-plus-one coverage domains — still pays the full instrumented
     # build and then prints those files as advisory `not gated`. The façade
     # and fakes are compiled and hard-gated through the differential aggregate
     # suites. The older 30/60/10 measurement predates that closure expansion
@@ -514,11 +514,10 @@ jobs:
       # against `origin/main`" — a red check for an infrastructure reason,
       # wearing a message that reads like a coverage failure.
       - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
-      # check-sim-coverage runs `cargo llvm-cov --all-features` over the
-      # moonpool + differential test binaries — which builds aws-lc-fips-sys
-      # under coverage instrumentation — then re-exports the same profile
-      # data over the wider report package set. Reclaim disk like the heavy
-      # build jobs.
+      # check-sim-coverage runs two fresh all-feature domains: Moonpool +
+      # differential for shared/sim source, then Tokio unit/integration tests
+      # for private Tokio adapter source. Their targets, profiles, objects and
+      # reports are disjoint under one invocation-owned scratch root (ADR-0103).
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:

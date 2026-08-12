@@ -917,16 +917,17 @@ Focused code, fake, proto, runtime, façade, and differential suites passed for 
 A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 Docker was unavailable on the integration host, so this branch did not execute the real M1 e2e locally; existing CI policy runs the ordinary e2e target when Docker is available.
 
-Sim coverage still executes only `magnetar-runtime-moonpool` and `magnetar-differential`, but the report and hard gate now cover exactly eight crates.
-`magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes` join the original six because the differential public aggregate tests compile and exercise both; façade Docker e2e targets do not execute in this gate.
-`magnetar-admin`, `magnetarctl`, and other uncompiled packages remain advisory `not gated`, and ADR-0100's isolated-target behavior remains unchanged.
+Patch coverage uses seven-plus-one isolated domains: Moonpool+differential owns the seven shared/sim packages, while Tokio unit/integration+differential owns only the Tokio adapter package (ADR-0103).
+Façade Docker e2e targets do not execute in either domain; `magnetar-admin`, `magnetarctl`, and other unowned packages remain advisory `not gated`.
+Each report is retained from domain scratch through the verdict before atomic diagnostic publication.
 A gated record-less file containing a non-test function body now hard-fails even if its crate emitted sibling records; genuinely non-executable files remain advisory.
 `check-sim-coverage` diffs `<merge-base>..HEAD` and cannot validate uncommitted worktree changes.
 The complete implementation diff must be represented by `HEAD` and the enforcing gate rerun before a green result is acceptance evidence for this surface.
 
 ### Scalable topics references
 
-- [ADR-0102](../specs/adr/0102-assignment-driven-m1-hardened-stream-consumer.md) — the current high-level assignment, delivery, ordering, budget, authority, lifecycle, and coverage contract.
+- [ADR-0102](../specs/adr/0102-assignment-driven-m1-hardened-stream-consumer.md) — the current high-level assignment, delivery, ordering, budget, authority, and lifecycle contract.
+- [ADR-0103](../specs/adr/0103-isolate-moonpool-and-tokio-coverage-evidence.md) — the amended coverage topology and provenance contract.
 - [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) — duplicate raw layout snapshots are idempotent.
 - [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) — the upstream wire surface and per-connection negotiation.
 - [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) — historical original scope, superseded first on wire by ADR-0093 and then on the surviving drop-on-change data-plane decision by ADR-0102.

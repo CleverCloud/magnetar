@@ -30,7 +30,7 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
 cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011, ADR-0086)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # patch coverage over the 8 sim-compiled crates; enforcing (ADR-0024, ADR-0088, ADR-0090, ADR-0092, ADR-0102)
+cargo run -p xtask -- check-sim-coverage        # enforcing isolated Moonpool/shared + Tokio-adapter patch coverage (ADR-0103)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
@@ -39,17 +39,17 @@ cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl
 Contributors with a FIPS toolchain locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 Per-package invocations (`cargo test -p <crate>`) need an explicit crypto feature because dependency features don't transitively activate under `-p`.
 
-`check-sim-coverage` executes only the `magnetar-runtime-moonpool` + `magnetar-differential` test binaries but reports over exactly eight crates: the original six plus `magnetar-driver` (directory `crates/magnetar`) and `magnetar-fakes`.
-The differential crate's dev-dependencies and public aggregate tests compile and exercise the façade and fakes without running the façade's Docker e2e targets; the two scopes are spelled out in `GUIDELINES.md#cross-runtime-test--coverage-policy`.
+`check-sim-coverage` executes two fresh isolated evidence domains: Moonpool+differential tests hard-gate shared/proto/Moonpool/differential/façade/fakes/auth source, and Tokio unit/integration plus differential tests hard-gate only `magnetar-runtime-tokio` adapter source.
+The domains use separate objects, profiles, profdata, and LCOV exports under one invocation-owned scratch root, so neither domain can discharge the other.
 Its uncovered-line verdict is **enforcing** ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)): an uncovered added line is printed with a count and fails the check, and the same job runs on every pull request in [`ci.yml`](.github/workflows/ci.yml).
-Note what it can and cannot be satisfied by: only the moonpool and differential binaries execute, so covering a `magnetar-proto` or `magnetar-runtime-tokio` line means writing a sim or equivalence test that reaches it — that crate's own unit tests never run under this gate.
+Shared and proto lines still require Moonpool or differential evidence; Tokio adapter lines require Tokio tests and cannot be credited by the Moonpool report.
 `--enforce` is redundant now and accepted for compatibility.
-An added gated file with no `SF:` record fails when its whole crate emitted no records or when that file contains a non-test function body, even if siblings reported; module/export/constant/bodyless-declaration-only files remain advisory.
+An added gated file with no `SF:` record fails when its whole crate emitted no records or when that file contains a non-test function body, even if siblings reported. Executable panic/placeholder macros have no lexical exclusion; missing `DA:` mappings inside an otherwise recorded file remain unresolved and are not classified by a bespoke parser.
 A diff confined to `xtask/`, `.github/`, `docs/`, `specs/`, `tasks/`, `.claude/`, `crates/magnetar-proto/src/pb/`, any `/tests/`, `/benches/`, `/examples/` path, or inside a `#[cfg(test)]` span short-circuits with "nothing to verify" and never pays the build.
 That bail is keyed on those exclusions and not on the gated crates, so a PR touching only `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, or another uncompiled package does pay the full build before printing it as `not gated`; façade and fakes changes are gated under ADR-0102.
 It builds with `--all-features`, so `crypto-fips` and its `aws-lc-fips-sys` build come along.
 On Linux the gate applies `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` to that build itself — the same toolchain `check-crypto-matrix` sets for its FIPS cells — so no command prefix is needed, but clang and the LLVM binutils must be installed: aws-lc's `delocate` step rejects the `.data.rel.ro.local` sections gcc emits, at any gcc version.
-Execution and report use one locked, invocation-owned target outside cached Cargo storage, so restored or locally stale first-party objects cannot affect the verdict; `target/sim-coverage.lcov` is only the final output ([ADR-0100](specs/adr/0100-isolate-sim-coverage-current-pass-artifacts.md)).
+Execution uses one locked, invocation-owned scratch root with separate domain targets outside cached Cargo storage, so restored, local, or cross-domain first-party objects cannot affect the verdict; LCOV files are diagnostic output only ([ADR-0100](specs/adr/0100-isolate-sim-coverage-current-pass-artifacts.md), [ADR-0103](specs/adr/0103-isolate-moonpool-and-tokio-coverage-evidence.md)).
 Do not set LLVM coverage/profdata flag variables around this command: the gate rejects non-empty values because cargo-llvm-cov would otherwise append arbitrary artifact paths to its tool invocations.
 
 Moonpool seed sweep: CI runs a daily 128-random-seed job per [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md); locally you can reproduce a flaky run with:

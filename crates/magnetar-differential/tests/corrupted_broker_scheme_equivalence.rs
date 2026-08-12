@@ -51,30 +51,10 @@
 //! in-process fake broker (moonpool via `TokioProviders`), so this asserts
 //! equivalence of the actual `Client` surface, not of a proto snapshot.
 //!
-//! It is also the only test in the moonpool/differential runner set that
-//! actually *executes* the fixed tokio helper, and since the sim-coverage
-//! gate was rescoped that execution is what the gate measures.
-//! `cargo run -p xtask -- check-sim-coverage` still EXECUTES only
-//! `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential`,
-//! but `-p` never controlled instrumentation — `cargo-llvm-cov`'s
-//! `RUSTC_WRAPPER` instruments every workspace member and `-p` only narrowed
-//! the report filter — so the gate now re-exports that same profile data
-//! over `SIM_COVERAGE_REPORT_PACKAGES`. `target/sim-coverage.lcov` carries
-//! 63 `SF:` records where it used to carry 16, among them 12
-//! `magnetar-runtime-tokio` files where it used to carry zero. Added lines
-//! in `magnetar-runtime-tokio/src/client.rs` are therefore measured like any
-//! other, and the crate is additionally hard-gated: a report mentioning no
-//! `magnetar-runtime-tokio` file at all fails the check outright instead of
-//! reading its added lines as non-executable.
-//!
-//! What did NOT change is the execution scope, and that is the part of the
-//! old warning worth keeping. `magnetar-runtime-tokio`'s own tests still
-//! never run under the gate: the only tokio lines that can be covered are
-//! the ones the differential suite reaches through its tokio half. So the
-//! conclusion inverts rather than disappearing — a tokio-only change IS
-//! measured now, but only a differential test can satisfy it, and an added
-//! tokio line no differential test executes is REPORTED as uncovered instead
-//! of being silently skipped.
+//! ADR-0103 assigns this execution to the isolated Tokio evidence domain.
+//! That domain runs Tokio's unit/integration tests plus the differential suite
+//! but reports only `magnetar-runtime-tokio` adapter source; its profiles can
+//! never satisfy the separate Moonpool/shared report.
 //!
 //! Reported and failed: the gate landed advisory under ADR-0090, but
 //! ADR-0092 flipped `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true` and put the

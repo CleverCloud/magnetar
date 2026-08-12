@@ -28,6 +28,9 @@ The architecture explicitly bans channels (`mpsc`, `broadcast`, `watch`, `onesho
 The wake-up mechanism is `Arc<parking_lot::Mutex<State>>` plus `tokio::sync::Notify` plus `core::task::Waker` slabs inside the state machine.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full rationale.
 
+Patch coverage is enforced in two provenance-isolated domains: Moonpool+differential tests own shared/proto/simulation evidence, while Tokio unit/integration plus differential tests own private Tokio adapter evidence.
+Neither report or artifact set can satisfy the other ([ADR-0103](specs/adr/0103-isolate-moonpool-and-tokio-coverage-evidence.md)).
+
 Magnetar is independent of the existing `pulsar-rs` crate — it shares neither code nor dependencies.
 The goal is feature-complete parity with the Apache Pulsar Java client.
 
