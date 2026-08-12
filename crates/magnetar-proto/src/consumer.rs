@@ -85,6 +85,143 @@ pub struct ConsumerSlot {
     pub state: parking_lot::Mutex<ConsumerState>,
 }
 
+/// Reusable result of an ordinary consumer close operation.
+///
+/// This protocol-owned value is cloneable so any number of runtime waiters can
+/// observe the same completion without requiring the public runtime error type
+/// to implement `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerCloseCompletion {
+    /// The broker acknowledged the close.
+    Success,
+    /// The broker rejected the close.
+    BrokerError {
+        /// Pulsar `ServerError` integer.
+        code: i32,
+        /// Broker-provided diagnostic.
+        message: String,
+    },
+    /// The transport session carrying the close request was reset.
+    SessionLost,
+    /// The connection terminated without a replacement session.
+    Terminal {
+        /// Local terminal reason.
+        reason: String,
+    },
+}
+
+/// Origin of the first close admitted for a consumer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerCloseOrigin {
+    /// A caller is waiting for the broker result.
+    Reliable,
+    /// Last-clone cleanup admitted the operation without a waiter.
+    BestEffort,
+}
+
+/// Reusable result of an unsubscribe operation.
+pub type ConsumerUnsubscribeCompletion = ConsumerCloseCompletion;
+
+/// Slot-owned unsubscribe operation retained by runtime waiters after success
+/// removes the consumer from the connection registry.
+#[derive(Debug)]
+pub struct ConsumerUnsubscribeOperation {
+    request_id: RequestId,
+    completion: Option<ConsumerUnsubscribeCompletion>,
+    waiters: Slab<Waker>,
+}
+
+/// Result of admitting one unsubscribe operation.
+#[derive(Debug, Clone)]
+pub struct ConsumerUnsubscribeAdmission {
+    /// Wire request correlation id.
+    pub request_id: RequestId,
+    /// Reusable slot-owned completion authority.
+    pub operation: std::sync::Arc<parking_lot::Mutex<ConsumerUnsubscribeOperation>>,
+}
+
+impl ConsumerUnsubscribeOperation {
+    /// Construct one pending operation.
+    #[must_use]
+    pub fn new(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            completion: None,
+            waiters: Slab::new(),
+        }
+    }
+
+    /// Correlation id allocated at admission.
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Cached completion, including completions published before first poll.
+    #[must_use]
+    pub fn completion(&self) -> Option<ConsumerUnsubscribeCompletion> {
+        self.completion.clone()
+    }
+
+    /// Register one independently cancellable waiter.
+    pub fn register(&mut self, waker: Waker) -> usize {
+        self.waiters.insert(waker)
+    }
+
+    /// Remove one waiter without changing operation ownership or completion.
+    pub fn cancel(&mut self, key: usize) {
+        if self.waiters.contains(key) {
+            self.waiters.remove(key);
+        }
+    }
+
+    /// Publish once and return waiters for waking after releasing the lock.
+    pub(crate) fn complete(&mut self, completion: ConsumerUnsubscribeCompletion) -> Vec<Waker> {
+        if self.completion.is_some() {
+            return Vec::new();
+        }
+        self.completion = Some(completion);
+        self.waiters.drain().collect()
+    }
+}
+
+/// Singleflight lifecycle for an ordinary consumer close.
+#[derive(Debug, Clone)]
+pub enum ConsumerTerminalOperation {
+    /// No close has been admitted yet.
+    Open,
+    /// One wire request is in flight.
+    Pending {
+        request_id: RequestId,
+        origin: ConsumerCloseOrigin,
+    },
+    /// The first admitted request completed and its result is reusable.
+    Complete {
+        request_id: Option<RequestId>,
+        origin: ConsumerCloseOrigin,
+        completion: ConsumerCloseCompletion,
+    },
+    /// One unsubscribe request owns terminal admission.
+    UnsubscribePending {
+        operation: std::sync::Arc<parking_lot::Mutex<ConsumerUnsubscribeOperation>>,
+    },
+}
+
+/// Deterministic rejection from mutually-exclusive close/unsubscribe admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerTerminalAdmissionError {
+    /// The consumer handle is absent.
+    UnknownConsumer,
+    /// Unsubscribe already owns terminal admission.
+    UnsubscribeInProgress,
+    /// Reliable close already owns terminal admission.
+    CloseInProgress,
+    /// Reliable close has completed and the consumer stays terminal.
+    Closed,
+    /// The connection has no remaining driver and cannot admit terminal work.
+    Terminal,
+}
+
 impl ConsumerSlot {
     /// Construct a slot for a newly-subscribed consumer.
     #[must_use]
@@ -276,15 +413,14 @@ pub struct ConsumerState {
     /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
     /// (see [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub receive_wakers: Slab<Waker>,
+    /// Reusable ordinary-close operation shared by every consumer clone.
+    pub terminal_operation: ConsumerTerminalOperation,
+    /// Independently cancellable waiters for [`Self::terminal_operation`].
+    pub close_waiters: Slab<Waker>,
+    /// At-most-once gate for a forgotten retry after a cached close failure.
+    pub forced_close_retry_issued: bool,
     /// Closed flag.
     pub closed: bool,
-    /// The unsubscribe request currently in flight, if any.
-    ///
-    /// This mirrors Java's `Closing` state closely enough for retry ownership:
-    /// detached re-attachment legs must stop before they can enqueue a
-    /// `CommandSubscribe` behind `CommandUnsubscribe`. A broker rejection
-    /// clears the flag and restores the prior attachment generation.
-    pub(crate) unsubscribe_request_id: Option<RequestId>,
     /// Whether this consumer has completed at least one broker attachment.
     /// Provisional retries belong to the routing-aware client operation;
     /// established-handle retries remain connection-local reattachment.
@@ -897,8 +1033,10 @@ impl ConsumerState {
             chunk_auto_ack_pending: Vec::new(),
             pending_seek: None,
             receive_wakers: Slab::new(),
+            terminal_operation: ConsumerTerminalOperation::Open,
+            close_waiters: Slab::new(),
+            forced_close_retry_issued: false,
             closed: false,
-            unsubscribe_request_id: None,
             has_ever_attached: false,
             transient_subscribe_attempts: 0,
             last_subscribe_error: None,
@@ -1969,6 +2107,55 @@ impl ConsumerState {
         if self.receive_wakers.contains(slab_key) {
             self.receive_wakers.remove(slab_key);
         }
+    }
+
+    /// Return the reusable ordinary-close completion, if it has landed.
+    #[must_use]
+    pub fn close_completion(&self) -> Option<ConsumerCloseCompletion> {
+        match &self.terminal_operation {
+            ConsumerTerminalOperation::Complete { completion, .. } => Some(completion.clone()),
+            ConsumerTerminalOperation::Open
+            | ConsumerTerminalOperation::Pending { .. }
+            | ConsumerTerminalOperation::UnsubscribePending { .. } => None,
+        }
+    }
+
+    /// Register one independently cancellable ordinary-close waiter.
+    pub fn register_close_waker(&mut self, waker: Waker) -> usize {
+        self.close_waiters.insert(waker)
+    }
+
+    /// Remove only one ordinary-close waiter, leaving operation ownership and
+    /// completion untouched.
+    pub fn cancel_close_waker(&mut self, slab_key: usize) {
+        if self.close_waiters.contains(slab_key) {
+            self.close_waiters.remove(slab_key);
+        }
+    }
+
+    /// Publish a reusable ordinary-close completion and return all waiters for
+    /// the connection to wake after releasing this slot lock.
+    pub(crate) fn complete_close(
+        &mut self,
+        request_id: RequestId,
+        completion: ConsumerCloseCompletion,
+    ) -> Vec<Waker> {
+        if matches!(
+            self.terminal_operation,
+            ConsumerTerminalOperation::Pending { request_id: pending, .. } if pending == request_id
+        ) {
+            let origin = match self.terminal_operation {
+                ConsumerTerminalOperation::Pending { origin, .. } => origin,
+                _ => return Vec::new(),
+            };
+            self.terminal_operation = ConsumerTerminalOperation::Complete {
+                request_id: Some(request_id),
+                origin,
+                completion,
+            };
+            return self.close_waiters.drain().collect();
+        }
+        Vec::new()
     }
 
     /// Mark the consumer closed. Wakes every parked receive future so they can

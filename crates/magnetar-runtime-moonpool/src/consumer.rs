@@ -46,6 +46,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use magnetar_proto::consumer::ConsumerCloseCompletion;
 use magnetar_proto::{
     AckRequest, ConnectionEvent, ConsumerHandle, IncomingMessage, MessageId, OpOutcome,
     PendingOpKey, RequestId, SeekTarget, SubscribeRequest, pb,
@@ -120,8 +121,8 @@ impl<P: Providers> Clone for Consumer<P> {
     }
 }
 
-/// RAII guard arming a best-effort `CommandCloseConsumer` on last-clone
-/// drop. The explicit [`Consumer::close`] path remains confirmation-bearing.
+/// RAII guard admitting the shared best-effort close on last-clone drop.
+/// The explicit [`Consumer::close`] path remains confirmation-bearing.
 #[derive(Debug)]
 struct ConsumerCloseGuard {
     shared: Arc<ConnectionShared>,
@@ -757,7 +758,7 @@ impl<P: Providers> Consumer<P> {
             {
                 let now = self.shared.now_instant();
                 let mut conn = self.shared.inner.lock();
-                let _ = conn.close_consumer_forget(self.handle, now);
+                let _ = conn.force_close_consumer_forget(self.handle, now);
             }
             self.shared.operation_cancel_notify.notify_waiters();
             self.shared.driver_waker.notify_one();
@@ -1222,21 +1223,21 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Broker`] when the broker rejects the unsubscribe.
     /// - [`ClientError::Other`] on an unexpected outcome.
     pub async fn unsubscribe(&self, force: bool) -> Result<(), ClientError> {
-        let request_id = {
+        let admission = {
             let mut conn = self.shared.inner.lock();
-            conn.try_unsubscribe(self.handle, force)
-                .ok_or_else(|| ClientError::Other("unsubscribe already in progress".to_owned()))?
+            conn.unsubscribe(self.handle, force)
+                .map_err(map_terminal_admission_error)?
         };
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
+        let outcome = ConsumerUnsubscribeFut {
+            operation: admission.operation,
+            slab_key: None,
         }
         .await;
         self.shared.operation_cancel_notify.notify_waiters();
         match outcome {
-            OpOutcome::Success { .. } => {
+            ConsumerCloseCompletion::Success => {
                 // The proto layer owns lifecycle finalization so cancellation
                 // of this future cannot strand the consumer in Closing.
                 // Lifecycle record (ADR-0054).
@@ -1249,11 +1250,12 @@ impl<P: Providers> Consumer<P> {
                 );
                 Ok(())
             }
-            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
-            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected unsubscribe outcome: {other:?}"
-            ))),
+            ConsumerCloseCompletion::BrokerError { code, message } => {
+                Err(ClientError::Broker { code, message })
+            }
+            ConsumerCloseCompletion::SessionLost | ConsumerCloseCompletion::Terminal { .. } => {
+                Err(ClientError::PeerClosed)
+            }
         }
     }
 
@@ -1527,20 +1529,21 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Broker`] when the broker reports a close failure.
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn close(self) -> Result<(), ClientError> {
-        let request_id = {
+        {
             let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
             conn.close_consumer(self.handle, now)
-        };
+                .map_err(map_terminal_admission_error)?;
+        }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
+        let completion = ConsumerCloseFut {
+            slot: self.slot.clone(),
+            slab_key: None,
         }
         .await;
-        match outcome {
-            OpOutcome::Success { .. } => {
+        match completion {
+            ConsumerCloseCompletion::Success => {
                 // Lifecycle record (ADR-0054).
                 tracing::info!(
                     topic = %self.slot.identity.topic,
@@ -1550,11 +1553,94 @@ impl<P: Providers> Consumer<P> {
                 );
                 Ok(())
             }
-            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
-            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected close outcome: {other:?}"
-            ))),
+            ConsumerCloseCompletion::BrokerError { code, message } => {
+                Err(ClientError::Broker { code, message })
+            }
+            ConsumerCloseCompletion::SessionLost | ConsumerCloseCompletion::Terminal { .. } => {
+                Err(ClientError::PeerClosed)
+            }
+        }
+    }
+}
+
+fn map_terminal_admission_error(
+    error: magnetar_proto::consumer::ConsumerTerminalAdmissionError,
+) -> ClientError {
+    use magnetar_proto::consumer::ConsumerTerminalAdmissionError as Error;
+    ClientError::Other(
+        match error {
+            Error::UnknownConsumer | Error::Closed => "consumer closed",
+            Error::UnsubscribeInProgress => "unsubscribe in progress",
+            Error::CloseInProgress => "close in progress",
+            Error::Terminal => return ClientError::PeerClosed,
+        }
+        .to_owned(),
+    )
+}
+
+/// Cancellation-safe waiter for the slot-owned ordinary consumer close.
+struct ConsumerCloseFut {
+    slot: Arc<magnetar_proto::ConsumerSlot>,
+    slab_key: Option<usize>,
+}
+
+struct ConsumerUnsubscribeFut {
+    operation: Arc<parking_lot::Mutex<magnetar_proto::consumer::ConsumerUnsubscribeOperation>>,
+    slab_key: Option<usize>,
+}
+
+impl Future for ConsumerUnsubscribeFut {
+    type Output = ConsumerCloseCompletion;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut operation = this.operation.lock();
+        if let Some(completion) = operation.completion() {
+            if let Some(key) = this.slab_key.take() {
+                operation.cancel(key);
+            }
+            return Poll::Ready(completion);
+        }
+        if let Some(key) = this.slab_key.take() {
+            operation.cancel(key);
+        }
+        this.slab_key = Some(operation.register(cx.waker().clone()));
+        Poll::Pending
+    }
+}
+
+impl Drop for ConsumerUnsubscribeFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            self.operation.lock().cancel(key);
+        }
+    }
+}
+
+impl Future for ConsumerCloseFut {
+    type Output = ConsumerCloseCompletion;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut state = this.slot.state.lock();
+        if let Some(completion) = state.close_completion() {
+            if let Some(key) = this.slab_key.take() {
+                state.cancel_close_waker(key);
+            }
+            return Poll::Ready(completion);
+        }
+        if let Some(key) = this.slab_key.take() {
+            state.cancel_close_waker(key);
+        }
+        this.slab_key = Some(state.register_close_waker(cx.waker().clone()));
+        Poll::Pending
+    }
+}
+
+impl Drop for ConsumerCloseFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            self.slot.state.lock().cancel_close_waker(key);
         }
     }
 }
@@ -2350,13 +2436,17 @@ mod tests {
     use std::time::Instant;
 
     use bytes::{Bytes, BytesMut};
+    use magnetar_proto::consumer::ConsumerCloseCompletion;
     use magnetar_proto::{
         ConnectionConfig, IncomingMessage, MessageId, SubscribeRequest, decode_one, encode_command,
         encode_payload, pb,
     };
     use moonpool_core::TokioProviders;
 
-    use super::{Consumer, PostProcessOutcome, ReceiveFut, post_process_message};
+    use super::{
+        Consumer, ConsumerCloseFut, ConsumerUnsubscribeFut, PostProcessOutcome, ReceiveFut,
+        post_process_message,
+    };
     use crate::client::{Client, ClientError};
     use crate::crypto::MessageDecryptor;
     use crate::{ConnectionShared, MoonpoolEngine};
@@ -2995,6 +3085,331 @@ mod tests {
 
     fn handshake_complete_shared() -> Arc<ConnectionShared> {
         handshake_complete_shared_with_config(ConnectionConfig::default())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_close_is_shared_cancellation_safe_and_reusable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWake(AtomicUsize);
+        impl std::task::Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(1);
+        let shared = handshake_complete_shared();
+        let make = |suffix: &str| {
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/{suffix}"),
+                subscription: suffix.to_owned(),
+                ..Default::default()
+            });
+            let _ = shared.inner.lock().poll_transmit();
+            make_consumer::<TokioProviders>(shared.clone(), handle)
+        };
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+
+        let consumer = make("close-success");
+        let cancelled = tokio::spawn(consumer.clone().close());
+        let surviving = tokio::spawn(consumer.clone().close());
+        tokio::time::timeout(HANG_GUARD, async {
+            while consumer.slot.state.lock().close_waiters.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both spawned closes must register before the broker reply");
+        let (request_id, consumer_id) = {
+            let mut bytes = shared.inner.lock().poll_transmit();
+            let close = decode_one(&mut bytes)
+                .expect("one close frame")
+                .command
+                .close_consumer
+                .expect("close payload");
+            assert!(bytes.is_empty(), "concurrent clones emit one frame");
+            (close.request_id, close.consumer_id)
+        };
+        assert_eq!(consumer_id, consumer.handle().0);
+        let first_wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let second_wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let mut replacement = Box::pin(ConsumerCloseFut {
+            slot: consumer.slot.clone(),
+            slab_key: None,
+        });
+        let first_waker: std::task::Waker = first_wake.clone().into();
+        assert!(matches!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Pending
+        ));
+        let second_waker: std::task::Waker = second_wake.clone().into();
+        assert!(matches!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Pending
+        ));
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("cancelled close task")
+                .is_cancelled()
+        );
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode close success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("apply close success");
+        assert_eq!(first_wake.0.load(Ordering::SeqCst), 0);
+        assert_eq!(second_wake.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Ready(ConsumerCloseCompletion::Success)
+        ));
+        tokio::time::timeout(HANG_GUARD, surviving)
+            .await
+            .expect("surviving close must not hang")
+            .expect("surviving close task")
+            .expect("surviving close succeeds");
+        assert!(consumer.slot.state.lock().close_waiters.is_empty());
+        let mut cached = Box::pin(consumer.close());
+        assert!(matches!(
+            cached.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(shared.inner.lock().poll_transmit().is_empty());
+
+        let consumer = make("close-error");
+        let mut close = Box::pin(consumer.clone().close());
+        let mut other_close = Box::pin(consumer.clone().close());
+        assert!(matches!(close.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            other_close.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let request_id = decode_one(&mut shared.inner.lock().poll_transmit())
+            .expect("error close frame")
+            .command
+            .close_consumer
+            .expect("error close payload")
+            .request_id;
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "close rejected".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &error).expect("encode close error");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("apply close error");
+        assert!(matches!(
+            close.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::Broker { code, message }))
+                if code == pb::ServerError::ServiceNotReady as i32 && message == "close rejected"
+        ));
+        assert!(matches!(
+            other_close.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::Broker { code, message }))
+                if code == pb::ServerError::ServiceNotReady as i32 && message == "close rejected"
+        ));
+        let mut cached_error = Box::pin(consumer.clone().close());
+        assert!(matches!(
+            cached_error.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::Broker { code, message }))
+                if code == pb::ServerError::ServiceNotReady as i32 && message == "close rejected"
+        ));
+        assert!(shared.inner.lock().poll_transmit().is_empty());
+        {
+            let now = shared.now_instant();
+            let mut conn = shared.inner.lock();
+            let _ = conn.force_close_consumer_forget(consumer.handle(), now);
+            let _ = conn.force_close_consumer_forget(consumer.handle(), now);
+        }
+        let mut retry_bytes = shared.inner.lock().poll_transmit();
+        let retry = decode_one(&mut retry_bytes)
+            .expect("one forced retry")
+            .command
+            .close_consumer
+            .expect("forced retry payload");
+        assert_eq!(retry.consumer_id, consumer.handle().0);
+        assert_ne!(retry.request_id, request_id);
+        assert!(
+            retry_bytes.is_empty(),
+            "forced retry is emitted at most once"
+        );
+
+        let consumer = make("close-terminal");
+        let mut close = Box::pin(consumer.clone().close());
+        let mut other_close = Box::pin(consumer.clone().close());
+        assert!(matches!(close.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            other_close.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let _ = shared.inner.lock().poll_transmit();
+        shared.inner.lock().fail_all_pending("peer closed");
+        assert!(matches!(
+            close.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::PeerClosed))
+        ));
+        assert!(matches!(
+            other_close.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::PeerClosed))
+        ));
+        let mut cached_terminal = Box::pin(consumer.close());
+        assert!(matches!(
+            cached_terminal.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::PeerClosed))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_resolves_when_connection_fails_before_first_poll() {
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(1);
+        for terminal in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/unsubscribe-early-{terminal}"),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            });
+            let admission = shared
+                .inner
+                .lock()
+                .unsubscribe(handle, false)
+                .expect("unsubscribe admitted");
+            if terminal {
+                shared.inner.lock().fail_all_pending("peer closed");
+            } else {
+                shared.inner.lock().reset();
+            }
+            assert!(
+                !shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(admission.request_id)
+            );
+            let future = ConsumerUnsubscribeFut {
+                operation: admission.operation.clone(),
+                slab_key: None,
+            };
+            let completion = tokio::time::timeout(HANG_GUARD, future)
+                .await
+                .expect("unsubscribe completion must be cached before first poll");
+            if terminal {
+                assert_eq!(
+                    completion,
+                    ConsumerCloseCompletion::Terminal {
+                        reason: "peer closed".to_owned(),
+                    }
+                );
+            } else {
+                assert_eq!(completion, ConsumerCloseCompletion::SessionLost);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_terminal_calls_after_driver_exit_resolve_without_staging() {
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(1);
+        for unsubscribe in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/terminal-after-exit-{unsubscribe}"),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            });
+            let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+            let _ = shared.inner.lock().poll_transmit();
+            let next_request_id = shared.inner.lock().peek_next_request_id_for_test();
+            shared.inner.lock().fail_all_pending("peer closed");
+            shared.mark_no_driver();
+
+            let result = if unsubscribe {
+                tokio::time::timeout(HANG_GUARD, consumer.unsubscribe(false))
+                    .await
+                    .expect("unsubscribe must not hang")
+            } else {
+                tokio::time::timeout(HANG_GUARD, consumer.close())
+                    .await
+                    .expect("close must not hang")
+            };
+            assert!(matches!(result, Err(ClientError::PeerClosed)));
+            let conn = &mut *shared.inner.lock();
+            assert_eq!(conn.peek_next_request_id_for_test(), next_request_id);
+            assert!(!conn.has_pending_request_for_test(magnetar_proto::RequestId(next_request_id)));
+            assert!(conn.poll_transmit().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn consumer_terminal_admission_blocked_on_sweep_resolves_before_no_driver() {
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(1);
+        for unsubscribe in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/terminal-boundary-{unsubscribe}"),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            });
+            let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+            let _ = shared.inner.lock().poll_transmit();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let task_barrier = barrier.clone();
+            let task = tokio::spawn(async move {
+                task_barrier.wait();
+                if unsubscribe {
+                    consumer.unsubscribe(false).await
+                } else {
+                    consumer.close().await
+                }
+            });
+
+            let mut conn = shared.inner.lock();
+            let next_request_id = conn.peek_next_request_id_for_test();
+            barrier.wait();
+            conn.fail_all_pending("peer closed");
+            drop(conn);
+
+            let result = tokio::time::timeout(HANG_GUARD, task)
+                .await
+                .expect("terminal-boundary admission must not hang")
+                .expect("terminal-boundary task");
+            assert!(matches!(result, Err(ClientError::PeerClosed)));
+            {
+                let mut conn = shared.inner.lock();
+                assert_eq!(conn.peek_next_request_id_for_test(), next_request_id);
+                assert!(
+                    !conn.has_pending_request_for_test(magnetar_proto::RequestId(next_request_id))
+                );
+                assert!(conn.poll_transmit().is_empty());
+            }
+            shared.mark_no_driver();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

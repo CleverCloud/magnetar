@@ -164,6 +164,9 @@ pub struct Connection {
     /// `ConnectionConfig` struct so adding the feature does not break
     /// downstream exhaustive config literals.
     operation_retry: crate::OperationRetryConfig,
+    /// Terminal driver-exit latch. Set before the final pending-operation
+    /// sweep so later admissions cannot enter behind that sweep.
+    terminal_admission_reason: Option<String>,
     state: HandshakeState,
     broker_max_message_size: Option<usize>,
     broker_protocol_version: i32,
@@ -560,6 +563,7 @@ impl Connection {
         Self {
             config,
             operation_retry: crate::OperationRetryConfig::default(),
+            terminal_admission_reason: None,
             state: HandshakeState::Uninitialized,
             broker_max_message_size: None,
             broker_protocol_version: 0,
@@ -958,21 +962,36 @@ impl Connection {
         self.session_epoch = self.session_epoch.wrapping_add(1);
 
         // (2) Fail every pending request and wake its waiter. Forgotten
-        // producer/consumer closes have no waiter by construction, so consume
-        // them without materializing an undrainable outcome.
+        // producer closes have no waiter; consumer terminal operations publish
+        // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
-                self.clear_consumer_unsubscribe(handle, request_id);
-                if !self.wakers.contains_key(&key) {
-                    continue;
-                }
+                self.publish_consumer_unsubscribe(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerUnsubscribeCompletion::SessionLost,
+                    true,
+                );
+                continue;
             }
-            if matches!(
-                kind,
-                PendingRequestKind::ProducerCloseForgotten { .. }
-                    | PendingRequestKind::ConsumerCloseForgotten { .. }
-            ) {
+            if let PendingRequestKind::ConsumerClose { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::SessionLost,
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerCloseForgotten { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::SessionLost,
+                );
+                continue;
+            }
+            if matches!(kind, PendingRequestKind::ProducerCloseForgotten { .. }) {
                 let _ = self.wakers.remove(&key);
                 continue;
             }
@@ -1184,22 +1203,44 @@ impl Connection {
     /// dropped BEFORE the user wakers fire, so a waker that re-enters the
     /// connection cannot deadlock.
     pub fn fail_all_pending(&mut self, reason: &str) {
+        self.terminal_admission_reason = Some(reason.to_owned());
         // (1) Terminate every pending request and wake its waiter. Forgotten
-        // producer/consumer closes have no waiter by construction, so consume
-        // them without materializing an undrainable outcome.
+        // producer closes have no waiter; consumer terminal operations publish
+        // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
-                self.clear_consumer_unsubscribe(handle, request_id);
-                if !self.wakers.contains_key(&key) {
-                    continue;
-                }
+                self.publish_consumer_unsubscribe(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerUnsubscribeCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                    false,
+                );
+                continue;
             }
-            if matches!(
-                kind,
-                PendingRequestKind::ProducerCloseForgotten { .. }
-                    | PendingRequestKind::ConsumerCloseForgotten { .. }
-            ) {
+            if let PendingRequestKind::ConsumerClose { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerCloseForgotten { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                );
+                continue;
+            }
+            if matches!(kind, PendingRequestKind::ProducerCloseForgotten { .. }) {
                 let _ = self.wakers.remove(&key);
                 continue;
             }
@@ -1213,6 +1254,29 @@ impl Connection {
             if let Some(w) = self.wakers.remove(&key) {
                 w.wake();
             }
+        }
+
+        let mut terminal_wakers = Vec::new();
+        for slot in self.consumers.values() {
+            let mut consumer = slot.state.lock();
+            if matches!(
+                consumer.terminal_operation,
+                crate::consumer::ConsumerTerminalOperation::Open
+            ) {
+                consumer.terminal_operation =
+                    crate::consumer::ConsumerTerminalOperation::Complete {
+                        request_id: None,
+                        origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                        completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                            reason: reason.to_owned(),
+                        },
+                    };
+                consumer.close();
+                terminal_wakers.extend(consumer.close_waiters.drain());
+            }
+        }
+        for waker in terminal_wakers {
+            waker.wake();
         }
 
         // (2) Terminate every in-flight publish. Drain each producer's pending
@@ -1930,7 +1994,12 @@ impl Connection {
             .filter_map(|(handle, req)| {
                 let slot = self.consumers.get(handle)?;
                 let state = slot.state.lock();
-                if state.closed || state.unsubscribe_request_id.is_some() {
+                if state.closed
+                    || matches!(
+                        state.terminal_operation,
+                        crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+                    )
+                {
                     return None;
                 }
                 let resume = Self::consumer_reattach_start_message_id(req, &state);
@@ -1996,16 +2065,14 @@ impl Connection {
         // (see the comment block in `CloseConsumer` branch above), so we
         // don't need to reset it here. Drain stale close and acknowledgement
         // events before replacing the logical waiter token.
-        if self
-            .consumers
-            .get(&handle)?
-            .state
-            .lock()
-            .unsubscribe_request_id
-            .is_some()
-        {
+        let consumer = self.consumers.get(&handle)?.state.lock();
+        if !matches!(
+            consumer.terminal_operation,
+            crate::consumer::ConsumerTerminalOperation::Open
+        ) {
             return None;
         }
+        drop(consumer);
         self.events.retain(|ev| {
             !matches!(
                 ev,
@@ -2585,11 +2652,13 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation("missing CommandSuccess"))?;
                 let request_id = RequestId(ok.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                let unsubscribe_has_waiter =
-                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
-                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
-                    self.complete_consumer_unsubscribe(handle, request_id);
+                    self.publish_consumer_unsubscribe(
+                        handle,
+                        request_id,
+                        crate::consumer::ConsumerUnsubscribeCompletion::Success,
+                        false,
+                    );
                 }
                 match kind {
                     Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
@@ -2605,6 +2674,11 @@ impl Connection {
                         );
                     }
                     Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::Success,
+                        );
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
@@ -2612,15 +2686,15 @@ impl Connection {
                             "fire-and-forget consumer close acked by broker"
                         );
                     }
-                    Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
-                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
-                        if !unsubscribe_has_waiter =>
-                    {
-                        // The user cancelled the unsubscribe future, but the
-                        // broker-side operation still completed. Lifecycle is
-                        // finalized above; without a waiter, retaining an
-                        // outcome would leak it permanently.
+                    Some(PendingRequestKind::ConsumerClose { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::Success,
+                        );
                     }
+                    Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -2736,10 +2810,16 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                let unsubscribe_has_waiter =
-                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
-                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
+                    self.publish_consumer_unsubscribe(
+                        handle,
+                        request_id,
+                        crate::consumer::ConsumerUnsubscribeCompletion::BrokerError {
+                            code: err.error,
+                            message: err.message.clone(),
+                        },
+                        true,
+                    );
                     let _ = self.resume_consumer_after_unsubscribe_failure(handle, request_id);
                 }
                 match kind {
@@ -2760,6 +2840,14 @@ impl Connection {
                         );
                     }
                     Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::BrokerError {
+                                code: err.error,
+                                message: err.message.clone(),
+                            },
+                        );
                         let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
                         tracing::warn!(
                             target: "magnetar_proto::conn",
@@ -2770,17 +2858,21 @@ impl Connection {
                             "broker rejected fire-and-forget consumer close (consumer dropped without explicit close)"
                         );
                     }
+                    Some(PendingRequestKind::ConsumerClose { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::BrokerError {
+                                code: err.error,
+                                message: err.message.clone(),
+                            },
+                        );
+                    }
                     Some(
                         PendingRequestKind::ProducerOpen { .. }
                         | PendingRequestKind::ConsumerSubscribe { .. },
                     ) => {}
-                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
-                        if !unsubscribe_has_waiter =>
-                    {
-                        // The retry generation was restored above. A cancelled
-                        // waiter cannot drain an error outcome, so consume it
-                        // in-place after applying the protocol-owned lifecycle.
-                    }
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -6240,43 +6332,160 @@ impl Connection {
         request_id
     }
 
-    /// Close a consumer. The caller is expected to await the broker ack via
-    /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
-    /// with [`Self::take_outcome`].
+    /// Admit or reuse this consumer's cancellation-safe close operation.
     ///
     /// `now` (ADR-0011 clock injection) is only consumed when this consumer
     /// has a non-empty ack-grouping tracker to flush — the flush routes
     /// through [`Self::ack`], which stamps the flushed `CommandAck`'s
     /// `enqueued_at` for the `ack_response_timeout` backstop (issue #346).
-    pub fn close_consumer(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
-        self.close_consumer_inner(handle, false, now)
+    pub fn close_consumer(
+        &mut self,
+        handle: ConsumerHandle,
+        now: Instant,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        self.close_consumer_inner(handle, now, crate::consumer::ConsumerCloseOrigin::Reliable)
     }
 
-    /// Fire-and-forget variant of [`Self::close_consumer`] for the engines'
-    /// last-clone drop guard. The broker ack is consumed in-place because no
-    /// waiter exists to drain it.
-    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
-        self.close_consumer_inner(handle, true, now)
+    /// Admission surface used by last-clone drop guards. It shares the same
+    /// reusable operation as [`Self::close_consumer`].
+    pub fn close_consumer_forget(
+        &mut self,
+        handle: ConsumerHandle,
+        now: Instant,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        self.close_consumer_inner(
+            handle,
+            now,
+            crate::consumer::ConsumerCloseOrigin::BestEffort,
+        )
+    }
+
+    /// Emit at most one forgotten retry after the reusable close completed with
+    /// a failure. Pending and successful closes are never duplicated.
+    pub fn force_close_consumer_forget(
+        &mut self,
+        handle: ConsumerHandle,
+        _now: Instant,
+    ) -> Option<RequestId> {
+        if self.terminal_admission_reason.is_some() {
+            return None;
+        }
+        let operation = self
+            .consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().terminal_operation.clone())?;
+        match operation {
+            crate::consumer::ConsumerTerminalOperation::Open
+            | crate::consumer::ConsumerTerminalOperation::Pending { .. }
+            | crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+            | crate::consumer::ConsumerTerminalOperation::Complete {
+                completion: crate::consumer::ConsumerCloseCompletion::Success,
+                ..
+            } => None,
+            crate::consumer::ConsumerTerminalOperation::Complete {
+                request_id: Some(_),
+                origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                ..
+            } => {
+                let should_retry = self.consumers.get(&handle).is_some_and(|slot| {
+                    let mut consumer = slot.state.lock();
+                    if consumer.forced_close_retry_issued {
+                        false
+                    } else {
+                        consumer.forced_close_retry_issued = true;
+                        true
+                    }
+                });
+                should_retry.then(|| self.emit_consumer_close(handle, true))
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete { .. } => None,
+        }
     }
 
     fn close_consumer_inner(
         &mut self,
         handle: ConsumerHandle,
-        forget: bool,
         now: Instant,
-    ) -> RequestId {
-        let ack_actions = self.consumers.get(&handle).and_then(|slot| {
-            slot.state
-                .lock()
-                .ack_tracker
-                .as_mut()
-                .map(crate::trackers::AckGroupingTracker::flush)
-        });
+        origin: crate::consumer::ConsumerCloseOrigin,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        if let Some(reason) = self.terminal_admission_reason.clone() {
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                if matches!(
+                    consumer.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ) {
+                    consumer.terminal_operation =
+                        crate::consumer::ConsumerTerminalOperation::Complete {
+                            request_id: None,
+                            origin,
+                            completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                                reason,
+                            },
+                        };
+                    consumer.close();
+                }
+            }
+            return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+        }
+        let slot = self
+            .consumers
+            .get(&handle)
+            .cloned()
+            .ok_or(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)?;
+        let mut consumer = slot.state.lock();
+        match consumer.terminal_operation {
+            crate::consumer::ConsumerTerminalOperation::Pending { request_id, .. } => {
+                return Ok(request_id);
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete {
+                request_id: Some(request_id),
+                ..
+            } => {
+                return Ok(request_id);
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete {
+                request_id: None, ..
+            } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+            }
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Open => {}
+        }
+        let request_id = self.alloc_request_id();
+        let ack_actions = consumer
+            .ack_tracker
+            .as_mut()
+            .map(crate::trackers::AckGroupingTracker::flush);
+        consumer.terminal_operation =
+            crate::consumer::ConsumerTerminalOperation::Pending { request_id, origin };
+        consumer.close();
+        drop(consumer);
         if let Some(actions) = ack_actions {
             self.dispatch_ack_actions(actions, now);
         }
+        self.emit_consumer_close_with_id(
+            handle,
+            request_id,
+            origin == crate::consumer::ConsumerCloseOrigin::BestEffort,
+        );
+        Ok(request_id)
+    }
 
+    fn emit_consumer_close(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
         let request_id = self.alloc_request_id();
+        self.emit_consumer_close_with_id(handle, request_id, forget);
+        request_id
+    }
+
+    fn emit_consumer_close_with_id(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        forget: bool,
+    ) {
         let cmd = pb::CommandCloseConsumer {
             consumer_id: handle.0,
             request_id: request_id.0,
@@ -6289,16 +6498,63 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().close();
-        }
         let kind = if forget {
             PendingRequestKind::ConsumerCloseForgotten { handle }
         } else {
             PendingRequestKind::ConsumerClose { handle }
         };
         self.pending_requests.insert(request_id, kind);
-        request_id
+    }
+
+    fn publish_consumer_close(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        completion: crate::consumer::ConsumerCloseCompletion,
+    ) {
+        let wakers = self
+            .consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().complete_close(request_id, completion))
+            .unwrap_or_default();
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    fn publish_consumer_unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        completion: crate::consumer::ConsumerUnsubscribeCompletion,
+        reopen: bool,
+    ) -> bool {
+        let Some((operation, close_slot)) = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            let operation =
+                match &consumer.terminal_operation {
+                    crate::consumer::ConsumerTerminalOperation::UnsubscribePending {
+                        operation,
+                    } if operation.lock().request_id() == request_id => operation.clone(),
+                    _ => return None,
+                };
+            if reopen {
+                consumer.terminal_operation = crate::consumer::ConsumerTerminalOperation::Open;
+            } else {
+                consumer.close();
+            }
+            Some((operation, !reopen))
+        }) else {
+            return false;
+        };
+        let wakers = operation.lock().complete(completion);
+        for waker in wakers {
+            waker.wake();
+        }
+        if close_slot {
+            self.cancel_consumer_subscribe(handle);
+        }
+        true
     }
 
     /// Unsubscribe — remove this consumer's subscription from the broker.
@@ -6311,37 +6567,61 @@ impl Connection {
     /// cancelled; a rejection restores the suspended attachment generation.
     /// `force=true` (PIP-313) drops the subscription even if other consumers
     /// are still attached.
-    pub fn unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
-        if let Some(request_id) = self
+    pub fn unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        force: bool,
+    ) -> Result<
+        crate::consumer::ConsumerUnsubscribeAdmission,
+        crate::consumer::ConsumerTerminalAdmissionError,
+    > {
+        if let Some(reason) = self.terminal_admission_reason.clone() {
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                if matches!(
+                    consumer.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ) {
+                    consumer.terminal_operation =
+                        crate::consumer::ConsumerTerminalOperation::Complete {
+                            request_id: None,
+                            origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                            completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                                reason,
+                            },
+                        };
+                    consumer.close();
+                }
+            }
+            return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+        }
+        let slot = self
             .consumers
             .get(&handle)
-            .and_then(|slot| slot.state.lock().unsubscribe_request_id)
-        {
-            return request_id;
+            .cloned()
+            .ok_or(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)?;
+        let mut consumer = slot.state.lock();
+        match consumer.terminal_operation {
+            crate::consumer::ConsumerTerminalOperation::Open => {}
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Pending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::CloseInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::Closed);
+            }
         }
-        self.stage_unsubscribe(handle, force)
-    }
-
-    /// Stage an unsubscribe unless one is already in flight for this handle.
-    ///
-    /// Built-in runtimes use this idempotent admission gate so overlapping
-    /// user futures cannot both claim ownership of the same broker operation.
-    pub fn try_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> Option<RequestId> {
-        if self
-            .consumers
-            .get(&handle)
-            .is_some_and(|slot| slot.state.lock().unsubscribe_request_id.is_some())
-        {
-            return None;
-        }
-        Some(self.stage_unsubscribe(handle, force))
-    }
-
-    fn stage_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
         let request_id = self.alloc_request_id();
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().unsubscribe_request_id = Some(request_id);
-        }
+        let operation = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::consumer::ConsumerUnsubscribeOperation::new(request_id),
+        ));
+        consumer.terminal_operation =
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending {
+                operation: operation.clone(),
+            };
+        drop(consumer);
         self.events.retain(|event| {
             !matches!(
                 event,
@@ -6367,7 +6647,10 @@ impl Connection {
             request_id,
             PendingRequestKind::ConsumerUnsubscribe { handle },
         );
-        request_id
+        Ok(crate::consumer::ConsumerUnsubscribeAdmission {
+            request_id,
+            operation,
+        })
     }
 
     /// Restore a consumer after the broker rejects an unsubscribe request.
@@ -6380,15 +6663,18 @@ impl Connection {
     fn resume_consumer_after_unsubscribe_failure(
         &mut self,
         handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
+        _unsubscribe_request_id: RequestId,
     ) -> Option<RequestId> {
         let failed_request_id = {
             let slot = self.consumers.get(&handle)?;
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) || consumer.closed {
+            let consumer = slot.state.lock();
+            if !matches!(
+                consumer.terminal_operation,
+                crate::consumer::ConsumerTerminalOperation::Open
+            ) || consumer.closed
+            {
                 return None;
             }
-            consumer.unsubscribe_request_id = None;
             consumer.last_subscribe_error.as_ref()?;
             consumer
                 .subscribe_waiter_request
@@ -6398,38 +6684,6 @@ impl Connection {
             return None;
         }
         self.retry_consumer_subscribe_if_current(handle, failed_request_id)
-    }
-
-    fn complete_consumer_unsubscribe(
-        &mut self,
-        handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
-    ) {
-        let current = self.consumers.get(&handle).is_some_and(|slot| {
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) {
-                return false;
-            }
-            consumer.unsubscribe_request_id = None;
-            consumer.close();
-            true
-        });
-        if current {
-            self.cancel_consumer_subscribe(handle);
-        }
-    }
-
-    fn clear_consumer_unsubscribe(
-        &mut self,
-        handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
-    ) {
-        if let Some(slot) = self.consumers.get(&handle) {
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id == Some(unsubscribe_request_id) {
-                consumer.unsubscribe_request_id = None;
-            }
-        }
     }
 
     /// Mutable accessor for the embedded [`TxnClient`].
@@ -7403,7 +7657,10 @@ impl Connection {
             && self.consumers.get(&handle).is_some_and(|slot| {
                 let consumer = slot.state.lock();
                 !consumer.closed
-                    && consumer.unsubscribe_request_id.is_none()
+                    && matches!(
+                        consumer.terminal_operation,
+                        crate::consumer::ConsumerTerminalOperation::Open
+                    )
                     && consumer.terminal_failure.is_none()
                     && (consumer.subscribe_waiter_request == Some(failed_request_id)
                         || (consumer.flow_on_subscribe_ack
@@ -7493,7 +7750,10 @@ impl Connection {
             };
             let c = slot.state.lock();
             if c.closed
-                || c.unsubscribe_request_id.is_some()
+                || !matches!(
+                    c.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                )
                 || c.terminal_failure.is_some()
                 || c.pending_seek.is_some()
                 || c.flow_on_subscribe_ack
@@ -10353,12 +10613,15 @@ mod conn_state_tests {
         feed_transient_error(&mut conn, failed_request_id);
         assert!(conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
 
-        let unsubscribe_request_id = conn
-            .try_unsubscribe(handle, false)
+        let admission = conn
+            .unsubscribe(handle, false)
             .expect("first unsubscribe must be staged");
-        assert_eq!(
-            conn.try_unsubscribe(handle, true),
-            None,
+        let unsubscribe_request_id = admission.request_id;
+        assert!(
+            matches!(
+                conn.unsubscribe(handle, true),
+                Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
+            ),
             "overlapping unsubscribe must be rejected"
         );
         assert!(!conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
@@ -10387,6 +10650,15 @@ mod conn_state_tests {
         encode_command(&mut frame, &error).expect("encode unsubscribe error");
         conn.handle_bytes(Instant::now(), &frame)
             .expect("handle unsubscribe error");
+        assert_eq!(
+            admission.operation.lock().completion(),
+            Some(
+                crate::consumer::ConsumerUnsubscribeCompletion::BrokerError {
+                    code: pb::ServerError::MetadataError as i32,
+                    message: "unsubscribe rejected".to_owned(),
+                }
+            )
+        );
         assert!(
             conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
                 .is_none(),
@@ -10430,9 +10702,10 @@ mod conn_state_tests {
         while conn.poll_event().is_some() {}
         let _ = drain_outbound_commands(&mut conn);
 
-        let unsubscribe_request_id = conn
-            .try_unsubscribe(handle, false)
+        let admission = conn
+            .unsubscribe(handle, false)
             .expect("unsubscribe must be staged");
+        let unsubscribe_request_id = admission.request_id;
         let unsubscribe_success = pb::BaseCommand {
             r#type: pb::base_command::Type::Success as i32,
             success: Some(pb::CommandSuccess {
@@ -10449,6 +10722,10 @@ mod conn_state_tests {
         assert!(
             conn.consumer(handle).is_none(),
             "broker success must finalize the local handle without a runtime waiter"
+        );
+        assert_eq!(
+            admission.operation.lock().completion(),
+            Some(crate::consumer::ConsumerUnsubscribeCompletion::Success)
         );
         assert!(
             conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
@@ -16755,6 +17032,18 @@ mod consumer_close_contract_tests {
         kinds
     }
 
+    fn drain_close_commands(conn: &mut Connection) -> Vec<pb::CommandCloseConsumer> {
+        let mut bytes = conn.poll_transmit();
+        let mut closes = Vec::new();
+        while !bytes.is_empty() {
+            let frame = decode_one(&mut bytes).expect("staged frame must decode");
+            if let Some(close) = frame.command.close_consumer {
+                closes.push(close);
+            }
+        }
+        closes
+    }
+
     fn ack_success(conn: &mut Connection, request_id: u64, now: Instant) {
         let ack = pb::BaseCommand {
             r#type: pb::base_command::Type::Success as i32,
@@ -16792,7 +17081,7 @@ mod consumer_close_contract_tests {
         let slot = conn.consumer(handle).expect("slot exists").clone();
         assert!(!slot.state.lock().closed, "fresh consumer must be open");
 
-        let _request_id = conn.close_consumer(handle, now);
+        let _request_id = conn.close_consumer(handle, now).expect("close admitted");
 
         assert!(
             slot.state.lock().closed,
@@ -16807,7 +17096,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "close-frame");
         let _ = conn.poll_transmit();
 
-        let _request_id = conn.close_consumer(handle, now);
+        let _request_id = conn.close_consumer(handle, now).expect("close admitted");
 
         assert_eq!(
             drain_command_types(&mut conn),
@@ -16841,105 +17130,424 @@ mod consumer_close_contract_tests {
             conn.ack_grouped_individual(handle, message_id, now);
 
             if forget {
-                let _request_id = conn.close_consumer_forget(handle, now);
+                let _request_id = conn
+                    .close_consumer_forget(handle, now)
+                    .expect("close admitted");
             } else {
-                let _request_id = conn.close_consumer(handle, now);
+                let _request_id = conn.close_consumer(handle, now).expect("close admitted");
             }
+            let same_request_id = conn.close_consumer(handle, now).expect("close reused");
 
+            let commands = drain_command_types(&mut conn);
             assert_eq!(
-                drain_command_types(&mut conn),
+                commands,
                 vec![
                     pb::base_command::Type::Ack as i32,
                     pb::base_command::Type::CloseConsumer as i32,
                 ],
-                "{forget:?} close must flush grouped acknowledgements before CloseConsumer"
+                "{forget:?} close must flush grouped acknowledgements once before one CloseConsumer"
             );
+            assert!(conn.has_pending_request_for_test(same_request_id));
         }
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_success() {
+    fn close_consumer_completion_is_reusable_after_success() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-success");
         let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         assert!(
             slot.state.lock().closed,
             "forget variant must still flip the closed flag synchronously"
         );
         ack_success(&mut conn, request_id.0, now);
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "fire-and-forget close ack must be consumed in-place, not recorded"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
         );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_broker_error() {
+    fn close_consumer_completion_is_reusable_after_broker_error() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-error");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         ack_error(&mut conn, request_id.0, now);
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "rejected fire-and-forget close must not leak an OpOutcome entry"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::BrokerError {
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "synthetic close rejection".to_owned(),
+            })
         );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_reset() {
+    fn close_consumer_completion_is_reusable_after_reset() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-reset");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
         conn.reset();
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "reset must not materialize an outcome for a forgotten close"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::SessionLost)
         );
+        assert!(!conn.has_pending_request_for_test(request_id));
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_fail_all_pending() {
+    fn close_consumer_completion_is_reusable_after_fail_all_pending() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-fail-all");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         conn.fail_all_pending("synthetic terminal drop");
 
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Terminal {
+                reason: "synthetic terminal drop".to_owned(),
+            })
+        );
+        assert!(!conn.has_pending_request_for_test(request_id));
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal)
+        );
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn terminal_sweep_rejects_new_consumer_terminal_admission_without_staging() {
+        let now = Instant::now();
+        for unsubscribe in [false, true] {
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(&mut conn, "terminal-admission");
+            let _ = conn.poll_transmit();
+            let next_request_id = conn.peek_next_request_id_for_test();
+
+            conn.fail_all_pending("peer closed");
+            let result = if unsubscribe {
+                conn.unsubscribe(handle, false)
+                    .map(|value| value.request_id)
+            } else {
+                conn.close_consumer(handle, now)
+            };
+
+            assert_eq!(
+                result,
+                Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal)
+            );
+            assert_eq!(conn.peek_next_request_id_for_test(), next_request_id);
+            assert!(!conn.has_pending_request_for_test(RequestId(next_request_id)));
+            assert!(conn.poll_transmit().is_empty());
+            assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        }
+    }
+
+    #[test]
+    fn reset_does_not_latch_consumer_terminal_admission() {
+        let now = Instant::now();
+        for unsubscribe in [false, true] {
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(&mut conn, "reset-admission");
+            let _ = conn.poll_transmit();
+
+            conn.reset();
+            let request_id = if unsubscribe {
+                conn.unsubscribe(handle, false)
+                    .expect("reset stays reconnectable")
+                    .request_id
+            } else {
+                conn.close_consumer(handle, now)
+                    .expect("reset stays reconnectable")
+            };
+
+            assert!(conn.has_pending_request_for_test(request_id));
+            assert!(!conn.poll_transmit().is_empty());
+        }
+    }
+
+    #[test]
+    fn forced_forgotten_close_retries_a_failure_at_most_once() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forced-retry");
+        let _ = conn.poll_transmit();
+
+        let request_id = conn.close_consumer(handle, now).expect("close admitted");
+        let first = drain_close_commands(&mut conn);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].consumer_id, handle.0);
+        assert_eq!(first[0].request_id, request_id.0);
+        ack_error(&mut conn, request_id.0, now);
+
+        let retry = conn
+            .force_close_consumer_forget(handle, now)
+            .expect("one failure retry");
+        assert_ne!(retry, request_id);
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        let second = drain_close_commands(&mut conn);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].consumer_id, handle.0);
+        assert_eq!(second[0].request_id, retry.0);
+    }
+
+    #[test]
+    fn unsolicited_broker_close_does_not_complete_client_close() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "broker-close");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+        let broker_close = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 991,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut bytes = bytes::BytesMut::new();
+        encode_command(&mut bytes, &broker_close).expect("encode broker close");
+        conn.handle_bytes(now, &bytes).expect("apply broker close");
+
+        assert!(slot.state.lock().close_completion().is_none());
+        let request_id = conn.close_consumer(handle, now).expect("close admitted");
+        assert_ne!(request_id.0, 991);
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, request_id.0);
+    }
+
+    #[test]
+    fn close_pending_rejects_unsubscribe_without_staging() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "close-before-unsubscribe");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+
+        let close_request = conn.close_consumer(handle, now).expect("close admitted");
+        assert!(matches!(
+            conn.unsubscribe(handle, false),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::CloseInProgress)
+        ));
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, close_request.0);
+        assert_eq!(conn.peek_next_request_id_for_test(), close_request.0 + 1);
+
+        ack_success(&mut conn, close_request.0, now);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+        assert!(!conn.has_pending_request_for_test(close_request));
         assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "fail_all_pending must not materialize an outcome for a forgotten close"
+            conn.take_outcome(PendingOpKey::Request(close_request))
+                .is_none()
         );
     }
 
     #[test]
-    fn close_consumer_awaited_still_records_outcome() {
+    fn unsubscribe_pending_rejects_close_then_rejection_allows_one_close() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
-        let handle = subscribe(&mut conn, "awaited-close");
+        let handle = subscribe(&mut conn, "unsubscribe-before-close-error");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
 
-        let request_id = conn.close_consumer(handle, now);
-        ack_success(&mut conn, request_id.0, now);
-
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_some(),
-            "awaited close must record the outcome its RequestFut drains"
+        let unsubscribe_request = conn
+            .unsubscribe(handle, false)
+            .expect("unsubscribe admitted")
+            .request_id;
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
         );
+        let commands = drain_command_types(&mut conn);
+        assert_eq!(commands, vec![pb::base_command::Type::Unsubscribe as i32]);
+        assert!(slot.state.lock().close_waiters.is_empty());
+
+        ack_error(&mut conn, unsubscribe_request.0, now);
+        assert!(!conn.has_pending_request_for_test(unsubscribe_request));
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request))
+                .is_none()
+        );
+        let close_request = conn
+            .close_consumer(handle, now)
+            .expect("close admitted after error");
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, close_request.0);
+        ack_success(&mut conn, close_request.0, now);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_success_removes_slot_before_late_close_admission() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "unsubscribe-before-close-success");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+
+        let unsubscribe_request = conn
+            .unsubscribe(handle, true)
+            .expect("unsubscribe admitted")
+            .request_id;
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
+        );
+        let commands = drain_command_types(&mut conn);
+        assert_eq!(commands, vec![pb::base_command::Type::Unsubscribe as i32]);
+        ack_success(&mut conn, unsubscribe_request.0, now);
+
+        assert!(conn.consumer(handle).is_none());
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+        assert!(!conn.has_pending_request_for_test(unsubscribe_request));
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request))
+                .is_none()
+        );
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_reset_and_terminal_failure_release_admission_without_close_artifacts() {
+        for terminal in [false, true] {
+            let now = Instant::now();
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(
+                &mut conn,
+                if terminal {
+                    "unsubscribe-fail-all"
+                } else {
+                    "unsubscribe-reset"
+                },
+            );
+            let slot = conn.consumer(handle).expect("slot exists").clone();
+            let _ = conn.poll_transmit();
+            let admission = conn
+                .unsubscribe(handle, false)
+                .expect("unsubscribe admitted");
+            let request = admission.request_id;
+            let _ = conn.poll_transmit();
+
+            if terminal {
+                conn.fail_all_pending("peer closed");
+                assert_eq!(
+                    admission.operation.lock().completion(),
+                    Some(crate::consumer::ConsumerUnsubscribeCompletion::Terminal {
+                        reason: "peer closed".to_owned(),
+                    })
+                );
+            } else {
+                conn.reset();
+                assert_eq!(
+                    admission.operation.lock().completion(),
+                    Some(crate::consumer::ConsumerUnsubscribeCompletion::SessionLost)
+                );
+            }
+
+            assert!(!conn.has_pending_request_for_test(request));
+            assert!(slot.state.lock().close_waiters.is_empty());
+            assert!(slot.state.lock().close_completion().is_none());
+            assert!(conn.take_outcome(PendingOpKey::Request(request)).is_none());
+            if terminal {
+                assert!(matches!(
+                    slot.state.lock().terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    slot.state.lock().terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn forced_retry_requires_cached_failed_reliable_close() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "force-requires-failure");
+        let _ = conn.poll_transmit();
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
+
+        let close_request = conn.close_consumer(handle, now).expect("close admitted");
+        let _ = conn.poll_transmit();
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        ack_success(&mut conn, close_request.0, now);
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn failed_best_effort_close_cannot_force_retry() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "best-effort-no-retry");
+        let _ = conn.poll_transmit();
+
+        let request = conn
+            .close_consumer_forget(handle, now)
+            .expect("best-effort close admitted");
+        let _ = conn.poll_transmit();
+        ack_error(&mut conn, request.0, now);
+
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
     }
 }
 

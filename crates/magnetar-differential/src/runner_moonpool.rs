@@ -343,6 +343,14 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                 client.close().await;
                 return Ok(stream);
             }
+            Op::ConcurrentClose => {
+                if let Some(c) = consumer.take() {
+                    let other = c.clone();
+                    let (first, second) = tokio::join!(c.close(), other.close());
+                    assert!(first.is_ok() && second.is_ok());
+                }
+                stream.push(Event::Closed);
+            }
         }
     }
 

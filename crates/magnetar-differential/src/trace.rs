@@ -59,6 +59,8 @@ pub enum Op {
     /// is a no-op on the consumer side) and the consumer if open.
     /// Resolves the producer/consumer close round-trip.
     Close,
+    /// Reliably close two clones of the same ordinary consumer concurrently.
+    ConcurrentClose,
     /// Drop every clone of the trace's producer WITHOUT an explicit
     /// `close().await`. Exercises the engines' last-clone drop guard
     /// (issue #241): the guard enqueues a best-effort
@@ -409,6 +411,7 @@ mod tests {
                     message_id: mid(1, 0),
                 },
                 Op::Close,
+                Op::ConcurrentClose,
             ],
         );
         assert_eq!(t.ops.len(), 4);

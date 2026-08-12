@@ -235,6 +235,21 @@ pub struct TxnDrainEvent {
 /// (e.g. lookup-before-producer-open).
 pub type FrameLog = Arc<Mutex<Vec<i32>>>;
 
+/// One ordinary consumer-close command observed by the scripted broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerCloseObservation {
+    /// Consumer id carried by `CommandCloseConsumer`.
+    pub consumer_id: u64,
+    /// Request id used for broker response correlation.
+    pub request_id: u64,
+    /// Topic bound to this consumer id when the command arrived.
+    pub topic: Option<String>,
+    /// Subscription bound to this consumer id when the command arrived.
+    pub subscription: Option<String>,
+}
+
+type ConsumerCloseLog = Arc<Mutex<Vec<ConsumerCloseObservation>>>;
+
 /// Cross-session, append-only log of partition indices touched by
 /// `CommandSeek` against partitioned topics. The partition index is
 /// parsed from the consumer's bound topic via the `-partition-N`
@@ -261,6 +276,7 @@ pub type TxnDrainLog = Arc<Mutex<Vec<TxnDrainEvent>>>;
 #[derive(Clone)]
 struct SessionDeps {
     frame_log: FrameLog,
+    consumer_close_log: ConsumerCloseLog,
     seeked_partitions: SeekedPartitionLog,
     txn_drain_log: TxnDrainLog,
     corrupt_after_connected: Arc<Mutex<bool>>,
@@ -291,6 +307,7 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of every `BaseCommand` kind (as the
     /// `pb::base_command::Type` integer tag) seen across every session.
     frame_log: FrameLog,
+    consumer_close_log: ConsumerCloseLog,
     /// Shared, append-only log of partition indices that received a
     /// `CommandSeek`.
     seeked_partitions: SeekedPartitionLog,
@@ -388,6 +405,8 @@ impl ScriptedBroker {
         let shutdown_clone = shutdown.clone();
         let frame_log: FrameLog = Arc::new(Mutex::new(Vec::new()));
         let frame_log_clone = frame_log.clone();
+        let consumer_close_log: ConsumerCloseLog = Arc::new(Mutex::new(Vec::new()));
+        let consumer_close_log_clone = consumer_close_log.clone();
         let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
         let seeked_partitions_clone = seeked_partitions.clone();
         let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
@@ -408,6 +427,7 @@ impl ScriptedBroker {
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
             frame_log: frame_log_clone,
+            consumer_close_log: consumer_close_log_clone,
             seeked_partitions: seeked_partitions_clone,
             txn_drain_log: txn_drain_log_clone,
             corrupt_after_connected: corrupt_after_connected_clone,
@@ -439,6 +459,7 @@ impl ScriptedBroker {
             shutdown,
             accept_task: Some(accept_task),
             frame_log,
+            consumer_close_log,
             seeked_partitions,
             txn_drain_log,
             corrupt_after_connected,
@@ -583,6 +604,17 @@ impl ScriptedBroker {
     /// engine's snapshot doesn't include the first engine's frames.
     pub fn clear_frame_log(&self) {
         self.frame_log.lock().clear();
+    }
+
+    /// Snapshot exact ordinary consumer-close correlations.
+    #[must_use]
+    pub fn consumer_close_log_snapshot(&self) -> Vec<ConsumerCloseObservation> {
+        self.consumer_close_log.lock().clone()
+    }
+
+    /// Clear ordinary consumer-close observations between engine legs.
+    pub fn clear_consumer_close_log(&self) {
+        self.consumer_close_log.lock().clear();
     }
 
     /// Snapshot the partition indices touched by every `CommandSeek`
@@ -1283,6 +1315,19 @@ fn handle_frame(
         }
         pb::base_command::Type::CloseConsumer => {
             if let Some(c) = &frame.command.close_consumer {
+                let identity = state
+                    .lock()
+                    .consumers
+                    .get(&c.consumer_id)
+                    .map(|(topic, consumer)| (topic.clone(), consumer.subscription.clone()));
+                deps.consumer_close_log
+                    .lock()
+                    .push(ConsumerCloseObservation {
+                        consumer_id: c.consumer_id,
+                        request_id: c.request_id,
+                        topic: identity.as_ref().map(|(topic, _)| topic.clone()),
+                        subscription: identity.map(|(_, subscription)| subscription),
+                    });
                 state.lock().consumers.remove(&c.consumer_id);
                 emit_success(out, c.request_id);
             }
