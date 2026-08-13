@@ -3647,6 +3647,17 @@ mod tests {
         bytes
     }
 
+    fn success(request_id: u64) -> bytes::BytesMut {
+        encode(&magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        })
+    }
+
     fn deferred_message(
         entry_id: u64,
         metadata: magnetar_proto::pb::MessageMetadata,
@@ -3700,7 +3711,10 @@ mod tests {
         bytes::Bytes::from(encoder.finish().expect("finish test compression"))
     }
 
-    fn connect_shared(shared: &Arc<ConnectionShared>) {
+    fn connect_shared_with_scalable_support(
+        shared: &Arc<ConnectionShared>,
+        supports_scalable_topics: bool,
+    ) {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("begin handshake");
         let _ = conn.poll_transmit();
@@ -3711,7 +3725,7 @@ mod tests {
                 protocol_version: Some(magnetar_proto::SUPPORTED_PROTOCOL_VERSION),
                 max_message_size: Some(5 * 1024 * 1024),
                 feature_flags: Some(magnetar_proto::pb::FeatureFlags {
-                    supports_scalable_topics: Some(true),
+                    supports_scalable_topics: Some(supports_scalable_topics),
                     ..Default::default()
                 }),
             }),
@@ -3721,6 +3735,10 @@ mod tests {
             .expect("connected");
         while conn.poll_event().is_some() {}
         drop(conn);
+    }
+
+    fn connect_shared(shared: &Arc<ConnectionShared>) {
+        connect_shared_with_scalable_support(shared, true);
     }
 
     fn connected_shared() -> Arc<ConnectionShared> {
@@ -3883,6 +3901,36 @@ mod tests {
             ScalableRouteKey::dag(session_id, magnetar_proto::ControllerIncarnation(epoch)),
             epoch,
         )
+    }
+
+    fn open_dag_fixture(
+        shared: &Arc<ConnectionShared>,
+        snapshot: magnetar_proto::DagSnapshot,
+    ) -> DagSession {
+        let session_id = shared
+            .inner
+            .lock()
+            .open_scalable_topic_session("topic://public/default/scaled")
+            .expect("open DAG protocol session");
+        let mut transmit = shared.inner.lock().poll_transmit();
+        let lookup = magnetar_proto::decode_one(&mut transmit)
+            .expect("DAG lookup frame")
+            .command
+            .scalable_topic_lookup
+            .expect("DAG lookup payload");
+        assert_eq!(lookup.session_id, session_id);
+        assert!(transmit.is_empty());
+        DagSession {
+            shared: shared.clone(),
+            route: claim_dag(shared, session_id),
+            session_id,
+            requested_topic: lookup.topic,
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://rejected.example:6650".to_owned()),
+            controller_broker_url_tls: Some("pulsar+ssl://allowed.example:6651".to_owned()),
+            snapshot,
+            closed: false,
+        }
     }
 
     fn subscriber_with_allow_list() -> SegmentSubscriber {
@@ -6188,6 +6236,196 @@ mod tests {
                 .await,
             Err(ClientError::ControllerRoutingUnsupported { .. })
         ));
+
+        crate::tls_crypto::install_default_provider();
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let tls_bootstrap = shared();
+        connect_shared_with_scalable_support(&tls_bootstrap, false);
+        let tls_pool = ProxyConnectionPool::new(crate::pool::ConnectionFactory {
+            url: crate::ParsedUrl {
+                host: "allowed.example".to_owned(),
+                port: 6651,
+                scheme: Scheme::Tls,
+            },
+            tls_config: Some(tls_config),
+            bootstrap_config: magnetar_proto::ConnectionConfig {
+                redirect_url_allow_list: Some(magnetar_proto::RedirectUrlAllowList::Exact(vec![
+                    "pulsar+ssl://allowed.example:6651".to_owned(),
+                ])),
+                ..Default::default()
+            },
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            auth_provider: None,
+            service_url_provider: None,
+            dns_resolver: None,
+        });
+        let tls_subscriber = SegmentSubscriber::new(
+            tls_bootstrap.clone(),
+            tls_pool,
+            std::time::Duration::from_secs(1),
+        );
+        let (snapshot, assignment) = control_plane_fixture();
+        let source = assignment.segments()[0].source();
+        let options = SegmentConsumerOptions {
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+            schema: magnetar_proto::pb::Schema::default(),
+        };
+        let mut descriptor = snapshot
+            .segment(source.segment_id())
+            .expect("assigned TLS descriptor")
+            .clone();
+        descriptor.broker_url = Some("pulsar://rejected.example:6650".to_owned());
+        assert!(matches!(
+            tls_subscriber
+                .open_segment_consumer(&source, &descriptor, &options,)
+                .await,
+            Err(ClientError::ControllerUnavailable)
+        ));
+        descriptor.broker_url_tls = Some("pulsar+ssl://rejected.example:6651".to_owned());
+        assert!(matches!(
+            tls_subscriber
+                .open_segment_consumer(&source, &descriptor, &options,)
+                .await,
+            Err(ClientError::ScalableAuthorityRejected)
+        ));
+        descriptor.broker_url_tls = Some("pulsar+ssl://allowed.example:6651".to_owned());
+        let mut open_segment =
+            Box::pin(tls_subscriber.open_segment_consumer(&source, &descriptor, &options));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(open_segment.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let request_id = {
+            let mut transmit = tls_bootstrap.inner.lock().poll_transmit();
+            magnetar_proto::decode_one(&mut transmit)
+                .expect("TLS segment subscribe frame")
+                .command
+                .subscribe
+                .expect("TLS segment subscribe payload")
+                .request_id
+        };
+        tls_bootstrap
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(request_id))
+            .expect("TLS segment subscribe success");
+        tls_bootstrap.event_waker.notify_waiters();
+        let consumer = open_segment.await.expect("TLS segment consumer");
+        assert!(consumer.is_paused());
+
+        let child_handle = consumer.handle();
+        let mut close_child = Box::pin(consumer.close());
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(close_child.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let close_request_id = {
+            let mut transmit = tls_bootstrap.inner.lock().poll_transmit();
+            let close = magnetar_proto::decode_one(&mut transmit)
+                .expect("TLS child close frame")
+                .command
+                .close_consumer
+                .expect("TLS child close payload");
+            assert_eq!(close.consumer_id, child_handle.0);
+            assert!(transmit.is_empty());
+            close.request_id
+        };
+        assert!(
+            tls_bootstrap
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(close_request_id))
+        );
+        tls_bootstrap
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(close_request_id))
+            .expect("TLS child close success");
+        tls_bootstrap.event_waker.notify_waiters();
+        close_child.await.expect("TLS child close");
+        {
+            let mut conn = tls_bootstrap.inner.lock();
+            assert!(conn.consumer_handle_is_terminal(child_handle));
+            assert!(
+                !conn.has_pending_request_for_test(magnetar_proto::RequestId(close_request_id))
+            );
+            assert!(conn.poll_transmit().is_empty());
+        }
+
+        let consumer_id = 73;
+        connect_shared(&subscriber.bootstrap);
+        let dag = open_dag_fixture(&subscriber.bootstrap, snapshot);
+        let session_id = dag.session_id();
+        let next_request_id = tls_bootstrap.inner.lock().peek_next_request_id_for_test();
+        let error = tls_subscriber
+            .open_controller_session_with_id(&dag, "workers", "worker-a", consumer_id)
+            .await
+            .expect_err("unsupported TLS controller registration");
+        assert!(matches!(
+            error,
+            ClientError::Other(message)
+                if message == "broker does not support scalable topics (PIP-460): CommandConnected did not advertise supports_scalable_topics"
+        ));
+        let mut conn = tls_bootstrap.inner.lock();
+        assert_eq!(conn.peek_next_request_id_for_test(), next_request_id);
+        assert!(conn.poll_transmit().is_empty());
+        assert!(!conn.remove_scalable_consumer_registration(
+            consumer_id,
+            magnetar_proto::ControllerIncarnation(1),
+        ));
+        drop(conn);
+        let routes = tls_bootstrap.scalable_routes.state.lock();
+        assert!(!routes.routes.contains_key(&ScalableRouteKey::consumer(
+            consumer_id,
+            magnetar_proto::ControllerIncarnation(1),
+        )));
+        assert!(
+            !routes
+                .active
+                .contains_key(&(ScalableRouteFamily::Consumer, consumer_id))
+        );
+        drop(routes);
+
+        dag.close();
+        let mut transmit = subscriber.bootstrap.inner.lock().poll_transmit();
+        let close = magnetar_proto::decode_one(&mut transmit)
+            .expect("DAG close frame")
+            .command
+            .scalable_topic_close
+            .expect("DAG close payload");
+        assert_eq!(close.session_id, session_id);
+        assert!(transmit.is_empty());
+        assert!(
+            subscriber
+                .bootstrap
+                .inner
+                .lock()
+                .dag_snapshot(session_id)
+                .is_none()
+        );
+        let routes = subscriber.bootstrap.scalable_routes.state.lock();
+        let dag_key = ScalableRouteKey::dag(session_id, magnetar_proto::ControllerIncarnation(1));
+        assert!(!routes.routes.contains_key(&dag_key));
+        assert!(
+            !routes
+                .active
+                .contains_key(&(ScalableRouteFamily::Dag, session_id))
+        );
     }
 
     #[tokio::test]
