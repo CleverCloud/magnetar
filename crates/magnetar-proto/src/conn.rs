@@ -94,6 +94,17 @@ pub struct Connection {
     inbound: BytesMut,
     /// Event queue.
     events: VecDeque<ConnectionEvent>,
+    /// Observational events (per-message `Message` / `MessageReceivedFromShadow`
+    /// clones) dropped because [`Self::events`] was at
+    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`]. Issue #413: nothing in the production
+    /// runtime consumes those events (`ReceiveFut` drains via `pop_message`,
+    /// `MessageListener` loops over `receive()`, `EventWaitFut` matches only
+    /// producer/subscribe families), so an unconsumed backlog of them retained
+    /// every received payload and grew the queue without bound — the OOM class
+    /// diagnosed on the accesslogs converter (heap profile: `VecDeque` growth +
+    /// `BytesMut` retention). Dropping them is always safe: they are emitted
+    /// for observability only and carry no protocol obligation.
+    dropped_observational_events: u64,
     /// Exact failed generations for built-in runtime retry legs.
     driver_retries: VecDeque<crate::DriverRetry>,
     /// Outcomes ready to be consumed by user futures.
@@ -259,6 +270,15 @@ impl core::fmt::Debug for Connection {
 /// [`crate::OperationRetryConfig`]; callers can override the count through
 /// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
+
+/// Cap on OBSERVATIONAL events (`ConnectionEvent::Message` /
+/// `MessageReceivedFromShadow`) queued in [`Connection::events`]. These are
+/// per-message payload clones emitted for observability; no production
+/// consumer drains them (issue #413), so without a bound they retain every
+/// received payload and grow the event queue until OOM. Protocol-bearing
+/// events (subscribe/producer/connection lifecycle) are NEVER dropped and are
+/// not counted against this cap.
+pub const EVENT_QUEUE_OBSERVATIONAL_CAP: usize = 4096;
 
 /// Error code surfaced when a publish exceeds its configured `send_timeout`.
 ///
@@ -450,6 +470,7 @@ impl Connection {
             pending_vectored_segments: Vec::new(),
             inbound: BytesMut::with_capacity(4 * 1024),
             events: VecDeque::new(),
+            dropped_observational_events: 0,
             driver_retries: VecDeque::new(),
             outcomes: HashMap::new(),
             wakers: HashMap::new(),
@@ -2368,7 +2389,7 @@ impl Connection {
                         (Vec::new(), None)
                     };
                 for ev in staged_events {
-                    self.events.push_back(ev);
+                    self.push_observational_event(ev);
                 }
                 if let Some(permits) = flow_permits {
                     self.flow(handle, permits);
@@ -3716,6 +3737,42 @@ impl Connection {
     }
 
     /// Pull the next [`ConnectionEvent`], if any.
+    /// Queue an OBSERVATIONAL event (per-message `Message` /
+    /// `MessageReceivedFromShadow`), dropping it instead when the queue
+    /// already holds [`EVENT_QUEUE_OBSERVATIONAL_CAP`] observational entries.
+    /// Issue #413: these events carry full payload clones and nothing in the
+    /// production runtime consumes them, so an unbounded queue retains every
+    /// received payload until OOM. Dropping is always safe — observability
+    /// only, no protocol obligation. Non-observational events must keep going
+    /// through `self.events.push_back` directly (they are never dropped).
+    fn push_observational_event(&mut self, event: ConnectionEvent) {
+        debug_assert!(matches!(
+            event,
+            ConnectionEvent::Message { .. } | ConnectionEvent::MessageReceivedFromShadow { .. }
+        ));
+        // O(1) proxy: compare the TOTAL queue length against the cap rather
+        // than counting observational entries. Non-observational events are
+        // rare lifecycle signals, so past the cap the queue is observational
+        // for all practical purposes; the proxy at worst drops an
+        // observational event slightly early, which is harmless, and it never
+        // blocks a non-observational push (those bypass this helper).
+        if self.events.len() >= EVENT_QUEUE_OBSERVATIONAL_CAP {
+            self.dropped_observational_events = self.dropped_observational_events.saturating_add(1);
+            return;
+        }
+        self.events.push_back(event);
+    }
+
+    /// Number of observational per-message events dropped at the
+    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`] bound since the connection was
+    /// created. A nonzero value means message events are being emitted faster
+    /// than anything drains them — harmless (they are observability-only),
+    /// but a signal that no listener is consuming what the queue produces.
+    #[must_use]
+    pub fn dropped_observational_events(&self) -> u64 {
+        self.dropped_observational_events
+    }
+
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         let event = self.events.pop_front()?;
         self.remove_driver_retry_for_event(&event);
@@ -14011,6 +14068,46 @@ mod conn_state_tests {
             }
             other => panic!("expected Update, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn observational_event_queue_is_capped_and_delivery_unaffected() {
+        // Issue #413: nothing in the production runtime consumes the
+        // per-message observational events, so without a cap the queue
+        // retains every payload until OOM. Deliver more messages than the
+        // cap WITHOUT draining events: the queue must stay bounded, the
+        // drop counter must account for the excess, and — critically —
+        // pop_message must still return every message (the cap concerns
+        // observability only, never delivery).
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let total = EVENT_QUEUE_OBSERVATIONAL_CAP + 100;
+        for i in 0..total {
+            let frame = message_frame(handle.0, &regular_metadata(), format!("m-{i}").as_bytes());
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle regular message");
+        }
+
+        assert!(
+            conn.events.len() <= EVENT_QUEUE_OBSERVATIONAL_CAP,
+            "event queue exceeded the observational cap: {}",
+            conn.events.len()
+        );
+        assert!(
+            conn.dropped_observational_events() >= 100,
+            "expected >= 100 dropped observational events, got {}",
+            conn.dropped_observational_events()
+        );
+
+        // Delivery is untouched by the cap: every message is still poppable.
+        let mut popped = 0usize;
+        while conn.pop_message(handle, Instant::now()).is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, total, "pop_message must yield every delivered message");
     }
 
     #[test]
