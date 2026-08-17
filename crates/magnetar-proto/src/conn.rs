@@ -272,7 +272,7 @@ impl core::fmt::Debug for Connection {
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
 
 /// Cap on OBSERVATIONAL events (`ConnectionEvent::Message` /
-/// `MessageReceivedFromShadow`) queued in [`Connection::events`]. These are
+/// `MessageReceivedFromShadow`) queued in `Connection::events`. These are
 /// per-message payload clones emitted for observability; no production
 /// consumer drains them (issue #413), so without a bound they retain every
 /// received payload and grow the event queue until OOM. Protocol-bearing
@@ -14107,7 +14107,10 @@ mod conn_state_tests {
         while conn.pop_message(handle, Instant::now()).is_some() {
             popped += 1;
         }
-        assert_eq!(popped, total, "pop_message must yield every delivered message");
+        assert_eq!(
+            popped, total,
+            "pop_message must yield every delivered message"
+        );
     }
 
     #[test]
