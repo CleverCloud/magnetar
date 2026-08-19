@@ -89,6 +89,48 @@ fn producer_receipt_events_are_capped_without_losing_completions() {
         conn.dropped_observational_events()
     );
 
+    let dropped_after_receipts = conn.dropped_observational_events();
+
+    // The producer side has a second per-message event: a broker-side send
+    // failure. Past the cap it must be dropped just the same — and, like the
+    // receipt, its outcome is recorded before the event is ever queued.
+    let seq = conn
+        .send(
+            producer,
+            OutgoingMessage {
+                payload: Bytes::from_static(b"hi"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 2,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            },
+            0,
+            t0,
+        )
+        .expect("send queues");
+
+    let send_error = pb::BaseCommand {
+        r#type: pb::base_command::Type::SendError as i32,
+        send_error: Some(pb::CommandSendError {
+            producer_id: producer.0,
+            sequence_id: seq.0,
+            error: pb::ServerError::PersistenceError as i32,
+            message: "broker refused the write".to_owned(),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &send_error).expect("encode CommandSendError");
+    conn.handle_bytes(t0 + Duration::from_millis(SEND_RTT_MS), &buf)
+        .expect("apply send error");
+
+    assert_eq!(
+        conn.dropped_observational_events(),
+        dropped_after_receipts + 1,
+        "a SendError past the cap must be dropped like a receipt"
+    );
+
     // …and every receipt still reached the producer state machine: one
     // send-latency sample per receipt, cap or no cap.
     let hist = conn
