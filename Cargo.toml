@@ -83,7 +83,7 @@ tokio-rustls         = { version = "^0.26.4", default-features = false }
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "^0.3.1", default-features = false }
+rustls-openssl       = { version = "^0.4.0", default-features = false }
 
 # Compression — Pulsar's four codecs
 lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
