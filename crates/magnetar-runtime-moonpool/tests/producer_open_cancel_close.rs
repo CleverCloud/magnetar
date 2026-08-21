@@ -478,6 +478,39 @@ async fn pinned_name_held_by_a_live_producer_stays_busy() {
         .await;
 }
 
+/// Successor re-attach is scoped to `Shared` producers: a named open under an
+/// exclusive access mode takes the plain fresh-id path even when abandoned
+/// ids exist, because its epoch participates in topic-epoch fencing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusive_named_open_never_reattaches_an_abandoned_id() {
+    const PRODUCER_NAME: &str = "pinned-406-exclusive";
+    const TOPIC: &str = "persistent://public/default/open-cancel-exclusive";
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host_port, _state) = spawn_broker(NameScript::Plain).await;
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let client = Client::connect_plain(&engine, &host_port, client_config())
+                .await
+                .expect("connect ok");
+
+            let opened = client
+                .open_producer(CreateProducerRequest {
+                    topic: TOPIC.to_owned(),
+                    producer_name: Some(PRODUCER_NAME.to_owned()),
+                    access_mode: pb::ProducerAccessMode::Exclusive,
+                    ..Default::default()
+                })
+                .await
+                .expect("exclusive named open ok");
+
+            opened.close().await.expect("close ok");
+            client.close().await;
+        })
+        .await;
+}
+
 /// The interleaving that reproduced against a real Pulsar 4.0.4 broker in CI
 /// after ADR-0100's cancel-time close landed: the broker consumes the close
 /// while the producer creation is still pending, acks it, stops mapping that
