@@ -242,17 +242,85 @@ impl Consumer {
     }
 
     /// Number of dispatch permits this consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
+    /// it has authorised the broker to push and the broker has not yet spent. Mirrors
     /// Java `ConsumerBase#getAvailablePermits`.
     ///
-    /// Issue #349 scope note: reads `ConsumerState::granted_permits` (the additive grant
-    /// mirror), unchanged by the permit-balance split — out of scope per the issue's four
-    /// locked design items, which name only `FlowStats::available_permits`.
+    /// Reads `ConsumerState::permit_balance`: the initial / replenishment grants, minus
+    /// one per broker dispatch unit that has actually arrived (plain message, batch
+    /// member, buffered chunk, PIP-33 marker), force-zeroed at every churn boundary.
+    ///
+    /// **Semantic change (issue #414).** This used to read the purely-ADDITIVE
+    /// `granted_permits` mirror, which never moves under dispatch and therefore made a
+    /// wedged consumer indistinguishable from a healthy one — an application polling it
+    /// could not detect issue #414's silent Shared-subscription stall. Poll this to see a
+    /// draining consumer's balance fall and refill; a balance pinned high while messages
+    /// stop arriving is the client-side signature of that stall. See
+    /// [ADR-0101](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md),
+    /// which amends ADR-0082's deferral of exactly this accessor.
     ///
     /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
-        self.slot.state.lock().granted_permits
+        self.slot.state.lock().permit_balance
+    }
+
+    /// Re-attach this consumer id in place, on the live connection, and re-arm its
+    /// dispatch permits — the caller-driven recovery for a consumer whose broker-side
+    /// dispatch has gone silent (issue #414).
+    ///
+    /// Reuses the machinery issue #307 landed for a same-broker `CommandCloseConsumer`:
+    /// zero the permit mirrors, fail every in-flight ack (issue #346 — their responses can
+    /// never arrive against the retired consumer generation), re-emit `CommandSubscribe`
+    /// for the same consumer id, and let the broker's `Success` release the initial
+    /// `CommandFlow`. No transport reconnect, no other consumer disturbed, and the
+    /// receiver queue is left intact so already-buffered messages stay receivable.
+    ///
+    /// Returns once the `CommandSubscribe` is staged and the driver has been woken; the
+    /// re-arm completes asynchronously when the broker acks. Poll
+    /// [`Self::available_permits`] to observe the grant land.
+    ///
+    /// # What this does and does not repair
+    ///
+    /// It repairs **this client's own slot** in the broker's dispatcher. Issue #414's
+    /// production failure was a dispatcher-WIDE corruption — the subscription's
+    /// broker-side `availablePermits` observed at `-177300`, affecting every attached
+    /// consumer — and one consumer re-attaching does not necessarily clear that. The
+    /// escalation is an operator-side `pulsar-admin topics unload`, which is what
+    /// recovered the production incident. See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Other`] when the consumer is not eligible for an in-place re-attach:
+    /// it is closed, unsubscribing, terminally failed, mid-seek (the seek owns its own
+    /// re-attach), or already has a re-attach in flight. Nothing is mutated in that case.
+    pub fn resubscribe(&self) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.resubscribe_consumer_in_place(self.handle)
+        };
+        let Some(request_id) = request_id else {
+            return Err(ClientError::Other(
+                "consumer is not eligible for an in-place re-subscribe (closed, \
+                 unsubscribing, terminal, mid-seek, or a re-attach is already in flight)"
+                    .to_owned(),
+            ));
+        };
+        self.shared.driver_waker.notify_one();
+        // Borrowed BEFORE the macro, not formatted inside it: `tracing` evaluates field
+        // expressions lazily behind its level check, so an inline `%`-formatted field
+        // never runs when no subscriber is installed — which is every coverage run
+        // (ADR-0024's sim-coverage gate would report the line as dead).
+        let topic = self.slot.identity.topic.as_str();
+        let subscription = self.slot.identity.subscription.as_str();
+        tracing::info!(
+            topic,
+            subscription,
+            handle = ?self.handle,
+            request_id = ?request_id,
+            "consumer re-subscribed in place; permits will re-arm on the broker ack"
+        );
+        Ok(())
     }
 
     /// This consumer's CURRENT receiver-queue target (issue #301). For the
@@ -2777,6 +2845,114 @@ mod tests {
         assert_eq!(closed.available_permits(), 0);
     }
 
+    /// Issue #414: `Consumer::resubscribe()` is the caller-driven recovery for a
+    /// consumer whose broker-side dispatch has gone silent. It re-attaches THIS
+    /// consumer id in place — zero the permit mirrors, re-emit
+    /// `CommandSubscribe`, defer the grant to the broker's `Success` — and it
+    /// refuses, without touching anything, a consumer that is not eligible.
+    /// Mirrors the moonpool engine test 1:1 (ADR-0024).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resubscribe_reattaches_in_place_and_refuses_an_ineligible_consumer() {
+        const RQ: usize = 8;
+        let shared = handshake_complete_shared();
+        let (handle, subscribe_request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/resub-in-place".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Shared,
+                receiver_queue_size: RQ,
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        // Ack the subscribe and arm the initial flow: the steady state a #414
+        // wedge strikes from.
+        {
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: subscribe_request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode subscribe success");
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("subscribe success");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+            let _ = conn.initial_flow(handle, Instant::now());
+            let _ = conn.poll_transmit();
+        }
+        let consumer = Consumer::assemble(
+            shared.clone(),
+            handle,
+            consumer_slot_for(&shared, handle),
+            None,
+        );
+        assert_eq!(consumer.available_permits(), RQ as u32);
+
+        let resub_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        consumer.resubscribe().expect("a live consumer is eligible");
+        assert_eq!(
+            consumer.available_permits(),
+            0,
+            "the broker recreates its dispatcher slot at zero permits; the client's \
+             mirror must follow until the re-subscribe is acked"
+        );
+        // A fresh `CommandSubscribe` for the SAME consumer id, and no flow ahead
+        // of it (Pulsar drops flow for a consumer whose subscribe is in flight).
+        let mut out = shared.inner.lock().poll_transmit();
+        let (mut subscribes, mut flows) = (Vec::new(), Vec::new());
+        while !out.is_empty() {
+            let frame = magnetar_proto::decode_one(&mut out).expect("decode outbound");
+            if let Some(sub) = frame.command.subscribe {
+                subscribes.push((sub.request_id, sub.consumer_id));
+            } else if let Some(flow) = frame.command.flow {
+                flows.push(flow.message_permits);
+            }
+        }
+        assert_eq!(subscribes, vec![(resub_request_id, handle.0)]);
+        assert!(flows.is_empty(), "the grant is deferred to the ack");
+
+        // The broker acks: the grant comes back on its own.
+        {
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: resub_request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode resubscribe success");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("resubscribe success");
+        }
+        assert_eq!(
+            consumer.available_permits(),
+            RQ as u32,
+            "the re-subscribe ack re-arms the full receiver-queue grant"
+        );
+
+        // An unknown handle has no subscribe request to replay, so the call is
+        // refused rather than silently doing nothing observable.
+        let bogus = magnetar_proto::ConsumerHandle(9999);
+        let orphan = Consumer::assemble(shared, bogus, stub_consumer_slot_for_test(bogus), None);
+        assert!(
+            orphan.resubscribe().is_err(),
+            "an unknown consumer must be refused"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn auto_receiver_queue_policy_grows_target_under_starvation() {
         // Issue #301: an `Auto`-policy consumer driven through the tokio engine's
@@ -2823,8 +2999,10 @@ mod tests {
             );
             assert_eq!(
                 conn.consumer_available_permits(handle),
-                200,
-                "the incremental flow tops the broker grant up to the new target"
+                100,
+                "issue #414: the accessor reports the REAL balance — dispatch drained the \
+                 100-permit initial grant to 0, so the incremental top-up of 100 leaves \
+                 exactly 100 un-spent, not the 200-permit cumulative grant"
             );
         }
     }

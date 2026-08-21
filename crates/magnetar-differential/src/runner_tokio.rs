@@ -123,6 +123,36 @@ pub async fn run_with_operation_timeout(
     .await
 }
 
+/// Run `trace` with the issue #414 per-consumer stall watchdog armed at
+/// `consumer_stall_timeout`.
+///
+/// The window is deliberately tiny here: a Shared consumer that is granted
+/// permits and then handed nothing crosses it while the trace is still running,
+/// so the driver's control-event pump has a real `ConsumerStalled` to drain —
+/// which is the whole point, since draining it silently is the engine behaviour
+/// ADR-0101 specifies and the only way it can go wrong is by escaping as an
+/// error or piling up. Nothing in the resulting `EventStream` is timing-derived:
+/// the watchdog only ever emits an event the engine consumes, so both legs
+/// compare equal regardless of exactly when it fires.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            consumer_stall_timeout: Some(consumer_stall_timeout),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,
@@ -165,6 +195,12 @@ async fn run_with_config(
     // put a second, asynchronous `CommandCloseProducer` on the wire, which is
     // exactly the frame the issue #406 scenario is counting.
     let mut named_producers: Vec<Producer> = Vec::new();
+
+    // Issue #414: additional `SubType::Shared` consumers opened by
+    // `Op::OpenSharedConsumer`, keyed by their harness-local name. They all
+    // land on ONE broker-side dispatcher for `(topic, subscription)`, so
+    // detaching one mid-drain redelivers its un-acked entries to the survivors.
+    let mut shared_consumers: HashMap<String, Consumer> = HashMap::new();
 
     // PIP-31: the current open txn id, if any. `NewTxn` populates it;
     // `EndTxn` consumes it. The harness supports one in-flight
@@ -364,6 +400,52 @@ async fn run_with_config(
                         .await,
                 );
             }
+            Op::OpenSharedConsumer {
+                name,
+                receiver_queue_size,
+            } => {
+                stream.push(
+                    open_shared_consumer(
+                        &client,
+                        &mut shared_consumers,
+                        name,
+                        &trace.topic,
+                        &trace.subscription,
+                        *receiver_queue_size,
+                    )
+                    .await?,
+                );
+            }
+            Op::RecvShared { name, timeout } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_recv(consumer, *timeout).await);
+            }
+            Op::AckShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_ack(consumer, *message_id).await);
+            }
+            Op::CloseSharedConsumer { name } => {
+                // `close` consumes the handle, so close a clone and keep the
+                // map entry: later ops must still be able to address the
+                // consumer that LEFT the subscription — that is exactly what a
+                // #414 caller does when it tries to recover the wrong one.
+                let departing = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened")
+                    .clone();
+                let _ = departing.close().await;
+                stream.push(Event::SharedConsumerClosed);
+            }
+            Op::ResubscribeShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_resubscribe_shared(consumer));
+            }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
                 // the engines' last-clone drop guard (issue #241). The
@@ -386,6 +468,9 @@ async fn run_with_config(
             }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
+                for (_, c) in shared_consumers.drain() {
+                    let _ = c.close().await;
+                }
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
@@ -414,6 +499,9 @@ async fn run_with_config(
     }
 
     // Implicit close if no Close op present.
+    for (_, c) in shared_consumers.drain() {
+        let _ = c.close().await;
+    }
     if let Some(c) = consumer.take() {
         let _ = c.close().await;
     }
@@ -611,6 +699,53 @@ async fn run_ack(consumer: &Consumer, message_id: MessageId) -> Event {
     match consumer.ack(message_id).await {
         Ok(()) => Event::Acked,
         Err(e) => Event::AckError { kind: classify(&e) },
+    }
+}
+
+/// Issue #414: open one more `SubType::Shared` consumer on the trace's
+/// `(topic, subscription)`, held under a harness-local name.
+///
+/// `receiver_queue_size` is the initial permit grant, and reading it straight
+/// back through `Consumer::available_permits()` is the point of the returned
+/// event: that accessor now reports the REAL decrementing balance, so both
+/// engines must agree on it before any dispatch lands.
+async fn open_shared_consumer(
+    client: &Client,
+    map: &mut HashMap<String, Consumer>,
+    name: &str,
+    topic: &str,
+    subscription: &str,
+    receiver_queue_size: usize,
+) -> Result<Event, ClientError> {
+    let consumer = client
+        .subscribe_with(
+            SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: subscription.to_owned(),
+                sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
+                receiver_queue_size,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+    let permits = consumer.available_permits();
+    map.insert(name.to_owned(), consumer);
+    Ok(Event::SharedConsumerOpened { permits })
+}
+
+/// Issue #414: the caller-driven in-place recovery.
+///
+/// `resubscribe()` only stages the `CommandSubscribe` and wakes the driver, so
+/// there is nothing here to wait on: the event reports whether the ENGINE
+/// accepted the call. That the broker's `Success` actually re-armed the grant is
+/// proved by the trace, which publishes after the recovery and receives the
+/// message — impossible without a live permit. A consumer that has already been
+/// closed is refused, and both engines must refuse it the same way.
+fn run_resubscribe_shared(consumer: &Consumer) -> Event {
+    match consumer.resubscribe() {
+        Ok(()) => Event::SharedConsumerResubscribed,
+        Err(e) => Event::SharedConsumerResubscribeError { kind: classify(&e) },
     }
 }
 

@@ -5,6 +5,10 @@
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, pip-74, receiver-queue, java-parity, issue-349
 
+> **Amendment (2026-08-21, [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md)).** `Connection::consumer_available_permits()` — and the `Consumer::available_permits()` chain on both engines — now reads `permit_balance`, not `granted_permits`.
+> The deferral recorded below ("intentionally left reading `granted_permits`", "a separate, unscoped change") is superseded: issue #414 is its concrete cost, because an accessor that never moves under dispatch cannot tell a healthy consumer from one whose broker-side dispatcher has wedged.
+> Everything else in this ADR stays in force: the two counters stay split, `granted_permits` keeps its additive semantics and its two callers (the #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta), `flow_stats` still feeds `permit_balance` into `FlowStats::available_permits`, and the `granted_permits == 0` churn-window guard is unchanged.
+
 ## Context
 
 [Issue #349](https://github.com/CleverCloud/magnetar/issues/349) reports that the `Auto` receiver-queue policy (ADR-0071, PIP-74 `autoScaledReceiverQueueSizeEnabled` parity) never scales up under real load.

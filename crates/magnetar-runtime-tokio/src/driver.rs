@@ -154,6 +154,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
                     | ConnectionEvent::ActiveConsumerChanged { .. }
+                    | ConnectionEvent::ConsumerStalled { .. }
                     | ConnectionEvent::LookupResponse {
                         result: magnetar_proto::LookupOutcome::Redirected { .. },
                         ..
@@ -411,8 +412,18 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             // `ActiveConsumerChange` arm), NOT by this event queue — draining
             // it here only stops it from piling up unbounded in the proto
             // queue, which nothing else polls.
+            //
+            // `ConsumerStalled` (issue #414) is drained the same way: the proto
+            // layer's `handle_timeout` watchdog holds the full context (permit
+            // balance, silence duration) and emits the `warn!` at the point of
+            // detection, so a second log here would double-report. Draining
+            // stops it accumulating in the proto queue, which nothing else
+            // polls; the event stays observable to a caller driving the state
+            // machine directly, and the recovery surface a user reaches for is
+            // `Consumer::available_permits` + `Consumer::resubscribe`.
             ConnectionEvent::ChecksumMismatch { .. } => {}
             ConnectionEvent::ActiveConsumerChanged { .. } => {}
+            ConnectionEvent::ConsumerStalled { .. } => {}
             ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }

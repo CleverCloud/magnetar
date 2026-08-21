@@ -206,6 +206,30 @@ pub struct ConsumerState {
     /// starvation signal instead of the never-decrementing mirror `granted_permits` was before
     /// this split.
     pub permit_balance: u32,
+    /// Monotonic count of broker dispatch units this consumer has observed since it
+    /// was constructed (issue #414). Bumped by [`Self::record_dispatch_unit`], the single
+    /// helper that also decrements [`Self::permit_balance`], so the two can never drift:
+    /// one unit per plain message, per batch member, per buffered chunk, and per PIP-33
+    /// marker.
+    ///
+    /// This is the stall watchdog's **progress signal**. It carries no clock, so the
+    /// dispatch sites need no `now` parameter (ADR-0011): the watchdog compares the mark
+    /// it latched at the start of a silence window against the current value, exactly the
+    /// way ADR-0058's keepalive compares `last_activity` against the deadline it armed.
+    /// Never reset — a wrapped `u64` would need ~584 years of continuous 1 GHz dispatch.
+    pub(crate) dispatch_units_received: u64,
+    /// Live per-consumer stall window (issue #414), or `None` when this consumer is not
+    /// currently a stall candidate ([`Self::is_stall_candidate`]). Seeded, advanced, and
+    /// cleared exclusively by [`Self::poll_stall`], which
+    /// [`crate::Connection::handle_timeout`] drives; the matching deadline is surfaced
+    /// through [`Self::next_stall_deadline`] so
+    /// [`crate::Connection::poll_timeout`] schedules a deterministic wake.
+    ///
+    /// Cleared at every grant site too ([`Self::initial_flow`], [`Self::maybe_flow`],
+    /// [`Self::adjust_receiver_queue`]'s growth branch): a fresh grant is a fresh promise
+    /// from the broker and deserves a fresh silence window rather than inheriting the
+    /// previous one's start instant.
+    pub(crate) stall_watch: Option<StallWatch>,
     /// Number of permits we've consumed since the last flow command. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
@@ -440,6 +464,34 @@ pub struct ConsumerState {
     /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
     /// no-channel wake pattern (ADR-0003).
     pub active_change_wakers: Slab<Waker>,
+}
+
+/// One open silence window on a consumer that currently satisfies
+/// [`ConsumerState::is_stall_candidate`] (issue #414).
+///
+/// Progress-based, exactly like ADR-0058's connection keepalive: the window survives
+/// only while no broker dispatch unit arrives. Any dispatch bumps the consumer's monotonic
+/// dispatch-unit counter past the mark this window latched, which makes the next
+/// [`ConsumerState::poll_stall`] tick discard the window and open a fresh one.
+///
+/// The keepalive watchdog cannot cover this failure mode: `PING` / `PONG` keeps flowing
+/// on a connection whose broker-side dispatcher has stopped serving ONE subscription, so
+/// `last_activity` never ages and no connection-level deadline ever fires (issue #414's
+/// production symptom — survivors receive ~20 messages, then silence, with the broker's
+/// `availablePermits` hugely negative and no client-visible error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallWatch {
+    /// [`ConsumerState::dispatch_units_received`] as of the tick that opened this window.
+    /// A later tick observing a different value has seen progress and restarts the window.
+    pub(crate) mark: u64,
+    /// Injected-clock instant the window opened (never `Instant::now()` — ADR-0011).
+    /// The stall fires once `now >= since + consumer_stall_timeout`.
+    pub(crate) since: std::time::Instant,
+    /// Whether this window has already surfaced its
+    /// [`crate::event::ConnectionEvent::ConsumerStalled`]. Latched so one stall episode
+    /// emits exactly one event however many ticks run past the deadline; a dispatch (new
+    /// `mark`) or a state change that ends candidacy replaces the window and re-arms.
+    pub(crate) reported: bool,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -779,6 +831,8 @@ impl ConsumerState {
             last_adjust_at: None,
             granted_permits: 0,
             permit_balance: 0,
+            dispatch_units_received: 0,
+            stall_watch: None,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
@@ -1016,6 +1070,7 @@ impl ConsumerState {
         self.consumed_since_flow = 0;
         self.granted_permits = self.granted_permits.saturating_add(permits);
         self.permit_balance = self.permit_balance.saturating_add(permits);
+        self.clear_stall_watch();
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -1024,6 +1079,149 @@ impl ConsumerState {
 
     fn record_broker_permit_consumed(&mut self) {
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+    }
+
+    /// Account for exactly ONE broker dispatch unit arriving on this consumer.
+    ///
+    /// Issue #349 owns the first half — decrement the REAL
+    /// [`Self::permit_balance`] once per unit the broker actually spent a permit on.
+    /// Issue #414 owns the second — bump the monotonic
+    /// [`Self::dispatch_units_received`] progress mark the stall watchdog reads.
+    /// They are one call precisely so a future dispatch site cannot update one and
+    /// forget the other: a missed balance decrement mis-reports starvation, a missed
+    /// progress bump makes the watchdog cry stall on a perfectly healthy consumer.
+    ///
+    /// Carries no clock (ADR-0011): the mark is a counter, so the three call sites keep
+    /// their existing signatures.
+    fn record_dispatch_unit(&mut self) {
+        self.permit_balance = self.permit_balance.saturating_sub(1);
+        self.dispatch_units_received = self.dispatch_units_received.saturating_add(1);
+    }
+
+    /// Drop any open stall window (issue #414). Called at every permit-grant site and by
+    /// [`crate::Connection::resubscribe_consumer_in_place`]: a fresh grant, or a fresh
+    /// broker-side dispatcher slot, restarts the silence window from the next tick rather
+    /// than inheriting a start instant that predates it.
+    pub(crate) fn clear_stall_watch(&mut self) {
+        self.stall_watch = None;
+    }
+
+    /// Open the stall window at `now` (issue #414), discarding any older one.
+    ///
+    /// Called by [`crate::Connection::initial_flow`], the one grant site that is handed an
+    /// injected clock (ADR-0011) — subscribe ack, reconnect rebuild, post-seek resubscribe,
+    /// the #307 Failover re-arm, and the #414 caller-driven recovery all route through it.
+    /// Seeding here rather than waiting for the first sweep is what makes detection take
+    /// `consumer_stall_timeout` instead of `consumer_stall_timeout + keepalive_interval`:
+    /// `poll_timeout` has no instant to arm from until a window exists, and on an otherwise
+    /// idle connection the keepalive deadline is the only thing that would produce that
+    /// first sweep. A full grant is also exactly the moment a #414 wedge begins — the
+    /// broker acknowledged permits it will never spend — so it is the right zero.
+    ///
+    /// Unconditional: a fresh grant is a fresh promise and always deserves a fresh window.
+    /// The other grant sites ([`Self::maybe_flow`], [`Self::adjust_receiver_queue`]) carry
+    /// no clock and only [`Self::clear_stall_watch`], which the next sweep re-seeds.
+    pub(crate) fn arm_stall_watch(&mut self, now: std::time::Instant) {
+        self.stall_watch = Some(StallWatch {
+            mark: self.dispatch_units_received,
+            since: now,
+            reported: false,
+        });
+    }
+
+    /// `true` while this consumer is in the state issue #414 wedges in: the broker has
+    /// been granted permits it has not spent (`permit_balance > 0`), the local queue is
+    /// empty so nothing is waiting on the user, and the consumer is dispatch-eligible.
+    ///
+    /// The eligibility set is deliberately the SAME one the #307 Failover re-arm gate uses
+    /// (`ActiveConsumerChange` arm in [`crate::Connection`]): not closed, not paused, no
+    /// in-flight seek freezing the queue, not terminally failed, not end-of-topic, and not
+    /// mid-re-attach. Each of those explains the silence without a broker fault, and a
+    /// watchdog that fired on them would be reporting the user's own gating back at them.
+    ///
+    /// Pure read — no clock, no mutation.
+    #[must_use]
+    pub fn is_stall_candidate(&self) -> bool {
+        self.permit_balance > 0
+            && self.queue.is_empty()
+            && !self.closed
+            && !self.paused
+            && !self.reached_end_of_topic
+            && self.pending_seek.is_none()
+            && self.terminal_failure.is_none()
+            && !self.flow_on_subscribe_ack
+    }
+
+    /// Deadline at which an open, not-yet-reported stall window becomes due, or `None`
+    /// when the watchdog is disabled, no window is open, or this window already fired.
+    ///
+    /// Surfaced through [`crate::Connection::poll_timeout`] so the driver schedules a
+    /// deterministic wake — without it the sweep would only fire opportunistically on an
+    /// unrelated deadline, which is seed-divergent under the moonpool engine (the same
+    /// rationale [`Self::next_adjust_deadline`] and `next_chunk_expiry_deadline` carry).
+    ///
+    /// A candidate with no window yet arms nothing here: there is no instant to arm from.
+    /// [`crate::Connection::initial_flow`] seeds one at grant time, so in practice a
+    /// granted consumer is armed from the moment the broker was told it may dispatch. A consumer
+    /// that regains candidacy some other way — its queue draining empty after `maybe_flow`
+    /// topped the grant up — waits for the next sweep to seed it, and the keepalive deadline
+    /// guarantees one (ADR-0058).
+    #[must_use]
+    pub fn next_stall_deadline(&self, window: std::time::Duration) -> Option<std::time::Instant> {
+        let watch = self.stall_watch.as_ref()?;
+        if watch.reported {
+            return None;
+        }
+        Some(crate::time::deadline_with_clamp(watch.since, window))
+    }
+
+    /// Run one stall-watchdog tick against the injected `now` (ADR-0011).
+    ///
+    /// Returns `Some(silent_for)` exactly once per stall episode — on the first tick at or
+    /// after `window` has elapsed with no dispatch unit — so the caller can surface one
+    /// [`crate::event::ConnectionEvent::ConsumerStalled`]. Every later tick in the same
+    /// episode returns `None`.
+    ///
+    /// Emitting the event is the ONLY effect. Recovery stays explicit
+    /// ([`crate::Connection::resubscribe_consumer_in_place`], or an operator-side
+    /// `topics unload`): a watchdog that re-subscribed on its own would turn a broker
+    /// hiccup into a re-subscribe storm across every partition at once, and would hide the
+    /// broker-side defect issue #414 is actually about.
+    pub fn poll_stall(
+        &mut self,
+        window: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if !self.is_stall_candidate() {
+            // Progress, user gating, or a terminal transition ended candidacy — drop the
+            // window so the next candidacy opens a fresh one (this is what re-arms the
+            // once-per-episode latch).
+            self.stall_watch = None;
+            return None;
+        }
+        let mark = self.dispatch_units_received;
+        match self.stall_watch {
+            // Same silence window, still running.
+            Some(watch) if watch.mark == mark => {
+                if watch.reported || now < crate::time::deadline_with_clamp(watch.since, window) {
+                    return None;
+                }
+                self.stall_watch = Some(StallWatch {
+                    reported: true,
+                    ..watch
+                });
+                Some(now.saturating_duration_since(watch.since))
+            }
+            // No window yet, or a dispatch landed since the last tick: (re-)open one.
+            _ => {
+                self.stall_watch = Some(StallWatch {
+                    mark,
+                    since: now,
+                    reported: false,
+                });
+                None
+            }
+        }
     }
 
     /// Account for one broker-side ledger entry that the conn-level filter has decided to
@@ -1040,8 +1238,10 @@ impl ConsumerState {
         // Issue #349: a marker is one broker-dispatched unit too — decrement the
         // REAL balance directly (not through `record_broker_permit_consumed`,
         // which only tracks the pop-driven `consumed_since_flow` counter, the
-        // wrong site for the live balance).
-        self.permit_balance = self.permit_balance.saturating_sub(1);
+        // wrong site for the live balance). Issue #414: the same call bumps the
+        // watchdog's progress mark, so a marker-only stream (a replicated
+        // subscription with no user traffic) counts as broker liveness.
+        self.record_dispatch_unit();
     }
 
     /// Force an initial flow for the current receiver-queue target.
@@ -1057,6 +1257,12 @@ impl ConsumerState {
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
+        // Issue #414: a fresh full grant (subscribe ack, reconnect rebuild, post-seek
+        // resubscribe, #307 re-arm, #414 caller-driven resubscribe) restarts the stall
+        // window. Keeping the old window would let a consumer that was already silent
+        // fire a stall the instant it is re-armed, before the broker had any chance to
+        // dispatch against the new grant.
+        self.clear_stall_watch();
         pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -1149,6 +1355,7 @@ impl ConsumerState {
         }
         self.granted_permits = self.granted_permits.saturating_add(delta);
         self.permit_balance = self.permit_balance.saturating_add(delta);
+        self.clear_stall_watch();
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: delta,
@@ -1537,8 +1744,10 @@ impl ConsumerState {
                     // still pending) — decrement the REAL balance directly
                     // rather than through `record_broker_permit_consumed`
                     // (which only tracks the pop-driven `consumed_since_flow`
-                    // counter, the wrong site for the live balance).
-                    self.permit_balance = self.permit_balance.saturating_sub(1);
+                    // counter, the wrong site for the live balance). Issue
+                    // #414: a consumer mid-reassembly is receiving, so the
+                    // same call bumps the watchdog's progress mark.
+                    self.record_dispatch_unit();
                     return Ok(DeliverOutcome::Buffered);
                 }
                 // All chunks present — assemble. Take the buffer out by value
@@ -1688,8 +1897,10 @@ impl ConsumerState {
         // completing logical message. Decrement the REAL balance
         // unconditionally, before the queued-vs-dead-lettered branch below:
         // the broker already spent one permit dispatching this entry
-        // regardless of which branch the client routes it into.
-        self.permit_balance = self.permit_balance.saturating_sub(1);
+        // regardless of which branch the client routes it into. Issue #414:
+        // the same call bumps the watchdog's progress mark — a dead-lettered
+        // entry is still evidence the broker is dispatching to us.
+        self.record_dispatch_unit();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
@@ -3636,5 +3847,394 @@ mod tests {
             "chunk_id == total_chunks must be Dropped, got {outcome:?}",
         );
         assert!(c.chunk_reassembly.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #414 — per-consumer stall watchdog state machine.
+//
+// The failure this models: a Pulsar Shared subscription whose broker-side
+// dispatcher wedges after consumer churn. The survivors hold the permits the
+// broker acknowledged, their local queues are empty, and nothing ever arrives
+// again — while the connection keepalive keeps passing, so ADR-0058's
+// connection watchdog never fires.
+//
+// The whole machine lives on `ConsumerState`: a monotonic dispatch counter as
+// the progress signal, and one `StallWatch` opened / advanced / discarded by
+// `poll_stall`. These tests pin every arm of it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stall_watchdog_tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn metadata() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn message_cmd() -> pb::CommandMessage {
+        pb::CommandMessage {
+            consumer_id: 1,
+            message_id: pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: 1,
+                ..Default::default()
+            },
+            redelivery_count: Some(0),
+            ack_set: Vec::new(),
+            consumer_epoch: None,
+        }
+    }
+
+    /// A granted consumer with an empty queue — precisely the shape issue #414
+    /// wedges in.
+    fn granted() -> ConsumerState {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c
+    }
+
+    fn deliver_one(c: &mut ConsumerState, at: std::time::Instant) {
+        c.deliver(
+            &message_cmd(),
+            metadata(),
+            None,
+            Bytes::from_static(b"x"),
+            at,
+        )
+        .expect("deliver");
+    }
+
+    #[test]
+    fn granted_consumer_with_empty_queue_is_a_stall_candidate() {
+        assert!(
+            granted().is_stall_candidate(),
+            "un-spent permits over an empty queue is exactly the #414 shape"
+        );
+    }
+
+    #[test]
+    fn fresh_consumer_is_not_a_candidate_before_any_grant() {
+        let c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert!(
+            !c.is_stall_candidate(),
+            "no grant means the broker was never asked to dispatch — silence is correct"
+        );
+    }
+
+    #[test]
+    fn queued_messages_suppress_candidacy() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        deliver_one(&mut c, t0);
+        assert!(
+            !c.is_stall_candidate(),
+            "a non-empty queue means the user, not the broker, owes the progress"
+        );
+    }
+
+    /// Every state that has its own explanation for the silence must suppress
+    /// the watchdog — otherwise it reports the caller's own gating back at them.
+    #[test]
+    fn user_and_protocol_gating_suppress_candidacy() {
+        for (label, mutate) in [
+            (
+                "closed",
+                (|c: &mut ConsumerState| c.closed = true) as fn(&mut ConsumerState),
+            ),
+            ("paused", |c: &mut ConsumerState| c.paused = true),
+            ("reached_end_of_topic", |c: &mut ConsumerState| {
+                c.reached_end_of_topic = true;
+            }),
+            ("pending_seek", |c: &mut ConsumerState| {
+                c.pending_seek = Some(crate::types::RequestId(7));
+            }),
+            ("terminal_failure", |c: &mut ConsumerState| {
+                c.terminal_failure = Some("dead".to_owned());
+            }),
+            ("flow_on_subscribe_ack", |c: &mut ConsumerState| {
+                c.flow_on_subscribe_ack = true;
+            }),
+        ] {
+            let mut c = granted();
+            assert!(c.is_stall_candidate(), "{label}: candidate before mutation");
+            mutate(&mut c);
+            assert!(
+                !c.is_stall_candidate(),
+                "{label} must suppress the stall watchdog"
+            );
+        }
+    }
+
+    #[test]
+    fn first_tick_only_seeds_the_window_and_arms_the_deadline() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "no window yet: there is no instant to arm a deadline from"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0),
+            None,
+            "the seeding tick never reports — the window starts here"
+        );
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            Some(t0 + WINDOW),
+            "poll_timeout must now be able to schedule the deterministic wake"
+        );
+    }
+
+    #[test]
+    fn stall_fires_once_at_the_window_and_never_again_in_the_same_episode() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                t0 + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "a tick one millisecond short of the window must not fire"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + WINDOW),
+            Some(WINDOW),
+            "the tick at the deadline reports the exact silence duration"
+        );
+        for extra in [1u64, 5, 60] {
+            assert_eq!(
+                c.poll_stall(WINDOW, t0 + WINDOW + std::time::Duration::from_secs(extra)),
+                None,
+                "one event per stall episode, however many ticks run past the deadline"
+            );
+        }
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "a reported window arms no further wake"
+        );
+    }
+
+    #[test]
+    fn a_late_tick_reports_the_real_silence_not_the_configured_window() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        let late = std::time::Duration::from_secs(95);
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + late),
+            Some(late),
+            "the event carries how long the silence actually lasted"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_restarts_the_window_and_re_arms_the_episode_latch() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        assert_eq!(
+            c.poll_stall(WINDOW, t0 + WINDOW),
+            Some(WINDOW),
+            "first stall"
+        );
+
+        // Recovery: one message arrives and the user drains it.
+        let recovered_at = t0 + WINDOW + std::time::Duration::from_secs(1);
+        deliver_one(&mut c, recovered_at);
+        let _ = c.pop_message(recovered_at);
+        assert!(
+            c.is_stall_candidate(),
+            "back to un-spent permits over an empty queue"
+        );
+
+        // The dispatch moved the progress mark, so the next tick opens a FRESH
+        // window rather than re-reporting the old one.
+        assert_eq!(c.poll_stall(WINDOW, recovered_at), None, "re-seed");
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                recovered_at + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "the new window is measured from the dispatch, not from the first stall"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, recovered_at + WINDOW),
+            Some(WINDOW),
+            "a consumer that wedges twice reports twice"
+        );
+    }
+
+    /// The regression this guards: a consumer draining a long backlog holds a
+    /// queue for minutes, so candidacy is false throughout; the instant it
+    /// empties and `maybe_flow` re-grants, a stale window would fire a stall
+    /// immediately even though the broker has done nothing wrong.
+    #[test]
+    fn losing_and_regaining_candidacy_restarts_the_window_from_scratch() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+
+        // A message arrives: candidacy drops while it sits in the queue.
+        let arrived = t0 + std::time::Duration::from_secs(5);
+        deliver_one(&mut c, arrived);
+        assert_eq!(
+            c.poll_stall(WINDOW, arrived),
+            None,
+            "not a candidate — the window is discarded"
+        );
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "and no deadline is armed while the user owes the progress"
+        );
+
+        // The user drains it much later than the window.
+        let drained = arrived + std::time::Duration::from_secs(600);
+        let _ = c.pop_message(drained);
+        assert_eq!(
+            c.poll_stall(WINDOW, drained),
+            None,
+            "regaining candidacy only re-seeds — it must NOT inherit the pre-queue window"
+        );
+        assert_eq!(
+            c.poll_stall(
+                WINDOW,
+                drained + WINDOW.saturating_sub(std::time::Duration::from_millis(1))
+            ),
+            None,
+            "the new window runs from the drain, so a stall is still one millisecond away"
+        );
+    }
+
+    #[test]
+    fn a_fresh_grant_restarts_the_window() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        assert_eq!(c.poll_stall(WINDOW, t0), None, "seed");
+        // A re-attach re-arms the full grant: the broker has a brand-new promise
+        // to honour and deserves a brand-new window.
+        let rearmed = t0 + std::time::Duration::from_secs(29);
+        let _ = c.initial_flow();
+        assert_eq!(
+            c.next_stall_deadline(WINDOW),
+            None,
+            "initial_flow drops the open window"
+        );
+        assert_eq!(c.poll_stall(WINDOW, rearmed), None, "re-seed at the re-arm");
+        assert_eq!(
+            c.poll_stall(WINDOW, rearmed + WINDOW),
+            Some(WINDOW),
+            "and the new window is measured from the re-arm"
+        );
+    }
+
+    /// Every dispatch shape the broker can spend a permit on must count as
+    /// progress. A shape that decremented `permit_balance` without bumping the
+    /// mark would make the watchdog cry stall on a healthy consumer.
+    #[test]
+    fn every_dispatch_unit_shape_bumps_the_progress_mark() {
+        let t0 = std::time::Instant::now();
+
+        // Plain message.
+        let mut plain = granted();
+        deliver_one(&mut plain, t0);
+        assert_eq!(plain.dispatch_units_received, 1);
+
+        // Batch member: one mark per exploded member.
+        let mut batched = granted();
+        let mut batch_meta = metadata();
+        batch_meta.num_messages_in_batch = Some(3);
+        let mut body = bytes::BytesMut::new();
+        for i in 0..3u8 {
+            let single = pb::SingleMessageMetadata {
+                payload_size: 1,
+                ..Default::default()
+            };
+            let encoded = single.encode_to_vec();
+            body.extend_from_slice(&(u32::try_from(encoded.len()).expect("fits")).to_be_bytes());
+            body.extend_from_slice(&encoded);
+            body.extend_from_slice(&[i]);
+        }
+        batched
+            .deliver(&message_cmd(), batch_meta, None, body.freeze(), t0)
+            .expect("deliver batch");
+        assert_eq!(
+            batched.dispatch_units_received, 3,
+            "each batch member is one broker dispatch unit"
+        );
+
+        // PIP-33 marker: filtered off the user stream but still a spent permit.
+        let mut marked = granted();
+        marked.record_marker_consumed();
+        assert_eq!(marked.dispatch_units_received, 1);
+    }
+
+    #[test]
+    fn an_incomplete_chunk_counts_as_progress() {
+        let t0 = std::time::Instant::now();
+        let mut c = granted();
+        let chunk_meta = pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            uuid: Some("chunked-progress".to_owned()),
+            num_chunks_from_msg: Some(2),
+            chunk_id: Some(0),
+            total_chunk_msg_size: Some(2),
+            ..Default::default()
+        };
+        let outcome = c
+            .deliver(
+                &message_cmd(),
+                chunk_meta,
+                None,
+                Bytes::from_static(b"a"),
+                t0,
+            )
+            .expect("buffer chunk");
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        assert_eq!(
+            c.dispatch_units_received, 1,
+            "a consumer mid-reassembly is receiving; the broker is not silent"
+        );
+        assert!(
+            !c.is_stall_candidate() || c.queue.is_empty(),
+            "candidacy is unaffected by reassembly state; only progress matters"
+        );
+        assert_eq!(
+            c.poll_stall(WINDOW, t0),
+            None,
+            "the seeding tick latches the post-chunk mark"
+        );
+    }
+
+    #[test]
+    fn a_disabled_or_zero_permit_consumer_never_arms_a_deadline() {
+        let t0 = std::time::Instant::now();
+        // Zero balance: the broker owes us nothing.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert_eq!(c.poll_stall(WINDOW, t0), None);
+        assert_eq!(c.next_stall_deadline(WINDOW), None);
+        // And a candidate whose window is dropped by `clear_stall_watch` arms
+        // nothing until the next tick re-seeds it.
+        let mut granted = granted();
+        assert_eq!(granted.poll_stall(WINDOW, t0), None);
+        granted.clear_stall_watch();
+        assert_eq!(granted.next_stall_deadline(WINDOW), None);
     }
 }

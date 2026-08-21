@@ -3245,46 +3245,21 @@ impl Connection {
                     // `flow_on_subscribe_ack`, any of which would otherwise skip
                     // this sweep entirely on some re-attach paths.
                     //
-                    // Two-phase collect-then-mutate (mirrors the send-timeout sweep
-                    // shape in `handle_timeout`) avoids mutating `pending_requests`
-                    // while iterating it.
-                    let orphaned_acks: Vec<RequestId> = self
-                        .pending_requests
-                        .iter()
-                        .filter_map(|(rid, kind)| match kind {
-                            PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
-                            _ => None,
-                        })
-                        .collect();
-                    for rid in orphaned_acks {
-                        self.pending_requests.remove(&rid);
-                        let message = "ack orphaned by broker consumer close".to_owned();
-                        self.outcomes.insert(
-                            PendingOpKey::Request(rid),
-                            OpOutcome::Error {
-                                request_id: rid,
-                                code: -1,
-                                message: message.clone(),
-                            },
-                        );
-                        self.wake_for_request(rid);
-                        if let Some(slot) = self.consumers.get(&handle) {
-                            let mut consumer = slot.state.lock();
-                            consumer.total_acks_failed =
-                                consumer.total_acks_failed.saturating_add(1);
-                        }
-                        self.events.push_back(ConnectionEvent::AckResponse {
-                            request_id: Some(rid),
-                            result: Err(message),
-                        });
-                    }
+                    self.fail_acks_orphaned_by_consumer_reattach(handle);
                     // Same-broker bundle reassignment: re-subscribe in place and
                     // DO NOT surface a `ConsumerClosedByBroker` event — the
                     // re-attach is transparent to the runtime (which would
                     // otherwise either drop the event or, if a `SubscribeAcked`
                     // wait is parked, mistake it for a terminal close). The
                     // method drains any older stale close events for this handle.
-                    self.resubscribe_consumer_after_broker_close(handle);
+                    if self.emit_in_place_consumer_resubscribe(handle).is_some() {
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            "broker closed running consumer (same-broker, url=None); \
+                             re-subscribed in place (#307)"
+                        );
+                    }
                 } else {
                     // PIP-188 topic migration (`assigned_broker_service_url`
                     // set): the supervised reconnect / migration path owns the
@@ -3977,6 +3952,17 @@ impl Connection {
             if let Some(d) = consumer.next_adjust_deadline() {
                 consider(d);
             }
+            // Issue #414: surface the per-consumer stall deadline so the driver wakes us
+            // deterministically for `handle_timeout`'s watchdog tick. `None` when the
+            // knob is disabled (the default) — no spurious wakeups, the same load-bearing
+            // determinism rationale the `ack_response_timeout` / `stats_interval` arms
+            // below carry — and `None` for a candidate whose window has not been seeded
+            // yet or has already reported.
+            if let Some(window) = self.config.consumer_stall_timeout {
+                if let Some(d) = consumer.next_stall_deadline(window) {
+                    consider(d);
+                }
+            }
         }
         for slot in self.producers.values() {
             let producer = slot.state.lock();
@@ -4108,6 +4094,12 @@ impl Connection {
         // re-borrowing `self.config` while `self.consumers` / `self.producers`
         // are borrowed.
         let stats_interval = self.config.stats_interval;
+        // Issue #414: hoisted for the same reason `stats_interval` is — one `Copy` read
+        // instead of re-borrowing `self.config` while `self.consumers` is borrowed.
+        let consumer_stall_timeout = self.config.consumer_stall_timeout;
+        // Stall reports staged inside the per-slot loop and pushed onto the event queue
+        // after it, under `&mut self` (same collect-then-mutate shape as `adjust_flows`).
+        let mut stall_reports: Vec<(ConsumerHandle, u32, std::time::Duration)> = Vec::new();
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -4187,6 +4179,46 @@ impl Connection {
             {
                 consumer.record_rate_window(now);
             }
+            // ---- BEGIN issue #414: per-consumer stall watchdog (CONSUMER slot) ----
+            // Progress-based, modelled on ADR-0058's keepalive but scoped to ONE
+            // consumer: the keepalive's `last_activity` is refreshed by every decoded
+            // frame, so a connection whose broker-side dispatcher wedged for a single
+            // subscription keeps it fresh forever. `poll_stall` runs entirely under the
+            // per-slot lock this loop already holds, with the injected `now` (ADR-0038
+            // lock ordering, ADR-0011 clock injection), and returns `Some` on exactly the
+            // one tick that closes a stall episode. No-op when the knob is disabled, in
+            // which case `poll_timeout` never arms the matching deadline either.
+            if let Some(window) = consumer_stall_timeout
+                && let Some(stalled_for) = consumer.poll_stall(window, now)
+            {
+                stall_reports.push((*handle, consumer.permit_balance, stalled_for));
+            }
+            // ---- END issue #414 ----
+        }
+        for (handle, permit_balance, stalled_for) in stall_reports {
+            // Computed BEFORE the macro, not inside it. `tracing` evaluates field
+            // expressions lazily behind its level check, so an expression written inline
+            // never runs when no subscriber is installed — which is every coverage run
+            // (ADR-0024's sim-coverage gate would report the line as dead). Hoisting also
+            // drops the lossy `as u64` cast.
+            let stalled_for_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX);
+            // ADR-0054 single-owner rule: `magnetar-proto` is the point of detection and
+            // holds the richest context, so it owns the log line; the engines drain the
+            // event without re-logging it.
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                permit_balance,
+                stalled_for_ms,
+                "consumer holds un-spent broker permits over an empty queue but has \
+                 received no dispatch for the stall window; the broker-side dispatcher \
+                 may be wedged (#414)"
+            );
+            self.events.push_back(ConnectionEvent::ConsumerStalled {
+                handle,
+                permit_balance,
+                stalled_for,
+            });
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
@@ -4849,6 +4881,12 @@ impl Connection {
             let mut consumer = self.consumers.get(&handle)?.state.lock();
             let flow_cmd = consumer.initial_flow();
             consumer.arm_adjust_clock(now);
+            // Issue #414: the same injected `now` opens the stall window. A full grant is
+            // where a wedge starts — the broker has acknowledged permits it may never
+            // spend — and it is the only grant site with a clock, so seeding here is what
+            // keeps detection at `consumer_stall_timeout` rather than that plus a
+            // keepalive interval waiting for the first sweep to find a baseline.
+            consumer.arm_stall_watch(now);
             flow_cmd
         };
         let base = pb::BaseCommand {
@@ -5068,21 +5106,32 @@ impl Connection {
     }
 
     /// Number of dispatch permits the consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push without an explicit `CommandFlow`. Returns `0`
+    /// it has authorised the broker to push and the broker has not yet spent. Returns `0`
     /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
     ///
-    /// Issue #349 scope note: this reads [`crate::consumer::ConsumerState::granted_permits`]
-    /// (the additive grant mirror), unchanged by the permit-balance split — out of scope per
-    /// the issue's four locked design items, which name only
-    /// [`crate::receiver_queue::FlowStats::available_permits`]. For the REAL, decrementing
-    /// balance see [`crate::consumer::ConsumerState::permit_balance`]; extending Java-parity
-    /// (a genuinely decrementing counter) to this public accessor is a separate, unscoped
-    /// change.
+    /// Reads [`crate::consumer::ConsumerState::permit_balance`], the REAL decrementing
+    /// balance: one unit off per broker dispatch unit (plain message, batch member,
+    /// buffered chunk, PIP-33 marker), topped back up at every grant, and force-zeroed at
+    /// every churn boundary.
+    ///
+    /// **Semantic change (issue #414).** Until this change the accessor read
+    /// `granted_permits`, the purely-ADDITIVE grant mirror — ADR-0082 split the two
+    /// counters but deliberately left this accessor on the additive one as out of scope.
+    /// The additive value makes the wedge issue #414 reports undetectable from the
+    /// client: it sits at the receiver-queue size forever whether the broker is
+    /// dispatching or has gone silent, so an application polling it can never tell a
+    /// draining consumer from a dead one. `permit_balance` moves under real dispatch,
+    /// which is both what Java's `getAvailablePermits` means and what makes the accessor
+    /// a usable liveness probe. ADR-0101 amends ADR-0082 §Consequences accordingly.
+    ///
+    /// For "how much have we told the broker it may use" — the question the #307
+    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta ask — read
+    /// [`crate::consumer::ConsumerState::granted_permits`] directly; it is unchanged.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
         self.consumers
             .get(&handle)
-            .map_or(0, |slot| slot.state.lock().granted_permits)
+            .map_or(0, |slot| slot.state.lock().permit_balance)
     }
 
     /// Last broker-reported Failover active/standby state for `handle`
@@ -7209,51 +7258,44 @@ impl Connection {
         Some(request_id)
     }
 
-    /// Re-subscribe a single consumer in place after the broker tore its
-    /// dispatcher down via a same-broker `CommandCloseConsumer`
-    /// (`assigned_broker_service_url = None`) on a still-live socket — issue
-    /// #307's proven root cause.
+    /// Re-subscribe a single consumer in place on the still-live socket: re-emit
+    /// `CommandSubscribe` for the SAME consumer id and defer the initial `CommandFlow` to
+    /// the broker's re-subscribe `Success`.
     ///
-    /// Unlike [`Self::rebuild_consumers`] (whole-connection sweep, runs after a
-    /// `reset`) this re-attaches exactly one consumer without a transport
-    /// reconnect, the way [`Self::resubscribe_consumer_after_seek`] does after a
-    /// seek and [`Self::retry_consumer_subscribe`] does after a transient
-    /// subscribe rejection. It reuses the same machinery: re-emit
-    /// `CommandSubscribe` (using the broker cursor for an established durable subscription) and
-    /// set `flow_on_subscribe_ack` so the initial
-    /// `CommandFlow` is deferred to the broker's re-subscribe `Success` (Pulsar
-    /// silently drops `CommandFlow` for a consumer id whose subscribe is still
-    /// being processed — `ServerCnx.handleFlow` "Couldn't find consumer").
+    /// This is the shared emit half of issue #307's proven same-broker
+    /// `CommandCloseConsumer` fix (`assigned_broker_service_url = None`) and of issue
+    /// #414's caller-driven [`Self::resubscribe_consumer_in_place`]. Unlike
+    /// [`Self::rebuild_consumers`] (whole-connection sweep, runs after a `reset`) it
+    /// re-attaches exactly one consumer without a transport reconnect, the way
+    /// [`Self::resubscribe_consumer_after_seek`] does after a seek and
+    /// [`Self::retry_consumer_subscribe`] does after a transient subscribe rejection.
     ///
-    /// Skips (no-op) when the consumer is unknown, was never subscribed, is
-    /// user-closed, terminal, mid-seek (the seek's own
-    /// [`Self::resubscribe_consumer_after_seek`] owns re-attach), or already has
-    /// a re-attach pending (`flow_on_subscribe_ack` — `rebuild_consumers` /
-    /// transient-retry in flight). Drains any stale `ConsumerClosedByBroker`
-    /// event for this handle first so a runtime wait-future cannot trip on it
-    /// before the fresh `SubscribeAcked` (mirrors
+    /// The deferral is load-bearing: Pulsar silently drops `CommandFlow` for a consumer id
+    /// whose subscribe is still being processed (`ServerCnx.handleFlow` "Couldn't find
+    /// consumer"), so `SubscribeAckAction::ReleaseFlow` makes the `Success` arm issue the
+    /// grant against a live consumer id.
+    ///
+    /// Returns `None` (no wire traffic, nothing mutated) when the consumer is unknown, was
+    /// never subscribed, is user-closed, unsubscribing, terminal, mid-seek (the seek's own
+    /// [`Self::resubscribe_consumer_after_seek`] owns re-attach), or already has a
+    /// re-attach pending (`flow_on_subscribe_ack` — `rebuild_consumers` / transient-retry
+    /// in flight). Drains any stale `ConsumerClosedByBroker` event for this handle first so
+    /// a runtime wait-future cannot trip on it before the fresh `SubscribeAcked` (mirrors
     /// `resubscribe_consumer_after_seek`).
     ///
     /// The receiver queue is left intact — already-dispatched messages stay
     /// user-visible (the #65 / `duringSeek` invariant).
-    fn resubscribe_consumer_after_broker_close(&mut self, handle: ConsumerHandle) {
+    fn emit_in_place_consumer_resubscribe(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
         let Some(req) = self.consumer_subscribe_requests.get(&handle).cloned() else {
             // Never subscribed (e.g. the broker closed a consumer whose
             // subscribe never landed) — nothing to replay.
-            return;
+            return None;
         };
         let resume_from = {
-            let Some(slot) = self.consumers.get(&handle) else {
-                return;
-            };
+            let slot = self.consumers.get(&handle)?;
             let c = slot.state.lock();
-            if c.closed
-                || c.unsubscribe_request_id.is_some()
-                || c.terminal_failure.is_some()
-                || c.pending_seek.is_some()
-                || c.flow_on_subscribe_ack
-            {
-                return;
+            if !Self::consumer_reattach_in_place_is_eligible(&c) {
+                return None;
             }
             Self::consumer_reattach_start_message_id(&req, &c)
         };
@@ -7265,13 +7307,136 @@ impl Connection {
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
-        let _ =
-            self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
-        tracing::debug!(
+        Some(self.emit_command_subscribe(
+            handle,
+            &req,
+            resume_from,
+            SubscribeAckAction::ReleaseFlow,
+        ))
+    }
+
+    /// Whether an in-place re-subscribe may be emitted for this consumer.
+    ///
+    /// Each rejected state has an owner that would otherwise be raced: `closed` and
+    /// `unsubscribe_request_id` mean the consumer is going away, `terminal_failure` means
+    /// it is already dead, `pending_seek` means the seek's own re-attach owns the next
+    /// `CommandSubscribe`, and `flow_on_subscribe_ack` means a re-attach is already in
+    /// flight (a second `CommandSubscribe` for the same id would leave one of the two
+    /// `Success` replies unmatched and the flow gate stuck).
+    ///
+    /// Pure read of an already-locked slot — the caller holds `slot.state.lock()`, so
+    /// this must never reach back for the connection mutex (ADR-0038 lock ordering).
+    fn consumer_reattach_in_place_is_eligible(c: &crate::consumer::ConsumerState) -> bool {
+        !(c.closed
+            || c.unsubscribe_request_id.is_some()
+            || c.terminal_failure.is_some()
+            || c.pending_seek.is_some()
+            || c.flow_on_subscribe_ack)
+    }
+
+    /// Fail every in-flight ack for `handle` immediately (issue #346).
+    ///
+    /// An ack in flight when this consumer's broker-side dispatcher is torn down is
+    /// orphaned: the old consumer id is gone, so no `CommandAckResponse` for it will EVER
+    /// arrive on this connection — the re-attach carries a fresh `CommandSubscribe`. Fail
+    /// them here so the caller's `ack().await` resolves immediately instead of parking
+    /// until the `ack_response_timeout` backstop (or, if that knob is disabled, forever).
+    ///
+    /// MUST run before the re-subscribe emit: that helper early-returns on several states,
+    /// any of which would otherwise skip this sweep entirely on some re-attach paths.
+    ///
+    /// Two-phase collect-then-mutate (mirrors the send-timeout sweep shape in
+    /// [`Self::handle_timeout`]) avoids mutating `pending_requests` while iterating it.
+    fn fail_acks_orphaned_by_consumer_reattach(&mut self, handle: ConsumerHandle) {
+        let orphaned_acks: Vec<RequestId> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(rid, kind)| match kind {
+                PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
+                _ => None,
+            })
+            .collect();
+        for rid in orphaned_acks {
+            self.pending_requests.remove(&rid);
+            let message = "ack orphaned by broker consumer close".to_owned();
+            self.outcomes.insert(
+                PendingOpKey::Request(rid),
+                OpOutcome::Error {
+                    request_id: rid,
+                    code: -1,
+                    message: message.clone(),
+                },
+            );
+            self.wake_for_request(rid);
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+            }
+            self.events.push_back(ConnectionEvent::AckResponse {
+                request_id: Some(rid),
+                result: Err(message),
+            });
+        }
+    }
+
+    /// Caller-driven recovery for a consumer whose broker-side dispatch has wedged
+    /// (issue #414): re-attach THIS consumer id in place, on the live socket, without a
+    /// transport reconnect.
+    ///
+    /// Runs the same three steps the #307 same-broker `CommandCloseConsumer` handler runs,
+    /// in the same order:
+    ///
+    /// 1. zero the permit mirrors (`granted_permits`, `permit_balance`, `consumed_since_flow`) and
+    ///    drop any open stall window — the broker recreates its dispatcher slot at
+    ///    `availablePermits = 0`, so the client's mirrors must follow or the want-have delta and
+    ///    the starvation signal both read a grant that no longer exists;
+    /// 2. fail every in-flight ack for this handle (issue #346) — their responses can never arrive
+    ///    against the retired consumer generation;
+    /// 3. re-emit `CommandSubscribe` and defer the initial `CommandFlow` to its `Success`.
+    ///
+    /// Returns the new subscribe `RequestId`, or `None` when the consumer is not eligible —
+    /// closed, unsubscribing, terminally failed, mid-seek (the seek's own re-attach owns the
+    /// next `CommandSubscribe`), or already re-attaching. Nothing is mutated on the
+    /// `None` path — in particular the permit mirrors are NOT zeroed, which would leave a
+    /// consumer we declined to re-subscribe strictly worse off than before the call.
+    ///
+    /// The receiver queue is left intact: already-dispatched messages stay user-visible.
+    ///
+    /// # Scope
+    ///
+    /// This repairs **this client's own slot** in the broker's dispatcher. Issue #414's
+    /// production failure is a dispatcher-WIDE corruption (the subscription's
+    /// `availablePermits` observed at `-177300` across every attached consumer), and a
+    /// single consumer re-attaching does not necessarily clear it: the escalation is an
+    /// operator-side `pulsar-admin topics unload`. See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    pub fn resubscribe_consumer_in_place(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        // Eligibility first: every mutation below is unconditional once started, so a
+        // consumer we are not going to re-subscribe must not be touched at all.
+        let eligible =
+            self.consumers.get(&handle).is_some_and(|slot| {
+                Self::consumer_reattach_in_place_is_eligible(&slot.state.lock())
+            }) && self.consumer_subscribe_requests.contains_key(&handle);
+        if !eligible {
+            return None;
+        }
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            consumer.granted_permits = 0;
+            consumer.permit_balance = 0;
+            consumer.consumed_since_flow = 0;
+            consumer.clear_stall_watch();
+        }
+        self.fail_acks_orphaned_by_consumer_reattach(handle);
+        let request_id = self.emit_in_place_consumer_resubscribe(handle)?;
+        tracing::info!(
             target: "magnetar_proto::conn",
             handle = ?handle,
-            "broker closed running consumer (same-broker, url=None); re-subscribed in place (#307)"
+            request_id = ?request_id,
+            "consumer re-subscribed in place on caller request; initial flow deferred to \
+             the re-subscribe Success (#414)"
         );
+        Some(request_id)
     }
 
     fn consumer_reattach_start_message_id(
@@ -13984,8 +14149,21 @@ mod conn_state_tests {
         );
         assert_eq!(
             conn.consumer_available_permits(handle),
+            100,
+            "issue #414: the accessor now reports the REAL balance — dispatch drained the \
+             initial 100-permit grant to 0, so after the incremental top-up of 100 the \
+             broker holds exactly 100 un-spent permits, not the 200-permit cumulative \
+             grant the additive `granted_permits` mirror still records"
+        );
+        assert_eq!(
+            conn.consumers
+                .get(&handle)
+                .expect("consumer registered")
+                .state
+                .lock()
+                .granted_permits,
             200,
-            "available permits track the new target after the incremental grant"
+            "the additive grant mirror is unchanged by #414 and still tracks the target"
         );
     }
 
@@ -15354,6 +15532,451 @@ mod conn_state_tests {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #414 — connection-level wiring of the per-consumer stall watchdog and
+// of the caller-driven in-place re-subscribe recovery.
+//
+// `consumer::stall_watchdog_tests` pins the state machine in isolation; this
+// module pins the three things only `Connection` can own: that `poll_timeout`
+// arms the deadline (so a moonpool driver wakes deterministically rather than
+// opportunistically), that `handle_timeout` surfaces exactly one
+// `ConsumerStalled`, and that `resubscribe_consumer_in_place` reproduces the
+// #307 same-broker re-attach on demand.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod consumer_stall_and_recovery_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(30);
+    const RQ: usize = 8;
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    fn feed_success(conn: &mut Connection, request_id: u64, at: Instant) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandSuccess");
+        conn.handle_bytes(at, &buf).expect("handle Success");
+    }
+
+    fn message_frame(consumer_id: u64, entry_id: u64, payload: &[u8]) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "producer".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, &meta, payload).expect("encode_payload");
+        buf.to_vec()
+    }
+
+    /// Drain the outbound buffer once, bucketing this consumer's subscribe
+    /// request ids and flow grants (`poll_transmit` empties the buffer, so a
+    /// second call would see nothing — classify in one pass).
+    fn drain_outbound(conn: &mut Connection, handle: ConsumerHandle) -> (Vec<u64>, Vec<u32>) {
+        let mut out = conn.poll_transmit();
+        let (mut subs, mut grants) = (Vec::new(), Vec::new());
+        while !out.is_empty() {
+            let frame = crate::frame::decode_one(&mut out).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Subscribe as i32 {
+                if let Some(sub) = frame.command.subscribe {
+                    if sub.consumer_id == handle.0 {
+                        subs.push(sub.request_id);
+                    }
+                }
+            } else if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                if let Some(flow) = frame.command.flow {
+                    if flow.consumer_id == handle.0 {
+                        grants.push(flow.message_permits);
+                    }
+                }
+            }
+        }
+        (subs, grants)
+    }
+
+    fn drain_stall_events(conn: &mut Connection) -> Vec<(ConsumerHandle, u32, Duration)> {
+        let mut out = Vec::new();
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ConsumerStalled {
+                handle,
+                permit_balance,
+                stalled_for,
+            } = ev
+            {
+                out.push((handle, permit_balance, stalled_for));
+            }
+        }
+        out
+    }
+
+    /// A handshaked connection with one acked, flowed Shared consumer — the
+    /// steady state a #414 wedge strikes from.
+    fn shared_consumer(
+        stall_timeout: Option<Duration>,
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                consumer_stall_timeout: stall_timeout,
+                // Off so the only deadlines in play are the keepalive and the
+                // watchdog — otherwise the assertions on `poll_timeout` would be
+                // reading whichever sweep happens to be nearer.
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/shared-stall".to_owned(),
+            subscription: "sub-shared-stall".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Shared,
+            receiver_queue_size: RQ,
+            ..Default::default()
+        });
+        feed_success(&mut conn, subscribe_rid, t0);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, t0);
+        let _ = drain_outbound(&mut conn, handle);
+        (conn, handle)
+    }
+
+    #[test]
+    fn available_permits_reports_the_real_decrementing_balance() {
+        // The #414 detection premise: an application polling this accessor must
+        // see the balance fall under dispatch. On the additive mirror it stayed
+        // pinned at the receiver-queue size forever, which is exactly why a
+        // wedged consumer was indistinguishable from a healthy one.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        assert_eq!(conn.consumer_available_permits(handle), RQ as u32);
+        for entry in 0..3u64 {
+            conn.handle_bytes(t0, &message_frame(handle.0, entry, b"x"))
+                .expect("deliver");
+        }
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32 - 3,
+            "three dispatch units spent three of the broker's permits"
+        );
+        assert_eq!(
+            conn.consumers
+                .get(&handle)
+                .expect("registered")
+                .state
+                .lock()
+                .granted_permits,
+            RQ as u32,
+            "the additive grant mirror is untouched by dispatch — that is the #414 problem"
+        );
+    }
+
+    #[test]
+    fn disabled_watchdog_arms_no_deadline_and_emits_nothing() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        // Only the keepalive deadline may be armed; the watchdog must not add
+        // one, because an armed-but-never-firing deadline still perturbs the
+        // moonpool engine's simulated wake schedule.
+        let keepalive_deadline = t0 + ConnectionConfig::default().keepalive_interval;
+        assert_eq!(conn.poll_timeout(), Some(keepalive_deadline));
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + Duration::from_secs(600));
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the watchdog ships disarmed; ten minutes of silence must stay silent"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and nothing about the permit state changed"
+        );
+    }
+
+    #[test]
+    fn a_silent_broker_surfaces_exactly_one_consumer_stalled_event() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+
+        // First tick seeds the window; `poll_timeout` must then advertise it so
+        // the driver schedules a deterministic wake for the firing tick.
+        conn.handle_timeout(t0);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the seeding tick reports nothing"
+        );
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(t0 + WINDOW),
+            "the stall deadline is nearer than the keepalive and must win"
+        );
+
+        conn.handle_timeout(t0 + WINDOW);
+        let events = drain_stall_events(&mut conn);
+        assert_eq!(
+            events,
+            vec![(handle, RQ as u32, WINDOW)],
+            "one event carrying the un-spent balance and the silence duration"
+        );
+
+        // Every later tick in the same episode stays silent.
+        for extra in [1u64, 30, 300] {
+            conn.handle_timeout(t0 + WINDOW + Duration::from_secs(extra));
+        }
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "exactly one event per stall episode"
+        );
+    }
+
+    #[test]
+    fn dispatch_re_arms_the_watchdog_for_a_second_episode() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "first episode");
+
+        // The broker resumes for one message, the user drains it, then it goes
+        // silent again.
+        let resumed = t0 + WINDOW + Duration::from_secs(1);
+        conn.handle_bytes(resumed, &message_frame(handle.0, 1, b"x"))
+            .expect("deliver");
+        let _ = conn.pop_message(handle, resumed);
+        let _ = conn.poll_transmit();
+        while conn.poll_event().is_some() {}
+
+        conn.handle_timeout(resumed);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the dispatch re-seeded the window"
+        );
+        conn.handle_timeout(resumed + WINDOW);
+        let events = drain_stall_events(&mut conn);
+        assert_eq!(
+            events.len(),
+            1,
+            "a consumer that wedges twice reports twice, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_paused_consumer_never_stalls() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        conn.set_paused(handle, true);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW * 4);
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "the user asked the broker to stop; reporting that back is noise"
+        );
+    }
+
+    #[test]
+    fn resubscribe_in_place_zeroes_permits_and_defers_flow_to_the_ack() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        // Drive it into a reported stall first — this is the recovery ladder's
+        // entry point, so the two halves are exercised in the order a caller
+        // would run them.
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "stall reported");
+
+        let resub_rid = conn.peek_next_request_id_for_test();
+        let issued = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("a live, acked, un-gated consumer is eligible");
+        assert_eq!(issued.0, resub_rid);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "the broker recreates its dispatcher slot at availablePermits = 0; the \
+             client's mirrors must follow"
+        );
+        let (subs, grants_before_ack) = drain_outbound(&mut conn, handle);
+        assert_eq!(subs, vec![resub_rid], "one fresh CommandSubscribe");
+        assert!(
+            grants_before_ack.is_empty(),
+            "pre-ack flow is dropped broker-side (ServerCnx.handleFlow 'Couldn't find \
+             consumer'), so it must be deferred"
+        );
+
+        feed_success(&mut conn, resub_rid, t0 + WINDOW);
+        let (_subs, grants_after_ack) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            grants_after_ack,
+            vec![RQ as u32],
+            "the Success arm re-arms the full receiver-queue grant"
+        );
+        assert_eq!(conn.consumer_available_permits(handle), RQ as u32);
+        assert!(!conn.consumer_is_closed(handle), "the consumer stays open");
+
+        // And the re-arm restarted the watchdog rather than inheriting the
+        // reported window: a fresh episode has to run its full length.
+        conn.handle_timeout(t0 + WINDOW);
+        assert!(drain_stall_events(&mut conn).is_empty(), "re-seed only");
+        conn.handle_timeout(t0 + WINDOW + WINDOW.saturating_sub(Duration::from_millis(1)));
+        assert!(
+            drain_stall_events(&mut conn).is_empty(),
+            "still one millisecond short of the new window"
+        );
+    }
+
+    #[test]
+    fn resubscribe_in_place_fails_in_flight_acks() {
+        // Issue #346's contract, reached through the #414 entry point: the old
+        // consumer generation is retired, so no CommandAckResponse for it can
+        // ever arrive and a parked `ack().await` would hang to the backstop.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let ack_rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                    #[cfg(feature = "scalable-topics")]
+                    segment_id: None,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound(&mut conn, handle);
+
+        conn.resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        match conn.take_outcome(PendingOpKey::Request(ack_rid)) {
+            Some(OpOutcome::Error { code, message, .. }) => {
+                assert_eq!(code, -1);
+                assert_eq!(message, "ack orphaned by broker consumer close");
+            }
+            other => panic!("in-flight ack must be failed synchronously, got {other:?}"),
+        }
+    }
+
+    /// The ineligible states must be refused BEFORE anything is mutated —
+    /// zeroing the permit mirrors for a consumer we then decline to re-subscribe
+    /// would leave it strictly worse off than the stall it was in.
+    #[test]
+    fn an_ineligible_consumer_is_refused_without_being_touched() {
+        let t0 = Instant::now();
+        for (label, mutate) in [
+            (
+                "closed",
+                (|c: &mut crate::consumer::ConsumerState| c.closed = true)
+                    as fn(&mut crate::consumer::ConsumerState),
+            ),
+            (
+                "terminal_failure",
+                |c: &mut crate::consumer::ConsumerState| {
+                    c.terminal_failure = Some("dead".to_owned());
+                },
+            ),
+            ("pending_seek", |c: &mut crate::consumer::ConsumerState| {
+                c.pending_seek = Some(RequestId(99));
+            }),
+            (
+                "flow_on_subscribe_ack",
+                |c: &mut crate::consumer::ConsumerState| c.flow_on_subscribe_ack = true,
+            ),
+            (
+                "unsubscribe_request_id",
+                |c: &mut crate::consumer::ConsumerState| {
+                    c.unsubscribe_request_id = Some(RequestId(98));
+                },
+            ),
+        ] {
+            let (mut conn, handle) = shared_consumer(None, t0);
+            mutate(
+                &mut conn
+                    .consumers
+                    .get(&handle)
+                    .expect("registered")
+                    .state
+                    .lock(),
+            );
+            assert_eq!(
+                conn.resubscribe_consumer_in_place(handle),
+                None,
+                "{label} must refuse an in-place re-subscribe"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                RQ as u32,
+                "{label}: a refused re-subscribe must not zero the permit mirrors"
+            );
+            let (subs, grants) = drain_outbound(&mut conn, handle);
+            assert!(
+                subs.is_empty() && grants.is_empty(),
+                "{label}: a refused re-subscribe must put nothing on the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn resubscribe_in_place_refuses_an_unknown_handle() {
+        let t0 = Instant::now();
+        let (mut conn, _handle) = shared_consumer(None, t0);
+        assert_eq!(
+            conn.resubscribe_consumer_in_place(ConsumerHandle(4242)),
+            None,
+            "an unknown handle has no subscribe request to replay"
+        );
     }
 }
 

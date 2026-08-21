@@ -86,6 +86,49 @@ struct ConsumerState {
     /// mode, where it is the key into [`CrossSession::cursors`] so a
     /// `CommandAck` advances the right durable cursor.
     subscription: String,
+    /// `Some((topic, subscription))` when this consumer subscribed with
+    /// `SubType::Shared` and is therefore served by the cross-consumer
+    /// [`SharedDispatcher`] under that key rather than by its own `cursor`
+    /// (issue #414). `None` for every other subscription type, which keeps the
+    /// per-consumer walk every existing golden trace depends on byte-identical.
+    shared_key: Option<(String, String)>,
+}
+
+/// One Pulsar **Shared** subscription's dispatcher (issue #414).
+///
+/// The scripted broker used to give every consumer its own ledger cursor, so
+/// two consumers on one Shared subscription each walked the whole ledger — a
+/// shape the real broker never produces, and one in which the issue #414
+/// failure mode is not even expressible. This models what a Shared dispatcher
+/// actually is: ONE cursor over the ledger, shared by every attached consumer,
+/// handed out round-robin to whichever attached consumers hold permits.
+///
+/// Consumer churn is the whole point of the model. When a consumer detaches
+/// (`CommandCloseConsumer`, or the last-clone drop guard), the entries it was
+/// holding un-acked are not lost: they go back into [`Self::redelivery`] and
+/// the surviving consumers get them ahead of the cursor — which is exactly the
+/// broker behaviour the #414 scale-down / recycle window exercises.
+///
+/// Scoped to one session, keyed by `(topic, subscription)`, following the same
+/// stable-identity-key precedent the issue #406 `(topic, producer_name)`
+/// registry set.
+#[derive(Debug, Default)]
+struct SharedDispatcher {
+    /// Next index into the topic's ledger to hand out. ONE cursor for the whole
+    /// subscription — the difference between a real Shared dispatcher and the
+    /// per-consumer full-ledger walk this replaces.
+    cursor: usize,
+    /// Attached consumer ids, in attach order — the round-robin ring.
+    attached: Vec<u64>,
+    /// Index into [`Self::attached`] the next dispatch round starts scanning
+    /// from, so a consumer that is out of permits does not monopolise the ring.
+    next: usize,
+    /// Entries handed to a consumer and not yet acked, keyed by consumer id.
+    /// A detach returns this consumer's entries to [`Self::redelivery`].
+    in_flight: HashMap<u64, Vec<StoredMessage>>,
+    /// Entries returned by a detaching consumer, redelivered to the survivors
+    /// ahead of the shared cursor (FIFO, oldest first).
+    redelivery: std::collections::VecDeque<StoredMessage>,
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +225,10 @@ struct SessionState {
     withhold_fired: bool,
     /// Per consumer id (assigned by the client).
     consumers: HashMap<u64, (String, ConsumerState)>,
+    /// Live Shared-subscription dispatchers keyed by `(topic, subscription)`
+    /// (issue #414). Empty for every trace that opens no `SubType::Shared`
+    /// consumer, which is every pre-#414 golden trace.
+    shared_dispatchers: HashMap<(String, String), SharedDispatcher>,
     /// Observability view of every stored message id grouped by
     /// partition index (parsed from the topic's `-partition-N`
     /// suffix; `-1` when the topic is non-partitioned).
@@ -1109,17 +1156,44 @@ fn handle_frame(
                 } else {
                     0
                 };
-                state.lock().consumers.insert(
-                    s.consumer_id,
-                    (
-                        s.topic.clone(),
-                        ConsumerState {
-                            cursor,
-                            subscription: s.subscription.clone(),
-                            ..ConsumerState::default()
-                        },
-                    ),
-                );
+                // Issue #414: a `SubType::Shared` consumer joins the ONE
+                // dispatcher for its `(topic, subscription)` instead of walking
+                // the ledger on its own cursor. Every other subscription type
+                // keeps the historical per-consumer walk verbatim.
+                let shared_key = (s.sub_type == pb::command_subscribe::SubType::Shared as i32)
+                    .then(|| (s.topic.clone(), s.subscription.clone()));
+                {
+                    let mut g = state.lock();
+                    g.consumers.insert(
+                        s.consumer_id,
+                        (
+                            s.topic.clone(),
+                            ConsumerState {
+                                cursor,
+                                subscription: s.subscription.clone(),
+                                shared_key: shared_key.clone(),
+                                ..ConsumerState::default()
+                            },
+                        ),
+                    );
+                    if let Some(key) = shared_key {
+                        let dispatcher = g.shared_dispatchers.entry(key).or_default();
+                        // A re-subscribe of the SAME consumer id (issue #307's
+                        // same-broker re-attach, issue #414's caller-driven
+                        // recovery) must not double-register it in the ring.
+                        // Its in-flight entries stay with it: the client id is
+                        // unchanged, so the broker has not detached anything.
+                        if !dispatcher.attached.contains(&s.consumer_id) {
+                            dispatcher.attached.push(s.consumer_id);
+                        }
+                        // A re-attach recreates the dispatcher slot at zero
+                        // permits broker-side — mirrors the real broker, and it
+                        // is what makes the client's own permit zeroing correct.
+                        if let Some((_, c)) = g.consumers.get_mut(&s.consumer_id) {
+                            c.permits = 0;
+                        }
+                    }
+                }
                 emit_success(out, s.request_id);
             }
         }
@@ -1161,6 +1235,28 @@ fn handle_frame(
                                 *cur = (*cur).max(next);
                             }
                         }
+                    }
+                }
+                // Issue #414: a Shared dispatcher only redelivers what is still
+                // un-acked, so an ack retires the entry from this consumer's
+                // in-flight set. Without this a consumer that acked everything
+                // and then detached would still hand its whole history back to
+                // the survivors.
+                {
+                    let mut g = state.lock();
+                    let key = g
+                        .consumers
+                        .get(&a.consumer_id)
+                        .and_then(|(_, c)| c.shared_key.clone());
+                    if let Some(key) = key
+                        && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
+                        && let Some(in_flight) = dispatcher.in_flight.get_mut(&a.consumer_id)
+                    {
+                        in_flight.retain(|m| {
+                            !a.message_id
+                                .iter()
+                                .any(|id| id.ledger_id == m.ledger_id && id.entry_id == m.entry_id)
+                        });
                     }
                 }
                 // PIP-31: if the ack carries a txn id, stage it against
@@ -1350,7 +1446,36 @@ fn handle_frame(
         }
         pb::base_command::Type::CloseConsumer => {
             if let Some(c) = &frame.command.close_consumer {
-                state.lock().consumers.remove(&c.consumer_id);
+                let mut g = state.lock();
+                let removed = g.consumers.remove(&c.consumer_id);
+                // Issue #414: detaching a Shared consumer returns everything it
+                // was holding un-acked to the subscription's redelivery pool, so
+                // a survivor picks it up. This is the broker half of the
+                // scale-down / mid-drain-recycle window the issue reports.
+                if let Some((_, state)) = removed
+                    && let Some(key) = state.shared_key
+                    && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
+                {
+                    dispatcher.attached.retain(|id| *id != c.consumer_id);
+                    // `unwrap_or_default` rather than `if let Some`: a consumer that never
+                    // received anything simply has nothing to hand back, and that is not a
+                    // separate case worth branching on — a dispatcher that redelivered on
+                    // an empty detach would duplicate the backlog on every scale-down.
+                    for m in dispatcher
+                        .in_flight
+                        .remove(&c.consumer_id)
+                        .unwrap_or_default()
+                    {
+                        dispatcher.redelivery.push_back(m);
+                    }
+                    // Keep the round-robin start inside the shrunken ring.
+                    if dispatcher.attached.is_empty() {
+                        dispatcher.next = 0;
+                    } else {
+                        dispatcher.next %= dispatcher.attached.len();
+                    }
+                }
+                drop(g);
                 emit_success(out, c.request_id);
             }
         }
@@ -1360,6 +1485,24 @@ fn handle_frame(
     // that returns `false` (above), to close the session after writing its
     // unparseable frame.
     true
+}
+
+/// The ledger this session serves for `topic`.
+///
+/// In **resume mode** (the drop + redial knob armed) a topic's messages live in
+/// the cross-session store so they survive the redial; in **isolated mode** —
+/// the default for every other trace — they live on this session alone. Both
+/// [`push_pending`]'s per-consumer walk and [`push_pending_shared`]'s Shared
+/// dispatcher make the identical choice, so it is made once here.
+fn topic_ledger(
+    state: &SessionState,
+    resume: Option<&Arc<Mutex<CrossSession>>>,
+    topic: &str,
+) -> Vec<StoredMessage> {
+    match resume {
+        Some(cross) => cross.lock().ledger.get(topic).cloned().unwrap_or_default(),
+        None => state.ledger.get(topic).cloned().unwrap_or_default(),
+    }
 }
 
 fn push_pending(
@@ -1372,13 +1515,17 @@ fn push_pending(
     let mut to_push: Vec<(u64, Vec<StoredMessage>)> = Vec::new();
     {
         let mut g = state.lock();
+        // Issue #414: Shared subscriptions are served by their own dispatcher
+        // (one cursor, round-robin over attached consumers) before the
+        // per-consumer walk below, which then skips them.
+        push_pending_shared(&mut g, resume, &mut to_push);
         // Avoid `clone_into_iter`-style traps: collect ids first.
         let ids: Vec<u64> = g.consumers.keys().copied().collect();
         for cid in ids {
             let Some((topic, c)) = g.consumers.get_mut(&cid) else {
                 continue;
             };
-            if c.permits == 0 {
+            if c.permits == 0 || c.shared_key.is_some() {
                 continue;
             }
             let topic = topic.clone();
@@ -1389,13 +1536,9 @@ fn push_pending(
                 batch.push(m);
                 c.permits -= 1;
             }
-            // Then deliver from the cursor. In resume mode the topic's
-            // messages live in the cross-session ledger (so they survive a
-            // redial); in isolated mode they live on this session.
-            let ledger = match resume {
-                Some(cross) => cross.lock().ledger.get(&topic).cloned().unwrap_or_default(),
-                None => g.ledger.get(&topic).cloned().unwrap_or_default(),
-            };
+            // Then deliver from the cursor, out of whichever ledger this
+            // session is serving (see `topic_ledger`).
+            let ledger = topic_ledger(&g, resume, &topic);
             let (_, c) = g.consumers.get_mut(&cid).expect("present");
             while c.permits > 0 && c.cursor < ledger.len() {
                 batch.push(ledger[c.cursor].clone());
@@ -1410,6 +1553,83 @@ fn push_pending(
     for (cid, batch) in to_push {
         for m in batch {
             emit_message(out, cid, &m);
+        }
+    }
+}
+
+/// Dispatch one round for every live Shared subscription (issue #414).
+///
+/// One cursor per `(topic, subscription)`, handed out round-robin to whichever
+/// attached consumers still hold permits, with a detaching consumer's un-acked
+/// entries redelivered ahead of the cursor. Loops until either no attached
+/// consumer has a permit left or the ledger and the redelivery pool are both
+/// exhausted, so one call drains as much as the granted permits allow — exactly
+/// what the per-consumer walk below it does for the other subscription types.
+///
+/// Appends into the caller's `to_push` list so the encode loop stays outside the
+/// state lock, matching [`push_pending`]'s existing shape.
+fn push_pending_shared(
+    g: &mut SessionState,
+    resume: Option<&Arc<Mutex<CrossSession>>>,
+    to_push: &mut Vec<(u64, Vec<StoredMessage>)>,
+) {
+    let keys: Vec<(String, String)> = g.shared_dispatchers.keys().cloned().collect();
+    for key in keys {
+        let ledger = topic_ledger(g, resume, &key.0);
+        // Pick the next attached consumer holding a permit, starting from where
+        // the previous round stopped so no consumer monopolises the ring.
+        while let Some(dispatcher) = g.shared_dispatchers.get(&key) {
+            if dispatcher.attached.is_empty() {
+                break;
+            }
+            let ring = dispatcher.attached.clone();
+            let start = dispatcher.next % ring.len();
+            let chosen = (0..ring.len()).find_map(|offset| {
+                let slot = (start + offset) % ring.len();
+                let cid = ring[slot];
+                g.consumers
+                    .get(&cid)
+                    .is_some_and(|(_, c)| c.permits > 0)
+                    .then_some(((slot + 1) % ring.len(), cid))
+            });
+            let Some((next_start, cid)) = chosen else {
+                break;
+            };
+            // Redeliveries (returned by a detached consumer) go out ahead of the
+            // shared cursor; a real broker replays the un-acked backlog first.
+            let entry = {
+                let dispatcher = g
+                    .shared_dispatchers
+                    .get_mut(&key)
+                    .expect("checked present above");
+                dispatcher.next = next_start;
+                if let Some(m) = dispatcher.redelivery.pop_front() {
+                    Some(m)
+                } else if dispatcher.cursor < ledger.len() {
+                    let m = ledger[dispatcher.cursor].clone();
+                    dispatcher.cursor += 1;
+                    Some(m)
+                } else {
+                    None
+                }
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+            if let Some((_, c)) = g.consumers.get_mut(&cid) {
+                c.permits = c.permits.saturating_sub(1);
+            }
+            g.shared_dispatchers
+                .get_mut(&key)
+                .expect("checked present above")
+                .in_flight
+                .entry(cid)
+                .or_default()
+                .push(entry.clone());
+            match to_push.iter_mut().find(|(id, _)| *id == cid) {
+                Some((_, batch)) => batch.push(entry),
+                None => to_push.push((cid, vec![entry])),
+            }
         }
     }
 }

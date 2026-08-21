@@ -293,16 +293,20 @@ fn flow_control_replenishes_without_permit_underrun() {
         "every replenishment flow must grant a positive permit batch, got {replenish_grants:?}",
     );
 
-    // Invariant 3: permits never under-run. After replenishment the broker is
-    // granted *more* than the initial window (initial RQ + the replenished
-    // batches), and the counter is a monotone-or-saturating `u32` — it never
-    // wraps below zero.
+    // Invariant 3: permits never under-run. Issue #414 re-pointed
+    // `available_permits` at the REAL decrementing balance, so the exact
+    // arithmetic is now "everything granted, minus everything the broker
+    // spent" — which is a strictly stronger statement than the cumulative
+    // grant this used to assert, because it ties the wire grants AND the
+    // dispatches together. The counter is a saturating `u32`; it never wraps
+    // below zero.
     let final_permits = shared.inner.lock().consumer_available_permits(handle);
     let total_granted: u32 = RQ as u32 + replenish_grants.iter().sum::<u32>();
+    let expected_balance = total_granted - pushed;
     assert_eq!(
-        final_permits, total_granted,
-        "available_permits ({final_permits}) must equal the initial grant plus every \
-         replenishment ({total_granted}) — no underflow, no drift",
+        final_permits, expected_balance,
+        "available_permits ({final_permits}) must equal every grant ({total_granted}) \
+         minus every dispatch unit the broker spent ({pushed}) — no underflow, no drift",
     );
     assert!(
         final_permits >= RQ as u32,
@@ -325,7 +329,7 @@ fn flow_control_replenishes_without_permit_underrun() {
     );
     assert_eq!(
         shared.inner.lock().consumer_available_permits(handle),
-        total_granted,
+        expected_balance,
         "the permit counter is unchanged by an empty-queue pop",
     );
 }
@@ -397,14 +401,17 @@ fn flow_control_single_permit_window_never_underruns() {
         );
         total_replenished += grants.iter().sum::<u32>();
 
-        // After each window the broker is granted the initial permit plus every
-        // replenishment so far — a strictly non-decreasing count, never an
-        // underflow.
+        // After each window the broker holds exactly what it has been granted
+        // minus what it has spent. Issue #414 re-pointed `available_permits` at
+        // the REAL balance, so a single-message window settles back at exactly
+        // `RQ` after every push/pop pair rather than climbing with the
+        // cumulative grant — the strictly stronger statement, since it pins the
+        // dispatch side too.
         let permits = shared.inner.lock().consumer_available_permits(handle);
         assert_eq!(
             permits,
-            RQ as u32 + total_replenished,
-            "window {w}: permits track the initial grant plus replenishments, no underflow",
+            RQ as u32 + total_replenished - received,
+            "window {w}: permits track every grant minus every dispatch, no underflow",
         );
         assert!(
             permits >= RQ as u32,

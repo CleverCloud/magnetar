@@ -46,6 +46,9 @@ pub struct ClientBuilder {
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `stats_interval`.
     /// `Some(Duration::ZERO)` is the Java `statsIntervalSeconds = 0` disable.
     stats_interval: Option<Duration>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `None` (watchdog off).
+    /// `Some(Duration::ZERO)` disables it explicitly (issue #414).
+    consumer_stall_timeout: Option<Duration>,
     operation_timeout: Option<Duration>,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `Some(30s)`.
@@ -72,6 +75,7 @@ impl Default for ClientBuilder {
             client_version: None,
             keepalive: None,
             stats_interval: None,
+            consumer_stall_timeout: None,
             operation_timeout: None,
             operation_retry: None,
             ack_response_timeout: None,
@@ -219,6 +223,34 @@ impl ClientBuilder {
     #[must_use]
     pub fn stats_interval(mut self, dur: Duration) -> Self {
         self.stats_interval = Some(dur);
+        self
+    }
+
+    /// Arm the per-consumer stall watchdog (issue #414).
+    ///
+    /// A consumer that holds un-spent broker permits over an empty receive queue, in a
+    /// dispatch-eligible state, for `dur` without a single dispatch unit arriving surfaces
+    /// one `warn!` and one
+    /// [`ConnectionEvent::ConsumerStalled`](magnetar_proto::event::ConnectionEvent::ConsumerStalled)
+    /// — exactly one per stall episode, re-armed by the next dispatch. That is its only
+    /// effect: recovery stays an explicit call to `Consumer::resubscribe()`, escalating to
+    /// an operator-side `pulsar-admin topics unload` for a dispatcher-wide broker fault.
+    ///
+    /// This is the one silence the ADR-0058 connection keepalive cannot see: a broker whose
+    /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`.
+    ///
+    /// **Unset by default** — the mechanism ships disarmed, since an armed deadline
+    /// perturbs the moonpool engine's simulated wake schedule even when it never fires, and
+    /// Java has no per-consumer dispatch watchdog to inherit a parity value from.
+    /// `Duration::from_secs(30)` is the recommended production value: it matches the
+    /// keepalive and ack-response cadences, and is far longer than any legitimate dispatch
+    /// gap on a subscription that holds permits over an empty queue.
+    ///
+    /// `Duration::ZERO` disables it explicitly, mirroring how
+    /// [`Self::stats_interval`] spells its disable.
+    #[must_use]
+    pub fn consumer_stall_timeout(mut self, dur: Duration) -> Self {
+        self.consumer_stall_timeout = Some(dur);
         self
     }
 
@@ -436,6 +468,11 @@ impl ClientBuilder {
         // this knob still gets Java-parity sampling.
         if let Some(d) = self.stats_interval {
             config.stats_interval = (d != Duration::ZERO).then_some(d);
+        }
+        // Issue #414: same zero-disables shape as `stats_interval` above. Unset leaves
+        // `ConnectionConfig::default()`'s `None` — the watchdog is opt-in.
+        if let Some(d) = self.consumer_stall_timeout {
+            config.consumer_stall_timeout = (d != Duration::ZERO).then_some(d);
         }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;

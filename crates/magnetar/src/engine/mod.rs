@@ -580,10 +580,15 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `Consumer#getNumMessagesInQueue`.
     fn available_in_queue(&self) -> usize;
 
-    /// Outstanding dispatch permits the consumer has granted the broker
-    /// (messages it has authorised the broker to push without an
-    /// explicit `CommandFlow`). Mirrors Java
+    /// Outstanding dispatch permits the broker still holds un-spent for this
+    /// consumer — the grants it has been given, minus one per dispatch unit
+    /// that has actually arrived. Mirrors Java
     /// `ConsumerBase#getAvailablePermits`.
+    ///
+    /// Issue #414 re-pointed this from the purely-additive grant mirror to
+    /// the real decrementing balance, so a value pinned high while messages
+    /// stop arriving is now a usable stall signal (ADR-0101 amending
+    /// ADR-0082).
     fn available_permits(&self) -> u32;
 
     /// `true` once the consumer has received at least one message since

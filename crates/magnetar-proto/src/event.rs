@@ -321,6 +321,37 @@ pub enum ConnectionEvent {
         active: bool,
     },
 
+    /// A consumer has held un-spent broker permits over an empty receive queue, in a
+    /// dispatch-eligible state, for
+    /// [`ConnectionConfig::consumer_stall_timeout`](crate::conn::ConnectionConfig)
+    /// without a single dispatch unit arriving (issue #414).
+    ///
+    /// Emitted at most **once per stall episode**: the next dispatch unit re-arms the
+    /// watchdog, so a consumer that recovers and wedges again reports twice. `None` of
+    /// the client's own state explains the silence — not `pause`, not an in-flight seek,
+    /// not end-of-topic, not a re-attach in progress; all of those suppress the watchdog.
+    ///
+    /// The wire protocol carries only monotonic client → broker permit increments
+    /// (`CommandFlow`), so the client cannot itself drive the broker's counter negative:
+    /// this event says the BROKER stopped dispatching against a grant it acknowledged.
+    /// The connection is otherwise healthy — ADR-0058's keepalive keeps passing, which is
+    /// precisely why it cannot detect this.
+    ///
+    /// Purely diagnostic. Recovery is the caller's explicit choice:
+    /// [`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place)
+    /// repairs this client's own dispatcher slot; a dispatcher-wide broker corruption
+    /// needs an operator-side `pulsar-admin topics unload`.
+    ConsumerStalled {
+        /// The consumer whose dispatch went silent.
+        handle: ConsumerHandle,
+        /// Permits the broker still had un-spent at the moment the stall was reported —
+        /// the client-side mirror of the broker's `availablePermits` for this consumer.
+        permit_balance: u32,
+        /// How long the silence had lasted when the watchdog fired. At least
+        /// `consumer_stall_timeout`; longer when the tick that noticed it ran late.
+        stalled_for: std::time::Duration,
+    },
+
     /// Broker requested the producer or consumer to migrate to a different broker URL.
     TopicMigrated {
         /// Producer handle if the resource type was `Producer`.
