@@ -271,11 +271,16 @@ impl core::fmt::Debug for Connection {
 /// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
 
-/// Cap on OBSERVATIONAL events (`ConnectionEvent::Message` /
-/// `MessageReceivedFromShadow`) queued in `Connection::events`. These are
-/// per-message payload clones emitted for observability; no production
-/// consumer drains them (issue #413), so without a bound they retain every
-/// received payload and grow the event queue until OOM. Protocol-bearing
+/// Cap on OBSERVATIONAL events queued in `Connection::events` — the ones
+/// emitted once per message, on either side of the connection:
+/// `ConnectionEvent::Message` / `MessageReceivedFromShadow` when consuming,
+/// `SendReceipt` / `SendError` when producing. No production consumer drains
+/// them (issue #413), so without a bound they grow the queue until OOM.
+/// Issue #423 is the same defect on the producer side: a steady sender queued
+/// one event per acknowledged message for the whole life of the connection.
+/// Dropping them is always safe — payload delivery goes through
+/// `pop_message`, send completion through the operation outcome and its
+/// waker, and both are settled before the event is queued. Protocol-bearing
 /// events (subscribe/producer/connection lifecycle) are NEVER dropped and are
 /// not counted against this cap.
 pub const EVENT_QUEUE_OBSERVATIONAL_CAP: usize = 4096;
@@ -2238,7 +2243,7 @@ impl Connection {
                         } else if let Some(w) = self.wakers.remove(&key) {
                             w.wake();
                         }
-                        self.events.push_back(ConnectionEvent::SendReceipt {
+                        self.push_observational_event(ConnectionEvent::SendReceipt {
                             handle,
                             sequence_id: seq,
                             message_id: mid,
@@ -2278,7 +2283,7 @@ impl Connection {
                     } else if let Some(w) = self.wakers.remove(&key) {
                         w.wake();
                     }
-                    self.events.push_back(ConnectionEvent::SendError {
+                    self.push_observational_event(ConnectionEvent::SendError {
                         handle,
                         sequence_id: seq,
                         code,
@@ -3736,19 +3741,24 @@ impl Connection {
         crate::Transmit::Contiguous(&self.pending_vectored_drain.insert(out)[..])
     }
 
-    /// Pull the next [`ConnectionEvent`], if any.
-    /// Queue an OBSERVATIONAL event (per-message `Message` /
-    /// `MessageReceivedFromShadow`), dropping it instead when the queue
-    /// already holds [`EVENT_QUEUE_OBSERVATIONAL_CAP`] observational entries.
-    /// Issue #413: these events carry full payload clones and nothing in the
-    /// production runtime consumes them, so an unbounded queue retains every
-    /// received payload until OOM. Dropping is always safe — observability
-    /// only, no protocol obligation. Non-observational events must keep going
-    /// through `self.events.push_back` directly (they are never dropped).
+    /// Queue an OBSERVATIONAL event — one emitted per message, either received
+    /// (`Message` / `MessageReceivedFromShadow`) or acknowledged by the broker
+    /// (`SendReceipt` / `SendError`) — dropping it instead when the queue
+    /// already holds [`EVENT_QUEUE_OBSERVATIONAL_CAP`] entries.
+    /// Issues #413 and #423: nothing in the production runtime consumes these
+    /// events, so an unbounded queue grows for the life of the connection —
+    /// until OOM on a busy consumer, and equally on a busy producer. Dropping
+    /// is always safe: delivery goes through `pop_message` and send completion
+    /// through the operation outcome and its waker, both settled before the
+    /// event is queued. Non-observational events must keep going through
+    /// `self.events.push_back` directly (they are never dropped).
     fn push_observational_event(&mut self, event: ConnectionEvent) {
         debug_assert!(matches!(
             event,
-            ConnectionEvent::Message { .. } | ConnectionEvent::MessageReceivedFromShadow { .. }
+            ConnectionEvent::Message { .. }
+                | ConnectionEvent::MessageReceivedFromShadow { .. }
+                | ConnectionEvent::SendReceipt { .. }
+                | ConnectionEvent::SendError { .. }
         ));
         // O(1) proxy: compare the TOTAL queue length against the cap rather
         // than counting observational entries. Non-observational events are
@@ -3773,6 +3783,7 @@ impl Connection {
         self.dropped_observational_events
     }
 
+    /// Pull the next [`ConnectionEvent`], if any.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         let event = self.events.pop_front()?;
         self.remove_driver_retry_for_event(&event);
