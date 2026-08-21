@@ -163,8 +163,7 @@ pub fn murmur3_32_hash(bytes: &[u8]) -> u32 {
         k1
     };
 
-    let chunks = bytes.chunks_exact(4);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = bytes.as_chunks::<4>();
     for chunk in chunks {
         // Java's `ByteBuffer.LITTLE_ENDIAN.getInt()` reads four bytes little-endian.
         let k1 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);

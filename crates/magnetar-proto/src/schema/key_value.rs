@@ -452,7 +452,7 @@ mod tests {
             return None;
         }
         let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
             let (a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3]);
             let av = lookup[a as usize];
             let bv = lookup[b as usize];
