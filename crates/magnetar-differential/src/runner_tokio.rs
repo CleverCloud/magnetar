@@ -99,6 +99,30 @@ pub async fn run_supervised_with_operation_timeout(
     .await
 }
 
+/// Run `trace` against the tokio engine with a caller-supplied
+/// `operation_timeout` and NO supervisor. The producer-open cancellation
+/// scenario (issue #406 / ADR-0100) needs a short deadline so a withheld
+/// `CommandProducerSuccess` gives up quickly, and a plain client so the only
+/// thing that can free the pinned name is the engine's own close-before-retry.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_operation_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            operation_timeout,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,
@@ -135,6 +159,12 @@ async fn run_with_config(
     // partition.
     let mut part_producers: HashMap<i32, Producer> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer> = HashMap::new();
+
+    // Producers opened by `Op::OpenNamedProducer`, held for the whole trace.
+    // Releasing one mid-trace would fire ADR-0057's last-clone drop guard and
+    // put a second, asynchronous `CommandCloseProducer` on the wire, which is
+    // exactly the frame the issue #406 scenario is counting.
+    let mut named_producers: Vec<Producer> = Vec::new();
 
     // PIP-31: the current open txn id, if any. `NewTxn` populates it;
     // `EndTxn` consumes it. The harness supports one in-flight
@@ -327,6 +357,12 @@ async fn run_with_config(
                         kind: "consumer-open-failed".to_owned(),
                     }),
                 }
+            }
+            Op::OpenNamedProducer { name } => {
+                stream.push(
+                    run_open_named_producer(&client, &trace.topic, name, &mut named_producers)
+                        .await,
+                );
             }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
@@ -622,6 +658,32 @@ async fn run_ack_in_txn(
     match consumer.ack_with_txn(message_id, txn_id).await {
         Ok(()) => Event::AckedInTxn,
         Err(e) => Event::AckInTxnError { kind: classify(&e) },
+    }
+}
+
+/// Issue #406 / ADR-0100: open one extra producer under a pinned name. The
+/// event is the open's verdict — that is the differential claim — and a
+/// successful handle is parked in `held` so it keeps holding the name for the
+/// rest of the trace instead of firing a drop-close mid-run.
+async fn run_open_named_producer(
+    client: &Client,
+    topic: &str,
+    name: &str,
+    held: &mut Vec<Producer>,
+) -> Event {
+    match client
+        .open_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            producer_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(producer) => {
+            held.push(producer);
+            Event::NamedProducerOpened
+        }
+        Err(e) => Event::NamedProducerOpenError { kind: classify(&e) },
     }
 }
 

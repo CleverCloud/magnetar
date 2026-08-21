@@ -162,6 +162,24 @@ struct SessionState {
     ledger: HashMap<String, Vec<StoredMessage>>,
     /// Per producer id (assigned by the client).
     producers: HashMap<u64, (String, ProducerState)>,
+    /// Live `(topic, producer_name) → producer_id` registrations, the
+    /// broker resource issue #406 leaks. A `CommandProducer` naming a key
+    /// already present is answered with `ProducerBusy` (the broker's
+    /// `NamingException`); a `CommandCloseProducer` releases every key the
+    /// closed id holds. Only user-provided, non-empty names register — an
+    /// unnamed open is assigned a unique name broker-side and never collides.
+    producer_names: HashMap<(String, String), u64>,
+    /// One withheld `(producer_id, request_id, producer_name)` whose
+    /// `CommandProducerSuccess` the session is deliberately sitting on, so a
+    /// client open races its `operation_timeout` while the registration
+    /// exists broker-side. Released — and finally flushed as a LATE success —
+    /// when the client closes that producer id. Armed by
+    /// [`ScriptedBroker::withhold_first_producer_success_for_name`].
+    withheld_producer_success: Option<(u64, u64, String)>,
+    /// One-shot latch for [`Self::withheld_producer_success`]: only the FIRST
+    /// matching open on a session is withheld, so the client's retry is
+    /// served normally.
+    withhold_fired: bool,
     /// Per consumer id (assigned by the client).
     consumers: HashMap<u64, (String, ConsumerState)>,
     /// Observability view of every stored message id grouped by
@@ -279,6 +297,11 @@ struct SessionDeps {
     /// first redial producer-open has been transiently rejected, so the retry's
     /// open (and every later open) is acked.
     transient_reject_fired: Arc<AtomicBool>,
+    /// Producer name whose FIRST open on each session has its
+    /// `CommandProducerSuccess` withheld until the client closes the
+    /// registered producer id (issue #406). `None` — the default — serves
+    /// every open normally.
+    withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -360,6 +383,12 @@ pub struct ScriptedBroker {
     /// One-shot latch for [`Self::transient_reject_on_redial`]. Reset by
     /// [`Self::clear_cross_session_state`].
     transient_reject_fired: Arc<AtomicBool>,
+    /// Producer name whose FIRST open on each session has its
+    /// `CommandProducerSuccess` withheld (issue #406). Armed by
+    /// [`Self::withhold_first_producer_success_for_name`]; the latch lives in
+    /// the per-session state, so both differential legs — each on its own
+    /// session — see the same one-shot behaviour with no reset between them.
+    withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -404,6 +433,8 @@ impl ScriptedBroker {
         let transient_reject_on_redial_clone = transient_reject_on_redial.clone();
         let transient_reject_fired = Arc::new(AtomicBool::new(false));
         let transient_reject_fired_clone = transient_reject_fired.clone();
+        let withhold_producer_success_for_name = Arc::new(Mutex::new(None));
+        let withhold_producer_success_for_name_clone = withhold_producer_success_for_name.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -416,6 +447,7 @@ impl ScriptedBroker {
             dropped_once: dropped_once_clone,
             transient_reject_on_redial: transient_reject_on_redial_clone,
             transient_reject_fired: transient_reject_fired_clone,
+            withhold_producer_success_for_name: withhold_producer_success_for_name_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -447,6 +479,7 @@ impl ScriptedBroker {
             dropped_once,
             transient_reject_on_redial,
             transient_reject_fired,
+            withhold_producer_success_for_name,
             cross_session,
         })
     }
@@ -533,6 +566,25 @@ impl ScriptedBroker {
     /// [`Self::clear_cross_session_state`].
     pub fn transient_reject_first_redial_producer_open(&self) {
         *self.transient_reject_on_redial.lock() = true;
+    }
+
+    /// Arm the withheld-`ProducerSuccess` injection for issue #406: on every
+    /// session, the FIRST `CommandProducer` carrying `producer_name` registers
+    /// its `(topic, name)` key as usual but its `CommandProducerSuccess` is
+    /// **withheld**, so the client's open races its `operation_timeout` while
+    /// the broker-side registration exists. Any later open naming the same
+    /// `(topic, name)` is rejected with `ProducerBusy` — the broker's
+    /// `NamingException` — until a `CommandCloseProducer` for the registered
+    /// producer id releases the key, at which point the withheld success is
+    /// finally flushed as the LATE ack the client must discard.
+    ///
+    /// A client that abandons a timed-out open without closing it therefore
+    /// can never reopen the name; one that emits the close (ADR-0100) reopens
+    /// it on the next try. The one-shot latch lives in the per-session state,
+    /// so the tokio and moonpool legs — each on its own session — observe the
+    /// same script with no reset in between.
+    pub fn withhold_first_producer_success_for_name(&self, producer_name: &str) {
+        *self.withhold_producer_success_for_name.lock() = Some(producer_name.to_owned());
     }
 
     /// Number of `(topic, message)` entries persisted in the cross-session
@@ -942,10 +994,7 @@ fn handle_frame(
                 if reject {
                     emit_transient_producer_error(out, p.request_id);
                 } else {
-                    let mut g = state.lock();
-                    g.producers
-                        .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
-                    emit_producer_success(out, p.request_id, &p.topic);
+                    answer_producer_open(state, p, deps, out);
                 }
             }
         }
@@ -1277,7 +1326,25 @@ fn handle_frame(
         }
         pb::base_command::Type::CloseProducer => {
             if let Some(c) = &frame.command.close_producer {
-                state.lock().producers.remove(&c.producer_id);
+                // Issue #406: releasing the `(topic, producer_name)` keys the
+                // closed id holds is the whole point of the close — that is
+                // what frees the name for the next open. A withheld success
+                // for the same id is flushed here as the LATE ack the client
+                // must discard without resurrecting anything.
+                let released = {
+                    let mut g = state.lock();
+                    g.producers.remove(&c.producer_id);
+                    g.producer_names.retain(|_, id| *id != c.producer_id);
+                    match g.withheld_producer_success.as_ref() {
+                        Some((producer_id, _, _)) if *producer_id == c.producer_id => {
+                            g.withheld_producer_success.take()
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((_, request_id, producer_name)) = released {
+                    emit_named_producer_success(out, request_id, &producer_name);
+                }
                 emit_success(out, c.request_id);
             }
         }
@@ -1706,15 +1773,80 @@ fn emit_pong(out: &mut BytesMut) {
 }
 
 fn emit_producer_success(out: &mut BytesMut, request_id: u64, _topic: &str) {
+    emit_named_producer_success(out, request_id, "diff-broker");
+}
+
+fn emit_named_producer_success(out: &mut BytesMut, request_id: u64, producer_name: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ProducerSuccess as i32,
         producer_success: Some(pb::CommandProducerSuccess {
             request_id,
-            producer_name: "diff-broker".to_owned(),
+            producer_name: producer_name.to_owned(),
             last_sequence_id: Some(-1),
             schema_version: None,
             topic_epoch: Some(0),
             producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Register a producer open, enforcing `(topic, producer_name)` exclusivity
+/// the way a real broker's `Topic#addProducer` does, and honouring the
+/// withheld-success injection (issue #406).
+///
+/// An unnamed open (`producer_name` absent or empty) is never registered by
+/// name: the broker assigns a unique one, so it cannot collide. A named open
+/// whose key is already held is rejected with `ProducerBusy` and registers
+/// nothing.
+fn answer_producer_open(
+    state: &Arc<Mutex<SessionState>>,
+    p: &pb::CommandProducer,
+    deps: &SessionDeps,
+    out: &mut BytesMut,
+) {
+    let name = p
+        .producer_name
+        .clone()
+        .filter(|candidate| !candidate.is_empty());
+    let withhold_name = deps.withhold_producer_success_for_name.lock().clone();
+    let mut g = state.lock();
+    if let Some(name) = name.as_ref() {
+        let key = (p.topic.clone(), name.clone());
+        if g.producer_names.contains_key(&key) {
+            drop(g);
+            emit_producer_busy(out, p.request_id, name);
+            return;
+        }
+        g.producer_names.insert(key, p.producer_id);
+    }
+    g.producers
+        .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
+    if withhold_name.is_some() && withhold_name == name && !g.withhold_fired {
+        g.withhold_fired = true;
+        let effective = name.unwrap_or_default();
+        g.withheld_producer_success = Some((p.producer_id, p.request_id, effective));
+        return;
+    }
+    drop(g);
+    match name {
+        Some(name) => emit_named_producer_success(out, p.request_id, &name),
+        None => emit_producer_success(out, p.request_id, &p.topic),
+    }
+}
+
+/// Encode the broker's `NamingException` — `ProducerBusy` correlated with a
+/// producer-open `request_id`. ADR-0080 classifies it as retryable for
+/// `ProducerOpen`, so an engine that never frees the name burns its retry
+/// budget against a registration that outlives every attempt (issue #406).
+fn emit_producer_busy(out: &mut BytesMut, request_id: u64, producer_name: &str) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Error as i32,
+        error: Some(pb::CommandError {
+            request_id,
+            error: pb::ServerError::ProducerBusy as i32,
+            message: format!("Producer with name '{producer_name}' is already connected to topic"),
         }),
         ..Default::default()
     };

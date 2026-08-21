@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`ProducerBuilder::unique_name_suffix(bool)`** — opt in to appending an engine-generated unique suffix to the name set by `ProducerBuilder::name`.
+  Default off, so a pinned name stays pinned, and a no-op with no name set.
+  It is the answer to a broker-side producer registration no `CommandCloseProducer` can ever reach — one stranded by a dead client process, or behind a proxy-mediated connection that outlived it.
+  The cost is why it is opt-in: a unique name breaks `Exclusive` / `WaitForExclusive` access-mode fencing, broker-side sequence-id dedup across a restart, and per-name dashboards and metrics.
+  (issue #406; ADR-0100)
+
+### Fixed
+
+- **A producer open abandoned on its deadline no longer poisons its producer name.**
+  Cancelling an opening producer was local-only, so the broker completed the open on its own schedule and kept the `(topic, producer_name)` registration; every later open under that name then failed with `ProducerBusy` (code 16, the broker's `NamingException`) until the topic was unloaded.
+  Because `ProducerBusy` is retryable for producer-open, the retry loop re-hit that zombie with a fresh producer id until the budget ran out, stranding one more registration each time.
+  Cancellation now writes one best-effort fire-and-forget `CommandCloseProducer` for the abandoned producer id whenever the broker may still hold its registration.
+  Pulsar processes commands in order per connection, so the close reaps the registration whether or not the open had completed.
+  (issue #406; ADR-0100, amending ADR-0080)
+
 ## [1.4.1] - 2026-08-11
 
 ### Fixed

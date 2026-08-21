@@ -153,6 +153,19 @@ pub enum Op {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
     },
+    /// Issue #406 / ADR-0100: open an ADDITIONAL producer on
+    /// [`Trace::topic`] under an explicit `producer_name`, bounded by the
+    /// runner's `operation_timeout`, and drop it immediately. The point is
+    /// the open's outcome, not the handle: a name the broker still holds
+    /// answers `ProducerBusy`, and an open whose `CommandProducerSuccess` is
+    /// withheld past the deadline is abandoned — which is exactly when the
+    /// engine must push a `CommandCloseProducer` so the next open under the
+    /// same name succeeds. Pair with
+    /// [`crate::broker::ScriptedBroker::withhold_first_producer_success_for_name`].
+    OpenNamedProducer {
+        /// Producer name to pin on `CommandProducer.producer_name`.
+        name: String,
+    },
     /// PIP-31: acknowledge a single message id against the currently-
     /// open transaction id (set by the most recent [`Self::NewTxn`]).
     /// The scripted broker stages the ack against the per-txn ledger
@@ -304,6 +317,15 @@ pub enum Event {
     /// `AckInTxn` was attempted with no open transaction, or failed at
     /// the engine surface / broker.
     AckInTxnError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// [`Op::OpenNamedProducer`] resolved: the broker acked the pinned name.
+    NamedProducerOpened,
+    /// [`Op::OpenNamedProducer`] failed. Same `kind` collapse as
+    /// [`Event::SendError`] — `timeout` when the open outlived the
+    /// operation deadline, `broker:16` when the name was still held.
+    NamedProducerOpenError {
         /// Stable error category string.
         kind: String,
     },

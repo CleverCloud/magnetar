@@ -95,6 +95,26 @@ pub async fn run_supervised_with_operation_timeout(
     replay(client, trace).await
 }
 
+/// Sibling of [`crate::runner_tokio::run_with_operation_timeout`]: a plain
+/// (unsupervised) client with a caller-supplied `operation_timeout`, for the
+/// producer-open cancellation scenario (issue #406 / ADR-0100).
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_operation_timeout(
+    host_port: &str,
+    trace: &Trace,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let config = ConnectionConfig {
+        operation_timeout,
+        ..Default::default()
+    };
+    let client = Client::connect_plain(&engine, host_port, config).await?;
+    replay(client, trace).await
+}
+
 async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
@@ -118,6 +138,11 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
     // targeting that partition. See `runner_tokio.rs` for the rationale.
     let mut part_producers: HashMap<i32, Producer<TokioProviders>> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer<TokioProviders>> = HashMap::new();
+
+    // Producers opened by `Op::OpenNamedProducer`, held for the whole trace.
+    // See `runner_tokio.rs` for why releasing one mid-trace would corrupt the
+    // issue #406 close accounting.
+    let mut named_producers: Vec<Producer<TokioProviders>> = Vec::new();
 
     // PIP-31: the current open txn id, if any. Mirrors `runner_tokio.rs`.
     let mut current_txn: Option<magnetar_proto::TxnId> = None;
@@ -305,6 +330,12 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                         kind: "consumer-open-failed".to_owned(),
                     }),
                 }
+            }
+            Op::OpenNamedProducer { name } => {
+                stream.push(
+                    run_open_named_producer(&client, &trace.topic, name, &mut named_producers)
+                        .await,
+                );
             }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
@@ -591,6 +622,29 @@ async fn run_ack_in_txn(
     match consumer.ack_with_txn(message_id, txn_id).await {
         Ok(()) => Event::AckedInTxn,
         Err(e) => Event::AckInTxnError { kind: classify(&e) },
+    }
+}
+
+/// Issue #406 / ADR-0100 sibling of `runner_tokio::run_open_named_producer`.
+async fn run_open_named_producer(
+    client: &Client<TokioProviders>,
+    topic: &str,
+    name: &str,
+    held: &mut Vec<Producer<TokioProviders>>,
+) -> Event {
+    match client
+        .open_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            producer_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(producer) => {
+            held.push(producer);
+            Event::NamedProducerOpened
+        }
+        Err(e) => Event::NamedProducerOpenError { kind: classify(&e) },
     }
 }
 

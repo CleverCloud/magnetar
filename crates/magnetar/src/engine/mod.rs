@@ -123,12 +123,15 @@ pub trait Engine:
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Engine-injected id provider for the façade's auto-generated
-    /// subscription names (`Reader`, `TableView`). Tokio plugs in
+    /// subscription names (`Reader`, `TableView`) and for the opt-in
+    /// [`ProducerBuilder::unique_name_suffix`](crate::ProducerBuilder::unique_name_suffix)
+    /// policy (issue #406). Tokio plugs in
     /// `Uuid::new_v4().simple()` (RFC 4122 random); moonpool plugs in
     /// a process-global atomic counter so deterministic-simulation runs
     /// produce stable, reproducible names. Callers that need fully
     /// deterministic names across processes should always pass an
-    /// explicit subscription / reader name through the builder.
+    /// explicit subscription / reader / producer name through the builder and
+    /// leave the suffix policy off.
     fn random_subscription_suffix() -> String
     where
         Self: Sized;

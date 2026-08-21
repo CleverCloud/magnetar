@@ -1617,9 +1617,44 @@ impl Connection {
 
     /// Cancel a producer that has not completed its opening operation.
     ///
-    /// Idempotent and local-only: the broker has not acknowledged the handle,
-    /// so no `CommandCloseProducer` is required. Any detached retry leg sees
-    /// the missing request/slot and exits without re-issuing.
+    /// Idempotent. Local correlation state (pending request, slot, replay
+    /// request, queued attachment events, driver retries) is always dropped.
+    ///
+    /// **Issue #406 — close before giving up.** Purging local state is not
+    /// enough when the `CommandProducer` already entered the current
+    /// session's byte stream: the broker completes the open regardless of the
+    /// client's deadline and keeps the `(topic, producer_name)` registration,
+    /// so every later open under that name is rejected with
+    /// `ProducerBusy` (code 16, broker `NamingException`) until the topic is
+    /// unloaded. `ProducerBusy` is retryable for `ProducerOpen` (ADR-0080), so
+    /// the engines' retry loop then re-hits that zombie with a fresh
+    /// producer id until the budget runs out.
+    ///
+    /// This method therefore emits a best-effort
+    /// [`Self::close_producer_forget`] for the abandoned producer id whenever
+    /// the broker may still hold a registration for it. Pulsar processes
+    /// commands in order per connection, so a `CommandCloseProducer` written
+    /// after the `CommandProducer` on the same stream reaps the registration
+    /// whether or not the broker had completed the open; an
+    /// unknown-producer rejection is consumed in place by the forgotten-close
+    /// handlers rather than leaking an undrainable [`OpOutcome`].
+    ///
+    /// The registration may still exist exactly when either
+    ///
+    /// - a `ProducerOpen` request for `handle` is still pending — [`Self::reset`] takes
+    ///   `pending_requests` wholesale and is the only place that clears `outbound`, so a pending
+    ///   entry proves the `CommandProducer` is buffered or already flushed on **this** session and
+    ///   that no definitive reply has landed; or
+    /// - the producer is already `broker_ready` — the open completed on this session and the caller
+    ///   cancelled anyway (a `ProducerSuccess` that raced the deadline).
+    ///
+    /// A session lost to [`Self::reset`] satisfies neither (the broker reaps
+    /// every producer of a dead connection), an already-`closed` slot has its
+    /// `CommandCloseProducer` on the wire, and a second cancel finds no slot —
+    /// so none of them emits a close.
+    ///
+    /// Any detached retry leg sees the missing request/slot and exits without
+    /// re-issuing.
     pub fn cancel_producer_open(&mut self, handle: ProducerHandle) {
         let request_ids: Vec<RequestId> = self
             .pending_requests
@@ -1629,6 +1664,19 @@ impl Connection {
                     .then_some(*request_id)
             })
             .collect();
+        let broker_may_hold_registration = self.producers.get(&handle).is_some_and(|slot| {
+            let state = slot.state.lock();
+            !state.closed && (!request_ids.is_empty() || state.broker_ready)
+        });
+        if broker_may_hold_registration {
+            let close_request_id = self.close_producer_forget(handle);
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                request_id = ?close_request_id,
+                "cancelled producer open: emitted fire-and-forget CommandCloseProducer so the broker cannot keep a zombie registration (issue #406)"
+            );
+        }
         for request_id in request_ids {
             self.cancel_request(request_id);
         }
@@ -2407,6 +2455,15 @@ impl Connection {
                         "missing CommandProducerSuccess",
                     ))?;
                 let request_id = RequestId(ok.request_id);
+                // A `ProducerSuccess` with no pending entry is a reply to an
+                // open [`Self::cancel_producer_open`] already abandoned. It is
+                // dropped here — no outcome, no waker, no slot resurrection.
+                // That leaves no zombie: cancellation emitted a
+                // `CommandCloseProducer` for the same producer id on the same
+                // ordered connection, so the broker registration this success
+                // announces is already reaped by the time the client sees it
+                // (issue #406). A session that died instead of acking took its
+                // producers with it, and its bytes never reach this decoder.
                 if let Some(PendingRequestKind::ProducerOpen { handle }) =
                     self.pending_requests.remove(&request_id)
                 {
@@ -11622,6 +11679,229 @@ mod conn_state_tests {
         assert!(!conn.driver_retries.iter().any(
             |retry| matches!(retry, crate::DriverRetry::Consumer { handle, .. } if *handle == consumer)
         ));
+    }
+
+    /// Decode every `BaseCommand` sitting in a drained transmit buffer, so a
+    /// test can assert on what the state machine actually put on the wire.
+    fn decode_transmitted(bytes: &bytes::Bytes) -> Vec<pb::BaseCommand> {
+        let mut rest = bytes.clone();
+        let mut commands = Vec::new();
+        while !rest.is_empty() {
+            let Ok(frame) = crate::frame::decode_one(&mut rest) else {
+                break;
+            };
+            commands.push(frame.command);
+        }
+        commands
+    }
+
+    /// Every `CommandCloseProducer` in a drained transmit buffer.
+    fn transmitted_producer_closes(bytes: &bytes::Bytes) -> Vec<pb::CommandCloseProducer> {
+        decode_transmitted(bytes)
+            .into_iter()
+            .filter_map(|command| command.close_producer)
+            .collect()
+    }
+
+    fn feed_producer_success(conn: &mut Connection, request_id: u64, producer_name: &str) {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id,
+                producer_name: producer_name.to_owned(),
+                last_sequence_id: Some(-1),
+                producer_ready: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode ProducerSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle ProducerSuccess");
+    }
+
+    fn feed_command_success(conn: &mut Connection, request_id: u64) {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode Success");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle Success");
+    }
+
+    fn handshaked_connection() -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+        conn
+    }
+
+    /// Issue #406: cancelling a producer open whose `CommandProducer` already
+    /// entered the current session's stream must emit a best-effort
+    /// `CommandCloseProducer` for the abandoned producer id. Without it the
+    /// broker completes the open on its own schedule and keeps the
+    /// `(topic, producer_name)` registration forever, so every later open under
+    /// that name is rejected with `ProducerBusy` (broker `NamingException`).
+    #[test]
+    fn cancelled_producer_open_emits_fire_and_forget_close_producer() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cancel-then-close".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let opened = decode_transmitted(&conn.poll_transmit());
+        assert!(
+            opened
+                .iter()
+                .any(|command| command.r#type == pb::base_command::Type::Producer as i32),
+            "the open must reach the wire before the cancellation under test"
+        );
+
+        conn.cancel_producer_open(handle);
+
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "cancelling a written producer open must emit exactly one CommandCloseProducer"
+        );
+        assert_eq!(
+            closes[0].producer_id, handle.0,
+            "the close must target the abandoned producer id"
+        );
+        let close_request_id = closes[0].request_id;
+        assert!(
+            !conn.has_pending_request_for_test(RequestId(open_request_id)),
+            "the cancelled open must leave no pending request behind"
+        );
+
+        // Idempotent: a second cancellation finds no slot and must not enqueue
+        // a duplicate close for a producer id the broker already released.
+        conn.cancel_producer_open(handle);
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a repeated cancellation must not emit a second CommandCloseProducer"
+        );
+
+        // The close is fire-and-forget: its broker ack is consumed in place, so
+        // no undrainable `OpOutcome` accumulates (the issue #241 leak shape).
+        feed_command_success(&mut conn, close_request_id);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(RequestId(close_request_id)))
+                .is_none(),
+            "the forgotten close must not record an outcome nobody drains"
+        );
+    }
+
+    /// The broker may ack an open the client already gave up on. That late
+    /// `ProducerSuccess` must resurrect nothing — and needs no second close,
+    /// because cancellation already wrote a `CommandCloseProducer` for the same
+    /// producer id onto the same ordered connection.
+    #[test]
+    fn late_producer_success_after_cancel_recreates_no_state() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/late-success-after-cancel".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(handle);
+        assert_eq!(
+            transmitted_producer_closes(&conn.poll_transmit()).len(),
+            1,
+            "cancellation emits the reaping close before the late success lands"
+        );
+
+        feed_producer_success(&mut conn, open_request_id, "pinned-406");
+
+        assert!(
+            conn.producer(handle).is_none(),
+            "a late producer success must not resurrect the cancelled slot"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(RequestId(open_request_id)))
+                .is_none(),
+            "a late producer success must not record an outcome nobody drains"
+        );
+        assert!(
+            !conn.events.iter().any(|event| matches!(
+                event,
+                ConnectionEvent::ProducerReady { handle: event_handle, .. }
+                    if *event_handle == handle
+            )),
+            "a late producer success must not queue a ProducerReady for a cancelled open"
+        );
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "the late success needs no second close — cancellation already sent one"
+        );
+    }
+
+    /// The open completed and the caller cancelled anyway (a `ProducerSuccess`
+    /// that raced the operation deadline). The registration exists broker-side,
+    /// so the cancellation must still reap it.
+    #[test]
+    fn cancelling_an_acked_producer_open_still_closes_the_registration() {
+        let mut conn = handshaked_connection();
+        let open_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/acked-then-cancelled".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        feed_producer_success(&mut conn, open_request_id, "pinned-406");
+
+        conn.cancel_producer_open(handle);
+
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "cancelling an already-acked open must reap the broker registration"
+        );
+        assert_eq!(closes[0].producer_id, handle.0);
+    }
+
+    /// A session lost to [`Connection::reset`] took its producers with it: the
+    /// broker reaps every producer of a dead connection, and the buffered
+    /// `CommandProducer` was dropped with the outbound bytes. Emitting a close
+    /// on the rebuilt session would name a producer id it never registered.
+    #[test]
+    fn cancelling_producer_open_after_session_loss_emits_no_close() {
+        let mut conn = handshaked_connection();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cancel-after-session-loss".to_owned(),
+            producer_name: Some("pinned-406".to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.reset();
+        let _ = conn.poll_transmit();
+
+        conn.cancel_producer_open(handle);
+
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a producer whose session died needs no close on the rebuilt connection"
+        );
     }
 
     #[test]
