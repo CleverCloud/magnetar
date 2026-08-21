@@ -128,6 +128,28 @@ pub struct Connection {
     /// freshly-handshaked transport via [`Self::rebuild_producers`]. Mirrors the parameters
     /// Java keeps inside `ProducerImpl#conf` for the same purpose.
     producer_create_requests: HashMap<ProducerHandle, CreateProducerRequest>,
+    /// Producer ids abandoned by [`Self::cancel_producer_open`], keyed by
+    /// `(topic, producer_name)` (issue #406, ADR-0100).
+    ///
+    /// The cancel-time `CommandCloseProducer` is issued while the broker's own
+    /// producer creation may still be in flight, and the outcome of that
+    /// interleaving is not the client's to decide. This map is what lets a
+    /// later `ProducerBusy` under the same name be *recovered from* instead of
+    /// merely retried: it names the exact producer ids that may still own the
+    /// registration, so the retry can reclaim it.
+    ///
+    /// Only user-provided names are tracked — an unnamed open gets a unique
+    /// broker-assigned name and can never collide.
+    ///
+    /// **Bounded by construction.** A fixed-size, self-overwriting ring of
+    /// [`MAX_ABANDONED_PRODUCER_OPENS`] records with no growth path: the insert
+    /// is an unconditional store at `index % capacity`. Records are cleared on
+    /// the name's next `CommandProducerSuccess` and wholesale by
+    /// [`Self::reset`] — producer ids are session-scoped, so they mean nothing
+    /// on a rebuilt connection.
+    abandoned_producer_opens: [Option<AbandonedProducerOpen>; MAX_ABANDONED_PRODUCER_OPENS],
+    /// Next write index into the [`Self::abandoned_producer_opens`] ring.
+    abandoned_producer_opens_next: usize,
     /// In-flight publish snapshots — populated by [`Self::reset`] and consumed by
     /// [`Self::rebuild_producers`]. Keyed by producer handle; each value is the in-FIFO-order
     /// list of [`crate::producer::OpSend`] entries that were unconfirmed at reset time, with
@@ -270,6 +292,38 @@ impl core::fmt::Debug for Connection {
 /// [`crate::OperationRetryConfig`]; callers can override the count through
 /// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
+
+/// Hard cap on abandoned producer opens remembered for the issue #406
+/// recovery (see `Connection::abandoned_producer_opens`).
+///
+/// The store is a fixed-size, self-overwriting ring: an insert always lands in
+/// `index % MAX_ABANDONED_PRODUCER_OPENS` and overwrites whatever was there.
+/// There is no growth path and no eviction policy to get wrong — the memory is
+/// the same on a connection that never wedges a name and on one that wedges a
+/// million. Sixteen covers any realistic burst of concurrently-wedged pinned
+/// names on a single connection, and losing the oldest record costs only the
+/// recovery for that name, never correctness.
+pub const MAX_ABANDONED_PRODUCER_OPENS: usize = 16;
+
+/// One producer id abandoned under a pinned `(topic, producer_name)`, retained
+/// so a later `ProducerBusy` under that name can be recovered from.
+///
+/// See [`Connection::abandoned_producer_opens`] for the lifecycle.
+#[derive(Debug, Clone)]
+struct AbandonedProducerOpen {
+    topic: String,
+    producer_name: String,
+    /// The abandoned producer id — what a re-close or a successor re-attach
+    /// has to name.
+    handle: ProducerHandle,
+    /// `true` once this id has been re-closed in response to a `ProducerBusy`.
+    /// A name still busy after that is one the broker no longer maps to this
+    /// id, which is what escalates the recovery to a successor re-attach.
+    reclosed: bool,
+    /// Epoch to stamp on the next successor re-attach of this id. Monotone, so
+    /// every re-attach strictly succeeds the registration it is reclaiming.
+    next_epoch: u64,
+}
 
 /// Cap on OBSERVATIONAL events queued in `Connection::events` — the ones
 /// emitted once per message, on either side of the connection:
@@ -482,6 +536,8 @@ impl Connection {
             pending_requests: HashMap::new(),
             producers: HashMap::new(),
             producer_create_requests: HashMap::new(),
+            abandoned_producer_opens: [const { None }; MAX_ABANDONED_PRODUCER_OPENS],
+            abandoned_producer_opens_next: 0,
             in_flight_publish_snapshots: HashMap::new(),
             consumers: HashMap::new(),
             consumer_subscribe_requests: HashMap::new(),
@@ -991,6 +1047,12 @@ impl Connection {
         // (4) Drop queued events + raw bytes. Anything not yet observed by the runtime
         // belongs to the dead session.
         self.driver_retries.clear();
+        // Producer ids are per-session: the broker reaps every producer of a
+        // dead connection, so an abandoned id means nothing on the rebuilt one
+        // and re-attaching to it would be a fabricated successor claim
+        // (issue #406).
+        self.abandoned_producer_opens = [const { None }; MAX_ABANDONED_PRODUCER_OPENS];
+        self.abandoned_producer_opens_next = 0;
         self.outbound.clear();
         self.inbound.clear();
 
@@ -1676,6 +1738,15 @@ impl Connection {
                 request_id = ?close_request_id,
                 "cancelled producer open: emitted fire-and-forget CommandCloseProducer so the broker cannot keep a zombie registration (issue #406)"
             );
+            // That close may still lose its race with the broker's own
+            // producer creation, which is asynchronous and which the client
+            // cannot observe. Remember the id under its pinned name so a later
+            // `ProducerBusy` can reclaim the registration instead of retrying
+            // into it forever (ADR-0100 § "Recovering a registration the close
+            // did not reap").
+            if let Some(key) = self.abandoned_open_key_of(handle) {
+                self.remember_abandoned_producer_open(handle, key);
+            }
         }
         for request_id in request_ids {
             self.cancel_request(request_id);
@@ -2480,6 +2551,9 @@ impl Connection {
                         );
                         return Ok(());
                     }
+                    // The name attached: this client owns the registration,
+                    // so nothing is left to reclaim under it (issue #406).
+                    self.forget_abandoned_producer_opens(handle);
                     let snapshots = self.in_flight_publish_snapshots.remove(&handle);
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
@@ -2786,6 +2860,13 @@ impl Connection {
                             crate::OperationKind::ProducerOpen,
                             err.error,
                         );
+                        // Issue #406: a `ProducerBusy` under a name this
+                        // connection abandoned an open for proves the
+                        // registration completed broker-side AFTER the
+                        // cancel-time close. Re-close it now, while its state
+                        // is unambiguous, so the caller's retry lands on a
+                        // free name.
+                        let _ = self.reclaim_busy_producer_name(handle, err.error);
                         let established = self
                             .producers
                             .get(&handle)
@@ -4591,12 +4672,189 @@ impl Connection {
         self.wakers.len()
     }
 
+    /// The `(topic, producer_name)` a request registers under for the issue
+    /// #406 recovery, or `None` when the open carries no user-provided name
+    /// (the broker assigns a unique one, which cannot collide).
+    fn abandoned_open_key(req: &CreateProducerRequest) -> Option<(String, String)> {
+        req.producer_name
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .map(|name| (req.topic.clone(), name.clone()))
+    }
+
+    /// The `(topic, producer_name)` an open handle registers under, if it has
+    /// a user-provided name.
+    fn abandoned_open_key_of(&self, handle: ProducerHandle) -> Option<(String, String)> {
+        self.producer_create_requests
+            .get(&handle)
+            .and_then(Self::abandoned_open_key)
+    }
+
+    /// Remember `handle` as an abandoned open under `key` so a later
+    /// `ProducerBusy` can be recovered from (issue #406, ADR-0100).
+    ///
+    /// The store is a fixed ring, so this is an unconditional overwrite: no
+    /// capacity test, no eviction choice, no growth.
+    fn remember_abandoned_producer_open(&mut self, handle: ProducerHandle, key: (String, String)) {
+        let slot = self.abandoned_producer_opens_next % MAX_ABANDONED_PRODUCER_OPENS;
+        self.abandoned_producer_opens_next = self.abandoned_producer_opens_next.wrapping_add(1);
+        self.abandoned_producer_opens[slot] = Some(AbandonedProducerOpen {
+            topic: key.0,
+            producer_name: key.1,
+            handle,
+            reclosed: false,
+            next_epoch: 1,
+        });
+    }
+
+    /// Drop every record for `handle`'s name — its open attached, so this
+    /// client owns the registration and nothing is left to reclaim.
+    fn forget_abandoned_producer_opens(&mut self, handle: ProducerHandle) {
+        let Some((topic, producer_name)) = self.abandoned_open_key_of(handle) else {
+            return;
+        };
+        for slot in &mut self.abandoned_producer_opens {
+            let matches = slot
+                .as_ref()
+                .is_some_and(|rec| rec.topic == topic && rec.producer_name == producer_name);
+            if matches {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Issue #406 recovery: the broker answered `ProducerBusy` for a name this
+    /// connection previously abandoned an open under.
+    ///
+    /// That answer is the unambiguous moment the cancel-time close never had.
+    /// Cancellation emits its `CommandCloseProducer` while the broker's own
+    /// producer creation may still be in flight — Pulsar completes a
+    /// close-before-creation by failing the pending creation future and acking
+    /// Success, and whether the registration that creation goes on to make is
+    /// then reaped is not something the client can observe or control. A
+    /// `ProducerBusy` proves it was not. By then the registration is complete
+    /// and addressable, so:
+    ///
+    /// 1. **first busy** — re-close every remembered id that has not been re-closed yet, and mark
+    ///    it. This lands on the broker's completed-producer path (`producer.close()`), which
+    ///    releases the name, and the caller's retry (ADR-0080 makes `ProducerBusy` retryable)
+    ///    re-issues the open behind it on the same ordered connection.
+    /// 2. **still busy afterwards** — the broker no longer maps that id to anything, so no close
+    ///    can reach the registration. Recovery escalates in [`Self::create_producer`], which
+    ///    re-attaches under the abandoned id itself.
+    ///
+    /// Returns `true` when a re-close was emitted.
+    fn reclaim_busy_producer_name(&mut self, handle: ProducerHandle, code: i32) -> bool {
+        if !matches!(
+            pb::ServerError::try_from(code),
+            Ok(pb::ServerError::ProducerBusy)
+        ) {
+            return false;
+        }
+        let Some((topic, producer_name)) = self.abandoned_open_key_of(handle) else {
+            return false;
+        };
+        let stale: Vec<ProducerHandle> =
+            self.abandoned_producer_opens
+                .iter_mut()
+                .filter_map(|slot| {
+                    let rec = slot.as_mut()?;
+                    (!rec.reclosed && rec.topic == topic && rec.producer_name == producer_name)
+                        .then(|| {
+                            rec.reclosed = true;
+                            rec.handle
+                        })
+                })
+                .collect();
+        for abandoned in &stale {
+            let close_request_id = self.close_producer_forget(*abandoned);
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                abandoned_handle = ?abandoned,
+                request_id = ?close_request_id,
+                topic = %topic,
+                producer_name = %producer_name,
+                "producer name reported busy; re-closing an abandoned producer id whose broker-side registration outlived its cancellation (issue #406)"
+            );
+        }
+        !stale.is_empty()
+    }
+
+    /// Issue #406 recovery, escalation: pick the abandoned producer id this
+    /// open should re-attach under, and the epoch that makes it a strict
+    /// successor of the registration it is reclaiming.
+    ///
+    /// Only ids already re-closed once qualify. A re-close that did not free
+    /// the name means the broker no longer maps the id, which is exactly the
+    /// state in which re-sending `CommandProducer` under it reaches Pulsar's
+    /// successor path instead of colliding with a live entry on the
+    /// connection. Doing this before the re-close would instead collide with
+    /// the broker's own record of that id.
+    ///
+    /// Limited to `Shared` producers: for the exclusive access modes the epoch
+    /// participates in topic-epoch fencing, and those modes have broker-side
+    /// ownership arbitration of their own.
+    fn reattach_abandoned_producer_open(
+        &mut self,
+        req: &CreateProducerRequest,
+    ) -> Option<(ProducerHandle, u64)> {
+        if req.access_mode != pb::ProducerAccessMode::Shared {
+            return None;
+        }
+        let (topic, producer_name) = Self::abandoned_open_key(req)?;
+        // One name can carry several abandoned ids — a caller-visible open
+        // retries — and only one of them owns the surviving registration.
+        // Picking the LEAST-TRIED candidate round-robins across them, since
+        // each attempt bumps only the id it used, so every candidate is tried
+        // before any is tried twice. Taking the first match instead would
+        // re-attach under the same wrong id until the retry budget ran out.
+        let rec = self
+            .abandoned_producer_opens
+            .iter_mut()
+            .filter_map(|slot| {
+                let rec = slot.as_mut()?;
+                (rec.reclosed && rec.topic == topic && rec.producer_name == producer_name)
+                    .then_some(rec)
+            })
+            .min_by_key(|rec| rec.next_epoch)?;
+        let epoch = rec.next_epoch;
+        rec.next_epoch = rec.next_epoch.saturating_add(1);
+        Some((rec.handle, epoch))
+    }
+
     /// Open a producer. The state machine emits a `CommandProducer` and assigns a
     /// [`ProducerHandle`]. The corresponding [`ConnectionEvent::ProducerReady`] arrives on the
     /// next `poll_event` cycle after the broker responds.
+    ///
+    /// **Issue #406 re-attach.** When this connection previously abandoned an
+    /// open for the same `(topic, producer_name)`, the newest abandoned
+    /// producer id is REUSED instead of allocating a fresh one, and the open
+    /// carries a strictly higher epoch. That is Pulsar's own re-attach shape —
+    /// the same one [`Self::rebuild_producers`] uses after a reconnect — and it
+    /// is what lets the broker recognise the open as a successor of the
+    /// registration it is reclaiming rather than as a stranger colliding with
+    /// it. Allocating a fresh id every retry, as this method used to do
+    /// unconditionally, makes every attempt a stranger and is why the retry
+    /// loop could never recover the name on its own.
     pub fn create_producer(&mut self, req: CreateProducerRequest) -> ProducerHandle {
-        let handle = ProducerHandle(self.next_producer_id);
-        self.next_producer_id = self.next_producer_id.wrapping_add(1);
+        let (handle, reattach_epoch) = match self.reattach_abandoned_producer_open(&req) {
+            Some((handle, epoch)) => {
+                tracing::warn!(
+                    target: "magnetar_proto::conn",
+                    handle = ?handle,
+                    epoch,
+                    topic = %req.topic,
+                    "reusing an abandoned producer id to re-attach a pinned producer name (issue #406)"
+                );
+                (handle, epoch)
+            }
+            None => {
+                let handle = ProducerHandle(self.next_producer_id);
+                self.next_producer_id = self.next_producer_id.wrapping_add(1);
+                (handle, 0)
+            }
+        };
         let max_size = self
             .broker_max_message_size
             .unwrap_or(self.config.default_max_message_size);
@@ -4612,6 +4870,12 @@ impl Connection {
         state.send_timeout = req.send_timeout;
         state.batching_max_publish_delay = req.batching_max_publish_delay;
         state.access_mode = req.access_mode;
+        // Issue #406: a re-attach stamps a strictly higher epoch than the
+        // abandoned open it is reclaiming, so `emit_command_producer` puts a
+        // non-zero `CommandProducer.epoch` on the wire and the broker can
+        // recognise this open as that registration's successor. A fresh open
+        // keeps epoch 0 and omits the field, exactly as before.
+        state.epoch = reattach_epoch;
         seed_rate_window_baseline(
             &mut state.last_rate_snapshot,
             self.config.stats_interval,
@@ -12043,6 +12307,337 @@ mod conn_state_tests {
             "cancelling an already-acked open must reap the broker registration"
         );
         assert_eq!(closes[0].producer_id, handle.0);
+    }
+
+    fn feed_producer_busy(conn: &mut Connection, request_id: u64, producer_name: &str) {
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ProducerBusy as i32,
+                message: format!(
+                    "org.apache.pulsar.broker.service.BrokerServiceException$NamingException: \
+                     Producer with name '{producer_name}' is already connected to topic"
+                ),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+    }
+
+    /// Every `CommandProducer` in a drained transmit buffer.
+    fn transmitted_producer_opens(bytes: &bytes::Bytes) -> Vec<pb::CommandProducer> {
+        decode_transmitted(bytes)
+            .into_iter()
+            .filter_map(|command| command.producer)
+            .collect()
+    }
+
+    /// Issue #406, the interleaving the cancel-time close cannot cover: the
+    /// broker completes the producer creation AFTER consuming the close, so the
+    /// `(topic, producer_name)` registration outlives its cancellation and the
+    /// retry is answered `ProducerBusy` forever.
+    ///
+    /// Recovery is two-phase, and this pins both phases plus their order.
+    #[test]
+    fn producer_busy_after_a_cancelled_open_recloses_then_reattaches() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/busy-after-cancel";
+        let mut conn = handshaked_connection();
+
+        // Attempt 1: abandoned on its deadline. The broker keeps the
+        // registration regardless.
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        assert_eq!(
+            transmitted_producer_closes(&conn.poll_transmit()).len(),
+            1,
+            "cancellation emits its close first — the recovery is what happens when it misses"
+        );
+
+        // Attempt 2 must NOT re-attach yet: the broker still maps the
+        // abandoned id, so re-sending `CommandProducer` under it would collide
+        // with the broker's own record instead of reaching its successor path.
+        let retry = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_ne!(
+            retry, abandoned,
+            "the first retry after a cancellation must use a fresh producer id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0].epoch, None,
+            "a first retry is not a successor claim and must not stamp an epoch"
+        );
+        let retry_request_id = opens[0].request_id;
+
+        // Phase 1: the busy answer proves the abandoned registration completed,
+        // so it is re-closed now — when the broker can address it.
+        feed_producer_busy(&mut conn, retry_request_id, NAME);
+        let closes = transmitted_producer_closes(&conn.poll_transmit());
+        assert_eq!(
+            closes.len(),
+            1,
+            "ProducerBusy must re-close the abandoned producer id"
+        );
+        assert_eq!(
+            closes[0].producer_id, abandoned.0,
+            "the re-close must name the abandoned id, not the rejected retry"
+        );
+
+        // Phase 2: the name is STILL busy, so the broker no longer maps that
+        // id and no close can reach it. The next open re-attaches under the
+        // abandoned id itself, as a strict successor.
+        let reattach = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            reattach, abandoned,
+            "the escalation must re-attach under the abandoned producer id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0].producer_id, abandoned.0,
+            "the re-attach rides the abandoned producer id"
+        );
+        assert_eq!(
+            opens[0].epoch,
+            Some(1),
+            "the re-attach must out-rank the registration it reclaims"
+        );
+
+        // Success clears the record: the name is ours, nothing is left to
+        // reclaim, and a later open under it starts fresh.
+        feed_producer_success(&mut conn, opens[0].request_id, NAME);
+        assert!(
+            conn.abandoned_producer_opens
+                .iter()
+                .all(std::option::Option::is_none),
+            "attaching the name must drop every record kept for reclaiming it"
+        );
+    }
+
+    /// A second `ProducerBusy` must not re-close the same abandoned id twice —
+    /// the id is consumed by phase 1 and the recovery escalates instead.
+    #[test]
+    fn a_reclosed_abandoned_producer_id_is_not_closed_again() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/busy-twice";
+        let mut conn = handshaked_connection();
+
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        let _ = conn.poll_transmit();
+
+        for expected_closes in [1, 0] {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let opens = transmitted_producer_opens(&conn.poll_transmit());
+            feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+            assert_eq!(
+                transmitted_producer_closes(&conn.poll_transmit()).len(),
+                expected_closes,
+                "an abandoned id is re-closed exactly once"
+            );
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+        }
+    }
+
+    /// Several abandoned ids can share one pinned name — a caller-visible open
+    /// retries — and only one of them owns the surviving registration. The
+    /// escalation must round-robin across them instead of re-attaching under
+    /// the same wrong id until the retry budget runs out.
+    #[test]
+    fn reattach_rotates_across_every_abandoned_producer_id() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/reattach-rotation";
+        let mut conn = handshaked_connection();
+
+        // Abandon three opens under the same name.
+        let mut abandoned = Vec::new();
+        for _ in 0..3 {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+            abandoned.push(handle);
+        }
+
+        // One busy answer re-closes all three at once — any of them may own the
+        // registration, and a close is cheap.
+        let retry = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            !abandoned.contains(&retry),
+            "the first retry after a cancellation uses a fresh id"
+        );
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+        let closed: Vec<u64> = transmitted_producer_closes(&conn.poll_transmit())
+            .into_iter()
+            .map(|close| close.producer_id)
+            .collect();
+        let mut expected: Vec<u64> = abandoned.iter().map(|h| h.0).collect();
+        expected.sort_unstable();
+        let mut closed_sorted = closed.clone();
+        closed_sorted.sort_unstable();
+        assert_eq!(
+            closed_sorted, expected,
+            "every abandoned id under the busy name must be re-closed"
+        );
+
+        // Each escalation picks a different candidate, so three attempts cover
+        // all three ids before any is tried twice.
+        let mut reattached = Vec::new();
+        for _ in 0..3 {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                producer_name: Some(NAME.to_owned()),
+                ..Default::default()
+            });
+            let opens = transmitted_producer_opens(&conn.poll_transmit());
+            assert_eq!(
+                opens[0].epoch,
+                Some(1),
+                "each id's first re-attach is epoch 1"
+            );
+            reattached.push(handle);
+            feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+            let _ = conn.poll_transmit();
+        }
+        reattached.sort_unstable();
+        let mut abandoned_sorted = abandoned.clone();
+        abandoned_sorted.sort_unstable();
+        assert_eq!(
+            reattached, abandoned_sorted,
+            "the escalation must try every candidate before repeating one"
+        );
+    }
+
+    /// A rejected open owns no registration, so a busy answer for a name this
+    /// connection never abandoned an open under emits nothing.
+    #[test]
+    fn producer_busy_without_an_abandoned_open_emits_no_close() {
+        const NAME: &str = "never-abandoned";
+        const TOPIC: &str = "persistent://public/default/busy-without-abandon";
+        let mut conn = handshaked_connection();
+
+        conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let opens = transmitted_producer_opens(&conn.poll_transmit());
+        feed_producer_busy(&mut conn, opens[0].request_id, NAME);
+        assert!(
+            transmitted_producer_closes(&conn.poll_transmit()).is_empty(),
+            "a busy name this connection never abandoned an open under has nothing to reclaim"
+        );
+    }
+
+    /// The reclaim store is a fixed ring: it never grows, and the oldest record
+    /// is what an overflowing insert overwrites.
+    #[test]
+    fn abandoned_producer_open_store_is_bounded() {
+        let mut conn = handshaked_connection();
+        for i in 0..(MAX_ABANDONED_PRODUCER_OPENS + 4) {
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/bounded".to_owned(),
+                producer_name: Some(format!("pinned-{i}")),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.cancel_producer_open(handle);
+            let _ = conn.poll_transmit();
+        }
+        assert_eq!(
+            conn.abandoned_producer_opens
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            MAX_ABANDONED_PRODUCER_OPENS,
+            "the reclaim store must stay at its fixed capacity"
+        );
+        assert!(
+            !conn
+                .abandoned_producer_opens
+                .iter()
+                .flatten()
+                .any(|rec| rec.producer_name == "pinned-0"),
+            "an overflowing insert overwrites the oldest record"
+        );
+    }
+
+    /// Producer ids are session-scoped: a reset must drop every reclaim record,
+    /// or a rebuilt connection would re-attach under an id the broker never
+    /// registered and claim to succeed a registration that no longer exists.
+    #[test]
+    fn reset_clears_the_abandoned_producer_open_store() {
+        const NAME: &str = "pinned-406";
+        const TOPIC: &str = "persistent://public/default/reset-clears-reclaim";
+        let mut conn = handshaked_connection();
+
+        let abandoned = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        conn.cancel_producer_open(abandoned);
+        let _ = conn.poll_transmit();
+        assert!(
+            conn.abandoned_producer_opens.iter().any(Option::is_some),
+            "the cancellation must have left a reclaim record to clear"
+        );
+
+        conn.reset();
+
+        assert!(
+            conn.abandoned_producer_opens
+                .iter()
+                .all(std::option::Option::is_none),
+            "reset must drop every session-scoped reclaim record"
+        );
+        let fresh = conn.create_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            producer_name: Some(NAME.to_owned()),
+            ..Default::default()
+        });
+        assert_ne!(
+            fresh, abandoned,
+            "a rebuilt session must not re-attach under a dead session's producer id"
+        );
     }
 
     /// A session lost to [`Connection::reset`] took its producers with it: the

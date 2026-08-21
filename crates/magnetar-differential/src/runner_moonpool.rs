@@ -111,7 +111,9 @@ pub async fn run_with_operation_timeout(
         operation_timeout,
         ..Default::default()
     };
-    let client = Client::connect_plain(&engine, host_port, config).await?;
+    let client = Client::connect_plain(&engine, host_port, config)
+        .await?
+        .with_operation_retry(crate::runner_tokio::fast_operation_retry());
     replay(client, trace).await
 }
 

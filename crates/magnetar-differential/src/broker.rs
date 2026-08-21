@@ -205,13 +205,21 @@ struct SessionState {
     ledger: HashMap<String, Vec<StoredMessage>>,
     /// Per producer id (assigned by the client).
     producers: HashMap<u64, (String, ProducerState)>,
-    /// Live `(topic, producer_name) → producer_id` registrations, the
+    /// Live `(topic, producer_name) → (producer_id, epoch)` registrations, the
     /// broker resource issue #406 leaks. A `CommandProducer` naming a key
     /// already present is answered with `ProducerBusy` (the broker's
-    /// `NamingException`); a `CommandCloseProducer` releases every key the
-    /// closed id holds. Only user-provided, non-empty names register — an
-    /// unnamed open is assigned a unique name broker-side and never collides.
-    producer_names: HashMap<(String, String), u64>,
+    /// `NamingException`) unless it is a SUCCESSOR of the current owner — same
+    /// producer id, strictly higher epoch — which overwrites it, mirroring
+    /// `AbstractTopic#tryOverwriteOldProducer` / `Producer#isSuccessorTo`.
+    /// A `CommandCloseProducer` releases every key the closed id holds. Only
+    /// user-provided, non-empty names register — an unnamed open is assigned a
+    /// unique name broker-side and never collides.
+    producer_names: HashMap<(String, String), (u64, u64)>,
+    /// Producer ids this connection no longer maps. A close for one is acked
+    /// and does nothing: Pulsar drops its record of a producer id when it
+    /// completes a close-before-creation, and the registration that pending
+    /// creation goes on to make is then unreachable by any close.
+    unmapped_producer_ids: std::collections::HashSet<u64>,
     /// One withheld `(producer_id, request_id, producer_name)` whose
     /// `CommandProducerSuccess` the session is deliberately sitting on, so a
     /// client open races its `operation_timeout` while the registration
@@ -349,6 +357,11 @@ struct SessionDeps {
     /// registered producer id (issue #406). `None` — the default — serves
     /// every open normally.
     withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
+    /// When `true`, the close that releases the withheld success does NOT
+    /// release the registration: the broker acks it, stops mapping that
+    /// producer id, and lets the creation complete anyway (issue #406's CI
+    /// reproduction). Only a successor re-attach reclaims the name.
+    withhold_registration_survives_close: Arc<Mutex<bool>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -436,6 +449,9 @@ pub struct ScriptedBroker {
     /// the per-session state, so both differential legs — each on its own
     /// session — see the same one-shot behaviour with no reset between them.
     withhold_producer_success_for_name: Arc<Mutex<Option<String>>>,
+    /// Companion to [`Self::withhold_producer_success_for_name`]: when `true`
+    /// the withheld open's registration OUTLIVES its close (issue #406).
+    withhold_registration_survives_close: Arc<Mutex<bool>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -482,6 +498,9 @@ impl ScriptedBroker {
         let transient_reject_fired_clone = transient_reject_fired.clone();
         let withhold_producer_success_for_name = Arc::new(Mutex::new(None));
         let withhold_producer_success_for_name_clone = withhold_producer_success_for_name.clone();
+        let withhold_registration_survives_close = Arc::new(Mutex::new(false));
+        let withhold_registration_survives_close_clone =
+            withhold_registration_survives_close.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -495,6 +514,7 @@ impl ScriptedBroker {
             transient_reject_on_redial: transient_reject_on_redial_clone,
             transient_reject_fired: transient_reject_fired_clone,
             withhold_producer_success_for_name: withhold_producer_success_for_name_clone,
+            withhold_registration_survives_close: withhold_registration_survives_close_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -527,6 +547,7 @@ impl ScriptedBroker {
             transient_reject_on_redial,
             transient_reject_fired,
             withhold_producer_success_for_name,
+            withhold_registration_survives_close,
             cross_session,
         })
     }
@@ -632,6 +653,21 @@ impl ScriptedBroker {
     /// same script with no reset in between.
     pub fn withhold_first_producer_success_for_name(&self, producer_name: &str) {
         *self.withhold_producer_success_for_name.lock() = Some(producer_name.to_owned());
+    }
+
+    /// Arm the harder issue #406 interleaving, the one that reproduced against
+    /// a real Pulsar 4.0.4 broker in CI after the cancel-time close landed.
+    ///
+    /// Same withheld `CommandProducerSuccess` as
+    /// [`Self::withhold_first_producer_success_for_name`], but the close that
+    /// releases it is consumed while the creation is still pending: the broker
+    /// acks it, stops mapping that producer id, and completes the registration
+    /// anyway. No close can address that registration afterwards, so a client
+    /// that only re-closes stays wedged — reclaiming the name requires
+    /// re-attaching under the abandoned id as a strict successor.
+    pub fn withhold_first_producer_success_surviving_close(&self, producer_name: &str) {
+        *self.withhold_producer_success_for_name.lock() = Some(producer_name.to_owned());
+        *self.withhold_registration_survives_close.lock() = true;
     }
 
     /// Number of `(topic, message)` entries persisted in the cross-session
@@ -1427,15 +1463,28 @@ fn handle_frame(
                 // what frees the name for the next open. A withheld success
                 // for the same id is flushed here as the LATE ack the client
                 // must discard without resurrecting anything.
+                let survives_close = *deps.withhold_registration_survives_close.lock();
                 let released = {
                     let mut g = state.lock();
-                    g.producers.remove(&c.producer_id);
-                    g.producer_names.retain(|_, id| *id != c.producer_id);
-                    match g.withheld_producer_success.as_ref() {
-                        Some((producer_id, _, _)) if *producer_id == c.producer_id => {
-                            g.withheld_producer_success.take()
+                    if g.unmapped_producer_ids.contains(&c.producer_id) {
+                        None
+                    } else {
+                        g.producers.remove(&c.producer_id);
+                        let creation_pending = g
+                            .withheld_producer_success
+                            .as_ref()
+                            .is_some_and(|(producer_id, _, _)| *producer_id == c.producer_id);
+                        if creation_pending && survives_close {
+                            g.unmapped_producer_ids.insert(c.producer_id);
+                        } else {
+                            g.producer_names.retain(|_, (id, _)| *id != c.producer_id);
                         }
-                        _ => None,
+                        match g.withheld_producer_success.as_ref() {
+                            Some((producer_id, _, _)) if *producer_id == c.producer_id => {
+                                g.withheld_producer_success.take()
+                            }
+                            _ => None,
+                        }
                     }
                 };
                 if let Some((_, request_id, producer_name)) = released {
@@ -2030,16 +2079,29 @@ fn answer_producer_open(
         .producer_name
         .clone()
         .filter(|candidate| !candidate.is_empty());
+    let epoch = p.epoch.unwrap_or(0);
     let withhold_name = deps.withhold_producer_success_for_name.lock().clone();
     let mut g = state.lock();
     if let Some(name) = name.as_ref() {
         let key = (p.topic.clone(), name.clone());
-        if g.producer_names.contains_key(&key) {
+        if let Some(&(owner_id, owner_epoch)) = g.producer_names.get(&key) {
+            if owner_id != p.producer_id || epoch <= owner_epoch {
+                drop(g);
+                emit_producer_busy(out, p.request_id, name);
+                return;
+            }
+            // Successor re-attach: same producer id, strictly higher epoch.
+            // The owner is overwritten in place and the connection maps the id
+            // again.
+            g.producer_names.insert(key, (p.producer_id, epoch));
+            g.unmapped_producer_ids.remove(&p.producer_id);
+            g.producers
+                .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));
             drop(g);
-            emit_producer_busy(out, p.request_id, name);
+            emit_named_producer_success(out, p.request_id, name);
             return;
         }
-        g.producer_names.insert(key, p.producer_id);
+        g.producer_names.insert(key, (p.producer_id, epoch));
     }
     g.producers
         .insert(p.producer_id, (p.topic.clone(), ProducerState::default()));

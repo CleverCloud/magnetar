@@ -41,6 +41,7 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
         pulsar_url,
         trace,
         magnetar_proto::ConnectionConfig::default(),
+        None,
     )
     .await
 }
@@ -67,6 +68,7 @@ pub async fn run_supervised(
             supervisor: Some(supervisor),
             ..Default::default()
         },
+        None,
     )
     .await
 }
@@ -95,6 +97,7 @@ pub async fn run_supervised_with_operation_timeout(
             operation_timeout,
             ..Default::default()
         },
+        None,
     )
     .await
 }
@@ -119,8 +122,22 @@ pub async fn run_with_operation_timeout(
             operation_timeout,
             ..Default::default()
         },
+        Some(fast_operation_retry()),
     )
     .await
+}
+
+/// Retry policy the producer-open cancellation scenario installs. The default
+/// 2 s initial backoff does not fit inside that scenario's short
+/// `operation_timeout`, and what it exercises is the SEQUENCE of recovery
+/// attempts, not the wait between them. Shared by both runners so the two legs
+/// retry in lockstep.
+pub(crate) fn fast_operation_retry() -> magnetar_proto::OperationRetryConfig {
+    magnetar_proto::OperationRetryConfig {
+        initial_backoff: Duration::from_millis(5),
+        max_backoff: Duration::from_millis(20),
+        max_retries: Some(8),
+    }
 }
 
 /// Run `trace` with the issue #414 per-consumer stall watchdog armed at
@@ -149,6 +166,7 @@ pub async fn run_with_stall_timeout(
             consumer_stall_timeout: Some(consumer_stall_timeout),
             ..Default::default()
         },
+        None,
     )
     .await
 }
@@ -157,10 +175,14 @@ async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,
     config: magnetar_proto::ConnectionConfig,
+    operation_retry: Option<magnetar_proto::OperationRetryConfig>,
 ) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
-    let client = Client::connect(pulsar_url, config).await?;
+    let mut client = Client::connect(pulsar_url, config).await?;
+    if let Some(retry) = operation_retry {
+        client = client.with_operation_retry(retry);
+    }
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
     // (issue #241 last-clone drop guard). `None` afterwards makes

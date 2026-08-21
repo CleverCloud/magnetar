@@ -56,11 +56,32 @@ A second cancellation finds no slot and emits nothing, so cancellation stays ide
 Pulsar processes commands in order per connection, so the `CommandCloseProducer` written after the `CommandProducer` on the same stream reaps the registration whether or not the broker had already completed the open.
 An unknown-producer rejection is consumed in place by the `ProducerCloseForgotten` handlers and surfaced as a `warn!` — never as an undrainable `OpOutcome`.
 
+### Recovering a registration the close did not reap
+
+The close above is issued at the one moment the client does not control: the broker's producer creation is asynchronous, and a `CommandCloseProducer` that arrives while it is still pending takes a different path than one that arrives after it completed.
+Pulsar completes a close-before-creation by failing the pending creation future, acking `Success`, and dropping its connection-level record of that producer id; whether the registration that creation goes on to make is then reaped is not something the client can observe or influence.
+Against a real Pulsar 4.0.4 broker on CI, it was not: the six abandoned opens of the e2e sweep left a registration behind, every close was acked without a rejection, and the next open under the name was answered `NamingException` (code 16) for the full 30 s `operation_timeout` — the exact production symptom of issue #406, reproduced with the cancel-time close in place.
+
+Cancellation therefore also _remembers_ the abandoned producer id under its `(topic, producer_name)`, and a later `ProducerBusy` for that name drives a two-phase recovery.
+A `ProducerBusy` is the unambiguous signal the cancel-time close never had: the registration is complete, registered under the name, and addressable.
+
+1. **First busy — re-close.** Every remembered id for that name that has not been re-closed yet gets a fresh best-effort `CommandCloseProducer`, and is marked. This one lands on the broker's completed-producer path, which releases the name, and the caller's retry (ADR-0080 makes `ProducerBusy` retryable) re-issues the open behind it on the same ordered connection.
+2. **Still busy — re-attach.** A name still busy after that is one the broker no longer maps to the abandoned id, so no close can reach it. [`Connection::create_producer`] then REUSES the abandoned producer id instead of allocating a fresh one, stamping a strictly higher epoch. That is Pulsar's own successor rule (`AbstractTopic#tryOverwriteOldProducer` → `Producer#isSuccessorTo`: same producer name, same topic, **same producer id**, same connection, higher epoch) and the same shape `Connection::rebuild_producers` already uses after a reconnect. Allocating a fresh id on every retry — which `create_producer` did unconditionally — makes each attempt a stranger to the registration rather than its successor, and is why the retry loop could never recover the name on its own.
+
+Ordering between the phases is load-bearing and not merely tidy: re-attaching _before_ the re-close would collide with the broker's own record of that id on the connection, which answers "producer is already present on the connection" rather than reaching the successor path.
+
+One pinned name can accumulate several abandoned ids, and only one owns the registration, so the escalation picks the least-tried candidate — every candidate is tried before any is tried twice.
+The re-attach is limited to `Shared` producers: for the exclusive access modes the epoch participates in topic-epoch fencing, and those modes have broker-side ownership arbitration of their own.
+
+The remembered state is bounded by construction — a fixed ring of `MAX_ABANDONED_PRODUCER_OPENS` (16) records with no growth path, whose insert is an unconditional store at `index % capacity`.
+Records are dropped when the name attaches, and cleared wholesale by `Connection::reset`, because producer ids are session-scoped and a re-attach under a dead session's id would be a fabricated successor claim.
+Losing a record costs only the recovery for that name, never correctness.
+
 ### The late `ProducerSuccess` path is unchanged, and that is sufficient
 
 A `CommandProducerSuccess` whose request id has no pending entry is still dropped: no outcome, no waker, no slot resurrection.
 No second close is emitted there, and none is needed.
-By the ordering argument above, the registration that success announces is already reaped by the close cancellation wrote onto the same connection before the success could be read.
+By the ordering argument above, the close cancellation wrote onto the same connection precedes it, and where that close was not enough the `ProducerBusy` recovery above is what reclaims the name — neither needs the success.
 The only way the client sees such a success without having written that close is a session that died instead — and its bytes never reach the decoder.
 Adding a late-success close would need a cancelled-request → handle map that outlives the request, i.e. exactly the unbounded-state leak the forgotten-close mechanism exists to avoid.
 
@@ -77,11 +98,15 @@ Its cost is the reason it is opt-in — a unique name breaks access-mode fencing
 
 ## Consequences
 
-- A timed-out or otherwise cancelled producer open no longer poisons its name for the life of the connection. The immediately following retry sees a free name, so the ADR-0080 retry budget is spent on real transients instead of on a self-inflicted `ProducerBusy`.
-- One extra `CommandCloseProducer` per cancelled open. It is fire-and-forget, allocates one request id, and its ack is consumed in place, so it adds no waiter, no outcome, and no per-cancel memory.
+- A timed-out or otherwise cancelled producer open no longer poisons its name for the life of the connection, under ANY broker-side close/creation interleaving. Where the cancel-time close reaps the registration, the immediately following retry sees a free name; where it does not, the recovery converts the wedge into one extra round trip per abandoned candidate. Either way the ADR-0080 retry budget is spent on real transients instead of on a self-inflicted `ProducerBusy`.
+- One extra `CommandCloseProducer` per cancelled open, plus at most one more per abandoned candidate on a busy name. All are fire-and-forget: each allocates one request id and its ack is consumed in place, so they add no waiter and no outcome.
+- Producer-id allocation is no longer strictly monotonic: a retry under a pinned name may reuse an abandoned id. Ids stay unique among LIVE producers — `next_producer_id` only ever advances, an abandoned id sits below it, and a candidate is handed out to one open at a time.
+- `CommandProducer.epoch` is now non-zero on a first open in exactly one case, the `Shared` re-attach. Every other open still omits the field.
 - A cancellation that races a broker rejection emits nothing: the `Error` handler removed the pending entry before the guard ran, and a rejected open holds no registration.
 - Callers that pin a producer name and expect `Exclusive` fencing are unaffected — the suffix is opt-in and the close only ever removes a registration this client created.
 - ADR-0080's cancellation clause is amended (below), not replaced: cancellation still owns all local correlation state, is still idempotent, and still ignores late broker replies.
+- The recovery is model-checked against a scripted broker, not against Pulsar's source: the runtime and differential brokers implement both interleavings (`NameScript::WithholdReleasedByClose`, `NameScript::WithholdSurvivingClose` /
+  `ScriptedBroker::withhold_first_producer_success_surviving_close`) and Pulsar's successor rule. A broker whose successor rule differs from that model would still wedge on phase 2 — phase 1 is unaffected.
 - `check-sim-coverage`: the new proto lines are reached from the moonpool and differential test binaries (`crates/magnetar-runtime-moonpool/tests/producer_open_cancel_close.rs`, `crates/magnetar-differential/tests/producer_open_cancel_close_equivalence.rs`), which the gate executes.
 
 ### Amends ADR-0080
@@ -97,7 +122,7 @@ and § "Cancellation owns all local correlation state" states:
 
 Both remain true of the LOCAL state, and late replies are still ignored.
 What is amended is the implied completeness: cancelling an opening PRODUCER is no longer local-only.
-It also writes one best-effort `CommandCloseProducer` under the conditions above, because local-only cancellation is what stranded the broker-side registration.
+It also writes one best-effort `CommandCloseProducer` under the conditions above, because local-only cancellation is what stranded the broker-side registration, and it remembers the abandoned producer id so a later `ProducerBusy` under that name is recovered from rather than retried into.
 Cancelling an opening consumer is unchanged — `CommandSubscribe` carries the subscription name the broker keys on, and a subscribe that never completed leaves nothing to reap.
 Every other ADR-0080 decision — the retry policy, the busy classification, the single operation deadline, the per-generation request ownership — remains binding.
 

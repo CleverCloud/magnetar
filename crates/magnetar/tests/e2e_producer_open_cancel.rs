@@ -16,16 +16,22 @@
 //!
 //! Two user-visible contracts are covered here:
 //!
-//! 1. **Close before giving up (ADR-0100).** A producer open abandoned on its deadline pushes a
-//!    best-effort `CommandCloseProducer` for the abandoned producer id, so a same-name open on the
-//!    same connection succeeds. The deterministic proof lives in the in-process layers
+//! 1. **Recovery, whatever the broker-side interleaving (ADR-0100).** A producer open abandoned on
+//!    its deadline pushes a best-effort `CommandCloseProducer` for the abandoned producer id. That
+//!    close can still lose its race with the broker's own creation — Pulsar completes a
+//!    close-before-creation by failing the pending creation future and acking Success, and CI
+//!    reproduced a registration surviving exactly that. So a subsequent `ProducerBusy` under the
+//!    name is *recovered from* rather than merely retried: the abandoned id is re-closed while the
+//!    broker can address it, and if the name is still busy the next attempt re-attaches under that
+//!    id as a strict successor. The claim this test makes is the user-visible one — **the name is
+//!    reusable on the same connection, with no `topics unload`** — inside the client's own retry
+//!    budget. The interleaving-by-interleaving proof lives in the in-process layers
 //!    (`crates/magnetar-proto/src/conn.rs` unit tests, the two engines'
 //!    `producer_open_cancel_close.rs`, and
 //!    `crates/magnetar-differential/tests/producer_open_cancel_close_equivalence.rs`), which script
-//!    the withheld `CommandProducerSuccess` exactly. Against a real broker the interleaving cannot
-//!    be scripted, so this test sweeps a range of tight deadlines to land inside the window and
-//!    asserts the recovery contract. It is one-sided: with the fix the final open always succeeds;
-//!    without it, any attempt that stranded a registration fails it.
+//!    each interleaving exactly. Against a real broker it cannot be scripted, so this test sweeps
+//!    tight deadlines to land inside the window. It is one-sided: with the recovery the final open
+//!    always succeeds; without it, any attempt that stranded a registration wedges the name.
 //! 2. **Opt-in unique name suffix.** `ProducerBuilder::unique_name_suffix(true)` makes each open
 //!    claim its own name, so a registration stranded by a dead client — or by a proxy-mediated
 //!    connection that outlived it, where no close can ever be sent — cannot collide with the next
@@ -65,7 +71,24 @@ const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
 /// A warm topic answers a producer open in single-digit milliseconds, so this
 /// range brackets the window where the `CommandProducer` is on the wire and
 /// the `CommandProducerSuccess` is not back yet.
-const TIGHT_DEADLINES_MS: [u64; 6] = [1, 2, 3, 5, 8, 13];
+///
+/// Kept short on purpose: every abandoned attempt is one more candidate the
+/// recovery may have to rotate through, and the recovery has to finish inside
+/// the final open's retry budget.
+const TIGHT_DEADLINES_MS: [u64; 3] = [2, 5, 9];
+
+/// Retry policy for the recovering open. Recovery costs at most one extra
+/// round trip per abandoned candidate, and the default 2 s to 8 s schedule
+/// would spend the whole operation budget waiting between them. Shortening the
+/// WAIT does not weaken the property under test — the final open must still
+/// succeed on its own, with no `topics unload` and no broker-side help.
+fn recovery_retry() -> magnetar_proto::OperationRetryConfig {
+    magnetar_proto::OperationRetryConfig {
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(250),
+        max_retries: Some(12),
+    }
+}
 
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
@@ -129,6 +152,7 @@ async fn e2e_timed_out_producer_open_does_not_poison_the_name()
     let (service_url, _admin_url, _container) = start_pulsar().await?;
     let client = PulsarClient::builder()
         .service_url(service_url)
+        .operation_retry(recovery_retry())
         .build()
         .await?;
     let topic = unique_topic("magnetar-e2e-producer-open-cancel");
@@ -155,8 +179,10 @@ async fn e2e_timed_out_producer_open_does_not_poison_the_name()
         }
     }
 
-    // The contract: whatever the sweep did to the broker, the pinned name is
-    // reusable on the same connection.
+    // The contract: whatever the sweep did to the broker — a registration
+    // reaped by the cancel-time close, or one that outlived it — the pinned
+    // name is reusable on the same connection, inside this open's own retry
+    // budget and with no `topics unload`.
     let recreated = client.producer(&topic).name(PRODUCER_NAME).create().await?;
     recreated
         .send_bytes(b"after-cancelled-opens".to_vec())

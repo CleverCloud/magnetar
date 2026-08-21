@@ -45,6 +45,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Because `ProducerBusy` is retryable for producer-open, the retry loop re-hit that zombie with a fresh producer id until the budget ran out, stranding one more registration each time.
   Cancellation now writes one best-effort fire-and-forget `CommandCloseProducer` for the abandoned producer id whenever the broker may still hold its registration.
   Pulsar processes commands in order per connection, so the close reaps the registration whether or not the open had completed.
+  Broker-side creation is asynchronous, though, and a close consumed while it is still pending is acked without reaching the registration that creation goes on to make — reproduced against Pulsar 4.0.4.
+  A later `ProducerBusy` under the name is therefore recovered from rather than retried into: the abandoned id is re-closed while the broker can address it, and if the name is still busy the next attempt re-attaches under that id with a strictly higher epoch, which is the successor claim Pulsar accepts.
+  The abandoned ids live in a fixed 16-record ring that is cleared on reconnect.
   (issue #406; ADR-0100, amending ADR-0080)
 
 ## [1.4.1] - 2026-08-11
