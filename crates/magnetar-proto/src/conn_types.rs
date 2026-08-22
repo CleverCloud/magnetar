@@ -347,9 +347,38 @@ pub struct ConnectionConfig {
     /// subscription that holds permits over an empty queue. Shorter windows start
     /// reporting ordinary idle backlogs; much longer ones defeat the point of a watchdog.
     ///
-    /// Emitting the event is the only effect — recovery stays explicit. See
+    /// Emitting the event is the only effect **unless**
+    /// [`Self::consumer_stall_auto_recovery`] is also set; otherwise recovery stays an
+    /// explicit
     /// [`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place).
     pub consumer_stall_timeout: Option<Duration>,
+    /// Bounded automatic recovery for the stall watchdog (issue #414, ADR-0103):
+    /// the maximum number of in-place re-subscribes
+    /// ([`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place))
+    /// the watchdog may drive **per consumer, per stall streak**.
+    ///
+    /// At most one attempt is made per stall episode, and an episode can only close once
+    /// per [`Self::consumer_stall_timeout`] window, so the bound is a cap on a sequence
+    /// that is already rate-limited to one re-subscribe per window. The counter resets to
+    /// zero on **real progress only** — one broker dispatch unit actually arriving
+    /// (`ConsumerState::record_dispatch_unit`). It deliberately does NOT reset at the
+    /// churn boundaries that zero the permit mirrors, because the recovery's own
+    /// re-subscribe is one of them and resetting there would make the bound infinite.
+    ///
+    /// **Default `None` — off, exactly like [`Self::consumer_stall_timeout`].** It is also
+    /// inert without that knob: no stall window means no stall episode means nothing to
+    /// recover from. `Some(0)` is the same as `None` (a budget of zero attempts).
+    ///
+    /// Each attempt zeroes this client's permit mirrors and re-attaches this consumer id
+    /// on the live socket, which repairs **this client's own slot** in the broker's
+    /// dispatcher. Issue #414's production failure was dispatcher-WIDE — the
+    /// subscription's `availablePermits` observed at `-177300` across every attached
+    /// consumer — and a fresh grant only lifts a corrupted aggregate by one receiver-queue
+    /// window per attempt. That is precisely why the bound exists: once it is exhausted
+    /// the client stops and logs the escalation (`pulsar-admin topics unload`) rather than
+    /// re-subscribing forever against a fault it cannot repair. See
+    /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    pub consumer_stall_auto_recovery: Option<u32>,
     /// Engine-arming slot for the ADR-0048 buggify fault-injection helper
     /// (ADR-0097 swarm configurations). Default [`crate::Buggify::disabled`]
     /// — a zero-sized no-op unless the `buggify` Cargo feature is enabled
@@ -423,6 +452,11 @@ impl Default for ConnectionConfig {
             // the flip is its own bisectable commit with its own seed sweep. The
             // recommended production value is documented on the field.
             consumer_stall_timeout: None,
+            // Issue #414 / ADR-0103: automatic recovery ships off for the same reason the
+            // watchdog above does, plus one of its own — it acts on the broker, and an
+            // action nobody asked for is not a default. It is inert anyway while
+            // `consumer_stall_timeout` is `None`.
+            consumer_stall_auto_recovery: None,
             buggify: crate::Buggify::disabled(),
         }
     }

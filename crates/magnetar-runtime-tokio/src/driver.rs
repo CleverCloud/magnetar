@@ -421,6 +421,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             // polls; the event stays observable to a caller driving the state
             // machine directly, and the recovery surface a user reaches for is
             // `Consumer::available_permits` + `Consumer::resubscribe`.
+            //
+            // ADR-0103's bounded automatic recovery does NOT live here either:
+            // `ClientBuilder::consumer_stall_auto_recovery` drives it inside the
+            // same proto `handle_timeout` sweep that raised the event, so both
+            // engines inherit identical behaviour with no per-engine attempt
+            // bookkeeping to drift. This arm stays a pure drain.
             ConnectionEvent::ChecksumMismatch { .. } => {}
             ConnectionEvent::ActiveConsumerChanged { .. } => {}
             ConnectionEvent::ConsumerStalled { .. } => {}

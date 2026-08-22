@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`ClientBuilder::consumer_stall_auto_recovery(u32)`** / `ConnectionConfig::consumer_stall_auto_recovery` — opt-in, bounded automatic recovery for the issue #414 stall watchdog.
+  With it set, the same `handle_timeout` sweep that emits `ConnectionEvent::ConsumerStalled` also performs the in-place re-attach `Consumer::resubscribe()` performs — zero the permit mirrors, fail the orphaned in-flight acks, re-emit `CommandSubscribe` for the same consumer id, let the broker's `Success` release a fresh initial `CommandFlow` — instead of leaving that to the application.
+  **At most one attempt per stall episode**, and an episode closes at most once per `consumer_stall_timeout`, so the value caps a sequence that is already rate-limited to one re-subscribe per window: `3` at the recommended 30 s window spends three re-subscribes over ninety seconds and then stops.
+  The budget resets on **real progress only** — one broker dispatch unit actually arriving — and deliberately not at the permit-mirror churn boundaries, because the recovery's own re-subscribe is one of them and resetting there would refund every attempt that paid for it, leaving no bound at all.
+  An attempt the eligibility gate refuses (closed, unsubscribing, terminally failed, mid-seek, re-attach already in flight) spends no budget and mutates nothing.
+  Exhausting the budget logs one `WARN` naming `pulsar-admin topics unload` and then goes quiet, because the last attempt was also the last thing that re-armed the stall window.
+  **Default unset**, `0` disables explicitly, and it is **inert without `consumer_stall_timeout`** — no window, no stall episode, nothing to recover from.
+  The diagnosis is never suppressed: the stall `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, and each attempt logs its own `INFO` carrying `attempt` and `max_attempts`.
+  Keep the number small — one attempt lifts the subscription's broker-side aggregate permit counter by exactly one receiver-queue window, and issue #414's production failure was `-177300` deep, so the bound exists to escalate rather than to eventually win.
+  This narrows ADR-0101's rejection of an automatic watchdog-driven re-subscribe to the unconditional unbounded form it was written about; that form is still rejected and is still the shipped default.
+  (issue #414; ADR-0103, amending ADR-0101)
+
 ### Fixed
 
 - **A fresh `Exclusive` / `Failover` subscribe no longer grants the initial consumer permits twice when the broker announces the active consumer.**

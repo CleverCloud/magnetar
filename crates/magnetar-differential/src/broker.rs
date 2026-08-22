@@ -129,6 +129,51 @@ struct SharedDispatcher {
     /// Entries returned by a detaching consumer, redelivered to the survivors
     /// ahead of the shared cursor (FIFO, oldest first).
     redelivery: std::collections::VecDeque<StoredMessage>,
+    /// The subscription's **aggregate** permit counter — the scripted analogue of the
+    /// number a real broker reports as `availablePermits` on a `Shared` subscription, and
+    /// the one issue #414 observed at `-177300` (issue #414, ADR-0103).
+    ///
+    /// Signed on purpose. A `u32` could not express the failure, which is the whole reason
+    /// this field exists: the wire protocol carries only monotonic client → broker permit
+    /// increments, so a NEGATIVE aggregate is by construction a broker-side accounting
+    /// fault and not something a client can produce.
+    ///
+    /// Maintained on three sites, all of them Shared-only:
+    ///
+    /// - `CommandFlow` credits it by the granted permits;
+    /// - each dispatched entry charges it one;
+    /// - a detach charges it the departing consumer's remaining permits (the "give the pool back
+    ///   what this consumer still held" half of a real `removeConsumer`).
+    ///
+    /// A re-registration of an already-attached consumer id zeroes that consumer's
+    /// permits without crediting the aggregate back, mirroring the client zeroing its own
+    /// mirrors: the fresh `CommandFlow` the client sends after the re-subscribe `Success`
+    /// is what puts the permits back, so one recovery attempt nets exactly
+    /// `+receiver_queue_size` on this counter. That is the arithmetic ADR-0103's attempt
+    /// bound is chosen against.
+    ///
+    /// [`Self::dispatch_gate_open`] is the `readMoreEntries`-style gate: a dispatcher
+    /// whose aggregate has reached zero or below hands out nothing, no matter what its
+    /// attached consumers individually hold. With correct accounting the gate can never be
+    /// the deciding factor — the counter is then the sum of the attached consumers'
+    /// permits plus a non-negative re-registration drift, so it is `<= 0` only when no
+    /// consumer holds a permit and the round-robin scan would have stopped anyway. Every
+    /// pre-existing golden trace is therefore byte-identical. Arm
+    /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`] to break that invariant
+    /// deliberately.
+    total_available_permits: i64,
+}
+
+impl SharedDispatcher {
+    /// Whether the dispatcher may hand out another entry.
+    ///
+    /// The scripted stand-in for the real dispatcher's `totalAvailablePermits > 0` read
+    /// gate: a subscription whose aggregate has gone non-positive stops dispatching
+    /// entirely, which is the client-visible shape of issue #414 — every attached consumer
+    /// still holds per-consumer permits, the backlog is non-empty, and nothing moves.
+    fn dispatch_gate_open(&self) -> bool {
+        self.total_available_permits > 0
+    }
 }
 
 #[derive(Debug, Default)]
@@ -377,6 +422,10 @@ struct SessionDeps {
     /// `CommandActiveConsumerChange { is_active: true }` — what a real broker
     /// does for an `Exclusive` / `Failover` subscription (issue #427).
     announce_active_consumer: Arc<Mutex<bool>>,
+    /// When `true`, detaching a `Shared` consumer subtracts its remaining permits from
+    /// the subscription's aggregate counter TWICE (issue #414). See
+    /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`].
+    leak_shared_permits_on_churn: Arc<Mutex<bool>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -476,6 +525,11 @@ pub struct ScriptedBroker {
     /// [`Self::announce_active_consumer_on_subscribe`] for the issue #427
     /// initial-grant scenario.
     announce_active_consumer: Arc<Mutex<bool>>,
+    /// When `true`, detaching a `Shared` consumer subtracts its remaining permits from
+    /// the subscription's aggregate permit counter TWICE, leaking that many permits per
+    /// churn event (issue #414). Armed by
+    /// [`Self::leak_shared_permits_on_consumer_churn`].
+    leak_shared_permits_on_churn: Arc<Mutex<bool>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -529,6 +583,8 @@ impl ScriptedBroker {
             withhold_registration_survives_close.clone();
         let announce_active_consumer = Arc::new(Mutex::new(false));
         let announce_active_consumer_clone = announce_active_consumer.clone();
+        let leak_shared_permits_on_churn = Arc::new(Mutex::new(false));
+        let leak_shared_permits_on_churn_clone = leak_shared_permits_on_churn.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -545,6 +601,7 @@ impl ScriptedBroker {
             withhold_producer_success_for_name: withhold_producer_success_for_name_clone,
             withhold_registration_survives_close: withhold_registration_survives_close_clone,
             announce_active_consumer: announce_active_consumer_clone,
+            leak_shared_permits_on_churn: leak_shared_permits_on_churn_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -580,8 +637,45 @@ impl ScriptedBroker {
             withhold_producer_success_for_name,
             withhold_registration_survives_close,
             announce_active_consumer,
+            leak_shared_permits_on_churn,
             cross_session,
         })
+    }
+
+    /// Arm the issue #414 Shared-dispatcher permit leak: every `CommandCloseConsumer` for
+    /// a `Shared` consumer subtracts that consumer's remaining permits from the
+    /// subscription's aggregate counter TWICE instead of once.
+    ///
+    /// The second subtraction removes permits no credit was ever issued for, so it is a
+    /// permanent leak of exactly the departing consumer's remaining permits per churn
+    /// event. Once the aggregate crosses zero the dispatcher's read gate closes and the
+    /// subscription stops dispatching entirely — the survivors still hold per-consumer
+    /// permits, the backlog is still non-empty, the connection is still healthy, and
+    /// nothing moves. That is the client-visible shape issue #414 reports, with the
+    /// broker's own `availablePermits` for the subscription observed at `-177300`.
+    ///
+    /// The **client cannot cause this**, which is why it has to be injected here: the wire
+    /// protocol carries only monotonic client → broker permit increments (`CommandFlow`),
+    /// with no decrement of any kind, so no sequence of client behaviour drives a broker's
+    /// aggregate negative.
+    ///
+    /// The recovery arithmetic this exposes is the point. An in-place re-subscribe zeroes
+    /// the consumer's permits broker-side and the client then sends one fresh
+    /// `CommandFlow` of a full receiver queue, so ONE recovery attempt lifts the aggregate
+    /// by exactly `receiver_queue_size`. A leak of `L` therefore needs
+    /// `ceil(L / receiver_queue_size)` attempts, which is why ADR-0103's automatic
+    /// recovery is bounded and escalates to `pulsar-admin topics unload` rather than
+    /// re-subscribing forever.
+    ///
+    /// Off by default: with it disarmed the aggregate is exactly the sum of the attached
+    /// consumers' permits plus a non-negative re-registration drift, the read gate can
+    /// never be the deciding factor, and every pre-existing trace is byte-identical.
+    ///
+    /// This models a HYPOTHESIS about the broker's churn-path permit accounting, chosen
+    /// because it reproduces the reported signature exactly. It is not a verified reading
+    /// of any Apache Pulsar source.
+    pub fn leak_shared_permits_on_consumer_churn(&self) {
+        *self.leak_shared_permits_on_churn.lock() = true;
     }
 
     /// Arm the active-consumer announcement: every `CommandSubscribe` is answered with
@@ -1283,6 +1377,16 @@ fn handle_frame(
                         // A re-attach recreates the dispatcher slot at zero
                         // permits broker-side — mirrors the real broker, and it
                         // is what makes the client's own permit zeroing correct.
+                        //
+                        // Deliberately NOT credited back to
+                        // `total_available_permits`: the client zeroes its
+                        // mirrors here too and then sends a full fresh
+                        // `CommandFlow` on the re-subscribe `Success`, so
+                        // crediting here would double-count that window. One
+                        // recovery attempt therefore nets exactly
+                        // `+receiver_queue_size` on the aggregate, which is what
+                        // makes ADR-0103's attempt bound a meaningful budget
+                        // rather than an arbitrary number.
                         if let Some((_, c)) = g.consumers.get_mut(&s.consumer_id) {
                             c.permits = 0;
                         }
@@ -1306,8 +1410,21 @@ fn handle_frame(
                     .lock()
                     .push((f.consumer_id, f.message_permits));
                 let mut g = state.lock();
-                if let Some((_, c)) = g.consumers.get_mut(&f.consumer_id) {
-                    c.permits = c.permits.saturating_add(f.message_permits);
+                let shared_key = g
+                    .consumers
+                    .get_mut(&f.consumer_id)
+                    .map(|(_, c)| {
+                        c.permits = c.permits.saturating_add(f.message_permits);
+                        c.shared_key.clone()
+                    })
+                    .unwrap_or_default();
+                // Issue #414: a Shared subscription's aggregate counter is credited by
+                // the same grant. This is the only site that ever raises it — which is
+                // why a recovery re-subscribe recovers anything at all.
+                if let Some(key) = shared_key
+                    && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
+                {
+                    dispatcher.total_available_permits += i64::from(f.message_permits);
                 }
             }
         }
@@ -1571,11 +1688,32 @@ fn handle_frame(
                 // was holding un-acked to the subscription's redelivery pool, so
                 // a survivor picks it up. This is the broker half of the
                 // scale-down / mid-drain-recycle window the issue reports.
+                let leak_on_churn = *deps.leak_shared_permits_on_churn.lock();
                 if let Some((_, state)) = removed
                     && let Some(key) = state.shared_key
                     && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
                 {
                     dispatcher.attached.retain(|id| *id != c.consumer_id);
+                    // Issue #414 / ADR-0103: the subscription's aggregate counter gives
+                    // back what the departing consumer still held. Correct accounting
+                    // subtracts it ONCE — the counter then stays equal to the sum of the
+                    // attached consumers' permits and the dispatch gate never binds.
+                    //
+                    // Armed, the detach subtracts it TWICE. The second subtraction is a
+                    // permit removal for which no credit was ever issued, so it is a
+                    // permanent, unrecoverable-by-the-client leak of exactly the departing
+                    // consumer's remaining permits, per churn event — and once the
+                    // aggregate crosses zero the dispatcher stops serving the survivors
+                    // even though they hold permits and the backlog is non-empty. That is
+                    // the client-visible shape issue #414 reports, and the accounting
+                    // asymmetry the upstream draft asks Pulsar's maintainers to check on
+                    // the Shared-dispatcher churn path. It is a HYPOTHESIS this harness
+                    // makes reproducible, not a verified reading of any broker source.
+                    let returned = i64::from(state.permits);
+                    dispatcher.total_available_permits -= returned;
+                    if leak_on_churn {
+                        dispatcher.total_available_permits -= returned;
+                    }
                     // `unwrap_or_default` rather than `if let Some`: a consumer that never
                     // received anything simply has nothing to hand back, and that is not a
                     // separate case worth branching on — a dispatcher that redelivered on
@@ -1701,6 +1839,16 @@ fn push_pending_shared(
             if dispatcher.attached.is_empty() {
                 break;
             }
+            // Issue #414: the aggregate read gate. With correct accounting this can never
+            // be the deciding break — the counter is the sum of the attached consumers'
+            // permits plus a non-negative re-registration drift, so it is non-positive
+            // only when the round-robin scan below would have found nobody anyway. Under
+            // `ScriptedBroker::leak_shared_permits_on_consumer_churn` it becomes the whole
+            // failure: survivors hold permits, the backlog is non-empty, and the
+            // subscription still dispatches nothing.
+            if !dispatcher.dispatch_gate_open() {
+                break;
+            }
             let ring = dispatcher.attached.clone();
             let start = dispatcher.next % ring.len();
             let chosen = (0..ring.len()).find_map(|offset| {
@@ -1738,6 +1886,10 @@ fn push_pending_shared(
             if let Some((_, c)) = g.consumers.get_mut(&cid) {
                 c.permits = c.permits.saturating_sub(1);
             }
+            g.shared_dispatchers
+                .get_mut(&key)
+                .expect("checked present above")
+                .total_available_permits -= 1;
             g.shared_dispatchers
                 .get_mut(&key)
                 .expect("checked present above")

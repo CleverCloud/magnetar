@@ -4,8 +4,8 @@
 //! deterministic moonpool clock.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): three `#[test]` functions here mirror the
-//! three in `magnetar-runtime-tokio/tests/consumer_stall_recovery.rs`.
+//! (`check-runtime-test-parity`): six `#[test]` functions here mirror the
+//! six in `magnetar-runtime-tokio/tests/consumer_stall_recovery.rs`.
 //!
 //! ## The failure this covers
 //!
@@ -40,6 +40,14 @@
 //!    re-subscribe.
 //! 3. Two Shared consumers on one subscription: closing one leaves the survivor's own permits,
 //!    queue, and watchdog untouched — the client-side half of the churn window issue #414 reports.
+//! 4. ADR-0103's opt-in automatic recovery: disarmed it emits no wire traffic at all, armed it
+//!    re-subscribes at most `consumer_stall_auto_recovery` times per stall streak and then stops,
+//!    reporting the episode either way so the broker-side defect is never papered over.
+//! 5. The budget resets on one broker dispatch unit actually arriving — and on nothing else, the
+//!    recovery's own re-subscribe included, which is what makes the bound a bound.
+//! 6. A consumer the in-place re-attach may not touch — a pending unsubscribe, the one ineligible
+//!    state that is still a stall candidate — is reported and left completely alone: no
+//!    `CommandSubscribe`, no mutation, no budget spent.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -404,7 +412,8 @@ fn closing_one_shared_consumer_leaves_the_survivor_untouched() {
     // reported — the event says "no dispatch despite outstanding permits", which
     // on a drained, idle subscription is the truth and not a fault; the caller
     // correlates it with the broker's backlog before acting. That is why the
-    // watchdog only ever emits an event and never recovers on its own.)
+    // watchdog emits an event and, unless `consumer_stall_auto_recovery` is
+    // armed, never recovers on its own.)
     shared.inner.lock().handle_timeout(t0);
     assert!(drain_stalls(&shared).is_empty(), "the seeding tick");
     {
@@ -420,5 +429,229 @@ fn closing_one_shared_consumer_leaves_the_survivor_untouched() {
     assert!(
         stalls.iter().all(|(handle, _, _)| *handle != survivor),
         "a survivor that received inside the window must not be reported, got {stalls:?}"
+    );
+}
+
+/// Connection config with the #414 watchdog armed AND ADR-0103's bounded automatic
+/// recovery armed at `max_attempts` in-place re-subscribes per stall streak.
+fn auto_recovery_config(max_attempts: u32) -> ConnectionConfig {
+    ConnectionConfig {
+        consumer_stall_auto_recovery: Some(max_attempts),
+        ..watchdog_config()
+    }
+}
+
+/// One watchdog sweep at `at`, reported as a `(stall events, resubscribe request id)`
+/// pair — the second element being `Some` exactly when the automatic recovery emitted a
+/// `CommandSubscribe`.
+///
+/// The request id is how an emitted re-subscribe is counted without a new public
+/// accessor: `emit_command_subscribe` is the only thing in these traces that consumes
+/// one, so a sweep that advanced the counter by exactly one emitted exactly one
+/// `CommandSubscribe` — and the id it consumed is the one the broker's `Success` must
+/// carry back.
+fn sweep(shared: &ConnectionShared, at: Instant) -> (usize, Option<u64>) {
+    let before = shared.inner.lock().peek_next_request_id_for_test();
+    shared.inner.lock().handle_timeout(at);
+    let after = shared.inner.lock().peek_next_request_id_for_test();
+    let stalls = drain_stalls(shared).len();
+    assert!(
+        after == before || after == before + 1,
+        "one sweep may emit at most one in-place re-subscribe, saw {before} -> {after}"
+    );
+    (stalls, (after != before).then_some(before))
+}
+
+/// Feed the broker's `Success` for a re-subscribe the watchdog emitted, which is what
+/// releases the deferred initial `CommandFlow` and re-arms both the grant and the window.
+fn ack_resubscribe(shared: &ConnectionShared, request_id: u64, at: Instant) {
+    let mut conn = shared.inner.lock();
+    conn.handle_bytes(at, &success_frame(request_id))
+        .expect("resubscribe Success");
+    while conn.poll_event().is_some() {}
+    let _ = conn.poll_transmit();
+}
+
+/// Recovery budget for [`auto_recovery_resubscribes_up_to_the_bound_and_then_escalates`].
+const MAX_ATTEMPTS: u32 = 2;
+
+#[test]
+fn auto_recovery_resubscribes_up_to_the_bound_and_then_escalates() {
+    // ── Control: the watchdog alone. ADR-0101 shipped it event-only, and that is still
+    // what an application that arms `consumer_stall_timeout` and nothing else gets: a
+    // report, and not one byte of recovery traffic. If this ever starts emitting a
+    // re-subscribe, opt-in stopped being opt-in.
+    let t0 = Instant::now();
+    let reporting_only = ConnectionShared::new(watchdog_config());
+    let _ = open_shared_consumers(&reporting_only, "sub-report-only", &["solo"], t0)[0];
+    let (stalls, resubscribe) = sweep(&reporting_only, t0 + WINDOW);
+    assert_eq!(
+        stalls, 1,
+        "the watchdog still reports with recovery disarmed"
+    );
+    assert_eq!(
+        resubscribe, None,
+        "an unset `consumer_stall_auto_recovery` must emit no wire traffic at all"
+    );
+
+    // ── Armed with a budget of two.
+    let shared = ConnectionShared::new(auto_recovery_config(MAX_ATTEMPTS));
+    let handle = open_shared_consumers(&shared, "sub-auto-recover", &["solo"], t0)[0];
+
+    // `initial_flow` armed the window at `t0`, so the first episode closes exactly one
+    // window later — no seeding sweep needed, and no keepalive interval added on top.
+    let mut at = t0;
+    for attempt in 1..=MAX_ATTEMPTS {
+        at += WINDOW;
+        let (stalls, resubscribe) = sweep(&shared, at);
+        assert_eq!(
+            stalls, 1,
+            "attempt {attempt}: the event is emitted whether or not recovery acts — \
+             arming recovery must never suppress the diagnosis"
+        );
+        let request_id = resubscribe.unwrap_or_else(|| {
+            panic!("attempt {attempt}: a consumer inside its budget must be re-subscribed")
+        });
+        assert_eq!(
+            shared.inner.lock().consumer_available_permits(handle),
+            0,
+            "attempt {attempt}: the mirrors follow the broker's freshly recreated \
+             dispatcher slot, which starts at zero permits"
+        );
+        ack_resubscribe(&shared, request_id, at);
+        assert_eq!(
+            shared.inner.lock().consumer_available_permits(handle),
+            RQ as u32,
+            "attempt {attempt}: the re-subscribe ack re-arms the full receiver-queue grant"
+        );
+    }
+
+    // Budget exhausted. The broker never dispatched, so nothing reset the counter: the
+    // next episode reports and escalates instead of re-subscribing a third time. This is
+    // the dispatcher-WIDE arm of issue #414 — one fresh grant per attempt cannot lift an
+    // aggregate observed at `-177300`, so the client stops and leaves `topics unload` to
+    // the operator rather than re-subscribing forever.
+    at += WINDOW;
+    let (stalls, resubscribe) = sweep(&shared, at);
+    assert_eq!(stalls, 1, "the exhausted episode is still reported");
+    assert_eq!(
+        resubscribe, None,
+        "a consumer whose budget is spent must emit no further re-subscribe"
+    );
+
+    // And it stays stopped: the last attempt was the last thing that re-armed the window,
+    // so with no dispatch there is no further episode and no further traffic — one
+    // escalation, not one per window forever.
+    for extra in [1u64, 60, 3_600] {
+        let (stalls, resubscribe) = sweep(&shared, at + Duration::from_secs(extra));
+        assert_eq!(
+            stalls, 0,
+            "the once-per-episode latch holds after exhaustion"
+        );
+        assert_eq!(
+            resubscribe, None,
+            "and no recovery traffic resumes on its own"
+        );
+    }
+}
+
+#[test]
+fn a_broker_dispatch_between_stalls_restores_the_auto_recovery_budget() {
+    // The budget is per stall STREAK, not per consumer lifetime: a consumer that wedges,
+    // is recovered, runs healthily for a while and later wedges again deserves its full
+    // budget the second time. The only thing that grants it back is a dispatch unit
+    // genuinely arriving — deliberately NOT the recovery's own re-subscribe, which zeroes
+    // the same permit mirrors a real churn boundary does and would therefore refund every
+    // attempt that bought it, leaving no bound at all.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(auto_recovery_config(1));
+    let handle = open_shared_consumers(&shared, "sub-auto-budget", &["solo"], t0)[0];
+
+    // Streak one spends the single attempt.
+    let first = t0 + WINDOW;
+    let (stalls, resubscribe) = sweep(&shared, first);
+    assert_eq!(stalls, 1, "first stall episode");
+    let request_id = resubscribe.expect("the first attempt is inside the budget");
+    ack_resubscribe(&shared, request_id, first);
+
+    // The broker resumes: one message, popped by the user. That is the whole definition
+    // of progress the budget resets on.
+    let resumed = first + Duration::from_secs(1);
+    {
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(resumed, &message_frame(handle, 0, b"progress"))
+            .expect("deliver");
+        let message = conn
+            .pop_message(handle, resumed)
+            .expect("the dispatch reaches the user");
+        assert_eq!(message.payload.as_ref(), b"progress");
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+    }
+
+    // Re-seed the window on the dispatch, then wedge again.
+    let (stalls, resubscribe) = sweep(&shared, resumed);
+    assert_eq!(stalls, 0, "the dispatch re-seeded rather than reported");
+    assert_eq!(
+        resubscribe, None,
+        "and re-seeding is not a recovery attempt"
+    );
+    let second = resumed + WINDOW;
+    let (stalls, resubscribe) = sweep(&shared, second);
+    assert_eq!(stalls, 1, "second stall episode");
+    let request_id = resubscribe
+        .expect("the dispatch restored the budget, so this streak may spend its own attempt");
+    ack_resubscribe(&shared, request_id, second);
+
+    // Nothing arrived this time, so the second streak's budget is now spent too.
+    let (stalls, resubscribe) = sweep(&shared, second + WINDOW);
+    assert_eq!(stalls, 1, "the exhausted episode of the second streak");
+    assert_eq!(
+        resubscribe, None,
+        "a streak with no dispatch in it gets exactly `max_attempts` attempts"
+    );
+}
+
+#[test]
+fn a_consumer_the_recovery_may_not_touch_is_reported_but_never_re_subscribed() {
+    // The refusal path, and the only state that reaches it: a pending unsubscribe is
+    // simultaneously a stall CANDIDATE (the broker still holds un-spent permits over an
+    // empty queue, nothing is closed, paused, seeking, terminal, or re-attaching) and
+    // INELIGIBLE for an in-place re-attach, because that pending unsubscribe owns this
+    // consumer's fate. Every other ineligible state also suppresses candidacy, so no
+    // stall episode opens for it and the refusal is never reached.
+    //
+    // Charging that refusal to the budget would let an unrelated teardown race burn the
+    // recovery a genuinely wedged consumer still needs, and re-subscribing anyway would
+    // resurrect a consumer the caller is in the middle of retiring. So the watchdog must
+    // still REPORT — the silence is real — while putting nothing at all on the wire.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(auto_recovery_config(MAX_ATTEMPTS));
+    let handle = open_shared_consumers(&shared, "sub-auto-refused", &["solo"], t0)[0];
+
+    {
+        let mut conn = shared.inner.lock();
+        let _ = conn.unsubscribe(handle, false);
+        // Drop the `CommandUnsubscribe` this staged so the sweep below starts from an
+        // empty outbound buffer.
+        let _ = conn.poll_transmit();
+        while conn.poll_event().is_some() {}
+    }
+
+    let (stalls, resubscribe) = sweep(&shared, t0 + WINDOW);
+    assert_eq!(
+        stalls, 1,
+        "a consumer the client cannot recover is still one the operator needs told about"
+    );
+    assert_eq!(
+        resubscribe, None,
+        "an in-place re-attach for a consumer with an unsubscribe in flight must be \
+         refused, not merely deferred"
+    );
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "and the refusal must mutate nothing: zeroing the mirrors for a consumer we then \
+         decline to re-subscribe leaves it strictly worse off than the stall it was in"
     );
 }
