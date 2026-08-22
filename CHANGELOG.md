@@ -11,6 +11,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Dependencies:** bumped workspace manifest floors — `rustls-openssl` 0.3.1→0.4.0, `apache-avro` 0.21.0→0.22.0, `uuid` 1.24.0→1.24.1, `rcgen` 0.14.8→0.14.9, `futures`/`futures-util` 0.3.33→0.3.34, `rustls` 0.23.42→0.23.43, `aws-lc-rs` 1.17.3→1.18.0, `base64` 0.23.0→0.23.1, `http` 1.4.2→1.5.0, `clap` 4.6.4→4.6.6, `thiserror` 2.0.18→2.0.20, `testcontainers` 0.27.3→0.28.0, and `async-trait` 0.1.91→0.1.92 — and refreshed `Cargo.lock`.
   `apache-avro` 0.22 deprecated the free `to_avro_datum`/`from_avro_datum` functions that `AvroSchema::encode`/`decode` called; `crates/magnetar-proto/src/schema/avro.rs` now drives the replacement `GenericDatumWriter`/`GenericDatumReader` builders instead, with the parsing-canonical-form `schema_data()` output and the encode/decode round-trip unchanged (`schema::avro::tests` exercises both).
 
+### Fixed
+
+- **A fresh `Exclusive` / `Failover` subscribe no longer grants the initial consumer permits twice when the broker announces the active consumer.**
+  A real broker answers such a subscribe with `CommandSuccess` and then `CommandActiveConsumerChange { is_active: true }` in the same write, so both frames reach the client in one read.
+  The issue #307 promotion re-arm therefore ran inside `handle_bytes` while the engine's own post-ack `Connection::initial_flow` was still parked on the resolving subscribe future, and its `granted_permits == 0` gate was legitimately still true at that instant because no grant had been issued yet.
+  Both then granted, and the broker held `2 × receiver_queue_size` for a fresh consumer whose mirrors recorded `1 ×` — measured 32 against a configured 16.
+  `Shared` subscriptions were unaffected: the broker never sends that command for them, which is why issue #426's fix left the count correct there and this one open.
+  `Connection::initial_flow` now grants at most once per attach: it emits a `CommandFlow` only when a `CommandSubscribe` has gone out since the last grant (the broker's freshly created dispatcher slot starts at zero permits) or when the client holds no outstanding grant at all (the churn boundary the #307 re-arm exists for).
+  Whichever of the two racing callers arrives first issues the grant; the other is a no-op instead of a second full window.
+  The #307 re-arm itself is unchanged and still restores flow for a promoted consumer whose permit mirrors a reset, a terminal subscribe failure, or a same-broker `CommandCloseConsumer` zeroed; `maybe_flow` and `adjust_receiver_queue` are untouched, since replenishment and growth are incremental top-ups that do not route through `initial_flow`.
+  (issue #427; ADR-0102, amending ADR-0082)
+
 ## [1.5.0] - 2026-08-22
 
 ### Added

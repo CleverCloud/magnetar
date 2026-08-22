@@ -1,6 +1,6 @@
 # ADR-0082 — Split the consumer permit mirror into a grant register and a real balance
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md), the `consumer_available_permits` accessor; amended by [ADR-0102](0102-grant-the-initial-consumer-flow-once-per-attach.md), the "two callers" clause — everything else below remains binding)
 - **Date**: 2026-07-17
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, pip-74, receiver-queue, java-parity, issue-349
@@ -8,6 +8,11 @@
 > **Amendment (2026-08-21, [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md)).** `Connection::consumer_available_permits()` — and the `Consumer::available_permits()` chain on both engines — now reads `permit_balance`, not `granted_permits`.
 > The deferral recorded below ("intentionally left reading `granted_permits`", "a separate, unscoped change") is superseded: issue #414 is its concrete cost, because an accessor that never moves under dispatch cannot tell a healthy consumer from one whose broker-side dispatcher has wedged.
 > Everything else in this ADR stays in force: the two counters stay split, `granted_permits` keeps its additive semantics and its two callers (the #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta), `flow_stats` still feeds `permit_balance` into `FlowStats::available_permits`, and the `granted_permits == 0` churn-window guard is unchanged.
+
+> **Amendment (2026-08-22, [ADR-0102](0102-grant-the-initial-consumer-flow-once-per-attach.md)).** `granted_permits` now has a THIRD caller: the once-per-attach guard in `Connection::initial_flow`.
+> The "two callers" clause below is superseded to that extent, and with it the #307 failover-reflow gate's standing as the sole arbiter of whether a promotion grants — its `granted_permits == 0` predicate answers "does the client hold an outstanding grant", which on a fresh subscribe is still true while the grant is merely owed, so a broker's `CommandActiveConsumerChange` behind the subscribe `Success` made that gate and the engine's post-ack `initial_flow` both grant for one attach (issue #427).
+> The new `ConsumerState::initial_grant_due` supplies the part the additive mirror cannot answer.
+> The field's additive semantics, the split, `flow_stats`, and the `granted_permits == 0` churn-window guard in `adjust_receiver_queue` are all unchanged.
 
 ## Context
 
