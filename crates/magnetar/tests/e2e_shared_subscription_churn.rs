@@ -28,6 +28,13 @@
 //!    strictly below the configured receiver-queue size while the broker is dispatching. On the old
 //!    semantics it was pinned at the queue size forever and a wedged consumer was indistinguishable
 //!    from a healthy one.
+//! 3. **The broker agrees with the client about the initial grant** (issue #426). Both engines used
+//!    to follow the sans-io `Connection::initial_flow` with a raw `Connection::flow(handle,
+//!    receiver_queue_size)`: a second, wire-only frame no client mirror accounted for.
+//!    `available_permits()` said `receiver_queue_size` while the broker's own `availablePermits`
+//!    said twice that, so the balance point 2 rests on was measured against the wrong number and
+//!    the broker could hand a consumer twice the messages its queue was sized for. Read straight
+//!    out of the broker's topic stats, which is the only oracle that can tell the two apart.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
@@ -42,6 +49,7 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
+use magnetar_admin::{AdminClient, TopicStats};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -68,6 +76,17 @@ const CONSUMERS: usize = 3;
 
 /// Messages published into the backlog.
 const TOTAL: usize = 60;
+
+/// How long the issue #426 check waits for every consumer's initial grant to
+/// show up in the broker's topic stats.
+const ADMIN_POLL_TIMEOUT: Duration = Duration::from_secs(15);
+const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Settle window between "the broker reports a non-zero grant" and the reading
+/// the assertion uses. A redundant second `CommandFlow` rides the same driver
+/// flush as the first, so it is already on the wire — this only removes any
+/// dependence on where the broker happened to be in processing that write.
+const ADMIN_SETTLE: Duration = Duration::from_secs(1);
 
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
@@ -114,6 +133,67 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
+/// The broker's own `availablePermits` for every consumer registered on
+/// `subscription`, in the order the broker lists them. Empty while the
+/// subscription is not yet in the stats response.
+fn broker_available_permits(stats: &TopicStats, subscription: &str) -> Vec<i64> {
+    stats
+        .subscriptions
+        .get(subscription)
+        .and_then(|sub| sub.get("consumers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|consumers| {
+            consumers
+                .iter()
+                .filter_map(|consumer| {
+                    consumer
+                        .get("availablePermits")
+                        .and_then(serde_json::Value::as_i64)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll the broker until it reports a grant for all `expected` consumers, let
+/// the reading settle, then return the settled per-consumer permits. Nothing
+/// has been published at the call site, so the broker has spent none of what it
+/// was granted and its counter is the grant itself.
+async fn settled_broker_permits(
+    admin: &AdminClient,
+    topic: &str,
+    subscription: &str,
+    expected: usize,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + ADMIN_POLL_TIMEOUT;
+    loop {
+        let observation = match admin.topic_stats(topic).await {
+            Ok(stats) => {
+                let permits = broker_available_permits(&stats, subscription);
+                if permits.len() == expected && permits.iter().all(|p| *p > 0) {
+                    tokio::time::sleep(ADMIN_SETTLE).await;
+                    return Ok(broker_available_permits(
+                        &admin.topic_stats(topic).await?,
+                        subscription,
+                    ));
+                }
+                format!("{permits:?}")
+            }
+            // The topic is created by the subscribe itself, so a stats call
+            // that races that creation 404s. Retry until the deadline.
+            Err(error) => format!("admin error: {error}"),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "broker did not report an initial grant for all {expected} consumer(s) of \
+                 `{subscription}` within {ADMIN_POLL_TIMEOUT:?}; last observation: {observation}"
+            )
+            .into());
+        }
+        tokio::time::sleep(ADMIN_POLL_INTERVAL).await;
+    }
+}
+
 /// Receive and ack up to `max` messages, stopping early once the consumer stays
 /// idle for `idle_timeout`. Records the lowest `available_permits()` observed
 /// while messages were actually flowing.
@@ -144,8 +224,12 @@ async fn drain_some(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (service_url, _admin_url, _container) = start_pulsar().await?;
+    let (service_url, admin_url, _container) = start_pulsar().await?;
 
+    let admin = AdminClient::builder()
+        .service_url(admin_url.parse()?)
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let client = PulsarClient::builder()
         .service_url(service_url)
         .build()
@@ -180,6 +264,18 @@ async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
             "consumer {index} must start with its full receiver-queue grant"
         );
     }
+
+    // Issue #426: and the BROKER must agree. A subscribe that grants twice
+    // leaves the client reporting `RECEIVER_QUEUE_SIZE` above while the broker
+    // holds `2 ×` — visible only from here, and only before anything has been
+    // published to spend it.
+    let granted = settled_broker_permits(&admin, &topic, &subscription, CONSUMERS).await?;
+    assert_eq!(
+        granted,
+        vec![i64::from(RECEIVER_QUEUE_SIZE as u32); CONSUMERS],
+        "the broker must hold exactly one receiver-queue grant per consumer after subscribe \
+         (issue #426): configured {RECEIVER_QUEUE_SIZE}, broker reports {granted:?}",
+    );
 
     let producer = client.producer(&topic).create().await?;
     let mut sent: Vec<Vec<u8>> = Vec::with_capacity(TOTAL);
