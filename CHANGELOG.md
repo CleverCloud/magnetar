@@ -40,6 +40,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A fresh subscribe no longer grants the initial consumer permits twice.**
+  Both engines followed the sans-io `Connection::initial_flow` — which emits the `CommandFlow` and updates the client-side permit mirrors — with a raw `Connection::flow(handle, receiver_queue_size)` immediately behind it.
+  That second frame was wire-only: no mirror accounted for it, so the broker held `2 × receiver_queue_size` permits for a freshly-subscribed consumer while `available_permits()` and `FlowStats` reported `1 ×`.
+  The broker could therefore hand a consumer twice the messages its receiver queue was sized for, and every client-side reading of the broker's balance was wrong from the first frame — including the issue #414 stall signature, which is measured against exactly that balance.
+  The raw call was defensive boilerplate from the founding commit, described in its own comment as a safety net for a sans-io version that gated the initial flow; no such gating ever existed.
+  `initial_flow` is now the single owner of the initial grant, which is already how every reconnect, re-attach, post-seek resubscribe and failover re-arm path issued it.
+  (issue #426)
 - **A producer open abandoned on its deadline no longer poisons its producer name.**
   Cancelling an opening producer was local-only, so the broker completed the open on its own schedule and kept the `(topic, producer_name)` registration; every later open under that name then failed with `ProducerBusy` (code 16, the broker's `NamingException`) until the topic was unloaded.
   Because `ProducerBusy` is retryable for producer-open, the retry loop re-hit that zombie with a fresh producer id until the budget ran out, stranding one more registration each time.

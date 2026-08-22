@@ -9567,6 +9567,75 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn initial_flow_grants_the_receiver_queue_size_exactly_once() {
+        // Issue #426: both runtime subscribe paths used to follow `initial_flow`
+        // with a raw `Connection::flow(handle, receiver_queue_size)`, so the broker
+        // was granted `2 × receiver_queue_size` on a fresh subscribe while the
+        // client-side mirrors (`granted_permits` / `permit_balance`, and therefore
+        // `available_permits()` and `FlowStats`) only ever accounted for `1 ×`.
+        // `initial_flow` is the single owner of the initial grant: ONE frame whose
+        // permits equal the receiver-queue size, and mirrors that agree with it.
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/initial-grant".to_owned(),
+            subscription: "initial-grant-sub".to_owned(),
+            receiver_queue_size: 128,
+            durable: true,
+            ..Default::default()
+        });
+        // Drop the `CommandSubscribe`; only the post-ack grant is under test.
+        let _initial = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        // The ack alone grants nothing on a fresh subscribe: the engine owns the
+        // call, which is what makes a second grant from the engine observable here.
+        let post_ack = drain_outbound_commands(&mut conn);
+        assert!(
+            post_ack
+                .iter()
+                .all(|c| c.r#type != pb::base_command::Type::Flow as i32),
+            "a fresh subscribe ack must not grant permits by itself: {post_ack:?}"
+        );
+
+        let _ = conn.initial_flow(handle, Instant::now());
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "initial_flow must put EXACTLY one CommandFlow on the wire: {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, 128);
+
+        let slot = conn.consumer(handle).expect("consumer slot").clone();
+        let state = slot.state.lock();
+        assert_eq!(
+            state.granted_permits, 128,
+            "the grant mirror must match the single frame that reached the broker"
+        );
+        assert_eq!(
+            state.permit_balance, 128,
+            "the live balance must match the single frame that reached the broker"
+        );
+    }
+
+    #[test]
     fn reattach_position_uses_only_authoritative_start_points() {
         let original = MessageId {
             ledger_id: 1,

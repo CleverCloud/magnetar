@@ -1556,10 +1556,6 @@ impl<P: Providers + Send + Sync> Client<P> {
                         let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
                         let _ = conn.initial_flow(handle, now);
-                        let initial_target = slot.state.lock().receiver_queue_size;
-                        if initial_target > 0 {
-                            conn.flow(handle, initial_target as u32);
-                        }
                     }
                     shared.driver_waker.notify_one();
                     tracing::info!(

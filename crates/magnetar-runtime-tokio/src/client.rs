@@ -2003,10 +2003,6 @@ impl Client {
                         let now = std::time::Instant::now();
                         let mut conn = target_shared.inner.lock();
                         let _ = conn.initial_flow(handle, now);
-                        let initial_target = slot.state.lock().receiver_queue_size;
-                        if initial_target > 0 {
-                            conn.flow(handle, initial_target as u32);
-                        }
                     }
                     target_shared.driver_waker.notify_one();
                     tracing::info!(

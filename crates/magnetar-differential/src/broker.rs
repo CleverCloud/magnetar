@@ -317,6 +317,15 @@ pub type FrameLog = Arc<Mutex<Vec<i32>>>;
 /// partition's cursor was moved by a `SeekPartition` op.
 pub type SeekedPartitionLog = Arc<Mutex<Vec<i32>>>;
 
+/// Cross-session, append-only log of every `CommandFlow` the broker received,
+/// as `(consumer_id, message_permits)` in arrival order. The per-consumer
+/// `permits` balance is spent by dispatch, so it cannot answer "how many
+/// permits was this consumer ever granted"; this log can, and it survives the
+/// redial that resets the per-session `consumers` map. Issue #426 needs exactly
+/// that: one `receiver_queue_size` grant per attach, on the fresh subscribe and
+/// again on the post-reconnect `rebuild_consumers` re-attach.
+pub type FlowGrantLog = Arc<Mutex<Vec<(u64, u32)>>>;
+
 /// Cross-session, append-only log of every `CommandEndTxn` the broker
 /// observed, in arrival order. Each entry records the txn id halves,
 /// whether the end was a commit (`drained: true`) or an abort
@@ -335,6 +344,7 @@ pub type TxnDrainLog = Arc<Mutex<Vec<TxnDrainEvent>>>;
 struct SessionDeps {
     frame_log: FrameLog,
     seeked_partitions: SeekedPartitionLog,
+    flow_grants: FlowGrantLog,
     txn_drain_log: TxnDrainLog,
     corrupt_after_connected: Arc<Mutex<bool>>,
     decode_fatal_on_send: Arc<Mutex<bool>>,
@@ -377,6 +387,9 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of partition indices that received a
     /// `CommandSeek`.
     seeked_partitions: SeekedPartitionLog,
+    /// Shared, append-only log of every `CommandFlow` as
+    /// `(consumer_id, message_permits)`, across every session.
+    flow_grants: FlowGrantLog,
     /// Shared, append-only log of every `CommandEndTxn` and its drain
     /// count. Surfaces the per-txn ack ledger's drain/drop side-effect
     /// to the golden-trace assertion path.
@@ -482,6 +495,8 @@ impl ScriptedBroker {
         let frame_log_clone = frame_log.clone();
         let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
         let seeked_partitions_clone = seeked_partitions.clone();
+        let flow_grants: FlowGrantLog = Arc::new(Mutex::new(Vec::new()));
+        let flow_grants_clone = flow_grants.clone();
         let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
         let txn_drain_log_clone = txn_drain_log.clone();
         let corrupt_after_connected = Arc::new(Mutex::new(false));
@@ -506,6 +521,7 @@ impl ScriptedBroker {
         let deps = SessionDeps {
             frame_log: frame_log_clone,
             seeked_partitions: seeked_partitions_clone,
+            flow_grants: flow_grants_clone,
             txn_drain_log: txn_drain_log_clone,
             corrupt_after_connected: corrupt_after_connected_clone,
             decode_fatal_on_send: decode_fatal_on_send_clone,
@@ -539,6 +555,7 @@ impl ScriptedBroker {
             accept_task: Some(accept_task),
             frame_log,
             seeked_partitions,
+            flow_grants,
             txn_drain_log,
             corrupt_after_connected,
             decode_fatal_on_send,
@@ -734,6 +751,16 @@ impl ScriptedBroker {
     /// the same broker instance.
     pub fn clear_seeked_partitions(&self) {
         self.seeked_partitions.lock().clear();
+    }
+
+    /// Snapshot every `CommandFlow` the broker received, as
+    /// `(consumer_id, message_permits)` in arrival order across all sessions.
+    /// The per-consumer `permits` balance is spent by dispatch and is reset by
+    /// the redial that replaces the session state, so this log is what answers
+    /// "how many permits was this consumer granted, per attach" (issue #426).
+    #[must_use]
+    pub fn flow_grant_log_snapshot(&self) -> Vec<(u64, u32)> {
+        self.flow_grants.lock().clone()
     }
 
     /// Snapshot every txn-drain event observed so far, in arrival order
@@ -1235,6 +1262,9 @@ fn handle_frame(
         }
         pb::base_command::Type::Flow => {
             if let Some(f) = &frame.command.flow {
+                deps.flow_grants
+                    .lock()
+                    .push((f.consumer_id, f.message_permits));
                 let mut g = state.lock();
                 if let Some((_, c)) = g.consumers.get_mut(&f.consumer_id) {
                     c.permits = c.permits.saturating_add(f.message_permits);
