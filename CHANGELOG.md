@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-22
+
 ### Added
 
 - **`Consumer::resubscribe()`** (both engines) and `Connection::resubscribe_consumer_in_place` — caller-driven recovery for a consumer whose broker-side dispatch has gone silent.
@@ -56,6 +58,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A later `ProducerBusy` under the name is therefore recovered from rather than retried into: the abandoned id is re-closed while the broker can address it, and if the name is still busy the next attempt re-attaches under that id with a strictly higher epoch, which is the successor claim Pulsar accepts.
   The abandoned ids live in a fixed 16-record ring that is cleared on reconnect.
   (issue #406; ADR-0100, amending ADR-0080)
+- **Slow event consumers no longer OOM the process: the observational event queue is capped.**
+  Every delivered message was cloned into `Connection::events` as an observational `ConnectionEvent::Message` / `MessageReceivedFromShadow`, and nothing in the production runtime ever consumes those events — the queue grew by one full payload clone per message for the lifetime of the connection, invisible to receiver-queue permits (issue #413: multi-GB `VecDeque` growth OOM-killing a consumer fleet every ~30 minutes).
+  The two per-message events now route through `push_observational_event`, which drops them once the queue holds `EVENT_QUEUE_OBSERVATIONAL_CAP` (4096) entries and counts the drops in the read-only `dropped_observational_events`.
+  Protocol-bearing events never go through this path and are never dropped; `pop_message` still yields every message — the cap touches observability, never delivery.
+  (issue #413)
+- **The producer side of that cap: `SendReceipt` / `SendError` events are bounded too.**
+  The #413 cap only matched the consumer-side events, so a steady producer still queued one receipt event per acknowledged message for the life of the connection (~430 MB/h at ~1,860 msg/s, OOM-killing the OpenTelemetry gateway every 24-48h).
+  Both variants are observational — the send outcome lands in `self.outcomes` and its waker is woken before the event is queued — so they now route through the same capped helper.
+  (issue #423)
+
+### Security
+
+- **`h2` 0.4.15 → 0.4.17** — [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258).
 
 ## [1.4.1] - 2026-08-11
 
@@ -549,6 +564,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.5.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.5.0
 [1.4.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.1
 [1.4.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.0
 [1.3.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.3.0
