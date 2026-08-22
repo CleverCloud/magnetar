@@ -230,6 +230,18 @@ pub struct ConsumerState {
     /// from the broker and deserves a fresh silence window rather than inheriting the
     /// previous one's start instant.
     pub(crate) stall_watch: Option<StallWatch>,
+    /// In-place re-subscribes the stall watchdog has driven for this consumer in the
+    /// current stall streak (issue #414, ADR-0103). Compared against
+    /// [`crate::ConnectionConfig::consumer_stall_auto_recovery`] in
+    /// [`crate::Connection::handle_timeout`], and bumped only when a re-subscribe was
+    /// actually emitted — a consumer the eligibility gate refuses spends no budget.
+    ///
+    /// Reset to zero in exactly ONE place: [`Self::record_dispatch_unit`], i.e. a broker
+    /// dispatch unit genuinely arriving. Resetting it at the churn boundaries that zero
+    /// the permit mirrors would be wrong rather than merely generous — the recovery's own
+    /// [`crate::Connection::resubscribe_consumer_in_place`] is one of those boundaries, so
+    /// the counter would clear itself on every attempt and the bound would not exist.
+    pub(crate) stall_recovery_attempts: u32,
     /// Number of permits we've consumed since the last flow command. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
@@ -849,6 +861,7 @@ impl ConsumerState {
             permit_balance: 0,
             dispatch_units_received: 0,
             stall_watch: None,
+            stall_recovery_attempts: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
@@ -1108,11 +1121,19 @@ impl ConsumerState {
     /// forget the other: a missed balance decrement mis-reports starvation, a missed
     /// progress bump makes the watchdog cry stall on a perfectly healthy consumer.
     ///
+    /// ADR-0103 hangs a third off the same call for the same reason: one dispatch unit
+    /// arriving is the ONLY definition of progress that clears
+    /// [`Self::stall_recovery_attempts`], so the automatic-recovery budget is restored
+    /// exactly when — and only when — the broker demonstrably started dispatching again.
+    /// A re-subscribe that the broker acked but never dispatched against is not progress
+    /// and must not refund the attempt that bought it.
+    ///
     /// Carries no clock (ADR-0011): the mark is a counter, so the three call sites keep
     /// their existing signatures.
     fn record_dispatch_unit(&mut self) {
         self.permit_balance = self.permit_balance.saturating_sub(1);
         self.dispatch_units_received = self.dispatch_units_received.saturating_add(1);
+        self.stall_recovery_attempts = 0;
     }
 
     /// Drop any open stall window (issue #414). Called at every permit-grant site and by
@@ -1199,11 +1220,17 @@ impl ConsumerState {
     /// [`crate::event::ConnectionEvent::ConsumerStalled`]. Every later tick in the same
     /// episode returns `None`.
     ///
-    /// Emitting the event is the ONLY effect. Recovery stays explicit
-    /// ([`crate::Connection::resubscribe_consumer_in_place`], or an operator-side
-    /// `topics unload`): a watchdog that re-subscribed on its own would turn a broker
-    /// hiccup into a re-subscribe storm across every partition at once, and would hide the
-    /// broker-side defect issue #414 is actually about.
+    /// Emitting the event is the only effect **this method** has, and the only effect the
+    /// watchdog has at all while `consumer_stall_auto_recovery` is unset: recovery is then
+    /// explicit ([`crate::Connection::resubscribe_consumer_in_place`], or an operator-side
+    /// `topics unload`). ADR-0101 rejected an unconditional automatic re-subscribe because
+    /// a broker hiccup would become a re-subscribe storm across every partition at once
+    /// and would hide the broker-side defect issue #414 is actually about; ADR-0103 admits
+    /// it only opt-in and only bounded, driven by
+    /// [`crate::Connection::handle_timeout`] from the `Some` this returns — one attempt
+    /// per episode, at most `consumer_stall_auto_recovery` attempts per stall streak, and
+    /// the event is emitted either way so the defect is still reported rather than
+    /// papered over.
     pub fn poll_stall(
         &mut self,
         window: std::time::Duration,
@@ -4162,6 +4189,49 @@ mod stall_watchdog_tests {
             Some(WINDOW),
             "and the new window is measured from the re-arm"
         );
+    }
+
+    /// ADR-0103: the automatic-recovery budget is restored by a broker dispatch unit and
+    /// by nothing else.
+    ///
+    /// The two negative halves matter more than the positive one. `initial_flow` and
+    /// `clear_stall_watch` are exactly what an automatic recovery attempt performs on its
+    /// way out, so a reset hanging off either would refund every attempt that bought it
+    /// and the bound would not exist at all; `record_marker_consumed` is the PIP-33
+    /// filtered-marker path, which IS a spent broker permit and therefore IS progress.
+    #[test]
+    fn only_a_dispatch_unit_restores_the_auto_recovery_budget() {
+        let t0 = std::time::Instant::now();
+
+        // Neither half of a recovery attempt refunds the budget.
+        let mut recovering = granted();
+        recovering.stall_recovery_attempts = 3;
+        recovering.clear_stall_watch();
+        assert_eq!(
+            recovering.stall_recovery_attempts, 3,
+            "dropping the stall window is not progress"
+        );
+        let _ = recovering.initial_flow();
+        assert_eq!(
+            recovering.stall_recovery_attempts, 3,
+            "a fresh grant is a fresh promise, not a kept one: the broker acking a \
+             re-subscribe must not refund the attempt that paid for it"
+        );
+
+        // A dispatch unit does.
+        let mut dispatched = granted();
+        dispatched.stall_recovery_attempts = 3;
+        deliver_one(&mut dispatched, t0);
+        assert_eq!(
+            dispatched.stall_recovery_attempts, 0,
+            "one message actually arriving is the definition of progress"
+        );
+
+        // Including a PIP-33 marker the user never sees — the broker spent a permit on it.
+        let mut marked = granted();
+        marked.stall_recovery_attempts = 2;
+        marked.record_marker_consumed();
+        assert_eq!(marked.stall_recovery_attempts, 0);
     }
 
     /// Every dispatch shape the broker can spend a permit on must count as

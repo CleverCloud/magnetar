@@ -171,6 +171,40 @@ pub async fn run_with_stall_timeout(
     .await
 }
 
+/// Run `trace` with the issue #414 stall watchdog armed at `consumer_stall_timeout`
+/// AND ADR-0103's bounded automatic recovery armed at `max_attempts` in-place
+/// re-subscribes per stall streak.
+///
+/// Pair it with [`crate::broker::ScriptedBroker::leak_shared_permits_on_consumer_churn`]:
+/// the broker wedges its Shared dispatcher on the first churn event, the watchdog notices
+/// the survivor holding un-spent permits over an empty queue, and each automatic
+/// re-subscribe lifts the broker's leaked aggregate by exactly one receiver-queue window.
+/// Whether delivery resumes is then a pure function of `max_attempts` against the size of
+/// the leak, which is what makes the same trace produce a `Received` under a sufficient
+/// budget and a `RecvTimeout` under an insufficient one — identically on both engines,
+/// since the whole mechanism lives in the shared sans-io layer.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_auto_recovery(
+    pulsar_url: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+    max_attempts: u32,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            consumer_stall_timeout: Some(consumer_stall_timeout),
+            consumer_stall_auto_recovery: Some(max_attempts),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+}
+
 async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,

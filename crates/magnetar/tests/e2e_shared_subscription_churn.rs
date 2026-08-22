@@ -230,8 +230,34 @@ async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
         .service_url(admin_url.parse()?)
         .timeout(Duration::from_secs(30))
         .build()?;
+    // Both #414 knobs armed end-to-end against a real broker (ADR-0101, ADR-0103).
+    //
+    // **This is a wiring claim, not a behaviour claim**, and the window is deliberately
+    // unreachable rather than the documented 30 s production value. The watchdog reports
+    // SILENCE, not fault (ADR-0101), so a *healthy* consumer that has drained its share
+    // while its siblings finish, or that is simply waiting out an admin poll, satisfies
+    // the stall predicate exactly as a wedged one does. With a reachable window this test
+    // could therefore fire automatic recovery and send a `CommandSubscribe` for a live,
+    // still-registered consumer id to a real broker — a path nothing here pins, and one
+    // that would make this test's outcome depend on CI runner speed.
+    //
+    // 300 s is above every wait this test can accumulate after the subscribe that arms
+    // the window: `ADMIN_POLL_TIMEOUT` is 15 s, the drain idle timeouts are 10 s, and
+    // `ADMIN_SETTLE` is 1 s, for a worst case well under a minute.
+    //
+    // What this does prove is that the façade accepts and plumbs both knobs through to a
+    // real broker session, and that arming them perturbs nothing about the churn drain
+    // asserted below. The mechanism's own behaviour — one report per episode, at most
+    // `consumer_stall_auto_recovery` re-subscribes per stall streak, reset on a real
+    // dispatch unit — is pinned deterministically at the three layers below this one
+    // (`magnetar-proto`'s `consumer_stall_and_recovery_tests`, both engines'
+    // `consumer_stall_recovery.rs`, and `magnetar-differential`'s
+    // `wedged_shared_dispatcher_*` traces), where the clock is injected and the broker's
+    // permit accounting can be corrupted on purpose.
     let client = PulsarClient::builder()
         .service_url(service_url)
+        .consumer_stall_timeout(Duration::from_secs(300))
+        .consumer_stall_auto_recovery(2)
         .build()
         .await?;
 

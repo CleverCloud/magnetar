@@ -146,21 +146,23 @@ Pair rate-limiting with a metric or alert on the cause (e.g. reconnect rate) so 
 Logs carry structured snake_case fields, never values formatted into the message string.
 The recurring fields:
 
-| Field                                           | Meaning                                                                                     |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `topic`                                         | Fully-qualified topic name (plus partition where relevant).                                 |
-| `subscription`                                  | Subscription name.                                                                          |
-| `producer_name`                                 | Producer name as registered with the broker.                                                |
-| `handle`                                        | Driver-local producer/consumer handle id.                                                   |
-| `sequence_id` / `message_id` / `request_id`     | Per-message / per-request identifiers.                                                      |
-| `broker_service_url` / `broker_service_url_tls` | Broker-advertised service URLs (truncated to 256 bytes at a char boundary).                 |
-| `host` / `port`                                 | Dialled broker endpoint.                                                                    |
-| `attempt` / `delay_ms` / `cooldown_ms`          | Reconnect-supervision counters and timings.                                                 |
-| `payload_len`                                   | Message payload size in bytes (never the payload itself).                                   |
-| `auth_method`                                   | Auth provider name (`token`, `oauth2`, `athenz`, …) — never credentials.                    |
-| `auth_challenge_pending`                        | Whether the broker requested an AUTH_CHALLENGE round-trip during connect (moonpool engine). |
-| `permits` / `count`                             | Flow-control permits / batch-summary counts.                                                |
-| `error` / `source` / `code`                     | Error display, origin tag, server error code.                                               |
+| Field                                           | Meaning                                                                                                |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `topic`                                         | Fully-qualified topic name (plus partition where relevant).                                            |
+| `subscription`                                  | Subscription name.                                                                                     |
+| `producer_name`                                 | Producer name as registered with the broker.                                                           |
+| `handle`                                        | Driver-local producer/consumer handle id.                                                              |
+| `sequence_id` / `message_id` / `request_id`     | Per-message / per-request identifiers.                                                                 |
+| `broker_service_url` / `broker_service_url_tls` | Broker-advertised service URLs (truncated to 256 bytes at a char boundary).                            |
+| `host` / `port`                                 | Dialled broker endpoint.                                                                               |
+| `attempt` / `delay_ms` / `cooldown_ms`          | Reconnect-supervision counters and timings; `attempt` also numbers a consumer stall auto-recovery try. |
+| `permit_balance` / `stalled_for_ms`             | Un-spent broker permits and observed silence on a `ConsumerStalled` report (issue #414, ADR-0101).     |
+| `attempts` / `max_attempts`                     | Consumer stall auto-recovery budget: spent so far, and the configured cap (ADR-0103).                  |
+| `payload_len`                                   | Message payload size in bytes (never the payload itself).                                              |
+| `auth_method`                                   | Auth provider name (`token`, `oauth2`, `athenz`, …) — never credentials.                               |
+| `auth_challenge_pending`                        | Whether the broker requested an AUTH_CHALLENGE round-trip during connect (moonpool engine).            |
+| `permits` / `count`                             | Flow-control permits / batch-summary counts.                                                           |
+| `error` / `source` / `code`                     | Error display, origin tag, server error code.                                                          |
 
 Targets follow module paths (`magnetar_runtime_tokio::driver`, `magnetar_proto::conn`, `magnetar::auth::oauth2`, …), so per-target filtering can isolate one layer.
 

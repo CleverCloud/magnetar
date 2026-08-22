@@ -28,6 +28,11 @@
 //! The one-permit receiver-queue window is deliberate: it makes the round-robin
 //! hand-off deterministic instead of letting whichever consumer subscribed first
 //! swallow the whole backlog, which is what keeps the two legs comparable.
+//!
+//! Two further scenarios reproduce the broker-side fault itself and pin ADR-0103's
+//! bounded automatic recovery against it — see
+//! [`ScriptedBroker::leak_shared_permits_on_consumer_churn`] and the two
+//! `wedged_shared_dispatcher_*` tests at the bottom of this file.
 
 use std::time::Duration;
 
@@ -412,5 +417,268 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
         },
         "the consumer must still be granted and usable after its stall was drained, got {:?}",
         events[3],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #414 / ADR-0103 — the broker-side wedge, and bounded automatic recovery
+// from it.
+//
+// Everything above models a CORRECT Shared dispatcher. These two model the fault
+// itself: `leak_shared_permits_on_consumer_churn` makes a detach subtract the
+// departing consumer's remaining permits from the subscription's aggregate permit
+// counter TWICE, so each churn event leaks that many permits with no credit
+// behind them. Once the aggregate crosses zero the dispatcher's read gate closes
+// and the subscription stops dispatching entirely — the survivor still holds
+// per-consumer permits, the backlog is still non-empty, the connection is still
+// healthy, and nothing moves. That is the client-visible shape issue #414 reports,
+// with the broker's own `availablePermits` for the subscription at `-177300`.
+//
+// The client cannot cause it: the wire protocol carries only monotonic client →
+// broker permit increments, so a negative aggregate is by construction a
+// broker-side accounting fault. It is a HYPOTHESIS about the churn-path accounting
+// that reproduces the reported signature, not a verified reading of any broker
+// source — `UPSTREAM-ISSUE-DRAFT.md` frames it that way for Pulsar's maintainers.
+//
+// What the two tests then pin is the recovery arithmetic, which is the whole
+// reason ADR-0103's budget is a small integer rather than "retry until it works".
+// An in-place re-subscribe zeroes this consumer's permits broker-side and the
+// client answers the `Success` with one fresh full-window `CommandFlow`, so ONE
+// attempt lifts the aggregate by exactly `receiver_queue_size`. The same trace and
+// the same leak therefore recover under a sufficient budget and stay wedged under
+// an insufficient one — which is why a leak of `-177300` against a 1000-message
+// queue is an operator's `topics unload` and not a client's retry loop.
+// ---------------------------------------------------------------------------
+
+/// Stall window for the wedge scenarios. Long enough that no episode can close
+/// while the opening ops are still running (they are milliseconds over loopback),
+/// short enough that two full episodes fit inside `WEDGE_RECV_TIMEOUT`.
+///
+/// **If either of these tests ever flakes, this constant is the first suspect.** The
+/// traces assume the three opening ops complete within this window of the survivor's
+/// initial grant; a machine slow enough to close an episode BEFORE the churn would spend
+/// a recovery attempt while the aggregate is still positive, leaving the recovering leg
+/// one attempt short. Raise it (and `WEDGE_RECV_TIMEOUT` with it) rather than widening
+/// the budgets, which is what the tests are asserting.
+const WEDGE_STALL_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Receive budget for the wedge scenarios: comfortably longer than the two stall
+/// episodes a recovering leg needs, so a `RecvTimeout` there would be a real
+/// failure to recover rather than an impatient assertion.
+const WEDGE_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Survivor's receiver queue. Each automatic recovery attempt credits the broker's
+/// leaked aggregate by exactly this much.
+const SURVIVOR_RQ: usize = 2;
+
+/// The departing consumer's receiver queue. It receives nothing (the topic is
+/// empty while it is attached), so it detaches holding all four permits and the
+/// armed double-subtraction leaks 4 — two survivor windows' worth, which is what
+/// makes one attempt insufficient and two sufficient.
+const LEAVER_RQ: usize = 4;
+
+/// Publish-after-churn trace: two Shared consumers, one leaves immediately, then a
+/// message is published that only an unwedged dispatcher can deliver.
+///
+/// Nothing is published before the churn on purpose. The departing consumer must
+/// leave holding its FULL grant, because the leak is exactly what it still holds —
+/// and a survivor that never received anything is unambiguously stall-eligible
+/// (un-spent permits over an empty queue) from the moment it is granted.
+fn wedge_trace(topic: &str, subscription: &str) -> Trace {
+    Trace::new(
+        topic,
+        subscription,
+        vec![
+            Op::OpenSharedConsumer {
+                name: "survivor".to_owned(),
+                receiver_queue_size: SURVIVOR_RQ,
+            },
+            Op::OpenSharedConsumer {
+                name: "leaver".to_owned(),
+                receiver_queue_size: LEAVER_RQ,
+            },
+            // The churn. Aggregate: 2 + 4 granted, minus 4 returned, minus a second
+            // 4 that was never credited → -2, with the survivor still holding 2.
+            Op::CloseSharedConsumer {
+                name: "leaver".to_owned(),
+            },
+            Op::Send {
+                payload: b"after-wedge".to_vec(),
+            },
+            Op::RecvShared {
+                name: "survivor".to_owned(),
+                timeout: WEDGE_RECV_TIMEOUT,
+            },
+        ],
+    )
+}
+
+/// How many `CommandSubscribe` frames the broker saw.
+///
+/// Two are the opens; every further one is an automatic in-place re-subscribe the
+/// stall watchdog drove. This is the discriminating assertion for the bound — the
+/// exhausted leg's user-visible outcome (`RecvTimeout`) is by construction the same
+/// one a client with no recovery at all would produce.
+fn subscribe_frame_count(broker: &ScriptedBroker) -> usize {
+    let subscribe = magnetar_proto::pb::base_command::Type::Subscribe as i32;
+    broker
+        .frame_log_snapshot()
+        .into_iter()
+        .filter(|kind| *kind == subscribe)
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wedged_shared_dispatcher_is_recovered_by_bounded_auto_recovery() {
+    // Budget of two against a leak of two survivor windows: the first attempt lifts
+    // the aggregate from -2 to 0 — still gated, since the real dispatcher's read
+    // gate is `> 0` — and the second lifts it to 2 and the backlog finally moves.
+    // That the recovery took TWO attempts rather than one is the point: this is a
+    // subscription-wide corruption being paid down one receiver-queue window at a
+    // time, not a per-consumer glitch a single re-attach clears.
+    const MAX_ATTEMPTS: u32 = 2;
+    let trace = wedge_trace(
+        "persistent://public/default/shared-wedge-recovered",
+        "sub-shared-wedge-recovered",
+    );
+
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    broker.leak_shared_permits_on_consumer_churn();
+    let pulsar_url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    broker.clear_frame_log();
+    let tokio_stream = runner_tokio::run_with_stall_auto_recovery(
+        &pulsar_url,
+        &trace,
+        WEDGE_STALL_TIMEOUT,
+        MAX_ATTEMPTS,
+    )
+    .await
+    .expect("tokio runner");
+    let tokio_subscribes = subscribe_frame_count(&broker);
+
+    broker.clear_frame_log();
+    let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
+        &host_port,
+        &trace,
+        WEDGE_STALL_TIMEOUT,
+        MAX_ATTEMPTS,
+    )
+    .await
+    .expect("moonpool runner");
+    let moonpool_subscribes = subscribe_frame_count(&broker);
+
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged recovering a wedged Shared dispatcher",
+    );
+
+    let events = &tokio_stream.events;
+    assert_eq!(
+        events[0],
+        Event::SharedConsumerOpened {
+            permits: SURVIVOR_RQ as u32
+        },
+        "the survivor opens with its full, un-spent grant — the state the watchdog watches",
+    );
+    assert_eq!(
+        events[1],
+        Event::SharedConsumerOpened {
+            permits: LEAVER_RQ as u32
+        },
+        "and so does the consumer that is about to leave holding all of it",
+    );
+    assert_eq!(events[2], Event::SharedConsumerClosed, "the churn event");
+    assert!(
+        matches!(events[3], Event::Sent { .. }),
+        "publishing is producer-side and unaffected by a wedged dispatcher, got {:?}",
+        events[3],
+    );
+    assert_eq!(
+        events[4],
+        Event::Received {
+            payload: b"after-wedge".to_vec(),
+            message_id: message_id(0),
+        },
+        "the backlog must reach the survivor once automatic recovery has credited the \
+         broker's leaked aggregate back above zero, got {:?}",
+        events[4],
+    );
+
+    // Two opens plus exactly `MAX_ATTEMPTS` automatic re-subscribes, on BOTH engines.
+    // The whole mechanism lives in the shared sans-io layer precisely so this number
+    // cannot drift between them.
+    let expected = 2 + MAX_ATTEMPTS as usize;
+    assert_eq!(
+        (tokio_subscribes, moonpool_subscribes),
+        (expected, expected),
+        "each engine must send two opens and exactly {MAX_ATTEMPTS} recovery re-subscribes",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget() {
+    // The same trace and the same leak with a budget of one. The single attempt
+    // lifts the aggregate from -2 to 0, which is still gated, and then the client
+    // stops: no third `CommandSubscribe`, one `warn!` naming `pulsar-admin topics
+    // unload`, and the message never arrives.
+    //
+    // This is also the negative control for the sibling test above — it proves the
+    // wedge is real and that automatic recovery, not the trace, is what clears it.
+    // And it is the shape issue #414 actually reported: an aggregate at `-177300`
+    // is ~178 receiver-queue windows deep, so no sane client budget reaches it and
+    // the escalation is the honest answer rather than an unbounded retry loop.
+    const MAX_ATTEMPTS: u32 = 1;
+    let trace = wedge_trace(
+        "persistent://public/default/shared-wedge-exhausted",
+        "sub-shared-wedge-exhausted",
+    );
+
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    broker.leak_shared_permits_on_consumer_churn();
+    let pulsar_url = broker.pulsar_url();
+    let host_port = broker.host_port();
+
+    broker.clear_frame_log();
+    let tokio_stream = runner_tokio::run_with_stall_auto_recovery(
+        &pulsar_url,
+        &trace,
+        WEDGE_STALL_TIMEOUT,
+        MAX_ATTEMPTS,
+    )
+    .await
+    .expect("tokio runner");
+    let tokio_subscribes = subscribe_frame_count(&broker);
+
+    broker.clear_frame_log();
+    let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
+        &host_port,
+        &trace,
+        WEDGE_STALL_TIMEOUT,
+        MAX_ATTEMPTS,
+    )
+    .await
+    .expect("moonpool runner");
+    let moonpool_subscribes = subscribe_frame_count(&broker);
+
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged exhausting the auto-recovery budget",
+    );
+    assert_eq!(
+        tokio_stream.events[4],
+        Event::RecvTimeout,
+        "one receiver-queue window is not enough to pay down this leak, so the \
+         subscription stays wedged and nothing is delivered, got {:?}",
+        tokio_stream.events[4],
+    );
+
+    let expected = 2 + MAX_ATTEMPTS as usize;
+    assert_eq!(
+        (tokio_subscribes, moonpool_subscribes),
+        (expected, expected),
+        "the budget is a hard cap: two opens and exactly {MAX_ATTEMPTS} recovery \
+         re-subscribe, not one per stall window for the life of the consumer",
     );
 }

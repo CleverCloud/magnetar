@@ -6,10 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`ClientBuilder::consumer_stall_auto_recovery(u32)`** / `ConnectionConfig::consumer_stall_auto_recovery` — opt-in, bounded automatic recovery for the issue #414 stall watchdog.
+  With it set, the same `handle_timeout` sweep that emits `ConnectionEvent::ConsumerStalled` also performs the in-place re-attach `Consumer::resubscribe()` performs — zero the permit mirrors, fail the orphaned in-flight acks, re-emit `CommandSubscribe` for the same consumer id, let the broker's `Success` release a fresh initial `CommandFlow` — instead of leaving that to the application.
+  **At most one attempt per stall episode**, and an episode closes at most once per `consumer_stall_timeout`, so the value caps a sequence that is already rate-limited to one re-subscribe per window: `3` at the recommended 30 s window spends three re-subscribes over ninety seconds and then stops.
+  The budget resets on **real progress only** — one broker dispatch unit actually arriving — and deliberately not at the permit-mirror churn boundaries, because the recovery's own re-subscribe is one of them and resetting there would refund every attempt that paid for it, leaving no bound at all.
+  An attempt the eligibility gate refuses (closed, unsubscribing, terminally failed, mid-seek, re-attach already in flight) spends no budget and mutates nothing.
+  Exhausting the budget logs one `WARN` naming `pulsar-admin topics unload` and then goes quiet, because the last attempt was also the last thing that re-armed the stall window.
+  **Default unset**, `0` disables explicitly, and it is **inert without `consumer_stall_timeout`** — no window, no stall episode, nothing to recover from.
+  The diagnosis is never suppressed: the stall `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, and each attempt logs its own `INFO` carrying `attempt` and `max_attempts`.
+  Keep the number small — one attempt lifts the subscription's broker-side aggregate permit counter by exactly one receiver-queue window, and issue #414's production failure was `-177300` deep, so the bound exists to escalate rather than to eventually win.
+  This narrows ADR-0101's rejection of an automatic watchdog-driven re-subscribe to the unconditional unbounded form it was written about; that form is still rejected and is still the shipped default.
+  (issue #414; ADR-0103, amending ADR-0101)
+
 ### Changed
 
 - **Dependencies:** bumped workspace manifest floors — `rustls-openssl` 0.3.1→0.4.0, `apache-avro` 0.21.0→0.22.0, `uuid` 1.24.0→1.24.1, `rcgen` 0.14.8→0.14.9, `futures`/`futures-util` 0.3.33→0.3.34, `rustls` 0.23.42→0.23.43, `aws-lc-rs` 1.17.3→1.18.0, `base64` 0.23.0→0.23.1, `http` 1.4.2→1.5.0, `clap` 4.6.4→4.6.6, `thiserror` 2.0.18→2.0.20, `testcontainers` 0.27.3→0.28.0, and `async-trait` 0.1.91→0.1.92 — and refreshed `Cargo.lock`.
   `apache-avro` 0.22 deprecated the free `to_avro_datum`/`from_avro_datum` functions that `AvroSchema::encode`/`decode` called; `crates/magnetar-proto/src/schema/avro.rs` now drives the replacement `GenericDatumWriter`/`GenericDatumReader` builders instead, with the parsing-canonical-form `schema_data()` output and the encode/decode round-trip unchanged (`schema::avro::tests` exercises both).
+  ||||||| parent of f85ac3e (feat(consumer): bounded automatic stall recovery (#414))
 
 ### Fixed
 

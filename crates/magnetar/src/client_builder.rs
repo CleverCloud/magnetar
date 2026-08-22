@@ -49,6 +49,9 @@ pub struct ClientBuilder {
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `None` (watchdog off).
     /// `Some(Duration::ZERO)` disables it explicitly (issue #414).
     consumer_stall_timeout: Option<Duration>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `None` (automatic recovery
+    /// off). `Some(0)` disables it explicitly (issue #414, ADR-0103).
+    consumer_stall_auto_recovery: Option<u32>,
     operation_timeout: Option<Duration>,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `Some(30s)`.
@@ -76,6 +79,7 @@ impl Default for ClientBuilder {
             keepalive: None,
             stats_interval: None,
             consumer_stall_timeout: None,
+            consumer_stall_auto_recovery: None,
             operation_timeout: None,
             operation_retry: None,
             ack_response_timeout: None,
@@ -233,8 +237,9 @@ impl ClientBuilder {
     /// one `warn!` and one
     /// [`ConnectionEvent::ConsumerStalled`](magnetar_proto::event::ConnectionEvent::ConsumerStalled)
     /// — exactly one per stall episode, re-armed by the next dispatch. That is its only
-    /// effect: recovery stays an explicit call to `Consumer::resubscribe()`, escalating to
-    /// an operator-side `pulsar-admin topics unload` for a dispatcher-wide broker fault.
+    /// effect unless [`Self::consumer_stall_auto_recovery`] is also set; otherwise
+    /// recovery stays an explicit call to `Consumer::resubscribe()`, escalating to an
+    /// operator-side `pulsar-admin topics unload` for a dispatcher-wide broker fault.
     ///
     /// This is the one silence the ADR-0058 connection keepalive cannot see: a broker whose
     /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`.
@@ -251,6 +256,45 @@ impl ClientBuilder {
     #[must_use]
     pub fn consumer_stall_timeout(mut self, dur: Duration) -> Self {
         self.consumer_stall_timeout = Some(dur);
+        self
+    }
+
+    /// Let the stall watchdog recover a wedged consumer by itself, at most `max_attempts`
+    /// times per stall streak (issue #414, ADR-0103).
+    ///
+    /// Each attempt is the same in-place re-attach `Consumer::resubscribe()` performs —
+    /// zero this client's permit mirrors, fail the orphaned in-flight acks, re-emit
+    /// `CommandSubscribe` for the same consumer id on the live connection, and let the
+    /// broker's `Success` release a fresh initial `CommandFlow`. No transport reconnect,
+    /// no other consumer or producer disturbed, and the receiver queue left intact.
+    ///
+    /// The `ConsumerStalled` event and its `warn!` are emitted either way, so arming this
+    /// adds a recovery attempt without ever hiding the diagnosis.
+    ///
+    /// **Requires [`Self::consumer_stall_timeout`]** — with no window there is no stall
+    /// episode, and this knob is inert. **Unset by default**, and `0` disables it
+    /// explicitly, mirroring how [`Self::consumer_stall_timeout`] spells its disable.
+    ///
+    /// # Choosing the bound
+    ///
+    /// At most one attempt is made per stall episode and an episode closes at most once
+    /// per `consumer_stall_timeout`, so `max_attempts` caps a sequence already limited to
+    /// one re-subscribe per window: with a 30 s window, `3` spends at most three
+    /// re-subscribes over ninety seconds before giving up. The counter resets on **real
+    /// progress only** — one broker dispatch unit actually arriving — so a consumer that
+    /// recovers and later wedges again gets its full budget back, while a consumer the
+    /// broker acks but never dispatches to does not.
+    ///
+    /// Keep it small. An attempt repairs **this client's own slot** in the broker's
+    /// dispatcher and lifts the subscription's aggregate permit counter by one
+    /// receiver-queue window; issue #414's production failure was dispatcher-WIDE, with
+    /// that aggregate observed at `-177300`, which no realistic number of re-subscribes
+    /// reaches. When the budget is exhausted the client stops and logs the escalation —
+    /// `pulsar-admin topics unload` — instead of re-subscribing forever against a fault it
+    /// cannot repair. See [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    #[must_use]
+    pub fn consumer_stall_auto_recovery(mut self, max_attempts: u32) -> Self {
+        self.consumer_stall_auto_recovery = Some(max_attempts);
         self
     }
 
@@ -473,6 +517,12 @@ impl ClientBuilder {
         // `ConnectionConfig::default()`'s `None` — the watchdog is opt-in.
         if let Some(d) = self.consumer_stall_timeout {
             config.consumer_stall_timeout = (d != Duration::ZERO).then_some(d);
+        }
+        // ADR-0103: the same zero-disables shape one knob up, spelled in attempts rather
+        // than in a `Duration`. Unset leaves `ConnectionConfig::default()`'s `None`, and
+        // the whole mechanism is inert anyway without `consumer_stall_timeout`.
+        if let Some(n) = self.consumer_stall_auto_recovery {
+            config.consumer_stall_auto_recovery = (n != 0).then_some(n);
         }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;
