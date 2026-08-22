@@ -150,3 +150,84 @@ async fn initial_flow_grants_one_receiver_queue_per_attach_on_both_engines() {
         "engine permit-grant sequences diverged for the initial-grant trace",
     );
 }
+
+/// Issue #427: the same claim once the broker also announces the active consumer.
+///
+/// A real broker answers an `Exclusive` / `Failover` subscribe with `CommandSuccess` and
+/// then `CommandActiveConsumerChange { is_active: true }` in the same write, so both frames
+/// reach the client in one read. The sans-io issue #307 promotion re-arm therefore runs
+/// inside `handle_bytes` while the engine's own post-ack `Connection::initial_flow` is still
+/// parked on the resolving subscribe future — and `granted_permits` is legitimately `0` at
+/// that instant, so the re-arm's gate passes.
+///
+/// Both grant sites then fired for one attach and the broker held `2 × receiver_queue_size`
+/// (measured 32 against a configured 16). Whichever caller wins the race, the log must show
+/// ONE grant of the receiver-queue size — identically on both engines, because the decision
+/// lives entirely in the sans-io layer they share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_consumer_change_does_not_add_a_second_grant_on_either_engine() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-active-change-grant",
+        "sub-active-change-grant",
+        vec![
+            Op::Send {
+                payload: b"one".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(5),
+            },
+            Op::Ack {
+                message_id: mid(1, 0),
+            },
+            Op::Close,
+        ],
+    );
+
+    // ── Tokio leg ──
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    broker_t.announce_active_consumer_on_subscribe();
+    let tokio_stream = tokio::time::timeout(
+        HANG_GUARD,
+        runner_tokio::run(&broker_t.pulsar_url(), &trace),
+    )
+    .await
+    .expect("tokio leg must not hang")
+    .expect("tokio runner");
+    let tokio_grants = broker_t.flow_grant_log_snapshot();
+    broker_t.shutdown().await;
+
+    // ── Moonpool leg ──
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    broker_m.announce_active_consumer_on_subscribe();
+    let moonpool_stream = tokio::time::timeout(
+        HANG_GUARD,
+        runner_moonpool::run(&broker_m.host_port(), &trace),
+    )
+    .await
+    .expect("moonpool leg must not hang")
+    .expect("moonpool runner");
+    let moonpool_grants = broker_m.flow_grant_log_snapshot();
+    broker_m.shutdown().await;
+
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for the active-change grant trace {trace:?}",
+    );
+    for (engine, grants) in [("tokio", &tokio_grants), ("moonpool", &moonpool_grants)] {
+        assert_eq!(
+            grants.len(),
+            1,
+            "{engine} leg: an active announcement behind the subscribe ack must not add a \
+             second grant (issue #427), grants: {grants:?}",
+        );
+        assert_eq!(
+            grants[0].1, RECEIVER_QUEUE_SIZE,
+            "{engine} leg: the single grant must be exactly the receiver-queue size, \
+             grants: {grants:?}",
+        );
+    }
+    assert_eq!(
+        tokio_grants, moonpool_grants,
+        "engine permit-grant sequences diverged for the active-change grant trace",
+    );
+}
