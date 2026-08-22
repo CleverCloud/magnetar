@@ -496,6 +496,10 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
 
     /// Sum of outstanding broker permits across every child consumer. Mirrors Java
     /// `ConsumerBase#getAvailablePermits` aggregated over partitions/topics.
+    ///
+    /// Each child reports the real decrementing balance since issue #414 (ADR-0101
+    /// amending ADR-0082), so the sum falls under dispatch instead of sitting pinned at
+    /// the children's combined receiver-queue size.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
         self.inner

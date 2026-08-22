@@ -41,6 +41,7 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
         pulsar_url,
         trace,
         magnetar_proto::ConnectionConfig::default(),
+        None,
     )
     .await
 }
@@ -67,6 +68,7 @@ pub async fn run_supervised(
             supervisor: Some(supervisor),
             ..Default::default()
         },
+        None,
     )
     .await
 }
@@ -95,6 +97,76 @@ pub async fn run_supervised_with_operation_timeout(
             operation_timeout,
             ..Default::default()
         },
+        None,
+    )
+    .await
+}
+
+/// Run `trace` against the tokio engine with a caller-supplied
+/// `operation_timeout` and NO supervisor. The producer-open cancellation
+/// scenario (issue #406 / ADR-0100) needs a short deadline so a withheld
+/// `CommandProducerSuccess` gives up quickly, and a plain client so the only
+/// thing that can free the pinned name is the engine's own close-before-retry.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_operation_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            operation_timeout,
+            ..Default::default()
+        },
+        Some(fast_operation_retry()),
+    )
+    .await
+}
+
+/// Retry policy the producer-open cancellation scenario installs. The default
+/// 2 s initial backoff does not fit inside that scenario's short
+/// `operation_timeout`, and what it exercises is the SEQUENCE of recovery
+/// attempts, not the wait between them. Shared by both runners so the two legs
+/// retry in lockstep.
+pub(crate) fn fast_operation_retry() -> magnetar_proto::OperationRetryConfig {
+    magnetar_proto::OperationRetryConfig {
+        initial_backoff: Duration::from_millis(5),
+        max_backoff: Duration::from_millis(20),
+        max_retries: Some(8),
+    }
+}
+
+/// Run `trace` with the issue #414 per-consumer stall watchdog armed at
+/// `consumer_stall_timeout`.
+///
+/// The window is deliberately tiny here: a Shared consumer that is granted
+/// permits and then handed nothing crosses it while the trace is still running,
+/// so the driver's control-event pump has a real `ConsumerStalled` to drain —
+/// which is the whole point, since draining it silently is the engine behaviour
+/// ADR-0101 specifies and the only way it can go wrong is by escaping as an
+/// error or piling up. Nothing in the resulting `EventStream` is timing-derived:
+/// the watchdog only ever emits an event the engine consumes, so both legs
+/// compare equal regardless of exactly when it fires.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            consumer_stall_timeout: Some(consumer_stall_timeout),
+            ..Default::default()
+        },
+        None,
     )
     .await
 }
@@ -103,10 +175,14 @@ async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,
     config: magnetar_proto::ConnectionConfig,
+    operation_retry: Option<magnetar_proto::OperationRetryConfig>,
 ) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
-    let client = Client::connect(pulsar_url, config).await?;
+    let mut client = Client::connect(pulsar_url, config).await?;
+    if let Some(retry) = operation_retry {
+        client = client.with_operation_retry(retry);
+    }
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
     // (issue #241 last-clone drop guard). `None` afterwards makes
@@ -135,6 +211,18 @@ async fn run_with_config(
     // partition.
     let mut part_producers: HashMap<i32, Producer> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer> = HashMap::new();
+
+    // Producers opened by `Op::OpenNamedProducer`, held for the whole trace.
+    // Releasing one mid-trace would fire ADR-0057's last-clone drop guard and
+    // put a second, asynchronous `CommandCloseProducer` on the wire, which is
+    // exactly the frame the issue #406 scenario is counting.
+    let mut named_producers: Vec<Producer> = Vec::new();
+
+    // Issue #414: additional `SubType::Shared` consumers opened by
+    // `Op::OpenSharedConsumer`, keyed by their harness-local name. They all
+    // land on ONE broker-side dispatcher for `(topic, subscription)`, so
+    // detaching one mid-drain redelivers its un-acked entries to the survivors.
+    let mut shared_consumers: HashMap<String, Consumer> = HashMap::new();
 
     // PIP-31: the current open txn id, if any. `NewTxn` populates it;
     // `EndTxn` consumes it. The harness supports one in-flight
@@ -328,6 +416,58 @@ async fn run_with_config(
                     }),
                 }
             }
+            Op::OpenNamedProducer { name } => {
+                stream.push(
+                    run_open_named_producer(&client, &trace.topic, name, &mut named_producers)
+                        .await,
+                );
+            }
+            Op::OpenSharedConsumer {
+                name,
+                receiver_queue_size,
+            } => {
+                stream.push(
+                    open_shared_consumer(
+                        &client,
+                        &mut shared_consumers,
+                        name,
+                        &trace.topic,
+                        &trace.subscription,
+                        *receiver_queue_size,
+                    )
+                    .await?,
+                );
+            }
+            Op::RecvShared { name, timeout } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_recv(consumer, *timeout).await);
+            }
+            Op::AckShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_ack(consumer, *message_id).await);
+            }
+            Op::CloseSharedConsumer { name } => {
+                // `close` consumes the handle, so close a clone and keep the
+                // map entry: later ops must still be able to address the
+                // consumer that LEFT the subscription — that is exactly what a
+                // #414 caller does when it tries to recover the wrong one.
+                let departing = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened")
+                    .clone();
+                let _ = departing.close().await;
+                stream.push(Event::SharedConsumerClosed);
+            }
+            Op::ResubscribeShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_resubscribe_shared(consumer));
+            }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
                 // the engines' last-clone drop guard (issue #241). The
@@ -350,6 +490,9 @@ async fn run_with_config(
             }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
+                for (_, c) in shared_consumers.drain() {
+                    let _ = c.close().await;
+                }
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
@@ -378,6 +521,9 @@ async fn run_with_config(
     }
 
     // Implicit close if no Close op present.
+    for (_, c) in shared_consumers.drain() {
+        let _ = c.close().await;
+    }
     if let Some(c) = consumer.take() {
         let _ = c.close().await;
     }
@@ -578,6 +724,53 @@ async fn run_ack(consumer: &Consumer, message_id: MessageId) -> Event {
     }
 }
 
+/// Issue #414: open one more `SubType::Shared` consumer on the trace's
+/// `(topic, subscription)`, held under a harness-local name.
+///
+/// `receiver_queue_size` is the initial permit grant, and reading it straight
+/// back through `Consumer::available_permits()` is the point of the returned
+/// event: that accessor now reports the REAL decrementing balance, so both
+/// engines must agree on it before any dispatch lands.
+async fn open_shared_consumer(
+    client: &Client,
+    map: &mut HashMap<String, Consumer>,
+    name: &str,
+    topic: &str,
+    subscription: &str,
+    receiver_queue_size: usize,
+) -> Result<Event, ClientError> {
+    let consumer = client
+        .subscribe_with(
+            SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: subscription.to_owned(),
+                sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
+                receiver_queue_size,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+    let permits = consumer.available_permits();
+    map.insert(name.to_owned(), consumer);
+    Ok(Event::SharedConsumerOpened { permits })
+}
+
+/// Issue #414: the caller-driven in-place recovery.
+///
+/// `resubscribe()` only stages the `CommandSubscribe` and wakes the driver, so
+/// there is nothing here to wait on: the event reports whether the ENGINE
+/// accepted the call. That the broker's `Success` actually re-armed the grant is
+/// proved by the trace, which publishes after the recovery and receives the
+/// message — impossible without a live permit. A consumer that has already been
+/// closed is refused, and both engines must refuse it the same way.
+fn run_resubscribe_shared(consumer: &Consumer) -> Event {
+    match consumer.resubscribe() {
+        Ok(()) => Event::SharedConsumerResubscribed,
+        Err(e) => Event::SharedConsumerResubscribeError { kind: classify(&e) },
+    }
+}
+
 async fn run_seek(consumer: &Consumer, message_id: MessageId) -> Event {
     match consumer.seek_to_message(message_id).await {
         Ok(()) => Event::Seeked,
@@ -622,6 +815,32 @@ async fn run_ack_in_txn(
     match consumer.ack_with_txn(message_id, txn_id).await {
         Ok(()) => Event::AckedInTxn,
         Err(e) => Event::AckInTxnError { kind: classify(&e) },
+    }
+}
+
+/// Issue #406 / ADR-0100: open one extra producer under a pinned name. The
+/// event is the open's verdict — that is the differential claim — and a
+/// successful handle is parked in `held` so it keeps holding the name for the
+/// rest of the trace instead of firing a drop-close mid-run.
+async fn run_open_named_producer(
+    client: &Client,
+    topic: &str,
+    name: &str,
+    held: &mut Vec<Producer>,
+) -> Event {
+    match client
+        .open_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            producer_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(producer) => {
+            held.push(producer);
+            Event::NamedProducerOpened
+        }
+        Err(e) => Event::NamedProducerOpenError { kind: classify(&e) },
     }
 }
 

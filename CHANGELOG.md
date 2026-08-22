@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`Consumer::resubscribe()`** (both engines) and `Connection::resubscribe_consumer_in_place` — caller-driven recovery for a consumer whose broker-side dispatch has gone silent.
+  It re-attaches THIS consumer id in place on the live connection: zero the permit mirrors, fail every in-flight ack (their responses can never arrive against the retired consumer generation), re-emit `CommandSubscribe` for the same consumer id, and let the broker's `Success` release a fresh initial `CommandFlow`.
+  No transport reconnect, no other consumer or producer disturbed, and the receiver queue is left intact so buffered messages stay receivable.
+  This is issue #307's same-broker `CommandCloseConsumer` machinery, which until now had exactly one trigger — an inbound close the broker may never send — made callable.
+  Ineligible states (closed, unsubscribing, terminal, mid-seek, re-attach already in flight) return `Err` without mutating anything.
+  It repairs this client's own dispatcher slot; a dispatcher-wide broker corruption still needs `pulsar-admin topics unload`.
+  (issue #414; ADR-0101)
+- **`ClientBuilder::consumer_stall_timeout(Duration)`** / `ConnectionConfig::consumer_stall_timeout` — an opt-in per-consumer stall watchdog.
+  A consumer holding un-spent broker permits over an empty receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces one `WARN` and one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` — exactly once per stall episode, re-armed by the next dispatch.
+  The connection keepalive of ADR-0058 cannot see this: `PING` / `PONG` keeps flowing on a connection whose dispatcher wedged for ONE subscription, so its baseline never ages.
+  **Default `None`** (the mechanism ships disarmed): an armed deadline perturbs the moonpool engine's simulated wake schedule even when it never fires, and Java has no per-consumer dispatch watchdog to inherit a parity default from. `Duration::from_secs(30)` is the documented recommended production value; `Duration::ZERO` disables it explicitly.
+  Emitting the event is its only effect — a watchdog that re-subscribed on its own would turn a broker hiccup into a re-subscribe storm and hide the broker-side defect. The event reports SILENCE, not fault: correlate it with the broker's `msgBacklog` before acting.
+  (issue #414; ADR-0101)
+- **`docs/consumer-stall-recovery.md`** — the operator-facing form of the above: the issue #414 symptom, why the connection keepalive misses it, detection via `available_permits()` / `ConsumerStalled` / admin `topic_stats`, and the `resubscribe()` → recreate → `topics unload` recovery ladder.
+- **`ProducerBuilder::unique_name_suffix(bool)`** — opt in to appending an engine-generated unique suffix to the name set by `ProducerBuilder::name`.
+  Default off, so a pinned name stays pinned, and a no-op with no name set.
+  It is the answer to a broker-side producer registration no `CommandCloseProducer` can ever reach — one stranded by a dead client process, or behind a proxy-mediated connection that outlived it.
+  The cost is why it is opt-in: a unique name breaks `Exclusive` / `WaitForExclusive` access-mode fencing, broker-side sequence-id dedup across a restart, and per-name dashboards and metrics.
+  (issue #406; ADR-0100)
+
+### Changed
+
+- **BREAKING (semantics): `Consumer::available_permits()` now reports the REAL, decrementing broker permit balance.**
+  It used to read `ConsumerState::granted_permits`, the purely-ADDITIVE grant mirror — a value dispatch never perturbs, so it read `receiver_queue_size` forever whether the broker was streaming or had gone silent.
+  ADR-0082 split that field from the real `permit_balance` for issue #349 but deliberately left this accessor on the additive one; issue #414 is the concrete cost of that deferral, because an application polling it could not distinguish a healthy consumer from one whose broker-side dispatcher had wedged.
+  The accessor now matches Java's `ConsumerBase#getAvailablePermits` and the value moves under dispatch, so a balance pinned near the receiver-queue size while nothing arrives is a usable stall signature.
+  The change reaches `Connection::consumer_available_permits`, both engines' `Consumer::available_permits`, the façade's `ConsumerApi::available_permits`, `Reader::available_permits`, `TypedConsumer::available_permits`, and `MultiTopicsConsumer::available_permits` (which sums its children).
+  Callers that genuinely want the cumulative grant read `ConsumerState::granted_permits` directly; it is unchanged, as are its two internal callers (the #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta).
+  (issue #414; ADR-0101, amending ADR-0082)
+
+### Fixed
+
+- **A producer open abandoned on its deadline no longer poisons its producer name.**
+  Cancelling an opening producer was local-only, so the broker completed the open on its own schedule and kept the `(topic, producer_name)` registration; every later open under that name then failed with `ProducerBusy` (code 16, the broker's `NamingException`) until the topic was unloaded.
+  Because `ProducerBusy` is retryable for producer-open, the retry loop re-hit that zombie with a fresh producer id until the budget ran out, stranding one more registration each time.
+  Cancellation now writes one best-effort fire-and-forget `CommandCloseProducer` for the abandoned producer id whenever the broker may still hold its registration.
+  Pulsar processes commands in order per connection, so the close reaps the registration whether or not the open had completed.
+  Broker-side creation is asynchronous, though, and a close consumed while it is still pending is acked without reaching the registration that creation goes on to make — reproduced against Pulsar 4.0.4.
+  A later `ProducerBusy` under the name is therefore recovered from rather than retried into: the abandoned id is re-closed while the broker can address it, and if the name is still busy the next attempt re-attaches under that id with a strictly higher epoch, which is the successor claim Pulsar accepts.
+  The abandoned ids live in a fixed 16-record ring that is cleared on reconnect.
+  (issue #406; ADR-0100, amending ADR-0080)
+
 ## [1.4.1] - 2026-08-11
 
 ### Fixed

@@ -325,3 +325,141 @@ fn topic_migration_close_event_streams_agree() {
          same-broker sweep does that"
     );
 }
+
+/// The refusal side of the in-place re-attach: a same-broker
+/// `CommandCloseConsumer` whose handle the connection cannot re-subscribe.
+///
+/// `Connection::emit_in_place_consumer_resubscribe` (issue #414 factored it out
+/// of this arm; issue #307 wrote it) declines two ways, and both must put
+/// NOTHING on the wire and leave the connection serving: an unknown consumer id
+/// has no `CommandSubscribe` to replay at all, and a consumer that is already
+/// mid-re-attach has one in flight whose `Success` would otherwise be raced by a
+/// second, unmatched subscribe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    /// A fresh `CommandSubscribe` was emitted for the handle?
+    resubscribed: bool,
+    /// `ConsumerClosedByBroker` surfaced for the handle?
+    saw_close_event: bool,
+    /// Connection still serving (a refusal is not a protocol error)?
+    connected_after: bool,
+}
+
+/// Feed a same-broker close for a consumer id that was never subscribed.
+fn run_unknown_handle(conn: &mut Connection, t0: Instant) -> Refusal {
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    while conn.poll_event().is_some() {}
+
+    let ghost = ConsumerHandle(4242);
+    let next_request_id = conn.peek_next_request_id_for_test();
+    conn.handle_bytes(t0, &close_consumer_frame(ghost, None))
+        .expect("handle close for an unknown consumer");
+    let saw_close_event = drain_close_event(conn, ghost);
+    let (subs, _grants) = drain_outbound(conn, ghost);
+    Refusal {
+        resubscribed: subs.contains(&next_request_id),
+        saw_close_event,
+        connected_after: conn.is_connected(),
+    }
+}
+
+/// Feed a same-broker close for a consumer whose re-attach is already in flight
+/// (`flow_on_subscribe_ack`, set by `rebuild_consumers` after a reset).
+fn run_reattach_in_flight(conn: &mut Connection, t0: Instant) -> Refusal {
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    while conn.poll_event().is_some() {}
+
+    let subscribe_rid = conn.peek_next_request_id_for_test();
+    let handle: ConsumerHandle = conn.subscribe(SubscribeRequest {
+        topic: "persistent://public/default/broker-close-refusal".to_owned(),
+        subscription: "sub-broker-close-refusal".to_owned(),
+        receiver_queue_size: RQ,
+        ..Default::default()
+    });
+    feed_success(conn, subscribe_rid, t0);
+    assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+    while conn.poll_event().is_some() {}
+    let _ = conn.initial_flow(handle, t0);
+    let _ = drain_outbound(conn, handle);
+
+    // Reconnect: `rebuild_consumers` re-emits `CommandSubscribe` and arms the
+    // flow gate, so a re-attach is pending and unacked.
+    conn.reset();
+    conn.begin_handshake().expect("re-handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("re-Connected");
+    while conn.poll_event().is_some() {}
+    let rebuilt = conn.rebuild_consumers();
+    assert_eq!(rebuilt.len(), 1, "one consumer to rebuild");
+    let _ = drain_outbound(conn, handle);
+
+    // Now the broker closes it. The re-attach already in flight owns the next
+    // `Success`; a second subscribe here would leave one of them unmatched.
+    let next_request_id = conn.peek_next_request_id_for_test();
+    conn.handle_bytes(t0, &close_consumer_frame(handle, None))
+        .expect("handle close mid-re-attach");
+    let saw_close_event = drain_close_event(conn, handle);
+    let (subs, _grants) = drain_outbound(conn, handle);
+    Refusal {
+        resubscribed: subs.contains(&next_request_id),
+        saw_close_event,
+        connected_after: conn.is_connected(),
+    }
+}
+
+fn run_refusal_both(scenario: fn(&mut Connection, Instant) -> Refusal) -> (Refusal, Refusal) {
+    let t0 = Instant::now();
+    let tokio = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        scenario(&mut conn, t0)
+    };
+    let moonpool = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        scenario(&mut conn, t0)
+    };
+    (tokio, moonpool)
+}
+
+#[test]
+fn same_broker_close_for_an_unknown_consumer_is_refused_identically() {
+    let (tokio_refusal, moonpool_refusal) = run_refusal_both(run_unknown_handle);
+    assert_eq!(
+        tokio_refusal, moonpool_refusal,
+        "tokio and moonpool diverged on a same-broker close for an unknown consumer",
+    );
+    assert_eq!(
+        tokio_refusal,
+        Refusal {
+            resubscribed: false,
+            saw_close_event: false,
+            connected_after: true,
+        },
+        "a close naming a consumer we never subscribed has nothing to replay: no \
+         `CommandSubscribe`, no surfaced close event, and the connection keeps serving",
+    );
+}
+
+#[test]
+fn same_broker_close_during_a_pending_reattach_is_refused_identically() {
+    let (tokio_refusal, moonpool_refusal) = run_refusal_both(run_reattach_in_flight);
+    assert_eq!(
+        tokio_refusal, moonpool_refusal,
+        "tokio and moonpool diverged on a same-broker close during a pending re-attach",
+    );
+    assert_eq!(
+        tokio_refusal,
+        Refusal {
+            resubscribed: false,
+            saw_close_event: false,
+            connected_after: true,
+        },
+        "the re-attach already in flight owns the next subscribe `Success`; a second \
+         `CommandSubscribe` here would leave one of the two unmatched and the flow gate stuck",
+    );
+}

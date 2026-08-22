@@ -556,8 +556,25 @@ Before this split, the single additive field never registered a genuine dispatch
 
 `adjust_receiver_queue` also gates on `granted_permits == 0` before computing anything: a zero grant mirror only occurs right after a reset / terminal-failure / same-broker `CloseConsumer` zeroing — a churn window, not load starvation — so the tick is skipped entirely rather than let the policy misread it and grow (or emit a `CommandFlow` the broker would drop against a torn-down consumer id).
 
-`Connection::consumer_available_permits()` (and the façade's `Consumer::available_permits()` chain on both engines) intentionally keeps reading `granted_permits` — unchanged, additive semantics; extending Java-parity (a genuinely decrementing counter) to that public accessor is a separate, unscoped change.
-See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md).
+`Connection::consumer_available_permits()` — and the façade's `Consumer::available_permits()` chain on both engines — reads `permit_balance`, matching Java's `ConsumerBase#getAvailablePermits`.
+ADR-0082 originally left it on the additive `granted_permits`; issue #414 is what that cost.
+A counter that never moves under dispatch cannot distinguish a healthy consumer from one whose broker-side dispatcher has wedged, so the public accessor now reports the balance that does move and `granted_permits` remains available for the two internal callers that genuinely want the cumulative grant.
+See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md) as amended by [ADR-0101](specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md).
+
+### Per-consumer stall watchdog (issue #414, ADR-0101)
+
+The connection keepalive of [ADR-0058](specs/adr/0058-keepalive-watchdog-progress-based.md) refreshes ONE connection-wide `last_activity` baseline off every decoded inbound frame, so a broker whose dispatcher has wedged for a single subscription — still answering `PING` with `PONG`, still serving every other subscription — never ages it.
+`ConsumerState` therefore carries its own progress-based watchdog, the same shape scoped to one consumer:
+
+- **`dispatch_units_received: u64`** — a monotonic progress mark bumped by `record_dispatch_unit`, the single helper that also decrements `permit_balance`. One call, so a future dispatch site cannot update one and forget the other. It is a counter, not a timestamp, so no dispatch site needed a `now` parameter ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md)).
+- **`stall_watch: Option<StallWatch>`** — the open silence window: the progress mark latched when it opened, the injected instant it opened at, and a `reported` latch that makes one stall episode emit exactly one event. `poll_stall(window, now)` advances and closes it; `next_stall_deadline` surfaces the deadline through `Connection::poll_timeout` so the driver wakes for the sweep deterministically rather than opportunistically. `Connection::initial_flow` opens it at grant time (`arm_stall_watch(now)`, beside the existing `arm_adjust_clock(now)`): that is the only grant site with an injected clock, and it is where a wedge begins, so detection takes the configured window rather than the window plus however long the next unrelated deadline takes to produce a first sweep.
+
+A consumer is a stall candidate only while it holds un-spent permits over an EMPTY queue in a dispatch-eligible state — the same eligibility set the #307 failover re-arm gate uses, since every state outside it (paused, mid-seek, end-of-topic, terminal, mid-re-attach, or simply a non-empty queue) explains the silence without a broker fault.
+The window is dropped when candidacy ends and at every grant site, so a fresh grant gets a fresh window.
+
+The whole mechanism is gated on `ConnectionConfig::consumer_stall_timeout`, which defaults to `None`: an armed deadline perturbs the moonpool engine's simulated wake schedule even when it never fires, and there is no Java counterpart to inherit a parity default from.
+Its only effect is one `warn!` plus one `ConnectionEvent::ConsumerStalled`; recovery is the caller's explicit `Connection::resubscribe_consumer_in_place` (issue #307's same-broker re-attach, made callable), escalating to an operator-side `topics unload`.
+See [`docs/consumer-stall-recovery.md`](docs/consumer-stall-recovery.md).
 
 ---
 

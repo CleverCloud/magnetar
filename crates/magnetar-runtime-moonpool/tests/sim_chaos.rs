@@ -2499,6 +2499,12 @@ struct ProxySessionRecord {
 /// pinned (`proxy_to_broker_url`-bearing) session.
 struct ProxyThroughBroker {
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
+    /// Index of the session that first issues a Lookup — the real
+    /// bootstrap session. Accept order alone can't identify it: a
+    /// chaos-killed dial can occupy session 0 and never issue one, so the
+    /// bootstrap can land on any accept index. `None` until the first
+    /// Lookup is observed.
+    bootstrap_session_idx: Arc<Mutex<Option<usize>>>,
 }
 
 #[async_trait]
@@ -2517,6 +2523,13 @@ impl Workload for ProxyThroughBroker {
 
         let shutdown = ctx.shutdown().clone();
         let sessions = self.sessions.clone();
+        let bootstrap_session_idx = self.bootstrap_session_idx.clone();
+        // Fresh per run() invocation: this workload is reused across every
+        // sweep iteration, and each iteration re-derives session_idx from
+        // scratch (sessions is cleared by the client's check()), so a
+        // bootstrap decision latched from a prior iteration must not carry
+        // over.
+        *bootstrap_session_idx.lock() = None;
         let task = ctx.providers().task().clone();
         loop {
             moonpool_core::select! {
@@ -2530,10 +2543,12 @@ impl Workload for ProxyThroughBroker {
                                 s.len() - 1
                             };
                             let sessions_for_task = sessions.clone();
+                            let bootstrap_session_idx_for_task = bootstrap_session_idx.clone();
                             let _handle = task.spawn_task("proxy-session", async move {
                                 let _ = handle_proxy_session(
                                     stream,
                                     sessions_for_task,
+                                    bootstrap_session_idx_for_task,
                                     session_idx,
                                 ).await;
                             });
@@ -2549,6 +2564,7 @@ impl Workload for ProxyThroughBroker {
 async fn handle_proxy_session<S>(
     mut stream: S,
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
+    bootstrap_session_idx: Arc<Mutex<Option<usize>>>,
     session_idx: usize,
 ) -> SimulationResult<()>
 where
@@ -2588,12 +2604,20 @@ where
                 pb::base_command::Type::Ping => emit_pong(&mut out_buf),
                 pb::base_command::Type::Lookup => {
                     if let Some(l) = &frame.command.lookup_topic {
-                        // Only the bootstrap (session 0) advertises
-                        // proxy_through=true. Subsequent pinned sessions
+                        // Only the bootstrap session advertises
+                        // proxy_through=true — the first session to issue
+                        // a Lookup, not accept order: a chaos-killed dial
+                        // can occupy an earlier accept slot and never get
+                        // this far, shifting the real bootstrap to a
+                        // later session_idx. Subsequent pinned sessions
                         // shouldn't be issuing lookups in this test;
                         // tolerating them with proxy_through=false avoids
                         // a redirect loop.
-                        let proxy_through = session_idx == 0;
+                        let proxy_through = {
+                            let mut bootstrap = bootstrap_session_idx.lock();
+                            let idx = *bootstrap.get_or_insert(session_idx);
+                            idx == session_idx
+                        };
                         emit_proxy_lookup(&mut out_buf, l.request_id, proxy_through);
                     }
                 }
@@ -2819,6 +2843,7 @@ fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
+            bootstrap_session_idx: Arc::new(Mutex::new(None)),
         })
         .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(sweep_seeds(8))
@@ -2859,6 +2884,7 @@ fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
+            bootstrap_session_idx: Arc::new(Mutex::new(None)),
         })
         .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(vec![

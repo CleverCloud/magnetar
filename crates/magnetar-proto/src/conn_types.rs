@@ -318,6 +318,38 @@ pub struct ConnectionConfig {
     /// `statsIntervalSeconds` later), so this is parity-correct rather
     /// than a rounding artefact.
     pub stats_interval: Option<Duration>,
+    /// Per-consumer stall watchdog window (issue #414). `handle_timeout` surfaces one
+    /// [`ConsumerStalled`](crate::event::ConnectionEvent::ConsumerStalled) event for a
+    /// consumer that has held un-spent broker permits over an empty receive queue, in a
+    /// dispatch-eligible state, for this long without a single dispatch unit arriving —
+    /// and exactly one per stall episode, re-armed by the next dispatch. See
+    /// [`ConsumerState::poll_stall`](crate::consumer::ConsumerState::poll_stall).
+    ///
+    /// The connection keepalive of ADR-0058 cannot cover this: a broker whose Shared
+    /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`, so
+    /// `last_activity` never ages and no connection-level deadline ever fires. Issue #414
+    /// is exactly that shape — survivors of a consumer-churn window receive ~20 messages
+    /// then nothing, the broker's own `availablePermits` for the subscription goes hugely
+    /// negative, `acks_failed` stays 0, and the client reports no error at all.
+    ///
+    /// **Default `None` — the mechanism ships disarmed.** Two reasons, both precedented
+    /// here: an armed deadline that never fires still perturbs the moonpool engine's
+    /// simulated wake schedule (the rationale [`Self::ack_response_timeout`] and
+    /// [`Self::stats_interval`] both carry), and ADR-0089 landed its sweep off for exactly
+    /// this reason so the flip could be its own bisectable commit with its own seed sweep.
+    /// There is no Java counterpart forcing a parity value either — the Java client has no
+    /// per-consumer dispatch watchdog.
+    ///
+    /// `Some(Duration::from_secs(30))` is the recommended production value: it matches
+    /// [`Self::keepalive_interval`] and [`Self::ack_response_timeout`], so a stall is
+    /// reported on roughly the cadence at which every other silence on the connection is
+    /// already judged, and it is far longer than any legitimate broker dispatch gap on a
+    /// subscription that holds permits over an empty queue. Shorter windows start
+    /// reporting ordinary idle backlogs; much longer ones defeat the point of a watchdog.
+    ///
+    /// Emitting the event is the only effect — recovery stays explicit. See
+    /// [`Connection::resubscribe_consumer_in_place`](crate::Connection::resubscribe_consumer_in_place).
+    pub consumer_stall_timeout: Option<Duration>,
     /// Engine-arming slot for the ADR-0048 buggify fault-injection helper
     /// (ADR-0097 swarm configurations). Default [`crate::Buggify::disabled`]
     /// — a zero-sized no-op unless the `buggify` Cargo feature is enabled
@@ -385,6 +417,12 @@ impl Default for ConnectionConfig {
             // the sweep off so this flip could be its own one-line commit,
             // bisectable on its own moonpool seed sweep.
             stats_interval: Some(Duration::from_mins(1)),
+            // Issue #414: the watchdog ships disarmed. It has no Java-parity default to
+            // inherit, and an armed deadline perturbs the moonpool wake schedule even
+            // when it never fires — ADR-0089's precedent is to land the mechanism off so
+            // the flip is its own bisectable commit with its own seed sweep. The
+            // recommended production value is documented on the field.
+            consumer_stall_timeout: None,
             buggify: crate::Buggify::disabled(),
         }
     }

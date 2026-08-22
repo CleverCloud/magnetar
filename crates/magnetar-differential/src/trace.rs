@@ -153,6 +153,73 @@ pub enum Op {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
     },
+    /// Issue #406 / ADR-0100: open an ADDITIONAL producer on
+    /// [`Trace::topic`] under an explicit `producer_name`, bounded by the
+    /// runner's `operation_timeout`, and drop it immediately. The point is
+    /// the open's outcome, not the handle: a name the broker still holds
+    /// answers `ProducerBusy`, and an open whose `CommandProducerSuccess` is
+    /// withheld past the deadline is abandoned — which is exactly when the
+    /// engine must push a `CommandCloseProducer` so the next open under the
+    /// same name succeeds. Pair with
+    /// [`crate::broker::ScriptedBroker::withhold_first_producer_success_for_name`].
+    OpenNamedProducer {
+        /// Producer name to pin on `CommandProducer.producer_name`.
+        name: String,
+    },
+    /// Issue #414: open an ADDITIONAL `SubType::Shared` consumer on
+    /// [`Trace::topic`] / [`Trace::subscription`] under a harness-local
+    /// `name`, held for the rest of the trace. Every Shared consumer joins the
+    /// scripted broker's ONE dispatcher for that `(topic, subscription)` — one
+    /// cursor, round-robin over whoever holds permits — so a churn scenario
+    /// (open two, drain a little, detach one mid-stream) is representable.
+    ///
+    /// `receiver_queue_size` is deliberately caller-supplied and small: a
+    /// one-permit window makes the round-robin hand-off deterministic across
+    /// both engines instead of letting whichever consumer subscribed first
+    /// swallow the whole backlog.
+    OpenSharedConsumer {
+        /// Harness-local name for later `…Shared` ops. Not a Pulsar
+        /// `consumer_name`.
+        name: String,
+        /// Receiver-queue size for this consumer (its initial permit grant).
+        receiver_queue_size: usize,
+    },
+    /// Issue #414: receive from the named Shared consumer.
+    RecvShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// How long to wait before surfacing [`Event::RecvTimeout`].
+        timeout: Duration,
+    },
+    /// Issue #414: individually acknowledge a message id on the named Shared
+    /// consumer, which also retires it from that consumer's broker-side
+    /// in-flight set (so a later detach does not redeliver it).
+    AckShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// Target message id.
+        message_id: MessageId,
+    },
+    /// Issue #414: close the named Shared consumer — the mid-drain detach. Its
+    /// un-acked in-flight entries go back to the subscription's redelivery pool
+    /// and the survivors pick them up.
+    CloseSharedConsumer {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
+    /// Issue #414: call `Consumer::resubscribe()` on the named Shared consumer —
+    /// the caller-driven in-place recovery.
+    ///
+    /// The call only stages the `CommandSubscribe` and wakes the driver, so the
+    /// event says whether the engine accepted it, not whether the grant landed.
+    /// That the grant DID land is proved by the trace instead: publish after the
+    /// recovery and receive it, which is impossible without a re-armed permit.
+    /// A consumer that has already been closed is refused, identically on both
+    /// engines.
+    ResubscribeShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
     /// PIP-31: acknowledge a single message id against the currently-
     /// open transaction id (set by the most recent [`Self::NewTxn`]).
     /// The scripted broker stages the ack against the per-txn ledger
@@ -304,6 +371,38 @@ pub enum Event {
     /// `AckInTxn` was attempted with no open transaction, or failed at
     /// the engine surface / broker.
     AckInTxnError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// [`Op::OpenSharedConsumer`] resolved: the broker acked the subscribe and
+    /// the engine armed the initial flow. `permits` is the balance read back
+    /// through `Consumer::available_permits()` — issue #414 re-pointed that
+    /// accessor at the REAL decrementing balance, so both engines must report
+    /// the same value here and it must equal the receiver-queue size before any
+    /// dispatch lands.
+    SharedConsumerOpened {
+        /// Un-spent broker permits right after the initial flow.
+        permits: u32,
+    },
+    /// [`Op::CloseSharedConsumer`] resolved: the broker acked the close and the
+    /// consumer detached from its Shared dispatcher.
+    SharedConsumerClosed,
+    /// [`Op::ResubscribeShared`] was accepted: the engine staged a fresh
+    /// `CommandSubscribe` for the same consumer id and woke the driver.
+    SharedConsumerResubscribed,
+    /// [`Op::ResubscribeShared`] was refused because the consumer is not
+    /// eligible for an in-place re-attach (closed, unsubscribing, terminal,
+    /// mid-seek, or already re-attaching).
+    SharedConsumerResubscribeError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// [`Op::OpenNamedProducer`] resolved: the broker acked the pinned name.
+    NamedProducerOpened,
+    /// [`Op::OpenNamedProducer`] failed. Same `kind` collapse as
+    /// [`Event::SendError`] — `timeout` when the open outlived the
+    /// operation deadline, `broker:16` when the name was still held.
+    NamedProducerOpenError {
         /// Stable error category string.
         kind: String,
     },

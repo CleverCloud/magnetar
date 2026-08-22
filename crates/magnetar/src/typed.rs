@@ -887,7 +887,10 @@ impl<S: Schema> TypedConsumer<S, Consumer> {
         self.inner.available_in_queue()
     }
 
-    /// Outstanding broker permits. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    /// Outstanding broker permits — grants issued, minus one per dispatch unit that has
+    /// actually arrived. Mirrors Java `ConsumerBase#getAvailablePermits`. Issue #414
+    /// re-pointed this from the purely-additive grant mirror to the real decrementing
+    /// balance, so the value moves under dispatch (ADR-0101 amending ADR-0082).
     #[must_use]
     pub fn available_permits(&self) -> u32 {
         self.inner.available_permits()

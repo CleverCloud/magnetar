@@ -95,6 +95,56 @@ pub async fn run_supervised_with_operation_timeout(
     replay(client, trace).await
 }
 
+/// Sibling of [`crate::runner_tokio::run_with_operation_timeout`]: a plain
+/// (unsupervised) client with a caller-supplied `operation_timeout`, for the
+/// producer-open cancellation scenario (issue #406 / ADR-0100).
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_operation_timeout(
+    host_port: &str,
+    trace: &Trace,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let config = ConnectionConfig {
+        operation_timeout,
+        ..Default::default()
+    };
+    let client = Client::connect_plain(&engine, host_port, config)
+        .await?
+        .with_operation_retry(crate::runner_tokio::fast_operation_retry());
+    replay(client, trace).await
+}
+
+/// Run `trace` with the issue #414 per-consumer stall watchdog armed at
+/// `consumer_stall_timeout`.
+///
+/// The window is deliberately tiny here: a Shared consumer that is granted
+/// permits and then handed nothing crosses it while the trace is still running,
+/// so the driver's control-event pump has a real `ConsumerStalled` to drain —
+/// which is the whole point, since draining it silently is the engine behaviour
+/// ADR-0101 specifies and the only way it can go wrong is by escaping as an
+/// error or piling up. Nothing in the resulting `EventStream` is timing-derived:
+/// the watchdog only ever emits an event the engine consumes, so both legs
+/// compare equal regardless of exactly when it fires.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_stall_timeout(
+    host_port: &str,
+    trace: &Trace,
+    consumer_stall_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let config = ConnectionConfig {
+        consumer_stall_timeout: Some(consumer_stall_timeout),
+        ..Default::default()
+    };
+    let client = Client::connect_plain(&engine, host_port, config).await?;
+    replay(client, trace).await
+}
+
 async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
@@ -118,6 +168,17 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
     // targeting that partition. See `runner_tokio.rs` for the rationale.
     let mut part_producers: HashMap<i32, Producer<TokioProviders>> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer<TokioProviders>> = HashMap::new();
+
+    // Producers opened by `Op::OpenNamedProducer`, held for the whole trace.
+    // See `runner_tokio.rs` for why releasing one mid-trace would corrupt the
+    // issue #406 close accounting.
+    let mut named_producers: Vec<Producer<TokioProviders>> = Vec::new();
+
+    // Issue #414: additional `SubType::Shared` consumers opened by
+    // `Op::OpenSharedConsumer`, keyed by their harness-local name. Mirrors
+    // `runner_tokio.rs` — they all land on ONE broker-side dispatcher for
+    // `(topic, subscription)`.
+    let mut shared_consumers: HashMap<String, Consumer<TokioProviders>> = HashMap::new();
 
     // PIP-31: the current open txn id, if any. Mirrors `runner_tokio.rs`.
     let mut current_txn: Option<magnetar_proto::TxnId> = None;
@@ -306,6 +367,58 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                     }),
                 }
             }
+            Op::OpenNamedProducer { name } => {
+                stream.push(
+                    run_open_named_producer(&client, &trace.topic, name, &mut named_producers)
+                        .await,
+                );
+            }
+            Op::OpenSharedConsumer {
+                name,
+                receiver_queue_size,
+            } => {
+                stream.push(
+                    open_shared_consumer(
+                        &client,
+                        &mut shared_consumers,
+                        name,
+                        &trace.topic,
+                        &trace.subscription,
+                        *receiver_queue_size,
+                    )
+                    .await?,
+                );
+            }
+            Op::RecvShared { name, timeout } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_recv(consumer, *timeout).await);
+            }
+            Op::AckShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_ack(consumer, *message_id).await);
+            }
+            Op::CloseSharedConsumer { name } => {
+                // `close` consumes the handle, so close a clone and keep the
+                // map entry: later ops must still be able to address the
+                // consumer that LEFT the subscription — that is exactly what a
+                // #414 caller does when it tries to recover the wrong one.
+                let departing = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened")
+                    .clone();
+                let _ = departing.close().await;
+                stream.push(Event::SharedConsumerClosed);
+            }
+            Op::ResubscribeShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(run_resubscribe_shared(consumer));
+            }
             Op::DropProducer => {
                 // Release every clone WITHOUT close().await — exercises
                 // the engines' last-clone drop guard (issue #241). The
@@ -327,6 +440,9 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                 stream.push(Event::ConsumerDropped);
             }
             Op::Close => {
+                for (_, c) in shared_consumers.drain() {
+                    let _ = c.close().await;
+                }
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
@@ -346,6 +462,9 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
         }
     }
 
+    for (_, c) in shared_consumers.drain() {
+        let _ = c.close().await;
+    }
     if let Some(c) = consumer.take() {
         let _ = c.close().await;
     }
@@ -550,6 +669,52 @@ async fn run_ack(consumer: &Consumer<TokioProviders>, message_id: MessageId) -> 
     }
 }
 
+/// Issue #414: open one more `SubType::Shared` consumer on the trace's
+/// `(topic, subscription)`, held under a harness-local name. 1:1 with
+/// `runner_tokio::open_shared_consumer`.
+///
+/// `receiver_queue_size` is the initial permit grant, and reading it straight
+/// back through `Consumer::available_permits()` is the point of the returned
+/// event: that accessor now reports the REAL decrementing balance, so both
+/// engines must agree on it before any dispatch lands.
+async fn open_shared_consumer(
+    client: &Client<TokioProviders>,
+    map: &mut HashMap<String, Consumer<TokioProviders>>,
+    name: &str,
+    topic: &str,
+    subscription: &str,
+    receiver_queue_size: usize,
+) -> Result<Event, ClientError> {
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: topic.to_owned(),
+            subscription: subscription.to_owned(),
+            sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
+            receiver_queue_size,
+            durable: true,
+            ..Default::default()
+        })
+        .await?;
+    let permits = consumer.available_permits();
+    map.insert(name.to_owned(), consumer);
+    Ok(Event::SharedConsumerOpened { permits })
+}
+
+/// Issue #414: the caller-driven in-place recovery.
+///
+/// `resubscribe()` only stages the `CommandSubscribe` and wakes the driver, so
+/// there is nothing here to wait on: the event reports whether the ENGINE
+/// accepted the call. That the broker's `Success` actually re-armed the grant is
+/// proved by the trace, which publishes after the recovery and receives the
+/// message — impossible without a live permit. A consumer that has already been
+/// closed is refused, and both engines must refuse it the same way.
+fn run_resubscribe_shared(consumer: &Consumer<TokioProviders>) -> Event {
+    match consumer.resubscribe() {
+        Ok(()) => Event::SharedConsumerResubscribed,
+        Err(e) => Event::SharedConsumerResubscribeError { kind: classify(&e) },
+    }
+}
+
 async fn run_seek(consumer: &Consumer<TokioProviders>, message_id: MessageId) -> Event {
     match consumer.seek_to_message(message_id).await {
         Ok(()) => Event::Seeked,
@@ -591,6 +756,29 @@ async fn run_ack_in_txn(
     match consumer.ack_with_txn(message_id, txn_id).await {
         Ok(()) => Event::AckedInTxn,
         Err(e) => Event::AckInTxnError { kind: classify(&e) },
+    }
+}
+
+/// Issue #406 / ADR-0100 sibling of `runner_tokio::run_open_named_producer`.
+async fn run_open_named_producer(
+    client: &Client<TokioProviders>,
+    topic: &str,
+    name: &str,
+    held: &mut Vec<Producer<TokioProviders>>,
+) -> Event {
+    match client
+        .open_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            producer_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(producer) => {
+            held.push(producer);
+            Event::NamedProducerOpened
+        }
+        Err(e) => Event::NamedProducerOpenError { kind: classify(&e) },
     }
 }
 

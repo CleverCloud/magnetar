@@ -386,3 +386,54 @@ test in replicated_subscriptions_sim.rs, which pins the derived sub-seed
 directly via `set_debug_seeds`. RETAINED as a regression anchor — do NOT
 remove on a green replay: the per-PR seed-replay re-validates this fix.
 """
+
+[[seed]]
+value        = "0xfdfd83d22818a362"
+discovered   = "2026-08-16"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/31925521482"
+commit_sha   = "6643c041b3d54b3440dda77a1079c46fe2980fc4"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/417"
+note         = """
+Derived sub-seed 4030431926096410523: chaos killed the client's first dial
+before it progressed past CONNECT, so the #362 `retry_setup` reconnect made
+the real bootstrap session land at accept index 1 — but ProxyThroughBroker
+decided the Lookup's `proxy_through` flag purely on raw accept order
+(`session_idx == 0`). The bootstrap session therefore received
+`proxy_through=false` with the advertised broker authority nothing in the
+simulated network listens on, and every open_producer attempt timed out
+re-issuing Lookups (frames: [Lookup x16], producer_opened=false).
+
+FIXED by keying the mock's redirect decision on whichever session first
+issues a Lookup (reset per sweep iteration) instead of accept order — a
+test-harness fix; the pool behaved per its documented contract. RETAINED
+as a regression anchor — do NOT remove on a green replay: the per-PR
+seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x62be2ae39ff4cf2b"
+discovered   = "2026-08-16"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/31925521482"
+commit_sha   = "6643c041b3d54b3440dda77a1079c46fe2980fc4"
+test_name    = "moonpool_malformed_mid_session_frame_terminates_driver_not_deadlock"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/416"
+note         = """
+Derived sub-seed 2165939632932382826: the sim's single bit-flip landed on
+the injected malformed frame's zero length header, turning 0x00000000 into
+0x04000000 (64 MiB). `peek_full_frame_len` rejected it on the oversize
+branch (> MAX_FRAME_SIZE) instead of the zero-length branch, so the driver
+terminated with `Protocol(Frame(BadLength(67108864)))` — a bounded outcome
+the test's classification did not yet name, landing in `OtherError`.
+
+FIXED by adding the `CorruptedLengthReject` bounded outcome for a chaos
+bit-flip that corrupts the announced frame length past the plausible
+ceiling (fourth documented chaos class; #290/#291 -> Severed, #305/#308 ->
+CleanExit precedents). The exact `BadLength(0)` reject assertion is
+unchanged, so the driver-swallows-malformed-frame regression still hard
+fails. Pinned into CHAOS_REGRESSION_SEEDS in driver_mid_session_reject.rs.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""

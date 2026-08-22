@@ -1,9 +1,15 @@
 # ADR-0080 — Configurable broker-operation retry policy
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0100](0100-close-cancelled-producer-open-before-retry.md), producer-open cancellation portion)
 - **Date**: 2026-07-16
 - **Decider**: Florentin Dubois
 - **Tags**: resilience, retry, timeout, runtime, sans-io
+
+> **Amendment (2026-08-21, [ADR-0100](0100-close-cancelled-producer-open-before-retry.md)).** Cancelling an opening PRODUCER is no longer local-only.
+> Beside every local purge described below, it now writes one best-effort fire-and-forget `CommandCloseProducer` for the abandoned producer id whenever a `ProducerOpen` request for that handle is still pending or the producer is already `broker_ready`, and the slot is not already closed.
+> Local-only cancellation was what stranded the broker-side `(topic, producer_name)` registration behind a timed-out open, and `ProducerBusy` being retryable here — the classification this ADR defines — then made the retry loop re-hit that zombie with a fresh producer id (issue #406).
+> Cancelling an opening CONSUMER is unchanged.
+> Everything else in this ADR stays in force: the retry policy and its defaults, the busy classification, the single per-operation deadline, per-generation request ownership, cancellation still owning all local correlation state, cancellation still being idempotent, and late broker replies still being ignored.
 
 ## Context
 
