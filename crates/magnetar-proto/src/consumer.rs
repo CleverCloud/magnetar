@@ -342,6 +342,22 @@ pub struct ConsumerState {
     /// initial flow. Request-id correlation prevents an older overlapping
     /// subscribe success from sending flow before the latest subscribe lands.
     pub(crate) flow_on_subscribe_ack_request: Option<RequestId>,
+    /// A `CommandSubscribe` has been emitted for this consumer and the initial
+    /// `CommandFlow` for that attach has not been issued yet (issue #427).
+    ///
+    /// Set by every `CommandSubscribe` emission — fresh subscribe, reconnect rebuild,
+    /// transient-subscribe retry, post-seek resubscribe, in-place re-attach — and cleared
+    /// by [`Self::initial_flow`], the single funnel every initial grant routes through.
+    /// It is what lets [`crate::Connection::initial_flow`] grant **once** per attach: the
+    /// broker (re-)creates its dispatcher slot at `availablePermits = 0`, so an attach with
+    /// no grant yet always needs one, and an attach that already has one never needs a
+    /// second.
+    ///
+    /// It is deliberately NOT the same question as `granted_permits == 0`. A post-seek
+    /// resubscribe leaves the additive `granted_permits` mirror alone (nothing zeroes it on
+    /// that path) while the broker's new dispatcher slot genuinely starts empty, so only
+    /// this flag can tell that attach apart from a consumer that is already fed.
+    pub(crate) initial_grant_due: bool,
     /// Configured max redelivery before DLQ routing kicks in (`0` disables DLQ routing).
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
@@ -857,6 +873,7 @@ impl ConsumerState {
             subscribe_waiter_completed: false,
             flow_on_subscribe_ack: false,
             flow_on_subscribe_ack_request: None,
+            initial_grant_due: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
             paused: false,
@@ -1257,6 +1274,10 @@ impl ConsumerState {
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
+        // Issue #427: this attach's initial grant is now on its way to the broker, so no
+        // other grant site owes it one. `Connection::initial_flow` reads the flag back to
+        // stay idempotent per attach.
+        self.initial_grant_due = false;
         // Issue #414: a fresh full grant (subscribe ack, reconnect rebuild, post-seek
         // resubscribe, #307 re-arm, #414 caller-driven resubscribe) restarts the stall
         // window. Keeping the old window would let a consumer that was already silent

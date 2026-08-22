@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fresh `Exclusive` / `Failover` subscribe no longer grants the initial consumer permits twice when the broker announces the active consumer.**
+  A real broker answers such a subscribe with `CommandSuccess` and then `CommandActiveConsumerChange { is_active: true }` in the same write, so both frames reach the client in one read.
+  The issue #307 promotion re-arm therefore ran inside `handle_bytes` while the engine's own post-ack `Connection::initial_flow` was still parked on the resolving subscribe future, and its `granted_permits == 0` gate was legitimately still true at that instant because no grant had been issued yet.
+  Both then granted, and the broker held `2 × receiver_queue_size` for a fresh consumer whose mirrors recorded `1 ×` — measured 32 against a configured 16.
+  `Shared` subscriptions were unaffected: the broker never sends that command for them, which is why issue #426's fix left the count correct there and this one open.
+  `Connection::initial_flow` now grants at most once per attach: it emits a `CommandFlow` only when a `CommandSubscribe` has gone out since the last grant (the broker's freshly created dispatcher slot starts at zero permits) or when the client holds no outstanding grant at all (the churn boundary the #307 re-arm exists for).
+  Whichever of the two racing callers arrives first issues the grant; the other is a no-op instead of a second full window.
+  The #307 re-arm itself is unchanged and still restores flow for a promoted consumer whose permit mirrors a reset, a terminal subscribe failure, or a same-broker `CommandCloseConsumer` zeroed; `maybe_flow` and `adjust_receiver_queue` are untouched, since replenishment and growth are incremental top-ups that do not route through `initial_flow`.
+  (issue #427; ADR-0102, amending ADR-0082)
+
 ## [1.5.0] - 2026-08-22
 
 ### Added

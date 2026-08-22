@@ -545,7 +545,7 @@ Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permi
 
 - **`granted_permits: u32`** — a purely ADDITIVE record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CommandCloseConsumer`).
   Bumped at the three grant sites (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth branch); never decremented by dispatch.
-  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`) and `adjust_receiver_queue`'s want-have delta both need exactly that, so both keep reading this field.
+  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`), `adjust_receiver_queue`'s want-have delta, and `Connection::initial_flow`'s once-per-attach guard (ADR-0102) all need exactly that, so all three read this field.
 - **`permit_balance: u32`** — the REAL broker-side balance: `granted_permits` minus one unit per broker dispatch unit that has actually arrived.
   Incremented at the same three grant sites, by the identical delta.
   Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
@@ -558,8 +558,15 @@ Before this split, the single additive field never registered a genuine dispatch
 
 `Connection::consumer_available_permits()` — and the façade's `Consumer::available_permits()` chain on both engines — reads `permit_balance`, matching Java's `ConsumerBase#getAvailablePermits`.
 ADR-0082 originally left it on the additive `granted_permits`; issue #414 is what that cost.
-A counter that never moves under dispatch cannot distinguish a healthy consumer from one whose broker-side dispatcher has wedged, so the public accessor now reports the balance that does move and `granted_permits` remains available for the two internal callers that genuinely want the cumulative grant.
-See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md) as amended by [ADR-0101](specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md).
+
+A counter that never moves under dispatch cannot distinguish a healthy consumer from one whose broker-side dispatcher has wedged, so the public accessor now reports the balance that does move and `granted_permits` remains available for the three internal callers that genuinely want the cumulative grant.
+See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md) as amended by [ADR-0101](specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md) and [ADR-0102](specs/adr/0102-grant-the-initial-consumer-flow-once-per-attach.md).
+
+`Connection::initial_flow` grants at most ONCE per attach ([ADR-0102](specs/adr/0102-grant-the-initial-consumer-flow-once-per-attach.md)): it emits a `CommandFlow` only when `ConsumerState::initial_grant_due` is set — a `CommandSubscribe` has gone out since the last grant, so the broker's freshly (re-)created dispatcher slot starts at zero permits — or when `granted_permits == 0`, the churn boundary the #307 re-arm exists for.
+Two sites can each decide a consumer needs its initial grant, and on a fresh `Exclusive` / `Failover` subscribe a real broker makes both fire: it sends `CommandActiveConsumerChange { is_active: true }` in the same write as the subscribe `Success`, so the #307 re-arm runs inside `handle_bytes` while the engine's own post-ack `initial_flow` is still parked on the resolving subscribe future.
+Both used to grant, and the broker held `2 × receiver_queue_size` for a consumer whose mirrors recorded one (issue #427, measured 32 against a configured 16).
+Whichever caller now arrives first issues the grant; the other is a no-op, so the order is unobservable on the wire.
+`initial_grant_due` is not the same question as `granted_permits == 0`: a post-seek resubscribe re-attaches without zeroing the additive mirror, so only the flag can tell that attach apart from a consumer that is already fed.
 
 ### Per-consumer stall watchdog (issue #414, ADR-0101)
 

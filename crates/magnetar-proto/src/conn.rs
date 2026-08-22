@@ -3412,6 +3412,16 @@ impl Connection {
                 // gate at the `Success` arm owns that flow). The predicate read
                 // takes only the per-slot lock and is dropped before
                 // `initial_flow` re-acquires it (ADR-0038 lock ordering).
+                //
+                // Issue #427: on a FRESH Exclusive/Failover subscribe this arm runs
+                // inside `handle_bytes` on the frame a real broker sends right behind
+                // the subscribe `Success`, while the runtime's own post-ack
+                // `initial_flow` is still parked on the resolving subscribe future.
+                // `granted_permits` is legitimately `0` at that instant, so this gate
+                // passes and the re-arm grants first. That is fine and deliberate: the
+                // grant is owed either way, and `Self::initial_flow` is idempotent per
+                // attach, so whichever of the two callers arrives second is a no-op
+                // rather than a second `receiver_queue_size` the broker would hold.
                 let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
                     let mut consumer = slot.state.lock();
                     consumer.record_active_change(active);
@@ -5093,6 +5103,14 @@ impl Connection {
             .insert(request_id, PendingRequestKind::ConsumerSubscribe { handle });
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
+            // Issue #427: the broker (re-)creates its dispatcher slot for this consumer id
+            // at `availablePermits = 0`, so this attach owes exactly one initial
+            // `CommandFlow` whichever site ends up issuing it — the `Success` arm below on
+            // `ReleaseFlow`, the runtime's post-ack call on `NotifyWaiter`, or the #307
+            // promotion re-arm when a `CommandActiveConsumerChange` beats the runtime to
+            // it. `Self::initial_flow` clears the flag as it grants, which is what makes
+            // the second of those two racing callers a no-op instead of a double grant.
+            consumer.initial_grant_due = true;
             match ack_action {
                 SubscribeAckAction::NotifyWaiter => {
                     consumer.subscribe_waiter_id = Some(request_id);
@@ -5140,18 +5158,54 @@ impl Connection {
     ///
     /// Both the flow command and the arming happen under a single per-slot lock
     /// acquisition, dropped before the connection-wide encode (ADR-0038).
+    ///
+    /// # Grants at most once per attach (issue #427)
+    ///
+    /// Two independent sites can each decide this consumer needs its initial grant, and on
+    /// a fresh `Exclusive` / `Failover` subscribe a real broker makes both fire: it sends
+    /// `CommandActiveConsumerChange { is_active: true }` immediately behind the subscribe
+    /// `Success`, so the #307 promotion re-arm runs inside `handle_bytes` while the
+    /// runtime's own post-ack call is still parked on the resolving subscribe future. Both
+    /// granted, and the broker held `2 × receiver_queue_size` for a consumer whose client
+    /// mirrors recorded one (measured 32 against a configured 16).
+    ///
+    /// So this method grants only when the current attach has not been granted yet:
+    ///
+    /// - `initial_grant_due` — a `CommandSubscribe` has gone out since the last grant, so the
+    ///   broker's freshly (re-)created dispatcher slot starts at zero permits. This is the only
+    ///   signal on the post-seek resubscribe path, which re-attaches without zeroing the additive
+    ///   `granted_permits` mirror.
+    /// - `granted_permits == 0` — the client holds no outstanding grant at all, which is the churn
+    ///   boundary the #307 re-arm exists for: a promoted standby whose mirrors a reset / terminal
+    ///   failure / same-broker `CommandCloseConsumer` zeroed still gets its flow back here.
+    ///
+    /// Neither being true means this attach's grant already reached the broker, and a
+    /// second one would be the double grant above — so the call is a no-op. `maybe_flow`
+    /// and `adjust_receiver_queue` are untouched: replenishment and growth are incremental
+    /// top-ups that do not route through here.
     pub fn initial_flow(&mut self, handle: ConsumerHandle, now: Instant) -> Option<RequestId> {
-        let flow_cmd = {
+        let Some(flow_cmd) = ({
             let mut consumer = self.consumers.get(&handle)?.state.lock();
-            let flow_cmd = consumer.initial_flow();
-            consumer.arm_adjust_clock(now);
-            // Issue #414: the same injected `now` opens the stall window. A full grant is
-            // where a wedge starts — the broker has acknowledged permits it may never
-            // spend — and it is the only grant site with a clock, so seeding here is what
-            // keeps detection at `consumer_stall_timeout` rather than that plus a
-            // keepalive interval waiting for the first sweep to find a baseline.
-            consumer.arm_stall_watch(now);
-            flow_cmd
+            if consumer.initial_grant_due || consumer.granted_permits == 0 {
+                let flow_cmd = consumer.initial_flow();
+                consumer.arm_adjust_clock(now);
+                // Issue #414: the same injected `now` opens the stall window. A full grant is
+                // where a wedge starts — the broker has acknowledged permits it may never
+                // spend — and it is the only grant site with a clock, so seeding here is what
+                // keeps detection at `consumer_stall_timeout` rather than that plus a
+                // keepalive interval waiting for the first sweep to find a baseline.
+                consumer.arm_stall_watch(now);
+                Some(flow_cmd)
+            } else {
+                None
+            }
+        }) else {
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                handle = ?handle,
+                "initial flow already granted for this attach; skipping redundant grant (#427)"
+            );
+            return None;
         };
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
@@ -9633,6 +9687,226 @@ mod conn_state_tests {
             state.permit_balance, 128,
             "the live balance must match the single frame that reached the broker"
         );
+    }
+
+    #[test]
+    fn active_consumer_change_behind_subscribe_ack_grants_the_queue_size_once() {
+        // Issue #427: a real broker answers an Exclusive/Failover subscribe with
+        // `CommandSuccess` and then `CommandActiveConsumerChange { is_active: true }`
+        // immediately behind it. Both frames are decoded inside the SAME `handle_bytes`
+        // call, so the #307 promotion re-arm runs while the runtime engine's own post-ack
+        // `initial_flow` is still parked on the resolving subscribe future — and at that
+        // instant `granted_permits` is legitimately `0`, so the re-arm's gate passes.
+        //
+        // Both then granted, and the broker held `2 × receiver_queue_size` for a fresh
+        // consumer whose mirrors recorded `1 ×` (measured 32 against a configured 16).
+        // Exactly one grant of the receiver-queue size must reach the wire whichever of
+        // the two callers gets there first.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/active-change-grant".to_owned(),
+            subscription: "active-change-grant-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        // Drop the `CommandSubscribe`; only the grants are under test.
+        let _initial = drain_outbound_commands(&mut conn);
+
+        // The broker's two frames, back to back on one read — the production ordering.
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle ActiveConsumerChange");
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        // …and the engine's post-ack call, which the runtime issues once the subscribe
+        // future resolves (tokio `client.rs`, moonpool `consumer.rs`).
+        let _ = conn.initial_flow(handle, Instant::now());
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "an active announcement behind the subscribe ack must not add a second grant \
+             (issue #427): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
+
+        let slot = conn.consumer(handle).expect("consumer slot").clone();
+        let state = slot.state.lock();
+        assert_eq!(
+            state.granted_permits, RQ as u32,
+            "the grant mirror must match the single frame that reached the broker"
+        );
+        assert_eq!(
+            state.permit_balance, RQ as u32,
+            "the live balance must match the single frame that reached the broker"
+        );
+    }
+
+    #[test]
+    fn established_standby_promotion_still_rearms_flow_at_zero_grant() {
+        // The other half of issue #427: closing the fresh-subscribe window must NOT cost
+        // the issue #307 re-arm its real case. An ESTABLISHED consumer — attached, its
+        // subscribe-ack grant already issued and accounted — whose permit mirrors were
+        // zeroed at a churn boundary (`reset`, terminal subscribe failure, a same-broker
+        // `CommandCloseConsumer` whose in-place re-attach was declined) and which is then
+        // promoted still has nothing to dispatch against. `maybe_flow` cannot help it: it
+        // only fires once messages have been consumed, and none can arrive at zero
+        // permits. So the promotion must re-arm exactly one full grant.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/standby-promotion".to_owned(),
+            subscription: "standby-promotion-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        // The engine's post-ack grant: this consumer is now established, and the attach's
+        // initial grant is spent.
+        let _ = conn.initial_flow(handle, Instant::now());
+        let subscribe_and_grant = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            subscribe_and_grant
+                .iter()
+                .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+                .count(),
+            1,
+            "the established consumer must have been granted exactly once: \
+             {subscribe_and_grant:?}"
+        );
+
+        // Churn boundary: the broker tore its dispatcher slot down and the client's
+        // mirrors followed it to zero, with no re-subscribe of its own.
+        {
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let mut state = slot.state.lock();
+            state.granted_permits = 0;
+            state.permit_balance = 0;
+            state.consumed_since_flow = 0;
+        }
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle ActiveConsumerChange");
+        while conn.poll_event().is_some() {}
+
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "promoting an established consumer that holds no grant must re-arm flow \
+             exactly once (issue #307): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "the re-arm must restore the client-side balance too"
+        );
+    }
+
+    #[test]
+    fn post_seek_resubscribe_still_grants_although_the_grant_mirror_is_non_zero() {
+        // The issue #427 once-per-attach guard must not cost the post-seek re-attach its
+        // grant. `resubscribe_consumer_after_seek` emits a fresh `CommandSubscribe` WITHOUT
+        // zeroing the additive `granted_permits` mirror, so at the runtime's post-ack call
+        // the mirror still reads the previous attach's grant — and a guard keyed on
+        // `granted_permits == 0` alone would swallow the frame. The broker recreated its
+        // dispatcher slot at `availablePermits = 0` on that re-subscribe, so swallowing it
+        // is exactly issue #67: the broker confirms the backlog after the cursor reset and
+        // dispatches nothing forever. `ConsumerState::initial_grant_due` is what keeps this
+        // attach distinguishable from a consumer that is already fed.
+        const RQ: usize = 16;
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let subscribe_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/post-seek-grant".to_owned(),
+            subscription: "post-seek-grant-sub".to_owned(),
+            receiver_queue_size: RQ,
+            durable: true,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            conn.consumer(handle)
+                .expect("consumer slot")
+                .state
+                .lock()
+                .granted_permits,
+            RQ as u32,
+            "the first attach's grant leaves the additive mirror non-zero"
+        );
+
+        // Post-seek re-attach: `CommandSubscribe` only, the grant deferred to the runtime
+        // (the tokio engine's seek path, `consumer.rs`).
+        let resubscribe_request_id = conn
+            .resubscribe_consumer_after_seek(handle)
+            .expect("post-seek resubscribe request");
+        feed_subscribe_success(&mut conn, resubscribe_request_id.0);
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let _ = conn.initial_flow(handle, Instant::now());
+        let cmds = drain_outbound_commands(&mut conn);
+        let flows: Vec<&pb::CommandFlow> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .filter_map(|c| c.flow.as_ref())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "the post-seek re-attach must still receive its grant (issue #67): {cmds:?}"
+        );
+        assert_eq!(flows[0].consumer_id, handle.0);
+        assert_eq!(flows[0].message_permits, RQ as u32);
     }
 
     #[test]
