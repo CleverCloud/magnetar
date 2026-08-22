@@ -57,8 +57,8 @@ crc32c          = "^0.6.8"
 # Async runtime (engines only, NEVER magnetar-proto)
 tokio           = { version = "^1.53.1", default-features = false }
 tokio-util      = { version = "^0.7.19", default-features = false }
-futures         = { version = "^0.3.33", default-features = false }
-futures-util    = { version = "^0.3.33", default-features = false }
+futures         = { version = "^0.3.34", default-features = false }
+futures-util    = { version = "^0.3.34", default-features = false }
 pin-project-lite = "^0.2.17"
 parking_lot     = "^0.12.5"
 slab            = "^0.4.12"
@@ -73,7 +73,7 @@ rustc-hash      = "^2.1.3"
 # via its own `crypto-*` feature so cargo does NOT silently unify two
 # providers into a single build (issue #9, ADR-0035). `tls12` and
 # `logging` stay on; both are rustls's own default-on features.
-rustls               = { version = "^0.23.42", default-features = false, features = ["std", "tls12", "logging"] }
+rustls               = { version = "^0.23.43", default-features = false, features = ["std", "tls12", "logging"] }
 # rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
 rustls-pki-types     = { version = "^1.15.1", features = ["std"] }
@@ -83,7 +83,7 @@ tokio-rustls         = { version = "^0.26.4", default-features = false }
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "^0.3.1", default-features = false }
+rustls-openssl       = { version = "^0.4.0", default-features = false }
 
 # Compression — Pulsar's four codecs
 lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
@@ -101,16 +101,16 @@ serde_json  = "^1.0.151"
 # file written by `magnetarctl context set` stays readable by pulsarctl. See
 # ADR-0068.
 serde_norway = "^0.9.42"
-apache-avro = "^0.21.0"
+apache-avro = "^0.22.0"
 schemars    = { version = "^1.2.2", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.24.0", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.24.1", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-aws-lc-rs` (ADR-0030 + ADR-0035).
-aws-lc-rs  = { version = "^1.17.3", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-rs  = { version = "^1.18.0", default-features = false, features = ["aws-lc-sys"] }
 # Alternate RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-ring`. Same RSASSA-PKCS1-v1_5 SHA-256
 # signature bytes as aws-lc-rs (RFC 8017 deterministic encoding).
@@ -120,7 +120,7 @@ ring       = { version = "^0.17.14", default-features = false }
 zeroize    = { version = "^1.9.0", default-features = false }
 # URL-safe-without-padding base64 for the JWS compact serialisation
 # emitted by the Athenz JwtSigner backends (RFC 7515 §3.1).
-base64     = { version = "^0.23.0", default-features = false, features = ["std"] }
+base64     = { version = "^0.23.1", default-features = false, features = ["std"] }
 
 # SASL Kerberos / GSSAPI. Safe Rust wrapper over the system GSS-API
 # (libkrb5 / Heimdal). Only opted-in by `magnetar-auth-sasl` under its
@@ -153,20 +153,20 @@ moonpool-sim = "^0.8.0"
 # `sourceConfig` / `sinkConfig`), even when no file is uploaded.
 reqwest = { version = "^0.13.4", default-features = false, features = ["json", "form", "multipart"] }
 url     = "^2.5.8"
-http    = "^1.4.2"
-clap    = { version = "^4.6.4", features = ["derive", "env"] }
+http    = "^1.5.0"
+clap    = { version = "^4.6.6", features = ["derive", "env"] }
 
 # Telemetry + errors
 opentelemetry      = { version = "^0.32.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features = ["trace"] }
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
-thiserror          = "^2.0.18"
+thiserror          = "^2.0.20"
 anyhow             = "^1.0.104"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 
 # Test infrastructure
-testcontainers = "^0.27.3"
+testcontainers = "^0.28.0"
 # Dev-only. `magnetar-differential` needs `SO_LINGER = 0` to make a fixture
 # reset a connection rather than close it cleanly, so the drivers' read-error
 # branch is exercised as well as their clean-EOF one. `tokio`'s own
@@ -180,7 +180,7 @@ tempfile       = "^3.27.0"
 wiremock       = "^0.6.5"
 # `async-trait` is needed by moonpool-sim's `Workload` trait. Pinned to the
 # compatible major version moonpool-sim 0.8 transitively depends on.
-async-trait    = "^0.1.91"
+async-trait    = "^0.1.92"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
