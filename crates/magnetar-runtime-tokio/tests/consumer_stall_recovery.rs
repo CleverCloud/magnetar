@@ -4,8 +4,8 @@
 //! of `magnetar-runtime-moonpool/tests/consumer_stall_recovery.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): six `#[test]` functions here mirror the
-//! moonpool file's six.
+//! (`check-runtime-test-parity`): seven `#[test]` functions here mirror the
+//! moonpool file's seven.
 //!
 //! ## The failure this covers
 //!
@@ -47,6 +47,9 @@
 //! 6. A consumer the in-place re-attach may not touch — a pending unsubscribe, the one ineligible
 //!    state that is still a stall candidate — is reported and left completely alone: no
 //!    `CommandSubscribe`, no mutation, no budget spent.
+//! 7. A reported Failover standby — the one shape that satisfies the stall predicate permanently
+//!    and legitimately — is reported and skipped, spends nothing, and hands its untouched budget to
+//!    the consumer it becomes on promotion.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -135,6 +138,40 @@ fn open_shared_consumers(
     names: &[&str],
     at: Instant,
 ) -> Vec<ConsumerHandle> {
+    open_consumers(
+        shared,
+        pb::command_subscribe::SubType::Shared,
+        subscription,
+        names,
+        at,
+    )
+}
+
+/// One acked, flowed `Failover` consumer — the subscription type the broker announces
+/// active/standby for (issue #348), and therefore the only one the standby pre-check can
+/// ever apply to.
+fn open_failover_consumer(
+    shared: &ConnectionShared,
+    subscription: &str,
+    name: &str,
+    at: Instant,
+) -> ConsumerHandle {
+    open_consumers(
+        shared,
+        pb::command_subscribe::SubType::Failover,
+        subscription,
+        &[name],
+        at,
+    )[0]
+}
+
+fn open_consumers(
+    shared: &ConnectionShared,
+    sub_type: pb::command_subscribe::SubType,
+    subscription: &str,
+    names: &[&str],
+    at: Instant,
+) -> Vec<ConsumerHandle> {
     {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("handshake");
@@ -149,7 +186,7 @@ fn open_shared_consumers(
         let handle = conn.subscribe(SubscribeRequest {
             topic: "persistent://public/default/stall".to_owned(),
             subscription: subscription.to_owned(),
-            sub_type: pb::command_subscribe::SubType::Shared,
+            sub_type,
             consumer_name: Some((*name).to_owned()),
             receiver_queue_size: RQ,
             ..Default::default()
@@ -652,5 +689,124 @@ fn a_consumer_the_recovery_may_not_touch_is_reported_but_never_re_subscribed() {
         RQ as u32,
         "and the refusal must mutate nothing: zeroing the mirrors for a consumer we then \
          decline to re-subscribe leaves it strictly worse off than the stall it was in"
+    );
+}
+
+/// Encode a `CommandActiveConsumerChange` — the Failover active/standby announcement
+/// (issue #348) whose `is_active` the recovery's standby pre-check reads.
+///
+/// Hand-encoded rather than driven through the scripted broker's
+/// `announce_active_consumer_on_subscribe` knob: that knob exists for issue #427's
+/// post-`Success` announcement and only ever sends `is_active: true`, so it structurally
+/// cannot set up a standby.
+fn active_consumer_change_frame(handle: ConsumerHandle, is_active: bool) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+        active_consumer_change: Some(pb::CommandActiveConsumerChange {
+            consumer_id: handle.0,
+            is_active: Some(is_active),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandActiveConsumerChange");
+    buf
+}
+
+/// Feed one broker active/standby announcement for `handle`.
+fn announce_active(
+    shared: &ConnectionShared,
+    handle: ConsumerHandle,
+    is_active: bool,
+    at: Instant,
+) {
+    let mut conn = shared.inner.lock();
+    conn.handle_bytes(at, &active_consumer_change_frame(handle, is_active))
+        .expect("ActiveConsumerChange");
+    while conn.poll_event().is_some() {}
+    let _ = conn.poll_transmit();
+}
+
+/// Recovery budget for the Failover-standby test. Exactly one attempt, so the
+/// post-promotion attempt below is a strict proof that the standby episodes spent nothing:
+/// had any of them charged the budget, there would be none left.
+const STANDBY_BUDGET: u32 = 1;
+
+#[test]
+fn a_reported_failover_standby_is_reported_but_never_costs_an_attempt() {
+    // A `Failover` standby satisfies the stall predicate PERMANENTLY and legitimately: it
+    // holds the initial grant the broker acked at subscribe time over an empty queue, in a
+    // dispatch-eligible state, and the broker correctly dispatches nothing to it because
+    // the active consumer owns the subscription. It also never receives the one thing that
+    // gives the budget back — a dispatch unit — so an unguarded recovery spends its whole
+    // budget on every healthy standby in a failover group and never recovers it.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(auto_recovery_config(STANDBY_BUDGET));
+    let handle = open_failover_consumer(&shared, "sub-failover-standby", "standby", t0);
+    announce_active(&shared, handle, false, t0);
+
+    // The report is unchanged from 1.5.0 — ADR-0101's event means SILENCE, not fault, and
+    // a standby is genuinely silent — while the recovery is skipped outright.
+    let (stalls, resubscribe) = sweep(&shared, t0 + WINDOW);
+    assert_eq!(
+        stalls, 1,
+        "a standby still reports: suppressing it would make the event mean something \
+         different depending on a knob the event does not carry"
+    );
+    assert_eq!(
+        resubscribe, None,
+        "the broker is not dispatching to a standby BY DESIGN, so there is nothing to \
+         recover and no `CommandSubscribe` may go out"
+    );
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "and the skip mutates nothing"
+    );
+    for extra in [1u64, 2, 60] {
+        let (stalls, resubscribe) = sweep(&shared, t0 + WINDOW + Duration::from_secs(extra));
+        assert_eq!(
+            stalls, 0,
+            "the once-per-episode latch holds for a standby too"
+        );
+        assert_eq!(
+            resubscribe, None,
+            "and no attempt is ever made while standby"
+        );
+    }
+
+    // ── Promotion. The skip spent nothing, so nothing needs repairing: the full budget is
+    // still there, and a genuine wedge after promotion gets the complete ladder.
+    let promoted = t0 + WINDOW * 2;
+    announce_active(&shared, handle, true, promoted);
+
+    // Promotion alone does not restart the window: issue #307's re-arm calls
+    // `initial_flow` only at `granted_permits == 0`, and ADR-0102 makes that a no-op for a
+    // consumer that already holds its grant. Lose and regain candidacy so a fresh episode
+    // can open — pausing drops the window on the next sweep, un-pausing lets the one after
+    // re-seed it.
+    shared.inner.lock().set_paused(handle, true);
+    let (stalls, resubscribe) = sweep(&shared, promoted);
+    assert_eq!(
+        (stalls, resubscribe),
+        (0, None),
+        "a paused consumer never stalls"
+    );
+    shared.inner.lock().set_paused(handle, false);
+    let (stalls, resubscribe) = sweep(&shared, promoted);
+    assert_eq!((stalls, resubscribe), (0, None), "re-seeding tick only");
+
+    let (stalls, request_id) = sweep(&shared, promoted + WINDOW);
+    assert_eq!(stalls, 1, "the promoted consumer's own stall episode");
+    let request_id = request_id.expect(
+        "a promoted consumer recovers normally, on a budget the standby episodes never \
+         touched — a single attempt was configured, so any standby charge would have \
+         exhausted it",
+    );
+    ack_resubscribe(&shared, request_id, promoted + WINDOW);
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "and the re-subscribe ack re-arms the full grant"
     );
 }

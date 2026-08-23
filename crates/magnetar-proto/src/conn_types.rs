@@ -369,6 +369,13 @@ pub struct ConnectionConfig {
     /// inert without that knob: no stall window means no stall episode means nothing to
     /// recover from. `Some(0)` is the same as `None` (a budget of zero attempts).
     ///
+    /// A consumer the broker has reported as a **Failover standby**
+    /// (`ConsumerState::is_active == Some(false)`, issue #348) is skipped entirely: the
+    /// stall is still reported, but no attempt is made and no budget is spent. A standby
+    /// satisfies the stall predicate exactly as a wedged consumer does and never receives
+    /// the dispatch unit that would reset the budget, so without that skip an armed
+    /// recovery would spend its whole budget on every healthy standby in a failover group.
+    ///
     /// Each attempt zeroes this client's permit mirrors and re-attaches this consumer id
     /// on the live socket, which repairs **this client's own slot** in the broker's
     /// dispatcher. Issue #414's production failure was dispatcher-WIDE — the

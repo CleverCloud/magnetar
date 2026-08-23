@@ -3,7 +3,7 @@
 - **Status**: Accepted (amends [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md), the rejected "have the watchdog re-subscribe automatically" alternative and the "emitting the event is the only effect" clause)
 - **Date**: 2026-08-22
 - **Decider**: Florentin Dubois
-- **Tags**: consumer, flow-control, resilience, sans-io, shared-subscription, issue-414
+- **Tags**: consumer, flow-control, resilience, sans-io, shared-subscription, failover, issue-414
 
 ## Context
 
@@ -37,6 +37,7 @@ ADR-0101 gave it a real `SharedDispatcher` per `(topic, subscription)` — one c
 - **A separate cool-off / backoff knob between attempts.** Rejected as redundant: `consumer_stall_timeout` already is the interval. An attempt can only follow a closed episode, and an episode takes a full window.
 - **A new `ConsumerStallRecoveryExhausted` event.** Rejected for now. `ConsumerStalled` already fires on the exhausted episode, and the exhaustion carries its own `warn!` with the escalation. Adding an event to make a log line programmatic is public surface this ADR does not need.
 - **Arm `consumer_stall_timeout` implicitly when auto-recovery is set.** Rejected: two knobs that silently set each other are harder to reason about than one that is documented as inert without the other.
+- **Put the Failover-standby skip (§4) in `consumer_reattach_in_place_is_eligible`** rather than in the auto-recovery arm. Rejected, and it would be a regression rather than mere scope creep: that helper is shared with issue #307's same-broker `CommandCloseConsumer` arm, where a broker-closed **standby** must re-attach or it never rejoins the failover group, and with `Consumer::resubscribe()`, where an application asking to re-attach a standby is making an explicit, legitimate request. Only the automatic path has a reason to decline, because only it is reacting to silence the broker is producing on purpose.
 
 ## Decision
 
@@ -78,7 +79,24 @@ Everything else is deliberately excluded, and the exclusion is load-bearing rath
 `clear_stall_watch` and `initial_flow` are exactly what a recovery attempt performs on its way out — an attempt that zeroed the mirrors and got a `Success` back would refund itself, and the bound would silently not exist.
 A re-subscribe the broker acked but never dispatched against is not progress.
 
-### 4. The differential broker models the aggregate permit counter, and can corrupt it
+### 4. A reported Failover standby is skipped, ahead of everything else
+
+A `Failover` standby satisfies the stall predicate exactly as a wedged consumer does, and it does so permanently: it holds the initial grant the broker acknowledged at subscribe time, over an empty queue, in a dispatch-eligible state, and the broker never dispatches to it because the active consumer owns the subscription.
+It is also the one shape that can never clear itself, since §3's only reset is a dispatch unit and a standby receives none.
+An armed recovery therefore spends its **entire** budget re-subscribing every healthy standby in a failover group, once per window, and never gets it back — the exact failure mode the bound exists to prevent, arrived at from the other direction.
+
+The `handle_timeout` recovery arm gains one pre-check, reading the `ConsumerState::is_active` mirror issue #348 already maintains from `CommandActiveConsumerChange`:
+
+- **`Some(false)`** — the broker has reported this consumer as standby. Skip: no `CommandSubscribe`, no budget spent, nothing mutated, one `debug!` explaining why.
+- **`Some(true)`** and **`None`** — active, or never announced, which is every `Shared` and `Exclusive` subscription plus a `Failover` one before its first announcement. Unchanged behaviour.
+
+Only a _reported_ standby is skipped. Inferring standby-ness from anything else would put the watchdog in the business of guessing the subscription's topology, and `None` is deliberately the permissive value: the overwhelming majority of consumers never receive that command at all, and issue #414's own failure is a `Shared` subscription.
+
+**The pre-check runs before the exhausted-budget arm.** A consumer that spent its budget while active and was then demoted therefore gets this skip rather than the `pulsar-admin topics unload` escalation — the right order, because escalation guidance about a consumer whose silence the broker is producing deliberately is misleading operator advice.
+
+**The report is unchanged.** `ConsumerStalled` and its `warn!` still fire for a standby exactly as they did in 1.5.0. That is deliberate rather than an oversight: ADR-0101's event means _silence_, not _fault_, and a standby is genuinely silent. Suppressing it here would make the event mean something different depending on a knob the event does not carry.
+
+### 5. The differential broker models the aggregate permit counter, and can corrupt it
 
 `SharedDispatcher` gains `total_available_permits: i64` — the scripted analogue of the number a real broker reports as `availablePermits` for a `Shared` subscription.
 It is **signed on purpose**: a `u32` could not express the failure, and a negative value is by construction a broker-side accounting fault, since the wire protocol carries only monotonic client → broker permit increments and no decrement of any kind.
@@ -106,6 +124,8 @@ It is the accounting shape that reproduces the reported signature, and `UPSTREAM
 - **The watchdog is still a silence detector, not a fault detector.** A consumer that has drained its backlog on an idle topic satisfies the predicate exactly as a wedged one does, so an armed budget will occasionally spend an attempt re-subscribing a perfectly healthy idle consumer. That is cheap (one `CommandSubscribe`, one `CommandFlow`, the receiver queue untouched) and self-limiting (the first dispatch resets the budget), but it is why the knob is opt-in and why the recommended window is long.
 - **The differential harness can now express the broker-side fault**, which is what makes the upstream report evidence-backed rather than anecdotal: the same trace and the same leak recover under a sufficient budget and stay wedged under an insufficient one, identically on both engines.
 - **One extra `u32` per consumer.** No allocation, no task, no new deadline — the recovery rides the sweep that already detected the stall.
+- **Promotion and demotion need no repair, because a skip spends nothing.** The standby pre-check emits nothing and mutates nothing, so a consumer that was standby throughout arrives at promotion with its budget untouched and gets the complete ladder if it then genuinely wedges. Demotion does not refund attempts already spent while active either; §3's single reset site is unchanged, and only a dispatch unit gives the budget back — which for a promoted consumer is exactly the event that proves the broker started serving it. No transition handling was added anywhere, and that is the point: the rule is that `is_active` gates whether an attempt is _made_, never what the budget _is_.
+- **Promotion does not restart the stall window, and a promoted-but-still-silent consumer stays quiet.** Issue #307's re-arm calls `initial_flow` only at `granted_permits == 0`, and ADR-0102 makes that a no-op for a consumer that already holds its grant — so no `arm_stall_watch` fires on promotion, and a report the standby already latched stays latched. The next episode opens only when candidacy is lost and regained or a fresh grant lands. This is pre-existing ADR-0101 latch semantics, unchanged by this guard and stated here only so it is not read as new behaviour: promotion is not evidence that the broker started dispatching, so it is correctly not treated as progress.
 
 ### Amends ADR-0101
 
@@ -128,7 +148,7 @@ ADR-0101's amendment of [ADR-0082](0082-consumer-permit-balance-split.md) is unt
 
 - `crates/magnetar-proto/src/conn_types.rs` — `ConnectionConfig::consumer_stall_auto_recovery`.
 - `crates/magnetar-proto/src/consumer.rs` — `ConsumerState::stall_recovery_attempts` and its single reset in `record_dispatch_unit`.
-- `crates/magnetar-proto/src/conn.rs` — the recovery arm in `handle_timeout`'s stall-report drain, and `resubscribe_consumer_in_place`'s second caller.
+- `crates/magnetar-proto/src/conn.rs` — the recovery arm in `handle_timeout`'s stall-report drain, its Failover-standby pre-check, and `resubscribe_consumer_in_place`'s second caller.
 - `crates/magnetar/src/client_builder.rs` — `ClientBuilder::consumer_stall_auto_recovery`.
 - `crates/magnetar-differential/src/broker.rs` — `SharedDispatcher::total_available_permits`, `dispatch_gate_open`, `ScriptedBroker::leak_shared_permits_on_consumer_churn`.
 - `crates/magnetar-differential/src/runner_{tokio,moonpool}.rs` — `run_with_stall_auto_recovery`.
@@ -136,6 +156,7 @@ ADR-0101's amendment of [ADR-0082](0082-consumer-permit-balance-split.md) is unt
 - `docs/consumer-stall-recovery.md` — the operator-facing ladder, with automatic recovery as rung 0.
 - [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md) — the watchdog and the in-place re-attach this connects, and whose rejected alternative this amends.
 - [ADR-0082](0082-consumer-permit-balance-split.md) — the permit split the detection signal rests on.
+- `crates/magnetar-proto/src/consumer.rs` — `ConsumerState::is_active`, the issue #348 mirror the standby pre-check reads.
 - [ADR-0058](0058-keepalive-watchdog-progress-based.md) — the connection keepalive the watchdog is modelled on and which cannot see a per-subscription wedge.
 - [ADR-0054](0054-logging-policy.md) — the single-owner logging rule that keeps the recovery's log lines in `magnetar-proto`.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — the test policy this change lands under.
