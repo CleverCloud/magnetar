@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-23
+
 ### Added
 
 - **`ClientBuilder::consumer_stall_auto_recovery(u32)`** / `ConnectionConfig::consumer_stall_auto_recovery` — opt-in, bounded automatic recovery for the issue #414 stall watchdog.
@@ -598,6 +600,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.6.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.6.0
 [1.5.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.5.0
 [1.4.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.1
 [1.4.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.0
