@@ -1,6 +1,6 @@
 # ADR-0101 — Make a wedged consumer detectable and recoverable from the client
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md), the rejected "have the watchdog re-subscribe automatically" alternative and the "emitting the event is the only effect" clause — everything else below remains binding)
 - **Date**: 2026-08-21
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, observability, resilience, sans-io, shared-subscription
@@ -28,6 +28,12 @@ The scripted broker in `magnetar-differential` could not even express the failur
 
 - **Add a sibling accessor** (`available_permit_balance()`) and leave `available_permits()` additive. Rejected: it leaves the Java-parity name (`ConsumerBase#getAvailablePermits`, which IS a decrementing counter) on the wrong field, and every existing caller — including the parity matrix's own claim — keeps reading the value that cannot detect the fault.
 - **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would hide the broker-side defect that issue #414 is actually about. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
+
+  > **Amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md).**
+  > This rejection stands verbatim for the unconditional, unbounded form it was written about, and it stands as the shipped default.
+  > ADR-0103 admits the automatic re-subscribe only opt-in (`ConnectionConfig::consumer_stall_auto_recovery`, default `None`) and only bounded — at most one attempt per stall episode, at most `max_attempts` per stall streak, the budget resetting only on a real dispatch unit — and the `ConsumerStalled` event plus its `warn!` are still emitted on every episode, so the diagnosis is not hidden.
+  > With the knob unset, this clause is unchanged down to the byte: the watchdog reports and puts nothing on the wire.
+
 - **Extend ADR-0058's connection keepalive to notice per-consumer silence.** Rejected: the keepalive's whole design is one connection-wide baseline refreshed by any inbound frame. Making it per-consumer means a per-consumer baseline, which is this ADR's watchdog under a misleading name.
 - **Ship the watchdog armed by default.** Rejected — see §Decision.
 
@@ -62,6 +68,10 @@ There is no Java counterpart to inherit a parity default from — the Java clien
 
 **Emitting the event is the only effect.**
 Recovery stays explicit, per the alternatives above.
+
+> **Amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md)** for the opt-in case only.
+> When `ConnectionConfig::consumer_stall_auto_recovery` is set, the same `handle_timeout` sweep also drives a bounded number of `resubscribe_consumer_in_place` calls for the reporting consumer.
+> The event is emitted either way, and with the knob unset — the default — this clause is unchanged.
 
 ### 3. `Connection::resubscribe_consumer_in_place`, and `Consumer::resubscribe()` on both engines
 

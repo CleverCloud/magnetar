@@ -568,12 +568,12 @@ Both used to grant, and the broker held `2 × receiver_queue_size` for a consume
 Whichever caller now arrives first issues the grant; the other is a no-op, so the order is unobservable on the wire.
 `initial_grant_due` is not the same question as `granted_permits == 0`: a post-seek resubscribe re-attaches without zeroing the additive mirror, so only the flag can tell that attach apart from a consumer that is already fed.
 
-### Per-consumer stall watchdog (issue #414, ADR-0101)
+### Per-consumer stall watchdog (issue #414, ADR-0101, ADR-0103)
 
 The connection keepalive of [ADR-0058](specs/adr/0058-keepalive-watchdog-progress-based.md) refreshes ONE connection-wide `last_activity` baseline off every decoded inbound frame, so a broker whose dispatcher has wedged for a single subscription — still answering `PING` with `PONG`, still serving every other subscription — never ages it.
 `ConsumerState` therefore carries its own progress-based watchdog, the same shape scoped to one consumer:
 
-- **`dispatch_units_received: u64`** — a monotonic progress mark bumped by `record_dispatch_unit`, the single helper that also decrements `permit_balance`. One call, so a future dispatch site cannot update one and forget the other. It is a counter, not a timestamp, so no dispatch site needed a `now` parameter ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md)).
+- **`dispatch_units_received: u64`** — a monotonic progress mark bumped by `record_dispatch_unit`, the single helper that also decrements `permit_balance` and zeroes `stall_recovery_attempts`. One call, so a future dispatch site cannot update one and forget the others. It is a counter, not a timestamp, so no dispatch site needed a `now` parameter ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md)).
 - **`stall_watch: Option<StallWatch>`** — the open silence window: the progress mark latched when it opened, the injected instant it opened at, and a `reported` latch that makes one stall episode emit exactly one event. `poll_stall(window, now)` advances and closes it; `next_stall_deadline` surfaces the deadline through `Connection::poll_timeout` so the driver wakes for the sweep deterministically rather than opportunistically. `Connection::initial_flow` opens it at grant time (`arm_stall_watch(now)`, beside the existing `arm_adjust_clock(now)`): that is the only grant site with an injected clock, and it is where a wedge begins, so detection takes the configured window rather than the window plus however long the next unrelated deadline takes to produce a first sweep.
 
 A consumer is a stall candidate only while it holds un-spent permits over an EMPTY queue in a dispatch-eligible state — the same eligibility set the #307 failover re-arm gate uses, since every state outside it (paused, mid-seek, end-of-topic, terminal, mid-re-attach, or simply a non-empty queue) explains the silence without a broker fault.
@@ -581,6 +581,14 @@ The window is dropped when candidacy ends and at every grant site, so a fresh gr
 
 The whole mechanism is gated on `ConnectionConfig::consumer_stall_timeout`, which defaults to `None`: an armed deadline perturbs the moonpool engine's simulated wake schedule even when it never fires, and there is no Java counterpart to inherit a parity default from.
 Its only effect is one `warn!` plus one `ConnectionEvent::ConsumerStalled`; recovery is the caller's explicit `Connection::resubscribe_consumer_in_place` (issue #307's same-broker re-attach, made callable), escalating to an operator-side `topics unload`.
+
+**Bounded automatic recovery** ([ADR-0103](specs/adr/0103-bounded-automatic-consumer-stall-recovery.md)) is the one thing that changes that, and only when the separate `ConnectionConfig::consumer_stall_auto_recovery: Option<u32>` is set (default `None`, inert without `consumer_stall_timeout`).
+The same `handle_timeout` stall-report drain that emits the event then also calls `resubscribe_consumer_in_place` for the reporting consumer — at most once per stall episode, since `poll_stall` closes at most one per window, and at most `max_attempts` per stall streak.
+A refused attempt (the eligibility gate) spends no budget and mutates nothing; exhausting the budget logs one `warn!` naming `pulsar-admin topics unload` and then goes quiet, because the last attempt was also the last thing that re-armed the window.
+`ConsumerState::stall_recovery_attempts` resets in exactly ONE place — `record_dispatch_unit` — deliberately not at the permit-mirror churn boundaries, since the recovery's own re-subscribe is one of them and resetting there would leave no bound at all.
+It lives in `magnetar-proto` rather than in the two drivers' `ConsumerStalled` drain arms so both engines inherit one implementation with no per-engine attempt bookkeeping to drift.
+One attempt credits the broker's aggregate permit counter by exactly one receiver-queue window, which is why the bound is a small integer and why a dispatcher-wide corruption is still an operator's `topics unload`.
+
 See [`docs/consumer-stall-recovery.md`](docs/consumer-stall-recovery.md).
 
 ---

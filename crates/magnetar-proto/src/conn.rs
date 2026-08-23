@@ -4310,6 +4310,66 @@ impl Connection {
                 permit_balance,
                 stalled_for,
             });
+            // ---- BEGIN issue #414 / ADR-0103: bounded automatic recovery ----
+            // Opt-in. `None` (the default) leaves the watchdog exactly as ADR-0101 shipped
+            // it: report and stop. The event above is pushed either way, so arming this
+            // never suppresses the diagnosis — it only adds the first rung of the recovery
+            // ladder ahead of the operator having to climb it by hand.
+            //
+            // The rate limit is structural rather than a separate knob: `poll_stall`
+            // returns `Some` at most once per stall episode, and an episode cannot close
+            // more often than once per `consumer_stall_timeout`, so this can emit at most
+            // one `CommandSubscribe` per consumer per window. The bound then caps the
+            // total, which is what stops a dispatcher-WIDE fault (issue #414's production
+            // shape: one fresh receiver-queue grant per attempt against an aggregate
+            // observed at `-177300`) from turning into an unbounded re-subscribe loop.
+            if let Some(max_attempts) = self.config.consumer_stall_auto_recovery {
+                let attempts = self
+                    .consumers
+                    .get(&handle)
+                    .map_or(0, |slot| slot.state.lock().stall_recovery_attempts);
+                if attempts < max_attempts {
+                    // The budget is spent only on an attempt that actually went out.
+                    // `resubscribe_consumer_in_place` returns `None` — mutating nothing —
+                    // for a consumer whose next `CommandSubscribe` has another owner
+                    // (closing, unsubscribing, terminal, mid-seek, re-attach in flight),
+                    // and charging that to the budget would let an unrelated close race
+                    // exhaust the recovery a genuinely wedged consumer still needs.
+                    if let Some(request_id) = self.resubscribe_consumer_in_place(handle) {
+                        let attempt = attempts.saturating_add(1);
+                        if let Some(slot) = self.consumers.get(&handle) {
+                            slot.state.lock().stall_recovery_attempts = attempt;
+                        }
+                        tracing::info!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            attempt,
+                            max_attempts,
+                            "stall watchdog re-subscribed this consumer in place automatically; \
+                             the budget resets on the next dispatch unit (#414)"
+                        );
+                    }
+                } else {
+                    // Terminal for this streak, and emitted exactly once: the last attempt
+                    // was the last thing that re-armed the window, so no further episode
+                    // can open for this consumer without a dispatch unit first — and a
+                    // dispatch unit would have reset the budget.
+                    tracing::warn!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        permit_balance,
+                        attempts,
+                        max_attempts,
+                        "stall watchdog exhausted its automatic in-place re-subscribe budget \
+                         and is giving up on this consumer; the broker-side dispatcher is \
+                         likely wedged subscription-wide — check the broker's own \
+                         availablePermits for the subscription and escalate to \
+                         `pulsar-admin topics unload` (#414)"
+                    );
+                }
+            }
+            // ---- END issue #414 / ADR-0103 ----
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
@@ -7697,9 +7757,14 @@ impl Connection {
         }
     }
 
-    /// Caller-driven recovery for a consumer whose broker-side dispatch has wedged
-    /// (issue #414): re-attach THIS consumer id in place, on the live socket, without a
-    /// transport reconnect.
+    /// Recovery for a consumer whose broker-side dispatch has wedged (issue #414):
+    /// re-attach THIS consumer id in place, on the live socket, without a transport
+    /// reconnect.
+    ///
+    /// Two callers: the application, directly or through `Consumer::resubscribe()`; and —
+    /// only when [`ConnectionConfig::consumer_stall_auto_recovery`](crate::ConnectionConfig)
+    /// is armed — [`Self::handle_timeout`]'s stall watchdog, bounded to that many attempts
+    /// per stall streak (ADR-0103). Both go through the identical three steps below.
     ///
     /// Runs the same three steps the #307 same-broker `CommandCloseConsumer` handler runs,
     /// in the same order:
@@ -7751,8 +7816,8 @@ impl Connection {
             target: "magnetar_proto::conn",
             handle = ?handle,
             request_id = ?request_id,
-            "consumer re-subscribed in place on caller request; initial flow deferred to \
-             the re-subscribe Success (#414)"
+            "consumer re-subscribed in place; initial flow deferred to the re-subscribe \
+             Success (#414)"
         );
         Some(request_id)
     }
@@ -16478,11 +16543,12 @@ mod conn_state_tests {
 // of the caller-driven in-place re-subscribe recovery.
 //
 // `consumer::stall_watchdog_tests` pins the state machine in isolation; this
-// module pins the three things only `Connection` can own: that `poll_timeout`
+// module pins the four things only `Connection` can own: that `poll_timeout`
 // arms the deadline (so a moonpool driver wakes deterministically rather than
 // opportunistically), that `handle_timeout` surfaces exactly one
-// `ConsumerStalled`, and that `resubscribe_consumer_in_place` reproduces the
-// #307 same-broker re-attach on demand.
+// `ConsumerStalled`, that `resubscribe_consumer_in_place` reproduces the
+// #307 same-broker re-attach on demand, and that ADR-0103's opt-in automatic
+// recovery drives that re-attach a BOUNDED number of times per stall streak.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod consumer_stall_and_recovery_tests {
@@ -16595,9 +16661,19 @@ mod consumer_stall_and_recovery_tests {
         stall_timeout: Option<Duration>,
         t0: Instant,
     ) -> (Connection, ConsumerHandle) {
+        shared_consumer_with_recovery(stall_timeout, None, t0)
+    }
+
+    /// [`shared_consumer`] with ADR-0103's automatic recovery budget also set.
+    fn shared_consumer_with_recovery(
+        stall_timeout: Option<Duration>,
+        auto_recovery: Option<u32>,
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle) {
         let mut conn = Connection::new(
             ConnectionConfig {
                 consumer_stall_timeout: stall_timeout,
+                consumer_stall_auto_recovery: auto_recovery,
                 // Off so the only deadlines in play are the keepalive and the
                 // watchdog — otherwise the assertions on `poll_timeout` would be
                 // reading whichever sweep happens to be nearer.
@@ -16914,6 +16990,148 @@ mod consumer_stall_and_recovery_tests {
             conn.resubscribe_consumer_in_place(ConsumerHandle(4242)),
             None,
             "an unknown handle has no subscribe request to replay"
+        );
+    }
+
+    /// This consumer's recovery-attempt counter.
+    fn recovery_attempts(conn: &Connection, handle: ConsumerHandle) -> u32 {
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .stall_recovery_attempts
+    }
+
+    #[test]
+    fn a_watchdog_without_auto_recovery_emits_no_wire_traffic() {
+        // ADR-0101's contract, unchanged: the watchdog alone reports and stops. ADR-0103
+        // is opt-in, so a consumer that stalls under `consumer_stall_timeout` with no
+        // budget configured must still produce exactly the report and nothing else — no
+        // `CommandSubscribe`, no `CommandFlow`, no mirror mutation.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer_with_recovery(Some(WINDOW), None, t0);
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "reported");
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty() && grants.is_empty(),
+            "recovery is opt-in: an unset budget must put nothing on the wire, got \
+             subs={subs:?} grants={grants:?}"
+        );
+        assert_eq!(recovery_attempts(&conn, handle), 0);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and the permit mirrors are untouched"
+        );
+    }
+
+    #[test]
+    fn auto_recovery_resubscribes_at_most_the_configured_number_of_times() {
+        // The bound is what separates ADR-0103 from the unconditional automatic
+        // re-subscribe ADR-0101 rejected. A dispatcher-WIDE wedge (issue #414's
+        // production shape) cannot be repaired by this client at all, so an unbounded
+        // watchdog would re-subscribe once per window forever against a fault it cannot
+        // fix; the budget turns that into a fixed, small number of attempts followed by a
+        // documented escalation to `pulsar-admin topics unload`.
+        const MAX_ATTEMPTS: u32 = 3;
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            shared_consumer_with_recovery(Some(WINDOW), Some(MAX_ATTEMPTS), t0);
+
+        let mut at = t0;
+        let mut emitted: Vec<u64> = Vec::new();
+        // Four episodes for a budget of three: the fourth must be reported and refused.
+        for episode in 1..=(MAX_ATTEMPTS + 1) {
+            at += WINDOW;
+            let expected_rid = conn.peek_next_request_id_for_test();
+            conn.handle_timeout(at);
+            assert_eq!(
+                drain_stall_events(&mut conn).len(),
+                1,
+                "episode {episode}: the event is emitted whether or not recovery acts"
+            );
+            let (subs, grants) = drain_outbound(&mut conn, handle);
+            assert!(
+                grants.is_empty(),
+                "episode {episode}: the initial flow is deferred to the re-subscribe ack, \
+                 never emitted alongside the CommandSubscribe"
+            );
+            if episode <= MAX_ATTEMPTS {
+                assert_eq!(
+                    subs,
+                    vec![expected_rid],
+                    "episode {episode}: one automatic in-place re-subscribe"
+                );
+                assert_eq!(
+                    conn.consumer_available_permits(handle),
+                    0,
+                    "episode {episode}: the mirrors follow the recreated dispatcher slot"
+                );
+                assert_eq!(recovery_attempts(&conn, handle), episode);
+                emitted.push(expected_rid);
+                // The broker acks, releasing the deferred grant and re-arming the window,
+                // but never dispatches — so nothing resets the budget.
+                feed_success(&mut conn, expected_rid, at);
+                let (_subs, grants) = drain_outbound(&mut conn, handle);
+                assert_eq!(grants, vec![RQ as u32], "episode {episode}: grant re-armed");
+            } else {
+                assert!(
+                    subs.is_empty(),
+                    "episode {episode}: the budget is spent, got {subs:?}"
+                );
+                assert_eq!(recovery_attempts(&conn, handle), MAX_ATTEMPTS);
+            }
+        }
+        assert_eq!(
+            emitted.len() as u32,
+            MAX_ATTEMPTS,
+            "exactly `max_attempts` re-subscribes across the whole streak, got {emitted:?}"
+        );
+
+        // And it stays stopped. The last attempt was the last thing that re-armed the
+        // window, so with no dispatch no further episode can open at all.
+        for extra in [1u64, 600, 86_400] {
+            conn.handle_timeout(at + Duration::from_secs(extra));
+            assert!(drain_stall_events(&mut conn).is_empty());
+            let (subs, _) = drain_outbound(&mut conn, handle);
+            assert!(subs.is_empty(), "no recovery traffic resumes on its own");
+        }
+    }
+
+    #[test]
+    fn auto_recovery_spends_no_budget_on_a_consumer_it_may_not_re_subscribe() {
+        // `unsubscribe_request_id` is the one state that is a stall candidate AND an
+        // ineligible re-attach: the watchdog still reports it, but the re-subscribe is
+        // refused because the pending unsubscribe owns this consumer's fate. Charging
+        // that refusal to the budget would let an unrelated teardown race burn the
+        // recovery a genuinely wedged consumer still needs.
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer_with_recovery(Some(WINDOW), Some(2), t0);
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .unsubscribe_request_id = Some(RequestId(98));
+
+        conn.handle_timeout(t0);
+        conn.handle_timeout(t0 + WINDOW);
+        assert_eq!(drain_stall_events(&mut conn).len(), 1, "still reported");
+        let (subs, _grants) = drain_outbound(&mut conn, handle);
+        assert!(subs.is_empty(), "the re-subscribe is refused, got {subs:?}");
+        assert_eq!(
+            recovery_attempts(&conn, handle),
+            0,
+            "a refused attempt spends no budget"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and mutates nothing — the refusal path must leave the consumer exactly as it \
+             was, not strictly worse off than the stall it was in"
         );
     }
 }
