@@ -234,7 +234,9 @@ pub struct ConsumerState {
     /// current stall streak (issue #414, ADR-0103). Compared against
     /// [`crate::ConnectionConfig::consumer_stall_auto_recovery`] in
     /// [`crate::Connection::handle_timeout`], and bumped only when a re-subscribe was
-    /// actually emitted — a consumer the eligibility gate refuses spends no budget.
+    /// actually emitted — a consumer the eligibility gate refuses spends no budget, and
+    /// neither does one the standby pre-check skips ([`Self::is_active`] reported
+    /// `Some(false)`, ADR-0103).
     ///
     /// Reset to zero in exactly ONE place: [`Self::record_dispatch_unit`], i.e. a broker
     /// dispatch unit genuinely arriving. Resetting it at the churn boundaries that zero

@@ -4324,11 +4324,40 @@ impl Connection {
             // shape: one fresh receiver-queue grant per attempt against an aggregate
             // observed at `-177300`) from turning into an unbounded re-subscribe loop.
             if let Some(max_attempts) = self.config.consumer_stall_auto_recovery {
-                let attempts = self
-                    .consumers
-                    .get(&handle)
-                    .map_or(0, |slot| slot.state.lock().stall_recovery_attempts);
-                if attempts < max_attempts {
+                let (attempts, is_active) = self.consumers.get(&handle).map_or((0, None), |slot| {
+                    let consumer = slot.state.lock();
+                    (consumer.stall_recovery_attempts, consumer.is_active)
+                });
+                // Failover standby (issue #348's `is_active`): the broker is CORRECT not to
+                // dispatch here, so there is nothing to recover and a re-subscribe would be
+                // pure noise against a healthy consumer. A standby satisfies the stall
+                // predicate exactly as a wedged consumer does — it holds its initial grant
+                // over an empty queue, in a dispatch-eligible state, forever — and it never
+                // receives a dispatch unit, which is the only thing that resets the budget.
+                // Left unguarded, an armed recovery therefore spends its ENTIRE budget on
+                // every standby in a failover group and never gets it back.
+                //
+                // Checked before the exhausted arm on purpose: a consumer that spent its
+                // budget while active and was then demoted gets this skip rather than the
+                // `topics unload` escalation, which would be misleading operator guidance
+                // about a consumer whose silence the broker is producing deliberately.
+                //
+                // `None` — the broker never announced, i.e. every `Shared` / `Exclusive`
+                // subscription and a `Failover` one before its first
+                // `CommandActiveConsumerChange` — and `Some(true)` both fall through to the
+                // normal path. Only a *reported* standby is skipped.
+                if is_active == Some(false) {
+                    tracing::debug!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        permit_balance,
+                        attempts,
+                        max_attempts,
+                        "stall watchdog skipped automatic recovery for a Failover standby; \
+                         the broker is not dispatching to it by design, so no attempt is \
+                         made and no budget is spent (#414)"
+                    );
+                } else if attempts < max_attempts {
                     // The budget is spent only on an attempt that actually went out.
                     // `resubscribe_consumer_in_place` returns `None` — mutating nothing —
                     // for a consumer whose next `CommandSubscribe` has another owner
@@ -7782,6 +7811,14 @@ impl Connection {
     /// next `CommandSubscribe`), or already re-attaching. Nothing is mutated on the
     /// `None` path — in particular the permit mirrors are NOT zeroed, which would leave a
     /// consumer we declined to re-subscribe strictly worse off than before the call.
+    ///
+    /// A **Failover standby is deliberately NOT in that set**. This method re-attaches on
+    /// demand, and both of its explicit callers legitimately want a standby re-attached: an
+    /// application calling `Consumer::resubscribe()` is asking for exactly that, and issue
+    /// #307's same-broker `CommandCloseConsumer` arm must re-attach a broker-closed standby
+    /// or it never rejoins the failover group. Only [`Self::handle_timeout`]'s automatic
+    /// recovery skips standbys, in its own pre-check, because there the silence it would be
+    /// reacting to is the broker behaving correctly (ADR-0103).
     ///
     /// The receiver queue is left intact: already-dispatched messages stay user-visible.
     ///
@@ -17099,6 +17136,85 @@ mod consumer_stall_and_recovery_tests {
             let (subs, _) = drain_outbound(&mut conn, handle);
             assert!(subs.is_empty(), "no recovery traffic resumes on its own");
         }
+    }
+
+    #[test]
+    fn auto_recovery_skips_a_reported_failover_standby_and_spends_no_budget() {
+        // A `Failover` standby is the one shape that satisfies the stall predicate
+        // PERMANENTLY and legitimately: it holds the initial grant the broker acked at
+        // subscribe time over an empty queue, in a dispatch-eligible state, and the broker
+        // correctly never dispatches to it because the active consumer owns the
+        // subscription. It also never receives the one thing that resets the budget — a
+        // dispatch unit — so an unguarded recovery spends its whole budget on every
+        // healthy standby in a failover group, once per window, and never gets it back.
+        const MAX_ATTEMPTS: u32 = 2;
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            shared_consumer_with_recovery(Some(WINDOW), Some(MAX_ATTEMPTS), t0);
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .record_active_change(false);
+
+        // Four episodes' worth of ticks: every one is reported, none spends a thing.
+        conn.handle_timeout(t0);
+        for episode in 1..=4u64 {
+            conn.handle_timeout(t0 + WINDOW * u32::try_from(episode).expect("fits"));
+            let (subs, grants) = drain_outbound(&mut conn, handle);
+            assert!(
+                subs.is_empty() && grants.is_empty(),
+                "episode {episode}: a standby must produce no recovery traffic at all, \
+                 got subs={subs:?} grants={grants:?}"
+            );
+            assert_eq!(
+                recovery_attempts(&conn, handle),
+                0,
+                "episode {episode}: a skipped standby must spend no budget"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                RQ as u32,
+                "episode {episode}: and must not be mutated"
+            );
+        }
+        // The report itself is untouched — ADR-0101's event means SILENCE, not fault, and
+        // a standby is genuinely silent. Exactly one episode closed (the latch holds after
+        // the first, since nothing re-arms the window).
+        assert_eq!(
+            drain_stall_events(&mut conn).len(),
+            1,
+            "the standby is still reported; only the recovery is skipped"
+        );
+
+        // Promotion needs no repair, because the skip spent nothing: the full budget is
+        // still there for a genuine wedge after the broker hands this consumer the
+        // subscription.
+        conn.consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .record_active_change(true);
+        // Lose and regain candidacy so a fresh episode can open — promotion alone does
+        // not restart the window (ADR-0102 makes `initial_flow` a no-op for a consumer
+        // that already holds its grant, so nothing re-arms the stall watch).
+        conn.set_paused(handle, true);
+        let promoted = t0 + WINDOW * 5;
+        conn.handle_timeout(promoted);
+        conn.set_paused(handle, false);
+        conn.handle_timeout(promoted);
+        let expected_rid = conn.peek_next_request_id_for_test();
+        conn.handle_timeout(promoted + WINDOW);
+        let (subs, _grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            subs,
+            vec![expected_rid],
+            "a promoted consumer recovers normally, on a budget the standby episodes \
+             never touched"
+        );
+        assert_eq!(recovery_attempts(&conn, handle), 1);
     }
 
     #[test]
