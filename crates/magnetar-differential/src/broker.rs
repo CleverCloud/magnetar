@@ -372,6 +372,11 @@ struct SessionDeps {
     /// producer id, and lets the creation complete anyway (issue #406's CI
     /// reproduction). Only a successor re-attach reclaims the name.
     withhold_registration_survives_close: Arc<Mutex<bool>>,
+    /// When `true`, every `CommandSubscribe` is answered with `CommandSuccess`
+    /// AND, immediately behind it in the same write,
+    /// `CommandActiveConsumerChange { is_active: true }` — what a real broker
+    /// does for an `Exclusive` / `Failover` subscription (issue #427).
+    announce_active_consumer: Arc<Mutex<bool>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -465,6 +470,12 @@ pub struct ScriptedBroker {
     /// Companion to [`Self::withhold_producer_success_for_name`]: when `true`
     /// the withheld open's registration OUTLIVES its close (issue #406).
     withhold_registration_survives_close: Arc<Mutex<bool>>,
+    /// When `true`, every `CommandSubscribe` is answered with `CommandSuccess`
+    /// AND `CommandActiveConsumerChange { is_active: true }` right behind it —
+    /// a real broker's `Exclusive` / `Failover` announcement. Armed by
+    /// [`Self::announce_active_consumer_on_subscribe`] for the issue #427
+    /// initial-grant scenario.
+    announce_active_consumer: Arc<Mutex<bool>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -516,6 +527,8 @@ impl ScriptedBroker {
         let withhold_registration_survives_close = Arc::new(Mutex::new(false));
         let withhold_registration_survives_close_clone =
             withhold_registration_survives_close.clone();
+        let announce_active_consumer = Arc::new(Mutex::new(false));
+        let announce_active_consumer_clone = announce_active_consumer.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -531,6 +544,7 @@ impl ScriptedBroker {
             transient_reject_fired: transient_reject_fired_clone,
             withhold_producer_success_for_name: withhold_producer_success_for_name_clone,
             withhold_registration_survives_close: withhold_registration_survives_close_clone,
+            announce_active_consumer: announce_active_consumer_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -565,8 +579,25 @@ impl ScriptedBroker {
             transient_reject_fired,
             withhold_producer_success_for_name,
             withhold_registration_survives_close,
+            announce_active_consumer,
             cross_session,
         })
+    }
+
+    /// Arm the active-consumer announcement: every `CommandSubscribe` is answered with
+    /// `CommandSuccess` and, immediately behind it in the same write,
+    /// `CommandActiveConsumerChange { is_active: true }`.
+    ///
+    /// That is what a real broker does for an `Exclusive` / `Failover` subscription, and
+    /// what makes issue #427 observable: both frames reach the client in one read, so the
+    /// sans-io issue #307 promotion re-arm runs inside `handle_bytes` while the engine's
+    /// own post-ack `initial_flow` is still parked on the resolving subscribe future. Both
+    /// used to grant, and [`Self::flow_grant_log_snapshot`] recorded `2 ×
+    /// receiver_queue_size` for one attach.
+    ///
+    /// Off by default, which is the shape every other differential trace relies on.
+    pub fn announce_active_consumer_on_subscribe(&self) {
+        *self.announce_active_consumer.lock() = true;
     }
 
     /// Arm the corrupted-frame injection: every subsequent session writes
@@ -1258,6 +1289,15 @@ fn handle_frame(
                     }
                 }
                 emit_success(out, s.request_id);
+                // Issue #427: a real broker follows the subscribe `Success` with
+                // `CommandActiveConsumerChange { is_active: true }` for an
+                // `Exclusive` / `Failover` subscription, in the same write. Both frames
+                // then reach the client in one read, which is what races the sans-io
+                // issue #307 promotion re-arm against the engine's own post-ack
+                // `initial_flow`.
+                if *deps.announce_active_consumer.lock() {
+                    emit_active_consumer_change(out, s.consumer_id, true);
+                }
             }
         }
         pb::base_command::Type::Flow => {
@@ -2202,6 +2242,21 @@ fn emit_lookup_response(out: &mut BytesMut, request_id: u64) {
             error: None,
             message: None,
             proxy_through_service_url: Some(false),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Emit `CommandActiveConsumerChange` for `consumer_id` — the broker's
+/// active/standby election report for an `Exclusive` / `Failover` subscription
+/// (issue #427).
+fn emit_active_consumer_change(out: &mut BytesMut, consumer_id: u64, is_active: bool) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+        active_consumer_change: Some(pb::CommandActiveConsumerChange {
+            consumer_id,
+            is_active: Some(is_active),
         }),
         ..Default::default()
     };

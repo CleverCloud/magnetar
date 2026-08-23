@@ -111,10 +111,11 @@ struct BrokerStats {
 /// client stops sending `CommandFlow`, the broker goes quiet and the consumer
 /// wedges.
 ///
-/// `announce_active` is off only for the issue #426 grant-count regression: the
-/// issue #307 promotion re-arm (`Connection`'s `ActiveConsumerChange` arm) is a
-/// second, independent grant site, and counting permits with it in play would
-/// measure two bugs at once.
+/// `announce_active` is off in the issue #426 grant-count regression and on in the issue
+/// #427 one. The issue #307 promotion re-arm (`Connection`'s `ActiveConsumerChange` arm) is
+/// a second, independent grant site, so counting permits with it in play would have
+/// measured two bugs at once while #426 was still open; with #426 fixed, turning it on is
+/// exactly how #427's own double grant becomes visible.
 async fn serve_failover_flow_strict_broker(
     mut stream: TcpStream,
     backlog: u64,
@@ -518,6 +519,78 @@ async fn subscribe_grants_initial_permits_exactly_once() {
         RECEIVER_QUEUE_SIZE as u64,
         "a fresh subscribe must grant the receiver-queue size EXACTLY once (issue #426); \
          the broker observed {} permit(s) against a configured {RECEIVER_QUEUE_SIZE}",
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        u64::from(consumer.available_permits()),
+        RECEIVER_QUEUE_SIZE as u64,
+        "the client-side balance must equal what the broker was actually granted",
+    );
+
+    client.close().await;
+    broker.abort();
+}
+
+/// REGRESSION (issue #427 — the active announcement does not add a second grant).
+///
+/// A real broker answers an `Exclusive` / `Failover` subscribe with `CommandSuccess` and
+/// then `CommandActiveConsumerChange { is_active: true }` right behind it — which is what
+/// `announce_active` turns on here, and what the issue #426 test above deliberately left
+/// off to isolate one bug at a time.
+///
+/// Both frames arrive in one read, so the sans-io layer's issue #307 promotion re-arm runs
+/// inside `handle_bytes` while this task is still parked on `subscribe()`; `granted_permits`
+/// is legitimately `0` at that instant, so its gate passes. The engine then issued its own
+/// post-ack `initial_flow` on top, and the broker held `2 × receiver_queue_size` for a fresh
+/// consumer — measured 32 against a configured 16 — while `available_permits()` reported
+/// `1 ×`.
+///
+/// The broker holds an EMPTY backlog, so it never spends a permit and its running total is
+/// exactly what the client granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_active_announcement_does_not_double_the_initial_grant() {
+    let stats = Arc::new(BrokerStats::default());
+    let broker_stats = stats.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
+    let port = listener.local_addr().expect("local_addr").port();
+    let broker = tokio::spawn(async move {
+        if let Ok((stream, _peer)) = listener.accept().await {
+            serve_failover_flow_strict_broker(stream, 0, false, true, broker_stats).await;
+        }
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("client connect");
+    let client = Client::from_socket(stream, long_keepalive_config())
+        .await
+        .expect("handshake");
+
+    let consumer = tokio::time::timeout(
+        RECV_GUARD,
+        client.subscribe(magnetar_proto::SubscribeRequest {
+            topic: "persistent://public/default/active-change-grant-once".to_owned(),
+            subscription: "active-change-grant-once-sub".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: RECEIVER_QUEUE_SIZE,
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe ok");
+
+    wait_for_first_grant(&stats).await;
+    tokio::time::sleep(GRANT_SETTLE).await;
+
+    assert_eq!(
+        stats.flow_permits_granted.load(Ordering::SeqCst),
+        RECEIVER_QUEUE_SIZE as u64,
+        "a Failover subscribe whose ack is followed by ActiveConsumerChange{{active}} must \
+         still grant the receiver-queue size EXACTLY once (issue #427); the broker observed \
+         {} permit(s) against a configured {RECEIVER_QUEUE_SIZE}",
         stats.flow_permits_granted.load(Ordering::SeqCst),
     );
     assert_eq!(
