@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
-use magnetar::{OutgoingMessage, PulsarClient};
+use magnetar::{MessageRoutingMode, OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -270,6 +270,208 @@ async fn e2e_dlq_explicit_ack_terminates() -> Result<(), Box<dyn std::error::Err
     );
 
     consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn e2e_partitioned_consumer_aggregate_republishes_every_child_dead_letter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, admin_url, _container) = start_pulsar().await?;
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-partitioned-dlq-{id}");
+    let dlq_topic = format!("{topic}-DLQ");
+    let subscription = format!("magnetar-partitioned-dlq-{id}");
+
+    let admin = magnetar_admin::AdminClient::builder()
+        .service_url(admin_url.parse()?)
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    admin.topic_create_partitioned(&topic, 2).await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let producer = client
+        .partitioned_producer(&topic)
+        .routing(MessageRoutingMode::RoundRobin)
+        .create()
+        .await?;
+    let expected = [
+        (
+            "poison-0",
+            "key-0",
+            b"order-0".as_slice(),
+            1_700_000_001_000,
+            "value-0",
+        ),
+        (
+            "poison-1",
+            "key-1",
+            b"order-1".as_slice(),
+            1_700_000_001_001,
+            "value-1",
+        ),
+    ];
+    for (payload, key, ordering_key, event_time, property) in expected {
+        producer
+            .send(
+                OutgoingMessage::with_payload(payload.as_bytes().to_vec())
+                    .key(key)
+                    .ordering_key(ordering_key.to_vec())
+                    .event_time_ms(event_time)
+                    .property("custom", property),
+            )
+            .await?;
+    }
+    producer.close().await?;
+
+    let consumer = client
+        .partitioned_consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
+        .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .subscribe()
+        .await?;
+
+    let mut source_correlation = std::collections::BTreeMap::new();
+    for delivery_round in 0..2 {
+        for index in 0..expected.len() {
+            let received = tokio::time::timeout(Duration::from_secs(15), consumer.receive())
+                .await
+                .map_err(|_| {
+                    format!("timed out receiving poison message {index} in round {delivery_round}")
+                })??;
+            let payload = String::from_utf8(received.message.payload.to_vec())?;
+            if delivery_round == 0 {
+                source_correlation.insert(
+                    payload,
+                    (
+                        received.topic.clone(),
+                        received.message.message_id.to_string(),
+                    ),
+                );
+            }
+        }
+        consumer.redeliver_unacked();
+    }
+    let source_topics: std::collections::BTreeSet<_> = source_correlation
+        .values()
+        .map(|(source_topic, _)| source_topic.as_str())
+        .collect();
+    assert_eq!(
+        source_topics.len(),
+        2,
+        "round-robin poison messages must exercise both real partition children"
+    );
+
+    let dlq_producer = client.producer(&dlq_topic).create().await?;
+    let classified = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let classified = consumer.aggregate_stats().total_msgs_dead_lettered;
+            if classified >= expected.len() as u64 {
+                break classified;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "timed out waiting for both partition children to classify dead letters")?;
+    assert_eq!(
+        classified,
+        expected.len() as u64,
+        "partition children classified an unexpected number of source originals"
+    );
+    assert_eq!(
+        consumer.republish_dead_letters(&dlq_producer).await?,
+        expected.len(),
+        "one aggregate drain must republish every partition child's dead letter"
+    );
+    assert_eq!(
+        consumer.republish_dead_letters(&dlq_producer).await?,
+        0,
+        "a second aggregate drain must be empty"
+    );
+
+    let dlq_consumer = client
+        .consumer(&dlq_topic)
+        .subscription(format!("magnetar-partitioned-dlq-tail-{id}"))
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let mut replacements = std::collections::BTreeMap::new();
+    for index in 0..expected.len() {
+        let message = tokio::time::timeout(Duration::from_secs(15), dlq_consumer.receive())
+            .await
+            .map_err(|_| format!("timed out receiving DLQ replacement {index}"))??;
+        let payload = String::from_utf8(message.payload.to_vec())?;
+        let property = |key: &str| {
+            message
+                .metadata
+                .properties
+                .iter()
+                .find(|property| property.key == key)
+                .map(|property| property.value.clone())
+        };
+        assert!(
+            replacements
+                .insert(
+                    payload,
+                    (
+                        message.metadata.partition_key.clone(),
+                        message.metadata.ordering_key.clone(),
+                        message.metadata.event_time,
+                        property("custom"),
+                        property("REAL_TOPIC"),
+                        property("ORIGINAL_MESSAGE_ID"),
+                    ),
+                )
+                .is_none(),
+            "duplicate DLQ replacement payload"
+        );
+        dlq_consumer.ack(message.message_id).await?;
+    }
+    let extra_replacement =
+        tokio::time::timeout(Duration::from_secs(2), dlq_consumer.receive()).await;
+    assert!(
+        extra_replacement.is_err(),
+        "unexpected additional DLQ replacement: {extra_replacement:?}"
+    );
+    for (payload, key, ordering_key, event_time, custom) in expected {
+        let replacement = replacements
+            .get(payload)
+            .ok_or_else(|| format!("missing DLQ replacement for {payload}"))?;
+        assert_eq!(replacement.0.as_deref(), Some(key));
+        assert_eq!(replacement.1.as_deref(), Some(ordering_key));
+        assert_eq!(replacement.2, Some(event_time));
+        assert_eq!(replacement.3.as_deref(), Some(custom));
+        let (source_topic, source_message_id) = source_correlation
+            .get(payload)
+            .ok_or_else(|| format!("missing source correlation for {payload}"))?;
+        assert_eq!(replacement.4.as_deref(), Some(source_topic.as_str()));
+        assert_eq!(replacement.5.as_deref(), Some(source_message_id.as_str()));
+    }
+
+    dlq_consumer.close().await?;
+    dlq_producer.close().await?;
+    consumer.close().await?;
+    let resumed = client
+        .partitioned_consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let redelivery = tokio::time::timeout(Duration::from_secs(2), resumed.receive()).await;
+    assert!(
+        redelivery.is_err(),
+        "source originals reappeared after replacement publication and aggregate ACK: {redelivery:?}"
+    );
+    resumed.close().await?;
     client.close().await;
     Ok(())
 }

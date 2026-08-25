@@ -4,10 +4,8 @@
 //!
 //! The binary speaks two kinds of subcommands:
 //!
-//! - `produce` / `consume`: data-plane operations. They are stubs in M9 (they print `not yet wired`
-//!   and exit 0). They get wired to the runtime once M2's
-//!   [`Connection`](magnetar::proto::Connection) state machine and M3's tokio engine are integrated
-//!   into the [`magnetar`] façade.
+//! - `produce` / `consume`: data-plane operations wired through the [`magnetar`] façade and its
+//!   production tokio runtime.
 //! - `admin ...`: control-plane operations. Fully wired against [`magnetar_admin::AdminClient`].
 //!   Output is JSON to stdout; errors go to stderr with a non-zero exit code.
 

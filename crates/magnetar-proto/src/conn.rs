@@ -7916,6 +7916,96 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn two_consumer_dead_letters_drain_independently_with_preserved_projection() {
+        let now = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let mut handles = Vec::new();
+        for partition in 0..2 {
+            handles.push(conn.subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/aggregate-dlq-partition-{partition}"),
+                subscription: "aggregate-dlq".to_owned(),
+                max_redeliver_count: 1,
+                ..Default::default()
+            }));
+        }
+
+        for (handle, ledger, entries) in [(handles[0], 11, 1), (handles[1], 22, 2)] {
+            for entry in 0..entries {
+                let command = pb::CommandMessage {
+                    consumer_id: handle.0,
+                    message_id: pb::MessageIdData {
+                        ledger_id: ledger,
+                        entry_id: entry,
+                        partition: Some(i32::from(ledger != 11)),
+                        ..Default::default()
+                    },
+                    redelivery_count: Some(2),
+                    ..Default::default()
+                };
+                let metadata = pb::MessageMetadata {
+                    producer_name: "aggregate-dlq-producer".to_owned(),
+                    sequence_id: entry,
+                    publish_time: 1_700_000_000_000,
+                    partition_key: Some(format!("key-{ledger}-{entry}")),
+                    ordering_key: Some(bytes::Bytes::from(format!("order-{ledger}-{entry}"))),
+                    event_time: Some(1_700_000_001_000 + entry),
+                    properties: vec![pb::KeyValue {
+                        key: "custom".to_owned(),
+                        value: format!("value-{ledger}-{entry}"),
+                    }],
+                    ..Default::default()
+                };
+                conn.consumer(handle)
+                    .expect("consumer slot")
+                    .state
+                    .lock()
+                    .deliver(
+                        &command,
+                        metadata,
+                        None,
+                        bytes::Bytes::from(format!("poison-{ledger}-{entry}")),
+                        now,
+                    )
+                    .expect("route poison message");
+            }
+        }
+
+        let first = conn.drain_dead_letter(handles[0]);
+        let second = conn.drain_dead_letter(handles[1]);
+        assert_eq!(first.len() + second.len(), 3);
+        assert_eq!(first.len(), 1, "first child owns only its dead letter");
+        assert_eq!(second.len(), 2, "second child state is independent");
+        let projection: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|message| {
+                (
+                    message.payload.clone(),
+                    message.message_id,
+                    message.metadata.partition_key.clone(),
+                    message.metadata.ordering_key.clone(),
+                    message.metadata.event_time,
+                    message.metadata.properties.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(projection[0].0.as_ref(), b"poison-11-0");
+        assert_eq!(
+            (projection[0].1.ledger_id, projection[0].1.entry_id),
+            (11, 0)
+        );
+        assert_eq!(projection[0].2.as_deref(), Some("key-11-0"));
+        assert_eq!(projection[0].3.as_deref(), Some(b"order-11-0".as_slice()));
+        assert_eq!(projection[0].4, Some(1_700_000_001_000));
+        assert_eq!(projection[0].5[0].value, "value-11-0");
+        assert!(conn.drain_dead_letter(handles[0]).is_empty());
+        assert!(conn.drain_dead_letter(handles[1]).is_empty());
+    }
+
+    #[test]
     fn handle_bytes_owned_swaps_empty_inbound_with_zero_copy() {
         // ADR-0040 wave 3: when the proto's inbound buffer is empty,
         // `handle_bytes_owned` must take ownership of the caller's
@@ -16779,7 +16869,7 @@ mod consumer_stall_and_recovery_tests {
         let keepalive_deadline = t0 + ConnectionConfig::default().keepalive_interval;
         assert_eq!(conn.poll_timeout(), Some(keepalive_deadline));
         conn.handle_timeout(t0);
-        conn.handle_timeout(t0 + Duration::from_secs(600));
+        conn.handle_timeout(t0 + Duration::from_mins(10));
         assert!(
             drain_stall_events(&mut conn).is_empty(),
             "the watchdog ships disarmed; ten minutes of silence must stay silent"

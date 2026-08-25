@@ -1216,6 +1216,11 @@ The removal is symmetric with the positive-ack path, which already drops acked i
 ```
 
 `Consumer::reconsume_later` is the retry-letter variant: republish to the retry topic with delay + properties, then ack the original.
+Each `MultiTopicsConsumer::republish_dead_letters` call independently snapshots its child consumers and applies the existing engine-generic `ConsumerApi::republish_dead_letters` operation; the `PartitionedConsumer` alias inherits the same behavior.
+One producer destination is shared across every child, each underlying operation confirms replacement publication before ACK, and successful counts are combined with saturating addition.
+Children run sequentially in deterministic vector/topic order, cancellation prevents future children from starting, and the first child error returns immediately with that topic in the context.
+Completed children remain completed: neither cancellation nor a later error rolls back their publications and acknowledgements.
+Concurrent aggregate calls are not serialized and race the runtimes' existing per-child destructive drains, so their counts and outcomes follow those drains; the coordinator adds no cross-call deduplication guarantee.
 
 ---
 
@@ -1238,6 +1243,11 @@ The receive race is _not_ a channel — it is a `futures_util::future::select_al
 ```
 
 Per-topic ack / nack / seek dispatch via the topic name attached to the incoming message.
+Aggregate DLQ republish is the deliberate exception to per-topic routing: the caller supplies one producer destination shared by all children.
+The coordinator clones the `Arc<Vec<NamedConsumer<C>>>` membership snapshot under the collection mutex and releases the guard before awaiting, so the traversed list and order are fixed and no collection lock spans child I/O.
+Children added later do not enter that snapshot; removing a snapshotted child does not remove it from the list, but `remove_topic` may close the shared child handle and affect that child's operation.
+It traverses that snapshot sequentially in its deterministic vector/topic order, saturating-sums successful child counts, and stops immediately on the first contextualized child error.
+Cancellation likewise stops future traversal while preserving completed children; successful publication-and-ACK work is never rolled back.
 
 ### Dynamic membership
 
