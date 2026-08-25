@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-25
+
+### Added
+
+- **`MultiTopicsConsumer::republish_dead_letters(&C::Producer)`**, inherited by the `PartitionedConsumer` alias — aggregate every child consumer's buffered dead letters into one shared producer destination and return the saturating sum of successful republishes.
+  Membership is snapshotted at call start without holding the collection lock across an await, and children run sequentially in deterministic vector/topic order.
+  The first child error stops traversal immediately and names that topic; cancellation likewise prevents future child work, while prior successful children remain published and acknowledged without rollback.
+  Each child delegates to the existing engine-generic `ConsumerApi::republish_dead_letters`, which confirms replacement publication before ACK, so the aggregate introduces no duplicate runtime logic.
+
 ## [1.6.0] - 2026-08-23
 
 ### Added
@@ -600,6 +609,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.0
 [1.6.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.6.0
 [1.5.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.5.0
 [1.4.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.4.1

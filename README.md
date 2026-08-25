@@ -4,9 +4,9 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.91-orange.svg)](specs/adr/0079-raise-msrv-to-rust-1-91.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (1.6.0).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
+> **Status: stable (1.7.0).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
-> PIP-460 scalable topics and the CLI `produce`/`consume` subcommands remain experimental / not-yet-implemented and are excluded from the 1.0 stability promise.
+> PIP-460 scalable topics remain experimental and are excluded from the 1.0 stability promise.
 
 ---
 
@@ -56,13 +56,13 @@ The goal is feature-complete parity with the Apache Pulsar Java client.
 - **Trackers**: ack grouping, unacked-message tracker (ack timeout + redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff` (PIP-37), batch-index ACK set (PIP-54) with conservative post-reset reconstruction.
 - **Interceptors**: `ProducerInterceptor` + `ConsumerInterceptor` SPIs.
 - **Admin REST client**: a `reqwest`-backed admin client lives in `magnetar-admin`.
-- **CLI**: `magnetarctl` binary in the `magnetarctl` crate covers admin lookups and stats today; data-plane subcommands (produce / consume / inspect) are in progress.
+- **CLI**: the `magnetarctl` binary in the `magnetarctl` crate provides data-plane `produce` / `consume` commands and the admin lookup, policy, and stats surface.
 
 ---
 
 ## Installation
 
-Magnetar's current release is `1.6.0`.
+Magnetar's current release is `1.7.0`.
 The façade is published to crates.io under the package name `magnetar-driver` (the `magnetar` name is held by an unrelated crate); its library / import name stays `magnetar`, so `use magnetar::...` is unchanged.
 
 Depend on it directly from crates.io:
@@ -70,14 +70,14 @@ Depend on it directly from crates.io:
 ```toml
 [dependencies]
 # crates.io package is `magnetar-driver`; the import path stays `magnetar`.
-magnetar-driver = "1.6.0"
+magnetar-driver = "1.7.0"
 ```
 
 Or pin the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.6.0" }
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.7.0" }
 ```
 
 The default feature set enables the tokio engine.
@@ -171,14 +171,14 @@ The `magnetarctl` binary exposes a sozu / systemd-style identification banner:
 
 ```
 $ magnetarctl --version
-magnetarctl 1.6.0 (a1b2c3d4e5f6)
+magnetarctl 1.7.0 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
-- `-V` prints a single-line, never-colorized form: `magnetarctl 1.6.0 (sha)`.
+- `-V` prints a single-line, never-colorized form: `magnetarctl 1.7.0 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for reproducible builds.
@@ -309,11 +309,18 @@ p.new_message().key("user-42").value(b"event".as_slice()).send().await?;
 let c = client
     .partitioned_consumer("persistent://public/default/events")
     .subscription("workers")
+    .dead_letter_policy(3, None)
     .subscribe()
     .await?;
 
-let msg = c.receive().await?;
-c.ack(msg.topic(), msg.message_id).await?;
+let dlq = client
+    .producer("persistent://public/default/events-DLQ")
+    .create()
+    .await?;
+
+// After prior failed deliveries have populated the children's dead-letter buffers:
+let republished = c.republish_dead_letters(&dlq).await?;
+println!("republished {republished} dead letters across all partitions");
 # Ok(()) }
 ```
 
@@ -526,7 +533,7 @@ A cross (`❌`) is a known-missing feature.
 | `startMessageRollbackDuration`                                        | ✅   | ✅       | `ConsumerBuilder::start_message_rollback_duration`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `readCompacted`                                                       | ✅   | ✅       | `ConsumerBuilder::read_compacted`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `forceTopicCreation`                                                  | ✅   | ✅       | `ConsumerBuilder::force_topic_creation`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Dead-letter policy                                                    | ✅   | ✅       | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter`. PIP-22/58/124/409.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Dead-letter policy                                                    | ✅   | ✅       | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter` / `republish_dead_letters`. Each `MultiTopicsConsumer::republish_dead_letters` call and its `PartitionedConsumer` alias independently snapshot their children, then aggregate them sequentially into one shared producer destination, stopping on the first child error without rolling back completed children. Concurrent calls are not serialized; per-child results follow the runtime's destructive drain, and the aggregate adds no cross-call deduplication guarantee. PIP-22/58/124/409.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `cryptoFailureAction` (PIP-4)                                         | ✅   | ✅       | `Fail` / `Discard` / `Consume` all wired end-to-end in `magnetar-runtime-tokio::consumer::deliver_post_process`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | Encryption (PIP-4)                                                    | ✅   | ✅       | `ConsumerBuilder::encryption` accepts a `MessageDecryptor`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `ConsumerInterceptor` SPI                                             | ✅   | ✅       | `magnetar::ConsumerInterceptor` + `receive_with_interceptors`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -551,22 +558,24 @@ A cross (`❌`) is a known-missing feature.
 
 ### Partitioned consumer
 
-| Feature                                                     | Java | Magnetar | Notes                                                                                                                                    |
-| ----------------------------------------------------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Auto partition discovery + one consumer per partition       | ✅   | ✅       | `PulsarClient::partitioned_consumer`.                                                                                                    |
-| Full `ConsumerBuilder` knob forwarding                      | ✅   | ✅       | 12 knobs forwarded from builder.                                                                                                         |
-| Receive / ack / nack / seek / unsubscribe across partitions | ✅   | ✅       | All forwarded.                                                                                                                           |
-| Auto-update partition count                                 | ✅   | ✅       | `PartitionedConsumerBuilder::auto_update_partitions_interval` mirrors the producer pattern; signal drives `refresh_partitions(&client)`. |
+| Feature                                                     | Java | Magnetar | Notes                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------- | ---- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auto partition discovery + one consumer per partition       | ✅   | ✅       | `PulsarClient::partitioned_consumer`.                                                                                                                                                                                                              |
+| Full `ConsumerBuilder` knob forwarding                      | ✅   | ✅       | 12 knobs forwarded from builder.                                                                                                                                                                                                                   |
+| Receive / ack / nack / seek / unsubscribe across partitions | ✅   | ✅       | All forwarded.                                                                                                                                                                                                                                     |
+| Aggregate DLQ republish across partitions                   | ❌   | ✅       | `PartitionedConsumer::republish_dead_letters` independently snapshots the partition children, uses one producer destination, and returns their saturating count. Concurrent calls are not serialized and add no aggregate deduplication guarantee. |
+| Auto-update partition count                                 | ✅   | ✅       | `PartitionedConsumerBuilder::auto_update_partitions_interval` mirrors the producer pattern; signal drives `refresh_partitions(&client)`.                                                                                                           |
 
 ### Multi-topics consumer
 
-| Feature                                               | Java | Magnetar | Notes                                                                                                                                                                                                                  |
-| ----------------------------------------------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Subscribe to N explicit topics under one subscription | ✅   | ✅       | `MultiTopicsConsumerBuilder::topics`.                                                                                                                                                                                  |
-| Receive / ack / nack / seek across all topics         | ✅   | ✅       | Per-topic forwarding.                                                                                                                                                                                                  |
-| `negativeAckWithDelay` / `ackCumulative`              | ✅   | ✅       | Forwarded.                                                                                                                                                                                                             |
-| Dynamic `add_topic` / `remove_topic`                  | ✅   | ✅       | `MultiTopicsConsumer::add_topic` / `remove_topic` — subscribe / unsubscribe at runtime.                                                                                                                                |
-| Auto-update partition count (background ticker)       | ✅   | ✅       | `MultiTopicsConsumerBuilder::auto_update_partitions_interval` spawns a `tokio::time::interval` that signals `partitions_changed_notify`; user drives `refresh_partitions(&client)` + `add_topic(...)` from the signal. |
+| Feature                                               | Java | Magnetar | Notes                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------------------------------- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Subscribe to N explicit topics under one subscription | ✅   | ✅       | `MultiTopicsConsumerBuilder::topics`.                                                                                                                                                                                                                                                                                                                                                                                    |
+| Receive / ack / nack / seek across all topics         | ✅   | ✅       | Per-topic forwarding.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `negativeAckWithDelay` / `ackCumulative`              | ✅   | ✅       | Forwarded.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Aggregate DLQ republish                               | ❌   | ✅       | Each `MultiTopicsConsumer::republish_dead_letters` call independently snapshots the children, traverses them sequentially in topic order, shares one producer destination, and stops at the first error without rollback. Additions do not enter an existing snapshot, but `remove_topic` may close a snapshotted shared child handle. Concurrent calls are not serialized and add no aggregate deduplication guarantee. |
+| Dynamic `add_topic` / `remove_topic`                  | ✅   | ✅       | `MultiTopicsConsumer::add_topic` / `remove_topic` — subscribe / unsubscribe at runtime.                                                                                                                                                                                                                                                                                                                                  |
+| Auto-update partition count (background ticker)       | ✅   | ✅       | `MultiTopicsConsumerBuilder::auto_update_partitions_interval` spawns a `tokio::time::interval` that signals `partitions_changed_notify`; user drives `refresh_partitions(&client)` + `add_topic(...)` from the signal.                                                                                                                                                                                                   |
 
 ### Pattern consumer (PIP-145)
 

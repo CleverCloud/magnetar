@@ -1,7 +1,7 @@
 # `magnetarctl` CLI
 
-> **Status: stable (1.0.1).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
-> `produce` / `consume` are not yet implemented and are excluded from the 1.0 stability guarantee.
+> **Status: stable (1.7.0).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> Data-plane `produce` / `consume` commands are wired through the production tokio runtime.
 
 `magnetarctl` — the command-line client for Apache Pulsar built on the magnetar workspace.
 This page is the canonical CLI reference; for the full subcommand surface, run `magnetarctl --help` (or `magnetarctl <subcommand> --help`).
@@ -130,7 +130,7 @@ The CLI exposes two forms, modeled on `sozu` and `systemd`:
 - **`-V`** prints a single-line, never-colorized identification banner:
 
   ```
-  magnetarctl 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 1.7.0 (a1b2c3d4e5f6-dirty)
   ```
 
 The parenthesized token is the 12-character git short SHA the binary was built from.
@@ -140,7 +140,7 @@ Outside a git checkout (e.g. released tarballs) the SHA is `unknown` and the dir
 - **`--version`** prints a multi-line build-metadata banner:
 
   ```
-  magnetarctl 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 1.7.0 (a1b2c3d4e5f6-dirty)
   built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
@@ -468,15 +468,15 @@ The `<type>` argument selects which subregistry: `function`, `source`, or `sink`
 | `admin packages metadata-set <type> <tenant>/<ns>/<name> --version V --description D --contact C [--property key=value]…` | `PUT /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}/metadata` |
 | `admin packages delete <type> <tenant>/<ns>/<name> --version V`                                                           | `DELETE /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}`       |
 
-### `produce` / `consume` (M9 stubs)
+### `produce` / `consume`
 
 ```sh
 magnetarctl produce persistent://public/default/x --message hi
 magnetarctl consume persistent://public/default/x --subscription s --count 5
 ```
 
-These print `not yet wired (M9)` and exit 0 today.
-They get implemented once the `Connection` state machine and the tokio engine are integrated into the `magnetar` façade.
+`produce` reads `--message` or stdin, publishes `--count` copies with optional key and properties, waits for each broker receipt, and prints its message id.
+`consume` receives `--count` messages under the requested subscription and subscription type, prints each payload and message id, and acknowledges each message.
 
 ## Output format
 
