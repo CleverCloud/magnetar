@@ -104,6 +104,32 @@ struct NamedConsumer<C: ConsumerApi> {
     consumer: C,
 }
 
+async fn republish_snapshot<T, E, F, Fut, Topic>(
+    members: &Mutex<Arc<Vec<T>>>,
+    topic: Topic,
+    mut republish: F,
+) -> Result<usize, PulsarError>
+where
+    T: Clone,
+    E: std::fmt::Display,
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = Result<usize, E>>,
+    Topic: Fn(&T) -> &str,
+{
+    let snapshot = members.lock().clone();
+    let mut republished = 0usize;
+    for child in snapshot.iter().cloned() {
+        let child_topic = topic(&child).to_owned();
+        let count = republish(child).await.map_err(|error| {
+            PulsarError::Other(format!(
+                "republish_dead_letters for topic {child_topic}: {error}"
+            ))
+        })?;
+        republished = republished.saturating_add(count);
+    }
+    Ok(republished)
+}
+
 /// A message yielded by [`MultiTopicsConsumer::receive`], carrying the topic it came from.
 #[derive(Debug)]
 pub struct MultiTopicsMessage {
@@ -337,6 +363,36 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
             .reconsume_later_with_properties(retry_producer, msg, custom_properties, delay)
             .await
             .map_err(|e| PulsarError::Other(format!("reconsume_later_with_properties: {e}")))
+    }
+
+    /// Republish every child consumer's buffered dead letters through one shared
+    /// `dlq_producer` destination and return the saturating sum of republished messages.
+    ///
+    /// Each call snapshots membership independently when it starts. Children added later do
+    /// not enter that snapshot; removing a snapshotted child does not remove it from the
+    /// traversal, but [`Self::remove_topic`] may close the shared child handle and thereby
+    /// affect that child's operation. The collection lock is released before the first
+    /// `.await`, and children are processed sequentially in the snapshot's deterministic
+    /// vector/topic order. Each child delegates to
+    /// [`ConsumerApi::republish_dead_letters`], whose underlying operation confirms each
+    /// replacement publication before acknowledging the original message.
+    ///
+    /// Cancellation stops future child work and preserves children already completed.
+    /// Likewise, the first child error stops the operation immediately; prior successful
+    /// children are not rolled back. Concurrent calls are not serialized and race the
+    /// per-child runtime operations. Per-child counts and outcomes therefore follow the
+    /// runtime's existing destructive-drain behavior; this aggregate coordinator adds no
+    /// deduplication guarantee across calls. An empty snapshot returns `Ok(0)`.
+    pub async fn republish_dead_letters(
+        &self,
+        dlq_producer: &C::Producer,
+    ) -> Result<usize, PulsarError> {
+        republish_snapshot(
+            &self.inner.consumers,
+            |child| child.topic.as_str(),
+            |child| async move { child.consumer.republish_dead_letters(dlq_producer).await },
+        )
+        .await
     }
 
     /// Tell the broker to redeliver every unacked message across every child consumer.
@@ -1375,8 +1431,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use magnetar_proto::MessageId;
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::SeekTarget;
@@ -1450,6 +1508,285 @@ mod tests {
             clone.subscription_properties,
             vec![("sk".to_owned(), "sv".to_owned())]
         );
+    }
+
+    #[derive(Clone)]
+    struct TestRepublish {
+        topic: &'static str,
+        count: usize,
+    }
+
+    #[tokio::test]
+    async fn republish_stops_at_first_error_with_partial_progress_and_topic_context() {
+        let members = Mutex::new(Arc::new(vec![
+            TestRepublish {
+                topic: "orders-0",
+                count: 3,
+            },
+            TestRepublish {
+                topic: "orders-1",
+                count: 5,
+            },
+            TestRepublish {
+                topic: "orders-2",
+                count: 7,
+            },
+        ]));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+
+        let error = republish_snapshot(
+            &members,
+            |child| child.topic,
+            |child| {
+                let started = started.clone();
+                let completed = completed.clone();
+                async move {
+                    started.lock().push(child.topic);
+                    if child.topic == "orders-1" {
+                        return Err("broker rejected publish");
+                    }
+                    completed.lock().push((child.topic, child.count));
+                    Ok(child.count)
+                }
+            },
+        )
+        .await
+        .expect_err("the second child must stop orchestration");
+
+        let PulsarError::Other(message) = error else {
+            panic!("child failure must surface as an engine error");
+        };
+        assert_eq!(
+            message,
+            "republish_dead_letters for topic orders-1: broker rejected publish"
+        );
+        assert_eq!(*started.lock(), vec!["orders-0", "orders-1"]);
+        assert_eq!(*completed.lock(), vec![("orders-0", 3)]);
+    }
+
+    #[tokio::test]
+    async fn republish_count_saturates_at_usize_max() {
+        let members = Mutex::new(Arc::new(vec![
+            TestRepublish {
+                topic: "orders-0",
+                count: usize::MAX,
+            },
+            TestRepublish {
+                topic: "orders-1",
+                count: 1,
+            },
+        ]));
+
+        let republished = republish_snapshot(
+            &members,
+            |child| child.topic,
+            |child| async move { Ok::<_, &'static str>(child.count) },
+        )
+        .await
+        .expect("republish must succeed");
+
+        assert_eq!(republished, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn republish_uses_membership_snapshot_taken_before_first_await() {
+        let members = Arc::new(Mutex::new(Arc::new(vec![
+            TestRepublish {
+                topic: "orders-0",
+                count: 2,
+            },
+            TestRepublish {
+                topic: "orders-1",
+                count: 3,
+            },
+        ])));
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let completed = Arc::new(Mutex::new(Vec::new()));
+
+        let task = tokio::spawn({
+            let members = members.clone();
+            let first_started = first_started.clone();
+            let release_first = release_first.clone();
+            let completed = completed.clone();
+            async move {
+                republish_snapshot(
+                    &members,
+                    |child| child.topic,
+                    |child| {
+                        let first_started = first_started.clone();
+                        let release_first = release_first.clone();
+                        let completed = completed.clone();
+                        async move {
+                            if child.topic == "orders-0" {
+                                first_started.notify_one();
+                                release_first.notified().await;
+                            }
+                            completed.lock().push(child.topic);
+                            Ok::<_, &'static str>(child.count)
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        first_started.notified().await;
+        {
+            let mut current = members
+                .try_lock()
+                .expect("membership lock must not be held across child work");
+            let current = Arc::make_mut(&mut current);
+            current.remove(1);
+            current.push(TestRepublish {
+                topic: "orders-2",
+                count: 11,
+            });
+        }
+        release_first.notify_one();
+
+        assert_eq!(
+            task.await
+                .expect("task must not panic")
+                .expect("snapshot republish must succeed"),
+            5
+        );
+        assert_eq!(*completed.lock(), vec!["orders-0", "orders-1"]);
+    }
+
+    struct CancellationProbe(Arc<AtomicBool>);
+
+    impl Drop for CancellationProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_republish_preserves_completed_children_and_stops_later_work() {
+        let members = Arc::new(Mutex::new(Arc::new(vec![
+            TestRepublish {
+                topic: "orders-0",
+                count: 2,
+            },
+            TestRepublish {
+                topic: "orders-1",
+                count: 3,
+            },
+            TestRepublish {
+                topic: "orders-2",
+                count: 5,
+            },
+        ])));
+        let second_started = Arc::new(Notify::new());
+        let never_release = Arc::new(Notify::new());
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let in_flight_dropped = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn({
+            let members = members.clone();
+            let second_started = second_started.clone();
+            let never_release = never_release.clone();
+            let completed = completed.clone();
+            let in_flight_dropped = in_flight_dropped.clone();
+            async move {
+                republish_snapshot(
+                    &members,
+                    |child| child.topic,
+                    |child| {
+                        let second_started = second_started.clone();
+                        let never_release = never_release.clone();
+                        let completed = completed.clone();
+                        let in_flight_dropped = in_flight_dropped.clone();
+                        async move {
+                            if child.topic == "orders-1" {
+                                let _probe = CancellationProbe(in_flight_dropped);
+                                second_started.notify_one();
+                                never_release.notified().await;
+                            }
+                            completed.lock().push(child.topic);
+                            Ok::<_, &'static str>(child.count)
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        second_started.notified().await;
+        task.abort();
+        let join_error = task
+            .await
+            .expect_err("aborted orchestration must be cancelled");
+
+        assert!(join_error.is_cancelled());
+        assert!(in_flight_dropped.load(Ordering::SeqCst));
+        assert_eq!(*completed.lock(), vec!["orders-0"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_republish_calls_overlap_on_independent_snapshots() {
+        let members = Arc::new(Mutex::new(Arc::new(vec![
+            TestRepublish {
+                topic: "orders-0",
+                count: 2,
+            },
+            TestRepublish {
+                topic: "orders-1",
+                count: 3,
+            },
+        ])));
+        let overlap = Arc::new(Barrier::new(2));
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+
+        let run = || {
+            let members = members.clone();
+            let overlap = overlap.clone();
+            let first_calls = first_calls.clone();
+            let second_calls = second_calls.clone();
+            tokio::spawn(async move {
+                republish_snapshot(
+                    &members,
+                    |child| child.topic,
+                    |child| {
+                        let overlap = overlap.clone();
+                        let first_calls = first_calls.clone();
+                        let second_calls = second_calls.clone();
+                        async move {
+                            if child.topic == "orders-0" {
+                                first_calls.fetch_add(1, Ordering::SeqCst);
+                                overlap.wait().await;
+                            } else {
+                                second_calls.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok::<_, &'static str>(child.count)
+                        }
+                    },
+                )
+                .await
+            })
+        };
+
+        let first = run();
+        let second = run();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("concurrent calls must not serialize behind the membership lock");
+
+        let first = first
+            .expect("first task must not panic")
+            .expect("first republish must succeed");
+        let second = second
+            .expect("second task must not panic")
+            .expect("second republish must succeed");
+        assert_eq!(first, 5);
+        assert_eq!(second, 5);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 2);
     }
 
     /// Mirror of the dispatch arm inside [`super::MultiTopicsConsumer::seek_per_partition`].

@@ -256,7 +256,7 @@ async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
     // permit accounting can be corrupted on purpose.
     let client = PulsarClient::builder()
         .service_url(service_url)
-        .consumer_stall_timeout(Duration::from_secs(300))
+        .consumer_stall_timeout(Duration::from_mins(5))
         .consumer_stall_auto_recovery(2)
         .build()
         .await?;

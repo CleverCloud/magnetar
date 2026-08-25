@@ -4154,7 +4154,7 @@ mod stall_watchdog_tests {
         );
 
         // The user drains it much later than the window.
-        let drained = arrived + std::time::Duration::from_secs(600);
+        let drained = arrived + std::time::Duration::from_mins(10);
         let _ = c.pop_message(drained);
         assert_eq!(
             c.poll_stall(WINDOW, drained),
