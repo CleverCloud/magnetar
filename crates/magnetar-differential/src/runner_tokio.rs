@@ -42,6 +42,35 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
         trace,
         magnetar_proto::ConnectionConfig::default(),
         None,
+        None,
+    )
+    .await
+}
+
+/// Run `trace` with `ack_timeout` armed on every `Op::OpenSharedConsumer` consumer
+/// (issue #436).
+///
+/// `ack_timeout` is a per-subscription setting rather than a `ConnectionConfig` one, so it
+/// arrives as a runner parameter instead of through a `ConnectionConfig` field the way
+/// [`run_with_stall_timeout`] does — but it plays the same role: the trace stays a pure
+/// sequence of operations and the scenario knob lives at the invocation.
+///
+/// Keep the window SHORT. Both differential legs run on the real tokio clock, so this is
+/// wall-clock time the test actually spends waiting for the unacked-message tracker to fire.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_ack_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    ack_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig::default(),
+        None,
+        Some(ack_timeout),
     )
     .await
 }
@@ -68,6 +97,7 @@ pub async fn run_supervised(
             supervisor: Some(supervisor),
             ..Default::default()
         },
+        None,
         None,
     )
     .await
@@ -98,6 +128,7 @@ pub async fn run_supervised_with_operation_timeout(
             ..Default::default()
         },
         None,
+        None,
     )
     .await
 }
@@ -123,6 +154,7 @@ pub async fn run_with_operation_timeout(
             ..Default::default()
         },
         Some(fast_operation_retry()),
+        None,
     )
     .await
 }
@@ -167,6 +199,7 @@ pub async fn run_with_stall_timeout(
             ..Default::default()
         },
         None,
+        None,
     )
     .await
 }
@@ -201,6 +234,7 @@ pub async fn run_with_stall_auto_recovery(
             ..Default::default()
         },
         None,
+        None,
     )
     .await
 }
@@ -210,6 +244,7 @@ async fn run_with_config(
     trace: &Trace,
     config: magnetar_proto::ConnectionConfig,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
+    shared_ack_timeout: Option<Duration>,
 ) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
@@ -258,6 +293,14 @@ async fn run_with_config(
     // detaching one mid-drain redelivers its un-acked entries to the survivors.
     let mut shared_consumers: HashMap<String, Consumer> = HashMap::new();
 
+    // Issue #436: the harness application's own state. `last_received` is what
+    // `Op::AckLastReceivedShared` acknowledges — whatever the named consumer was handed
+    // last, not an id the trace author guessed — and `acked` is its dedup set, because an
+    // application does not acknowledge the same message twice. Shared verbatim with the
+    // moonpool runner's `replay`.
+    let mut last_received: HashMap<String, MessageId> = HashMap::new();
+    let mut acked: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+
     // PIP-31: the current open txn id, if any. `NewTxn` populates it;
     // `EndTxn` consumes it. The harness supports one in-flight
     // transaction per trace at a time — matches the scripted broker's
@@ -272,6 +315,13 @@ async fn run_with_config(
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send(p, bytes).await,
+                    None => producer_dropped_send_error(),
+                };
+                stream.push(event);
+            }
+            Op::SendBatch { payloads } => {
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_batch(p, payloads).await,
                     None => producer_dropped_send_error(),
                 };
                 stream.push(event);
@@ -468,6 +518,7 @@ async fn run_with_config(
                         &trace.topic,
                         &trace.subscription,
                         *receiver_queue_size,
+                        shared_ack_timeout,
                     )
                     .await?,
                 );
@@ -476,13 +527,38 @@ async fn run_with_config(
                 let consumer = shared_consumers
                     .get(name)
                     .expect("trace names a shared consumer it never opened");
-                stream.push(run_recv(consumer, *timeout).await);
+                let event = run_recv(consumer, *timeout).await;
+                if let Event::Received { message_id, .. } = &event {
+                    last_received.insert(name.clone(), *message_id);
+                }
+                stream.push(event);
             }
             Op::AckShared { name, message_id } => {
                 let consumer = shared_consumers
                     .get(name)
                     .expect("trace names a shared consumer it never opened");
-                stream.push(run_ack(consumer, *message_id).await);
+                let event = run_ack(consumer, *message_id).await;
+                if matches!(event, Event::Acked) {
+                    acked.insert(*message_id);
+                }
+                stream.push(event);
+            }
+            Op::AckLastReceivedShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                let message_id = *last_received
+                    .get(name)
+                    .expect("trace acks a shared consumer that never received anything");
+                if acked.contains(&message_id) {
+                    stream.push(Event::AckSkippedDuplicate);
+                } else {
+                    let event = run_ack(consumer, message_id).await;
+                    if matches!(event, Event::Acked) {
+                        acked.insert(message_id);
+                    }
+                    stream.push(event);
+                }
             }
             Op::CloseSharedConsumer { name } => {
                 // `close` consumes the handle, so close a clone and keep the
@@ -722,6 +798,34 @@ async fn run_send(producer: &Producer, payload: Bytes) -> Event {
     }
 }
 
+/// Issue #436: publish `payloads` as ONE batched broker entry.
+///
+/// The producer's own batching stays off (`CreateProducerRequest::enable_batching` defaults
+/// to `false`), so the body is framed here by [`crate::trace::pack_batch_body`] and declared
+/// through `MessageMetadata.num_messages_in_batch` — the same two things a batching producer
+/// would put on the wire, and the pair the scripted broker stores and echoes back. One entry
+/// in, one [`Event::Sent`] out. Shared verbatim with the moonpool runner so both legs publish
+/// byte-identical frames.
+async fn run_send_batch(producer: &Producer, payloads: &[Vec<u8>]) -> Event {
+    let body = crate::trace::pack_batch_body(payloads);
+    let num_messages = i32::try_from(payloads.len()).unwrap_or(i32::MAX);
+    let msg = OutgoingMessage {
+        payload: body.clone(),
+        metadata: magnetar_proto::pb::MessageMetadata {
+            num_messages_in_batch: Some(num_messages),
+            ..Default::default()
+        },
+        uncompressed_size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+        num_messages,
+        txn_id: None,
+        source_message_id: None,
+    };
+    match producer.send(msg).await {
+        Ok(message_id) => Event::Sent { message_id },
+        Err(e) => Event::SendError { kind: classify(&e) },
+    }
+}
+
 /// PIP-180 / ADR-0033: replicator-style send. The scripted broker echoes the
 /// source id back on `CommandSendReceipt` so the resulting `Event::Sent`
 /// carries `message_id == source_msg_id`.
@@ -772,6 +876,7 @@ async fn open_shared_consumer(
     topic: &str,
     subscription: &str,
     receiver_queue_size: usize,
+    ack_timeout: Option<Duration>,
 ) -> Result<Event, ClientError> {
     let consumer = client
         .subscribe_with(
@@ -780,6 +885,9 @@ async fn open_shared_consumer(
                 subscription: subscription.to_owned(),
                 sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
                 receiver_queue_size,
+                // Issue #436: `None` (the default) leaves the unacked-message tracker
+                // unbuilt, which is the shape every other Shared trace runs in.
+                ack_timeout,
                 ..Default::default()
             },
             None,

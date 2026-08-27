@@ -6,8 +6,11 @@
 //!
 //! - Bounded receiver queue (`max_receiver_queue_size`).
 //! - Permit accounting → emit `CommandFlow` when the receiver queue drains below the threshold.
-//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch > 1` is split into N
-//!   [`IncomingMessage`]s with `batch_index` set.
+//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch > 1` is split into one
+//!   [`IncomingMessage`] per position the broker still lists as unacked in
+//!   [`pb::CommandMessage::ack_set`], each with `batch_index` set. A first dispatch carries no
+//!   `ack_set` and therefore surfaces all N; a re-dispatch of a partially-acked entry surfaces only
+//!   the positions that still owe an acknowledgement (ADR-0105, issue #436).
 //! - Chunk reassembly: messages with `num_chunks_from_msg > 1` are buffered until all chunks
 //!   arrive, then surfaced as one logical message.
 //! - Dead-letter routing: when redelivery count exceeds `max_redeliver_count`, the consumer records
@@ -550,6 +553,57 @@ impl BatchAckEntry {
             batch_size,
             unacked,
         }
+    }
+
+    /// Construct the entry a broker-delivered `CommandMessage.ack_set` describes for a batch of
+    /// `batch_size` messages (issue #436, ADR-0105).
+    ///
+    /// The delivered bitset uses the same convention as the outbound one: bit `i` SET ⇒ position
+    /// `i` is still unacked. A word the broker did not send says nothing about the positions it
+    /// would have covered, so those read as unacked (`u64::MAX`) — a short or malformed `ack_set`
+    /// must never acknowledge a position on the broker's behalf. An EMPTY `ack_set`, which is what
+    /// a first dispatch and a broker with `acknowledgmentAtBatchIndexLevelEnabled=false` both
+    /// carry, therefore reduces to exactly [`Self::fresh`] with no special case.
+    ///
+    /// Bits at or above `batch_size` are never set by [`Self::fresh`] and this only ever clears
+    /// bits, so the tail stays zero and [`Self::is_fully_acked`] remains reachable.
+    #[must_use]
+    pub fn from_delivered_ack_set(batch_size: i32, ack_set: &[i64]) -> Self {
+        let mut entry = Self::fresh(batch_size);
+        for (index, word) in entry.unacked.iter_mut().enumerate() {
+            *word &= ack_set
+                .get(index)
+                .map_or(u64::MAX, |delivered| *delivered as u64);
+        }
+        entry
+    }
+
+    /// AND-accumulate a freshly delivered bitset into this one (issue #436, ADR-0105).
+    ///
+    /// Mirrors the broker's own accumulation in `ManagedCursorImpl.java:2632-2645`: bits only ever
+    /// clear, so a position this session already acked locally can never be re-asserted as unacked
+    /// by a later re-dispatch, and a position the broker reports as acked clears even if this
+    /// session never acked it (another consumer of the same `Shared` subscription did). A
+    /// delivered bitset narrower than this one leaves the uncovered words untouched, for the same
+    /// reason [`Self::from_delivered_ack_set`] treats a missing word as all-unacked.
+    pub fn intersect_delivered(&mut self, delivered: &Self) {
+        for (index, word) in self.unacked.iter_mut().enumerate() {
+            *word &= delivered.unacked.get(index).copied().unwrap_or(u64::MAX);
+        }
+    }
+
+    /// `true` when `position` is still listed as unacked in this bitset.
+    ///
+    /// Out-of-range positions — negative, past `batch_size`, past the allocated words — read as
+    /// ACKED: a bitset only ever describes `batch_size` positions, and [`Self::fresh`] never sets
+    /// a bit beyond them. No panic on any input (invariant #6): the negative case saturates to a
+    /// word index no bitset can hold, and the shift is masked to `0..64` by construction.
+    #[must_use]
+    pub fn is_unacked(&self, position: i32) -> bool {
+        let position = usize::try_from(position).unwrap_or(usize::MAX);
+        self.unacked
+            .get(position / 64)
+            .is_some_and(|word| word & (1u64 << (position % 64)) != 0)
     }
 
     /// Clear the bit at `position`. Returns `true` once *every* position has been acked
@@ -1861,12 +1915,36 @@ impl ConsumerState {
         // Batched message path.
         let num_in_batch = metadata.num_messages_in_batch.unwrap_or(1);
         if num_in_batch > 1 {
+            // Issue #436 / ADR-0105: the broker re-dispatches a partially-acked batched entry as
+            // ONE entry and names the positions that are still outstanding in
+            // `CommandMessage.ack_set` (bit SET ⇒ still unacked — the same convention as the
+            // outbound `BatchAckEntry`). Read it once, up front: the same bitset decides which
+            // positions reach the application below AND what the PIP-54 tracker holds for the
+            // entry. A first dispatch carries no `ack_set`, and so does every dispatch from a
+            // broker running `acknowledgmentAtBatchIndexLevelEnabled=false`; both reduce to the
+            // all-unacked bitset this branch has always built, so neither changes behaviour.
+            let delivered_ack_set =
+                BatchAckEntry::from_delivered_ack_set(num_in_batch, &cmd.ack_set);
             // PIP-54: stamp the per-batch ack tracker once. Subsequent acks of individual
             // positions in this batch clear bits in the bitset; the broker sees the partial
             // ack state and only advances the cursor once every position is acked.
+            //
+            // A vacant entry is SEEDED from the delivered bitset rather than from
+            // `BatchAckEntry::fresh`: a session whose first sight of this entry is a re-dispatch
+            // would otherwise re-assert the positions the broker has already accounted for as
+            // unacked on every partial ack, so the entry could never reach "fully acked", its
+            // `CommandAck` would carry an `ack_set` forever, and the subscription's mark-delete
+            // position would stay pinned behind it (issue #436) while the tracker entry leaked
+            // for the lifetime of the connection (the issue #326 growth class).
+            //
+            // An occupied entry AND-accumulates instead of being overwritten, mirroring
+            // `ManagedCursorImpl.java:2632-2645`: bits only ever clear, so an ack this session
+            // issued between the dispatch and the re-dispatch is never undone by the broker's
+            // older view of the entry.
             self.batch_ack_tracker
                 .entry((message_id.ledger_id, message_id.entry_id))
-                .or_insert_with(|| BatchAckEntry::fresh(num_in_batch));
+                .and_modify(|existing| existing.intersect_delivered(&delivered_ack_set))
+                .or_insert_with(|| delivered_ack_set.clone());
             // Wrap the per-batch metadata once so every sub-message shares
             // a refcount instead of deep-cloning. For a 100-message batch
             // this collapses 100 `MessageMetadata::clone()` calls (each of
@@ -1894,6 +1972,28 @@ impl ConsumerState {
                     break;
                 }
                 let payload = cursor.split_to(payload_size);
+                // Issue #436 / ADR-0105: a position whose delivered bit is CLEAR was already
+                // acknowledged, so it is decoded (the payload cursor has to keep advancing for
+                // the positions behind it to parse at all) and then dropped. Skipping means
+                // skipping `classify_and_queue` entirely, which is the single site that queues
+                // the message for the application, registers it with the ack-timeout tracker,
+                // and calls `record_dispatch_unit`. All three are correct to skip:
+                //
+                // - the application already acked it and must never see it twice;
+                // - re-registering it in the unacked tracker makes the ack-timeout sweep re-request
+                //   it forever — the self-sustaining redelivery loop of issue #436;
+                // - the broker debited `MESSAGE_PERMITS_UPDATER.addAndGet(this, ackedCount -
+                //   totalMessages)` when it re-dispatched the entry (apache/pulsar master 3bf3ec2,
+                //   `Consumer.java:433-434`), i.e. it charged only the positions it still expects
+                //   to be consumed, so debiting the mirror for an already-acked position would
+                //   drive it below the broker's real `availablePermits` by `ackedCount` on every
+                //   re-dispatch. Java keeps them out of `skippedMessages` for the mirror-image
+                //   reason — "Broker … did not decrease the permits in the broker-side. So do not
+                //   acquire more permits for this message" (`ConsumerImpl.java:1798-1862`) — so
+                //   neither side moves for them.
+                if !delivered_ack_set.is_unacked(idx) {
+                    continue;
+                }
                 let mut single_mid = message_id;
                 single_mid.batch_index = idx;
                 single_mid.batch_size = num_in_batch;
@@ -2514,6 +2614,396 @@ mod tests {
         let _ = e.ack_position(99);
         assert!(!e.is_fully_acked());
         assert_eq!(e.unacked, vec![0b1111]);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #436 / ADR-0105 — the delivered `CommandMessage.ack_set`.
+    //
+    // The broker re-dispatches a partially-acked batched entry as ONE entry
+    // and names the positions that still owe an acknowledgement (bit SET ⇒
+    // still unacked). Those positions — and only those — reach the
+    // application, enter the ack-timeout tracker, and cost a permit; the
+    // delivered bitset is also the authoritative seed / AND-accumulator for
+    // the PIP-54 tracker entry.
+    // -------------------------------------------------------------------
+
+    /// Pack `payloads` into the `(u32 single_size)(SingleMessageMetadata)(payload)` wire shape
+    /// the batch branch of [`ConsumerState::deliver`] explodes.
+    fn batch_body(payloads: &[&[u8]]) -> Bytes {
+        let mut buf = bytes::BytesMut::new();
+        for payload in payloads {
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = sm.encoded_len();
+            buf.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            sm.encode(&mut buf).unwrap();
+            buf.extend_from_slice(payload);
+        }
+        buf.freeze()
+    }
+
+    /// Four packed sub-messages, distinct payloads so a mis-advanced cursor is visible.
+    fn four_message_batch() -> Bytes {
+        batch_body(&[
+            b"p0".as_ref(),
+            b"p1".as_ref(),
+            b"p2".as_ref(),
+            b"p3".as_ref(),
+        ])
+    }
+
+    /// A batched `CommandMessage` on `(1, 1)` carrying `ack_set`.
+    fn batch_cmd_with_ack_set(ack_set: Vec<i64>) -> pb::CommandMessage {
+        pb::CommandMessage {
+            ack_set,
+            ..message_cmd(0)
+        }
+    }
+
+    /// Batch positions currently sitting in the receiver queue, in order.
+    fn queued_positions(c: &ConsumerState) -> Vec<i32> {
+        c.queue.iter().map(|m| m.message_id.batch_index).collect()
+    }
+
+    #[test]
+    fn batch_ack_entry_from_empty_delivered_ack_set_is_all_unacked() {
+        // A first dispatch — and every dispatch from a broker running
+        // `acknowledgmentAtBatchIndexLevelEnabled=false` — carries no `ack_set` at all, and
+        // must reduce to exactly the all-unacked entry this branch has always built.
+        assert_eq!(
+            BatchAckEntry::from_delivered_ack_set(5, &[]).unacked,
+            BatchAckEntry::fresh(5).unacked,
+            "an absent ack_set says nothing, so every position stays unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_from_delivered_ack_set_keeps_only_the_set_bits() {
+        let e = BatchAckEntry::from_delivered_ack_set(8, &[0b1100_0000]);
+        assert_eq!(e.unacked, vec![0b1100_0000]);
+        assert_eq!(e.batch_size, 8);
+        assert!(!e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_from_delivered_ack_set_masks_bits_past_the_batch() {
+        // A broker word covers 64 positions whatever the batch is wide; bits at or above
+        // `batch_size` must stay clear or `is_fully_acked` could never fire and the tracker
+        // entry would leak for the lifetime of the connection.
+        let e = BatchAckEntry::from_delivered_ack_set(3, &[i64::from(-1i32)]);
+        assert_eq!(e.unacked, vec![0b111]);
+    }
+
+    #[test]
+    fn batch_ack_entry_from_short_delivered_ack_set_leaves_uncovered_words_unacked() {
+        // 70 positions need two words; the broker sent one. The uncovered positions must read
+        // as UNACKED — a truncated bitset may never acknowledge a position on the broker's
+        // behalf.
+        let e = BatchAckEntry::from_delivered_ack_set(70, &[0b1010]);
+        assert_eq!(e.unacked.len(), 2);
+        assert_eq!(e.unacked[0], 0b1010);
+        assert_eq!(
+            e.unacked[1], 0b11_1111,
+            "the six positions of the second word that exist (64..70) stay unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_from_all_clear_delivered_ack_set_is_fully_acked() {
+        let e = BatchAckEntry::from_delivered_ack_set(4, &[0]);
+        assert!(e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_intersect_delivered_never_resets_a_cleared_bit() {
+        let mut e = BatchAckEntry::fresh(4);
+        assert!(!e.ack_position(0));
+        assert_eq!(e.unacked, vec![0b1110]);
+        // The broker's older view still lists position 0 as unacked. AND-accumulation must
+        // NOT re-set it (`ManagedCursorImpl.java:2632-2645`).
+        e.intersect_delivered(&BatchAckEntry::from_delivered_ack_set(4, &[0b1111]));
+        assert_eq!(e.unacked, vec![0b1110]);
+        // And a bit the broker reports as acked clears even though this session never acked
+        // it — a sibling consumer of the same Shared subscription did.
+        e.intersect_delivered(&BatchAckEntry::from_delivered_ack_set(4, &[0b1100]));
+        assert_eq!(e.unacked, vec![0b1100]);
+    }
+
+    #[test]
+    fn batch_ack_entry_intersect_delivered_keeps_words_the_delivered_set_does_not_cover() {
+        let mut e = BatchAckEntry::fresh(70);
+        let narrow = BatchAckEntry::from_delivered_ack_set(4, &[0b0001]);
+        e.intersect_delivered(&narrow);
+        assert_eq!(e.unacked[0], 0b0001, "the covered word intersects");
+        assert_eq!(
+            e.unacked[1], 0b11_1111,
+            "an uncovered word is left untouched, exactly as a missing word reads as unacked",
+        );
+    }
+
+    #[test]
+    fn batch_ack_entry_is_unacked_reads_out_of_range_positions_as_acked() {
+        let e = BatchAckEntry::from_delivered_ack_set(4, &[0b1010]);
+        assert!(!e.is_unacked(0));
+        assert!(e.is_unacked(1));
+        assert!(!e.is_unacked(2));
+        assert!(e.is_unacked(3));
+        // Out of range in every direction — no panic (invariant #6), and never "unacked".
+        assert!(!e.is_unacked(-1));
+        assert!(!e.is_unacked(4));
+        assert!(!e.is_unacked(i32::MAX));
+        assert!(!e.is_unacked(i32::MIN));
+    }
+
+    #[test]
+    fn delivered_ack_set_skips_the_positions_it_reports_as_acked() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                // Positions 1 and 3 still unacked; 0 and 2 already acknowledged.
+                &batch_cmd_with_ack_set(vec![0b1010]),
+                metadata(4),
+                None,
+                four_message_batch(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
+            other => panic!("expected Delivered(2), got {other:?}"),
+        }
+        assert_eq!(
+            queued_positions(&c),
+            vec![1, 3],
+            "only the positions the broker still lists as unacked may reach the application",
+        );
+        assert_eq!(
+            c.queue
+                .iter()
+                .map(|m| m.payload.as_ref().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"p1".to_vec(), b"p3".to_vec()],
+            "a skipped position is decoded and dropped, so the payload cursor stays aligned \
+             and the positions behind it carry their own payloads",
+        );
+    }
+
+    #[test]
+    fn delivered_ack_set_charges_a_permit_only_for_the_positions_it_lists_unacked() {
+        // Ground truth: the broker debits `ackedCount - totalMessages` when it re-dispatches
+        // the entry (`Consumer.java:433-434`), so it charged 2 of the 4 positions here. A
+        // mirror that debits all 4 drifts 2 below the broker's real `availablePermits` on
+        // every re-dispatch, which is the unbounded drift of issue #436.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.permit_balance, 98,
+            "a re-dispatched K=4 entry whose ack_set lists 2 positions unacked consumes \
+             exactly 2 dispatch units, not 4",
+        );
+    }
+
+    #[test]
+    fn skipped_positions_never_enter_the_ack_timeout_tracker() {
+        // Re-registering an already-acked position is what makes the ack-timeout redelivery
+        // loop self-sustaining: the sweep re-requests it, the broker re-dispatches the entry,
+        // the client re-registers it, forever (issue #436).
+        let ack_timeout = std::time::Duration::from_secs(2);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        c.unacked_tracker = Some(crate::trackers::UnackedMessageTracker::new(
+            ConsumerHandle(1),
+            ack_timeout,
+        ));
+        let _ = c.initial_flow();
+        let at = std::time::Instant::now();
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            at,
+        )
+        .unwrap();
+
+        let expired: Vec<i32> = c
+            .unacked_tracker
+            .as_mut()
+            .expect("tracker configured")
+            .poll(at + ack_timeout + std::time::Duration::from_millis(1))
+            .into_iter()
+            .flat_map(|action| match action {
+                crate::trackers::UnackedAction::RedeliverExpired { message_ids, .. } => message_ids,
+            })
+            .map(|id| id.batch_index)
+            .collect();
+        assert_eq!(
+            expired,
+            vec![1, 3],
+            "only the genuinely outstanding positions may expire into a redelivery request",
+        );
+    }
+
+    #[test]
+    fn delivered_ack_set_seeds_a_vacant_batch_ack_tracker_entry() {
+        // A session whose FIRST sight of the entry is a re-dispatch. Seeding from
+        // `BatchAckEntry::fresh` would re-assert positions 0 and 2 as unacked on every partial
+        // ack, so the entry could never reach "fully acked" and the subscription's mark-delete
+        // position would stay pinned behind it (issue #436).
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let entry = c
+            .batch_ack_tracker
+            .get(&(1, 1))
+            .expect("the batched entry stamps a tracker entry");
+        assert_eq!(entry.unacked, vec![0b1010]);
+        assert_eq!(entry.batch_size, 4);
+    }
+
+    #[test]
+    fn a_redispatch_and_merges_into_the_existing_batch_ack_tracker_entry() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // First dispatch: no ack_set, so every position is unacked.
+        c.deliver(
+            &batch_cmd_with_ack_set(Vec::new()),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.batch_ack_tracker.get(&(1, 1)).map(|e| e.unacked.clone()),
+            Some(vec![0b1111]),
+            "a first dispatch seeds the all-unacked bitset, exactly as before",
+        );
+        // This session acknowledges position 3 locally.
+        let fully = c
+            .batch_ack_tracker
+            .get_mut(&(1, 1))
+            .expect("entry present")
+            .ack_position(3);
+        assert!(!fully);
+
+        // The broker re-dispatches with its own (older) view: 0 and 2 acked, 1 and 3 unacked.
+        c.deliver(
+            &batch_cmd_with_ack_set(vec![0b1010]),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.batch_ack_tracker.get(&(1, 1)).map(|e| e.unacked.clone()),
+            Some(vec![0b0010]),
+            "AND-accumulation only ever clears bits: position 3 stays acked even though the \
+             broker still listed it as unacked, and 0 and 2 clear from the delivered view",
+        );
+    }
+
+    #[test]
+    fn a_short_delivered_ack_set_delivers_the_positions_it_does_not_cover() {
+        // A malformed / truncated bitset must fail towards delivery, never towards silently
+        // dropping a message that has not been acknowledged.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // 68 positions span two words; the broker sends one, and it clears every position it
+        // covers. Positions 64..68 are uncovered and must still be delivered.
+        let payloads: Vec<Vec<u8>> = (0..68).map(|i| format!("p{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(std::vec::Vec::as_slice).collect();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                metadata(68),
+                None,
+                batch_body(&refs),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 4),
+            other => panic!("expected Delivered(4), got {other:?}"),
+        }
+        assert_eq!(queued_positions(&c), vec![64, 65, 66, 67]);
+        assert_eq!(
+            c.permit_balance, 96,
+            "and the mirror is debited for exactly those four",
+        );
+    }
+
+    #[test]
+    fn an_all_clear_delivered_ack_set_delivers_nothing_and_charges_nothing() {
+        // Every position acknowledged. The entry still parses (the wire body is walked
+        // position by position), nothing reaches the application, no permit moves, and the
+        // tracker entry is immediately fully-acked.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                metadata(4),
+                None,
+                four_message_batch(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 0),
+            other => panic!("expected Delivered(0), got {other:?}"),
+        }
+        assert!(c.queue.is_empty());
+        assert_eq!(c.permit_balance, 100);
+        assert!(
+            c.batch_ack_tracker
+                .get(&(1, 1))
+                .expect("entry present")
+                .is_fully_acked(),
+        );
+    }
+
+    #[test]
+    fn an_ack_set_on_an_unbatched_entry_is_ignored() {
+        // `num_messages_in_batch <= 1` never reaches the batched branch, so a stray `ack_set`
+        // cannot suppress a plain message.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &batch_cmd_with_ack_set(vec![0]),
+                metadata(1),
+                None,
+                Bytes::from_static(b"plain"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 1),
+            other => panic!("expected Delivered(1), got {other:?}"),
+        }
+        assert_eq!(queued_positions(&c), vec![-1]);
+        assert_eq!(c.permit_balance, 99);
+        assert!(c.batch_ack_tracker.is_empty());
     }
 
     /// Drive a synthetic distribution through `receive_latency_hist` and confirm the snapshot
