@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-08-27
+
 ### Fixed
 
 - **A re-dispatched batched entry no longer re-delivers, re-tracks, and re-charges the positions the broker already reported as acknowledged.**
@@ -54,7 +56,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Dependencies:** bumped workspace manifest floors — `rustls-openssl` 0.3.1→0.4.0, `apache-avro` 0.21.0→0.22.0, `uuid` 1.24.0→1.24.1, `rcgen` 0.14.8→0.14.9, `futures`/`futures-util` 0.3.33→0.3.34, `rustls` 0.23.42→0.23.43, `aws-lc-rs` 1.17.3→1.18.0, `base64` 0.23.0→0.23.1, `http` 1.4.2→1.5.0, `clap` 4.6.4→4.6.6, `thiserror` 2.0.18→2.0.20, `testcontainers` 0.27.3→0.28.0, and `async-trait` 0.1.91→0.1.92 — and refreshed `Cargo.lock`.
   `apache-avro` 0.22 deprecated the free `to_avro_datum`/`from_avro_datum` functions that `AvroSchema::encode`/`decode` called; `crates/magnetar-proto/src/schema/avro.rs` now drives the replacement `GenericDatumWriter`/`GenericDatumReader` builders instead, with the parsing-canonical-form `schema_data()` output and the encode/decode round-trip unchanged (`schema::avro::tests` exercises both).
-  ||||||| parent of f85ac3e (feat(consumer): bounded automatic stall recovery (#414))
 
 ### Fixed
 
@@ -626,7 +627,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
 [1.7.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.0
 [1.6.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.6.0
 [1.5.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.5.0
