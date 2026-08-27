@@ -44,6 +44,12 @@ magnetar-runtime-tokio    = { workspace = true }
 magnetar-runtime-moonpool = { workspace = true }
 bytes                     = { workspace = true }
 moonpool-core             = { workspace = true }
+# Issue #436: `trace::pack_batch_body` frames a batched entry's packed
+# `SingleMessageMetadata` body the way a real producer does, so both runners can
+# publish one from an `Op::SendBatch`. Already in this crate's graph — it was a
+# `[dev-dependencies]` entry here (PIP-33 marker encoding) and is a hard dependency
+# of `magnetar-proto`; this promotes the existing entry rather than adding a crate.
+prost                     = { workspace = true }
 parking_lot               = { workspace = true }
 tokio                     = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 tracing                   = { workspace = true }
@@ -70,8 +76,6 @@ magnetar-auth-sasl = { workspace = true }
 # two engine-shaped drivers. `crypto-aws-lc-rs` for the deterministic RS256.
 magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
 async-trait = { workspace = true }
-# PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
-prost = { workspace = true }
 # Capturing fmt subscriber for `tests/corrupted_frame_equivalence.rs` — the
 # proto point-of-detection `error!` is the witness that the injected
 # CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).

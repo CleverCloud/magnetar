@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A re-dispatched batched entry no longer re-delivers, re-tracks, and re-charges the positions the broker already reported as acknowledged.**
+  `pb::CommandMessage.ack_set` is the broker's per-position view of the batched entry it is dispatching — bit `i` SET ⇒ position `i` is still unacked, the same convention as the outbound `BatchAckEntry` — and the broker attaches it when `acknowledgmentAtBatchIndexLevelEnabled=true` and it is re-dispatching an entry some of whose positions have already been acked.
+  `ConsumerState::deliver`'s batched branch never read it: it exploded `0..num_messages_in_batch` unconditionally and stamped an all-unacked `BatchAckEntry::fresh`, so a 1024-message entry with 1022 positions acked re-delivered all 1024.
+  It now builds one `BatchAckEntry` from that bitset and uses it for all three decisions.
+  Positions whose bit is CLEAR are decoded and dropped — the payload cursor must still walk them for the positions behind them to parse — and skip `classify_and_queue` entirely, which is the single site that queues the message for the application, registers it with the ack-timeout tracker, and calls `record_dispatch_unit`.
+  The permit half is not an optimisation: the broker debits `MESSAGE_PERMITS_UPDATER.addAndGet(this, ackedCount - totalMessages)` as it re-dispatches (`Consumer.java:433-434`), charging only the positions it still expects to be consumed, and Java keeps those positions out of `skippedMessages` so `increaseAvailablePermits` never fires for them either (`ConsumerImpl.java:1798-1862`) — neither side moves for a skipped position, so a mirror that debited the whole entry drifted `ackedCount` further below the broker's real `availablePermits` on every redelivery, one-way and unbounded.
+  A vacant `(ledger_id, entry_id)` tracker entry is now SEEDED from the delivered bitset instead of from `BatchAckEntry::fresh`, and an existing one AND-accumulates it (`ManagedCursorImpl.java:2632-2645`), so bits only ever clear and a locally acked position is never re-asserted as unacked.
+  Together these kill the metastable loop behind the report: with `ack_timeout` armed, the sweep re-requested positions the broker had already accounted for, the broker honoured the request by re-dispatching the whole entry, the client re-registered them, and the request set grew by `ackedCount` every cycle — which is why raising `ack_timeout` past the run length, with nothing else changed, made the wedge disappear.
+  It also unpins the mark-delete position: an entry seeded all-unacked could never reach fully-acked, so its `CommandAck` carried an `ack_set` forever, the broker held the cursor behind it, and the tracker entry leaked for the lifetime of the connection.
+  A **missing or short** `ack_set` leaves every position it does not cover unacked — a truncated bitset may never acknowledge a position on the broker's behalf — and an **empty** one reduces to `BatchAckEntry::fresh` by construction, so a first dispatch and every dispatch from a broker running `acknowledgmentAtBatchIndexLevelEnabled=false` are bit-for-bit unchanged.
+  `num_messages_in_batch <= 1` ignores the field entirely.
+  The one visible behaviour change for an existing deployment is the intended one: where the broker sends the field, an application stops receiving duplicates of positions it already acknowledged.
+  ADR-0096's conservative ack-time PIP-54 reconstruction in `Connection::ack` is untouched — it governs an ack with no broker evidence, this governs a delivery that carries it.
+  (issue #436; ADR-0105, resolving ADR-0096's deferred receive-side `ack_set` gap)
+
 ## [1.7.0] - 2026-08-25
 
 ### Added

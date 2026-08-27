@@ -46,7 +46,7 @@ fn partition_topic(base: &str, partition: i32) -> String {
 pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientError> {
     let engine = MoonpoolEngine::new(TokioProviders::new());
     let client = Client::connect_plain(&engine, host_port, ConnectionConfig::default()).await?;
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
 /// Run `trace` against the moonpool engine with the auto-reconnect supervisor
@@ -70,7 +70,7 @@ pub async fn run_supervised(
         ..Default::default()
     };
     let client = Client::connect_plain_supervised(&engine, host_port, config, None, None).await?;
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
 /// Sibling of [`run_supervised`] with a caller-supplied `operation_timeout`
@@ -92,7 +92,7 @@ pub async fn run_supervised_with_operation_timeout(
         ..Default::default()
     };
     let client = Client::connect_plain_supervised(&engine, host_port, config, None, None).await?;
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
 /// Sibling of [`crate::runner_tokio::run_with_operation_timeout`]: a plain
@@ -114,7 +114,7 @@ pub async fn run_with_operation_timeout(
     let client = Client::connect_plain(&engine, host_port, config)
         .await?
         .with_operation_retry(crate::runner_tokio::fast_operation_retry());
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
 /// Run `trace` with the issue #414 per-consumer stall watchdog armed at
@@ -142,7 +142,7 @@ pub async fn run_with_stall_timeout(
         ..Default::default()
     };
     let client = Client::connect_plain(&engine, host_port, config).await?;
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
 /// Run `trace` with the issue #414 stall watchdog armed at `consumer_stall_timeout`
@@ -173,10 +173,30 @@ pub async fn run_with_stall_auto_recovery(
         ..Default::default()
     };
     let client = Client::connect_plain(&engine, host_port, config).await?;
-    replay(client, trace).await
+    replay(client, trace, None).await
 }
 
-async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventStream, ClientError> {
+/// Run `trace` with `ack_timeout` armed on every `Op::OpenSharedConsumer` consumer
+/// (issue #436). Mirrors [`crate::runner_tokio::run_with_ack_timeout`] — see it for why the
+/// window belongs at the invocation and must stay short.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_with_ack_timeout(
+    host_port: &str,
+    trace: &Trace,
+    ack_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = Client::connect_plain(&engine, host_port, ConnectionConfig::default()).await?;
+    replay(client, trace, Some(ack_timeout)).await
+}
+
+async fn replay(
+    client: Client<TokioProviders>,
+    trace: &Trace,
+    shared_ack_timeout: Option<Duration>,
+) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
@@ -211,6 +231,11 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
     // `(topic, subscription)`.
     let mut shared_consumers: HashMap<String, Consumer<TokioProviders>> = HashMap::new();
 
+    // Issue #436: the harness application's last-received id per Shared consumer plus its
+    // dedup set, driving `Op::AckLastReceivedShared`. Mirrors `runner_tokio.rs`.
+    let mut last_received: HashMap<String, MessageId> = HashMap::new();
+    let mut acked: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+
     // PIP-31: the current open txn id, if any. Mirrors `runner_tokio.rs`.
     let mut current_txn: Option<magnetar_proto::TxnId> = None;
 
@@ -220,6 +245,13 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send(p, bytes).await,
+                    None => producer_dropped_send_error(),
+                };
+                stream.push(event);
+            }
+            Op::SendBatch { payloads } => {
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_batch(p, payloads).await,
                     None => producer_dropped_send_error(),
                 };
                 stream.push(event);
@@ -416,6 +448,7 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                         &trace.topic,
                         &trace.subscription,
                         *receiver_queue_size,
+                        shared_ack_timeout,
                     )
                     .await?,
                 );
@@ -424,13 +457,38 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                 let consumer = shared_consumers
                     .get(name)
                     .expect("trace names a shared consumer it never opened");
-                stream.push(run_recv(consumer, *timeout).await);
+                let event = run_recv(consumer, *timeout).await;
+                if let Event::Received { message_id, .. } = &event {
+                    last_received.insert(name.clone(), *message_id);
+                }
+                stream.push(event);
             }
             Op::AckShared { name, message_id } => {
                 let consumer = shared_consumers
                     .get(name)
                     .expect("trace names a shared consumer it never opened");
-                stream.push(run_ack(consumer, *message_id).await);
+                let event = run_ack(consumer, *message_id).await;
+                if matches!(event, Event::Acked) {
+                    acked.insert(*message_id);
+                }
+                stream.push(event);
+            }
+            Op::AckLastReceivedShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                let message_id = *last_received
+                    .get(name)
+                    .expect("trace acks a shared consumer that never received anything");
+                if acked.contains(&message_id) {
+                    stream.push(Event::AckSkippedDuplicate);
+                } else {
+                    let event = run_ack(consumer, message_id).await;
+                    if matches!(event, Event::Acked) {
+                        acked.insert(message_id);
+                    }
+                    stream.push(event);
+                }
             }
             Op::CloseSharedConsumer { name } => {
                 // `close` consumes the handle, so close a clone and keep the
@@ -664,6 +722,29 @@ async fn run_send(producer: &Producer<TokioProviders>, payload: Bytes) -> Event 
     }
 }
 
+/// Issue #436: publish `payloads` as ONE batched broker entry. Mirrors
+/// [`crate::runner_tokio`]'s sibling — same [`crate::trace::pack_batch_body`] framing and the
+/// same declared `num_messages_in_batch`, so both legs put byte-identical frames on the wire.
+async fn run_send_batch(producer: &Producer<TokioProviders>, payloads: &[Vec<u8>]) -> Event {
+    let body = crate::trace::pack_batch_body(payloads);
+    let num_messages = i32::try_from(payloads.len()).unwrap_or(i32::MAX);
+    let msg = OutgoingMessage {
+        payload: body.clone(),
+        metadata: magnetar_proto::pb::MessageMetadata {
+            num_messages_in_batch: Some(num_messages),
+            ..Default::default()
+        },
+        uncompressed_size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+        num_messages,
+        txn_id: None,
+        source_message_id: None,
+    };
+    match producer.send(msg).await {
+        Ok(message_id) => Event::Sent { message_id },
+        Err(e) => Event::SendError { kind: classify(&e) },
+    }
+}
+
 /// PIP-180 / ADR-0033: replicator-style send. The scripted broker echoes
 /// the source id back on `CommandSendReceipt` so the resulting
 /// `Event::Sent` carries `message_id == source_msg_id`.
@@ -715,6 +796,7 @@ async fn open_shared_consumer(
     topic: &str,
     subscription: &str,
     receiver_queue_size: usize,
+    ack_timeout: Option<Duration>,
 ) -> Result<Event, ClientError> {
     let consumer = client
         .subscribe(SubscribeRequest {
@@ -723,6 +805,9 @@ async fn open_shared_consumer(
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
             receiver_queue_size,
             durable: true,
+            // Issue #436: `None` (the default) leaves the unacked-message tracker unbuilt,
+            // which is the shape every other Shared trace runs in.
+            ack_timeout,
             ..Default::default()
         })
         .await?;

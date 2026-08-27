@@ -8,15 +8,19 @@
 //! 1:1 by index. The harness then byte-compares the two event streams
 //! produced by the tokio and moonpool runners.
 //!
-//! Op surface is intentionally tight: `Send`, `Recv`, `Ack`, `Nack`,
-//! `Seek`, `Close`, last-clone producer/consumer drops, plus
+//! Op surface is intentionally tight: `Send`, `SendBatch`, `Recv`, `Ack`,
+//! `Nack`, `Seek`, `Close`, last-clone producer/consumer drops, plus
 //! partition-aware siblings `SendPartition`, `RecvPartition`,
-//! `AckPartition`, `SeekPartition` for the partitioned-topic traces.
+//! `AckPartition`, `SeekPartition` for the partitioned-topic traces, and the
+//! `…Shared` family (`OpenSharedConsumer`, `RecvShared`, `AckShared`,
+//! `AckLastReceivedShared`, `CloseSharedConsumer`, `ResubscribeShared`) for the
+//! Shared-subscription traces.
 //! Extend it as new differential coverage lands; keep every variant
 //! **observable** so the equivalence check stays meaningful.
 
 use std::time::Duration;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use magnetar_proto::MessageId;
 
 /// A single operation in a [`Trace`].
@@ -28,6 +32,23 @@ pub enum Op {
     Send {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
+    },
+    /// Issue #436: publish ONE broker entry carrying `payloads.len()` packed
+    /// messages — a batched entry, the shape the wedge needs.
+    ///
+    /// The runner frames the body with [`pack_batch_body`] and stamps
+    /// `MessageMetadata.num_messages_in_batch`, exactly as a producer with
+    /// batching enabled would; the scripted broker stores what it is told and
+    /// echoes it back on dispatch. The whole batch is ONE ledger entry, so it
+    /// resolves to ONE [`Event::Sent`] and the consumer explodes it back into
+    /// `payloads.len()` messages with `batch_index` `0..n`.
+    ///
+    /// The point is that "one entry" and "one message" stop being the same
+    /// thing: a redelivery, a permit, and a mark-delete all address the ENTRY,
+    /// while an ack addresses a position inside it.
+    SendBatch {
+        /// Raw payload bytes of each packed message, in batch-index order.
+        payloads: Vec<Vec<u8>>,
     },
     /// Receive one message with the given timeout. The harness waits
     /// up to `timeout` for a message to arrive on the consumer's
@@ -200,6 +221,26 @@ pub enum Op {
         /// Target message id.
         message_id: MessageId,
     },
+    /// Issue #436: acknowledge whatever the named Shared consumer received LAST,
+    /// unless this trace has already acknowledged that exact id — the shape a
+    /// real application has, and the one the wedge needs.
+    ///
+    /// [`Self::AckShared`] names an id the trace author picked in advance, which
+    /// silently assumes the consumer delivered it. An application cannot make
+    /// that assumption: it acknowledges what it was handed, and it does not
+    /// acknowledge the same message twice. That difference is the whole
+    /// scenario. A consumer that re-delivers positions the application already
+    /// acknowledged hands it nothing to ack, so the positions that genuinely
+    /// still owe an ack are never reached — issue #436's "the application is
+    /// acking" (`acks_sent` tracking `msgs_received` bar the unacked gap) while
+    /// one entry never completes.
+    ///
+    /// Resolves to [`Event::Acked`] when an acknowledgement went to the broker
+    /// and [`Event::AckSkippedDuplicate`] when the id was already acknowledged.
+    AckLastReceivedShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
     /// Issue #414: close the named Shared consumer — the mid-drain detach. Its
     /// un-acked in-flight entries go back to the subscription's redelivery pool
     /// and the survivors pick them up.
@@ -267,6 +308,12 @@ pub enum Event {
         /// Stable error category string.
         kind: String,
     },
+    /// [`Op::AckLastReceivedShared`] found the last received id already
+    /// acknowledged by this trace and sent nothing. Issue #436: an application
+    /// that is handed a message it already acknowledged has no ack to send, so
+    /// the redelivery buys the subscription no progress at all — this event is
+    /// where that shows up in the stream.
+    AckSkippedDuplicate,
     /// `Nack` was enqueued (fire-and-forget at the engine surface).
     /// The redelivery itself surfaces as a follow-up [`Event::Received`].
     Nacked,
@@ -472,6 +519,30 @@ impl Default for EventStream {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Frame `payloads` as one batched entry's body: a `(u32 big-endian single_size)
+/// (SingleMessageMetadata)(payload)` triple per packed message, concatenated.
+///
+/// This is the exact wire layout `magnetar_proto::consumer::ConsumerState::deliver` walks
+/// when `MessageMetadata.num_messages_in_batch > 1`, and the one Java's
+/// `BatchMessageContainerImpl` writes. Both runners build [`Op::SendBatch`]'s frame through
+/// here so the two legs publish byte-identical bodies (issue #436).
+#[must_use]
+pub fn pack_batch_body(payloads: &[Vec<u8>]) -> Bytes {
+    let mut body = BytesMut::new();
+    for payload in payloads {
+        let single = magnetar_proto::pb::SingleMessageMetadata {
+            payload_size: i32::try_from(payload.len()).unwrap_or(i32::MAX),
+            ..Default::default()
+        };
+        let encoded_len = prost::Message::encoded_len(&single);
+        body.put_u32(u32::try_from(encoded_len).unwrap_or(u32::MAX));
+        // `encode` only fails on a short buffer; `BytesMut` grows, so this cannot.
+        let _ = prost::Message::encode(&single, &mut body);
+        body.extend_from_slice(payload);
+    }
+    body.freeze()
 }
 
 #[cfg(test)]
