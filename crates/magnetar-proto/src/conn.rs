@@ -3422,11 +3422,19 @@ impl Connection {
                 // grant is owed either way, and `Self::initial_flow` is idempotent per
                 // attach, so whichever of the two callers arrives second is a no-op
                 // rather than a second `receiver_queue_size` the broker would hold.
+                // Starved-corner extension (#331 lineage): `granted_permits` is the
+                // ADDITIVE mirror, so a consumer that was fed once and then drained
+                // to a real balance of zero — with too little queued to ever cross
+                // the `maybe_flow` threshold again — fails the `== 0` gate forever.
+                // Promotion is its only exit: `maybe_flow` is provably unreachable
+                // (nothing left to pop), and the #414 stall watchdog requires
+                // `permit_balance > 0` for candidacy. `is_flow_starved` is that
+                // exact predicate, computed against the real balance (#349).
                 let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
                     let mut consumer = slot.state.lock();
                     consumer.record_active_change(active);
                     active
-                        && consumer.granted_permits == 0
+                        && (consumer.granted_permits == 0 || consumer.is_flow_starved())
                         && !consumer.closed
                         && !consumer.paused
                         && consumer.pending_seek.is_none()
@@ -5275,7 +5283,18 @@ impl Connection {
     pub fn initial_flow(&mut self, handle: ConsumerHandle, now: Instant) -> Option<RequestId> {
         let Some(flow_cmd) = ({
             let mut consumer = self.consumers.get(&handle)?.state.lock();
-            if consumer.initial_grant_due || consumer.granted_permits == 0 {
+            // `is_flow_starved` (issue #331 lineage): a previously-fed consumer whose
+            // real balance drained to zero with no way to reach `maybe_flow` again is
+            // owed a grant exactly as much as an untouched one — the additive
+            // `granted_permits` mirror alone cannot see the difference between "fed
+            // and healthy" and "fed and starved". The predicate is `false` whenever
+            // any queued-or-counted progress can still trigger replenishment, so the
+            // #427 no-double-grant contract is preserved: a consumer with permits
+            // in flight or a viable pop path is still refused here.
+            if consumer.initial_grant_due
+                || consumer.granted_permits == 0
+                || consumer.is_flow_starved()
+            {
                 let flow_cmd = consumer.initial_flow();
                 consumer.arm_adjust_clock(now);
                 // Issue #414: the same injected `now` opens the stall window. A full grant is
