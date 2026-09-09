@@ -432,7 +432,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
       # headers under `--all-features`.
