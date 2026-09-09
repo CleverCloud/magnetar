@@ -7,6 +7,7 @@
 //! representation matches what the broker code below expects.
 
 use clap::Parser;
+use clap::error::ErrorKind;
 
 // The CLI types live in `src/main.rs`. We pull them in via a tiny `mod` re-
 // export driven by `path` so the integration test sees the real public-ish
@@ -915,4 +916,205 @@ fn message_id_to_json_surfaces_segment_id_under_feature() {
 
     let with = cli::message_id_to_json(&id.with_segment(SegmentId(9)));
     assert_eq!(with["segmentId"], 9);
+}
+
+// `-1` is the documented "infinite / unlimited" sentinel on every policy
+// setter below, yet clap refused it unless it was spelled `--flag=-1`: a bare
+// `-1` was parsed as an unknown short flag. Twenty of these args even declare
+// `default_value_t = -1`, so their own default could not be typed by hand.
+// `allow_negative_numbers = true` on each arg is the fix; this table pins the
+// space-separated form on all twelve affected commands.
+#[test]
+fn policy_setters_accept_space_separated_negative_one() {
+    // One entry per affected command variant, spelled exactly as an operator
+    // types it. `set-backlog-quota` is the only one of the twelve carrying
+    // extra required flags of its own.
+    let cases: &[&str] = &[
+        "admin namespaces set-retention acme/svc --time-minutes -1 --size-mb -1",
+        "admin namespaces set-backlog-quota acme/svc --type destination-storage \
+         --policy producer_request_hold --limit-size -1 --limit-time -1",
+        "admin namespaces set-dispatch-rate acme/svc --rate-msg -1 --rate-byte -1",
+        "admin namespaces set-subscription-dispatch-rate acme/svc --rate-msg -1 --rate-byte -1",
+        "admin namespaces set-replicator-dispatch-rate acme/svc --rate-msg -1 --rate-byte -1",
+        "admin namespaces set-publish-rate acme/svc --rate-msg -1 --rate-byte -1",
+        "admin topics set-retention acme/svc/orders --time-minutes -1 --size-mb -1",
+        "admin topics set-backlog-quota acme/svc/orders --type destination-storage \
+         --policy producer_request_hold --limit-size -1 --limit-time -1",
+        "admin topics set-dispatch-rate acme/svc/orders --rate-msg -1 --rate-byte -1",
+        "admin topics set-subscription-dispatch-rate acme/svc/orders --rate-msg -1 --rate-byte -1",
+        "admin topics set-replicator-dispatch-rate acme/svc/orders --rate-msg -1 --rate-byte -1",
+        "admin topics set-publish-rate acme/svc/orders --rate-msg -1 --rate-byte -1",
+    ];
+    assert_eq!(cases.len(), 12, "one case per affected command variant");
+
+    for case in cases {
+        let mut argv = vec!["magnetar"];
+        argv.extend(case.split_whitespace());
+        assert!(
+            Cli::try_parse_from(&argv).is_ok(),
+            "space-separated `-1` must parse: magnetar {case}"
+        );
+    }
+}
+
+#[test]
+fn admin_namespaces_set_retention_negative_one_reaches_the_fields() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "namespaces",
+        "set-retention",
+        "acme/svc",
+        "--time-minutes",
+        "-1",
+        "--size-mb",
+        "-1",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Namespaces {
+                    sub:
+                        NamespacesCmd::SetRetention {
+                            namespace,
+                            time_minutes,
+                            size_mb,
+                        },
+                },
+        } => {
+            assert_eq!(namespace, "acme/svc");
+            assert_eq!(time_minutes, -1);
+            assert_eq!(size_mb, -1);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_topics_set_publish_rate_negative_one_reaches_the_fields() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "topics",
+        "set-publish-rate",
+        "acme/svc/orders",
+        "--rate-msg",
+        "-1",
+        "--rate-byte",
+        "-1",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Topics {
+                    sub:
+                        TopicsCmd::SetPublishRate {
+                            topic,
+                            rate_msg,
+                            rate_byte,
+                        },
+                },
+        } => {
+            assert_eq!(topic, "acme/svc/orders");
+            assert_eq!(rate_msg, -1);
+            assert_eq!(rate_byte, -1);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+// `--flag=-1` was the only spelling that worked before the fix. It is baked
+// into runbooks and scripts, so it must keep working.
+#[test]
+fn admin_namespaces_set_retention_still_accepts_equals_form() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "namespaces",
+        "set-retention",
+        "acme/svc",
+        "--time-minutes=-1",
+        "--size-mb=-1",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Namespaces {
+                    sub:
+                        NamespacesCmd::SetRetention {
+                            time_minutes,
+                            size_mb,
+                            ..
+                        },
+                },
+        } => {
+            assert_eq!(time_minutes, -1);
+            assert_eq!(size_mb, -1);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+// `allow_negative_numbers` gates on the *shape* of the token: a leading `-` is
+// only taken as a value when the rest of it is a number, so a typo is rejected
+// while it is still being lexed — as an unknown short flag. Asserting that
+// exact kind, rather than merely `Err`, is what pins the setting: the much
+// broader `allow_hyphen_values` swallows the same tokens as values and fails
+// later at value parsing with `ValueValidation`, so swapping it in breaks this
+// test instead of shipping quietly.
+#[test]
+fn admin_namespaces_set_retention_rejects_non_numeric_hyphen_values() {
+    for bad in ["-1abc", "-x"] {
+        let err = Cli::try_parse_from([
+            "magnetar",
+            "admin",
+            "namespaces",
+            "set-retention",
+            "acme/svc",
+            "--time-minutes",
+            bad,
+            "--size-mb",
+            "-1",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::UnknownArgument,
+            "`{bad}` is not a number: it must be rejected as an unknown flag \
+             while lexing, not swallowed as a value and failed later at value \
+             parsing (which is what `allow_hyphen_values` would do)"
+        );
+    }
+}
+
+#[test]
+fn admin_namespaces_set_retention_still_accepts_positive_values() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "namespaces",
+        "set-retention",
+        "acme/svc",
+        "--time-minutes",
+        "4320",
+        "--size-mb",
+        "10240",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Namespaces {
+                    sub:
+                        NamespacesCmd::SetRetention {
+                            time_minutes,
+                            size_mb,
+                            ..
+                        },
+                },
+        } => {
+            assert_eq!(time_minutes, 4320);
+            assert_eq!(size_mb, 10240);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
 }

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`magnetarctl` no longer rejects the `-1` sentinel when it is passed space-separated on the policy-setting commands.**
+  By default clap reads a token beginning with `-` as a flag, and none of these arguments carried one of the opt-ins that relax that, so `--time-minutes -1` was read as an unknown short flag and `magnetarctl admin namespaces set-retention acme/ns --time-minutes -1 --size-mb -1` failed with `error: unexpected argument '-1' found` — even though `-1` is the documented "infinite / unlimited" value on every one of those flags.
+  That error also carried clap's own `tip: to pass '-1' as a value, use '-- -1'`, which is wrong here: `--` ends option parsing rather than escaping the next token, so following the tip returned the same `unexpected argument '-1' found` with the tip itself removed.
+  `--flag=-1` was the only spelling that worked, and it is not the spelling the help text or the docs suggest.
+  Twenty of the affected arguments declare `default_value_t = -1`, so their own default was a value the parser refused when an operator typed it by hand.
+  `allow_negative_numbers = true` is now set on all 24 of them, covering `set-retention`, `set-backlog-quota`, `set-dispatch-rate`, `set-subscription-dispatch-rate`, `set-replicator-dispatch-rate` and `set-publish-rate` under both `admin namespaces` and `admin topics`.
+  The opt-in gates on the shape of the token rather than on the leading hyphen alone — unlike the broader `allow_hyphen_values` — so a malformed `--time-minutes -1abc` is still rejected and the `=` form keeps working unchanged.
+
 ## [1.7.1] - 2026-08-27
 
 ### Fixed

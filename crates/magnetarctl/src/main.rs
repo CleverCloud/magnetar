@@ -1040,10 +1040,10 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
         /// Retention time in minutes. `-1` = infinite, `0` = none.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         time_minutes: i32,
         /// Retention size in MB. `-1` = infinite, `0` = none.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         size_mb: i64,
     },
     /// Remove a namespace's retention policy (fall back to broker default).
@@ -1067,10 +1067,10 @@ pub(crate) enum NamespacesCmd {
         #[arg(long = "type", value_parser = parse_backlog_quota_type)]
         quota_type: BacklogQuotaType,
         /// Maximum bytes for `destination-storage`. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         limit_size: i64,
         /// Maximum age in seconds for `message-age`. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         limit_time: i32,
         /// Action when the quota is exceeded — `producer_request_hold`,
         /// `producer_exception`, or `consumer_backlog_eviction`.
@@ -1149,10 +1149,10 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1179,10 +1179,10 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1209,10 +1209,10 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1239,10 +1239,10 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
     },
     /// Remove a namespace's publish-rate policy.
@@ -1519,10 +1519,10 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
         /// Retention time in minutes. `-1` = infinite, `0` = none.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         time_minutes: i32,
         /// Retention size in MB. `-1` = infinite, `0` = none.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         size_mb: i64,
     },
     /// Remove a topic's retention policy (fall back to namespace default).
@@ -1546,10 +1546,10 @@ pub(crate) enum TopicsCmd {
         #[arg(long = "type", value_parser = parse_backlog_quota_type)]
         quota_type: BacklogQuotaType,
         /// Maximum bytes for `destination-storage`. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         limit_size: i64,
         /// Maximum age in seconds for `message-age`. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         limit_time: i32,
         /// Action when the quota is exceeded — `producer_request_hold`,
         /// `producer_exception`, or `consumer_backlog_eviction`.
@@ -1628,10 +1628,10 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1658,10 +1658,10 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1688,10 +1688,10 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
         /// Averaging window in seconds.
         #[arg(long, default_value_t = 1)]
@@ -1718,10 +1718,10 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
         /// Throttle in messages/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_msg: i32,
         /// Throttle in bytes/sec. `-1` = unlimited.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         rate_byte: i64,
     },
     /// Remove a topic's publish-rate policy.
