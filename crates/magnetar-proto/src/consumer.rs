@@ -1141,6 +1141,36 @@ impl ConsumerState {
         self.receive_latency_hist.clone()
     }
 
+    /// The half-queue permit count [`Self::maybe_flow`] replenishes at. Shared with
+    /// [`Self::is_flow_starved`] so the starvation predicate can never drift from the
+    /// replenishment trigger it reasons about.
+    fn flow_threshold(&self) -> u32 {
+        (self.receiver_queue_size / 2).max(1) as u32
+    }
+
+    /// `true` when this consumer can NEVER emit another flow on its own: the broker has
+    /// dispatched every granted permit (`permit_balance == 0`, issue #349's REAL balance),
+    /// and even popping everything still queued cannot push `consumed_since_flow` across
+    /// the half-queue `flow_threshold` — so [`Self::maybe_flow`] is unreachable, the
+    /// broker sits at zero permits, and both sides wait on each other forever.
+    ///
+    /// Dispatch units that are debited from `permit_balance` but never popped are what
+    /// opens the gap between "consumed" and "delivered": dead-lettered messages
+    /// (`classify_and_queue`'s DLQ branch), incomplete chunks buffered in `deliver`, and
+    /// any broker-side debit the client mirror missed. Without those, pops always cross
+    /// the threshold before the balance empties and this predicate stays `false`.
+    ///
+    /// Read by the two `initial_flow` gates (the #307 Failover promotion re-arm and
+    /// [`crate::Connection::initial_flow`]) so a starved-but-previously-fed consumer —
+    /// refused by the additive `granted_permits == 0` gate, invisible to the #414 stall
+    /// watchdog (`permit_balance > 0` candidacy), and unable to reach `maybe_flow` — has
+    /// exactly one exit.
+    pub fn is_flow_starved(&self) -> bool {
+        self.permit_balance == 0
+            && (self.consumed_since_flow as usize).saturating_add(self.queue.len())
+                < self.flow_threshold() as usize
+    }
+
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
@@ -1148,7 +1178,7 @@ impl ConsumerState {
         if self.closed || self.pending_seek.is_some() || self.paused {
             return None;
         }
-        let threshold = (self.receiver_queue_size / 2).max(1) as u32;
+        let threshold = self.flow_threshold();
         if self.consumed_since_flow < threshold {
             return None;
         }
