@@ -174,7 +174,7 @@ testcontainers = "^0.28.0"
 # canonical API and is already in the graph via tokio/rustls, so no new crate
 # enters the dependency tree.
 socket2 = "^0.6.5"
-rstest         = "^0.26.1"
+rstest         = "^0.27.0"
 proptest       = "^1.11.0"
 tempfile       = "^3.27.0"
 wiremock       = "^0.6.5"
