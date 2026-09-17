@@ -42,10 +42,11 @@ use magnetar_proto::{
 struct Reaction {
     /// `ProducerClosedByBroker` surfaced for this handle?
     saw_close_event: bool,
-    /// A fresh `CommandProducer` was re-emitted on the same socket?
-    reattached: bool,
-    /// `CommandProducer.epoch` on the wire for that re-attach.
-    epoch_on_wire: Option<u64>,
+    /// `Some(epoch)` when a fresh `CommandProducer` was re-emitted on the same
+    /// socket, carrying that `CommandProducer.epoch` (a re-attach always stamps
+    /// a non-zero epoch, so a missing one reads as `Some(0)` and fails the
+    /// expectation); `None` when no re-attach was emitted.
+    reattach_epoch: Option<u64>,
     /// Send-drain gate shut right after the close (before any re-attach ack)?
     gate_closed_after_close: bool,
     /// `CommandSend` frames emitted between the close and the re-attach ack
@@ -203,11 +204,10 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     // A publish staged behind the gate must not reach the wire.
     let _ = conn.send(handle, outgoing(b"staged"), 0, t0).expect("send");
     let (opens, send_frames_before_ack) = drain_outbound(conn, handle);
-    let reattached = opens.iter().any(|(rid, _)| *rid == reattach_rid);
-    let epoch_on_wire = opens
+    let reattach_epoch = opens
         .iter()
         .find(|(rid, _)| *rid == reattach_rid)
-        .and_then(|(_, epoch)| *epoch);
+        .map(|(_, epoch)| epoch.unwrap_or(0));
 
     // Ack the re-attach (only meaningful when one was emitted; harmless
     // otherwise — an unmatched ProducerSuccess is ignored).
@@ -217,8 +217,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
 
     Reaction {
         saw_close_event,
-        reattached,
-        epoch_on_wire,
+        reattach_epoch,
         gate_closed_after_close,
         send_frames_before_ack,
         send_frames_after_ack,
@@ -248,8 +247,7 @@ fn run_both(url: Option<String>) -> (Reaction, Reaction) {
 fn expected_in_place_reaction() -> Reaction {
     Reaction {
         saw_close_event: false,
-        reattached: true,
-        epoch_on_wire: Some(1),
+        reattach_epoch: Some(1),
         gate_closed_after_close: true,
         send_frames_before_ack: 0,
         send_frames_after_ack: 2,

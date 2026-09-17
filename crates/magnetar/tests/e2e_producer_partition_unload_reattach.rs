@@ -23,7 +23,7 @@
 //!    the broker arbitrates; parity with Java on that path is UNVERIFIED (ADR-0106 § Consequences).
 //!    The outcome is printed, not asserted.
 //!
-//! A standalone broker runs the ModularLoadManager, so the close carries
+//! A standalone broker runs the `ModularLoadManager`, so the close carries
 //! `assigned_broker_service_url = None`. The `Some(url)` shape an
 //! Extensible-Load-Manager multi-phase unload produces is covered by the proto,
 //! runtime and differential layers instead.
@@ -133,7 +133,9 @@ async fn e2e_producer_partition_unload_reattach() -> Result<(), Box<dyn std::err
     // Warm up so every child producer is attached before the unload.
     for i in 0..(PARTITIONS * 2) {
         producer
-            .send(OutgoingMessage::with_payload(format!("warmup-{i}").into_bytes()).into())
+            .send(OutgoingMessage::with_payload(
+                format!("warmup-{i}").into_bytes(),
+            ))
             .await?;
     }
 
@@ -156,7 +158,7 @@ async fn e2e_producer_partition_unload_reattach() -> Result<(), Box<dyn std::err
         let payload = format!("post-unload-{i}").into_bytes();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            producer.send(OutgoingMessage::with_payload(payload).into()),
+            producer.send(OutgoingMessage::with_payload(payload)),
         )
         .await
         .unwrap_or_else(|_| {
