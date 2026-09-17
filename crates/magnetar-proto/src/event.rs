@@ -391,6 +391,14 @@ pub enum ConnectionEvent {
     },
 
     /// The broker asked us to close a producer (e.g. fenced).
+    ///
+    /// Surfaced ONLY while that producer's open is still in flight (issue #451,
+    /// [ADR-0106](../../specs/adr/0106-reattach-broker-closed-producer-in-place.md)):
+    /// the parked open waiter — `EventWaitFut` on tokio, `ProducerReadyFut` on
+    /// moonpool — is the one reader in the tree, and it owns that open's outcome.
+    /// An ESTABLISHED producer is re-attached in place on the same socket
+    /// instead, transparently to the runtime, and a closed or unknown handle
+    /// pushes nothing at all.
     ProducerClosedByBroker {
         /// The producer that was closed.
         handle: ProducerHandle,

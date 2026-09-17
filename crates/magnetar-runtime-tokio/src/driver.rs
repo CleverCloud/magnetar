@@ -42,6 +42,12 @@
 //! reset. This delivers at-least-once publish parity with the Java client (mirrors
 //! `ProducerImpl#resendMessages`).
 //!
+//! Stage 3 is the RECONNECT path only. A broker `CommandCloseConsumer` or
+//! `CommandCloseProducer` that arrives on a connection which stays up never reaches
+//! it: the sans-io layer re-attaches that single handle in place on the same socket
+//! (issue #307 for consumers, issue #451 / ADR-0106 for producers) and this driver
+//! only flushes the frames that re-attach encoded during `handle_bytes`.
+//!
 //! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use std::collections::VecDeque;
