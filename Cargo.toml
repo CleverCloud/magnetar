@@ -73,23 +73,23 @@ rustc-hash      = "^2.1.3"
 # via its own `crypto-*` feature so cargo does NOT silently unify two
 # providers into a single build (issue #9, ADR-0035). `tls12` and
 # `logging` stay on; both are rustls's own default-on features.
-rustls               = { version = "^0.23.43", default-features = false, features = ["std", "tls12", "logging"] }
+rustls               = { version = "^0.23.45", default-features = false, features = ["std", "tls12", "logging"] }
 # rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
 rustls-pki-types     = { version = "^1.15.1", features = ["std"] }
 rustls-native-certs  = "^0.8.4"
-tokio-rustls         = { version = "^0.26.4", default-features = false }
+tokio-rustls         = { version = "^0.26.5", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "^0.4.0", default-features = false }
+rustls-openssl       = { version = "^0.4.1", default-features = false }
 
 # Compression — Pulsar's four codecs
 lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
-zstd       = { version = "^0.13.3", default-features = false }
+zstd       = { version = "^0.14.0", default-features = false }
 snap       = "^1.1.2"
-flate2     = { version = "^1.1.9", default-features = false, features = ["zlib"] }
+flate2     = { version = "^1.1.10", default-features = false, features = ["zlib"] }
 
 # Schemas
 serde       = { version = "^1.0.229", features = ["derive"] }
@@ -105,12 +105,12 @@ apache-avro = "^0.22.0"
 schemars    = { version = "^1.2.2", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.24.1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.26.1", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-aws-lc-rs` (ADR-0030 + ADR-0035).
-aws-lc-rs  = { version = "^1.18.0", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-rs  = { version = "^1.18.1", default-features = false, features = ["aws-lc-sys"] }
 # Alternate RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-ring`. Same RSASSA-PKCS1-v1_5 SHA-256
 # signature bytes as aws-lc-rs (RFC 8017 deterministic encoding).
@@ -151,10 +151,10 @@ moonpool-sim = "^0.8.0"
 # IO connectors. The broker insists on `multipart/form-data` with a
 # `url=<pkg-url>` part and a typed JSON part (`functionConfig` /
 # `sourceConfig` / `sinkConfig`), even when no file is uploaded.
-reqwest = { version = "^0.13.4", default-features = false, features = ["json", "form", "multipart"] }
+reqwest = { version = "^0.13.5", default-features = false, features = ["json", "form", "multipart"] }
 url     = "^2.5.8"
 http    = "^1.5.0"
-clap    = { version = "^4.6.6", features = ["derive", "env"] }
+clap    = { version = "^4.6.7", features = ["derive", "env"] }
 
 # Telemetry + errors
 opentelemetry      = { version = "^0.32.0", default-features = false, features = ["trace"] }
@@ -174,7 +174,7 @@ testcontainers = "^0.28.0"
 # canonical API and is already in the graph via tokio/rustls, so no new crate
 # enters the dependency tree.
 socket2 = "^0.6.5"
-rstest         = "^0.26.1"
+rstest         = "^0.27.0"
 proptest       = "^1.11.0"
 tempfile       = "^3.27.0"
 wiremock       = "^0.6.5"
