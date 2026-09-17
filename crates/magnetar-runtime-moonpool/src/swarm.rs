@@ -255,8 +255,14 @@ impl SwarmConfig {
     }
 
     /// No-feature stub of [`Self::build_buggify`] — always the disabled
-    /// helper, keeping one call shape on both feature axes.
+    /// helper, keeping one call shape on both feature axes: callers use
+    /// method syntax (`swarm.build_buggify(rng)`) and are compiled under
+    /// the no-`buggify` seed-replay/sweep cells, and the armed twin reads
+    /// `self`. This stub reads nothing, which trips pedantic `unused_self`
+    /// under `clippy.toml`'s `avoid-breaking-exported-api = false`; hence
+    /// the explicit allow.
     #[cfg(not(feature = "buggify"))]
+    #[allow(clippy::unused_self)]
     #[must_use]
     pub fn build_buggify<R>(&self, _rng: R) -> magnetar_proto::Buggify {
         magnetar_proto::Buggify::disabled()

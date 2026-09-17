@@ -145,6 +145,9 @@ Run before declaring a task done (in this order):
 cargo +nightly fmt --all
 cargo build --workspace --all-features
 cargo clippy --workspace --all-features --all-targets -- -D warnings
+# no-buggify axis of the moonpool engine — the seed-replay/sweep cell;
+# --all-features cfg-strips its stubs, so this is the only lint pass over it
+cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. Local-only per ADR-0036 (fixed seeds
