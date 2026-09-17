@@ -18661,3 +18661,182 @@ mod otel_property_round_trip_tests {
         assert!(conn.poll_transmit().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #437: the flow permit of a dead-lettered dispatch unit.
+//
+// `consumer::tests` pins the ledger arithmetic in isolation; this module pins
+// the one thing only `Connection` can own — that the refund reaches the WIRE on
+// the same inbound frame that crosses the half-queue threshold, through the
+// `maybe_flow()` call the `Message` arm already makes after every `deliver`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod dead_letter_flow_refund_tests {
+    use super::*;
+
+    /// Receiver queue for the consumer under test. `maybe_flow`'s threshold is
+    /// `max(RQ / 2, 1)` = 4.
+    const RQ: usize = 8;
+    /// `SubscribeRequest::max_redeliver_count`: a frame whose `redelivery_count`
+    /// exceeds this routes to the dead-letter pending list instead of the queue.
+    const MAX_REDELIVER: u32 = 1;
+    /// Redelivery counter stamped on the synthetic frames — strictly greater than
+    /// [`MAX_REDELIVER`], so every one of them dead-letters.
+    const OVER_REDELIVERED: u32 = 2;
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(crate::SUPPORTED_PROTOCOL_VERSION),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// Handshake, subscribe a `Shared` consumer with a dead-letter threshold, ack the
+    /// subscribe, grant the initial flow, and drain the outbound buffer so later wire
+    /// assertions see only what the scenario produces.
+    fn dlq_consumer(t0: Instant) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/dlq-flow-refund".to_owned(),
+            subscription: "sub-dlq-flow-refund".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Shared,
+            receiver_queue_size: RQ,
+            max_redeliver_count: MAX_REDELIVER,
+            ..Default::default()
+        });
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: subscribe_rid,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &success).expect("encode CommandSuccess");
+        conn.handle_bytes(t0, &buf).expect("Success");
+        while conn.poll_event().is_some() {}
+        let _ = conn.initial_flow(handle, t0);
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    /// One synthetic broker `CommandMessage` + payload addressed to `handle`, with an
+    /// explicit `redelivery_count` so a test can push it over the dead-letter threshold.
+    fn message_frame(handle: ConsumerHandle, entry_id: u64, redelivery_count: u32) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 7,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(redelivery_count),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "dlq-flow-refund-producer".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, &meta, b"poison").expect("encode_payload");
+        buf.to_vec()
+    }
+
+    /// Every `CommandFlow` this consumer emitted, in wire order.
+    fn drain_flow_grants(conn: &mut Connection, handle: ConsumerHandle) -> Vec<u32> {
+        let mut out = conn.poll_transmit();
+        let mut grants = Vec::new();
+        while !out.is_empty() {
+            let frame = crate::frame::decode_one(&mut out).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                if let Some(flow) = frame.command.flow {
+                    if flow.consumer_id == handle.0 {
+                        grants.push(flow.message_permits);
+                    }
+                }
+            }
+        }
+        grants
+    }
+
+    #[test]
+    fn a_half_queue_of_dead_letters_re_grants_on_the_same_inbound_frame() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = dlq_consumer(t0);
+        for entry in 0..(RQ as u64 / 2) {
+            conn.handle_bytes(t0, &message_frame(handle, entry, OVER_REDELIVERED))
+                .expect("Message frame");
+        }
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            drain_flow_grants(&mut conn, handle),
+            vec![RQ as u32 / 2],
+            "the frame that crosses the half-queue threshold must carry the re-grant, \
+             emitted by the `maybe_flow()` the Message arm already calls after `deliver`",
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            RQ as u32,
+            "and the real balance is back to the full window",
+        );
+        assert_eq!(
+            conn.drain_dead_letter(handle).len(),
+            RQ / 2,
+            "every refunded unit is still buffered for the application to republish",
+        );
+    }
+
+    #[test]
+    fn a_full_window_of_dead_letters_never_starves_the_consumer() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = dlq_consumer(t0);
+        for entry in 0..RQ as u64 {
+            conn.handle_bytes(t0, &message_frame(handle, entry, OVER_REDELIVERED))
+                .expect("Message frame");
+        }
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            drain_flow_grants(&mut conn, handle),
+            vec![RQ as u32 / 2, RQ as u32 / 2],
+            "a whole receiver queue of poison re-grants twice, half a window each time",
+        );
+        assert!(
+            !conn
+                .consumer(handle)
+                .expect("consumer slot")
+                .state
+                .lock()
+                .is_flow_starved(),
+            "permits alone must no longer wedge a poison-fed Shared consumer (#437)",
+        );
+    }
+}

@@ -247,9 +247,18 @@ pub struct ConsumerState {
     /// [`crate::Connection::resubscribe_consumer_in_place`] is one of those boundaries, so
     /// the counter would clear itself on every attempt and the bound would not exist.
     pub(crate) stall_recovery_attempts: u32,
-    /// Number of permits we've consumed since the last flow command. Visible to the
+    /// Number of permits the client owes the broker back since the last flow command: one
+    /// per dispatch unit whose fate the client has decided. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
+    ///
+    /// Written in exactly one place, [`Self::record_broker_permit_consumed`], from four
+    /// callers — [`Self::pop_message`], the incomplete-chunk buffer in [`Self::deliver`],
+    /// [`Self::record_marker_consumed`], and the dead-letter branch of
+    /// `classify_and_queue` (issue #437) — and zeroed by [`Self::maybe_flow`] when it
+    /// grants, plus at the churn boundaries that zero the permit mirrors. It is
+    /// refund-driven, not pop-driven: the invariant it holds up is
+    /// `granted window == permit_balance + consumed_since_flow + queue.len()`.
     pub(crate) consumed_since_flow: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
@@ -1154,11 +1163,14 @@ impl ConsumerState {
     /// the half-queue `flow_threshold` — so [`Self::maybe_flow`] is unreachable, the
     /// broker sits at zero permits, and both sides wait on each other forever.
     ///
-    /// Dispatch units that are debited from `permit_balance` but never popped are what
-    /// opens the gap between "consumed" and "delivered": dead-lettered messages
-    /// (`classify_and_queue`'s DLQ branch), incomplete chunks buffered in `deliver`, and
-    /// any broker-side debit the client mirror missed. Without those, pops always cross
-    /// the threshold before the balance empties and this predicate stays `false`.
+    /// Defence-in-depth since issue #437. What opens the gap between "charged" and
+    /// "refunded" is a dispatch unit debited from `permit_balance` that never credits
+    /// `consumed_since_flow`, and every client-side path that used to do that is closed:
+    /// a dead-lettered unit refunds in `classify_and_queue`'s DLQ branch and an incomplete
+    /// chunk refunds in `deliver`, both at buffering time (ADR-0107). What remains is a
+    /// broker-side debit the client mirror missed, which no well-formed wire frame
+    /// produces — hence the twin `failover_starved_reflow.rs` tests manufacturing the state
+    /// by direct slot mutation rather than by feeding frames.
     ///
     /// Read by the two `initial_flow` gates (the #307 Failover promotion re-arm and
     /// [`crate::Connection::initial_flow`]) so a starved-but-previously-fed consumer —
@@ -1193,6 +1205,20 @@ impl ConsumerState {
         })
     }
 
+    /// Credit the flow ledger for ONE dispatch unit the broker charged and the client will
+    /// not (or no longer) hold against the receiver queue.
+    ///
+    /// Four callers, one rule: a unit is refunded the moment the client decides it will
+    /// never be popped, or the moment it actually is. [`Self::pop_message`] refunds a
+    /// delivered message at the pop; the incomplete-chunk buffer in [`Self::deliver`] and
+    /// the dead-letter branch of `classify_and_queue` (issue #437) refund at buffering,
+    /// because neither will ever reach a pop; and [`Self::record_marker_consumed`] refunds a
+    /// PIP-33 marker the conn-level filter drops. Nothing else may call it — a
+    /// `DeliverOutcome::Dropped` frame moves neither side of the mirror, and neither does an
+    /// ADR-0105 `ack_set`-cleared batch position, which the broker never charged.
+    ///
+    /// Deliberately does NOT touch [`Self::permit_balance`]: that is the live arrival mirror
+    /// and belongs to [`Self::record_dispatch_unit`]. A site that owes both calls both.
     fn record_broker_permit_consumed(&mut self) {
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
     }
@@ -1367,8 +1393,8 @@ impl ConsumerState {
         self.record_broker_permit_consumed();
         // Issue #349: a marker is one broker-dispatched unit too — decrement the
         // REAL balance directly (not through `record_broker_permit_consumed`,
-        // which only tracks the pop-driven `consumed_since_flow` counter, the
-        // wrong site for the live balance). Issue #414: the same call bumps the
+        // which credits the `consumed_since_flow` refund ledger, the wrong site
+        // for the live arrival mirror). Issue #414: the same call bumps the
         // watchdog's progress mark, so a marker-only stream (a replicated
         // subscription with no user traffic) counts as broker liveness.
         self.record_dispatch_unit();
@@ -1877,8 +1903,8 @@ impl ConsumerState {
                     // it never reaches `classify_and_queue` (reassembly is
                     // still pending) — decrement the REAL balance directly
                     // rather than through `record_broker_permit_consumed`
-                    // (which only tracks the pop-driven `consumed_since_flow`
-                    // counter, the wrong site for the live balance). Issue
+                    // (which credits the `consumed_since_flow` refund ledger,
+                    // the wrong site for the live arrival mirror). Issue
                     // #414: a consumer mid-reassembly is receiving, so the
                     // same call bumps the watchdog's progress mark.
                     self.record_dispatch_unit();
@@ -2082,6 +2108,21 @@ impl ConsumerState {
         // entry is still evidence the broker is dispatching to us.
         self.record_dispatch_unit();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
+            // Issue #437: a unit the broker charged is refunded to the flow
+            // ledger the moment the client decides it will never be popped.
+            // All four refund sites follow that one rule — `pop_message`, the
+            // incomplete-chunk buffer, `record_marker_consumed`, and this
+            // branch — and it mirrors `ConsumerImpl.messageReceived`, which
+            // calls `increaseAvailablePermits(cnx)` straight after it skips an
+            // over-redelivered message, and `receiveIndividualMessagesFromBatch`,
+            // which accumulates `skippedMessages` and calls
+            // `increaseAvailablePermits(cnx, skippedMessages)` once per entry
+            // (apache/pulsar master 2c3133a5:1555-1565 and :1865-1866). This
+            // was the only debit site without its refund: a dead-lettered unit
+            // is never queued, so no `pop_message` would ever count it, and the
+            // ledger drifted one-way by exactly the dead-letter count until a
+            // churn boundary zeroed both mirrors. See ADR-0107.
+            self.record_broker_permit_consumed();
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
             DeliverOutcome::Buffered
@@ -2543,6 +2584,206 @@ mod tests {
         assert_eq!(
             c.permit_balance, 99,
             "a DLQ-routed message still consumes exactly one dispatch unit"
+        );
+    }
+
+    #[test]
+    fn dlq_routed_units_refill_flow_at_half_queue() {
+        // Issue #437: the broker spent a permit dispatching the entry, and the client
+        // decides on arrival that it will never be popped. The refund therefore belongs
+        // at routing time, exactly where Java puts it
+        // (`ConsumerImpl.messageReceived` -> `increaseAvailablePermits`).
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        for _ in 0..4 {
+            c.deliver(
+                &message_cmd(2),
+                metadata(1),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert!(c.queue.is_empty(), "every unit dead-lettered, none queued");
+        assert_eq!(c.dead_letter_pending.len(), 4);
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "a dead-lettered unit must credit the flow ledger the moment it is buffered",
+        );
+        assert_eq!(c.permit_balance, 4, "four of eight permits spent");
+        let flow = c
+            .maybe_flow()
+            .expect("four dead-lettered units cross the half-queue threshold");
+        assert_eq!(flow.message_permits, 4);
+        assert_eq!(c.permit_balance, 8, "the grant restores the full window");
+        assert_eq!(c.granted_permits, 12);
+    }
+
+    #[test]
+    fn eight_dlq_units_do_not_starve() {
+        // The wedge issue #437 reports: a full receiver queue of poison drains the real
+        // balance to zero with nothing ever queued, so `maybe_flow` was unreachable and
+        // `is_flow_starved` became true with no exit for a Shared consumer.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        let mut grants = Vec::new();
+        for _ in 0..8 {
+            c.deliver(
+                &message_cmd(2),
+                metadata(1),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+            if let Some(flow) = c.maybe_flow() {
+                grants.push(flow.message_permits);
+            }
+        }
+        assert_eq!(
+            grants,
+            vec![4, 4],
+            "each half-queue of dead-lettered units must re-grant its own width",
+        );
+        assert!(
+            !c.is_flow_starved(),
+            "permits alone must no longer wedge a poison-fed consumer",
+        );
+        assert_eq!(c.dead_letter_pending.len(), 8);
+    }
+
+    #[test]
+    fn mixed_pop_and_dlq_units_share_one_flow_ledger() {
+        // One ledger, four refund sites: pop, incomplete chunk, PIP-33 marker, dead letter.
+        // A stream mixing popped and dead-lettered units crosses the threshold on their sum.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &message_cmd(0),
+            metadata(1),
+            None,
+            Bytes::from_static(b"good"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let _ = c
+            .pop_message(std::time::Instant::now())
+            .expect("the well-behaved unit is queued");
+        for _ in 0..3 {
+            c.deliver(
+                &message_cmd(2),
+                metadata(1),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "one popped plus three dead-lettered"
+        );
+        let flow = c.maybe_flow().expect("the sum crosses the threshold");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn dead_lettered_batch_members_refill_flow() {
+        // Java's batched path accumulates `skippedMessages` and calls
+        // `increaseAvailablePermits(cnx, skippedMessages)` once per entry
+        // (`receiveIndividualMessagesFromBatch`). The per-member refund here adds up to
+        // the same grant.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &message_cmd(2),
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(c.queue.is_empty(), "every batch member dead-lettered");
+        assert_eq!(c.dead_letter_pending.len(), 4);
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "each dead-lettered batch member is one dispatch unit to refund",
+        );
+        let flow = c
+            .maybe_flow()
+            .expect("a wholly dead-lettered four-member entry crosses the threshold");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn paused_consumer_accrues_dlq_refund_without_emitting() {
+        // `maybe_flow` already honours `paused`, matching Java's `!paused` gate inside
+        // `increaseAvailablePermits`. The refund still accrues, so un-pausing grants it.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        c.paused = true;
+        let _ = c.initial_flow();
+        for _ in 0..4 {
+            c.deliver(
+                &message_cmd(2),
+                metadata(1),
+                None,
+                Bytes::from_static(b"poison"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "the refund accrues even while the consumer is paused",
+        );
+        assert!(
+            c.maybe_flow().is_none(),
+            "a paused consumer emits no flow — the broker is meant to stop dispatching",
+        );
+        c.paused = false;
+        let flow = c
+            .maybe_flow()
+            .expect("un-pausing releases the accrued refund");
+        assert_eq!(flow.message_permits, 4);
+    }
+
+    #[test]
+    fn a_dead_lettered_batch_refunds_only_the_positions_the_broker_charged() {
+        // ADR-0105 boundary: a re-dispatched entry whose `ack_set` clears positions was
+        // charged only for the ones it still lists unacked, so only those may be refunded
+        // — dead-lettered or not. Both sides of the mirror stay still for the rest.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_redeliver_count = 1;
+        let _ = c.initial_flow();
+        c.deliver(
+            &pb::CommandMessage {
+                ack_set: vec![0b1010],
+                ..message_cmd(2)
+            },
+            metadata(4),
+            None,
+            four_message_batch(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.dead_letter_pending.len(),
+            2,
+            "only the still-unacked positions are routed anywhere",
+        );
+        assert_eq!(
+            c.permit_balance, 6,
+            "the broker charged two of the four positions",
+        );
+        assert_eq!(
+            c.consumed_since_flow, 2,
+            "and exactly those two are refunded — never a position the broker never charged",
         );
     }
 

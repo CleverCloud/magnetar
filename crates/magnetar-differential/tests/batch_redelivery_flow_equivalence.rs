@@ -168,6 +168,8 @@ fn trace() -> Trace {
         Op::OpenSharedConsumer {
             name: CONSUMER.to_owned(),
             receiver_queue_size: RQ,
+            // Issue #437: no dead-letter threshold — this trace predates it.
+            max_redeliver_count: 0,
         },
         // 2
         recv(),
@@ -406,6 +408,8 @@ async fn unbatched_shared_delivery_is_unchanged() {
     ops.push(Op::OpenSharedConsumer {
         name: CONSUMER.to_owned(),
         receiver_queue_size: RQ,
+        // Issue #437: no dead-letter threshold — this trace predates it.
+        max_redeliver_count: 0,
     });
     for _ in &payloads {
         ops.push(recv());

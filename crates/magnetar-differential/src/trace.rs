@@ -13,7 +13,8 @@
 //! partition-aware siblings `SendPartition`, `RecvPartition`,
 //! `AckPartition`, `SeekPartition` for the partitioned-topic traces, and the
 //! `…Shared` family (`OpenSharedConsumer`, `RecvShared`, `AckShared`,
-//! `AckLastReceivedShared`, `CloseSharedConsumer`, `ResubscribeShared`) for the
+//! `AckLastReceivedShared`, `NackShared`, `DrainDeadLettersShared`,
+//! `CloseSharedConsumer`, `ResubscribeShared`) for the
 //! Shared-subscription traces.
 //! Extend it as new differential coverage lands; keep every variant
 //! **observable** so the equivalence check stays meaningful.
@@ -204,6 +205,12 @@ pub enum Op {
         name: String,
         /// Receiver-queue size for this consumer (its initial permit grant).
         receiver_queue_size: usize,
+        /// Issue #437: `SubscribeRequest::max_redeliver_count`. A dispatch whose
+        /// `redelivery_count` exceeds this routes to the consumer's dead-letter
+        /// pending list instead of the receiver queue. `0` — the value every
+        /// pre-#437 trace passes — disables the dead-letter branch entirely and
+        /// leaves the subscribe frame byte-identical.
+        max_redeliver_count: u32,
     },
     /// Issue #414: receive from the named Shared consumer.
     RecvShared {
@@ -241,6 +248,30 @@ pub enum Op {
         /// Name from a previous [`Self::OpenSharedConsumer`].
         name: String,
     },
+    /// Issue #437: negatively acknowledge a message id on the named Shared
+    /// consumer, handing the entry back to that subscription's dispatcher so the
+    /// broker re-dispatches it with an incremented `redelivery_count`.
+    ///
+    /// [`Self::Nack`] targets the trace's default single consumer, which is a
+    /// different subscription shape — the dead-letter threshold only takes effect
+    /// on a re-dispatch the Shared dispatcher stamps, so the wedge needs this one.
+    /// Resolves to [`Event::Nacked`], fire-and-forget at the engine surface.
+    NackShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+        /// Target message id.
+        message_id: MessageId,
+    },
+    /// Issue #437: drain the named Shared consumer's dead-letter pending list —
+    /// what an application does before republishing to its DLQ topic.
+    ///
+    /// Resolves to [`Event::DeadLettersDrained`] carrying the number of messages
+    /// taken, so a trace can assert that an over-redelivered entry was routed to
+    /// the buffer rather than the receiver queue.
+    DrainDeadLettersShared {
+        /// Name from a previous [`Self::OpenSharedConsumer`].
+        name: String,
+    },
     /// Issue #414: close the named Shared consumer — the mid-drain detach. Its
     /// un-acked in-flight entries go back to the subscription's redelivery pool
     /// and the survivors pick them up.
@@ -272,6 +303,28 @@ pub enum Op {
         /// Target message id.
         message_id: MessageId,
     },
+}
+
+/// The per-consumer subscribe knobs an [`Op::OpenSharedConsumer`] carries,
+/// folded into ONE runner parameter.
+///
+/// Both runners' `open_shared_consumer` already takes the client, the
+/// harness-local consumer map, the name, the topic, the subscription and the
+/// invocation-wide ack timeout; issue #437's `max_redeliver_count` would have
+/// been the eighth scalar and `clippy::too_many_arguments` (7) is denied
+/// workspace-wide. Grouping the two window knobs keeps the signature under the
+/// limit without an `#[allow]`, and keeps the tokio and moonpool runners
+/// identical on this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedConsumerWindow {
+    /// Receiver-queue size for this consumer (its initial permit grant).
+    pub receiver_queue_size: usize,
+    /// Issue #437: `SubscribeRequest::max_redeliver_count`. A dispatch whose
+    /// `redelivery_count` exceeds this routes to the consumer's dead-letter
+    /// pending list instead of the receiver queue. `0` — the value every
+    /// pre-#437 trace passes — disables the dead-letter branch entirely and
+    /// leaves the subscribe frame byte-identical.
+    pub max_redeliver_count: u32,
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`
@@ -430,6 +483,14 @@ pub enum Event {
     SharedConsumerOpened {
         /// Un-spent broker permits right after the initial flow.
         permits: u32,
+    },
+    /// [`Op::DrainDeadLettersShared`] resolved: `count` messages were taken off the
+    /// named consumer's dead-letter pending list. Issue #437: a dead-lettered unit
+    /// lands here instead of the receiver queue, and the permit the broker spent on
+    /// it is refunded at that moment.
+    DeadLettersDrained {
+        /// Number of messages the drain removed.
+        count: usize,
     },
     /// [`Op::CloseSharedConsumer`] resolved: the broker acked the close and the
     /// consumer detached from its Shared dispatcher.

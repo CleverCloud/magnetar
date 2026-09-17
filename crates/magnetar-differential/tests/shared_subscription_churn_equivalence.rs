@@ -88,10 +88,14 @@ fn churn_trace() -> Trace {
         Op::OpenSharedConsumer {
             name: "a".to_owned(),
             receiver_queue_size: RQ,
+            // Issue #437: no dead-letter threshold — this trace predates it.
+            max_redeliver_count: 0,
         },
         Op::OpenSharedConsumer {
             name: "b".to_owned(),
             receiver_queue_size: RQ,
+            // Issue #437: no dead-letter threshold — this trace predates it.
+            max_redeliver_count: 0,
         },
         // One receive each. Neither acks, so whatever "b" is holding is still
         // owed by the subscription when it leaves.
@@ -137,6 +141,8 @@ fn churn_trace() -> Trace {
         Op::OpenSharedConsumer {
             name: "late".to_owned(),
             receiver_queue_size: RQ,
+            // Issue #437: no dead-letter threshold — this trace predates it.
+            max_redeliver_count: 0,
         },
         Op::Close,
     ]);
@@ -271,6 +277,8 @@ async fn shared_consumer_resubscribe_event_streams_agree() {
             Op::OpenSharedConsumer {
                 name: "a".to_owned(),
                 receiver_queue_size: RQ,
+                // Issue #437: no dead-letter threshold — this trace predates it.
+                max_redeliver_count: 0,
             },
             Op::RecvShared {
                 name: "a".to_owned(),
@@ -363,6 +371,8 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
             Op::OpenSharedConsumer {
                 name: "idle".to_owned(),
                 receiver_queue_size: RQ,
+                // Issue #437: no dead-letter threshold — this trace predates it.
+                max_redeliver_count: 0,
             },
             Op::RecvShared {
                 name: "idle".to_owned(),
@@ -492,10 +502,14 @@ fn wedge_trace(topic: &str, subscription: &str) -> Trace {
             Op::OpenSharedConsumer {
                 name: "survivor".to_owned(),
                 receiver_queue_size: SURVIVOR_RQ,
+                // Issue #437: no dead-letter threshold — this trace predates it.
+                max_redeliver_count: 0,
             },
             Op::OpenSharedConsumer {
                 name: "leaver".to_owned(),
                 receiver_queue_size: LEAVER_RQ,
+                // Issue #437: no dead-letter threshold — this trace predates it.
+                max_redeliver_count: 0,
             },
             // The churn. Aggregate: 2 + 4 granted, minus 4 returned, minus a second
             // 4 that was never credited → -2, with the survivor still holding 2.

@@ -202,9 +202,9 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
                 .expect("deliver drain message");
         }
         // Drop the Message events + confirm no stray outbound bytes leaked
-        // from delivery alone (delivery never emits a flow on its own here
-        // — `consumed_since_flow` only moves on `pop_message`, which this
-        // test never calls).
+        // from delivery alone (delivery never emits a flow on its own here —
+        // no frame in this test is popped, dead-lettered, a PIP-33 marker or
+        // an incomplete chunk, so `consumed_since_flow` never moves).
         while conn.poll_event().is_some() {}
         let _ = conn.poll_transmit();
 

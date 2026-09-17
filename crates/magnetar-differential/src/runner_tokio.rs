@@ -14,7 +14,7 @@ use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{CreateProducerRequest, MessageId, SubscribeRequest};
 use magnetar_runtime_tokio::{Client, ClientError, Consumer, Producer};
 
-use crate::trace::{Event, EventStream, Op, Trace};
+use crate::trace::{Event, EventStream, Op, SharedConsumerWindow, Trace};
 
 /// Build the per-partition topic name for a given base topic.
 /// Mirrors Java `PartitionedProducerImpl`'s topic-naming convention.
@@ -509,6 +509,7 @@ async fn run_with_config(
             Op::OpenSharedConsumer {
                 name,
                 receiver_queue_size,
+                max_redeliver_count,
             } => {
                 stream.push(
                     open_shared_consumer(
@@ -517,7 +518,10 @@ async fn run_with_config(
                         name,
                         &trace.topic,
                         &trace.subscription,
-                        *receiver_queue_size,
+                        SharedConsumerWindow {
+                            receiver_queue_size: *receiver_queue_size,
+                            max_redeliver_count: *max_redeliver_count,
+                        },
                         shared_ack_timeout,
                     )
                     .await?,
@@ -559,6 +563,21 @@ async fn run_with_config(
                     }
                     stream.push(event);
                 }
+            }
+            Op::NackShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                consumer.negative_ack(*message_id);
+                stream.push(Event::Nacked);
+            }
+            Op::DrainDeadLettersShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(Event::DeadLettersDrained {
+                    count: consumer.drain_dead_letter().len(),
+                });
             }
             Op::CloseSharedConsumer { name } => {
                 // `close` consumes the handle, so close a clone and keep the
@@ -865,19 +884,23 @@ async fn run_ack(consumer: &Consumer, message_id: MessageId) -> Event {
 /// Issue #414: open one more `SubType::Shared` consumer on the trace's
 /// `(topic, subscription)`, held under a harness-local name.
 ///
-/// `receiver_queue_size` is the initial permit grant, and reading it straight
-/// back through `Consumer::available_permits()` is the point of the returned
-/// event: that accessor now reports the REAL decrementing balance, so both
-/// engines must agree on it before any dispatch lands.
+/// [`SharedConsumerWindow::receiver_queue_size`] is the initial permit grant,
+/// and reading it straight back through `Consumer::available_permits()` is the
+/// point of the returned event: that accessor now reports the REAL decrementing
+/// balance, so both engines must agree on it before any dispatch lands.
 async fn open_shared_consumer(
     client: &Client,
     map: &mut HashMap<String, Consumer>,
     name: &str,
     topic: &str,
     subscription: &str,
-    receiver_queue_size: usize,
+    window: SharedConsumerWindow,
     ack_timeout: Option<Duration>,
 ) -> Result<Event, ClientError> {
+    let SharedConsumerWindow {
+        receiver_queue_size,
+        max_redeliver_count,
+    } = window;
     let consumer = client
         .subscribe_with(
             SubscribeRequest {
@@ -885,6 +908,9 @@ async fn open_shared_consumer(
                 subscription: subscription.to_owned(),
                 sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
                 receiver_queue_size,
+                // Issue #437: `0` — what every pre-#437 trace passes — disables the
+                // dead-letter branch and leaves the subscribe frame byte-identical.
+                max_redeliver_count,
                 // Issue #436: `None` (the default) leaves the unacked-message tracker
                 // unbuilt, which is the shape every other Shared trace runs in.
                 ack_timeout,
