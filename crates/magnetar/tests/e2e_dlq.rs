@@ -475,3 +475,122 @@ async fn e2e_partitioned_consumer_aggregate_republishes_every_child_dead_letter(
     client.close().await;
     Ok(())
 }
+
+/// Issue #437: a receiver queue's worth of dead letters must not wedge the subscription.
+///
+/// The broker charges a permit for every dispatch unit, dead-letter-bound ones included. The
+/// client mirrors that debit, and before this fix it never credited the permit back — a
+/// dead-lettered unit is never queued, so it is never popped, and `consumed_since_flow` (the
+/// counter `maybe_flow` compares against the half-queue threshold) only moved on a pop. Net
+/// `-1` per dead-lettered unit, one-way. A poison-heavy `Shared` subscription therefore
+/// parked at `availablePermits=0` with `msgRateOut=0`, no error and no reconnect: the issue
+/// #414 stall watchdog needs `permit_balance > 0` to consider the consumer a candidate, and
+/// the issue #307 promotion re-arm only fires on a `Failover` election.
+///
+/// Java refunds at routing time — `ConsumerImpl.messageReceived` calls
+/// `increaseAvailablePermits(cnx)` straight after it skips an over-redelivered message — and
+/// so does magnetar now. This is that claim against a real broker: drive a small receiver
+/// queue's worth of poison past `max_redeliver_count`, publish one sentinel behind it, and
+/// require the sentinel WITHOUT the application having drained the dead letters first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_dlq_flow_survives_a_receiver_queue_of_dead_letters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-dlq-flow-{id}");
+    let dlq_topic = format!("persistent://public/default/magnetar-e2e-dlq-flow-{id}-DLQ");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // Three poison payloads, published before the consumer attaches so the dispatch order is
+    // the broker's and not a race with the subscribe.
+    let producer = client.producer(topic.clone()).create().await?;
+    for index in 0..3u8 {
+        producer
+            .send(OutgoingMessage::with_payload(format!("poison-{index}").into_bytes()).into())
+            .await?;
+    }
+
+    // A two-permit window: `maybe_flow`'s threshold is `max(2 / 2, 1)` = 1, so every refund
+    // is its own `CommandFlow` and two un-refunded dispatch units are enough to empty it.
+    let consumer = client
+        .consumer(topic.clone())
+        .subscription("magnetar-dlq-flow-sub")
+        .subscription_type(SubType::Shared)
+        .receiver_queue_size(2)
+        .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    // Drain-and-redeliver rounds. Nothing is ever acked, so each round bumps every entry's
+    // broker-side redelivery count; at `redelivery_count > 1` the client stops queueing them
+    // and routes them to the dead-letter buffer instead. Repeated rounds re-dispatch the
+    // still-unacked dead letters, which is exactly the traffic that used to drain the window
+    // to zero for good.
+    for _ in 0..6 {
+        while let Ok(Ok(message)) =
+            tokio::time::timeout(Duration::from_millis(400), consumer.receive()).await
+        {
+            // Deliberately unacked: the redelivery count is the whole mechanism here.
+            let _ = message;
+        }
+        consumer.redeliver_unacked();
+    }
+
+    // The sentinel goes out behind the poison, after the window has been spent on units the
+    // client will never hand to the application.
+    producer
+        .send(OutgoingMessage::with_payload(b"sentinel".to_vec()).into())
+        .await?;
+    producer.close().await?;
+
+    // The load-bearing assertion. Before the fix the broker holds zero permits for this
+    // consumer and never dispatches the sentinel, so this times out — `msgRateOut = 0` with
+    // a non-empty backlog, seen from the application. No `republish_dead_letters` call is
+    // allowed to precede it: the point is that the consumer recovers its own flow.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut sentinel_seen = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, consumer.receive()).await {
+            Ok(Ok(message)) => {
+                if message.payload.as_ref() == b"sentinel" {
+                    consumer.ack(message.message_id).await?;
+                    sentinel_seen = true;
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        sentinel_seen,
+        "a message published behind a receiver queue of dead letters must still be \
+         dispatched: every dead-lettered unit returns its flow permit at routing time \
+         (available_permits() reads {})",
+        consumer.available_permits(),
+    );
+
+    // And the poison really did go to the dead-letter buffer rather than the queue. `>=`, not
+    // `==`: every `redeliver_unacked` round re-dispatched the still-unacked dead letters and
+    // the routing path does not de-duplicate ids, so the buffer holds at least one entry per
+    // poison payload and usually several.
+    let dlq_producer = client.producer(dlq_topic.clone()).create().await?;
+    let republished = consumer.republish_dead_letters(&dlq_producer).await?;
+    assert!(
+        republished >= 3,
+        "each poison payload must have been routed to the dead-letter buffer at least once, \
+         got {republished}",
+    );
+
+    dlq_producer.close().await?;
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}

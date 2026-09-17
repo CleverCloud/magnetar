@@ -48,6 +48,16 @@ Since [ADR-0101](../specs/adr/0101-consumer-stall-detection-and-in-place-recover
 
 > **Semantic change.** Before ADR-0101 this accessor read the purely-additive grant mirror, which never moved under dispatch — it read `receiver_queue_size` forever whether the broker was streaming or dead. If you have code that treated it as a cumulative grant total, it now returns the un-spent balance instead. [ADR-0082](../specs/adr/0082-consumer-permit-balance-split.md)'s deferral of exactly this accessor is what ADR-0101 amends.
 
+Two things this rung does NOT cover.
+
+A poison-heavy topic with a dead-letter policy is not a stall.
+Until [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md) it looked exactly like one from the outside — the balance fell to zero and stayed there, because a dead-lettered dispatch unit was debited and never refunded — and no rung on this ladder could recover it.
+A dead-lettered unit now returns its permit at routing time, so the balance climbs again on its own and the subscription keeps draining.
+What grows instead is the consumer's dead-letter buffer, which only `drain_dead_letter` / `republish_dead_letters` empties.
+
+And `permit_balance == 0` was never in scope for the watchdog below: `is_stall_candidate` requires `permit_balance > 0`, since a consumer holding no permits has told the broker nothing it is failing to honour.
+A balance pinned at zero is therefore read here, by polling, and not reported as a `ConsumerStalled` event.
+
 ### 2. Arm the stall watchdog
 
 ```rust

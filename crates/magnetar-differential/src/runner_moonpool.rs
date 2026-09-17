@@ -24,7 +24,7 @@ use magnetar_proto::{ConnectionConfig, CreateProducerRequest, MessageId, Subscri
 use magnetar_runtime_moonpool::{Client, ClientError, Consumer, MoonpoolEngine, Producer};
 use moonpool_core::TokioProviders;
 
-use crate::trace::{Event, EventStream, Op, Trace};
+use crate::trace::{Event, EventStream, Op, SharedConsumerWindow, Trace};
 
 /// Build the per-partition topic name for a given base topic.
 /// Mirrors Java `PartitionedProducerImpl`'s topic-naming convention.
@@ -439,6 +439,7 @@ async fn replay(
             Op::OpenSharedConsumer {
                 name,
                 receiver_queue_size,
+                max_redeliver_count,
             } => {
                 stream.push(
                     open_shared_consumer(
@@ -447,7 +448,10 @@ async fn replay(
                         name,
                         &trace.topic,
                         &trace.subscription,
-                        *receiver_queue_size,
+                        SharedConsumerWindow {
+                            receiver_queue_size: *receiver_queue_size,
+                            max_redeliver_count: *max_redeliver_count,
+                        },
                         shared_ack_timeout,
                     )
                     .await?,
@@ -489,6 +493,21 @@ async fn replay(
                     }
                     stream.push(event);
                 }
+            }
+            Op::NackShared { name, message_id } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                consumer.negative_ack(*message_id);
+                stream.push(Event::Nacked);
+            }
+            Op::DrainDeadLettersShared { name } => {
+                let consumer = shared_consumers
+                    .get(name)
+                    .expect("trace names a shared consumer it never opened");
+                stream.push(Event::DeadLettersDrained {
+                    count: consumer.drain_dead_letter().len(),
+                });
             }
             Op::CloseSharedConsumer { name } => {
                 // `close` consumes the handle, so close a clone and keep the
@@ -785,25 +804,32 @@ async fn run_ack(consumer: &Consumer<TokioProviders>, message_id: MessageId) -> 
 /// `(topic, subscription)`, held under a harness-local name. 1:1 with
 /// `runner_tokio::open_shared_consumer`.
 ///
-/// `receiver_queue_size` is the initial permit grant, and reading it straight
-/// back through `Consumer::available_permits()` is the point of the returned
-/// event: that accessor now reports the REAL decrementing balance, so both
-/// engines must agree on it before any dispatch lands.
+/// [`SharedConsumerWindow::receiver_queue_size`] is the initial permit grant,
+/// and reading it straight back through `Consumer::available_permits()` is the
+/// point of the returned event: that accessor now reports the REAL decrementing
+/// balance, so both engines must agree on it before any dispatch lands.
 async fn open_shared_consumer(
     client: &Client<TokioProviders>,
     map: &mut HashMap<String, Consumer<TokioProviders>>,
     name: &str,
     topic: &str,
     subscription: &str,
-    receiver_queue_size: usize,
+    window: SharedConsumerWindow,
     ack_timeout: Option<Duration>,
 ) -> Result<Event, ClientError> {
+    let SharedConsumerWindow {
+        receiver_queue_size,
+        max_redeliver_count,
+    } = window;
     let consumer = client
         .subscribe(SubscribeRequest {
             topic: topic.to_owned(),
             subscription: subscription.to_owned(),
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
             receiver_queue_size,
+            // Issue #437: `0` — what every pre-#437 trace passes — disables the
+            // dead-letter branch and leaves the subscribe frame byte-identical.
+            max_redeliver_count,
             durable: true,
             // Issue #436: `None` (the default) leaves the unacked-message tracker unbuilt,
             // which is the shape every other Shared trace runs in.

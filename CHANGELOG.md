@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A dead-lettered dispatch unit now returns its flow permit, so a poison-heavy `Shared` subscription no longer wedges at `availablePermits=0`.**
+  The broker charges one permit per dispatch unit — `Consumer#sendMessages` debits `ackedCount - totalMessages` — and a unit the client will route to its dead-letter buffer is inside `totalMessages`, because the broker has no idea what the client intends to do with the entry.
+  `ConsumerState::classify_and_queue` mirrored that debit correctly: `record_dispatch_unit()` runs unconditionally, before the queued-versus-dead-lettered branch.
+  What it never did was hand the permit back.
+  `consumed_since_flow` — the counter `maybe_flow` compares against `max(receiver_queue_size / 2, 1)` — was credited only by `pop_message`, the incomplete-chunk buffer, and the PIP-33 marker filter, and a dead-lettered unit is never queued, so it is never popped.
+  No later path compensated either: `drain_dead_letter` is a `std::mem::take`, `Connection::ack` never touches the flow ledger, and `republish_dead_letters` is drain, send, ack.
+  So each dead-lettered unit was a net `-1` permit, drifting one way by exactly the dead-letter count until a churn boundary zeroed both mirrors.
+  A receiver queue's worth of poison drove `permit_balance` to zero with `consumed_since_flow` still at zero, and nothing could recover it: `maybe_flow` was unreachable with nothing left to pop, `is_stall_candidate` requires `permit_balance > 0` so the issue #414 watchdog and ADR-0103's automatic recovery never fired, and `is_flow_starved` is read only by the Failover promotion re-arm and `Connection::initial_flow` — churn and election boundaries a `Shared` subscription never reaches on its own.
+  The broker showed `availablePermits=0` and `msgRateOut=0` with no error and no reconnect, and `Consumer::available_permits()` read `0`.
+  The dead-letter branch now calls `record_broker_permit_consumed()` before it buffers the message, which is the rule the other three refund sites already followed and the one Java follows in both dispatch shapes: `ConsumerImpl.messageReceived` calls `increaseAvailablePermits(cnx)` immediately after it skips an over-redelivered message, and `receiveIndividualMessagesFromBatch` accumulates `skippedMessages` and calls `increaseAvailablePermits(cnx, skippedMessages)` once per entry.
+  There is no new emission site: `conn.rs`'s `Message` arm already calls `maybe_flow()` after every `deliver`, so the inbound frame that crosses the half-queue threshold carries the `CommandFlow` out, batched entries whose members all dead-letter included.
+  The invariant is now uniform — `granted window == permit_balance + consumed_since_flow + queue.len()` — with `Delivered` refunded at pop, `Buffered` refunded at buffering, `Dropped` moving neither side, and an ADR-0105 ack-set-cleared position moving neither side because the broker never charged it.
+  Two consequences are worth planning for.
+  The accidental backpressure is gone, so a poison-heavy topic keeps dispatching and `dead_letter_pending` — an unbounded `Vec` — grows until the application calls `drain_dead_letter` or `republish_dead_letters`; nothing auto-drains it.
+  And permits ALONE no longer wedge the consumer: a dead-lettered unit stays unacked at the broker until `republish_dead_letters` acks it, so an application that never drains still stops at the broker's `maxUnackedMessagesPerConsumer`.
+  On upgrade, a subscription that had parked at `availablePermits=0` resumes draining and its DLQ topic may receive a burst.
+  (issue #437; ADR-0107, amending ADR-0082's "pop-driven `consumed_since_flow`" parenthetical and ADR-0105's "`consumed_since_flow` only moves on `pop_message`" clause)
+
+- **A `Failover` consumer whose permit balance was drained to zero without crossing the flow threshold is re-armed on promotion.**
+  `ConsumerState::is_flow_starved` is `true` when the broker has dispatched every granted permit and even popping the whole remaining queue could not push `consumed_since_flow` across the half-queue threshold — so `maybe_flow` is unreachable and both sides wait on each other forever.
+  It is now read by both `initial_flow` gates: the issue #307 `CommandActiveConsumerChange { is_active: true }` promotion re-arm and `Connection::initial_flow` itself, whose additive `granted_permits == 0` gate a previously-fed consumer never satisfies again outside a churn boundary.
+  A fed consumer with permits still in flight gets no grant, so the issue #427 no-double-grant contract is unchanged.
+  This was shipped before the issue #437 refund above and is retro-documented here; with the refund in place the predicate is no longer reachable through well-formed wire frames and remains as defence-in-depth for a broker-side debit the client mirror missed.
+  (issue #443, PR #444; recorded in ADR-0107)
+
 - **`magnetarctl` no longer rejects the `-1` sentinel when it is passed space-separated on the policy-setting commands.**
   By default clap reads a token beginning with `-` as a flag, and none of these arguments carried one of the opt-ins that relax that, so `--time-minutes -1` was read as an unknown short flag and `magnetarctl admin namespaces set-retention acme/ns --time-minutes -1 --size-mb -1` failed with `error: unexpected argument '-1' found` — even though `-1` is the documented "infinite / unlimited" value on every one of those flags.
   That error also carried clap's own `tip: to pass '-1' as a value, use '-- -1'`, which is wrong here: `--` ends option parsing rather than escaping the next token, so following the tip returned the same `unexpected argument '-1' found` with the tip itself removed.

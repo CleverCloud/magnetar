@@ -5,9 +5,12 @@
 //! ## The corner this pins
 //!
 //! A consumer that was fed once (`granted_permits > 0`) can drain its REAL permit
-//! balance (#349) to zero through dispatch units that are debited but never popped —
-//! dead-lettered messages are the deterministic client-side path (`classify_and_queue`
-//! debits the balance for a DLQ-routed message that no `pop_message` will ever count).
+//! balance (#349) to zero through dispatch units that are debited but never refunded.
+//! Issue #437 closed the client-side path into that state — a dead-lettered unit now
+//! credits the flow ledger at routing time, exactly as `pop_message`, the incomplete-chunk
+//! buffer and the PIP-33 marker filter do — so what remains is a broker-side debit the
+//! client mirror missed, and this test manufactures it by zeroing `permit_balance` on the
+//! slot directly rather than by feeding frames.
 //! Once `permit_balance == 0` with too little queued to cross the `maybe_flow`
 //! threshold, every recovery mechanism declines:
 //!
@@ -47,16 +50,10 @@ use crate::common::handshake_response_bytes;
 
 /// Receiver queue for every test. `maybe_flow`'s threshold is `max(RQ / 2, 1)` = 4.
 const RQ: usize = 8;
-/// `SubscribeRequest::max_redeliver_count`: a frame whose `redelivery_count` exceeds
-/// this routes to the DLQ pending list instead of the queue.
-const MAX_REDELIVER: u32 = 1;
-/// Redelivery counter stamped on the synthetic frames — strictly greater than
-/// [`MAX_REDELIVER`], so every one of them dead-letters.
-const OVER_REDELIVERED: u32 = 2;
 
-/// Handshake, subscribe a `Failover` consumer with a DLQ threshold, ack the subscribe,
-/// and force the initial flow so the broker holds exactly [`RQ`] permits. Drains the
-/// outbound buffer so later wire assertions see only what the scenario produces.
+/// Handshake, subscribe a `Failover` consumer, ack the subscribe, and force the initial
+/// flow so the broker holds exactly [`RQ`] permits. Drains the outbound buffer so later
+/// wire assertions see only what the scenario produces.
 fn open_failover_consumer(shared: &ConnectionShared, topic: &str, at: Instant) -> ConsumerHandle {
     {
         let mut conn = shared.inner.lock();
@@ -71,7 +68,6 @@ fn open_failover_consumer(shared: &ConnectionShared, topic: &str, at: Instant) -
         subscription: "magnetar-test-starved-reflow".to_owned(),
         sub_type: pb::command_subscribe::SubType::Failover,
         receiver_queue_size: RQ,
-        max_redeliver_count: MAX_REDELIVER,
         ..Default::default()
     };
     let (handle, subscribe_request_id) = {
@@ -167,22 +163,22 @@ fn drain_flow_permits(out: &mut Bytes) -> Vec<u32> {
     grants
 }
 
-/// Drive the consumer into the starved state: the broker dispatches the full granted
-/// window as over-redelivered frames, every one of which dead-letters — debiting the
-/// real balance to zero while `consumed_since_flow` stays at zero (nothing is ever
-/// queued, so nothing is ever popped).
-fn starve(shared: &ConnectionShared, handle: ConsumerHandle, at: Instant) {
-    let mut conn = shared.inner.lock();
-    for entry in 0..RQ as u64 {
-        let frame = message_frame(handle, 7, entry, OVER_REDELIVERED);
-        conn.handle_bytes(at, &frame).expect("Message frame");
-    }
-    while conn.poll_event().is_some() {}
-    // No flow may have been emitted by delivery itself: dead-lettered units never pop.
-    assert_eq!(
-        drain_flow_permits(&mut conn.poll_transmit()),
-        Vec::<u32>::new(),
-        "dead-lettered dispatch must not replenish flow on its own"
+/// Put the consumer in the starved state: the REAL balance at zero with `consumed_since_flow`
+/// and the queue both empty, so `maybe_flow` can never be reached again.
+///
+/// Since issue #437 no well-formed wire frame produces this — every dispatch unit the broker
+/// charges is refunded when the client decides its fate, so the ledger cannot drift. What the
+/// state still models is a broker-side debit the client mirror missed, which is the second
+/// cause `is_flow_starved` was written for, so the state is set directly on the slot (the
+/// same mutation `conn.rs`'s own churn-boundary test performs).
+fn starve(shared: &ConnectionShared, handle: ConsumerHandle, _at: Instant) {
+    let conn = shared.inner.lock();
+    let slot = conn.consumer(handle).expect("consumer slot").clone();
+    let mut state = slot.state.lock();
+    state.permit_balance = 0;
+    assert!(
+        state.is_flow_starved(),
+        "the fixture must land in the state the fix reasons about"
     );
 }
 

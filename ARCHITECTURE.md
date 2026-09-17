@@ -550,6 +550,10 @@ Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permi
   Incremented at the same three grant sites, by the identical delta.
   Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
   Force-zeroed everywhere `granted_permits` is zeroed, so the two never drift apart at a churn boundary.
+- **`consumed_since_flow: u32`** — the refund ledger `maybe_flow` compares against `max(receiver_queue_size / 2, 1)`.
+  It has one writer, `record_broker_permit_consumed`, and exactly four callers: `pop_message`, the incomplete-chunk buffer in `deliver`, `record_marker_consumed`, and `classify_and_queue`'s dead-letter branch.
+  The rule they share is that a unit the broker charged is refunded the moment the client decides it will never be popped — which is `ConsumerImpl.messageReceived`'s `increaseAvailablePermits(cnx)` and `receiveIndividualMessagesFromBatch`'s `increaseAvailablePermits(cnx, skippedMessages)` ([ADR-0107](specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md)).
+  The resulting invariant on every frame path is `granted window == permit_balance + consumed_since_flow + queue.len()`: `Delivered` is refunded at pop, `Buffered` at buffering, `Dropped` moves neither side, and a position the broker never charged (an [ADR-0105](specs/adr/0105-read-the-delivered-batch-index-ack-set.md) cleared `ack_set` bit) moves neither side either.
 
 `flow_stats` feeds `permit_balance` — not `granted_permits` — into `FlowStats::available_permits`, the signal [`Auto::adjust`](../crates/magnetar-proto/src/receiver_queue.rs) uses to detect starvation.
 Before this split, the single additive field never registered a genuine dispatch-driven starvation (issue #349): `Auto` never scaled up under real load.
@@ -1198,7 +1202,7 @@ The removal is symmetric with the positive-ack path, which already drops acked i
                       receive(msg) — redelivery_count = N
                                   │
                                   ▼
-                  if N >= max_redeliver_count
+                  if N > max_redeliver_count
                                   │
                               yes ───── no → normal ack flow
                                   │

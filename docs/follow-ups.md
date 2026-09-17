@@ -20,12 +20,15 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                     | Status                   |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)           | ⚡ ready to dispatch     |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                         | 🧠 needs design decision |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)     | ⚡ ready to dispatch     |
-| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load) | ⚡ ready to dispatch     |
+| #   | Item                                                                                                                                           | Status                   |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                 | ⚡ ready to dispatch     |
+| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                               | 🧠 needs design decision |
+| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)           | ⚡ ready to dispatch     |
+| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)       | ⚡ ready to dispatch     |
+| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered) | 🟡 deferred              |
+| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                 | 🟡 deferred              |
+| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                       | 🧠 needs design decision |
 
 ---
 
@@ -83,6 +86,33 @@ It is **not proven**. This entry previously asserted "a real thread, a `spawn_bl
 **Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
 
 **Do not** fix this by widening the 90-second margin. The margin is virtual; widening it makes the race less likely to be observed without changing anything real, which is the failure mode [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) and the `lookup_error_propagation` correction both exist to avoid.
+
+## 16. The batched `deliver` loop counts dead-lettered members as delivered
+
+**Gap.** `ConsumerState::deliver`'s batched branch increments its own `delivered` counter after every `classify_and_queue` call, including for a member the dead-letter branch routed to `dead_letter_pending` rather than to the queue.
+The branch then returns `DeliverOutcome::Delivered { count: delivered }`, so `count` over-reports by the number of dead-lettered members.
+`conn.rs`'s `Message` arm reads `count` as "the number of newly delivered tail entries" and clones `queue[queue_len - count ..]` to emit one `ConnectionEvent::Message` per entry, so an over-reported count makes it re-emit observational events for OLDER queued entries it already announced.
+
+**Why it stays open.** It is adjacent to [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md) and read-verified, but it changes event emission rather than flow accounting, so it wants its own test layers and its own line in the compatibility story — an application counting `ConnectionEvent::Message` sees a behaviour change.
+The permit ledger is unaffected either way: `record_dispatch_unit` and the dead-letter refund are per-member and do not read `delivered`.
+
+## 17. The PIP-33 marker branch returns before `maybe_flow`
+
+**Gap.** `conn.rs`'s `Message` arm filters a replicated-subscription marker, calls `consumer.record_marker_consumed()` — which credits `consumed_since_flow` — and returns from the arm before reaching the `consumer.maybe_flow()` call the ordinary delivery path makes.
+A marker-only stream therefore accrues refunds it never emits: the grant waits for the next non-marker frame, or for a `pop_message` that a stream carrying no user messages never gets.
+
+**Why it stays open.** The accounting is correct (the ledger holds the credit, nothing is lost) and the practical window is a replicated subscription with no user traffic at all, so the cost is latency to the next grant rather than a wedge.
+Closing it means deciding whether the marker path should emit its own flow or whether the keepalive sweep should drain the ledger, which is a small design call and the ADR-0024 five layers.
+
+## 18. `dead_letter_pending` is unbounded and never auto-drained
+
+**Gap.** `ConsumerState::dead_letter_pending` is a plain `Vec<IncomingMessage>` with no cap, and every caller that empties it is user-driven (`Consumer::drain_dead_letter`, `Consumer::republish_dead_letters` and the aggregate wrappers).
+Before [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md) the missing flow refund was an accidental bound: the subscription wedged once a receiver queue's worth of poison had accumulated, so the buffer stopped growing.
+With the refund in place a poison-heavy topic keeps dispatching and the buffer grows until the application drains it.
+
+**Why it stays open.** Needs a product decision, and the Java client offers no precedent: it has no client-side dead-letter buffer at all, it republishes to the DLQ topic and acks inside `messageReceived`.
+The options are not equivalent — cap and drop (loses messages the application asked to see), cap and stop refunding (reintroduces the wedge deliberately, with a documented contract), or auto-republish when a producer is configured (changes what `dead_letter_policy` means).
+There is a residual bound today regardless: a dead-lettered unit stays unacked at the broker until `republish_dead_letters` acks it, so an application that never drains eventually stops at `maxUnackedMessagesPerConsumer`.
 
 ## Notes on this file
 
