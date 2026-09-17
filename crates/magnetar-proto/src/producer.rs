@@ -193,7 +193,11 @@ pub struct ProducerState {
     /// CURRENT session via `CommandProducerSuccess`. Starts `false`; flipped
     /// true by the `ProducerSuccess` handler, back to `false` on session
     /// reset ([`Self::snapshot_pending_sends`]), on a transient open
-    /// failure, and on a broker-forced `CommandCloseProducer`. While
+    /// failure, and on a broker-forced `CommandCloseProducer` — which, on a
+    /// connection that stays up, also re-emits `CommandProducer` for the same
+    /// producer id so the gate reopens on the fresh `ProducerSuccess` rather
+    /// than staying shut for the life of the connection (issue #451,
+    /// ADR-0106). While
     /// `false`, the connection-wide drain skips this slot: Pulsar closes
     /// the WHOLE connection on a `CommandSend` for a producer that is not
     /// ready ("Received message, but the producer is not ready : N.

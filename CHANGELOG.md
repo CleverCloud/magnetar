@@ -33,6 +33,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   This was shipped before the issue #437 refund above and is retro-documented here; with the refund in place the predicate is no longer reachable through well-formed wire frames and remains as defence-in-depth for a broker-side debit the client mirror missed.
   (issue #443, PR #444; recorded in ADR-0107)
 
+- **A broker `CommandCloseProducer` on a connection that stays up no longer leaves that producer detached until the process restarts.**
+  `pulsar-admin topics unload` of one partition of a partitioned topic makes the owning broker remove the producer and write the frame on a connection that keeps serving every other producer and consumer on it — no TCP drop, so no supervised reconnect and no `rebuild_producers`.
+  The `Type::CloseProducer` arm only shut the send-drain gate and pushed a `ProducerClosedByBroker` event that nothing reads for an already-assembled producer, so the slot sat at `closed = false, broker_ready = false, open_request_id = None` for the life of the connection and every publish the round-robin router sent to that partition failed `code=-1 send timeout` forever.
+  The producer is now re-attached in place on the same connection with a bumped `epoch`, exactly as the `CommandCloseConsumer` twin has done since issue #307, and the gate stays shut until the broker's fresh `CommandProducerSuccess` replays the staged publishes.
+  A `ServiceNotReady` answer while the bundle reloads — the expected one, since the broker fences the topic before writing the close — rides the existing operation-retry leg (2 s initial backoff plus a lookup) and gives up with a terminal error after the configured budget instead of hanging.
+  An `assigned_broker_service_url` on the close takes the same in-place path: no path owned that event shape on a live socket, and an Extensible-Load-Manager multi-phase unload makes it the default close shape.
+  A `warn!` now records every such close with the handle, topic, request id, epoch and truncated assigned URL.
+  `ProducerClosedByBroker` is surfaced only while a producer open is still in flight, where its parked waiter is the one reader that can consume it; a closed or unknown handle pushes nothing.
+  (issue #451; [ADR-0106](specs/adr/0106-reattach-broker-closed-producer-in-place.md))
+
 - **`magnetarctl` no longer rejects the `-1` sentinel when it is passed space-separated on the policy-setting commands.**
   By default clap reads a token beginning with `-` as a flag, and none of these arguments carried one of the opt-ins that relax that, so `--time-minutes -1` was read as an unknown short flag and `magnetarctl admin namespaces set-retention acme/ns --time-minutes -1 --size-mb -1` failed with `error: unexpected argument '-1' found` — even though `-1` is the documented "infinite / unlimited" value on every one of those flags.
   That error also carried clap's own `tip: to pass '-1' as a value, use '-- -1'`, which is wrong here: `--` ends option parsing rather than escaping the next token, so following the tip returned the same `unexpected argument '-1' found` with the tip itself removed.

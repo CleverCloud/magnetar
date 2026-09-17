@@ -3197,39 +3197,99 @@ impl Connection {
                     ))?;
                 let handle = ProducerHandle(close.producer_id);
                 // Broker reasons for `CommandCloseProducer`:
-                //   - PIP-188 topic migration (`assigned_broker_service_url` set): producer is
-                //     supposed to reconnect on the new URL.
+                //   - Same-broker bundle unload / reassignment on a LIVE socket (`pulsar-admin
+                //     topics unload`, bundle split, load shedding): no TCP drop follows, so no
+                //     supervised reconnect ever runs.
+                //   - PIP-188 topic migration or an Extensible-Load-Manager multi-phase unload
+                //     (`assigned_broker_service_url` set): the URL is a dial hint.
                 //   - Broker restart / failover / cluster swap via `ServiceUrlProvider`: TCP drops
-                //     next; supervised reconnect re-attaches via `rebuild_producers`.
-                //   - Admin-initiated forced delete: a subsequent send will surface a broker-side
-                //     rejection (`ProducerFenced`, etc.) which is the right place to surface the
-                //     error.
+                //     next; the supervised reconnect re-attaches via `rebuild_producers`.
+                //   - Admin-initiated forced delete: the re-attach below is rejected non-retryably
+                //     (`ProducerFenced`, `TopicNotFound`), which terminalizes the slot — the right
+                //     place to surface the error.
                 //
-                // All cases are *transient at the protocol level* — the
-                // user-facing producer handle keeps being valid. Mirroring
-                // Java's `ProducerImpl.connectionClosed`, we surface the
-                // event for observability but do NOT permanently mark
-                // `closed=true`. Marking it closed would cause
-                // `rebuild_producers` to filter it out (`!p.closed` at
-                // conn.rs:933), so the supervised reconnect would never
-                // re-establish the producer and the next user `send()`
-                // would surface `ProducerError::Closed →
-                // InvariantViolation("producer rejected send")` even
-                // though the broker is willing to re-accept it.
+                // All cases are *transient at the protocol level* — the user-facing
+                // producer handle keeps being valid. Mirroring Java's
+                // `ProducerImpl.connectionClosed`, we never permanently mark
+                // `closed=true`. Marking it closed would cause `rebuild_producers` to
+                // filter it out (`!p.closed`), so the supervised reconnect would never
+                // re-establish the producer and the next user `send()` would surface
+                // `ProducerError::Closed → InvariantViolation("producer rejected send")`
+                // even though the broker is willing to re-accept it.
                 //
-                // Refs: Task #56.
-                // The broker detached the producer — close the drain gate so no
-                // staged send reaches the wire before the re-attachment's
-                // `ProducerSuccess` (send-to-detached-producer closes the whole
-                // connection broker-side).
-                if let Some(slot) = self.producers.get(&handle) {
-                    slot.state.lock().broker_ready = false;
+                // Issue #451 ROOT CAUSE: keeping the handle valid was only ever HALF the
+                // recovery. `rebuild_producers` runs exclusively after a new-session
+                // handshake, and the ADR-0080 retry leg is armed only by a `CommandError`
+                // for a still-pending open — a close creates neither. So a close that
+                // arrives while the connection STAYS UP left the slot at
+                // `closed=false, broker_ready=false, open_request_id=None` for the life of
+                // the connection: `drain_producer_outbound` skips it forever and every
+                // `send()` routed to it resolved `code=-1 "send timeout"` until the process
+                // restarted. Re-attach it IN PLACE on this socket instead, exactly like the
+                // `CommandCloseConsumer` twin below does for issue #307.
+                //
+                // Unlike the consumer twin, `assigned_broker_service_url = Some(url)` takes
+                // the SAME in-place path: no existing path owns
+                // `ProducerClosedByBroker { assigned_broker_service_url: Some(_) }` on a
+                // live socket (the driver's migration arm keys on
+                // `ConnectionEvent::TopicMigrated`), and on an Extensible-Load-Manager
+                // cluster `Some(url)` is the DEFAULT shape of a plain unload
+                // (`PersistentTopic.close` attaches the assigned lookup data whenever
+                // multi-phase bundle unload is on). Java uses the URL only as a dial hint
+                // and re-sends `CommandProducer` regardless; when it names this
+                // connection's broker the in-place open succeeds, otherwise it fails
+                // bounded through the ADR-0080 retry leg.
+                //
+                // Refs: Task #56, issue #451, ADR-0106.
+                let url = close.assigned_broker_service_url;
+                match self.emit_in_place_producer_reattach(handle) {
+                    Some(request_id) => {
+                        let (topic, epoch) = self
+                            .producers
+                            .get(&handle)
+                            .map(|slot| (slot.identity.topic.clone(), slot.state.lock().epoch))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            topic = %topic,
+                            request_id = ?request_id,
+                            epoch,
+                            assigned_broker_service_url = url
+                                .as_deref()
+                                .map(crate::log_fields::truncate_broker_str),
+                            "broker closed attached producer on a live connection; \
+                             re-attaching in place (#451)"
+                        );
+                        // Transparent to the runtime: NO `ProducerClosedByBroker` event,
+                        // mirroring the #307 consumer re-subscribe. A parked runtime wait
+                        // future would otherwise mistake it for a terminal close.
+                    }
+                    None => {
+                        // Not eligible. Close the drain gate anyway — the broker has
+                        // detached this producer id and Pulsar closes the WHOLE connection
+                        // on a `CommandSend` for a producer that is not ready.
+                        //
+                        // Keep surfacing the event ONLY while an open is in flight: its
+                        // parked waiter (`EventWaitFut` / `ProducerReadyFut`, armed just
+                        // inside the open operation) is the sole reader in the tree, and it
+                        // owns that open's outcome. For a user-closed or unknown handle
+                        // nobody can ever consume the event, so pushing one would only grow
+                        // the queue — one per partition under bundle churn.
+                        let open_in_flight = self.producers.get(&handle).is_some_and(|slot| {
+                            let mut producer = slot.state.lock();
+                            producer.broker_ready = false;
+                            producer.open_request_id.is_some()
+                        });
+                        if open_in_flight {
+                            self.events
+                                .push_back(ConnectionEvent::ProducerClosedByBroker {
+                                    handle,
+                                    assigned_broker_service_url: url,
+                                });
+                        }
+                    }
                 }
-                self.events
-                    .push_back(ConnectionEvent::ProducerClosedByBroker {
-                        handle,
-                        assigned_broker_service_url: close.assigned_broker_service_url,
-                    });
             }
             pb::base_command::Type::CloseConsumer => {
                 let close = command
@@ -7615,6 +7675,66 @@ impl Connection {
         // message, but the producer is not ready"). Java parity:
         // `ProducerImpl#handleProducerSuccess` → `resendMessages`.
         Some(request_id)
+    }
+
+    /// Re-attach a producer the broker closed on a still-live socket: re-emit
+    /// `CommandProducer` for the SAME producer id with a bumped `epoch`, keeping the
+    /// send-drain gate shut until the broker's fresh `CommandProducerSuccess` (issue
+    /// #451, ADR-0106).
+    ///
+    /// This is the producer twin of [`Self::emit_in_place_consumer_resubscribe`] (issue
+    /// #307). Unlike [`Self::rebuild_producers`] (whole-connection sweep, runs only after
+    /// a `reset` + new handshake) it re-attaches exactly one producer without a transport
+    /// reconnect, the way [`Self::retry_producer_open_if_current`] does after a transient
+    /// open rejection.
+    ///
+    /// Returns the new open [`RequestId`], or `None` (no wire traffic, no state mutated)
+    /// when the slot is not eligible — see
+    /// [`Self::producer_reattach_in_place_is_eligible`]. Drains any stale
+    /// `ProducerClosedByBroker` event for this handle first, so a runtime wait future
+    /// cannot trip on a close the re-attach has already superseded.
+    ///
+    /// The staged/pending sends are left in the slot: their replay is owned by the
+    /// `ProducerSuccess` arm (`replay_pending_outbound`), because Pulsar closes the whole
+    /// connection on a `CommandSend` that arrives before the attach completes. Each keeps
+    /// its ORIGINAL `enqueued_at` deadline, so a `send_timeout` keeps ticking across the
+    /// re-attach exactly as Java's does.
+    fn emit_in_place_producer_reattach(&mut self, handle: ProducerHandle) -> Option<RequestId> {
+        if !self.producer_create_requests.contains_key(&handle) {
+            // Never created here (e.g. a close naming a producer id we do not own, or one
+            // whose create request a user close already forgot) — nothing to replay.
+            return None;
+        }
+        {
+            let slot = self.producers.get(&handle)?;
+            let mut producer = slot.state.lock();
+            if !Self::producer_reattach_in_place_is_eligible(&producer) {
+                return None;
+            }
+            // The broker detached this producer id: shut the drain gate until the
+            // re-attach is acked. Pulsar closes the WHOLE connection on a `CommandSend`
+            // for a producer that is not ready.
+            producer.broker_ready = false;
+        }
+        self.events.retain(
+            |ev| !matches!(ev, ConnectionEvent::ProducerClosedByBroker { handle: h, .. } if *h == handle),
+        );
+        self.retry_producer_open_inner(handle)
+    }
+
+    /// Whether an in-place re-attach may be emitted for this producer.
+    ///
+    /// Each rejected state has an owner that would otherwise be raced: `closed` means the
+    /// user is closing the producer and owns the handle, `!has_ever_attached` means the
+    /// routing-aware client open loop still owns the first attachment, and
+    /// `open_request_id.is_some()` means an open is already in flight (a second
+    /// `CommandProducer` for the same id would leave one of the two replies unmatched and
+    /// the drain gate stuck).
+    ///
+    /// Pure read of an already-locked slot — the caller holds `slot.state.lock()`, so this
+    /// must never reach back for the connection mutex (ADR-0038 lock ordering).
+    fn producer_reattach_in_place_is_eligible(p: &crate::producer::ProducerState) -> bool {
+        !p.closed && p.has_ever_attached && p.open_request_id.is_none()
     }
 
     /// Whether this failed wire request still owns the consumer's active
@@ -16680,6 +16800,454 @@ mod conn_state_tests {
                      before the #326 fix it kept every entry below the acked position"
                 );
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #451 — a broker `CommandCloseProducer` that arrives on a LIVE
+    // connection (no TCP drop) must re-attach the producer in place, exactly
+    // like the #307 consumer twin, instead of leaving it detached until the
+    // process restarts.
+    // ---------------------------------------------------------------------
+
+    /// Broker-initiated `CommandCloseProducer` for `handle`. `url = None` is a
+    /// same-broker bundle unload (ModularLoadManager / standalone); `Some(_)` is
+    /// the shape an Extensible-Load-Manager multi-phase unload puts on the wire.
+    fn close_producer_frame(handle: ProducerHandle, url: Option<String>) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseProducer as i32,
+            close_producer: Some(pb::CommandCloseProducer {
+                producer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: url,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseProducer");
+        buf
+    }
+
+    /// One `OutgoingMessage` carrying `payload`.
+    fn reattach_outgoing(payload: &'static [u8]) -> crate::producer::OutgoingMessage {
+        crate::producer::OutgoingMessage {
+            payload: bytes::Bytes::from_static(payload),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: payload.len() as u32,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        }
+    }
+
+    /// Handshake + open one attached producer. Returns the handle.
+    fn reattach_attached_producer(conn: &mut Connection, topic: &str) -> ProducerHandle {
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: topic.to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(conn);
+        ack_producer_success(conn, open_rid);
+        while conn.poll_event().is_some() {}
+        handle
+    }
+
+    /// Every `CommandProducer` in `commands` naming `handle`, as
+    /// `(request_id, epoch)` pairs in wire order.
+    fn reattach_producer_opens(
+        commands: &[pb::BaseCommand],
+        handle: ProducerHandle,
+    ) -> Vec<(u64, Option<u64>)> {
+        commands
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Producer as i32)
+            .filter_map(|c| c.producer.as_ref())
+            .filter(|p| p.producer_id == handle.0)
+            .map(|p| (p.request_id, p.epoch))
+            .collect()
+    }
+
+    /// How many `CommandSend` frames in `commands` name `handle`.
+    fn reattach_send_frames(commands: &[pb::BaseCommand], handle: ProducerHandle) -> usize {
+        commands
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Send as i32)
+            .filter_map(|c| c.send.as_ref())
+            .filter(|s| s.producer_id == handle.0)
+            .count()
+    }
+
+    /// Whether a `ProducerClosedByBroker` for `handle` surfaced (drains the queue).
+    fn drain_producer_close_event(conn: &mut Connection, handle: ProducerHandle) -> bool {
+        let mut saw = false;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ProducerClosedByBroker { handle: h, .. } = ev {
+                if h == handle {
+                    saw = true;
+                }
+            }
+        }
+        saw
+    }
+
+    /// #451 root cause: a `CommandCloseProducer` on a live socket re-emits
+    /// `CommandProducer` with a bumped epoch, keeps the drain gate shut until
+    /// the fresh `ProducerSuccess`, and surfaces NO event (the re-attach is
+    /// transparent to the runtime, mirroring #307).
+    #[test]
+    fn broker_close_of_attached_producer_reattaches_in_place_without_event() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451");
+
+        // A first send goes out normally on the healthy attachment.
+        let t0 = Instant::now();
+        let _ = conn
+            .send(handle, reattach_outgoing(b"before"), 0, t0)
+            .expect("queue first send");
+        let before = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&before, handle),
+            1,
+            "the pre-close send must reach the wire on the healthy attachment"
+        );
+
+        // Broker closes the attached producer on the LIVE socket.
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(t0, &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            vec![(reattach_rid, Some(1))],
+            "the close must re-emit exactly one CommandProducer with epoch 1"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "the in-place re-attach is transparent: no ProducerClosedByBroker event"
+        );
+        {
+            let slot = conn.producer(handle).expect("producer slot");
+            let p = slot.state.lock();
+            assert!(
+                !p.broker_ready,
+                "the drain gate stays shut until the fresh ProducerSuccess"
+            );
+            assert_eq!(
+                p.open_request_id,
+                Some(RequestId(reattach_rid)),
+                "the re-attach owns the producer's active open generation"
+            );
+            assert!(
+                !p.closed,
+                "an in-place re-attach must not close the producer"
+            );
+        }
+
+        // A send staged behind the shut gate must not reach the wire.
+        let _ = conn
+            .send(handle, reattach_outgoing(b"staged"), 0, t0)
+            .expect("queue staged send");
+        let gated = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&gated, handle),
+            0,
+            "Pulsar closes the whole connection on a send to a not-ready producer: \
+             the staged send must wait for the re-attach ack"
+        );
+
+        // The broker acks the re-attach: the gate opens and BOTH publishes reach
+        // the wire — the staged one, plus the pre-close publish the broker never
+        // receipted (`replay_pending_outbound`, Java `resendMessages`). That
+        // replay is the documented at-least-once shape of every re-attach path.
+        ack_producer_success(&mut conn, reattach_rid);
+        let flushed = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_send_frames(&flushed, handle),
+            2,
+            "the re-attach ack flushes the staged send and replays the still-unacked \
+             pre-close publish"
+        );
+        assert!(
+            conn.producer(handle)
+                .expect("slot")
+                .state
+                .lock()
+                .broker_ready,
+            "ProducerSuccess re-opens the drain gate"
+        );
+    }
+
+    /// #451: an `assigned_broker_service_url` on the close takes the SAME
+    /// in-place path. No existing path owns `ProducerClosedByBroker{Some(url)}`
+    /// on a live socket (the driver migration arm keys on `TopicMigrated`), and
+    /// an Extensible-Load-Manager multi-phase unload makes `Some(url)` the
+    /// default close shape. Java uses the URL only as a dial hint and re-sends
+    /// `CommandProducer` regardless.
+    #[test]
+    fn broker_close_with_assigned_url_takes_the_same_in_place_path() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-url");
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(
+            Instant::now(),
+            &close_producer_frame(handle, Some("pulsar://other-broker:6650".to_owned())),
+        )
+        .expect("handle CommandCloseProducer with an assigned url");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            vec![(reattach_rid, Some(1))],
+            "an assigned-url close re-attaches in place, exactly like url=None"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "an assigned-url close must not surface ProducerClosedByBroker either"
+        );
+        assert!(
+            !conn
+                .producer(handle)
+                .expect("slot")
+                .state
+                .lock()
+                .broker_ready,
+            "the drain gate stays shut until the fresh ProducerSuccess"
+        );
+    }
+
+    /// #451 refusal: a close that lands while the producer's FIRST open is
+    /// still in flight is left to that open's parked waiter — no second
+    /// `CommandProducer` (which would leave one of the two replies unmatched),
+    /// and the event still surfaces because a waiter can consume it.
+    #[test]
+    fn broker_close_during_in_flight_open_surfaces_event_without_second_open() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/reattach-451-in-flight".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        // The close arrives BEFORE the first ProducerSuccess.
+        let next_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer mid-open");
+
+        let after_close = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_close, handle),
+            Vec::<(u64, Option<u64>)>::new(),
+            "the open already in flight owns the next ProducerSuccess: no second CommandProducer"
+        );
+        assert!(
+            drain_producer_close_event(&mut conn, handle),
+            "while an open is in flight its parked waiter owns the outcome, so the event \
+             must still surface"
+        );
+        {
+            let slot = conn.producer(handle).expect("producer slot");
+            let p = slot.state.lock();
+            assert!(!p.broker_ready, "the drain gate is shut");
+            assert_eq!(
+                p.open_request_id,
+                Some(RequestId(open_rid)),
+                "the in-flight open keeps owning the active generation"
+            );
+        }
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            next_rid,
+            "a refused close allocates no request id"
+        );
+    }
+
+    /// #451 refusal: a close naming a producer we never created, or one the
+    /// user already closed, puts nothing on the wire and pushes no event —
+    /// there is no waiter that could consume it, so pushing one would only
+    /// grow the event queue under bundle churn.
+    #[test]
+    fn broker_close_for_unknown_or_user_closed_producer_emits_nothing() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-gone");
+
+        // (a) unknown producer id.
+        let ghost = ProducerHandle(4242);
+        let next_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(ghost, None))
+            .expect("a close for an unknown producer is not a protocol error");
+        let after_ghost = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_ghost, ghost),
+            Vec::<(u64, Option<u64>)>::new(),
+            "nothing to replay for a producer we never created"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, ghost),
+            "an unknown handle has no waiter: push no event"
+        );
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            next_rid,
+            "a refused close allocates no request id"
+        );
+        assert!(conn.is_connected(), "a refusal is not a protocol error");
+
+        // (b) the user closed the producer first.
+        let _ = conn.close_producer(handle);
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+        let before_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("a close for a user-closed producer is not a protocol error");
+        let after_closed = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&after_closed, handle),
+            Vec::<(u64, Option<u64>)>::new(),
+            "a user close owns the handle: never re-attach it"
+        );
+        assert!(
+            !drain_producer_close_event(&mut conn, handle),
+            "a user-closed producer has no waiter: push no event"
+        );
+        assert_eq!(
+            conn.peek_next_request_id_for_test(),
+            before_rid,
+            "a refused close allocates no request id"
+        );
+    }
+
+    /// #451 primary real-world path: the broker fences the topic before writing
+    /// the close, so the immediate re-issue is typically answered
+    /// `ServiceNotReady`. That rides the existing ADR-0080 operation-retry leg
+    /// (`DriverRetry::Producer`) rather than terminalizing.
+    #[test]
+    fn in_place_reattach_rejected_service_not_ready_arms_driver_retry() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/reattach-451-retry");
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        feed_transient_error(&mut conn, RequestId(reattach_rid));
+        let retry = conn
+            .poll_driver_retry()
+            .expect("a transient rejection arms the retry leg");
+        match retry {
+            crate::DriverRetry::Producer {
+                handle: h,
+                failed_request_id,
+                ..
+            } => {
+                assert_eq!(h, handle, "the retry leg names the closed producer");
+                assert_eq!(
+                    failed_request_id,
+                    RequestId(reattach_rid),
+                    "the leg is bound to the re-attach generation it must supersede"
+                );
+            }
+            other => panic!("unexpected driver retry: {other:?}"),
+        }
+        assert_eq!(
+            conn.producer_transient_open_attempts(handle),
+            1,
+            "one ADR-0080 attempt is consumed per rejected re-attach"
+        );
+
+        let retry_rid = conn
+            .retry_producer_open_if_current(handle, RequestId(reattach_rid))
+            .expect("the leg still owns the active generation");
+        let retried = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&retried, handle),
+            vec![(retry_rid.0, Some(2))],
+            "the retry re-issues with a strictly newer epoch"
+        );
+    }
+
+    /// #451: sends staged across an in-place re-attach keep their ORIGINAL
+    /// `send_timeout` deadline (Java parity: `sendTimeout` keeps ticking while
+    /// the producer is re-attaching), so a re-attach the broker never acks
+    /// still resolves the send instead of hanging forever.
+    #[test]
+    fn sends_staged_across_in_place_reattach_keep_their_original_send_timeout() {
+        let send_timeout = Duration::from_secs(5);
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let open_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/reattach-451-timeout".to_owned(),
+            send_timeout: Some(send_timeout),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, open_rid);
+        while conn.poll_event().is_some() {}
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(handle, reattach_outgoing(b"across-reattach"), 0, t0)
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // The broker closes the producer one second into the send's budget; the
+        // re-attach is never acked.
+        conn.handle_bytes(
+            t0 + Duration::from_secs(1),
+            &close_producer_frame(handle, None),
+        )
+        .expect("handle CommandCloseProducer");
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        conn.handle_timeout(t0 + send_timeout);
+        let outcome = conn
+            .take_outcome(PendingOpKey::Send(handle, seq))
+            .expect("the send-timeout sweep must resolve the staged send at its ORIGINAL deadline");
+        match outcome {
+            OpOutcome::SendError { code, .. } => assert_eq!(
+                code, -1,
+                "the synthetic send-timeout sentinel resolves the staged send"
+            ),
+            other => panic!("unexpected send outcome: {other:?}"),
         }
     }
 }

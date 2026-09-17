@@ -20,15 +20,18 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                           | Status                   |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                 | ⚡ ready to dispatch     |
-| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                               | 🧠 needs design decision |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)           | ⚡ ready to dispatch     |
-| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)       | ⚡ ready to dispatch     |
-| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered) | 🟡 deferred              |
-| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                 | 🟡 deferred              |
-| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                       | 🧠 needs design decision |
+| #   | Item                                                                                                                                                     | Status                   |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                           | ⚡ ready to dispatch     |
+| 12  | [PIP-460 per-segment consumer fan-out](#12-pip-460-per-segment-consumer-fan-out)                                                                         | 🧠 needs design decision |
+| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)                     | ⚡ ready to dispatch     |
+| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)                 | ⚡ ready to dispatch     |
+| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered)           | 🟡 deferred              |
+| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                           | 🟡 deferred              |
+| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                 | 🧠 needs design decision |
+| 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection) | 🧠 needs design decision |
+| 20  | [No deadline on a pending `ProducerOpen` / `Subscribe` request](#20-no-deadline-on-a-pending-produceropen--subscribe-request)                            | ⚡ ready to dispatch     |
+| 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
 
 ---
 
@@ -113,6 +116,38 @@ With the refund in place a poison-heavy topic keeps dispatching and the buffer g
 **Why it stays open.** Needs a product decision, and the Java client offers no precedent: it has no client-side dead-letter buffer at all, it republishes to the DLQ topic and acks inside `messageReceived`.
 The options are not equivalent — cap and drop (loses messages the application asked to see), cap and stop refunding (reintroduces the wedge deliberately, with a documented contract), or auto-republish when a producer is configured (changes what `dead_letter_policy` means).
 There is a residual bound today regardless: a dead-lettered unit stays unacked at the broker until `republish_dead_letters` acks it, so an application that never drains eventually stops at `maxUnackedMessagesPerConsumer`.
+
+## 19. Re-home an established producer or consumer to another broker connection
+
+**Gap.** [ADR-0106](../specs/adr/0106-reattach-broker-closed-producer-in-place.md) re-attaches a broker-closed producer on the connection it is already pinned to, and issue #307 does the same for a consumer.
+Neither can follow the bundle to a different broker.
+When the `CommandCloseProducer` / `CommandCloseConsumer` carries an `assigned_broker_service_url` naming another broker, or when the retry leg's lookup answers `Redirected`, the in-place re-attach fails: `lookup_then` terminalizes the handle and the application must re-create it.
+Java re-homes instead — `ConnectionHandler.grabCnx(hostUrl)` dials the assigned host, or performs a fresh lookup and takes whatever connection it resolves to.
+
+**Why it stays open.** No proto or pool primitive exists for it.
+A `Producer` / `Consumer` holds one `Arc<ConnectionShared>` for its lifetime (the engines' `open_producer` / `subscribe` capture it at creation), so re-homing means moving a live handle between two `Connection` state machines — including its pending publishes, its permit mirrors and its registered wakers.
+That is an architectural decision with its own ADR, not an amendment to ADR-0106.
+The current behaviour is a bounded terminal error rather than a silent hang, which is the part that mattered for issue #451.
+
+The consumer arm's own `assigned_broker_service_url = Some(url)` branch belongs to the same decision: it still diverts to the supervised reconnect, and ADR-0106 deliberately did not transfer the producer-side argument to it without separate evidence.
+
+## 20. No deadline on a pending `ProducerOpen` / `Subscribe` request
+
+**Gap.** `Connection::handle_timeout` sweeps only `PendingRequestKind::Ack`.
+A `CommandProducer` or `CommandSubscribe` the broker never answers leaves the slot at `broker_ready = false` (or the consumer's flow gate armed) with `open_request_id = Some(_)` forever.
+That reproduces the issue #451 symptom exactly — every publish resolves `code=-1 send timeout` — and it additionally makes every LATER broker close ineligible for an in-place re-attach, because `open_request_id.is_some()` is a refusal.
+
+**Why it stays open.** It is shared by every re-attach path — the ADR-0080 retry leg, the reconnect rebuilds, the issue #307 consumer re-subscribe and ADR-0106's producer re-attach — so it belongs to the request-deadline surface as a whole, not to any one of them.
+Java covers it with `operationTimeout` applied to every pending request; the equivalent here is a per-kind deadline on `pending_requests` plus the terminalization each kind already has.
+
+## 21. Optional partitioned-router readiness skip
+
+**Gap.** `PartitionedProducer::pick_partition` has no readiness input: round-robin keeps handing `1/N` of all publishes to a child whose broker-side producer is detached, and those publishes wait out the whole `send_timeout` before resolving.
+Issue #451's own expectation 5 asked for the router to skip such a child.
+
+**Why it stays open.** It is beyond Java parity — `PartitionedProducerImpl.internalSendWithTxnAsync` routes through `routerPolicy.choosePartition` with no connectivity check at all, and `isConnected()` is an `allMatch` over the children — and it needs a per-slot readiness accessor on `ProducerApi`, which today exposes only the connection-level `is_connected`.
+Skipping a partition also silently changes key-less ordering and per-partition distribution, which is a product decision.
+ADR-0106 removes the permanent case (the child re-attaches on its own), leaving only the bounded re-attach window this would optimise.
 
 ## Notes on this file
 
