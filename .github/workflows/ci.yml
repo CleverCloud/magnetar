@@ -71,6 +71,16 @@ jobs:
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      # `--all-features` above enables `buggify`, which cfg-strips every
+      # `#[cfg(not(feature = "buggify"))]` stub — so it never lints the
+      # no-buggify axis that `seed-replay` (below) and
+      # `moonpool-seed-sweep.yml` actually build and test. Lint that
+      # exact single-provider cell here explicitly (issue #438). Without
+      # `--no-deps`, this also lints magnetar-proto/magnetar-auth-sasl/
+      # magnetar-auth-athenz/magnetar-messagecrypto at this feature
+      # combination, which doubles as an incidental rustc-warning gate
+      # for that axis since the seed cells carry no `-D warnings`.
+      - run: cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 
   build:
     name: build (${{ matrix.toolchain }})

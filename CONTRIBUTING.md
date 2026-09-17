@@ -21,6 +21,11 @@ FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts
 
 cargo +nightly fmt --check
 cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
+# Per-package invocation needs an explicit crypto feature (see below); this
+# is the seed-replay/moonpool-seed-sweep cell, which `--all-features`
+# above never lints because it enables `buggify` and cfg-strips the
+# no-`buggify` stubs (issue #438).
+cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
