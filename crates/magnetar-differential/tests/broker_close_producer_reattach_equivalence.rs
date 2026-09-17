@@ -24,6 +24,11 @@
 //! assigned lookup data, making `Some(url)` the default close shape, and Java
 //! uses the URL only as a dial hint. Both cases are driven here.
 //!
+//! The in-place scenarios also leave a stale `ProducerClosedByBroker` queued
+//! from a close that raced the first open (Task #56), so they prove the
+//! re-attach drops it: `saw_close_event` stays `false` only because the arm
+//! drains its own stale events before re-emitting `CommandProducer`.
+//!
 //! The refusal side (`run_refusal_both`) covers the two branches that must put
 //! NOTHING on the wire: an unknown producer id, and a close arriving while the
 //! producer's first open is still in flight.
@@ -180,8 +185,16 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
         topic: "persistent://public/default/reattach-451-equiv".to_owned(),
         ..Default::default()
     });
+    let _ = drain_outbound(conn, handle);
+
+    // A close that lands while the first open is still in flight is surfaced
+    // as `ProducerClosedByBroker` for the parked open waiter (Task #56) and is
+    // deliberately left queued here: the later in-place re-attach must drop
+    // that STALE event instead of letting a runtime mistake it for the outcome
+    // of the fresh re-attach.
+    conn.handle_bytes(t0, &close_producer_frame(handle, None))
+        .expect("handle close mid-open");
     feed_producer_success(conn, open_rid, t0);
-    while conn.poll_event().is_some() {}
 
     // One publish on the healthy attachment, drained off the wire but left
     // unacked — the broker never receipts it, so the re-attach must replay it.

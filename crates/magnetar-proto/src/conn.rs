@@ -3249,15 +3249,18 @@ impl Connection {
                             .get(&handle)
                             .map(|slot| (slot.identity.topic.clone(), slot.state.lock().epoch))
                             .unwrap_or_default();
+                        // Bounded outside the macro: a `tracing` field expression only runs
+                        // when a subscriber enables the level, and the sim-coverage gate
+                        // runs with none.
+                        let assigned_broker_service_url =
+                            url.as_deref().map(crate::log_fields::truncate_broker_str);
                         tracing::warn!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
                             topic = %topic,
                             request_id = ?request_id,
                             epoch,
-                            assigned_broker_service_url = url
-                                .as_deref()
-                                .map(crate::log_fields::truncate_broker_str),
+                            assigned_broker_service_url,
                             "broker closed attached producer on a live connection; \
                              re-attaching in place (#451)"
                         );
