@@ -738,7 +738,9 @@ async fn churn_round(
 ///
 /// It keeps the `latest` default rather than pinning a green image, so the day an image
 /// with the fix ships as `latest` the reproduce command below goes green with no edit.
-/// Remove the `#[ignore]` then.
+/// Remove the `#[ignore]` then — tracked by
+/// [issue #462](https://github.com/CleverCloud/magnetar/issues/462), which also owns the
+/// choice between removing it and recording the exception in ADR-0046 itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "asserts apache/pulsar#26416; no GA image carries the fix (4.0.14/4.2.5 unpublished). Reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.4 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting -- --ignored"]
 async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
