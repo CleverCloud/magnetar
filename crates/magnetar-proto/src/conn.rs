@@ -8071,13 +8071,12 @@ impl Connection {
     /// # The two phases
     ///
     /// 1. emit `CommandCloseConsumer` for this id, registered as
-    ///    [`PendingRequestKind::ConsumerCloseForReattach`]. The client slot is deliberately NOT
+    ///    `PendingRequestKind::ConsumerCloseForReattach`. The client slot is deliberately NOT
     ///    marked closed — this consumer is being repaired, not retired — and no ack tracker is
     ///    flushed, so nothing about the caller-visible consumer changes yet;
-    /// 2. on that close's `Success`, and only then, [`Self::complete_consumer_close_for_reattach`]
-    ///    zeroes the permit mirrors, drops any open stall window, fails every in-flight ack (issue
-    ///    #346) and re-emits `CommandSubscribe` with the initial `CommandFlow` deferred to ITS
-    ///    `Success`.
+    /// 2. on that close's `Success`, and only then, `complete_consumer_close_for_reattach` zeroes
+    ///    the permit mirrors, drops any open stall window, fails every in-flight ack (issue #346)
+    ///    and re-emits `CommandSubscribe` with the initial `CommandFlow` deferred to ITS `Success`.
     ///
     /// Deferring every mutation to phase 2 is what makes a rejected close harmless: the
     /// broker still holds the consumer exactly as it was, so the client's mirrors must
@@ -8104,7 +8103,7 @@ impl Connection {
     ///   in-place repair for a cursor the close destroys.
     ///
     /// Both refusals are made HERE rather than in
-    /// [`Self::consumer_reattach_in_place_is_eligible`], which is shared with issue #307's
+    /// `consumer_reattach_in_place_is_eligible`, which is shared with issue #307's
     /// broker-initiated `CommandCloseConsumer` arm and with phase 2's own re-attach: there
     /// the broker has ALREADY closed the consumer, so refusing a Failover standby or a
     /// non-durable consumer would only leave it detached forever.
