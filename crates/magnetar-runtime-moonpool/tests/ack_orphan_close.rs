@@ -91,6 +91,11 @@ fn ack_orphaned_by_same_broker_close_fails_fast() {
             t0,
         );
         let _ = conn.poll_transmit();
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the sweep's issue #241 waiter guard sees a live caller and still
+        // records the synthetic error for it to consume (the guard's whole
+        // point is skipping this record for a dropped, never-polled future).
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
         rid
     };
 
@@ -164,6 +169,10 @@ fn ack_response_timeout_fires_at_virtual_deadline() {
             t0,
         );
         let _ = conn.poll_transmit();
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the reap sweep's issue #241 waiter guard sees a live caller and
+        // still records the synthetic timeout error for it to consume.
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
         rid
     };
     let key = PendingOpKey::Request(rid);
