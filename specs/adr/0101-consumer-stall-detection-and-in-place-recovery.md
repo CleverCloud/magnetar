@@ -1,6 +1,6 @@
 # ADR-0101 — Make a wedged consumer detectable and recoverable from the client
 
-- **Status**: Accepted (amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md), the rejected "have the watchdog re-subscribe automatically" alternative and the "emitting the event is the only effect" clause — everything else below remains binding)
+- **Status**: Accepted (amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md), the rejected "have the watchdog re-subscribe automatically" alternative and the "emitting the event is the only effect" clause; amended by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md), §3's step list and its `availablePermits = 0` premise — everything else below remains binding)
 - **Date**: 2026-08-21
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, observability, resilience, sans-io, shared-subscription
@@ -74,6 +74,10 @@ Recovery stays explicit, per the alternatives above.
 > The event is emitted either way, and with the knob unset — the default — this clause is unchanged.
 
 ### 3. `Connection::resubscribe_consumer_in_place`, and `Consumer::resubscribe()` on both engines
+
+> **Amended by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) (2026-09-18).** Step 1's premise is false: `ServerCnx.handleSubscribe` answers a `CommandSubscribe` naming a consumer id already live on the connection with a bare `sendSuccessResponse(requestId)` and touches neither the dispatcher nor `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414`, master `:2037-2044`), so the re-subscribe was a broker-side no-op and step 3's fresh `CommandFlow` was a second full window the broker never agreed to.
+> The recovery now emits `CommandCloseConsumer` first and runs all three steps on its `Success`, and refuses `Failover` and non-durable subscriptions outright.
+> The steps themselves, their order, the eligibility-before-mutation rule and the intact receiver queue are unchanged; the `CommandCloseConsumer` arm this was factored out of keeps the bare re-subscribe, which is correct there because the broker has already closed the consumer.
 
 The issue #307 same-broker re-attach becomes callable.
 `resubscribe_consumer_in_place(handle)` runs the same three steps in the same order the `CommandCloseConsumer` arm runs them:

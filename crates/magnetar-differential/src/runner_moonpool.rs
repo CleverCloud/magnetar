@@ -150,13 +150,23 @@ pub async fn run_with_stall_timeout(
 /// re-subscribes per stall streak.
 ///
 /// Pair it with [`crate::broker::ScriptedBroker::leak_shared_permits_on_consumer_churn`]:
-/// the broker wedges its Shared dispatcher on the first churn event, the watchdog notices
-/// the survivor holding un-spent permits over an empty queue, and each automatic
-/// re-subscribe lifts the broker's leaked aggregate by exactly one receiver-queue window.
-/// Whether delivery resumes is then a pure function of `max_attempts` against the size of
-/// the leak, which is what makes the same trace produce a `Received` under a sufficient
-/// budget and a `RecvTimeout` under an insufficient one — identically on both engines,
-/// since the whole mechanism lives in the shared sans-io layer.
+/// the broker wedges its Shared dispatcher on the first churn event, and the watchdog
+/// notices the survivor holding un-spent permits over an empty queue.
+///
+/// What each attempt then does to the leaked aggregate is **nothing**, and that is the
+/// point since ADR-0108. The recovery closes the consumer before re-subscribing it, so
+/// the close returns the consumer's remaining permits and the re-subscribe's
+/// `CommandFlow` takes them back: one attempt is permit-neutral. (Before ADR-0108 it
+/// re-subscribed a still-live consumer id — a broker-side no-op — and granted a full
+/// window on top, so the aggregate rose by `receiver_queue_size` per attempt. That credit
+/// had no matching debit anywhere; it was the over-commit, not a repair.) The recovery's
+/// own `CommandCloseConsumer` is itself a churn event, so under the double-subtraction
+/// this harness models the aggregate moves the wrong way.
+///
+/// So `max_attempts` changes the frame counts and not the outcome: a subscription-wide
+/// leak stays wedged at every budget, identically on both engines, since the whole
+/// mechanism lives in the shared sans-io layer. `pulsar-admin topics unload` is the
+/// escalation, which is what ADR-0101 always scoped this repair to.
 ///
 /// # Errors
 /// Same envelope as [`run`].

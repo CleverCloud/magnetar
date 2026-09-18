@@ -286,12 +286,18 @@ impl ClientBuilder {
     /// broker acks but never dispatches to does not.
     ///
     /// Keep it small. An attempt repairs **this client's own slot** in the broker's
-    /// dispatcher and lifts the subscription's aggregate permit counter by one
-    /// receiver-queue window; issue #414's production failure was dispatcher-WIDE, with
-    /// that aggregate observed at `-177300`, which no realistic number of re-subscribes
-    /// reaches. When the budget is exhausted the client stops and logs the escalation —
-    /// `pulsar-admin topics unload` — instead of re-subscribing forever against a fault it
-    /// cannot repair. See [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
+    /// dispatcher and nothing wider: since ADR-0108 it closes the consumer id and
+    /// re-attaches it, which is permit-NEUTRAL on the subscription's aggregate counter —
+    /// the close returns this consumer's remaining permits and the re-subscribe's grant
+    /// takes them back. Attempts therefore do not accumulate toward repairing issue #414's
+    /// dispatcher-WIDE failure, whose aggregate was observed at `-177300`. When the budget
+    /// is exhausted the client stops and logs the escalation — `pulsar-admin topics
+    /// unload` — instead of acting forever against a fault it cannot repair.
+    ///
+    /// It is also no longer free: the close is real, so anything the consumer was holding
+    /// un-acked is redelivered. Arm it where a duplicate is cheaper than a wedge. A
+    /// `Failover` or non-durable subscription is refused outright and never spends any of
+    /// the budget. See [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
     #[must_use]
     pub fn consumer_stall_auto_recovery(mut self, max_attempts: u32) -> Self {
         self.consumer_stall_auto_recovery = Some(max_attempts);

@@ -125,14 +125,14 @@ When a stall episode closes, the client performs rung 1 itself — the identical
 
 - **At most one attempt per stall episode**, and an episode closes at most once per `consumer_stall_timeout`. With a 30 s window, `3` spends three re-subscribes over ninety seconds and then stops.
 - **The budget resets on real progress only**: one broker dispatch unit actually arriving. A consumer that recovers, runs healthily, and later wedges again gets its full budget back; a consumer the broker acks but never dispatches to does not, because the recovery's own re-subscribe would otherwise refund every attempt that paid for it.
-- **An ineligible consumer spends no budget** — closed, unsubscribing, terminally failed, mid-seek, or already re-attaching. Nothing is mutated in that case.
+- **An ineligible consumer spends no budget** — closed, unsubscribing, terminally failed, mid-seek, already re-attaching, already awaiting a recovery close, `Failover`, or non-durable. Nothing is mutated in that case.
 - **A Failover standby is skipped entirely.** Once the broker has reported this consumer as standby (`Consumer::is_active() == Some(false)`), the stall is still reported but no recovery is attempted and no budget is spent. A standby holds its initial grant over an empty queue forever, which is the stall predicate exactly — and since it never receives a dispatch unit, nothing would ever give the budget back. Without the skip, arming recovery on a failover group would burn every standby's whole budget on the broker behaving correctly. A consumer promoted to active keeps the full budget it never spent, so a genuine wedge after promotion still gets the complete ladder.
 - **The diagnosis is never suppressed.** The `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, each attempt logs its own `INFO` carrying `attempt` and `max_attempts`, and exhausting the budget logs one `WARN` naming `pulsar-admin topics unload`.
 - **Unset by default**; `0` disables it explicitly.
 
-**Keep the number small.** Each attempt lifts the subscription's aggregate permit counter by exactly one receiver-queue window (see rung 1 for why), and issue #414's production failure was `-177300` deep — roughly 178 windows at a 1000-message queue. No realistic budget reaches that, and the point of the bound is to stop and escalate rather than re-subscribe forever against a fault this client cannot repair.
+**Keep the number small.** An attempt does not pay down a negative aggregate permit counter — since [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) one recovery is permit-neutral on the subscription's aggregate (see rung 1) — so a budget is a small number of chances for THIS consumer's own slot to come back, not a countdown toward repairing a subscription-wide fault. Issue #414's production failure was `-177300` deep; the point of the bound is to stop and escalate to `pulsar-admin topics unload`, not to re-subscribe forever against something this client cannot repair.
 
-> **This is opt-in for a reason.** The watchdog reports silence, not fault, so an armed budget will occasionally re-subscribe a perfectly healthy consumer that is merely idle on a drained topic. That is cheap — one `CommandSubscribe`, one `CommandFlow`, the receiver queue untouched, the first dispatch resetting the budget — but it is an action taken against the broker on the client's own initiative, which is not something to do by default.
+> **This is opt-in for a reason.** The watchdog reports silence, not fault, so an armed budget will occasionally close and re-subscribe a perfectly healthy consumer that is merely idle on a drained topic. Since ADR-0108 that is no longer free: the close is real, so anything the consumer was holding un-acked is redelivered. Arm it only where a duplicate is cheaper than a wedge, and prefer rung 1 by hand where it is not.
 
 ### Rung 1 — `Consumer::resubscribe()`
 
@@ -140,20 +140,29 @@ When a stall episode closes, the client performs rung 1 itself — the identical
 consumer.resubscribe()?;
 ```
 
-Re-attaches **this consumer id in place**, on the live connection: zero the permit mirrors, fail every in-flight ack (their responses can never arrive against the retired consumer generation), re-emit `CommandSubscribe` for the same consumer id, and let the broker's `Success` release a fresh initial `CommandFlow`.
+**Closes this consumer id and re-subscribes it**, on the live connection, in two phases:
+
+1. `CommandCloseConsumer` for this consumer id;
+2. on the broker's `Success` for that close, and only then: zero the permit mirrors, fail every in-flight ack, re-emit `CommandSubscribe` for the same consumer id, and let ITS `Success` release a fresh initial `CommandFlow`.
 
 - No transport reconnect. No other consumer, producer, or subscription is disturbed.
-- The receiver queue is left intact, so anything already buffered stays receivable.
-- Returns as soon as the `CommandSubscribe` is staged and the driver is woken; the grant re-arms asynchronously on the broker's ack. Poll `available_permits()` to watch it land.
-- Returns `Err` — mutating nothing — when the consumer is not eligible: closed, unsubscribing, terminally failed, mid-seek, or already re-attaching.
+- The client-side consumer survives its own close: the handle, the registration, and the receiver queue are all kept, so anything already buffered stays receivable.
+- Returns as soon as the `CommandCloseConsumer` is staged and the driver is woken; the grant re-arms two broker replies later. Poll `available_permits()` to watch it land.
+- Returns `Err` — mutating nothing — when the consumer is not eligible: closed, unsubscribing, terminally failed, mid-seek, already re-attaching, already awaiting a recovery close, **`Failover`**, or **non-durable** (see below).
+- If the broker **rejects** the close, nothing is mutated and no re-subscribe is sent. One `WARN` on `magnetar_proto::conn` records the rejection; the consumer is left exactly as it was — still wedged, still reported by the watchdog, still eligible for another attempt.
 
-This is the same machinery issue #307 wired to an inbound same-broker `CommandCloseConsumer`; ADR-0101 made it callable.
+> **Why the close is not optional.** A `CommandSubscribe` naming a consumer id that is still live on the connection is a **broker-side no-op**: `ServerCnx.handleSubscribe` finds the id in its own per-connection map, logs a warning, answers `CommandSuccess`, and returns without touching the dispatcher, the cursor, or `availablePermits` (identical at Pulsar v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and master `:2037-2044`). Before [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) this rung sent exactly that, and then granted a second full receiver-queue window on top of a slot the broker had never reset — adding permits the broker never agreed to, once per attempt, while repairing nothing. The close is what makes the re-attach real.
+
+**It costs redelivery.** The broker genuinely drops the consumer, so everything it was holding un-acked goes back to the subscription's redelivery pool — to this consumer after its re-attach, or to a `Shared` sibling meanwhile. Acks still buffered in the ack-grouping tracker when the close lands are dropped by the broker and their messages redelivered. At-least-once is preserved; **duplicates are not**. If your consumer is not idempotent, prefer rung 2, where you control the boundary.
+
+**Two subscription shapes have no rung 1**, and `resubscribe()` returns `Err` for both rather than doing something surprising:
+
+- **`Failover`** — the close really detaches the consumer, so the broker runs an election. An active consumer would hand its partition to a standby and come back at the end of the priority order. That is a subscription-wide reshuffle to repair one slot. Use rung 2 or rung 3.
+- **non-durable** — a non-durable subscription's cursor exists only while the consumer does. Closing it discards the cursor and the re-attach restarts from the subscription's configured start position, silently skipping or replaying the backlog. There is no in-place repair for a cursor the close destroys.
 
 **What it repairs:** this client's own slot in the broker's dispatcher.
 
-**What it may not repair:** a dispatcher-WIDE corruption. Issue #414's production failure had the subscription's `availablePermits` at `-177300` across every attached consumer, and one consumer re-attaching does not necessarily clear that.
-
-The arithmetic is worth knowing, because it is what rung 0's bound is chosen against. The re-attach zeroes this consumer's permits broker-side and the client answers the re-subscribe `Success` with one fresh `CommandFlow` of a full receiver-queue window, so **one attempt credits the subscription's aggregate counter by exactly `receiver_queue_size`**. A corruption of `L` therefore needs `ceil(L / receiver_queue_size)` attempts — about 178 for the reported numbers at a 1000-message queue. That is an operator's `topics unload`, not a client's retry loop.
+**What it does not repair:** a dispatcher-WIDE corruption. Issue #414's production failure had the subscription's `availablePermits` at `-177300` across every attached consumer, and this does not clear it. One recovery attempt is **permit-neutral** on the subscription's aggregate counter — the close returns this consumer's remaining permits and the re-subscribe's `CommandFlow` grants them back — so attempts do not add up to a repair the way the pre-ADR-0108 arithmetic claimed. `topics unload` is the answer to a negative aggregate, and rung 0's bound exists to reach it rather than to grind toward it.
 
 Give it a few seconds and re-check `available_permits()` and the broker's `msgRateOut`. If nothing moves, climb.
 
@@ -190,6 +199,7 @@ Nothing here prevents a broker-side dispatcher fault, but two habits shrink the 
 
 - [ADR-0101](../specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md) — the decision, its alternatives, and the ADR-0082 amendment.
 - [ADR-0103](../specs/adr/0103-bounded-automatic-consumer-stall-recovery.md) — rung 0: why automatic recovery is opt-in, why it is bounded, and why the budget resets on a dispatch unit and on nothing else.
+- [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) — why rung 1 closes the consumer before re-subscribing it, and why `Failover` and non-durable subscriptions have no rung 1.
 - [ADR-0082](../specs/adr/0082-consumer-permit-balance-split.md) — the `granted_permits` / `permit_balance` split.
 - [ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md) — the connection keepalive, and why it cannot see this.
 - [`logging.md`](logging.md) — the structured-log field glossary.

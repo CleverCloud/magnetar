@@ -342,16 +342,32 @@ impl<P: Providers> Consumer<P> {
     /// dispatch permits — the caller-driven recovery for a consumer whose broker-side
     /// dispatch has gone silent (issue #414). 1:1 with the tokio engine.
     ///
-    /// Reuses the machinery issue #307 landed for a same-broker `CommandCloseConsumer`:
-    /// zero the permit mirrors, fail every in-flight ack (issue #346 — their responses can
-    /// never arrive against the retired consumer generation), re-emit `CommandSubscribe`
-    /// for the same consumer id, and let the broker's `Success` release the initial
-    /// `CommandFlow`. No transport reconnect, no other consumer disturbed, and the
-    /// receiver queue is left intact so already-buffered messages stay receivable.
+    /// Two phases on the same socket (ADR-0108): emit `CommandCloseConsumer` for this
+    /// consumer id and, on the broker's `Success` for it, zero the permit mirrors, fail
+    /// every in-flight ack (issue #346 — the consumer id they were correlated against is
+    /// gone), re-emit `CommandSubscribe` for the same consumer id, and let ITS `Success`
+    /// release the initial `CommandFlow`. No transport reconnect, no other consumer
+    /// disturbed, and the client-side consumer survives its own close: the handle, the
+    /// registration and the receiver queue are all kept, so already-buffered messages stay
+    /// receivable.
     ///
-    /// Returns once the `CommandSubscribe` is staged and the driver has been woken; the
-    /// re-arm completes asynchronously when the broker acks. Poll
-    /// [`Self::available_permits`] to observe the grant land.
+    /// The close is not optional. `ServerCnx.handleSubscribe` answers a `CommandSubscribe`
+    /// naming a consumer id that is already live on the connection with a bare
+    /// `sendSuccessResponse(requestId)`, touching neither the dispatcher nor
+    /// `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414`, master
+    /// `:2037-2044`), so a bare re-subscribe repairs nothing and its fresh grant is a
+    /// second full window the broker never agreed to.
+    ///
+    /// **It costs redelivery.** The broker really drops the consumer, so everything it was
+    /// holding un-acked returns to the subscription's redelivery pool — to this consumer
+    /// after its re-attach, or to a `Shared` sibling meanwhile. At-least-once is preserved;
+    /// duplicates are not.
+    ///
+    /// Returns once the `CommandCloseConsumer` is staged and the driver has been woken; the
+    /// re-arm completes two broker replies later. Poll [`Self::available_permits`] to
+    /// observe the grant land. A close the broker REJECTS mutates nothing and sends no
+    /// re-subscribe; it is recorded as a `warn!` and the consumer stays eligible for
+    /// another attempt.
     ///
     /// # What this does and does not repair
     ///
@@ -367,7 +383,10 @@ impl<P: Providers> Consumer<P> {
     ///
     /// [`ClientError::Other`] when the consumer is not eligible for an in-place re-attach:
     /// it is closed, unsubscribing, terminally failed, mid-seek (the seek owns its own
-    /// re-attach), or already has a re-attach in flight. Nothing is mutated in that case.
+    /// re-attach), already has a re-attach or a recovery close in flight, or is a
+    /// `Failover` or non-durable subscription — for those two the close would trigger an
+    /// election or discard a cursor that lives only as long as the consumer, so there is no
+    /// in-place repair (ADR-0108, ADR-0099). Nothing is mutated in any of those cases.
     pub fn resubscribe(&self) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
@@ -376,7 +395,8 @@ impl<P: Providers> Consumer<P> {
         let Some(request_id) = request_id else {
             return Err(ClientError::Other(
                 "consumer is not eligible for an in-place re-subscribe (closed, \
-                 unsubscribing, terminal, mid-seek, or a re-attach is already in flight)"
+                 unsubscribing, terminal, mid-seek, a re-attach or recovery close is \
+                 already in flight, or the subscription is Failover or non-durable)"
                     .to_owned(),
             ));
         };
@@ -392,7 +412,8 @@ impl<P: Providers> Consumer<P> {
             subscription,
             handle = ?self.handle,
             request_id = ?request_id,
-            "consumer re-subscribed in place; permits will re-arm on the broker ack"
+            "consumer close staged for an in-place re-subscribe; the re-attach follows the \
+             close ack and permits re-arm on the re-subscribe ack"
         );
         Ok(())
     }
@@ -3881,13 +3902,55 @@ mod tests {
     }
 
     /// Issue #414: `Consumer::resubscribe()` is the caller-driven recovery for a
-    /// consumer whose broker-side dispatch has gone silent. It re-attaches THIS
-    /// consumer id in place — zero the permit mirrors, re-emit
-    /// `CommandSubscribe`, defer the grant to the broker's `Success` — and it
-    /// refuses, without touching anything, a consumer that is not eligible.
+    /// consumer whose broker-side dispatch has gone silent. Since ADR-0108 it
+    /// re-attaches THIS consumer id in two phases on the live socket —
+    /// `CommandCloseConsumer` first, then on its `Success` the permit-mirror
+    /// zeroing and a fresh `CommandSubscribe` whose own `Success` releases the
+    /// deferred grant — and it refuses, without touching anything, a consumer
+    /// that is not eligible.
     /// Mirrors the tokio engine test 1:1 (ADR-0024).
     #[tokio::test(flavor = "current_thread")]
     async fn resubscribe_reattaches_in_place_and_refuses_an_ineligible_consumer() {
+        /// Drain the outbound buffer once, bucketing this consumer's closes,
+        /// subscribes and flow grants. `poll_transmit` empties the buffer, so a
+        /// second call would see nothing — classify in one pass.
+        fn drain(
+            shared: &std::sync::Arc<ConnectionShared>,
+        ) -> (Vec<u64>, Vec<(u64, u64)>, Vec<u32>) {
+            let mut out = shared.inner.lock().poll_transmit();
+            let (mut closes, mut subscribes, mut flows) = (Vec::new(), Vec::new(), Vec::new());
+            while !out.is_empty() {
+                let frame = magnetar_proto::decode_one(&mut out).expect("decode outbound");
+                if let Some(close) = frame.command.close_consumer {
+                    closes.push(close.request_id);
+                } else if let Some(sub) = frame.command.subscribe {
+                    subscribes.push((sub.request_id, sub.consumer_id));
+                } else if let Some(flow) = frame.command.flow {
+                    flows.push(flow.message_permits);
+                }
+            }
+            (closes, subscribes, flows)
+        }
+
+        /// Feed the broker's `CommandSuccess` for `request_id`.
+        fn ack(shared: &std::sync::Arc<ConnectionShared>, request_id: u64) {
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode success");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("handle success");
+        }
+
         const RQ: usize = 8;
         let shared = handshake_complete_shared();
         let (handle, subscribe_request_id) = {
@@ -3926,47 +3989,43 @@ mod tests {
         let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
         assert_eq!(consumer.available_permits(), RQ as u32);
 
-        let resub_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        // Phase 1 (ADR-0108): a `CommandCloseConsumer` and nothing else. Nothing is
+        // mutated — the broker still holds this consumer exactly as it was.
+        let close_request_id = shared.inner.lock().peek_next_request_id_for_test();
         consumer.resubscribe().expect("a live consumer is eligible");
         assert_eq!(
             consumer.available_permits(),
+            RQ as u32,
+            "phase 1 must not touch the mirror: a `CommandSubscribe` for a consumer id \
+             the broker still holds is answered `CommandSuccess` and changes nothing \
+             broker-side, so the close is what makes the re-attach real"
+        );
+        let (closes, subscribes, flows) = drain(&shared);
+        assert_eq!(closes, vec![close_request_id], "one CommandCloseConsumer");
+        assert!(
+            subscribes.is_empty() && flows.is_empty(),
+            "the re-attach is owed to the close ack, not to this call"
+        );
+
+        // Phase 2: the broker confirms the close, so the slot really is gone and the
+        // mirror follows it to zero. A fresh `CommandSubscribe` for the SAME consumer
+        // id goes out, with no flow ahead of it (Pulsar drops flow for a consumer
+        // whose subscribe is in flight).
+        let resub_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        ack(&shared, close_request_id);
+        assert_eq!(
+            consumer.available_permits(),
             0,
-            "the broker recreates its dispatcher slot at zero permits; the client's \
+            "the broker has now really dropped the dispatcher slot, so the client's \
              mirror must follow until the re-subscribe is acked"
         );
-        // A fresh `CommandSubscribe` for the SAME consumer id, and no flow ahead
-        // of it (Pulsar drops flow for a consumer whose subscribe is in flight).
-        let mut out = shared.inner.lock().poll_transmit();
-        let (mut subscribes, mut flows) = (Vec::new(), Vec::new());
-        while !out.is_empty() {
-            let frame = magnetar_proto::decode_one(&mut out).expect("decode outbound");
-            if let Some(sub) = frame.command.subscribe {
-                subscribes.push((sub.request_id, sub.consumer_id));
-            } else if let Some(flow) = frame.command.flow {
-                flows.push(flow.message_permits);
-            }
-        }
+        let (closes, subscribes, flows) = drain(&shared);
         assert_eq!(subscribes, vec![(resub_request_id, handle.0)]);
+        assert!(closes.is_empty(), "exactly one close per recovery");
         assert!(flows.is_empty(), "the grant is deferred to the ack");
 
-        // The broker acks: the grant comes back on its own.
-        {
-            let success = pb::BaseCommand {
-                r#type: pb::base_command::Type::Success as i32,
-                success: Some(pb::CommandSuccess {
-                    request_id: resub_request_id,
-                    schema: None,
-                }),
-                ..Default::default()
-            };
-            let mut frame = BytesMut::new();
-            encode_command(&mut frame, &success).expect("encode resubscribe success");
-            shared
-                .inner
-                .lock()
-                .handle_bytes(Instant::now(), &frame)
-                .expect("resubscribe success");
-        }
+        // The broker acks the re-attach: the grant comes back on its own.
+        ack(&shared, resub_request_id);
         assert_eq!(
             consumer.available_permits(),
             RQ as u32,
