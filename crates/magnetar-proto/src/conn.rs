@@ -3062,18 +3062,27 @@ impl Connection {
                             }
                         }
                     }
-                    self.outcomes.insert(
-                        PendingOpKey::Request(rid),
-                        match &result {
-                            Ok(()) => OpOutcome::Success { request_id: rid },
-                            Err(msg) => OpOutcome::Error {
-                                request_id: rid,
-                                code: ack.error.unwrap_or(0),
-                                message: msg.clone(),
+                    // Issue #241 leak shape (mirrors the `Success` arm's `None => {}`):
+                    // `pending_requests.remove` returning `None` means this ack was
+                    // already resolved elsewhere — the #346 orphan sweep above or the
+                    // `ack_response_timeout` backstop already removed it and woke (or
+                    // never had) its waiter. Recording a second `outcomes` entry here
+                    // for the broker's late reply would leak it permanently, since
+                    // nothing is left to `take_outcome` it.
+                    if kind.is_some() {
+                        self.outcomes.insert(
+                            PendingOpKey::Request(rid),
+                            match &result {
+                                Ok(()) => OpOutcome::Success { request_id: rid },
+                                Err(msg) => OpOutcome::Error {
+                                    request_id: rid,
+                                    code: ack.error.unwrap_or(0),
+                                    message: msg.clone(),
+                                },
                             },
-                        },
-                    );
-                    self.wake_for_request(rid);
+                        );
+                        self.wake_for_request(rid);
+                    }
                 }
                 self.events
                     .push_back(ConnectionEvent::AckResponse { request_id, result });
@@ -4631,6 +4640,12 @@ impl Connection {
         // send-timeout sweep above. Skipped entirely when the knob is
         // disabled (`None`) — `poll_timeout` never arms a deadline in that
         // case either, so this loop is then a guaranteed no-op.
+        //
+        // Same issue #241 leak shape as `fail_acks_orphaned_by_consumer_reattach`:
+        // only records an `outcomes` entry when a waker is still parked, since a
+        // dropped `ack()` future (never calling `cancel_request`, see that
+        // function's doc comment) reaches this deadline sweep exactly the same
+        // way it reaches the close-triggered one.
         if let Some(timeout) = self.config.ack_response_timeout {
             let expired_acks: Vec<(RequestId, ConsumerHandle)> = self
                 .pending_requests
@@ -4648,15 +4663,17 @@ impl Connection {
             for (rid, handle) in expired_acks {
                 self.pending_requests.remove(&rid);
                 let message = "ack timeout".to_owned();
-                self.outcomes.insert(
-                    PendingOpKey::Request(rid),
-                    OpOutcome::Error {
-                        request_id: rid,
-                        code: -1,
-                        message: message.clone(),
-                    },
-                );
-                self.wake_for_request(rid);
+                if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(rid),
+                        OpOutcome::Error {
+                            request_id: rid,
+                            code: -1,
+                            message: message.clone(),
+                        },
+                    );
+                    self.wake_for_request(rid);
+                }
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
                     consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
@@ -7896,6 +7913,22 @@ impl Connection {
     ///
     /// Two-phase collect-then-mutate (mirrors the send-timeout sweep shape in
     /// [`Self::handle_timeout`]) avoids mutating `pending_requests` while iterating it.
+    ///
+    /// Only records an `outcomes` entry when a waker is still parked for the request
+    /// (mirrors the `Success` arm's `unsubscribe_has_waiter` guard, issue #241's
+    /// continuous-eviction fix). Both runtime engines' `RequestFut::drop` clear the waker
+    /// and take any outcome that already landed but never call `cancel_request`
+    /// (`magnetar-runtime-moonpool/src/consumer.rs`, `magnetar-runtime-tokio/src/consumer.rs`),
+    /// so a caller that dropped its `ack()` future before it resolved — a `select!` timeout,
+    /// a cancelled task — leaves this `pending_requests` entry with no waker. Recording an
+    /// outcome nobody is left to `take_outcome` would leak it permanently, since nothing
+    /// ever prunes `outcomes` wholesale. `pending_requests.remove`, the `total_acks_failed`
+    /// accounting, and the emitted [`ConnectionEvent::AckResponse`] stay unconditional —
+    /// they are not the leak. This narrows an already-accepted race: a sweep that lands in
+    /// the gap between a live `ack()` releasing the connection lock and its future's first
+    /// poll (which is when the waker registers) also finds no waker yet and skips recording
+    /// — the same shape `unsubscribe_has_waiter` already carries, here without a broker
+    /// round trip.
     fn fail_acks_orphaned_by_consumer_reattach(&mut self, handle: ConsumerHandle) {
         let orphaned_acks: Vec<RequestId> = self
             .pending_requests
@@ -7908,15 +7941,17 @@ impl Connection {
         for rid in orphaned_acks {
             self.pending_requests.remove(&rid);
             let message = "ack orphaned by broker consumer close".to_owned();
-            self.outcomes.insert(
-                PendingOpKey::Request(rid),
-                OpOutcome::Error {
-                    request_id: rid,
-                    code: -1,
-                    message: message.clone(),
-                },
-            );
-            self.wake_for_request(rid);
+            if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::Error {
+                        request_id: rid,
+                        code: -1,
+                        message: message.clone(),
+                    },
+                );
+                self.wake_for_request(rid);
+            }
             if let Some(slot) = self.consumers.get(&handle) {
                 let mut consumer = slot.state.lock();
                 consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
@@ -15065,6 +15100,155 @@ mod conn_state_tests {
         );
     }
 
+    /// Complementary to `ack_orphaned_by_same_broker_close_fails_fast`: a
+    /// caller that dropped its `ack()` future before it resolved — a
+    /// `select!` timeout, a cancelled task — leaves this `pending_requests`
+    /// entry with no waker, because both runtime engines' `RequestFut::drop`
+    /// clear the waker and take any already-landed outcome but never call
+    /// `cancel_request` (`magnetar-runtime-moonpool/src/consumer.rs`,
+    /// `magnetar-runtime-tokio/src/consumer.rs`). The sweep must not write an
+    /// `outcomes` entry for it — the same issue #241 leak shape the
+    /// `Success` arm's `ProducerCloseForgotten` / `ConsumerCloseForgotten` /
+    /// `unsubscribe_has_waiter` guards already cover, on the ack sweep this
+    /// time. This is NOT issue #414: no `resubscribe_consumer_in_place` call
+    /// is involved — the same-broker `CommandCloseConsumer` sweep alone
+    /// reaches the leak.
+    #[test]
+    fn ack_sweep_must_not_leak_an_outcome_for_an_unwaited_ack() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.pending_waker_count(),
+            0,
+            "precondition: no ack future is parked on this request — dropped before its \
+             first poll, or dropped after being polled and cancelled; both leave no waker"
+        );
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        let key = PendingOpKey::Request(rid);
+        let leaked = conn.take_outcome(key);
+        assert!(
+            leaked.is_none(),
+            "the sweep wrote an outcomes entry for an ack with no waiter: {leaked:?}. \
+             Nothing is left to take_outcome it — that is one permanent outcomes entry \
+             per swept ack with a dropped future."
+        );
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the orphaned ack must still drain out of pending_requests even when \
+             nothing consumes its outcome"
+        );
+    }
+
+    /// The `AckResponse` arm's own leak site: unlike the sweep above, this one
+    /// fires on the broker's OWN late reply, after a waited ack already
+    /// consumed a synthetic error from that same sweep and its future
+    /// completed. `pending_requests.remove` returns `None` here (the sweep
+    /// already removed the entry), but the arm inserted an `outcomes` entry
+    /// unconditionally regardless — the same issue #241 leak shape, on the
+    /// broker's real reply instead of the synthetic sweep error.
+    #[test]
+    fn late_ack_response_must_not_leak_an_outcome_after_the_waiter_is_gone() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle, Instant::now());
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        let key = PendingOpKey::Request(rid);
+        // A real ack().await parks a waker on its first poll; simulate that.
+        conn.register_waker(key, std::task::Waker::noop().clone());
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        // The future's poll() consumes the sweep's synthetic error and
+        // completes; nothing re-registers a waker afterward.
+        let consumed = conn.take_outcome(key);
+        assert!(
+            matches!(consumed, Some(OpOutcome::Error { .. })),
+            "precondition: the sweep recorded an outcome for the waited ack: {consumed:?}"
+        );
+        assert_eq!(
+            conn.pending_waker_count(),
+            0,
+            "precondition: the sweep's wake_for_request already drained the waker"
+        );
+
+        // The broker's own real reply for the same request id lands late.
+        let ack_response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack_response).expect("encode CommandAckResponse");
+        conn.handle_bytes(t0 + Duration::from_millis(2), &buf)
+            .expect("handle AckResponse");
+
+        let leaked = conn.take_outcome(key);
+        assert!(
+            leaked.is_none(),
+            "a late CommandAckResponse wrote an outcomes entry after its waiter was \
+             already gone: {leaked:?}. The AckResponse arm inserted unconditionally \
+             even when `pending_requests.remove` returned `None`."
+        );
+    }
+
     /// Backstop deadline: an ack whose `CommandAckResponse` never arrives (the
     /// broker goes silent without ever tearing the consumer down) must not
     /// hang the caller's `ack().await` forever. Once the INJECTED clock
@@ -17628,6 +17812,13 @@ mod consumer_stall_and_recovery_tests {
             t0,
         );
         let _ = drain_outbound(&mut conn, handle);
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the sweep's waiter guard (issue #241 leak fix) sees a live caller
+        // and still records the synthetic error for it to consume.
+        conn.register_waker(
+            PendingOpKey::Request(ack_rid),
+            std::task::Waker::noop().clone(),
+        );
 
         conn.resubscribe_consumer_in_place(handle)
             .expect("eligible");

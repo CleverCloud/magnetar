@@ -4,7 +4,7 @@
 //! moonpool engine twin of
 //! `crates/magnetar-runtime-tokio/tests/ack_orphan_close.rs`.
 //!
-//! Both scenarios lock [`ConnectionShared::inner`] directly and drive
+//! Every scenario locks [`ConnectionShared::inner`] directly and drives
 //! `handle_bytes` / `handle_timeout` with injected [`Instant`]s instead of a
 //! real driver task + TCP loopback — the same "no driver task, no TCP
 //! listener" idiom `virtual_clock_send_timeout.rs` and
@@ -13,6 +13,16 @@
 //! without a real host-clock wait on this side — the deadline scenario in
 //! particular advances a synthetic clock for free, which is the whole point
 //! of the moonpool engine existing.
+//!
+//! Two further scenarios cover the `AckResponse` command arm's own issue
+//! #241 guard, one per branch:
+//!
+//! 3. `ack_response_broker_rejection_for_a_live_waiter_is_recorded_and_wakes_it` — the *record*
+//!    branch. Unrelated to the sweeps above: a broker that outright rejects a still-pending,
+//!    live-waiter ack must still have its error recorded and its caller woken.
+//! 4. `a_late_ack_response_for_an_already_resolved_ack_records_nothing` — the *skip* branch, the
+//!    one the guard exists for. A sweep already resolved the ack and its waiter already drained the
+//!    outcome; the broker's real reply, still in flight, must record no second, undrainable entry.
 
 mod common;
 
@@ -20,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    AckRequest, ConnectionConfig, ConsumerHandle, MessageId, OpOutcome, PendingOpKey,
+    AckRequest, ConnectionConfig, ConsumerHandle, MessageId, OpOutcome, PendingOpKey, RequestId,
     SubscribeRequest, encode_command, pb,
 };
 
@@ -91,6 +101,11 @@ fn ack_orphaned_by_same_broker_close_fails_fast() {
             t0,
         );
         let _ = conn.poll_transmit();
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the sweep's issue #241 waiter guard sees a live caller and still
+        // records the synthetic error for it to consume (the guard's whole
+        // point is skipping this record for a dropped, never-polled future).
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
         rid
     };
 
@@ -164,6 +179,10 @@ fn ack_response_timeout_fires_at_virtual_deadline() {
             t0,
         );
         let _ = conn.poll_transmit();
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the reap sweep's issue #241 waiter guard sees a live caller and
+        // still records the synthetic timeout error for it to consume.
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
         rid
     };
     let key = PendingOpKey::Request(rid);
@@ -206,5 +225,214 @@ fn ack_response_timeout_fires_at_virtual_deadline() {
     assert!(
         !shared.inner.lock().has_pending_request_for_test(rid),
         "the timed-out ack must drain out of pending_requests"
+    );
+}
+
+/// Encode a broker `CommandAckResponse` rejecting `request_id` with `code` /
+/// `message` — the shape a real broker error (not a synthetic sweep) takes.
+fn ack_response_error_frame(
+    handle: ConsumerHandle,
+    request_id: RequestId,
+    code: pb::ServerError,
+    message: &str,
+) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AckResponse as i32,
+        ack_response: Some(pb::CommandAckResponse {
+            consumer_id: handle.0,
+            request_id: Some(request_id.0),
+            error: Some(code as i32),
+            message: Some(message.to_owned()),
+            txnid_least_bits: None,
+            txnid_most_bits: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAckResponse");
+    buf
+}
+
+/// The `AckResponse` command arm's own issue #241 guard has two branches:
+/// `Ok(()) => OpOutcome::Success` (already exercised without this test, by the
+/// plain ack round-trip in `receiver_queue_auto_growth.rs`'s
+/// `auto_adjust_schedule_survives_continuous_ack_response_traffic`) and
+/// `Err(msg) => OpOutcome::Error`, exercised here for the first time.
+///
+/// A broker that outright rejects a still-pending, live-waiter ack —
+/// `pending_requests.remove` finds the entry, so `kind.is_some()` is true —
+/// must still record the `Error` outcome and wake the caller. The guard only
+/// ever skips recording when `pending_requests.remove` found NOTHING (the
+/// #346 sweep above or the `ack_response_timeout` backstop already resolved
+/// it), never for an ordinary negative reply to a still-tracked ack.
+#[test]
+fn ack_response_broker_rejection_for_a_live_waiter_is_recorded_and_wakes_it() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+
+    let handle = {
+        let mut conn = shared.inner.lock();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/ack-response-rejected".to_owned(),
+            subscription: "ack-response-rejected".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        handle
+    };
+
+    let rid = {
+        let mut conn = shared.inner.lock();
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![ack_message_id()],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        // A real `ack().await` parks a waker on its first poll; simulate that
+        // so the assertion below proves the broker's rejection actually wakes
+        // a live caller, not just that an outcome landed in the slab.
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
+        rid
+    };
+
+    {
+        let mut conn = shared.inner.lock();
+        let frame = ack_response_error_frame(
+            handle,
+            rid,
+            pb::ServerError::AuthorizationError,
+            "not authorized",
+        );
+        conn.handle_bytes(t0, &frame).expect("handle AckResponse");
+    }
+
+    let key = PendingOpKey::Request(rid);
+    let outcome = shared.inner.lock().take_outcome(key);
+    match outcome {
+        Some(OpOutcome::Error {
+            request_id,
+            code,
+            message,
+        }) => {
+            assert_eq!(request_id, rid);
+            assert_eq!(
+                code,
+                pb::ServerError::AuthorizationError as i32,
+                "the broker's error code must pass through unchanged"
+            );
+            assert_eq!(message, "not authorized");
+        }
+        other => panic!("expected the broker's rejection as an Error outcome, got {other:?}"),
+    }
+    assert!(
+        !shared.inner.lock().has_pending_request_for_test(rid),
+        "a resolved ack — success or rejection — must drain out of pending_requests"
+    );
+}
+
+/// Encode a broker `CommandAckResponse` accepting `request_id` — no `error`,
+/// no `message`, which is what the `AckResponse` arm reads as `Ok(())`.
+fn ack_response_success_frame(handle: ConsumerHandle, request_id: RequestId) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AckResponse as i32,
+        ack_response: Some(pb::CommandAckResponse {
+            consumer_id: handle.0,
+            request_id: Some(request_id.0),
+            error: None,
+            message: None,
+            txnid_least_bits: None,
+            txnid_most_bits: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAckResponse");
+    buf
+}
+
+/// The guard's *skip* branch — the branch the fix exists for.
+///
+/// The #346 sweep above already resolved this ack and its waiter already
+/// drained the outcome. The broker knows nothing about that: its real
+/// `CommandAckResponse` for the same request id is still in flight and
+/// arrives afterwards. `pending_requests.remove` now finds nothing, so
+/// `kind` is `None` — there is no future left to `take_outcome` a second
+/// record, and `outcomes` is pruned only by `take_outcome` or
+/// `cancel_request` (`Connection::cancel_request`), never wholesale. Writing
+/// the late reply into `outcomes` would therefore leak one entry
+/// permanently, which is the issue #241 shape the `Success` arm's own
+/// `None => {}` case has always avoided.
+///
+/// Same-broker `CloseConsumer` is only the cheapest way to reach that state
+/// here; the `ack_response_timeout` backstop and a caller that simply
+/// dropped its `ack()` future reach it identically.
+#[test]
+fn a_late_ack_response_for_an_already_resolved_ack_records_nothing() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+
+    let handle = {
+        let mut conn = shared.inner.lock();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/ack-late-response".to_owned(),
+            subscription: "ack-late-response".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        handle
+    };
+
+    let rid = {
+        let mut conn = shared.inner.lock();
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![ack_message_id()],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        conn.register_waker(PendingOpKey::Request(rid), std::task::Waker::noop().clone());
+        rid
+    };
+
+    // The sweep resolves the ack, and the caller's future consumes it — the
+    // state a returning `ack().await` leaves behind.
+    {
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &close_consumer_frame(handle))
+            .expect("handle broker close");
+    }
+    let key = PendingOpKey::Request(rid);
+    assert!(
+        shared.inner.lock().take_outcome(key).is_some(),
+        "precondition: the sweep resolved the ack for its live waiter"
+    );
+
+    // The broker's own reply lands afterwards, for a request nothing is
+    // tracking any more.
+    {
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &ack_response_success_frame(handle, rid))
+            .expect("handle late AckResponse");
+    }
+
+    assert!(
+        shared.inner.lock().take_outcome(key).is_none(),
+        "a late broker reply for an already-resolved ack must record no second, \
+         undrainable outcome (issue #241 leak shape)"
     );
 }

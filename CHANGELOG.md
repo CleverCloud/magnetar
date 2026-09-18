@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A dropped `ack()` future no longer leaks a permanent `outcomes` entry — same issue #241 leak shape as the producer-close fix, now on the ack bookkeeping.**
+  Both runtime engines' `RequestFut::drop` clear the parked waker and take any outcome that already landed, but neither calls `cancel_request`: `magnetar-runtime-moonpool/src/consumer.rs` and `magnetar-runtime-tokio/src/consumer.rs` both stop at `unregister_waker` + `take_outcome`.
+  So a caller that dropped its `ack()` future before it resolved — a `select!` timeout, a cancelled task — left the `pending_requests` entry behind with no waker, which is exactly the state three sweeps in `crates/magnetar-proto/src/conn.rs` then hit: `fail_acks_orphaned_by_consumer_reattach` (the same-broker `CommandCloseConsumer` sweep, issue #346), the `ack_response_timeout` backstop reap in `handle_timeout`, and the `AckResponse` command arm.
+  All three recorded an `OpOutcome` in the connection's `outcomes` map unconditionally, mirroring neither the `Success` arm's `unsubscribe_has_waiter` guard nor its `ProducerCloseForgotten` / `ConsumerCloseForgotten` fire-and-forget handling, both added for issue #241's continuous-eviction leak.
+  Nothing ever prunes `outcomes` wholesale — entries leave only via `take_outcome` or `cancel_request` — so every dropped ack whose resolution reached one of these three sites left one permanent entry.
+  The two sweep sites now record an outcome only when `self.wakers` still holds a waker for the request, mirroring `unsubscribe_has_waiter`; the `AckResponse` arm now records one only when `pending_requests.remove` actually found an entry, mirroring the `Success` arm's `None => {}` case — a late broker reply for an ack an earlier sweep already resolved no longer overwrites `outcomes` with a second, undrainable entry.
+  `pending_requests.remove`, the `total_acks_failed` accounting, and the emitted `ConnectionEvent::AckResponse` stay unconditional in all three sites; only the `outcomes` write and its paired wake are guarded.
+  A caller that still holds its `ack()` future sees no change: the guard only ever skips a record nothing is left to consume.
+  (issue #346-adjacent, same defect class as issue #241; not issue #414 — no `resubscribe_consumer_in_place` call is involved)
+
 - **A dead-lettered dispatch unit now returns its flow permit, so a poison-heavy `Shared` subscription no longer wedges at `availablePermits=0`.**
   The broker charges one permit per dispatch unit — `Consumer#sendMessages` debits `ackedCount - totalMessages` — and a unit the client will route to its dead-letter buffer is inside `totalMessages`, because the broker has no idea what the client intends to do with the entry.
   `ConsumerState::classify_and_queue` mirrored that debit correctly: `record_dispatch_unit()` runs unconditionally, before the queued-versus-dead-lettered branch.

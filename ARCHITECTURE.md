@@ -840,6 +840,12 @@ Two independent mechanisms resolve a pending ack that would otherwise park its `
 
 Both mechanisms mirror the pre-existing per-producer `send_timeout` sweep in shape (two-phase collect-then-mutate over the pending map, then wake + record the outcome), and both also bump `ConsumerState::total_acks_failed` and push a `ConnectionEvent::AckResponse { request_id: Some(rid), result: Err(..) }` so the failure is observable through the same seams a real broker-rejected ack would use.
 
+**Waiter guard (issue #241 shape, applied to the ack path).**
+Neither runtime engine's `RequestFut::drop` calls `cancel_request` — only `unregister_waker` + `take_outcome` — so a caller that drops its `ack()` future before it resolves (a `select!` timeout, a cancelled task) leaves the `pending_requests` entry behind with no waker.
+Nothing ever prunes `outcomes` wholesale (entries leave only via `take_outcome` or `cancel_request`), so recording an `OpOutcome` for that entry would leak it permanently — the same shape the `Success` arm's `ProducerCloseForgotten` / `ConsumerCloseForgotten` fire-and-forget handling and `unsubscribe_has_waiter` guard already cover for issue #241.
+Both mechanisms above, and the `AckResponse` command arm that resolves a _waited_ ack, now record an outcome only when there is still someone to drain it: the two sweeps check `self.wakers.contains_key(&PendingOpKey::Request(rid))` before inserting, and the `AckResponse` arm inserts only when `pending_requests.remove` actually found an entry (mirroring the `Success` arm's own `None => {}` case) — a late broker reply for an ack a sweep already resolved no longer overwrites `outcomes` with a second, undrainable entry.
+`pending_requests` removal, the `total_acks_failed` bump, and the emitted `ConnectionEvent::AckResponse` stay unconditional in all three sites; only the `outcomes` write and its paired wake are guarded, so a caller that still holds its `ack()` future observes no change.
+
 ### Producer / consumer states
 
 `ProducerState` lives at [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/producer.rs).

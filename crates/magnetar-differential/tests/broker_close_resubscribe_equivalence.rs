@@ -208,6 +208,13 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
         },
         t0,
     );
+    // A real `ack().await` parks a waker on its first poll; simulate that on
+    // both engines so the close sweep's issue #241 waiter guard sees a live
+    // caller and still records the synthetic error this test asserts on.
+    conn.register_waker(
+        PendingOpKey::Request(ack_rid),
+        std::task::Waker::noop().clone(),
+    );
     let _ = drain_outbound(conn, handle); // discard the CommandAck frame
 
     // The re-subscribe (if any) will allocate this request id.
