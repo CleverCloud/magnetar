@@ -85,4 +85,5 @@ Both refusals live in `resubscribe_consumer_in_place` and **not** in the shared 
 - [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md) — amended: §3's "zero the mirrors, re-emit `CommandSubscribe` for the same consumer id" becomes close-then-re-subscribe, and its "the broker recreates its dispatcher slot at `availablePermits = 0`" premise is corrected.
 - [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md) — amended: the in-place-recovery clause now runs through the close, and the "one attempt credits the aggregate back exactly `receiver_queue_size`" arithmetic is superseded.
 - [ADR-0099](0099-nondurable-reattach-cursor-safety.md) — the non-durable cursor rule the non-durable refusal follows from.
+- [ADR-0102](0102-grant-the-initial-consumer-flow-once-per-attach.md) — corrected: one parenthetical in its rejected "zero the mirrors at every emission" alternative restates the same false premise. Its rejection rests on blast radius and is unaffected.
 - [ADR-0102](0102-grant-the-initial-consumer-flow-once-per-attach.md) — `initial_grant_due`, which is what makes the deferred flow grant exactly once per attach.

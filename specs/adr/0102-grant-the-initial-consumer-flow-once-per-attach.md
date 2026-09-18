@@ -1,6 +1,6 @@
 # ADR-0102 — Grant the initial consumer flow once per attach
 
-- **Status**: Accepted (amends [ADR-0082](0082-consumer-permit-balance-split.md), the "two callers" clause)
+- **Status**: Accepted (amends [ADR-0082](0082-consumer-permit-balance-split.md), the "two callers" clause; one parenthetical in the rejected "zero the mirrors at every emission" alternative is corrected by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) — the decision itself is unaffected)
 - **Date**: 2026-08-22
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, failover, sans-io, issue-427
@@ -31,6 +31,8 @@ The cost is the same one issue #426 carried: the broker may hand a consumer twic
 
 - **Gate the #307 re-arm on "the runtime still owes this attach's grant".** The symmetric twin of the existing `!flow_on_subscribe_ack` clause: a new flag set on `NotifyWaiter` subscribes and cleared at the grant, blocking the re-arm until the engine has had its turn. Correct, but it makes the re-arm the loser of the race by construction rather than making the outcome order-independent, and it does not help if a broker ever sends the announcement BEFORE the `Success`. It also invalidates the way all three existing #307 tests model a starved standby (subscribe, ack, no `initial_flow`), which would have had to be rewritten to keep asserting behaviour the fix leaves untouched.
 - **Zero the permit mirrors at every `CommandSubscribe` emission**, making `granted_permits != 0` a sufficient guard on its own with no new state. Semantically right — the broker recreates its dispatcher slot at zero permits — but it changes the post-seek resubscribe's live permit accounting mid-flight, where `flow_stats` and `adjust_receiver_queue` read those mirrors. A wider blast radius than the decision needs.
+
+  > **Corrected by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) (2026-09-18).** "The broker recreates its dispatcher slot at zero permits" holds for a `CommandSubscribe` naming a consumer id the broker does not already have; it is false for one it does, where `ServerCnx.handleSubscribe` replies `sendSuccessResponse(requestId)` and touches neither dispatcher nor `availablePermits`. This alternative's rejection stands unchanged — it rests on the blast radius, not on that parenthetical.
 - **Drop the #307 re-arm and let the engines own every grant.** Refused: the re-arm is the only path that restores flow to a consumer whose mirrors a churn boundary zeroed without a re-subscribe following, and `maybe_flow` cannot substitute for it (it only fires once messages have been consumed, and none can arrive at zero permits).
 
 ## Decision
