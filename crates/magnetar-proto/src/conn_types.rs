@@ -363,7 +363,8 @@ pub struct ConnectionConfig {
     /// zero on **real progress only** — one broker dispatch unit actually arriving
     /// (`ConsumerState::record_dispatch_unit`). It deliberately does NOT reset at the
     /// churn boundaries that zero the permit mirrors, because the recovery's own
-    /// re-subscribe is one of them and resetting there would make the bound infinite.
+    /// close-and-re-subscribe is one of them and resetting there would make the bound
+    /// infinite.
     ///
     /// **Default `None` — off, exactly like [`Self::consumer_stall_timeout`].** It is also
     /// inert without that knob: no stall window means no stall episode means nothing to
@@ -376,14 +377,19 @@ pub struct ConnectionConfig {
     /// the dispatch unit that would reset the budget, so without that skip an armed
     /// recovery would spend its whole budget on every healthy standby in a failover group.
     ///
-    /// Each attempt zeroes this client's permit mirrors and re-attaches this consumer id
-    /// on the live socket, which repairs **this client's own slot** in the broker's
-    /// dispatcher. Issue #414's production failure was dispatcher-WIDE — the
-    /// subscription's `availablePermits` observed at `-177300` across every attached
-    /// consumer — and a fresh grant only lifts a corrupted aggregate by one receiver-queue
-    /// window per attempt. That is precisely why the bound exists: once it is exhausted
-    /// the client stops and logs the escalation (`pulsar-admin topics unload`) rather than
-    /// re-subscribing forever against a fault it cannot repair. See
+    /// Each attempt closes this consumer id and re-attaches it on the live socket (ADR-0108
+    /// — a `CommandSubscribe` for a consumer id the broker still holds is a broker-side
+    /// no-op, so the close is what makes the re-attach real), which repairs **this client's
+    /// own slot** in the broker's dispatcher and costs redelivery of whatever it was holding
+    /// un-acked. Issue #414's production failure was dispatcher-WIDE — the subscription's
+    /// `availablePermits` observed at `-177300` across every attached consumer — and an
+    /// attempt does not lift a corrupted aggregate at all: the close returns this consumer's
+    /// remaining permits and the re-subscribe's grant takes them back, so one recovery is
+    /// permit-NEUTRAL. That is why the bound exists and why it stays small: once it is
+    /// exhausted the client stops and logs the escalation (`pulsar-admin topics unload`)
+    /// rather than acting forever against a fault it cannot repair. A `Failover` or
+    /// non-durable subscription is refused outright, so an armed budget never spends
+    /// anything on one. See
     /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
     pub consumer_stall_auto_recovery: Option<u32>,
     /// Engine-arming slot for the ADR-0048 buggify fault-injection helper

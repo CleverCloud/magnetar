@@ -450,14 +450,26 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
 // that reproduces the reported signature, not a verified reading of any broker
 // source — `UPSTREAM-ISSUE-DRAFT.md` frames it that way for Pulsar's maintainers.
 //
-// What the two tests then pin is the recovery arithmetic, which is the whole
-// reason ADR-0103's budget is a small integer rather than "retry until it works".
-// An in-place re-subscribe zeroes this consumer's permits broker-side and the
-// client answers the `Success` with one fresh full-window `CommandFlow`, so ONE
-// attempt lifts the aggregate by exactly `receiver_queue_size`. The same trace and
-// the same leak therefore recover under a sufficient budget and stay wedged under
-// an insufficient one — which is why a leak of `-177300` against a 1000-message
-// queue is an operator's `topics unload` and not a client's retry loop.
+// What the two tests then pin is the recovery arithmetic — and ADR-0108 changed it.
+//
+// Before ADR-0108 the recovery re-emitted `CommandSubscribe` for a consumer id the
+// broker still held. A real broker answers that with a bare `CommandSuccess` and
+// touches nothing (`ServerCnx.java:1320-1326`), but the client then granted a full
+// fresh `CommandFlow` on top, so the aggregate rose by `receiver_queue_size` per
+// attempt — a credit with no matching debit anywhere, i.e. the over-commit, which is
+// the same accounting asymmetry these tests exist to model, pointed the other way.
+// On that arithmetic the same trace recovered under a sufficient budget.
+//
+// The recovery now closes the consumer first, so it is permit-NEUTRAL: the close
+// returns this consumer's remaining permits to the aggregate and the re-subscribe's
+// grant takes them back. Attempts therefore no longer add up — and the recovery's own
+// `CommandCloseConsumer` is itself a consumer-churn event, so under the hypothesised
+// double-subtraction it makes the aggregate WORSE, not better.
+//
+// So the two tests below now pin the honest position: a subscription-wide leak is not
+// client-recoverable at any budget, exactly as ADR-0101 always claimed for the scope
+// of this repair, and `pulsar-admin topics unload` is the answer to `-177300`. The
+// bound exists to reach that escalation, not to grind toward it.
 // ---------------------------------------------------------------------------
 
 /// Stall window for the wedge scenarios. Long enough that no episode can close
@@ -529,31 +541,68 @@ fn wedge_trace(topic: &str, subscription: &str) -> Trace {
 
 /// How many `CommandSubscribe` frames the broker saw.
 ///
-/// Two are the opens; every further one is an automatic in-place re-subscribe the
-/// stall watchdog drove. This is the discriminating assertion for the bound — the
-/// exhausted leg's user-visible outcome (`RecvTimeout`) is by construction the same
-/// one a client with no recovery at all would produce.
+/// Two are the opens; every further one is the second phase of an automatic in-place
+/// recovery the stall watchdog drove. This is the discriminating assertion for the
+/// bound — the user-visible outcome (`RecvTimeout`) is by construction the same one a
+/// client with no recovery at all would produce, so counting frames is the only way to
+/// tell "the client tried and could not" from "the client never tried".
 fn subscribe_frame_count(broker: &ScriptedBroker) -> usize {
-    let subscribe = magnetar_proto::pb::base_command::Type::Subscribe as i32;
+    frame_count(
+        broker,
+        magnetar_proto::pb::base_command::Type::Subscribe as i32,
+    )
+}
+
+/// How many `CommandCloseConsumer` frames the broker saw.
+///
+/// One is the trace's own churn event; every further one is ADR-0108's phase 1. A
+/// recovery that reached the broker at all is visible here even when its phase 2
+/// never ran.
+fn close_consumer_frame_count(broker: &ScriptedBroker) -> usize {
+    frame_count(
+        broker,
+        magnetar_proto::pb::base_command::Type::CloseConsumer as i32,
+    )
+}
+
+/// `CommandCloseConsumer` frames [`wedge_trace`] produces with recovery DISARMED, which
+/// every recovery close is counted on top of: the trace's own `CloseSharedConsumer` op,
+/// plus the two consumers' last-clone drop closes when the runner tears the client down
+/// (issue #241 / #342). Engine teardown bookkeeping rather than anything the trace
+/// states, so this is a measured baseline, not a derived one.
+const WEDGE_BASELINE_CLOSES: usize = 3;
+
+fn frame_count(broker: &ScriptedBroker, kind: i32) -> usize {
     broker
         .frame_log_snapshot()
         .into_iter()
-        .filter(|kind| *kind == subscribe)
+        .filter(|seen| *seen == kind)
         .count()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn wedged_shared_dispatcher_is_recovered_by_bounded_auto_recovery() {
-    // Budget of two against a leak of two survivor windows: the first attempt lifts
-    // the aggregate from -2 to 0 — still gated, since the real dispatcher's read
-    // gate is `> 0` — and the second lifts it to 2 and the backlog finally moves.
-    // That the recovery took TWO attempts rather than one is the point: this is a
-    // subscription-wide corruption being paid down one receiver-queue window at a
-    // time, not a per-consumer glitch a single re-attach clears.
+async fn a_leaked_shared_dispatcher_is_not_recovered_by_a_generous_budget() {
+    // A budget of two against a leak of two survivor windows — the configuration that
+    // recovered this trace before ADR-0108, and the reason the pre-ADR-0108 arithmetic
+    // looked like it worked. It no longer does, and that is the correct outcome rather
+    // than a regression:
+    //
+    // - the old recovery re-subscribed a live consumer id, which a real broker answers with a bare
+    //   `CommandSuccess` while changing nothing, and then granted a full fresh window on top. The
+    //   `+receiver_queue_size` per attempt that paid this leak down was that unmatched credit — the
+    //   client inventing permits;
+    // - the new recovery closes the consumer first, so the close returns its permits and the
+    //   re-subscribe's grant takes them back. Permit-neutral. And the close is itself a
+    //   consumer-churn event, so under the double-subtraction this harness models it subtracts the
+    //   survivor's window twice and credits it once.
+    //
+    // A client cannot climb out of a broker-side accounting hole by churning consumers
+    // into the very path that digs it. `pulsar-admin topics unload` is the answer to
+    // `-177300`, which is what ADR-0101 said the scope of this repair was all along.
     const MAX_ATTEMPTS: u32 = 2;
     let trace = wedge_trace(
-        "persistent://public/default/shared-wedge-recovered",
-        "sub-shared-wedge-recovered",
+        "persistent://public/default/shared-wedge-generous-budget",
+        "sub-shared-wedge-generous-budget",
     );
 
     let broker = ScriptedBroker::bind().await.expect("broker bind");
@@ -570,7 +619,10 @@ async fn wedged_shared_dispatcher_is_recovered_by_bounded_auto_recovery() {
     )
     .await
     .expect("tokio runner");
-    let tokio_subscribes = subscribe_frame_count(&broker);
+    let (tokio_subscribes, tokio_closes) = (
+        subscribe_frame_count(&broker),
+        close_consumer_frame_count(&broker),
+    );
 
     broker.clear_frame_log();
     let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
@@ -581,11 +633,14 @@ async fn wedged_shared_dispatcher_is_recovered_by_bounded_auto_recovery() {
     )
     .await
     .expect("moonpool runner");
-    let moonpool_subscribes = subscribe_frame_count(&broker);
+    let (moonpool_subscribes, moonpool_closes) = (
+        subscribe_frame_count(&broker),
+        close_consumer_frame_count(&broker),
+    );
 
     assert_eq!(
         tokio_stream, moonpool_stream,
-        "engine event streams diverged recovering a wedged Shared dispatcher",
+        "engine event streams diverged against a wedged Shared dispatcher",
     );
 
     let events = &tokio_stream.events;
@@ -611,38 +666,47 @@ async fn wedged_shared_dispatcher_is_recovered_by_bounded_auto_recovery() {
     );
     assert_eq!(
         events[4],
-        Event::Received {
-            payload: b"after-wedge".to_vec(),
-            message_id: message_id(0),
-        },
-        "the backlog must reach the survivor once automatic recovery has credited the \
-         broker's leaked aggregate back above zero, got {:?}",
+        Event::RecvTimeout,
+        "a subscription-wide permit leak is not repairable by re-attaching one \
+         consumer, at any budget: the recovery is permit-neutral by construction and \
+         its own close is another churn event. Escalation is `topics unload`. Got {:?}",
         events[4],
     );
 
-    // Two opens plus exactly `MAX_ATTEMPTS` automatic re-subscribes, on BOTH engines.
-    // The whole mechanism lives in the shared sans-io layer precisely so this number
-    // cannot drift between them.
-    let expected = 2 + MAX_ATTEMPTS as usize;
+    // And the client genuinely SPENT its budget rather than declining to act — the
+    // distinction the user-visible `RecvTimeout` cannot make on its own. Two opens plus
+    // exactly `MAX_ATTEMPTS` phase-2 re-subscribes, and the trace's own close plus
+    // exactly `MAX_ATTEMPTS` phase-1 closes. On BOTH engines: the whole mechanism lives
+    // in the shared sans-io layer precisely so these numbers cannot drift between them.
+    let expected_subscribes = 2 + MAX_ATTEMPTS as usize;
+    let expected_closes = WEDGE_BASELINE_CLOSES + MAX_ATTEMPTS as usize;
     assert_eq!(
         (tokio_subscribes, moonpool_subscribes),
-        (expected, expected),
+        (expected_subscribes, expected_subscribes),
         "each engine must send two opens and exactly {MAX_ATTEMPTS} recovery re-subscribes",
+    );
+    assert_eq!(
+        (tokio_closes, moonpool_closes),
+        (expected_closes, expected_closes),
+        "each engine must send exactly {MAX_ATTEMPTS} recovery closes on top of the \
+         trace's own churn close and the two teardown closes — ADR-0108's phase 1, \
+         without which the re-subscribes above would be broker-side no-ops",
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget() {
-    // The same trace and the same leak with a budget of one. The single attempt
-    // lifts the aggregate from -2 to 0, which is still gated, and then the client
-    // stops: no third `CommandSubscribe`, one `warn!` naming `pulsar-admin topics
-    // unload`, and the message never arrives.
+    // The same trace and the same leak with a budget of one. The client makes its
+    // single attempt and then stops: no further recovery close, no further
+    // `CommandSubscribe`, one `warn!` naming `pulsar-admin topics unload`, and the
+    // message never arrives.
     //
-    // This is also the negative control for the sibling test above — it proves the
-    // wedge is real and that automatic recovery, not the trace, is what clears it.
-    // And it is the shape issue #414 actually reported: an aggregate at `-177300`
-    // is ~178 receiver-queue windows deep, so no sane client budget reaches it and
-    // the escalation is the honest answer rather than an unbounded retry loop.
+    // Paired with the sibling above, this is what shows the BOUND is a bound rather
+    // than the thing that decides the outcome: doubling the budget changes the frame
+    // counts and nothing else. That is the shape issue #414 actually reported — an
+    // aggregate at `-177300` is ~178 receiver-queue windows deep — and since ADR-0108
+    // the attempts do not accumulate at all, so escalation is the only honest answer
+    // rather than an unbounded retry loop.
     const MAX_ATTEMPTS: u32 = 1;
     let trace = wedge_trace(
         "persistent://public/default/shared-wedge-exhausted",
@@ -664,6 +728,7 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     .await
     .expect("tokio runner");
     let tokio_subscribes = subscribe_frame_count(&broker);
+    let tokio_closes = close_consumer_frame_count(&broker);
 
     broker.clear_frame_log();
     let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
@@ -675,6 +740,7 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     .await
     .expect("moonpool runner");
     let moonpool_subscribes = subscribe_frame_count(&broker);
+    let moonpool_closes_for_assertion = close_consumer_frame_count(&broker);
 
     assert_eq!(
         tokio_stream, moonpool_stream,
@@ -683,8 +749,8 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     assert_eq!(
         tokio_stream.events[4],
         Event::RecvTimeout,
-        "one receiver-queue window is not enough to pay down this leak, so the \
-         subscription stays wedged and nothing is delivered, got {:?}",
+        "a permit-neutral recovery cannot pay down this leak whatever the budget, so \
+         the subscription stays wedged and nothing is delivered, got {:?}",
         tokio_stream.events[4],
     );
 
@@ -694,5 +760,12 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
         (expected, expected),
         "the budget is a hard cap: two opens and exactly {MAX_ATTEMPTS} recovery \
          re-subscribe, not one per stall window for the life of the consumer",
+    );
+    let expected_closes = WEDGE_BASELINE_CLOSES + MAX_ATTEMPTS as usize;
+    assert_eq!(
+        (tokio_closes, moonpool_closes_for_assertion),
+        (expected_closes, expected_closes),
+        "and the cap covers ADR-0108's phase 1 too: exactly {MAX_ATTEMPTS} recovery close \
+         on top of the trace's own churn close and the two teardown closes",
     );
 }

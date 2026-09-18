@@ -587,6 +587,10 @@ struct SessionDeps {
     /// the subscription's aggregate counter TWICE (issue #414). See
     /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`].
     leak_shared_permits_on_churn: Arc<Mutex<bool>>,
+    /// When `true`, a `CommandSubscribe` naming a consumer id ALREADY live on this
+    /// session is answered with a bare `CommandSuccess` and changes no broker state.
+    /// See [`ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`].
+    live_id_subscribe_is_noop: Arc<Mutex<bool>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -697,6 +701,10 @@ pub struct ScriptedBroker {
     /// churn event (issue #414). Armed by
     /// [`Self::leak_shared_permits_on_consumer_churn`].
     leak_shared_permits_on_churn: Arc<Mutex<bool>>,
+    /// When `true`, a `CommandSubscribe` naming a consumer id already live on the session
+    /// is a `CommandSuccess` no-op. Armed by
+    /// [`Self::subscribe_on_live_consumer_id_is_a_success_noop`].
+    live_id_subscribe_is_noop: Arc<Mutex<bool>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -756,6 +764,8 @@ impl ScriptedBroker {
         let announce_active_consumer_clone = announce_active_consumer.clone();
         let leak_shared_permits_on_churn = Arc::new(Mutex::new(false));
         let leak_shared_permits_on_churn_clone = leak_shared_permits_on_churn.clone();
+        let live_id_subscribe_is_noop = Arc::new(Mutex::new(false));
+        let live_id_subscribe_is_noop_clone = live_id_subscribe_is_noop.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -775,6 +785,7 @@ impl ScriptedBroker {
             withhold_registration_survives_close: withhold_registration_survives_close_clone,
             announce_active_consumer: announce_active_consumer_clone,
             leak_shared_permits_on_churn: leak_shared_permits_on_churn_clone,
+            live_id_subscribe_is_noop: live_id_subscribe_is_noop_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -813,6 +824,7 @@ impl ScriptedBroker {
             withhold_registration_survives_close,
             announce_active_consumer,
             leak_shared_permits_on_churn,
+            live_id_subscribe_is_noop,
             cross_session,
         })
     }
@@ -834,13 +846,22 @@ impl ScriptedBroker {
     /// with no decrement of any kind, so no sequence of client behaviour drives a broker's
     /// aggregate negative.
     ///
-    /// The recovery arithmetic this exposes is the point. An in-place re-subscribe zeroes
-    /// the consumer's permits broker-side and the client then sends one fresh
-    /// `CommandFlow` of a full receiver queue, so ONE recovery attempt lifts the aggregate
-    /// by exactly `receiver_queue_size`. A leak of `L` therefore needs
-    /// `ceil(L / receiver_queue_size)` attempts, which is why ADR-0103's automatic
-    /// recovery is bounded and escalates to `pulsar-admin topics unload` rather than
-    /// re-subscribing forever.
+    /// The recovery arithmetic this exposes is the point, and ADR-0108 changed it. The
+    /// recovery now closes the consumer before re-subscribing it, so the close returns the
+    /// consumer's remaining permits and the re-subscribe's `CommandFlow` takes them back:
+    /// ONE attempt is permit-NEUTRAL on the aggregate. The recovery's own
+    /// `CommandCloseConsumer` is itself a churn event, so with this knob armed it is
+    /// subtracted twice and credited once, and attempts move the aggregate the wrong way.
+    ///
+    /// Before ADR-0108 the recovery re-subscribed a still-live consumer id — which a real
+    /// broker answers with a bare `CommandSuccess`, changing nothing — and then granted a
+    /// full window on top, so the aggregate rose by `receiver_queue_size` per attempt. That
+    /// credit had no matching debit anywhere: it was the client over-committing, not a
+    /// repair, and it is why the pre-ADR-0108 arithmetic looked like it converged.
+    ///
+    /// So a leak is not client-recoverable at any budget. ADR-0103's automatic recovery is
+    /// bounded in order to reach the escalation — `pulsar-admin topics unload` — rather
+    /// than to grind toward a repair it cannot make.
     ///
     /// Off by default: with it disarmed the aggregate is exactly the sum of the attached
     /// consumers' permits plus a non-negative re-registration drift, the read gate can
@@ -851,6 +872,28 @@ impl ScriptedBroker {
     /// of any Apache Pulsar source.
     pub fn leak_shared_permits_on_consumer_churn(&self) {
         *self.leak_shared_permits_on_churn.lock() = true;
+    }
+
+    /// Model a real broker's answer to a `CommandSubscribe` that names a consumer id
+    /// **already live on this connection**: a bare `CommandSuccess`, and nothing else
+    /// changes broker-side.
+    ///
+    /// The default model recreates the dispatcher slot at zero permits — see the
+    /// `Subscribe` arm of `handle_frame`. Apache Pulsar does not: `ServerCnx
+    /// .handleSubscribe` looks the consumer id up in its own `consumers` map first and,
+    /// on a hit for an already-completed subscribe, answers `CommandSuccess` and
+    /// returns without touching the dispatcher, the cursor, or the consumer's
+    /// `availablePermits` (apache/pulsar v4.0.4 `ServerCnx.java:1319-1326`).
+    ///
+    /// **This knob encodes that premise; it does not prove it.** It is verified
+    /// separately against the Pulsar source. Everything a test built on it concludes is
+    /// conditional on the premise holding.
+    ///
+    /// Default is off, so every pre-existing scenario keeps the fresh-slot model it was
+    /// written against. Arm it only in a test that is deliberately measuring what the
+    /// live broker's permit counter would have held.
+    pub fn subscribe_on_live_consumer_id_is_a_success_noop(&self) {
+        *self.live_id_subscribe_is_noop.lock() = true;
     }
 
     /// Arm the active-consumer announcement: every `CommandSubscribe` is answered with
@@ -1564,7 +1607,14 @@ fn handle_frame(
                 // keeps the historical per-consumer walk verbatim.
                 let shared_key = (s.sub_type == pb::command_subscribe::SubType::Shared as i32)
                     .then(|| (s.topic.clone(), s.subscription.clone()));
-                {
+                // A `CommandSubscribe` for a consumer id that is ALREADY live on this
+                // session. The default model below recreates the slot; a real broker
+                // answers `CommandSuccess` and mutates nothing (see
+                // [`ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`],
+                // which is where that premise is stated and scoped).
+                let live_id_subscribe_is_noop = *deps.live_id_subscribe_is_noop.lock()
+                    && state.lock().consumers.contains_key(&s.consumer_id);
+                if !live_id_subscribe_is_noop {
                     let mut g = state.lock();
                     g.consumers.insert(
                         s.consumer_id,
@@ -1588,19 +1638,29 @@ fn handle_frame(
                         if !dispatcher.attached.contains(&s.consumer_id) {
                             dispatcher.attached.push(s.consumer_id);
                         }
-                        // A re-attach recreates the dispatcher slot at zero
-                        // permits broker-side — mirrors the real broker, and it
-                        // is what makes the client's own permit zeroing correct.
+                        // This arm recreates the dispatcher slot at zero permits
+                        // broker-side. That is faithful for a `CommandSubscribe`
+                        // arriving for a consumer id the broker does NOT already
+                        // hold — a reconnect rebuild, a post-seek re-attach, or
+                        // the re-subscribe behind ADR-0108's recovery close.
+                        //
+                        // It is NOT faithful for a re-subscribe naming a consumer
+                        // id that is still live on this session: `ServerCnx
+                        // .handleSubscribe` answers that with a bare
+                        // `CommandSuccess` and touches neither the dispatcher nor
+                        // `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`).
+                        // `ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`
+                        // selects that model explicitly, and the branch above is
+                        // what skips this block when it is armed.
                         //
                         // Deliberately NOT credited back to
-                        // `total_available_permits`: the client zeroes its
-                        // mirrors here too and then sends a full fresh
-                        // `CommandFlow` on the re-subscribe `Success`, so
-                        // crediting here would double-count that window. One
-                        // recovery attempt therefore nets exactly
-                        // `+receiver_queue_size` on the aggregate, which is what
-                        // makes ADR-0103's attempt bound a meaningful budget
-                        // rather than an arbitrary number.
+                        // `total_available_permits`: the aggregate is credited
+                        // only by `CommandFlow`, and a slot recreated here is
+                        // about to receive one. Since ADR-0108 a recovery closes
+                        // the consumer first, so the aggregate is debited by the
+                        // `CloseConsumer` arm and credited by the re-subscribe's
+                        // grant — one attempt is permit-NEUTRAL, not
+                        // `+receiver_queue_size`.
                         if let Some((_, c)) = g.consumers.get_mut(&s.consumer_id) {
                             c.permits = 0;
                         }

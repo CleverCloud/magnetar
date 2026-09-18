@@ -4,8 +4,8 @@
 //! of `magnetar-runtime-moonpool/tests/consumer_stall_recovery.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): seven `#[test]` functions here mirror the
-//! moonpool file's seven.
+//! (`check-runtime-test-parity`): twelve `#[test]` functions here mirror the
+//! moonpool file's twelve.
 //!
 //! ## The failure this covers
 //!
@@ -50,6 +50,20 @@
 //! 7. A reported Failover standby — the one shape that satisfies the stall predicate permanently
 //!    and legitimately — is reported and skipped, spends nothing, and hands its untouched budget to
 //!    the consumer it becomes on promotion.
+//! 8. ADR-0108's phase 1 rejected: a broker that refuses the recovery `CommandCloseConsumer` leaves
+//!    the consumer byte-for-byte untouched, no `CommandSubscribe` follows it, and the consumer
+//!    stays both reportable and recoverable.
+//! 9. The session lost between the two phases — through `reset` or `fail_all_pending` — leaves the
+//!    re-attach to the reconnect rebuild and clears the in-flight marker, so the next attempt is
+//!    not gated by a dead one.
+//! 10. `Failover` and non-durable subscriptions are refused outright, because the close the
+//!     recovery depends on would trigger an election or discard a cursor — and the stall is still
+//!     reported, since withholding the repair never withholds the diagnosis.
+//! 11. A second recovery while phase 1 is still awaiting its ack is refused off `pending_requests`,
+//!     so exactly one `CommandCloseConsumer` reaches the broker per recovery and the re-attach
+//!     follows only that one close.
+//! 12. A consumer that became ineligible while the close flew — an unsubscribe raced it — is not
+//!     re-attached by phase 2, because the shared eligibility gate is re-run there.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -141,6 +155,7 @@ fn open_shared_consumers(
     open_consumers(
         shared,
         pb::command_subscribe::SubType::Shared,
+        true,
         subscription,
         names,
         at,
@@ -159,6 +174,7 @@ fn open_failover_consumer(
     open_consumers(
         shared,
         pb::command_subscribe::SubType::Failover,
+        true,
         subscription,
         &[name],
         at,
@@ -168,6 +184,7 @@ fn open_failover_consumer(
 fn open_consumers(
     shared: &ConnectionShared,
     sub_type: pb::command_subscribe::SubType,
+    durable: bool,
     subscription: &str,
     names: &[&str],
     at: Instant,
@@ -187,6 +204,7 @@ fn open_consumers(
             topic: "persistent://public/default/stall".to_owned(),
             subscription: subscription.to_owned(),
             sub_type,
+            durable,
             consumer_name: Some((*name).to_owned()),
             receiver_queue_size: RQ,
             ..Default::default()
@@ -334,29 +352,27 @@ fn dispatch_and_in_place_resubscribe_both_re_arm_the_watchdog() {
         "a consumer that wedges twice reports twice"
     );
 
-    // ── Re-arm path 2: the caller-driven recovery. The in-place re-subscribe
-    // zeroes the permit mirrors, and the broker's ack re-arms both the grant and
-    // the watchdog.
+    // ── Re-arm path 2: the caller-driven recovery. Since ADR-0108 that is a
+    // `CommandCloseConsumer` whose ack releases the re-subscribe; only then do the
+    // permit mirrors follow the slot the broker really dropped, and the
+    // re-subscribe's own ack re-arms both the grant and the watchdog.
     let recovered = resumed + WINDOW;
-    let resub_request_id = {
+    let permits_before = shared.inner.lock().consumer_available_permits(handle);
+    let close_request_id = {
         let mut conn = shared.inner.lock();
-        let request_id = conn.peek_next_request_id_for_test();
-        conn.resubscribe_consumer_in_place(handle)
-            .expect("a live, acked, un-gated consumer is eligible");
+        let request_id = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("a live, acked, un-gated durable non-Failover consumer is eligible");
         assert_eq!(
             conn.consumer_available_permits(handle),
-            0,
-            "the broker recreates its dispatcher slot at zero permits"
+            permits_before,
+            "phase 1 mutates nothing: the broker has not agreed to drop the slot yet, \
+             and a close it rejects must leave a consumer the watchdog can still see"
         );
         let _ = conn.poll_transmit();
-        request_id
+        request_id.0
     };
-    {
-        let mut conn = shared.inner.lock();
-        conn.handle_bytes(recovered, &success_frame(resub_request_id))
-            .expect("resubscribe Success");
-        while conn.poll_event().is_some() {}
-    }
+    let _resub_request_id = ack_resubscribe(&shared, close_request_id, recovered);
     assert_eq!(
         shared.inner.lock().consumer_available_permits(handle),
         RQ as u32,
@@ -477,15 +493,14 @@ fn auto_recovery_config(max_attempts: u32) -> ConnectionConfig {
     }
 }
 
-/// One watchdog sweep at `at`, reported as a `(stall events, resubscribe request id)`
-/// pair — the second element being `Some` exactly when the automatic recovery emitted a
-/// `CommandSubscribe`.
+/// One watchdog sweep at `at`, reported as a `(stall events, recovery request id)`
+/// pair — the second element being `Some` exactly when the automatic recovery acted.
 ///
-/// The request id is how an emitted re-subscribe is counted without a new public
-/// accessor: `emit_command_subscribe` is the only thing in these traces that consumes
-/// one, so a sweep that advanced the counter by exactly one emitted exactly one
-/// `CommandSubscribe` — and the id it consumed is the one the broker's `Success` must
-/// carry back.
+/// The request id is how an emitted recovery is counted without a new public accessor:
+/// since ADR-0108 the recovery's first wire act is a `CommandCloseConsumer`, and in
+/// these traces it is the only thing a sweep can consume a request id for, so a sweep
+/// that advanced the counter by exactly one emitted exactly one recovery — and the id
+/// it consumed is the one the broker's `Success` must carry back to release phase 2.
 fn sweep(shared: &ConnectionShared, at: Instant) -> (usize, Option<u64>) {
     let before = shared.inner.lock().peek_next_request_id_for_test();
     shared.inner.lock().handle_timeout(at);
@@ -493,19 +508,39 @@ fn sweep(shared: &ConnectionShared, at: Instant) -> (usize, Option<u64>) {
     let stalls = drain_stalls(shared).len();
     assert!(
         after == before || after == before + 1,
-        "one sweep may emit at most one in-place re-subscribe, saw {before} -> {after}"
+        "one sweep may emit at most one in-place recovery, saw {before} -> {after}"
     );
     (stalls, (after != before).then_some(before))
 }
 
-/// Feed the broker's `Success` for a re-subscribe the watchdog emitted, which is what
-/// releases the deferred initial `CommandFlow` and re-arms both the grant and the window.
-fn ack_resubscribe(shared: &ConnectionShared, request_id: u64, at: Instant) {
+/// Drive both phases of an in-place recovery to completion: ack the
+/// `CommandCloseConsumer` the watchdog emitted, which releases the `CommandSubscribe`,
+/// then ack that too — which is what releases the deferred initial `CommandFlow` and
+/// re-arms both the grant and the window.
+///
+/// Returns the re-subscribe's request id, so a caller can assert the second phase
+/// happened at all rather than inferring it from the grant.
+fn ack_resubscribe(shared: &ConnectionShared, close_request_id: u64, at: Instant) -> u64 {
+    let resubscribe_request_id = {
+        let mut conn = shared.inner.lock();
+        let next = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(at, &success_frame(close_request_id))
+            .expect("recovery close Success");
+        while conn.poll_event().is_some() {}
+        let after = conn.peek_next_request_id_for_test();
+        assert_eq!(
+            after,
+            next + 1,
+            "the close ack must release exactly one CommandSubscribe"
+        );
+        next
+    };
     let mut conn = shared.inner.lock();
-    conn.handle_bytes(at, &success_frame(request_id))
+    conn.handle_bytes(at, &success_frame(resubscribe_request_id))
         .expect("resubscribe Success");
     while conn.poll_event().is_some() {}
     let _ = conn.poll_transmit();
+    resubscribe_request_id
 }
 
 /// Recovery budget for [`auto_recovery_resubscribes_up_to_the_bound_and_then_escalates`].
@@ -546,13 +581,13 @@ fn auto_recovery_resubscribes_up_to_the_bound_and_then_escalates() {
              arming recovery must never suppress the diagnosis"
         );
         let request_id = resubscribe.unwrap_or_else(|| {
-            panic!("attempt {attempt}: a consumer inside its budget must be re-subscribed")
+            panic!("attempt {attempt}: a consumer inside its budget must be recovered")
         });
         assert_eq!(
             shared.inner.lock().consumer_available_permits(handle),
-            0,
-            "attempt {attempt}: the mirrors follow the broker's freshly recreated \
-             dispatcher slot, which starts at zero permits"
+            RQ as u32,
+            "attempt {attempt}: ADR-0108's phase 1 is a CommandCloseConsumer alone and \
+             mutates nothing — the broker has not agreed to drop the slot yet"
         );
         ack_resubscribe(&shared, request_id, at);
         assert_eq!(
@@ -727,9 +762,10 @@ fn announce_active(
     let _ = conn.poll_transmit();
 }
 
-/// Recovery budget for the Failover-standby test. Exactly one attempt, so the
-/// post-promotion attempt below is a strict proof that the standby episodes spent nothing:
-/// had any of them charged the budget, there would be none left.
+/// Recovery budget for the Failover-standby test. Exactly one attempt, so any charge at
+/// all would be visible: the test asserts no `CommandCloseConsumer` ever leaves the
+/// connection and the permit mirror never moves, across standby episodes and after
+/// promotion alike.
 const STANDBY_BUDGET: u32 = 1;
 
 #[test]
@@ -775,8 +811,9 @@ fn a_reported_failover_standby_is_reported_but_never_costs_an_attempt() {
         );
     }
 
-    // ── Promotion. The skip spent nothing, so nothing needs repairing: the full budget is
-    // still there, and a genuine wedge after promotion gets the complete ladder.
+    // ── Promotion. The skip spent nothing — `consumer_available_permits` is still the
+    // untouched initial grant and no `CommandSubscribe` ever went out — so a promoted
+    // consumer inherits everything it would have had.
     let promoted = t0 + WINDOW * 2;
     announce_active(&shared, handle, true, promoted);
 
@@ -796,17 +833,329 @@ fn a_reported_failover_standby_is_reported_but_never_costs_an_attempt() {
     let (stalls, resubscribe) = sweep(&shared, promoted);
     assert_eq!((stalls, resubscribe), (0, None), "re-seeding tick only");
 
-    let (stalls, request_id) = sweep(&shared, promoted + WINDOW);
+    // Since ADR-0108 a promoted ACTIVE `Failover` consumer is refused too, and by a
+    // second, independent gate: the recovery's `CommandCloseConsumer` really detaches the
+    // consumer, so the broker runs an election and this consumer returns at the end of the
+    // priority order — a subscription-wide reshuffle to repair one slot. The standby
+    // pre-check of ADR-0103 is therefore redundant for `Failover` specifically, and is
+    // retained because it is what documents WHY a standby's silence is correct.
+    //
+    // The diagnosis survives both gates. That is the invariant: withholding the repair
+    // never withholds the report.
+    let (stalls, resubscribe) = sweep(&shared, promoted + WINDOW);
     assert_eq!(stalls, 1, "the promoted consumer's own stall episode");
-    let request_id = request_id.expect(
-        "a promoted consumer recovers normally, on a budget the standby episodes never \
-         touched — a single attempt was configured, so any standby charge would have \
-         exhausted it",
+    assert_eq!(
+        resubscribe, None,
+        "a `Failover` consumer has no in-place repair at any point in its lifecycle: \
+         rung 1 is unavailable and the ladder continues at recreate / topics unload"
     );
-    ack_resubscribe(&shared, request_id, promoted + WINDOW);
     assert_eq!(
         shared.inner.lock().consumer_available_permits(handle),
         RQ as u32,
-        "and the re-subscribe ack re-arms the full grant"
+        "and a refused recovery mutates nothing, in either gate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0108 — the recovery's first phase, and what happens when it does not land.
+//
+// `resubscribe_consumer_in_place` emits `CommandCloseConsumer` and defers EVERY
+// mutation to that close's `Success`, because a `CommandSubscribe` naming a
+// consumer id the broker still holds is a broker-side no-op: `ServerCnx
+// .handleSubscribe` finds the id in its own per-connection map, answers
+// `sendSuccessResponse(requestId)` and returns without touching the dispatcher or
+// `availablePermits` (v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414`,
+// master `:2037-2044`).
+//
+// The three tests below pin the three ways phase 2 can fail to run.
+// ---------------------------------------------------------------------------
+
+/// The broker's `CommandError` for `request_id`.
+fn error_frame(request_id: u64, code: pb::ServerError) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Error as i32,
+        error: Some(pb::CommandError {
+            request_id,
+            error: code as i32,
+            message: "broker says no".to_owned(),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandError");
+    buf
+}
+
+/// Every `CommandCloseConsumer` and `CommandSubscribe` request id this connection
+/// has staged, drained in one pass (`poll_transmit` empties the buffer).
+fn drain_closes_and_subscribes(shared: &ConnectionShared) -> (Vec<u64>, Vec<u64>) {
+    let mut out = shared.inner.lock().poll_transmit();
+    let (mut closes, mut subscribes) = (Vec::new(), Vec::new());
+    while !out.is_empty() {
+        let frame = magnetar_proto::decode_one(&mut out).expect("decode outbound");
+        if let Some(close) = frame.command.close_consumer {
+            closes.push(close.request_id);
+        } else if let Some(sub) = frame.command.subscribe {
+            subscribes.push(sub.request_id);
+        }
+    }
+    (closes, subscribes)
+}
+
+/// A broker that REJECTS the recovery close must leave the consumer exactly as the
+/// caller found it, and no `CommandSubscribe` may follow.
+///
+/// This is the whole reason every mutation sits in phase 2. Zeroing the mirrors up
+/// front and then failing to close would leave a consumer that is still wedged AND
+/// invisible to the watchdog — `is_stall_candidate` requires `permit_balance > 0` —
+/// which is strictly worse than the stall it was called to repair.
+#[test]
+fn a_rejected_recovery_close_leaves_the_consumer_untouched_and_recoverable() {
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(watchdog_config());
+    let handle = open_shared_consumers(&shared, "sub-close-rejected", &["solo"], t0)[0];
+
+    let close_request_id = shared
+        .inner
+        .lock()
+        .resubscribe_consumer_in_place(handle)
+        .expect("a live, acked, un-gated durable non-Failover consumer is eligible")
+        .0;
+    let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+    assert_eq!(closes, vec![close_request_id], "phase 1 is the close alone");
+    assert!(
+        subscribes.is_empty(),
+        "the re-attach is owed to the close ack"
+    );
+
+    shared
+        .inner
+        .lock()
+        .handle_bytes(
+            t0,
+            &error_frame(close_request_id, pb::ServerError::ServiceNotReady),
+        )
+        .expect("recovery close Error");
+
+    let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+    assert!(
+        closes.is_empty() && subscribes.is_empty(),
+        "a rejected close must not be followed by a CommandSubscribe — that is exactly \
+         the live-id no-op ADR-0108 exists to stop emitting, got closes={closes:?} \
+         subscribes={subscribes:?}"
+    );
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "the broker still holds this consumer's permits, so the client's mirror must \
+         still describe them"
+    );
+
+    // Still detectable, and still recoverable: a rejected close is one spent attempt,
+    // not a terminal state.
+    shared.inner.lock().handle_timeout(t0);
+    let (stalls, recovery) = sweep(&shared, t0 + WINDOW);
+    assert_eq!(stalls, 1, "a consumer left wedged must still be reported");
+    assert_eq!(
+        recovery, None,
+        "recovery is disarmed in this config; the report is the whole effect"
+    );
+    assert!(
+        shared
+            .inner
+            .lock()
+            .resubscribe_consumer_in_place(handle)
+            .is_some(),
+        "a rejected close leaves the consumer eligible for another attempt"
+    );
+}
+
+/// Losing the session between the two phases hands the re-attach to the reconnect
+/// path, which is its only correct owner: the broker reaped that consumer along with
+/// the connection its close was written on.
+///
+/// `reset` and `fail_all_pending` both take `pending_requests` wholesale, which is
+/// what clears the in-flight marker — and both must consume the entry WITHOUT
+/// recording an outcome, since a recovery close has no waiter by construction and one
+/// leaked entry per attempt is the issue #241 shape.
+#[test]
+fn a_session_lost_between_the_two_phases_defers_to_the_reconnect_rebuild() {
+    let t0 = Instant::now();
+    for (label, lose_session) in [
+        (
+            "reset",
+            (|shared: &ConnectionShared| shared.inner.lock().reset()) as fn(&ConnectionShared),
+        ),
+        ("fail_all_pending", |shared: &ConnectionShared| {
+            shared.inner.lock().fail_all_pending("engine shutting down");
+        }),
+    ] {
+        let shared = ConnectionShared::new(watchdog_config());
+        let handle = open_shared_consumers(&shared, "sub-close-session-lost", &["solo"], t0)[0];
+        let close_request_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible")
+            .0;
+        let _ = drain_closes_and_subscribes(&shared);
+
+        lose_session(&shared);
+
+        // The close never lands, so phase 2 never runs — correctly, because the
+        // broker dropped that consumer with the session.
+        let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+        assert!(
+            closes.is_empty() && subscribes.is_empty(),
+            "{label}: the dead session's recovery must not be replayed, got \
+             closes={closes:?} subscribes={subscribes:?}"
+        );
+
+        // And nothing from it keeps gating the next one: the marker lived in
+        // `pending_requests`, which both paths emptied.
+        let retry = shared.inner.lock().resubscribe_consumer_in_place(handle);
+        match retry {
+            Some(request_id) => assert_ne!(
+                request_id.0, close_request_id,
+                "{label}: a fresh close, not the abandoned one"
+            ),
+            None => panic!("{label}: the consumer must be recoverable again"),
+        }
+    }
+}
+
+/// `Failover` and non-durable subscriptions have no in-place recovery, because the
+/// close it depends on is not a repair for either: it triggers a broker-side election,
+/// or it discards a cursor that lives only as long as the consumer (ADR-0099).
+///
+/// Refused with no wire traffic and no mutation — and, for a `Failover` consumer, the
+/// stall is still REPORTED, because ADR-0101's event means silence and a wedged active
+/// `Failover` consumer is genuinely silent. Only the repair is withheld.
+#[test]
+fn failover_and_non_durable_subscriptions_are_refused_without_being_touched() {
+    let t0 = Instant::now();
+    for (label, sub_type, durable) in [
+        ("failover", pb::command_subscribe::SubType::Failover, true),
+        ("non-durable", pb::command_subscribe::SubType::Shared, false),
+    ] {
+        let shared = ConnectionShared::new(watchdog_config());
+        let handle = open_consumers(
+            &shared,
+            sub_type,
+            durable,
+            "sub-no-in-place-repair",
+            &["solo"],
+            t0,
+        )[0];
+
+        assert_eq!(
+            shared.inner.lock().resubscribe_consumer_in_place(handle),
+            None,
+            "{label}: closing this consumer is not a repair, so refuse it"
+        );
+        let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+        assert!(
+            closes.is_empty() && subscribes.is_empty(),
+            "{label}: a refused recovery must put nothing on the wire, got \
+             closes={closes:?} subscribes={subscribes:?}"
+        );
+        assert_eq!(
+            shared.inner.lock().consumer_available_permits(handle),
+            RQ as u32,
+            "{label}: a refused recovery must not touch the permit mirrors"
+        );
+
+        // The diagnosis is never suppressed by the repair being unavailable.
+        shared.inner.lock().handle_timeout(t0);
+        let (stalls, recovery) = sweep(&shared, t0 + WINDOW);
+        assert_eq!(stalls, 1, "{label}: the wedge is still reported");
+        assert_eq!(recovery, None, "{label}: and nothing is attempted");
+    }
+}
+
+/// A second recovery while phase 1 is still in flight must not emit a second close.
+///
+/// Two `CommandCloseConsumer` frames for one consumer id would leave the second
+/// answered against a consumer the first already removed, and its `Success` would
+/// drive a second `CommandSubscribe` behind the re-attach the first one already made.
+/// The in-flight marker is read straight out of `pending_requests`, which is what
+/// makes a lost session clear it for free.
+#[test]
+fn a_second_recovery_is_refused_while_the_close_is_in_flight() {
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(watchdog_config());
+    let handle = open_shared_consumers(&shared, "sub-close-already-pending", &["solo"], t0)[0];
+
+    let close_request_id = shared
+        .inner
+        .lock()
+        .resubscribe_consumer_in_place(handle)
+        .expect("eligible")
+        .0;
+    assert_eq!(
+        shared.inner.lock().resubscribe_consumer_in_place(handle),
+        None,
+        "a recovery close is already awaiting its ack"
+    );
+    let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+    assert_eq!(
+        closes,
+        vec![close_request_id],
+        "exactly one close on the wire"
+    );
+    assert!(
+        subscribes.is_empty(),
+        "and no re-attach before the close ack"
+    );
+
+    // Once the close is answered and the re-attach is out, the marker is gone — the
+    // `flow_on_subscribe_ack` gate owns the consumer from here.
+    shared
+        .inner
+        .lock()
+        .handle_bytes(t0, &success_frame(close_request_id))
+        .expect("recovery close Success");
+    let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+    assert!(closes.is_empty(), "still exactly one close per recovery");
+    assert_eq!(subscribes.len(), 1, "the re-attach follows the close ack");
+}
+
+/// The close lands, but by then the consumer has an owner for its next
+/// `CommandSubscribe` — the application unsubscribed it while phase 1 was in flight.
+///
+/// Phase 2 must not re-attach it: `emit_in_place_consumer_resubscribe` re-runs the
+/// shared eligibility gate for exactly this reason, so the consumer is left to the
+/// path that now owns it rather than being raced back onto the connection.
+#[test]
+fn a_consumer_that_became_ineligible_while_the_close_flew_is_not_re_attached() {
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(watchdog_config());
+    let handle = open_shared_consumers(&shared, "sub-close-then-ineligible", &["solo"], t0)[0];
+
+    let close_request_id = shared
+        .inner
+        .lock()
+        .resubscribe_consumer_in_place(handle)
+        .expect("eligible")
+        .0;
+    let _ = drain_closes_and_subscribes(&shared);
+
+    // The application unsubscribes while phase 1 is on the wire. That is the one
+    // ineligible state which is also a live stall candidate, so it is the realistic
+    // shape of this race.
+    let _ = shared.inner.lock().try_unsubscribe(handle, false);
+    let _ = drain_closes_and_subscribes(&shared);
+
+    shared
+        .inner
+        .lock()
+        .handle_bytes(t0, &success_frame(close_request_id))
+        .expect("recovery close Success");
+
+    let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+    assert!(
+        closes.is_empty() && subscribes.is_empty(),
+        "the pending unsubscribe owns this consumer's fate now, so phase 2 must emit \
+         nothing, got closes={closes:?} subscribes={subscribes:?}"
     );
 }
