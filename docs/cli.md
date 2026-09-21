@@ -1,6 +1,6 @@
 # `magnetarctl` CLI
 
-> **Status: stable (1.7.0).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> **Status: stable (1.7.2).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
 > Data-plane `produce` / `consume` commands are wired through the production tokio runtime.
 
 `magnetarctl` — the command-line client for Apache Pulsar built on the magnetar workspace.
@@ -130,7 +130,7 @@ The CLI exposes two forms, modeled on `sozu` and `systemd`:
 - **`-V`** prints a single-line, never-colorized identification banner:
 
   ```
-  magnetarctl 1.7.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 1.7.2 (a1b2c3d4e5f6-dirty)
   ```
 
 The parenthesized token is the 12-character git short SHA the binary was built from.
@@ -140,7 +140,7 @@ Outside a git checkout (e.g. released tarballs) the SHA is `unknown` and the dir
 - **`--version`** prints a multi-line build-metadata banner:
 
   ```
-  magnetarctl 1.7.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 1.7.2 (a1b2c3d4e5f6-dirty)
   built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21

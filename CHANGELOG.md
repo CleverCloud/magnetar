@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-09-21
+
 ### Fixed
 
 - **`Consumer::resubscribe()` now closes the consumer before re-subscribing it, instead of handing the broker a second permit window it never agreed to.**
@@ -702,7 +704,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.2...HEAD
+[1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2
 [1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
 [1.7.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.0
 [1.6.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.6.0
