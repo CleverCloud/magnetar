@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Broker-side permit *accounting* under `Shared`-subscription churn — the
-//! other half of issue #414, and the half
+//! Broker-side permit *accounting* under `Shared`-subscription churn, tracked
+//! by issue #462. This aggregate defect is distinct from issue #414's
+//! production per-consumer wedge, which this suite has not reproduced;
 //! [`e2e_shared_subscription_churn.rs`](./e2e_shared_subscription_churn.rs)
-//! deliberately does not cover.
+//! checks continued dispatch instead.
 //!
 //! ## Why a second churn suite
 //!
@@ -13,8 +14,8 @@
 //! past a threshold — `readMoreEntries` has fallen back to
 //! `max(totalAvailablePermits, firstAvailableConsumerPermits)` since 2021, so a
 //! negative *aggregate* is masked entirely. "Messages kept flowing" therefore
-//! proves nothing about issue #414's root cause. This suite asserts on the
-//! **numbers the broker reports about itself** instead.
+//! does not establish the cause of issue #414's per-consumer wedge. This suite
+//! asserts on the **numbers the broker reports about itself** instead.
 //!
 //! ## The upstream mechanism (apache/pulsar#26416)
 //!
@@ -23,17 +24,18 @@
 //! executor. `PersistentDispatcherMultipleConsumers.internalConsumerFlow`
 //! discards that deferred credit when the consumer has already left
 //! `consumerSet`, while `removeConsumer` debits the aggregate by the consumer's
-//! **full** per-consumer counter — discarded credit included. Merged fixes:
+//! **full** per-consumer counter — discarded credit included. Related upstream
+//! patches merged:
 //! apache/pulsar#26289 (deferred-flow accounting) and apache/pulsar#26422
 //! (unacked double-debit guard).
 //!
 //! The production signature was a **per-consumer** `ConsumerStatsImpl`
 //! `availablePermits` of `-177300` that never recovered; only a superuser
-//! `topics unload` cleared it.
+//! `topics unload` cleared it. This test has not reproduced that signature.
 //!
 //! ## What this test observes, and where it has to read it from
 //!
-//! The dispatcher's `totalAvailablePermits` — the counter the root cause
+//! The dispatcher's `totalAvailablePermits` — the counter this aggregate defect
 //! corrupts — is **exposed by no Pulsar admin endpoint**. Measured against
 //! 4.2.4 on 2026-09-18: absent from `…/stats` (`SubscriptionStatsImpl` carries
 //! no permit field at all), from `/admin/v2/broker-stats/topics`, from
@@ -45,19 +47,20 @@
 //!
 //! Four assertions, all on numbers the broker reported about itself:
 //!
-//! 1. the dispatcher's `totalAvailablePermits` is never negative — the root cause;
-//! 2. every **per-consumer** `availablePermits` stays inside `[0, receiver_queue_size]` — the
-//!    client only ever grants what it has consumed, so the broker's balance can neither go negative
-//!    (the production wedge signature) nor exceed one queue's worth (an issue #426 double grant);
-//! 3. no per-consumer and no subscription `unackedMessages` is negative, which the
-//!    apache/pulsar#26422 double-debit can cause;
+//! 1. the dispatcher's `totalAvailablePermits` is never negative — the aggregate defect;
+//! 2. every **per-consumer** `availablePermits` stays inside `[0, receiver_queue_size]`. A negative
+//!    settled reading resembles one numeric part of issue #414's production report; a reading above
+//!    the queue size needs separate investigation against issue #426. Neither value alone
+//!    identifies a cause;
+//! 3. no per-consumer and no subscription `unackedMessages` is negative. A negative reading is
+//!    consistent with, but does not prove, the apache/pulsar#26422 double-debit;
 //! 4. the backlog reaches zero with a survivor still attached.
 //!
 //! The per-consumer readings are taken **settled** — after the churn, with the
 //! subscription quiescent — because the production failure was a counter stuck
 //! negative forever, not a transient dip while a batched entry is being charged.
 //!
-//! ## Measured verdicts (2026-09-18, this test binary)
+//! ## Historical verdicts reported on 2026-09-18 (this test binary)
 //!
 //! | image | broker | runs | red | min `totalAvailablePermits` |
 //! | ----- | ------ | ---- | --- | --------------------------- |
@@ -65,21 +68,24 @@
 //! | `4.2.4` (== `latest`) | 4.2.4 | 8 | 8 | −4 … −18 |
 //! | `5.0.0-M2` | 5.0.0-M2 | 12 | 1 | 0 in eleven runs, −2 in one |
 //!
-//! The merged fixes ship in no released image: Docker Hub's `apachepulsar/pulsar`
-//! stops at 4.0.13 and 4.2.4, and 4.0.14 / 4.2.5 are unpublished. `5.0.0-M2` is a
-//! milestone build and the only image carrying both, so it is the only green cell
-//! available at all.
+//! The −2 `5.0.0-M2` result is reported in the 2026-09-18 investigation,
+//! but its raw log and hash were not archived with that report. The current
+//! four-run reproduction is archived separately in the issue #462 record.
+//! As observed on 2026-09-30, no tested stable GA image passed; `latest` is
+//! 4.2.4, and 4.0.14 / 4.2.5 were unpublished. `5.0.0-M2` is a milestone
+//! build carrying both merged patches, but the historical matrix also reports
+//! one negative run on that image.
 //!
-//! Two findings the numbers carry beyond "the fix works":
+//! Two limits of those historical results:
 //!
-//! * `5.0.0-M2` is not unconditionally clean. One run in twelve reached −2 with a single negative
-//!   reading, against 22–83 negative readings in every pre-fix run. apache/pulsar#26289 and #26422
-//!   shrink the leak by roughly two orders of magnitude here without closing it, which is
-//!   consistent with apache/pulsar#26416 having stayed open and with PIP-491 being unmerged.
+//! * `5.0.0-M2` is not shown to be unconditionally clean. The earlier report says one run in twelve
+//!   reached −2 with one negative reading, against 22–83 negative readings in every pre-fix run.
+//!   Those historical counts suggest the merged patches reduced the aggregate leak, but do not
+//!   prove it closed or explain issue #414's per-consumer wedge.
 //! * The per-consumer counter stayed inside `[0, 4]` on every image at every settled reading,
 //!   although the discard window was entered 2–10 times per run. The production wedge signature — a
-//!   per-consumer `availablePermits` stuck at −177300 — did **not** reproduce; only the aggregate
-//!   leak behind it did.
+//!   per-consumer `availablePermits` stuck at −177300 — did **not** reproduce; this test observed
+//!   the separate aggregate defect under its own client traffic and churn.
 //!
 //! ## The shape being reproduced
 //!
@@ -363,7 +369,7 @@ fn subscription_i64(stats: &TopicStats, subscription: &str, field: &str) -> Opti
 /// on every image in the matrix instead of being assumed from one of them.
 fn report_subscription_shape(stats: &TopicStats, subscription: &str) {
     let Some(serde_json::Value::Object(map)) = subscription_object(stats, subscription) else {
-        eprintln!("[#414-permits] subscription `{subscription}` absent from topic stats");
+        eprintln!("[#462-permits] subscription `{subscription}` absent from topic stats");
         return;
     };
     let mut scalar_keys: Vec<&str> = map
@@ -376,9 +382,9 @@ fn report_subscription_shape(stats: &TopicStats, subscription: &str) {
         .iter()
         .filter(|key| key.to_lowercase().contains("permit"))
         .collect();
-    eprintln!("[#414-permits] subscription-level fields: {scalar_keys:?}");
+    eprintln!("[#462-permits] subscription-level fields: {scalar_keys:?}");
     eprintln!(
-        "[#414-permits] subscription-level permit fields: {permit_keys:?} \
+        "[#462-permits] subscription-level permit fields: {permit_keys:?} \
          (empty ⇒ the dispatcher's `totalAvailablePermits` is not observable through admin stats)"
     );
 }
@@ -386,12 +392,13 @@ fn report_subscription_shape(stats: &TopicStats, subscription: &str) {
 /// The invariant this suite exists to check, asserted on numbers the broker
 /// reported about itself.
 ///
-/// * `availablePermits >= 0` — the wedge signature of issue #414. The wire protocol carries only
-///   monotonic client → broker permit increments, so a negative balance can only come from the
-///   broker's own ledger.
-/// * `availablePermits <= receiver_queue_size` — the client never grants more than one queue's
-///   worth outstanding, so a larger balance is an issue #426-style double grant.
-/// * `unackedMessages >= 0` — apache/pulsar#26422's double-debit.
+/// * `availablePermits >= 0` — detects a negative per-consumer report. Issue #414's production
+///   report had a persistently negative value, but this reading alone does not reproduce that wedge
+///   or isolate its cause. Flow, Subscribe, and churn timing are inputs to this scenario.
+/// * `availablePermits <= receiver_queue_size` — detects a settled value outside the configured
+///   queue range; investigate a high reading against issue #426 without assigning its cause here.
+/// * `unackedMessages >= 0` — a negative value is consistent with the apache/pulsar#26422
+///   double-debit, but the reading alone does not prove that mechanism.
 fn assert_permit_invariant(rows: &[ConsumerRow], label: &str) {
     for row in rows {
         let name = &row.name;
@@ -400,24 +407,25 @@ fn assert_permit_invariant(rows: &[ConsumerRow], label: &str) {
         });
         assert!(
             permits >= 0,
-            "{label}: broker-side `availablePermits` for consumer `{name}` is {permits}, \
-             which is negative — the issue #414 wedge signature. The client can only ever \
-             send monotonic permit increments, so this balance came from the broker's own \
-             ledger. Full row: {row:?}"
+            "{label}: broker-reported `availablePermits` for consumer `{name}` is {permits}, \
+             which is negative. Issue #414's production report had a persistent negative \
+             per-consumer value; this reading alone does not reproduce that wedge or identify \
+             its cause. Flow, Subscribe, and churn timing are scenario inputs. Full row: {row:?}"
         );
         assert!(
             permits <= RECEIVER_QUEUE_SIZE as i64,
-            "{label}: broker-side `availablePermits` for consumer `{name}` is {permits}, \
-             above the configured receiver-queue size {RECEIVER_QUEUE_SIZE} — the broker holds \
-             more grant than the client believes it issued (issue #426). Full row: {row:?}"
+            "{label}: broker-reported `availablePermits` for consumer `{name}` is {permits}, \
+             above the configured receiver-queue size {RECEIVER_QUEUE_SIZE}. Investigate the \
+             out-of-range value against issue #426 without assigning its cause. Full row: {row:?}"
         );
         let unacked = row.unacked_messages.unwrap_or_else(|| {
             panic!("{label}: broker reported no `unackedMessages` for consumer `{name}`")
         });
         assert!(
             unacked >= 0,
-            "{label}: broker-side `unackedMessages` for consumer `{name}` is {unacked}, \
-             which is negative — the apache/pulsar#26422 double-debit. Full row: {row:?}"
+            "{label}: broker-reported `unackedMessages` for consumer `{name}` is {unacked}, \
+             which is negative and warrants investigation against apache/pulsar#26422; this \
+             reading alone does not establish its cause. Full row: {row:?}"
         );
     }
 }
@@ -513,7 +521,7 @@ fn dispatcher_aggregate_permits(logs: &str) -> (Vec<i64>, usize) {
     (values, discards)
 }
 
-/// Assert the invariant issue #414's root cause breaks: the dispatcher's
+/// Assert the broker aggregate-accounting invariant: the dispatcher's
 /// subscription-wide permit ledger never goes negative.
 ///
 /// Reading zero observations is its own, separately-worded failure. It means
@@ -525,7 +533,7 @@ fn assert_aggregate_invariant(logs: &str) {
     let minimum = values.iter().copied().min();
     let negatives = values.iter().filter(|value| **value < 0).count();
     eprintln!(
-        "[#414-permits] dispatcher totalAvailablePermits: observations={} min={minimum:?} \
+        "[#462-permits] dispatcher totalAvailablePermits: observations={} min={minimum:?} \
          negatives={negatives} discardedDeferredCredits={discards}",
         values.len(),
     );
@@ -541,12 +549,14 @@ fn assert_aggregate_invariant(logs: &str) {
     assert!(
         minimum >= 0,
         "the dispatcher's subscription-wide `totalAvailablePermits` reached {minimum}, which \
-         is negative — issue #414's broker-side root cause (apache/pulsar#26416). The \
+         is negative — the broker aggregate-accounting defect tracked by issue #462 \
+         (apache/pulsar#26416), not proof of issue #414's per-consumer wedge. The \
          deferred flow credit of a consumer that has already left `consumerSet` is discarded \
          by `internalConsumerFlow` while `removeConsumer` still debits the aggregate by that \
          consumer's full counter. Observed {negatives} negative reading(s) of {} total, with \
-         {discards} discarded deferred credit(s) during the run. Fixed upstream by \
-         apache/pulsar#26289 and apache/pulsar#26422.",
+         {discards} discarded deferred credit(s) during the run. Related upstream \
+         patches merged as apache/pulsar#26289 and apache/pulsar#26422; this \
+         result still fails on the tested GA broker.",
         values.len(),
     );
 }
@@ -635,7 +645,7 @@ fn observe(stats: &TopicStats, subscription: &str, label: &str) {
     let rows = consumer_rows(stats, subscription);
     let permit_sum: i64 = rows.iter().filter_map(|row| row.available_permits).sum();
     eprintln!(
-        "[#414-permits] {label}: consumers={} permits={:?} unacked={:?} sum(permits)={permit_sum} \
+        "[#462-permits] {label}: consumers={} permits={:?} unacked={:?} sum(permits)={permit_sum} \
          subUnacked={:?} backlog={:?}",
         rows.len(),
         rows.iter()
@@ -651,8 +661,8 @@ fn observe(stats: &TopicStats, subscription: &str, label: &str) {
     if let Some(unacked) = subscription_i64(stats, subscription, "unackedMessages") {
         assert!(
             unacked >= 0,
-            "{label}: subscription-level `unackedMessages` is {unacked}, which is negative \
-             (apache/pulsar#26422 double-debit)"
+            "{label}: subscription-level `unackedMessages` is {unacked}, which is negative; \
+             investigate against apache/pulsar#26422 without assuming that mechanism"
         );
     }
 }
@@ -725,24 +735,26 @@ async fn churn_round(
 ///
 /// [ADR-0046](../../../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) makes the
 /// e2e suite run as a regular `cargo test`, deliberately: an e2e test behind `#[ignore]` is an
-/// e2e test nobody runs. This is the documented exception, and it is narrow.
+/// e2e test nobody runs. This existing ignore conflicts with that policy and
+/// remains tracked by issue #462 while the tested GA broker fails the assertion.
 ///
 /// Every other e2e test asserts something about **magnetar**. This one asserts
 /// something about the **broker**: that `apache/pulsar#26416`'s deferred-flow
-/// accounting leak is absent. The client's behaviour cannot make it pass or fail, and
-/// no generally-available image carries the fix — Docker Hub's `apachepulsar/pulsar`
-/// stops at 4.0.13 and 4.2.4, and the fixed 4.0.14 / 4.2.5 are unpublished. Left
-/// running on the `latest` default it would therefore be **permanently red in CI on a
+/// accounting leak is absent under this client's Flow/Subscribe traffic and
+/// timing. No tested generally available image has passed — Docker Hub's `apachepulsar/pulsar`
+/// stopped at 4.0.13 and 4.2.4 when checked on 2026-09-30, while 4.0.14 / 4.2.5
+/// were unpublished. The published 4.0.13 image failed this test on 2026-09-30:
+/// its aggregate reached -16, with 79 negative readings among 98 observations.
+/// Left running on that `latest` default it would be **red in CI on a
 /// defect this repository cannot fix**, which is the failure mode the enforcement rules
 /// exist to prevent: a check that is always failing stops being read.
 ///
-/// It keeps the `latest` default rather than pinning a green image, so the day an image
-/// with the fix ships as `latest` the reproduce command below goes green with no edit.
-/// Remove the `#[ignore]` then — tracked by
+/// It keeps the `latest` default rather than pinning the milestone image. A
+/// qualifying stable image must pass repeatedly before the `#[ignore]` can be removed — tracked by
 /// [issue #462](https://github.com/CleverCloud/magnetar/issues/462), which also owns the
 /// choice between removing it and recording the exception in ADR-0046 itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "asserts apache/pulsar#26416; no GA image carries the fix (4.0.14/4.2.5 unpublished). Reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.4 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting -- --ignored"]
+#[ignore = "asserts apache/pulsar#26416; tested GA 4.0.13/4.2.4 fail (4.0.14/4.2.5 unpublished). Reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.4 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting -- --ignored"]
 async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, container) = start_pulsar().await?;
@@ -756,7 +768,7 @@ async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
         .await
         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
     eprintln!(
-        "[#414-permits] image={}:{} brokerVersion={version}",
+        "[#462-permits] image={}:{} brokerVersion={version}",
         image_repo(),
         image_tag()
     );
