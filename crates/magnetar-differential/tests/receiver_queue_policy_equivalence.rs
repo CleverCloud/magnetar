@@ -14,7 +14,7 @@
 //! This test subscribes an `Auto` consumer over each engine's locked
 //! `Connection`, forces the initial flow, then before each adjust tick drives
 //! REAL message deliveries (issue #349: not a synthetic `available_permits = 0`
-//! field write) to drain the broker-side permit BALANCE to zero, and advances a
+//! field write) to drain the client-accounted permit balance to zero, and advances a
 //! SHARED synthetic [`Instant`] across several adjust ticks — capturing the
 //! receiver-queue target trajectory and the ordered `CommandFlow` grants. The
 //! two engines must agree, and the trajectory must be the correct
@@ -25,7 +25,7 @@
 //! Issue #349 split the consumer's permit mirror into two counters:
 //! `ConsumerState::granted_permits` (a purely additive record of every grant
 //! sent to the broker — never decremented by dispatch) and
-//! `ConsumerState::permit_balance` (the REAL balance, decremented once per
+//! `ConsumerState::permit_balance` (the client-accounted balance, decremented once per
 //! broker dispatch unit as it arrives). `Auto::adjust`'s starvation signal
 //! (`FlowStats::available_permits`) is now fed from `permit_balance`, and
 //! `adjust_receiver_queue` guards against `granted_permits == 0` (a churn
@@ -158,7 +158,7 @@ fn drain_flow_grants(conn: &mut Connection, handle: ConsumerHandle) -> Vec<u32> 
 
 /// Drive handshake + subscribe-Auto + initial-flow + N adjust ticks over one
 /// engine's locked `Connection`, returning the captured reaction. Before each
-/// tick, real message deliveries drain the broker-side permit BALANCE to
+/// tick, real message deliveries drain the client-accounted permit balance to
 /// zero so every tick observes genuine dispatch-driven starvation — exactly
 /// the ramp PIP-74 auto-scaling targets.
 fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
@@ -193,7 +193,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     let _ = conn.poll_transmit();
 
     for i in 1..=TICKS {
-        // Issue #349: drain the REAL permit balance via genuine dispatch
+        // Issue #349: drain the client-accounted permit balance via genuine dispatch
         // before the tick observes it.
         for _ in 0..DRAIN_BATCH {
             let frame = drain_message_frame(handle, next_entry_id, b"x");

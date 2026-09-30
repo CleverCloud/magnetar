@@ -167,14 +167,13 @@ struct SharedDispatcher {
     /// Entries returned by a detaching consumer, redelivered to the survivors
     /// ahead of the shared cursor (FIFO, oldest first).
     redelivery: std::collections::VecDeque<StoredMessage>,
-    /// The subscription's **aggregate** permit counter — the scripted analogue of the
-    /// number a real broker reports as `availablePermits` on a `Shared` subscription, and
-    /// the one issue #414 observed at `-177300` (issue #414, ADR-0103).
+    /// The subscription's **aggregate** permit counter in this scripted model.
+    /// Issue #414 instead reported per-consumer `availablePermits = -177300` on a
+    /// ghost entry with an empty `consumerName`; no aggregate value was captured.
     ///
     /// Signed on purpose. A `u32` could not express the failure, which is the whole reason
-    /// this field exists: the wire protocol carries only monotonic client → broker permit
-    /// increments, so a NEGATIVE aggregate is by construction a broker-side accounting
-    /// fault and not something a client can produce.
+    /// this field exists: the model can inject a NEGATIVE aggregate by double-subtracting
+    /// on detach. This hypothesis does not attribute the production per-consumer value.
     ///
     /// Maintained on three sites, all of them Shared-only:
     ///
@@ -183,12 +182,14 @@ struct SharedDispatcher {
     /// - a detach charges it the departing consumer's remaining permits (the "give the pool back
     ///   what this consumer still held" half of a real `removeConsumer`).
     ///
-    /// A re-registration of an already-attached consumer id zeroes that consumer's
-    /// permits without crediting the aggregate back, mirroring the client zeroing its own
-    /// mirrors: the fresh `CommandFlow` the client sends after the re-subscribe `Success`
-    /// is what puts the permits back, so one recovery attempt nets exactly
-    /// `+receiver_queue_size` on this counter. That is the arithmetic ADR-0103's attempt
-    /// bound is chosen against.
+    /// In this default scripted model, re-registering an already-attached consumer id
+    /// zeroes its permits without crediting the aggregate back. A subsequent fresh
+    /// `CommandFlow` then nets `+receiver_queue_size` on this counter. That was the
+    /// historical arithmetic behind ADR-0103's attempt bound, not current client
+    /// recovery and not a real broker's live-id behavior: Pulsar answers a completed
+    /// live-id subscribe with `Success` and changes no slot or permit state. The
+    /// `subscribe_on_live_consumer_id_is_a_success_noop` mode models that behavior;
+    /// ADR-0108's current recovery closes before re-subscribing.
     ///
     /// [`Self::dispatch_gate_open`] is the `readMoreEntries`-style gate: a dispatcher
     /// whose aggregate has reached zero or below hands out nothing, no matter what its
@@ -584,7 +585,8 @@ struct SessionDeps {
     /// does for an `Exclusive` / `Failover` subscription (issue #427).
     announce_active_consumer: Arc<Mutex<bool>>,
     /// When `true`, detaching a `Shared` consumer subtracts its remaining permits from
-    /// the subscription's aggregate counter TWICE (issue #414). See
+    /// the modeled subscription aggregate counter TWICE (ADR-0103 hypothesis,
+    /// distinct from issue #414's observed per-consumer value). See
     /// [`ScriptedBroker::leak_shared_permits_on_consumer_churn`].
     leak_shared_permits_on_churn: Arc<Mutex<bool>>,
     /// When `true`, a `CommandSubscribe` naming a consumer id ALREADY live on this
@@ -838,13 +840,12 @@ impl ScriptedBroker {
     /// event. Once the aggregate crosses zero the dispatcher's read gate closes and the
     /// subscription stops dispatching entirely — the survivors still hold per-consumer
     /// permits, the backlog is still non-empty, the connection is still healthy, and
-    /// nothing moves. That is the client-visible shape issue #414 reports, with the
-    /// broker's own `availablePermits` for the subscription observed at `-177300`.
+    /// nothing moves. That models the delivery stall in issue #414, but the incident's
+    /// `availablePermits = -177300` belonged to one ghost consumer, not an aggregate.
     ///
-    /// The **client cannot cause this**, which is why it has to be injected here: the wire
-    /// protocol carries only monotonic client → broker permit increments (`CommandFlow`),
-    /// with no decrement of any kind, so no sequence of client behaviour drives a broker's
-    /// aggregate negative.
+    /// The model injects this double-subtraction explicitly; it has not been shown to
+    /// be the production cause. `CommandFlow` carries only non-negative increments, but
+    /// dispatch, detach and the timing of client operations also affect broker counters.
     ///
     /// The recovery arithmetic this exposes is the point, and ADR-0108 changed it. The
     /// recovery now closes the consumer before re-subscribing it, so the close returns the
@@ -1695,9 +1696,9 @@ fn handle_frame(
                         c.shared_key.clone()
                     })
                     .unwrap_or_default();
-                // Issue #414: a Shared subscription's aggregate counter is credited by
-                // the same grant. This is the only site that ever raises it — which is
-                // why a recovery re-subscribe recovers anything at all.
+                // ADR-0103's modeled Shared aggregate is credited by the same grant.
+                // This is the only site that raises it; ADR-0108's close-then-re-subscribe
+                // does not make a net repair to a corrupted aggregate.
                 if let Some(key) = shared_key
                     && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
                 {
@@ -2068,7 +2069,7 @@ fn handle_frame(
                     && let Some(dispatcher) = g.shared_dispatchers.get_mut(&key)
                 {
                     dispatcher.attached.retain(|id| *id != c.consumer_id);
-                    // Issue #414 / ADR-0103: the subscription's aggregate counter gives
+                    // ADR-0103's model: the subscription aggregate gives
                     // back what the departing consumer still held. Correct accounting
                     // subtracts it ONCE — the counter then stays equal to the sum of the
                     // attached consumers' permits and the dispatch gate never binds.
@@ -2227,7 +2228,7 @@ fn push_pending_shared(
             if dispatcher.attached.is_empty() {
                 break;
             }
-            // Issue #414: the aggregate read gate. With correct accounting this can never
+            // ADR-0103's modeled aggregate read gate. With correct accounting this can never
             // be the deciding break — the counter is the sum of the attached consumers'
             // permits plus a non-negative re-registration drift, so it is non-positive
             // only when the round-robin scan below would have found nobody anyway. Under

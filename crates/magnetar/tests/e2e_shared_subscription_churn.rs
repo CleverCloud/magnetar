@@ -9,13 +9,13 @@
 //! A Shared subscription wedged broker-side after a churn window (a cursor reset
 //! with consumers attached, a 12 → 1 scale-down, and an instance recycle
 //! mid-drain). The survivors received about twenty messages and then nothing,
-//! forever: the broker's `availablePermits` for the subscription sat at
-//! `-177300`, `acks_failed` was `0`, and the client reported no error at all.
+//! forever: one ghost consumer with an empty name had broker-reported
+//! `availablePermits = -177300`, `acks_failed` was `0`, and the client reported no error.
 //! Only a superuser `pulsar-admin topics unload` recovered it.
 //!
-//! The wire protocol carries only monotonic client → broker permit increments
-//! (`CommandFlow`), so the client cannot itself drive the broker's counter
-//! negative — the root cause is broker-side. What this test pins is the
+//! `CommandFlow` carries non-negative grants, but broker dispatch, detach and
+//! client operation timing also affect permit accounting. This test does not
+//! attribute the production counter to either side. It pins the
 //! client-side contract that has to hold for the *healthy* broker, because
 //! without it the client-side mitigations of issue #414 would be measuring
 //! nothing:
@@ -24,10 +24,10 @@
 //!    must between them receive every published message exactly once, including whatever the
 //!    departed consumer had un-acked.
 //! 2. **`available_permits()` is a live signal.** Issue #414 re-pointed that accessor from the
-//!    purely-additive grant mirror to the REAL decrementing balance, so it must be observed
-//!    strictly below the configured receiver-queue size while the broker is dispatching. On the old
-//!    semantics it was pinned at the queue size forever and a wedged consumer was indistinguishable
-//!    from a healthy one.
+//!    purely-additive grant mirror to the client-accounted decrementing balance, so it must be
+//!    observed strictly below the configured receiver-queue size while the broker is dispatching.
+//!    On the old semantics it was pinned at the queue size forever and a wedged consumer was
+//!    indistinguishable from a healthy one.
 //! 3. **The broker agrees with the client about the initial grant** (issue #426). Both engines used
 //!    to follow the sans-io `Connection::initial_flow` with a raw `Connection::flow(handle,
 //!    receiver_queue_size)`: a second, wire-only frame no client mirror accounted for.
@@ -210,7 +210,7 @@ async fn drain_some(
         };
         // Sampled BEFORE the ack, i.e. with the broker's grant partly spent —
         // this is the observation that only means something on the issue #414
-        // semantics (the REAL decrementing balance).
+        // semantics (the client-accounted decrementing balance).
         *lowest_permits = (*lowest_permits).min(consumer.available_permits());
         payloads.push(message.payload.to_vec());
         let _ = consumer.ack(message.message_id).await;
@@ -368,7 +368,7 @@ async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
         unique.len(),
     );
 
-    // Issue #414's detection premise: `available_permits()` reports the REAL
+    // Issue #414's detection premise: `available_permits()` reports the client-accounted
     // decrementing balance. Under the pre-#414 additive mirror this stayed
     // pinned at `RECEIVER_QUEUE_SIZE` for the whole run, which is exactly why an
     // application polling it could not tell a draining consumer from a wedged
@@ -376,7 +376,7 @@ async fn e2e_shared_subscription_survives_mid_drain_consumer_close()
     assert!(
         lowest_permits < RECEIVER_QUEUE_SIZE as u32,
         "available_permits() must fall below the receiver-queue size ({RECEIVER_QUEUE_SIZE}) \
-         while the broker is dispatching — it reports the real balance now, not the \
+         while the broker is dispatching — it reports the client-accounted balance now, not the \
          cumulative grant; observed minimum {lowest_permits}"
     );
 

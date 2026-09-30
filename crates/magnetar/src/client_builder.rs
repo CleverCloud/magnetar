@@ -232,7 +232,7 @@ impl ClientBuilder {
 
     /// Arm the per-consumer stall watchdog (issue #414).
     ///
-    /// A consumer that holds un-spent broker permits over an empty receive queue, in a
+    /// A consumer whose client-accounted balance remains positive over an empty receive queue, in a
     /// dispatch-eligible state, for `dur` without a single dispatch unit arriving surfaces
     /// one `warn!` and one
     /// [`ConnectionEvent::ConsumerStalled`](magnetar_proto::event::ConnectionEvent::ConsumerStalled)
@@ -259,14 +259,16 @@ impl ClientBuilder {
         self
     }
 
-    /// Let the stall watchdog recover a wedged consumer by itself, at most `max_attempts`
-    /// times per stall streak (issue #414, ADR-0103).
+    /// Let the stall watchdog attempt an in-place re-attach after reporting consumer
+    /// silence, at most `max_attempts` times per stall streak (issue #414, ADR-0103).
     ///
-    /// Each attempt is the same in-place re-attach `Consumer::resubscribe()` performs —
-    /// zero this client's permit mirrors, fail the orphaned in-flight acks, re-emit
-    /// `CommandSubscribe` for the same consumer id on the live connection, and let the
-    /// broker's `Success` release a fresh initial `CommandFlow`. No transport reconnect,
-    /// no other consumer or producer disturbed, and the receiver queue left intact.
+    /// Each attempt follows `Consumer::resubscribe()` and ADR-0108 on the live connection:
+    /// send `CommandCloseConsumer` and wait for its broker `Success`; only then zero this
+    /// client's permit mirrors, fail orphaned in-flight acks, and send `CommandSubscribe`
+    /// for the same consumer id. Its separate `Success` releases the initial `CommandFlow`.
+    /// A rejected close leaves the client state unchanged. No transport reconnect or other
+    /// consumer or producer is disturbed; the receiver queue stays intact, while the
+    /// broker may redeliver unacked entries detached with the old slot.
     ///
     /// The `ConsumerStalled` event and its `warn!` are emitted either way, so arming this
     /// adds a recovery attempt without ever hiding the diagnosis.
@@ -289,8 +291,9 @@ impl ClientBuilder {
     /// dispatcher and nothing wider: since ADR-0108 it closes the consumer id and
     /// re-attaches it, which is permit-NEUTRAL on the subscription's aggregate counter —
     /// the close returns this consumer's remaining permits and the re-subscribe's grant
-    /// takes them back. Attempts therefore do not accumulate toward repairing issue #414's
-    /// dispatcher-WIDE failure, whose aggregate was observed at `-177300`. When the budget
+    /// takes them back. Attempts therefore do not accumulate toward repairing a
+    /// dispatcher-wide failure. Issue #414 observed `-177300` on one ghost consumer,
+    /// not on the subscription aggregate. When the budget
     /// is exhausted the client stops and logs the escalation — `pulsar-admin topics
     /// unload` — instead of acting forever against a fault it cannot repair.
     ///

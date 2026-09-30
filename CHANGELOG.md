@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Verified identical at v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and master `:2037-2044`; the sibling branches are deliberately not no-ops (a still-pending creation is answered `ServiceNotReady`, an exceptionally-completed one a mapped error), and neither `SubType` nor durability is read there at all.
   So the client zeroed its permit mirrors against a broker state that never happened, the broker kept its slot and its balance, and the re-subscribe `Success` then granted a full fresh `receiver_queue_size` window on top of what the broker already held — once per recovery attempt, while the wedge the call exists to clear could not move.
   Measured on the differential harness with a faithful live-id broker model: one recovery took an 8-message receiver queue's broker-observed balance from `8` to `16`.
-  Issue #414's production signature is a subscription permit counter at `-177300`, and a recovery that adds permits the broker never agreed to is moving that same counter, in the opposite direction, on the client's own initiative.
+  Issue #414 reported `availablePermits = -177300` on one ghost consumer with an empty name, not on a measured subscription aggregate. The proven client over-grant moved a live slot's counter in the opposite direction but was not shown to cause or repair that production value.
   The recovery is now two phases on the same live socket, with no transport reconnect: a `CommandCloseConsumer` for this consumer id, and then — on that close's `Success` only — the permit-mirror zeroing, the issue #346 in-flight-ack sweep, and the `CommandSubscribe` whose own `Success` releases the initial `CommandFlow`.
   Every mutation moved to the second phase, so a broker that rejects the close leaves the consumer byte-for-byte as the caller found it: still wedged, but still holding the positive `permit_balance` that `is_stall_candidate` requires, so it stays visible to the watchdog and eligible for another attempt.
   Zeroing up front and then failing to close would have produced a consumer that is wedged AND undetectable.
@@ -123,6 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **`ClientBuilder::consumer_stall_auto_recovery(u32)`** / `ConnectionConfig::consumer_stall_auto_recovery` — opt-in, bounded automatic recovery for the issue #414 stall watchdog.
   With it set, the same `handle_timeout` sweep that emits `ConnectionEvent::ConsumerStalled` also performs the in-place re-attach `Consumer::resubscribe()` performs — zero the permit mirrors, fail the orphaned in-flight acks, re-emit `CommandSubscribe` for the same consumer id, let the broker's `Success` release a fresh initial `CommandFlow` — instead of leaving that to the application.
+  This records the original 1.6.0 sequence; the 1.7.2 entry above supersedes it with a required `CommandCloseConsumer` and its `Success` before zeroing the mirrors and subscribing again.
   **At most one attempt per stall episode**, and an episode closes at most once per `consumer_stall_timeout`, so the value caps a sequence that is already rate-limited to one re-subscribe per window: `3` at the recommended 30 s window spends three re-subscribes over ninety seconds and then stops.
   The budget resets on **real progress only** — one broker dispatch unit actually arriving — and deliberately not at the permit-mirror churn boundaries, because the recovery's own re-subscribe is one of them and resetting there would refund every attempt that paid for it, leaving no bound at all.
   An attempt the eligibility gate refuses (closed, unsubscribing, terminally failed, mid-seek, re-attach already in flight) spends no budget and mutates nothing.
@@ -131,7 +132,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Exhausting the budget logs one `WARN` naming `pulsar-admin topics unload` and then goes quiet, because the last attempt was also the last thing that re-armed the stall window.
   **Default unset**, `0` disables explicitly, and it is **inert without `consumer_stall_timeout`** — no window, no stall episode, nothing to recover from.
   The diagnosis is never suppressed: the stall `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, and each attempt logs its own `INFO` carrying `attempt` and `max_attempts`.
-  Keep the number small — one attempt lifts the subscription's broker-side aggregate permit counter by exactly one receiver-queue window, and issue #414's production failure was `-177300` deep, so the bound exists to escalate rather than to eventually win.
+  Keep the number small. This historical one-window aggregate-credit premise was superseded by ADR-0108; issue #414's `-177300` was a per-consumer ghost-entry value, and the bound exists to escalate when delivery does not resume.
   This narrows ADR-0101's rejection of an automatic watchdog-driven re-subscribe to the unconditional unbounded form it was written about; that form is still rejected and is still the shipped default.
   (issue #414; ADR-0103, amending ADR-0101)
 
@@ -164,10 +165,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   It repairs this client's own dispatcher slot; a dispatcher-wide broker corruption still needs `pulsar-admin topics unload`.
   (issue #414; ADR-0101)
 - **`ClientBuilder::consumer_stall_timeout(Duration)`** / `ConnectionConfig::consumer_stall_timeout` — an opt-in per-consumer stall watchdog.
-  A consumer holding un-spent broker permits over an empty receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces one `WARN` and one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` — exactly once per stall episode, re-armed by the next dispatch.
+  A consumer holding client-accounted unspent permits over an empty receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces one `WARN` and one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` — exactly once per stall episode, re-armed by the next dispatch.
   The connection keepalive of ADR-0058 cannot see this: `PING` / `PONG` keeps flowing on a connection whose dispatcher wedged for ONE subscription, so its baseline never ages.
   **Default `None`** (the mechanism ships disarmed): an armed deadline perturbs the moonpool engine's simulated wake schedule even when it never fires, and Java has no per-consumer dispatch watchdog to inherit a parity default from. `Duration::from_secs(30)` is the documented recommended production value; `Duration::ZERO` disables it explicitly.
-  Emitting the event is its only effect — a watchdog that re-subscribed on its own would turn a broker hiccup into a re-subscribe storm and hide the broker-side defect. The event reports SILENCE, not fault: correlate it with the broker's `msgBacklog` before acting.
+  Emitting the event is its only effect — a watchdog that re-subscribed on its own would turn a broker hiccup into a re-subscribe storm and obscure diagnosis of the unresolved stall. The event reports SILENCE, not fault: correlate it with the broker's `msgBacklog` and actual delivery before acting.
   (issue #414; ADR-0101)
 - **`docs/consumer-stall-recovery.md`** — the operator-facing form of the above: the issue #414 symptom, why the connection keepalive misses it, detection via `available_permits()` / `ConsumerStalled` / admin `topic_stats`, and the `resubscribe()` → recreate → `topics unload` recovery ladder.
 - **`ProducerBuilder::unique_name_suffix(bool)`** — opt in to appending an engine-generated unique suffix to the name set by `ProducerBuilder::name`.
@@ -178,10 +179,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **BREAKING (semantics): `Consumer::available_permits()` now reports the REAL, decrementing broker permit balance.**
+- **BREAKING (semantics): `Consumer::available_permits()` now reports the client-accounted, decrementing permit balance.**
   It used to read `ConsumerState::granted_permits`, the purely-ADDITIVE grant mirror — a value dispatch never perturbs, so it read `receiver_queue_size` forever whether the broker was streaming or had gone silent.
-  ADR-0082 split that field from the real `permit_balance` for issue #349 but deliberately left this accessor on the additive one; issue #414 is the concrete cost of that deferral, because an application polling it could not distinguish a healthy consumer from one whose broker-side dispatcher had wedged.
-  The accessor now matches Java's `ConsumerBase#getAvailablePermits` and the value moves under dispatch, so a balance pinned near the receiver-queue size while nothing arrives is a usable stall signature.
+  ADR-0082 split that field from the decrementing `permit_balance` for issue #349 but deliberately left this accessor on the additive one; issue #414 exposed the deferral because polling could not detect dispatch silence.
+  The accessor now matches the arithmetic of Java's client-side `ConsumerBase#getAvailablePermits` and moves under dispatch. A balance pinned near the receiver-queue size while nothing arrives is a silence signal, requiring broker statistics and delivery evidence before attributing a wedge. It is not the broker's admin `availablePermits` measurement.
   The change reaches `Connection::consumer_available_permits`, both engines' `Consumer::available_permits`, the façade's `ConsumerApi::available_permits`, `Reader::available_permits`, `TypedConsumer::available_permits`, and `MultiTopicsConsumer::available_permits` (which sums its children).
   Callers that genuinely want the cumulative grant read `ConsumerState::granted_permits` directly; it is unchanged, as are its two internal callers (the #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta).
   (issue #414; ADR-0101, amending ADR-0082)
@@ -450,8 +451,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via a broker genuinely exhausting its grant.
-  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the REAL balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
+- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via received dispatch units consuming the locally recorded grant.
+  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the client-accounted balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
   A new churn-window guard skips the adjust tick entirely when `granted_permits == 0` (reset / terminal-failure / same-broker `CloseConsumer`), so that window is never mistaken for load starvation.
   `Auto::adjust` itself is unchanged — only the signal it was fed was wrong.
   (#349; ADR-0082)

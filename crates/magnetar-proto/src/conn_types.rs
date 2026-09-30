@@ -320,7 +320,7 @@ pub struct ConnectionConfig {
     pub stats_interval: Option<Duration>,
     /// Per-consumer stall watchdog window (issue #414). `handle_timeout` surfaces one
     /// [`ConsumerStalled`](crate::event::ConnectionEvent::ConsumerStalled) event for a
-    /// consumer that has held un-spent broker permits over an empty receive queue, in a
+    /// consumer whose client-accounted balance remained positive over an empty receive queue, in a
     /// dispatch-eligible state, for this long without a single dispatch unit arriving —
     /// and exactly one per stall episode, re-armed by the next dispatch. See
     /// [`ConsumerState::poll_stall`](crate::consumer::ConsumerState::poll_stall).
@@ -329,8 +329,8 @@ pub struct ConnectionConfig {
     /// dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG`, so
     /// `last_activity` never ages and no connection-level deadline ever fires. Issue #414
     /// is exactly that shape — survivors of a consumer-churn window receive ~20 messages
-    /// then nothing, the broker's own `availablePermits` for the subscription goes hugely
-    /// negative, `acks_failed` stays 0, and the client reports no error at all.
+    /// then nothing, one ghost consumer with an empty name has broker-reported
+    /// `availablePermits = -177300`, `acks_failed` stays 0, and the client reports no error.
     ///
     /// **Default `None` — the mechanism ships disarmed.** Two reasons, both precedented
     /// here: an armed deadline that never fires still perturbs the moonpool engine's
@@ -381,13 +381,13 @@ pub struct ConnectionConfig {
     /// — a `CommandSubscribe` for a consumer id the broker still holds is a broker-side
     /// no-op, so the close is what makes the re-attach real), which repairs **this client's
     /// own slot** in the broker's dispatcher and costs redelivery of whatever it was holding
-    /// un-acked. Issue #414's production failure was dispatcher-WIDE — the subscription's
-    /// `availablePermits` observed at `-177300` across every attached consumer — and an
-    /// attempt does not lift a corrupted aggregate at all: the close returns this consumer's
-    /// remaining permits and the re-subscribe's grant takes them back, so one recovery is
-    /// permit-NEUTRAL. That is why the bound exists and why it stays small: once it is
-    /// exhausted the client stops and logs the escalation (`pulsar-admin topics unload`)
-    /// rather than acting forever against a fault it cannot repair. A `Failover` or
+    /// un-acked. Issue #414 observed `availablePermits = -177300` on one ghost consumer
+    /// with an empty name while all fresh consumers stopped progressing; no aggregate
+    /// value was captured. An attempt does not lift a corrupted aggregate at all: the close
+    /// returns this consumer's remaining permits and the re-subscribe's grant takes them back,
+    /// so one recovery is permit-NEUTRAL. That is why the bound exists and why it stays small:
+    /// once it is exhausted the client stops and logs the escalation (`pulsar-admin topics
+    /// unload`) rather than acting forever against a fault it cannot repair. A `Failover` or
     /// non-durable subscription is refused outright, so an armed budget never spends
     /// anything on one. See
     /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).

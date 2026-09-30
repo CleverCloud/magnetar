@@ -180,16 +180,17 @@ pub struct ConsumerState {
     /// reset, terminal subscribe failure, same-broker `CloseConsumer`). Issue #349: this is a
     /// purely ADDITIVE mirror — it is bumped at every grant site (`initial_flow`, `maybe_flow`,
     /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
-    /// actually arrive, so it does not track the broker's REAL outstanding grant. It is still
+    /// actually arrive, so it does not track the client's decrementing estimate. It is still
     /// the right register for "how much have we told the broker it may use": the #307
     /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
-    /// that question answered, and this additive counter answers it correctly. For the REAL,
-    /// decrementing balance — the starvation signal
+    /// that question answered, and this additive counter answers it correctly. For the
+    /// decrementing client-accounted balance — the starvation signal
     /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
     /// [`Self::permit_balance`].
     pub granted_permits: u32,
-    /// REAL broker-side permit balance: `granted_permits` minus one unit per broker dispatch
-    /// unit that has actually arrived (issue #349). Incremented at the same three grant sites
+    /// Client-accounted permit balance: `granted_permits` minus one unit per broker dispatch
+    /// unit received (issue #349). This is a local estimate, not the broker's admin
+    /// `consumers[].availablePermits` statistic. Incremented at the same three grant sites
     /// as `granted_permits` (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth
     /// branch) by the identical delta. Decremented by exactly one (saturating) per dispatch
     /// unit as it arrives:
@@ -1158,9 +1159,9 @@ impl ConsumerState {
     }
 
     /// `true` when this consumer can NEVER emit another flow on its own: the broker has
-    /// dispatched every granted permit (`permit_balance == 0`, issue #349's REAL balance),
-    /// and even popping everything still queued cannot push `consumed_since_flow` across
-    /// the half-queue `flow_threshold` — so [`Self::maybe_flow`] is unreachable, the
+    /// dispatched every granted permit (`permit_balance == 0`, issue #349's client-accounted
+    /// balance), and even popping everything still queued cannot push `consumed_since_flow`
+    /// across the half-queue `flow_threshold` — so [`Self::maybe_flow`] is unreachable, the
     /// broker sits at zero permits, and both sides wait on each other forever.
     ///
     /// Defence-in-depth since issue #437. What opens the gap between "charged" and
@@ -1265,8 +1266,8 @@ impl ConsumerState {
     /// `consumer_stall_timeout` instead of `consumer_stall_timeout + keepalive_interval`:
     /// `poll_timeout` has no instant to arm from until a window exists, and on an otherwise
     /// idle connection the keepalive deadline is the only thing that would produce that
-    /// first sweep. A full grant is also exactly the moment a #414 wedge begins — the
-    /// broker acknowledged permits it will never spend — so it is the right zero.
+    /// first sweep. A full grant also starts the observation window for the
+    /// silence reported in #414; it does not identify which side caused that stall.
     ///
     /// Unconditional: a fresh grant is a fresh promise and always deserves a fresh window.
     /// The other grant sites ([`Self::maybe_flow`], [`Self::adjust_receiver_queue`]) carry
@@ -1279,15 +1280,16 @@ impl ConsumerState {
         });
     }
 
-    /// `true` while this consumer is in the state issue #414 wedges in: the broker has
-    /// been granted permits it has not spent (`permit_balance > 0`), the local queue is
-    /// empty so nothing is waiting on the user, and the consumer is dispatch-eligible.
+    /// `true` while this consumer is in a state that can expose issue #414's silence:
+    /// the client has granted permits it has not observed being spent
+    /// (`permit_balance > 0`), the local queue is empty so nothing is waiting on
+    /// the user, and the consumer is dispatch-eligible.
     ///
     /// The eligibility set is deliberately the SAME one the #307 Failover re-arm gate uses
     /// (`ActiveConsumerChange` arm in [`crate::Connection`]): not closed, not paused, no
     /// in-flight seek freezing the queue, not terminally failed, not end-of-topic, and not
-    /// mid-re-attach. Each of those explains the silence without a broker fault, and a
-    /// watchdog that fired on them would be reporting the user's own gating back at them.
+    /// mid-re-attach. Each of those can explain silence without a broker fault, and a
+    /// watchdog that fired on them could report the user's own gating back at them.
     ///
     /// Pure read — no clock, no mutation.
     #[must_use]
@@ -1337,7 +1339,7 @@ impl ConsumerState {
     /// explicit ([`crate::Connection::resubscribe_consumer_in_place`], or an operator-side
     /// `topics unload`). ADR-0101 rejected an unconditional automatic re-subscribe because
     /// a broker hiccup would become a re-subscribe storm across every partition at once
-    /// and would hide the broker-side defect issue #414 is actually about; ADR-0103 admits
+    /// and would obscure diagnosis of the unresolved issue #414 stall; ADR-0103 admits
     /// it only opt-in and only bounded, driven by
     /// [`crate::Connection::handle_timeout`] from the `Some` this returns — one attempt
     /// per episode, at most `consumer_stall_auto_recovery` attempts per stall streak, and
@@ -1392,7 +1394,7 @@ impl ConsumerState {
     pub fn record_marker_consumed(&mut self) {
         self.record_broker_permit_consumed();
         // Issue #349: a marker is one broker-dispatched unit too — decrement the
-        // REAL balance directly (not through `record_broker_permit_consumed`,
+        // client-accounted balance directly (not through `record_broker_permit_consumed`,
         // which credits the `consumed_since_flow` refund ledger, the wrong site
         // for the live arrival mirror). Issue #414: the same call bumps the
         // watchdog's progress mark, so a marker-only stream (a replicated
@@ -1443,7 +1445,7 @@ impl ConsumerState {
         crate::receiver_queue::FlowStats {
             current_queue_size: self.receiver_queue_size,
             queued_messages: self.queue.len(),
-            // Issue #349: feed the REAL decrementing balance, not the
+            // Issue #349: feed the client-accounted decrementing balance, not the
             // purely-additive `granted_permits` mirror, so `0` here is a
             // genuine starvation signal (see `Self::permit_balance`'s doc).
             available_permits: self.permit_balance,
@@ -1901,7 +1903,7 @@ impl ConsumerState {
                     self.record_broker_permit_consumed();
                     // Issue #349: this chunk is one dispatch unit even though
                     // it never reaches `classify_and_queue` (reassembly is
-                    // still pending) — decrement the REAL balance directly
+                    // still pending) — decrement the client-accounted balance directly
                     // rather than through `record_broker_permit_consumed`
                     // (which credits the `consumed_since_flow` refund ledger,
                     // the wrong site for the live arrival mirror). Issue
@@ -2100,7 +2102,7 @@ impl ConsumerState {
         // Issue #349: `classify_and_queue` is called exactly once per
         // broker dispatch unit — once for a plain message, once per batch
         // member (the `deliver` batch loop), and once for the chunk-
-        // completing logical message. Decrement the REAL balance
+        // completing logical message. Decrement the client-accounted balance
         // unconditionally, before the queued-vs-dead-lettered branch below:
         // the broker already spent one permit dispatching this entry
         // regardless of which branch the client routes it into. Issue #414:

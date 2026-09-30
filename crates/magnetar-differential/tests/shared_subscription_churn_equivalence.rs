@@ -6,8 +6,9 @@
 //!
 //! Until this landed the scripted broker had no shared-dispatcher state at all:
 //! every consumer walked the ledger on its own cursor, so two consumers on one
-//! Shared subscription each received the whole ledger and the #414 failure mode
-//! was not even expressible in the harness. `broker.rs` now models what a Shared
+//! Shared subscription each received the whole ledger and a Shared delivery-stall
+//! shape was not expressible in the harness. This does not reproduce #414's ghost
+//! consumer counter. `broker.rs` now models what a Shared
 //! dispatcher actually is — ONE cursor per `(topic, subscription)`, handed out
 //! round-robin to whoever holds permits, with a detaching consumer's un-acked
 //! entries returned to the survivors.
@@ -19,18 +20,20 @@
 //!    redelivery) and then keep draining the rest of the ledger. Before the shared dispatcher
 //!    existed both consumers would simply have replayed the whole ledger independently and this
 //!    scenario would have proved nothing.
-//! 2. **Recovery.** `Consumer::resubscribe()` on a live Shared consumer: the in-place re-attach
-//!    zeroes the permit mirrors, re-emits `CommandSubscribe` for the SAME consumer id, and the
-//!    broker's `Success` re-arms the grant. The event carries the re-armed balance read back
-//!    through `Consumer::available_permits()` — which issue #414 re-pointed at the REAL
-//!    decrementing balance, so both engines must report the same number.
+//! 2. **Recovery.** `Consumer::resubscribe()` on a live Shared consumer: ADR-0108 first sends
+//!    `CommandCloseConsumer`, then closes the old slot and zeroes the client permit mirrors only on
+//!    that close's `Success`. A new `CommandSubscribe` for the SAME consumer id receives its own
+//!    `Success` before the fresh `CommandFlow` re-arms the grant. The event reports the
+//!    client-accounted unspent balance through `Consumer::available_permits()`; this is not a
+//!    broker stats reading. Closing the old slot can redeliver its unacked messages.
 //!
 //! The one-permit receiver-queue window is deliberate: it makes the round-robin
 //! hand-off deterministic instead of letting whichever consumer subscribed first
 //! swallow the whole backlog, which is what keeps the two legs comparable.
 //!
-//! Two further scenarios reproduce the broker-side fault itself and pin ADR-0103's
-//! bounded automatic recovery against it — see
+//! Two further scenarios inject a hypothetical negative aggregate in the scripted
+//! dispatcher and pin the bounded recovery against that model. They do not reproduce
+//! issue #414's negative per-consumer ghost entry. See
 //! [`ScriptedBroker::leak_shared_permits_on_consumer_churn`] and the two
 //! `wedged_shared_dispatcher_*` tests at the bottom of this file.
 
@@ -208,8 +211,8 @@ async fn shared_subscription_churn_event_streams_agree() {
 
     // The survivor drains everything that is left, and the entry the departed
     // consumer never acked comes back to it. Nothing is stranded on the consumer
-    // that left — the property a Shared subscription owes its survivors, and the
-    // one issue #414 reports the real broker failing to honour after churn.
+    // that left — the property a Shared subscription owes its survivors. Issue
+    // #414 reported delivery silence after churn, without an exact redelivery trace.
     let survivor: Vec<u64> = [9usize, 10, 11]
         .iter()
         .map(|index| {
@@ -288,10 +291,10 @@ async fn shared_consumer_resubscribe_event_streams_agree() {
                 name: "a".to_owned(),
                 message_id: message_id(0),
             },
-            // The #414 recovery ladder's first rung: re-attach this consumer id
-            // in place on the live socket. The permit mirrors are zeroed, a
-            // fresh `CommandSubscribe` goes out, and the broker's `Success`
-            // re-arms the grant — which is what the event reports.
+            // The recovery ladder's first rung closes this consumer id on the live
+            // socket, then zeroes the client mirrors after close Success. A fresh
+            // Subscribe and its Success precede the new Flow grant reported by
+            // the event (ADR-0108). This trace has already acked its one message.
             Op::ResubscribeShared {
                 name: "a".to_owned(),
             },
@@ -431,8 +434,8 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #414 / ADR-0103 — the broker-side wedge, and bounded automatic recovery
-// from it.
+// ADR-0103's hypothetical aggregate wedge, and bounded automatic recovery
+// against that model. This is not a reproduction of issue #414's ghost entry.
 //
 // Everything above models a CORRECT Shared dispatcher. These two model the fault
 // itself: `leak_shared_permits_on_consumer_churn` makes a detach subtract the
@@ -441,14 +444,15 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
 // behind them. Once the aggregate crosses zero the dispatcher's read gate closes
 // and the subscription stops dispatching entirely — the survivor still holds
 // per-consumer permits, the backlog is still non-empty, the connection is still
-// healthy, and nothing moves. That is the client-visible shape issue #414 reports,
-// with the broker's own `availablePermits` for the subscription at `-177300`.
+// healthy, and nothing moves. This models issue #414's delivery stall, but the
+// observed `availablePermits = -177300` belonged to one ghost consumer with an
+// empty name, not to a measured subscription aggregate.
 //
-// The client cannot cause it: the wire protocol carries only monotonic client →
-// broker permit increments, so a negative aggregate is by construction a
-// broker-side accounting fault. It is a HYPOTHESIS about the churn-path accounting
-// that reproduces the reported signature, not a verified reading of any broker
-// source — `UPSTREAM-ISSUE-DRAFT.md` frames it that way for Pulsar's maintainers.
+// The double-subtraction is a HYPOTHESIS about aggregate churn-path accounting,
+// not a verified reading of the production per-consumer fault. `CommandFlow`
+// carries only non-negative increments, but dispatch, detach and client timing
+// can all affect broker counters. This model has not reproduced the exact ghost
+// consumer signature; `UPSTREAM-ISSUE-DRAFT.md` frames the hypothesis for Pulsar.
 //
 // What the two tests then pin is the recovery arithmetic — and ADR-0108 changed it.
 //
@@ -467,9 +471,9 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
 // double-subtraction it makes the aggregate WORSE, not better.
 //
 // So the two tests below now pin the honest position: a subscription-wide leak is not
-// client-recoverable at any budget, exactly as ADR-0101 always claimed for the scope
-// of this repair, and `pulsar-admin topics unload` is the answer to `-177300`. The
-// bound exists to reach that escalation, not to grind toward it.
+// client-recoverable at any budget, exactly as ADR-0101 claimed for the scope
+// of this repair. The production `-177300` was per-consumer; unload recovered
+// that incident. The bound exists to reach that escalation, not to grind toward it.
 // ---------------------------------------------------------------------------
 
 /// Stall window for the wedge scenarios. Long enough that no episode can close
@@ -485,18 +489,20 @@ async fn stalled_shared_consumer_is_drained_by_both_drivers() {
 const WEDGE_STALL_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Receive budget for the wedge scenarios: comfortably longer than the two stall
-/// episodes a recovering leg needs, so a `RecvTimeout` there would be a real
-/// failure to recover rather than an impatient assertion.
+/// episodes a recovering leg needs. Both current tests expect a timeout under
+/// the injected aggregate leak; this window also lets the attempted closes run.
 const WEDGE_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Survivor's receiver queue. Each automatic recovery attempt credits the broker's
-/// leaked aggregate by exactly this much.
+/// Survivor's receiver queue. Before ADR-0108, each bare re-subscribe incorrectly
+/// credited the modeled aggregate by this much. Current close-then-re-subscribe
+/// does not create that unmatched credit.
 const SURVIVOR_RQ: usize = 2;
 
 /// The departing consumer's receiver queue. It receives nothing (the topic is
 /// empty while it is attached), so it detaches holding all four permits and the
-/// armed double-subtraction leaks 4 — two survivor windows' worth, which is what
-/// makes one attempt insufficient and two sufficient.
+/// armed double-subtraction leaks 4 — two survivor windows' worth. Under the
+/// historical bare re-subscribe, one unmatched grant was insufficient and two
+/// were sufficient; under ADR-0108 neither budget repairs this injected leak.
 const LEAVER_RQ: usize = 4;
 
 /// Publish-after-churn trace: two Shared consumers, one leaves immediately, then a
@@ -596,9 +602,9 @@ async fn a_leaked_shared_dispatcher_is_not_recovered_by_a_generous_budget() {
     //   consumer-churn event, so under the double-subtraction this harness models it subtracts the
     //   survivor's window twice and credits it once.
     //
-    // A client cannot climb out of a broker-side accounting hole by churning consumers
-    // into the very path that digs it. `pulsar-admin topics unload` is the answer to
-    // `-177300`, which is what ADR-0101 said the scope of this repair was all along.
+    // A client cannot climb out of this modeled aggregate hole by churning consumers
+    // into the very path that digs it. `pulsar-admin topics unload` recovered the
+    // reported incident, but this model does not establish that incident's cause.
     const MAX_ATTEMPTS: u32 = 2;
     let trace = wedge_trace(
         "persistent://public/default/shared-wedge-generous-budget",
@@ -703,8 +709,8 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     //
     // Paired with the sibling above, this is what shows the BOUND is a bound rather
     // than the thing that decides the outcome: doubling the budget changes the frame
-    // counts and nothing else. That is the shape issue #414 actually reported — an
-    // aggregate at `-177300` is ~178 receiver-queue windows deep — and since ADR-0108
+    // counts and nothing else. This is an aggregate-model result, not the exact
+    // per-consumer `-177300` reported by issue #414. Since ADR-0108
     // the attempts do not accumulate at all, so escalation is the only honest answer
     // rather than an unbounded retry loop.
     const MAX_ATTEMPTS: u32 = 1;

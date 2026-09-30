@@ -241,20 +241,20 @@ impl Consumer {
         out
     }
 
-    /// Number of dispatch permits this consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push and the broker has not yet spent. Mirrors
-    /// Java `ConsumerBase#getAvailablePermits`.
+    /// Client-accounted unspent dispatch permits: locally recorded grants minus
+    /// received dispatch units. Mirrors the arithmetic of Java
+    /// `ConsumerBase#getAvailablePermits`, not broker admin `availablePermits`.
     ///
     /// Reads `ConsumerState::permit_balance`: the initial / replenishment grants, minus
-    /// one per broker dispatch unit that has actually arrived (plain message, batch
+    /// one per received dispatch unit (plain message, batch
     /// member, buffered chunk, PIP-33 marker), force-zeroed at every churn boundary.
     ///
     /// **Semantic change (issue #414).** This used to read the purely-ADDITIVE
     /// `granted_permits` mirror, which never moves under dispatch and therefore made a
-    /// wedged consumer indistinguishable from a healthy one — an application polling it
-    /// could not detect issue #414's silent Shared-subscription stall. Poll this to see a
-    /// draining consumer's balance fall and refill; a balance pinned high while messages
-    /// stop arriving is the client-side signature of that stall. See
+    /// consumer receiving messages indistinguishable from a silent one when polling.
+    /// Poll this to see the local balance fall and refill; a balance pinned high while
+    /// messages stop arriving signals silence to correlate with broker stats and actual
+    /// delivery before attributing a stall. See
     /// [ADR-0101](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md),
     /// which amends ADR-0082's deferral of exactly this accessor.
     ///
@@ -297,10 +297,10 @@ impl Consumer {
     ///
     /// # What this does and does not repair
     ///
-    /// It repairs **this client's own slot** in the broker's dispatcher. Issue #414's
-    /// production failure was a dispatcher-WIDE corruption — the subscription's
-    /// broker-side `availablePermits` observed at `-177300`, affecting every attached
-    /// consumer — and one consumer re-attaching does not necessarily clear that. The
+    /// It repairs **this client's own slot** in the broker's dispatcher. Issue #414
+    /// observed broker-side `availablePermits = -177300` on one ghost consumer with
+    /// an empty name; every fresh consumer then stopped progressing, but no aggregate
+    /// value was captured. One consumer re-attaching does not necessarily clear that. The
     /// escalation is an operator-side `pulsar-admin topics unload`, which is what
     /// recovered the production incident. See
     /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
@@ -3040,7 +3040,7 @@ mod tests {
             let _ = conn.initial_flow(handle, t0);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
-            // Issue #349: drain the broker-side permit BALANCE via real
+            // Issue #349: drain the client-accounted permit balance via real
             // dispatch — 100 single-message deliveries against the
             // 100-permit initial grant — so the tick observes genuine
             // starvation, not a synthetic field write.
@@ -3059,7 +3059,7 @@ mod tests {
             assert_eq!(
                 conn.consumer_available_permits(handle),
                 100,
-                "issue #414: the accessor reports the REAL balance — dispatch drained the \
+                "issue #414: the accessor reports the client-accounted balance — dispatch drained the \
                  100-permit initial grant to 0, so the incremental top-up of 100 leaves \
                  exactly 100 un-spent, not the 200-permit cumulative grant"
             );

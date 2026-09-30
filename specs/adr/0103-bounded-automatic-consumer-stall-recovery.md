@@ -8,26 +8,24 @@
 ## Context
 
 [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md) shipped the two halves of issue #414's client-side answer and deliberately left them unconnected.
-The per-consumer stall watchdog detects the wedge and emits `ConnectionEvent::ConsumerStalled`; `Connection::resubscribe_consumer_in_place` (and `Consumer::resubscribe()` on both engines) repairs this client's dispatcher slot.
+The per-consumer stall watchdog detects dispatch silence and emits `ConnectionEvent::ConsumerStalled`; that is a heuristic to correlate with backlog and actual delivery, not a diagnosis of the issue #414 broker fault. `Connection::resubscribe_consumer_in_place` (and `Consumer::resubscribe()` on both engines) attempts to replace this client's dispatcher slot without proving subscription-wide recovery.
 Nothing joins them: an application that arms `consumer_stall_timeout` still has to observe the event, decide, and call the recovery itself.
 
 ADR-0101 rejected joining them, in these words:
 
-> **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would hide the broker-side defect that issue #414 is actually about. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
+> **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would obscure diagnosis of the unresolved issue #414 stall. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
 
 Both objections are real and both are about an **unconditional, unbounded** automatic re-subscribe. Neither survives contact with an opt-in, bounded one:
 
 - **The storm is already rate-limited by the mechanism that would drive it.** `poll_stall` returns `Some` exactly once per stall episode, and an episode cannot close more often than once per `consumer_stall_timeout` — the recommended value being 30 s. A partition set that all wedge together therefore emits at most one `CommandSubscribe` per consumer per 30 s, which is quieter than the reconnect storm the same event set would produce if the application reacted to every `ConsumerStalled` itself. What is genuinely unbounded is the _duration_: without a cap the client would keep re-subscribing once per window forever against a fault it may not be able to repair at all.
 - **The diagnosis is not hidden, because the event still fires.** The `warn!` and the `ConsumerStalled` are emitted on every episode whether or not recovery acts, and each attempt logs its own `info!` with the attempt number. An operator sees strictly more than before, not less.
 
-What tips the balance is the arithmetic of the recovery itself, which ADR-0101 states as a scope limit but does not quantify.
-An in-place re-subscribe zeroes this consumer's permit mirrors, the broker recreates its dispatcher slot at zero permits, and the client answers the re-subscribe `Success` with one fresh `CommandFlow` of a full receiver-queue window.
-Against a subscription whose **aggregate** permit counter has been corrupted — issue #414 observed it at `-177300` — one attempt therefore credits back exactly `receiver_queue_size`.
-A leak of `L` needs `ceil(L / receiver_queue_size)` attempts: with the reported numbers and a 1000-message queue, about 178 of them.
-No sane client budget reaches that, which is precisely why the correct behaviour is a small number of attempts followed by an honest escalation, not a retry loop.
+The original argument invoked recovery arithmetic that [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) superseded. It assumed a bare in-place `CommandSubscribe` recreated the broker slot at zero permits, let the client zero its mirrors, and then answered `Success` with one full-window `CommandFlow`.
+In fact the broker treated that live-id subscribe as a no-op; the subsequent Flow was an unmatched second grant to the old slot. It could offset a hypothetical corrupted **aggregate** by `receiver_queue_size` per attempt, making a leak of `L` appear to need `ceil(L / receiver_queue_size)` attempts, but that was over-grant rather than repair. Current recovery sends `CommandCloseConsumer`, waits for its `Success`, then resets the local mirrors, subscribes, waits for a second `Success`, and grants the new window.
+Issue #414 reported `-177300` on one ghost consumer with an empty `consumerName`, not on an aggregate counter. The small budget bounds attempted slot recovery and escalates if delivery does not resume; the historical division by a queue window does not describe that observation.
 
-`magnetar-differential`'s scripted broker could state the wedge but not produce it.
-ADR-0101 gave it a real `SharedDispatcher` per `(topic, subscription)` — one cursor, round-robin over permitted consumers, detach returns un-acked entries to the survivors — but no aggregate permit counter, so there was nothing that could go negative and nothing that could stop dispatching while the survivors still held permits.
+`magnetar-differential`'s scripted broker could state a Shared delivery stall but not produce one under its original model.
+ADR-0101 gave it a modeled `SharedDispatcher` per `(topic, subscription)` — one cursor, round-robin over permitted consumers, detach returns un-acked entries to the survivors — but no aggregate permit counter. The later injected aggregate leak is a test hypothesis, not a reproduction of #414's per-consumer ghost value.
 
 ### Alternatives considered
 
@@ -98,11 +96,11 @@ Only a _reported_ standby is skipped. Inferring standby-ness from anything else 
 
 ### 5. The differential broker models the aggregate permit counter, and can corrupt it
 
-`SharedDispatcher` gains `total_available_permits: i64` — the scripted analogue of the number a real broker reports as `availablePermits` for a `Shared` subscription.
-It is **signed on purpose**: a `u32` could not express the failure, and a negative value is by construction a broker-side accounting fault, since the wire protocol carries only monotonic client → broker permit increments and no decrement of any kind.
+`SharedDispatcher` gains `total_available_permits: i64` to model an aggregate dispatcher gate. This is distinct from the per-consumer `availablePermits = -177300` reported for the ghost entry in issue #414.
+It is **signed on purpose** so the model can represent a negative aggregate. The model's negative value is injected by its own double-subtraction fault; the fact that `CommandFlow` carries only non-negative increments does not, by itself, attribute the production per-consumer state to either client or broker.
 
 It is credited by `CommandFlow`, charged one per dispatched entry, and charged the departing consumer's remaining permits on detach.
-A re-registration of an already-attached consumer id zeroes that consumer's permits without crediting the aggregate back — mirroring the client zeroing its own mirrors, with the fresh full-window `CommandFlow` after the `Success` being what puts them back.
+In the **default scripted model**, a re-registration of an already-attached consumer id zeroes that consumer's permits without crediting the aggregate back. This is the model's historical bare live-id `CommandSubscribe` behavior, **not** Apache Pulsar's: a real broker answers a completed live-id subscribe with `Success` and changes no slot or permit state. The scripted broker has a separate `subscribe_on_live_consumer_id_is_a_success_noop` mode for that behavior. Since [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md), current client recovery first closes the old slot, waits for close `Success`, and only then resets its local mirrors and re-subscribes.
 `dispatch_gate_open()` is the read gate: a dispatcher at or below zero hands out nothing regardless of what its consumers individually hold.
 
 With correct accounting the gate can never be the deciding factor — the counter is then the sum of the attached consumers' permits plus a non-negative re-registration drift, so it is non-positive only when the round-robin scan would have found nobody anyway.
@@ -110,22 +108,22 @@ Every pre-existing golden trace is byte-identical, and the differential suite pa
 
 `ScriptedBroker::leak_shared_permits_on_consumer_churn()` (off by default) makes a detach subtract the departing consumer's remaining permits **twice**.
 The second subtraction removes permits no credit was ever issued for, so each churn event leaks exactly that many, permanently.
-Once the aggregate crosses zero the subscription stops dispatching while its survivors still hold permits, the backlog is non-empty, and the connection stays healthy — the client-visible shape issue #414 reports.
+Once the model aggregate crosses zero the subscription stops dispatching while its survivors still hold permits, the backlog is non-empty, and the connection stays healthy — a modeled analogue of issue #414's delivery stall, not a reproduction of its negative ghost-consumer counter.
 
 **This is a hypothesis, not a verified reading of any Apache Pulsar source.**
-It is the accounting shape that reproduces the reported signature, and `UPSTREAM-ISSUE-DRAFT.md` frames it to Pulsar's maintainers as a question about the Shared dispatcher's churn-path permit accounting rather than as a claim about a specific method.
+It recreates a delivery stall under an injected aggregate leak, not the reported per-consumer ghost counter. `UPSTREAM-ISSUE-DRAFT.md` records the historical hypothesis for Pulsar's maintainers, not a verified cause of issue #414.
 
 ## Consequences
 
-- **`consumer_stall_auto_recovery` is new public API on a minor version.** One `ConnectionConfig` field, one `ClientBuilder` method. No event, no trait, no accessor: the observability is the existing `ConsumerStalled` plus three structured log lines (`info!` per attempt with `attempt` / `max_attempts`, the unchanged stall `warn!`, and the exhaustion `warn!`).
+- **`consumer_stall_auto_recovery` is new public API on a minor version.** One `ConnectionConfig` field, one `ClientBuilder` method. No event, no trait, no accessor: the observability is the existing `ConsumerStalled` plus three structured log lines (`info!` per attempt with `attempt` / `max_attempts`, the stall `warn!`, and the exhaustion `warn!`).
 - **The exhaustion warning fires exactly once per streak, not once per window.** The last attempt is the last thing that re-arms the stall window, so with no dispatch no further episode can open. A consumer that gives up goes quiet rather than logging forever — and the moment the broker dispatches again, the budget resets and the whole ladder is available for the next wedge.
-- **It cannot repair a dispatcher-wide corruption, and the bound is how it says so.** ADR-0101's scope limit is unchanged; this ADR quantifies it. One attempt buys `receiver_queue_size` of aggregate. `docs/consumer-stall-recovery.md` carries the ladder, and the exhaustion log names `pulsar-admin topics unload` in the message itself so an operator reading logs alone reaches the next rung.
+- **The bound limits attempts before escalation.** The original bare re-subscribe appeared to buy `receiver_queue_size` of modeled aggregate by over-granting an already-live slot. That arithmetic is superseded by ADR-0108's close-then-re-subscribe; current recovery does not pay down the modeled aggregate leak. `docs/consumer-stall-recovery.md` carries the ladder, and the exhaustion log names `pulsar-admin topics unload`.
 
 > **Superseded by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) (2026-09-18).** "One attempt buys `receiver_queue_size` of aggregate" was true only of a bare re-subscribe for a still-live consumer id, which credits a window the broker never debited — the over-commit ADR-0108 removes. The recovery now closes the consumer first, so one attempt is permit-neutral on the aggregate under correct broker accounting, and the recovery's own close is itself a churn event under the fault this harness models. A bounded automatic recovery therefore repairs **this client's own dispatcher slot** and never a subscription-wide corruption. The scope limit, the bound, the exhaustion log and `pulsar-admin topics unload` as the escalation are all unchanged — only the claim that attempts add up is withdrawn.
 
 - **A small budget is the right budget.** Three attempts at a 30 s window spends ninety seconds before escalating. Larger values do not become useful — the failures a single re-attach clears are cleared on the first attempt — they only delay the escalation.
-- **The watchdog is still a silence detector, not a fault detector.** A consumer that has drained its backlog on an idle topic satisfies the predicate exactly as a wedged one does, so an armed budget will occasionally spend an attempt re-subscribing a perfectly healthy idle consumer. That is cheap (one `CommandSubscribe`, one `CommandFlow`, the receiver queue untouched) and self-limiting (the first dispatch resets the budget), but it is why the knob is opt-in and why the recommended window is long.
-- **The differential harness can now express the broker-side fault**, which is what makes the upstream report evidence-backed rather than anecdotal: the same trace and the same leak recover under a sufficient budget and stay wedged under an insufficient one, identically on both engines.
+- **The watchdog is still a silence detector, not a fault detector.** A consumer that has drained its backlog on an idle topic satisfies the predicate exactly as a wedged one does, so an armed budget can close and re-subscribe a healthy idle consumer. Under ADR-0108 that costs a `CommandCloseConsumer`, its `Success`, a fresh `CommandSubscribe` and `Success`, then a `CommandFlow`; any unacked entries held by the old slot can be redelivered. The budget is self-limiting because the next actual dispatch resets it, which is why the knob is opt-in and the recommended window is long.
+- **The differential harness expresses a hypothetical aggregate fault.** Before ADR-0108, the bare re-subscribe's extra grant could offset that leak under a sufficiently large budget; that was an over-grant, not a repair. Current close-then-re-subscribe is permit-neutral under correct accounting and its close can worsen this injected leak. The current tests therefore show that neither a generous nor an insufficient budget repairs this model on either engine; they do not reproduce issue #414's per-consumer counter.
 - **One extra `u32` per consumer.** No allocation, no task, no new deadline — the recovery rides the sweep that already detected the stall.
 - **Promotion and demotion need no repair, because a skip spends nothing.** The standby pre-check emits nothing and mutates nothing, so a consumer that was standby throughout arrives at promotion with its budget untouched and gets the complete ladder if it then genuinely wedges. Demotion does not refund attempts already spent while active either; §3's single reset site is unchanged, and only a dispatch unit gives the budget back — which for a promoted consumer is exactly the event that proves the broker started serving it. No transition handling was added anywhere, and that is the point: the rule is that `is_active` gates whether an attempt is _made_, never what the budget _is_.
 - **Promotion does not restart the stall window, and a promoted-but-still-silent consumer stays quiet.** Issue #307's re-arm calls `initial_flow` only at `granted_permits == 0`, and ADR-0102 makes that a no-op for a consumer that already holds its grant — so no `arm_stall_watch` fires on promotion, and a report the standby already latched stays latched. The next episode opens only when candidacy is lost and regained or a fresh grant lands. This is pre-existing ADR-0101 latch semantics, unchanged by this guard and stated here only so it is not read as new behaviour: promotion is not evidence that the broker started dispatching, so it is correctly not treated as progress.
@@ -134,7 +132,7 @@ It is the accounting shape that reproduces the reported signature, and `UPSTREAM
 
 [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md) § Context, "Alternatives considered", states:
 
-> **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would hide the broker-side defect that issue #414 is actually about. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
+> **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would obscure diagnosis of the unresolved issue #414 stall. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
 
 and § Decision, part 2, states:
 

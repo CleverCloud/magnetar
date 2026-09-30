@@ -605,7 +605,7 @@ The policy is threaded through partitioned, multi-topics, and pattern consumers 
 
 `Auto { min, max_bytes }` recomputes the target from the observed [`FlowStats`](../crates/magnetar-proto/src/receiver_queue.rs) on each adjust tick:
 
-- **Grow** (bounded doubling) while the broker has drained every permit (`available_permits == 0`, the starvation signal) and the byte budget still has room.
+- **Grow** (bounded doubling) while received dispatch units have drained the client-accounted balance to zero (`available_permits == 0`, the starvation signal) and the byte budget still has room.
   A grown target emits an incremental `CommandFlow` so the broker is fed more.
 - **Shrink** (gentle halving toward `min`) when the buffered-queue bytes reach the byte budget (the OOM guard).
   Permits already granted cannot be un-granted, so the surplus drains naturally and the next refill asks for less.

@@ -1,4 +1,4 @@
-# ADR-0082 — Split the consumer permit mirror into a grant register and a real balance
+# ADR-0082 — Split the consumer permit mirror into a grant register and a decrementing balance
 
 - **Status**: Accepted (amended by [ADR-0101](0101-consumer-stall-detection-and-in-place-recovery.md), the `consumer_available_permits` accessor; amended by [ADR-0102](0102-grant-the-initial-consumer-flow-once-per-attach.md), the "two callers" clause — everything else below remains binding)
 - **Date**: 2026-07-17
@@ -14,6 +14,8 @@
 > The new `ConsumerState::initial_grant_due` supplies the part the additive mirror cannot answer.
 > The field's additive semantics, the split, `flow_stats`, and the `granted_permits == 0` churn-window guard in `adjust_receiver_queue` are all unchanged.
 
+> **Terminology clarification (2026-09-30).** `permit_balance` is computed in the client from local grants and received dispatch units. Its decrementing behavior makes it useful for flow policy and silence detection, but it is not a read of the broker's per-consumer admin statistic. The historical uses of “real” below contrast it with the additive grant register, not with broker-observed state.
+
 ## Context
 
 [Issue #349](https://github.com/CleverCloud/magnetar/issues/349) reports that the `Auto` receiver-queue policy (ADR-0071, PIP-74 `autoScaledReceiverQueueSizeEnabled` parity) never scales up under real load.
@@ -22,7 +24,7 @@
 It is purely additive: once a consumer's first flow lands, the field only grows (or gets forced to `0` at a session reset, a terminal subscribe failure, or a same-broker `CommandCloseConsumer`) for as long as the consumer runs.
 
 `ConsumerState::flow_stats` fed this same field into `FlowStats::available_permits`, the signal [`Auto::adjust`](../../crates/magnetar-proto/src/receiver_queue.rs) uses to detect starvation (`available_permits == 0`).
-Because the field never decremented under real dispatch, `available_permits == 0` was reachable only via the churn-reset paths, never via a broker legitimately exhausting its grant.
+Because the field never decremented under real dispatch, the client-side `available_permits == 0` signal was reachable only via churn-reset paths, never via dispatch consuming the locally recorded grant.
 `Auto` therefore never observed a genuine starvation signal and never grew past its floor — the headline symptom in #349, even though the policy's own doubling/OOM-guard/hysteresis logic (verified independently in `crates/magnetar-proto/src/receiver_queue.rs`'s unit tests) was correct.
 
 A second, related bug: the #307 failover-reflow gate and the same reset/close-consumer paths that zero the permit mirror are legitimate "no outstanding grant" states, not starvation — but with a single field, any future fix that made the field track real dispatch would make these churn windows indistinguishable from starvation, risking a growth (and a wasted `CommandFlow`) on every reset or same-broker bundle reassignment.
@@ -32,14 +34,14 @@ A second, related bug: the #307 failover-reflow gate and the same reset/close-co
 Split the one field into two, each with a single, unambiguous meaning.
 
 - **`ConsumerState::granted_permits: u32`** — the existing field, renamed, semantics UNCHANGED: a purely additive record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CloseConsumer`). It answers "how much have we told the broker it may use" — the #307 failover-reflow gate (`conn.rs`'s `ActiveConsumerChange` arm) and the `adjust_receiver_queue` want-have delta both need exactly that question answered, and keep reading this field.
-- **`ConsumerState::permit_balance: u32`** — new field, the REAL broker-side balance: `granted_permits` minus one unit per broker dispatch unit that has actually arrived. Incremented at the same three grant sites as `granted_permits`, by the identical delta. Decremented by exactly one (`saturating_sub`) per dispatch unit as it arrives:
+- **`ConsumerState::permit_balance: u32`** — new field, the client-accounted decrementing balance: `granted_permits` minus one unit per broker dispatch unit received. It estimates unspent permits locally; it does not read the broker's admin `availablePermits`. Incremented at the same three grant sites as `granted_permits`, by the identical delta. Decremented by exactly one (`saturating_sub`) per dispatch unit as it arrives:
   - once per delivered logical message in `classify_and_queue` — covers a plain message, each batch member, and the chunk-completing logical message, unconditionally across both the queued and dead-lettered branches (the broker already spent the permit dispatching the entry regardless of where the client routes it);
   - once per incomplete chunk buffered in `deliver` (the chunk never reaches `classify_and_queue` while reassembly is pending, but the broker already dispatched it);
   - once per PIP-33 marker in `record_marker_consumed`.
 
   Force-zeroed everywhere `granted_permits` is zeroed, so the two mirrors never drift apart at a churn boundary.
 
-- **`flow_stats` feeds `permit_balance`, not `granted_permits`, into `FlowStats::available_permits`.** The public contract documented on `FlowStats::available_permits` ("`0` is the starvation signal") is now literally true.
+- **`flow_stats` feeds `permit_balance`, not `granted_permits`, into `FlowStats::available_permits`.** A local zero now signals that received dispatch units consumed the locally recorded grant; it does not measure the broker's own permit counter.
 - **Churn-window guard**: `adjust_receiver_queue` returns `None` immediately when `granted_permits == 0`. A zero grant mirror only occurs right after a reset / terminal-failure / same-broker `CloseConsumer` zeroing — there is no outstanding grant for the broker to have dispatched against, so a zero `permit_balance` in that window reflects the churn, not load starvation. Without the guard, a tick landing in that window would misread it and grow (or emit a `CommandFlow` the broker would drop against a torn-down consumer id).
 - **`Auto::adjust` itself is unchanged.** The policy's doubling/OOM-guard/hysteresis math was already correct; only the signal it is fed was wrong.
 - **`Connection::consumer_available_permits()`** (and the façade's `Consumer::available_permits()` chain on both engines) is intentionally left reading `granted_permits` — unchanged behaviour. Extending Java-parity semantics (a genuinely decrementing counter matching `ConsumerBase#getAvailablePermits`) to this public accessor is a separate, unscoped change; this ADR's fix is confined to the `FlowStats::available_permits` signal `Auto::adjust` consumes.
