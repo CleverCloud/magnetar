@@ -14,6 +14,12 @@
 //! no readiness input, so every publish it routed to that partition failed
 //! `code=-1 "send timeout"` after the configured `send_timeout`, forever.
 //!
+//! Issue #463 extends the first test: after the unload, one at a time (an
+//! in-flight window of one), publishes must keep progressing within a single
+//! bounded deadline, and both children must be ready again afterward. The
+//! real broker's re-attach window is brief; the held-not-ready state and the
+//! skip itself are pinned deterministically by the facade regression.
+//!
 //! Two tests:
 //!
 //! 1. `e2e_producer_partition_unload_reattach` — the regression. 20 publishes across 2 partitions
@@ -153,27 +159,53 @@ async fn e2e_producer_partition_unload_reattach() -> Result<(), Box<dyn std::err
         )
         .await?;
 
-    // Round-robin keeps routing half of these to the detached child.
-    for i in 0..20 {
-        let payload = format!("post-unload-{i}").into_bytes();
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            producer.send(OutgoingMessage::with_payload(payload)),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "publish {i} WEDGED after unloading {topic}-partition-1: the detached child \
-                 producer was never re-attached (issue #451)"
-            )
-        });
-        result.unwrap_or_else(|err| {
-            panic!(
-                "publish {i} failed after unloading {topic}-partition-1: {err:?} — before \
-                 ADR-0106 this was `code=-1 send timeout`, forever (issue #451)"
-            )
-        });
+    // A sequential caller has W=1: a single send parked on the detached
+    // child blocks its whole window. Bound the ENTIRE post-unload workload,
+    // not just each send, so healthy progress cannot be hidden by repeated
+    // per-send timeouts.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for i in 0..20 {
+            let payload = format!("post-unload-{i}").into_bytes();
+            producer
+                .send(OutgoingMessage::with_payload(payload))
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("publish {i} failed after unloading {topic}-partition-1: {err:?}")
+                });
+        }
+    })
+    .await
+    .expect("bounded W=1 publish window stalled after partition unload (issues #451 and #463)");
+    assert!(
+        producer.is_connected(),
+        "partition unload did not drop the connection"
+    );
+
+    // A real unload may answer the first re-attach with ServiceNotReady;
+    // ADR-0080 then holds the child behind a bounded retry backoff. The 20
+    // publishes above can complete through the healthy child before that
+    // backoff expires. Require eventual re-entry instead of assuming it has
+    // already completed at the end of the fast publish loop.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !producer.not_ready_partitions().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("detached child did not become ready after bounded re-attach retry");
+
+    let recovered_before = producer.child_producers()[1].stats().total_msgs_sent;
+    for i in 0..4 {
+        producer
+            .send(OutgoingMessage::with_payload(
+                format!("after-reattach-{i}").into_bytes(),
+            ))
+            .await?;
     }
+    assert!(
+        producer.child_producers()[1].stats().total_msgs_sent > recovered_before,
+        "the recovered child must rejoin the round-robin rotation"
+    );
 
     producer.close().await?;
     drop(container);

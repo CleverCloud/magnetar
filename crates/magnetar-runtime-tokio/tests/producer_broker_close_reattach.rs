@@ -405,8 +405,8 @@ async fn send_recovers_when_first_reattach_is_rejected_service_not_ready() {
     .expect("connect did not time out")
     .expect("connect ok")
     .with_operation_retry(OperationRetryConfig {
-        initial_backoff: Duration::from_millis(20),
-        max_backoff: Duration::from_millis(50),
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(1),
         max_retries: Some(3),
     });
     let producer = tokio::time::timeout(
@@ -420,11 +420,25 @@ async fn send_recovers_when_first_reattach_is_rejected_service_not_ready() {
     .await
     .expect("open_producer did not time out")
     .expect("open_producer ok");
+    assert!(producer.is_ready(), "initial broker attachment is ready");
 
     tokio::time::timeout(HANG_GUARD, producer.send_bytes(&b"first"[..]))
         .await
         .expect("first send did not time out")
         .expect("first send ok");
+
+    // #463: the broker rejected the first re-attach but left the socket up.
+    // The per-producer readiness signal must show this partial outage before
+    // the retry leg recovers it. The bounded wait observes state, not elapsed
+    // time; the one-second retry backoff keeps the transition observable.
+    tokio::time::timeout(HANG_GUARD, async {
+        while producer.is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broker-close readiness transition was not observed");
+    assert!(producer.is_connected(), "the TCP connection remains up");
 
     tokio::time::timeout(HANG_GUARD, producer.send_bytes(&b"after-close"[..]))
         .await
@@ -433,6 +447,10 @@ async fn send_recovers_when_first_reattach_is_rejected_service_not_ready() {
              leg (issue #451)",
         )
         .expect("post-close send must resolve Ok once the retried re-attach is acked");
+    assert!(
+        producer.is_ready(),
+        "successful re-attach restores readiness"
+    );
 
     assert_eq!(
         *log.producer_opens.lock(),

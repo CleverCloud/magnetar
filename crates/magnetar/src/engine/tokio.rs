@@ -282,6 +282,10 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
         magnetar_runtime_tokio::Producer::is_connected(self)
     }
 
+    fn is_ready(&self) -> bool {
+        magnetar_runtime_tokio::Producer::is_ready(self)
+    }
+
     fn topic(&self) -> String {
         magnetar_runtime_tokio::Producer::topic(self)
     }

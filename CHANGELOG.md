@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
   Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
+- **A detached partition no longer parks a bounded keyless producer pipeline.** Round-robin sends now scan the ready child producers and route to one that can drain a send; recovered children rejoin the rotation. Non-empty keys retain their partition for ordering, as do explicit single-partition and custom routes. If every child is unavailable, sends still receive their configured timeout or terminal error. `PartitionedProducer::not_ready_partitions()` reports child indices observed unavailable during its scan; its readiness path reads an atomic broker-attachment hint without a connection or slot lock. The protocol send-drain gate remains authoritative if an attachment changes concurrently. (issue #463; [ADR-0110](specs/adr/0110-route-around-unready-partitioned-producer-children.md))
 
 ## [1.7.2] - 2026-09-21
 

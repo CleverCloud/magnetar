@@ -140,15 +140,6 @@ That reproduces the issue #451 symptom exactly — every publish resolves `code=
 **Why it stays open.** It is shared by every re-attach path — the ADR-0080 retry leg, the reconnect rebuilds, the issue #307 consumer re-subscribe and ADR-0106's producer re-attach — so it belongs to the request-deadline surface as a whole, not to any one of them.
 Java covers it with `operationTimeout` applied to every pending request; the equivalent here is a per-kind deadline on `pending_requests` plus the terminalization each kind already has.
 
-## 21. Optional partitioned-router readiness skip
-
-**Gap.** `PartitionedProducer::pick_partition` has no readiness input: round-robin keeps handing `1/N` of all publishes to a child whose broker-side producer is detached, and those publishes wait out the whole `send_timeout` before resolving.
-Issue #451's own expectation 5 asked for the router to skip such a child.
-
-**Why it stays open.** It is beyond Java parity — `PartitionedProducerImpl.internalSendWithTxnAsync` routes through `routerPolicy.choosePartition` with no connectivity check at all, and `isConnected()` is an `allMatch` over the children — and it needs a per-slot readiness accessor on `ProducerApi`, which today exposes only the connection-level `is_connected`.
-Skipping a partition also silently changes key-less ordering and per-partition distribution, which is a product decision.
-ADR-0106 removes the permanent case (the child re-attaches on its own), leaving only the bounded re-attach window this would optimise.
-
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.

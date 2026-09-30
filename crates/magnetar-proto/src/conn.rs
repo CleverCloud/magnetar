@@ -639,6 +639,15 @@ impl Connection {
             );
         }
         self.state = next;
+        // Routing reads an atomic hint instead of the connection and slot
+        // mutexes. A transport drop shuts every hint immediately; recovery
+        // restores only attachments the broker has acknowledged on this
+        // session. The protocol drain gate remains the send authority.
+        let connected = matches!(next, HandshakeState::Connected);
+        for slot in self.producers.values() {
+            let state = slot.state.lock();
+            slot.set_routing_ready(connected && state.broker_ready && !state.closed);
+        }
     }
 
     /// Returns whether the connection is ready to accept producer / consumer opens.
@@ -984,10 +993,10 @@ impl Connection {
         // because anything successfully replayed is gone from the map.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
-            let snap = self
-                .producers
-                .get(&handle)
-                .map(|slot| slot.state.lock().snapshot_pending_sends());
+            let snap = self.producers.get(&handle).map(|slot| {
+                slot.set_routing_ready(false);
+                slot.state.lock().snapshot_pending_sends()
+            });
             if let Some((replay_wakers, dropped, snapshots)) = snap {
                 for (seq, waker_opt) in replay_wakers {
                     // Prefer the producer-stored waker (registered via
@@ -1215,6 +1224,7 @@ impl Connection {
             let drained = self.producers.get(&handle).map(|slot| {
                 let mut slot_state = slot.state.lock();
                 slot_state.closed = true;
+                slot.set_routing_ready(false);
                 slot_state.drain_pending_sends()
             });
             let Some(drained) = drained else { continue };
@@ -1369,7 +1379,7 @@ impl Connection {
         let drained = self.producers.get(&handle).map(|slot| {
             let mut slot_state = slot.state.lock();
             slot_state.closed = true;
-            slot_state.broker_ready = false;
+            slot.set_broker_ready(&mut slot_state, false, false);
             slot_state.drain_pending_sends()
         });
         if let Some(drained) = drained {
@@ -2597,7 +2607,7 @@ impl Connection {
                         if let Some(snapshots) = snapshots {
                             producer.replay_snapshots(snapshots);
                         }
-                        producer.broker_ready = true;
+                        slot.set_broker_ready(&mut producer, true, self.is_connected());
                         producer.has_ever_attached = true;
                         // The re-attach succeeded — clear the transient-retry
                         // budget so a future bundle reshuffle starts its backoff
@@ -2944,22 +2954,14 @@ impl Connection {
                             // forever — and install a TERMINAL failure so the
                             // parked `send()` future surfaces `Err(PeerClosed)`
                             // instead of hanging.
-                            let attempts = {
-                                let mut slot_state =
-                                    self.producers.get(&handle).map(|slot| slot.state.lock());
-                                match slot_state.as_mut() {
-                                    Some(s) => {
-                                        s.broker_ready = false;
-                                        s.last_open_error = Some((err.error, err.message.clone()));
-                                        s.transient_open_attempts =
-                                            s.transient_open_attempts.saturating_add(1);
-                                        s.transient_open_attempts
-                                    }
-                                    // Producer already gone (closed between the
-                                    // broker error and here) — nothing to retry.
-                                    None => u32::MAX,
-                                }
-                            };
+                            let attempts = self.producers.get(&handle).map_or(u32::MAX, |slot| {
+                                let mut producer = slot.state.lock();
+                                slot.set_broker_ready(&mut producer, false, false);
+                                producer.last_open_error = Some((err.error, err.message.clone()));
+                                producer.transient_open_attempts =
+                                    producer.transient_open_attempts.saturating_add(1);
+                                producer.transient_open_attempts
+                            });
                             if self.operation_retry.should_retry_after_failure(attempts) {
                                 self.driver_retries.push_back(crate::DriverRetry::Producer {
                                     handle,
@@ -3349,7 +3351,7 @@ impl Connection {
                         // the queue — one per partition under bundle churn.
                         let open_in_flight = self.producers.get(&handle).is_some_and(|slot| {
                             let mut producer = slot.state.lock();
-                            producer.broker_ready = false;
+                            slot.set_broker_ready(&mut producer, false, false);
                             producer.open_request_id.is_some()
                         });
                         if open_in_flight {
@@ -6715,6 +6717,7 @@ impl Connection {
         let _ = self.encode_command(&base);
         if let Some(slot) = self.producers.get(&handle) {
             slot.state.lock().close();
+            slot.set_routing_ready(false);
         }
         let kind = if forget {
             PendingRequestKind::ProducerCloseForgotten { handle }
@@ -7805,7 +7808,7 @@ impl Connection {
             // The broker detached this producer id: shut the drain gate until the
             // re-attach is acked. Pulsar closes the WHOLE connection on a `CommandSend`
             // for a producer that is not ready.
-            producer.broker_ready = false;
+            slot.set_broker_ready(&mut producer, false, false);
         }
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ProducerClosedByBroker { handle: h, .. } if *h == handle),
@@ -17262,6 +17265,65 @@ mod conn_state_tests {
         ack_producer_success(conn, open_rid);
         while conn.poll_event().is_some() {}
         handle
+    }
+
+    /// #463: the per-slot gate exposed through both runtime producer handles
+    /// must distinguish a detached child from its still-live connection, then
+    /// reopen only when the broker acknowledges the new attachment.
+    #[test]
+    fn partition_child_gate_tracks_close_and_reattach_on_live_connection() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = reattach_attached_producer(
+            &mut conn,
+            "persistent://public/default/router-readiness-463",
+        );
+        assert!(conn.is_connected());
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(state.broker_ready);
+            assert!(
+                slot.is_routing_ready(),
+                "the routing read cannot take the held slot lock"
+            );
+        }
+
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("broker close");
+        assert!(conn.is_connected(), "only the child attachment closed");
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(!state.broker_ready);
+            assert!(
+                !slot.is_routing_ready(),
+                "a detached child cannot take a route"
+            );
+        }
+
+        ack_producer_success(&mut conn, reattach_rid);
+        assert!(conn.is_connected());
+        {
+            let slot = conn.producer(handle).expect("slot");
+            let state = slot.state.lock();
+            assert!(state.broker_ready);
+            assert!(
+                slot.is_routing_ready(),
+                "ProducerSuccess restores the route"
+            );
+        }
+
+        conn.mark_disconnected();
+        assert!(
+            !conn.producer(handle).expect("slot").is_routing_ready(),
+            "a connection loss invalidates even a previously attached child"
+        );
+        conn.reset();
+        assert!(!conn.producer(handle).expect("slot").is_routing_ready());
     }
 
     /// Every `CommandProducer` in `commands` naming `handle`, as

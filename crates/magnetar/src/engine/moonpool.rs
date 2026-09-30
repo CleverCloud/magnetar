@@ -631,6 +631,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
         magnetar_runtime_moonpool::Producer::is_connected(self)
     }
 
+    fn is_ready(&self) -> bool {
+        magnetar_runtime_moonpool::Producer::is_ready(self)
+    }
+
     fn topic(&self) -> String {
         magnetar_runtime_moonpool::Producer::topic(self)
     }

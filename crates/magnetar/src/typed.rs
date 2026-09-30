@@ -157,6 +157,14 @@ impl<S: Schema, P: crate::ProducerApi> TypedProducer<S, P> {
         crate::ProducerApi::is_connected(&self.inner)
     }
 
+    /// `true` while this producer's broker attachment can drain sends.
+    /// Unlike [`Self::is_connected`], this detects a detached producer on a
+    /// still-live connection.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        crate::ProducerApi::is_ready(&self.inner)
+    }
+
     /// `true` once [`Self::close`] has been called.
     #[must_use]
     pub fn is_closed(&self) -> bool {

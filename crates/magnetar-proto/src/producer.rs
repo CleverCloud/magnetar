@@ -29,6 +29,7 @@
 //! - `BatchMessageContainerImpl.java:267-327` (flush)
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
 
 use bytes::Bytes;
@@ -337,6 +338,10 @@ pub struct ProducerSlot {
     /// Mutex-guarded state-machine state. Hot path for queue / waker /
     /// outbound-staging operations.
     pub state: parking_lot::Mutex<ProducerState>,
+    /// Lock-free routing snapshot of the effective attachment gate. Connection
+    /// state transitions and every broker-ready transition maintain this mirror;
+    /// the actual send drain still checks `ProducerState::broker_ready`.
+    routing_ready: AtomicBool,
 }
 
 impl ProducerSlot {
@@ -345,8 +350,37 @@ impl ProducerSlot {
     pub fn new(identity: ProducerIdentity, state: ProducerState) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             identity,
+            routing_ready: AtomicBool::new(state.broker_ready && !state.closed),
             state: parking_lot::Mutex::new(state),
         })
+    }
+
+    /// Point-in-time routing hint. An attachment change racing a send may
+    /// still let that send enter the slot; the drain gate remains authoritative.
+    #[must_use]
+    pub fn is_routing_ready(&self) -> bool {
+        self.routing_ready.load(Ordering::Acquire)
+    }
+
+    /// Update the protocol drain gate and its routing mirror together while
+    /// the caller holds this slot's state guard.
+    pub(crate) fn set_broker_ready(
+        &self,
+        state: &mut ProducerState,
+        ready: bool,
+        connection_ready: bool,
+    ) {
+        state.broker_ready = ready;
+        self.routing_ready.store(
+            ready && connection_ready && !state.closed,
+            Ordering::Release,
+        );
+    }
+
+    /// Refresh effective readiness when the connection's handshake state
+    /// changes or when a producer is closed without changing its drain gate.
+    pub(crate) fn set_routing_ready(&self, ready: bool) {
+        self.routing_ready.store(ready, Ordering::Release);
     }
 
     /// Enqueue a send into this producer's state machine and stage the

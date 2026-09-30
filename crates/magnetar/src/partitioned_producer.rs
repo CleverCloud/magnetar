@@ -351,10 +351,7 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
         let key = msg.key.as_deref();
         match self.routing {
             MessageRoutingMode::SinglePartition(p) => (p as usize).min(n - 1),
-            MessageRoutingMode::RoundRobin => {
-                let prev = self.cursor.fetch_add(1, Ordering::Relaxed);
-                (prev as usize) % n
-            }
+            MessageRoutingMode::RoundRobin => self.pick_round_robin(),
             MessageRoutingMode::KeyHashOrRoundRobin => match key {
                 // Java parity: `HashingScheme.JavaStringHash` —
                 // `String.hashCode() & Integer.MAX_VALUE`, masked into a
@@ -366,12 +363,56 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
                 // for the regression. The `java_string_hash` helper is the
                 // same one wired into [`JavaStringHashHasher`].
                 Some(k) if !k.is_empty() => (java_string_hash(k) as usize) % n,
-                _ => {
-                    let prev = self.cursor.fetch_add(1, Ordering::Relaxed);
-                    (prev as usize) % n
-                }
+                _ => self.pick_round_robin(),
             },
         }
+    }
+
+    /// Walk at most one rotation from the next cursor ticket. A healthy child
+    /// keeps its fast path; an unavailable child is skipped without consuming
+    /// an in-flight send. If none is ready, retain the old round-robin choice
+    /// so the caller retains its existing send-timeout or terminal-error outcome.
+    fn pick_round_robin(&self) -> usize {
+        let n = self.partitions.len();
+        let ticket = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let start = (ticket as usize) % n;
+        for offset in 0..n {
+            let index = (start + offset) % n;
+            if crate::ProducerApi::is_ready(&self.partitions[index]) {
+                if offset != 0 {
+                    // In the uncontended case, advance past the skipped
+                    // children so the remaining ready children share the
+                    // rotation. A concurrent sender already holding the next
+                    // ticket wins; its routing decision is independent.
+                    let next = ticket.wrapping_add(1);
+                    let _ = self.cursor.compare_exchange(
+                        next,
+                        next.wrapping_add(offset as u64),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+                return index;
+            }
+        }
+        start
+    }
+
+    /// Partition indices whose child producer reports unready for routing.
+    /// This scans children sequentially, so concurrent state changes can make
+    /// the returned indices reflect different moments rather than one coherent
+    /// snapshot. It is suitable for a health check or alert. The in-tree
+    /// engines report broker attachment readiness, distinguishing a detached
+    /// child on an otherwise live connection from [`Self::is_connected`];
+    /// external [`crate::ProducerApi`] implementations use transport readiness
+    /// unless they override `is_ready()`.
+    #[must_use]
+    pub fn not_ready_partitions(&self) -> Vec<usize> {
+        self.partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, child)| (!crate::ProducerApi::is_ready(child)).then_some(index))
+            .collect()
     }
 
     /// Aggregate cumulative stats across all child producers (issue #347).
@@ -1075,7 +1116,226 @@ fn _bytes_in_use() -> Bytes {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
+
+    /// A child whose TCP connection remains up while its broker attachment is
+    /// shut. `send` never completes on that child, matching a staged publish
+    /// that can only resolve on the send-timeout sweep.
+    #[derive(Debug)]
+    struct ProbeProducer {
+        ready: Arc<AtomicBool>,
+        sent: Arc<AtomicUsize>,
+    }
+
+    impl crate::ProducerApi for ProbeProducer {
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _msg: OutgoingMessage,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<MessageId, Self::Error>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                if !self.ready.load(Ordering::Relaxed) {
+                    return std::future::pending().await;
+                }
+                self.sent.fetch_add(1, Ordering::Relaxed);
+                Ok(MessageId::EARLIEST)
+            })
+        }
+
+        fn flush(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+
+        fn topic(&self) -> String {
+            "probe".to_owned()
+        }
+
+        fn name(&self) -> String {
+            "probe".to_owned()
+        }
+
+        fn last_sequence_id(&self) -> i64 {
+            -1
+        }
+
+        fn get_schema(
+            &self,
+            _version: Option<Bytes>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<pb::Schema, Self::Error>> + Send + '_>,
+        > {
+            Box::pin(async { Err(std::io::Error::other("schema lookup is not used")) })
+        }
+
+        fn stats(&self) -> magnetar_proto::ProducerStats {
+            magnetar_proto::ProducerStats::default()
+        }
+
+        fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+            None
+        }
+
+        fn close_owned(
+            self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+            None
+        }
+
+        fn compression(&self) -> CompressionKind {
+            CompressionKind::None
+        }
+
+        fn last_sequence_id_published(&self) -> i64 {
+            -1
+        }
+
+        fn pending_count(&self) -> usize {
+            0
+        }
+
+        fn batch_len(&self) -> usize {
+            0
+        }
+
+        fn batch_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    fn probe_partitioned(
+        routing: MessageRoutingMode,
+        ready: &[Arc<AtomicBool>],
+        sent: &[Arc<AtomicUsize>],
+    ) -> PartitionedProducer<ProbeProducer> {
+        PartitionedProducer {
+            partitions: ready
+                .iter()
+                .zip(sent)
+                .map(|(ready, sent)| ProbeProducer {
+                    ready: ready.clone(),
+                    sent: sent.clone(),
+                })
+                .collect(),
+            base_topic: "probe".to_owned(),
+            routing,
+            router: None,
+            cursor: AtomicU64::new(0),
+            auto_update: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_window_keeps_publishing_when_one_child_is_not_ready() {
+        let ready = [
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let sent = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let producer = probe_partitioned(MessageRoutingMode::RoundRobin, &ready, &sent);
+        producer.cursor.store(1, Ordering::Relaxed);
+
+        // W=1 is the smallest bounded in-flight window. The first cursor
+        // ticket names the unavailable child, whose send never resolves.
+        // Healthy traffic must still complete without waiting for that
+        // child's send_timeout.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..12 {
+                producer
+                    .send(OutgoingMessage::with_payload(b"healthy".to_vec()))
+                    .await
+                    .expect("a ready partition must take each unkeyed send");
+            }
+        })
+        .await
+        .expect("bounded window parked on the unavailable child");
+        assert_eq!(sent[0].load(Ordering::Relaxed), 12);
+        assert_eq!(sent[1].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn keyed_routing_keeps_affinity_and_all_unready_falls_back() {
+        let ready = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let sent = [
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ];
+        let producer = probe_partitioned(MessageRoutingMode::KeyHashOrRoundRobin, &ready, &sent);
+        assert!(producer.is_connected(), "the mock transport remains live");
+        assert_eq!(producer.not_ready_partitions(), vec![0, 1, 2]);
+        let keyed = OutgoingMessage::default().key("order-42");
+        let affinity = (java_string_hash("order-42") as usize) % ready.len();
+        for _ in 0..6 {
+            assert_eq!(producer.pick_partition(&keyed), affinity);
+        }
+        let explicit = probe_partitioned(
+            MessageRoutingMode::SinglePartition(affinity as u32),
+            &ready,
+            &sent,
+        );
+        assert_eq!(
+            explicit.pick_partition(&OutgoingMessage::default()),
+            affinity
+        );
+        let mut custom = probe_partitioned(MessageRoutingMode::RoundRobin, &ready, &sent);
+        custom.router = Some(Arc::new(ConstantRouter(affinity)));
+        assert_eq!(custom.pick_partition(&OutgoingMessage::default()), affinity);
+        let unkeyed = OutgoingMessage::default();
+        assert_eq!(producer.pick_partition(&unkeyed), 0);
+        assert_eq!(producer.pick_partition(&unkeyed), 1);
+        assert_eq!(producer.pick_partition(&unkeyed), 2);
+
+        let healthy = (affinity + 1) % ready.len();
+        ready[healthy].store(true, Ordering::Relaxed);
+        assert_eq!(
+            producer.not_ready_partitions(),
+            (0..ready.len())
+                .filter(|&index| index != healthy)
+                .collect::<Vec<_>>()
+        );
+        for _ in 0..6 {
+            assert_eq!(producer.pick_partition(&unkeyed), healthy);
+            assert_eq!(producer.pick_partition(&keyed), affinity);
+        }
+        ready[affinity].store(true, Ordering::Relaxed);
+        let chosen: std::collections::HashSet<_> = (0..ready.len() * 2)
+            .map(|_| producer.pick_partition(&unkeyed))
+            .collect();
+        assert!(chosen.contains(&healthy));
+        assert!(
+            chosen.contains(&affinity),
+            "recovered child rejoins the rotation"
+        );
+    }
 
     #[test]
     fn key_hash_is_deterministic_and_round_robin_advances() {
