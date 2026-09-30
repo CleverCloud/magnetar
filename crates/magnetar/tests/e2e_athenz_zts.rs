@@ -33,7 +33,7 @@
 //!   cached token) end-to-end against a real `reqwest` client + real HTTP server, with
 //!   deterministic responses.
 //! - **Docker reachability probe** (`e2e_athenz_zts_image_pulls_and_serves_status`) spins the real
-//!   `athenz/athenz-zts-server:1.12.41` image to prove the upstream image is pullable and the
+//!   `athenz/athenz-zts-server:1.12.47` image to prove the upstream image is pullable and the
 //!   wiring (testcontainers, port mapping) is correct. It does **not** complete a token exchange
 //!   because the standalone container has no ZMS to talk to and surfaces a startup error on the
 //!   `/zts/v1/status` probe — the test treats either successful status (host has a co-deployed ZMS)
@@ -74,7 +74,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// rather than `latest` so test reproducibility survives upstream tag
 /// retags. Override via env for internal CI mirrors.
 const DEFAULT_ZTS_IMAGE_REPO: &str = "athenz/athenz-zts-server";
-const DEFAULT_ZTS_IMAGE_TAG: &str = "1.12.41";
+const DEFAULT_ZTS_IMAGE_TAG: &str = "1.12.47";
 const ZTS_TLS_PORT: u16 = 8443;
 
 /// PKCS#8 v1 RSA-2048 test key. Generated offline by piping `openssl

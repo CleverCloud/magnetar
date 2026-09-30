@@ -9,11 +9,11 @@ description = "cargo-fuzz harnesses for magnetar-proto (decode_one, encode_round
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys  = "0.4"
-arbitrary      = { version = "1", features = ["derive"] }
-bytes          = "1"
+libfuzzer-sys  = "^0.4.13"
+arbitrary      = { version = "^1.4.2", features = ["derive"] }
+bytes          = "^1.12.1"
 magnetar-proto = { path = ".." }
-prost          = "0.13"
+prost          = "^0.14.4"
 
 [[bin]]
 name = "decode_one"

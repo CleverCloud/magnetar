@@ -36,7 +36,7 @@ env:
 jobs:
   e2e-replicated-subs:
     name: PIP-33 two-cluster e2e
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

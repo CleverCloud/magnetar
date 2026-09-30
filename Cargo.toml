@@ -78,7 +78,7 @@ rustls               = { version = "^0.23.45", default-features = false, feature
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
 rustls-pki-types     = { version = "^1.15.1", features = ["std"] }
 rustls-native-certs  = "^0.8.4"
-tokio-rustls         = { version = "^0.26.5", default-features = false }
+tokio-rustls         = { version = "^0.26.6", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
@@ -157,11 +157,11 @@ http    = "^1.5.0"
 clap    = { version = "^4.6.7", features = ["derive", "env"] }
 
 # Telemetry + errors
-opentelemetry      = { version = "^0.32.0", default-features = false, features = ["trace"] }
-opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features = ["trace"] }
+opentelemetry      = { version = "^0.33.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk  = { version = "^0.33.0", default-features = false, features = ["trace"] }
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
-thiserror          = "^2.0.20"
+thiserror          = "^2.0.21"
 anyhow             = "^1.0.104"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 
