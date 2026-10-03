@@ -300,6 +300,10 @@ TLS, effective batch formation, grouped ACKs, concurrent traffic, pure/SimProvid
 Doctests remain functional compilation/execution evidence with unmeasured performance.
 
 The inspected image must carry matching Dockerfile SHA-256 and frozen base digest build labels; stale or unlabeled images are refused and the raw inspection is retained.
+The image pins Debian Go 1.19.8 (`golang-go` 2:1.19~1 and `golang-1.19-go` 1.19.8-2) and checks both installed package versions alongside the collectors.
+Go is required by the existing all-features FIPS build; aws-lc-fips-sys 0.14.2 requires at least 1.17.13.
+An unsuccessful suite build or catalogue command persists the original command diagnostic and child exit code as `functional-failure`, with stage `build/inventory` and null metrics.
+The fixture observer still verifies its ready/end barriers after that failure but credits no test or fixture-use coverage; a successful launch without a suite report remains invalid.
 The final `campaign-artifacts.json` is generated after container exit and includes the inner `artifacts.json`, environment, raw image inspection, launch container and exit status; hashes can be checked with `verify_artifact_manifest`.
 Each collection writes a structured `.collection.json`; child failures are `functional-failure`, profiler/format failures are `invalid-collection`, and campaign failures persist `campaign-failure.json` with null metrics.
 An identical ELF is explicitly `calibration-identical-elf` and has no product effect verdict, even when ranges are disjoint; the report separately summarizes base/base observations.

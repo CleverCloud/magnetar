@@ -10,6 +10,8 @@ RUN apt-get update -qq \
        libclang-dev=1:14.0-55.7~deb12u1 \
        libkrb5-dev=1.20.1-2+deb12u5 \
        cmake=3.25.1-1 \
+       golang-go=2:1.19~1 \
+       golang-1.19-go=1.19.8-2 \
        time=1.9-0.2 \
        strace=6.1-0.1 \
        heaptrack=1.4.0-2 \

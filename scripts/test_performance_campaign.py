@@ -20,6 +20,48 @@ SPEC.loader.exec_module(CAMPAIGN)
 
 
 class CampaignContracts(unittest.TestCase):
+    def test_suite_compilation_failure_keeps_original_machine_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"; output.mkdir()
+            environment = root / "environment.json"
+            CAMPAIGN.save(environment, {"axis": "workspace-all-features", "seed": 17})
+            arguments = ["performance_campaign.py", "--base", str(root / "base"), "--candidate", str(root / "candidate"),
+                         "--expected-base-sha", "a" * 40, "--expected-candidate-sha", "b" * 40,
+                         "--output", str(output), "--environment", str(environment), "--suite"]
+            failure = CAMPAIGN.perf.CommandFailure(101, "controlled compiler command failed; raw stderr retained")
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(CAMPAIGN, "suite_environment", return_value={}), \
+                    mock.patch.object(CAMPAIGN.perf, "compare_checkouts", side_effect=failure):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    CAMPAIGN.main()
+            result = json.loads((output / "campaign-failure.json").read_text())
+            self.assertEqual(result["state"], "functional-failure")
+            self.assertEqual(result["child_exit_code"], 101)
+            self.assertEqual(result["stage"], "build/inventory")
+            self.assertEqual(result["reason"], str(failure))
+            self.assertIsNone(result["metrics"])
+            self.assertEqual(CAMPAIGN.suite_observer_report(output, 2), result)
+            with self.assertRaises(ValueError):
+                CAMPAIGN.suite_observer_report(output, 0)
+
+    def test_failed_build_observer_proves_barriers_without_crediting_fixture_use(self):
+        markers = {phase: {"id": char * 64, "image_id": "sha256:" + "c" * 64, "label": phase}
+                   for phase, char in (("ready", "a"), ("end", "b"))}
+        events = [{"Type": "container", "Action": "create", "timeNano": epoch,
+                   "Actor": {"ID": markers[phase]["id"], "Attributes": {"magnetar.performance.observer": phase,
+                             "image": markers[phase]["image_id"]}}}
+                  for phase, epoch in (("ready", 10), ("end", 20))]
+        failure = {"state": "functional-failure", "stage": "build/inventory", "metrics": None, "child_exit_code": 101}
+        images = {"broker:fixed": {"image_id": "sha256:" + "d" * 64, "reference": "broker@sha256:" + "e" * 64}}
+        proof = CAMPAIGN.check_fixture_events(events, images, failure, markers)
+        self.assertEqual(proof["observed"], [])
+        self.assertEqual(proof["observations"], [])
+        self.assertEqual(proof["state"], "functional-failure")
+        for changed in ([], events[:1], events + [{"Type": "container", "Action": "create", "timeNano": 15,
+                "Actor": {"ID": "f" * 64, "Attributes": {"image": "broker:fixed"}}}]):
+            with self.subTest(events=changed), self.assertRaises(ValueError):
+                CAMPAIGN.check_fixture_events(changed, images, failure, markers)
+
     def test_container_identity_keeps_host_ownership_and_only_socket_group(self):
         socket_stat = os.stat_result((stat.S_IFSOCK | 0o660, 0, 0, 1, 0, 964, 0, 0, 0, 0))
         with mock.patch.object(os, "getuid", return_value=1001), mock.patch.object(os, "getgid", return_value=1002), mock.patch.object(Path, "stat", return_value=socket_stat):

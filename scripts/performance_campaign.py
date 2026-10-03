@@ -35,7 +35,8 @@ UNITS = {"native_run_ns": "ns/client-run-window", "elapsed_ns": "ns/launcher-pro
          "malloc_family_calls": "calls/glibc-malloc-family", "heap_peak_bytes": "B/glibc-malloc-family-peak",
          "intercepted_copy_bytes": "B/intercepted-library-copies", "intercepted_copy_calls": "calls/intercepted-library-copies"}
 PACKAGES = {"strace": "6.1-0.1", "valgrind": "1:3.19.0-1", "heaptrack": "1.4.0-2",
-            "libc6": "2.36-9+deb12u14", "time": "1.9-0.2", "clang": "1:14.0-55.7~deb12u1"}
+            "libc6": "2.36-9+deb12u14", "time": "1.9-0.2", "clang": "1:14.0-55.7~deb12u1",
+            "golang-go": "2:1.19~1", "golang-1.19-go": "1.19.8-2"}
 GAPS = ["doctest performance (functional compilation/execution only)", "effective multi-message batch formation",
         "TLS", "grouped ACKs", "concurrent traffic", "pure/SimProviders isolated scenarios",
         "explicit feature/fault isolated scenarios", "quiescent RSS/retention after drain",
@@ -52,11 +53,12 @@ def save(path, data):
 
 
 class CollectionFailure(ValueError):
-    def __init__(self, state, reason, collector_exit_code=None, child_exit_code=None):
+    def __init__(self, state, reason, collector_exit_code=None, child_exit_code=None, stage=None):
         super().__init__(reason)
         self.state = state
         self.collector_exit_code = collector_exit_code
         self.child_exit_code = child_exit_code
+        self.stage = stage
 
 
 def write_artifact_manifest(output, name="artifacts.json", required=()):
@@ -585,7 +587,10 @@ def internal_suite(args):
     environment = suite_environment(launch, output)
     # Native suite processes inherit a fixed seed; both reference builds finish first.
     os.environ["MOONPOOL_SEED"] = str(launch["seed"])
-    status = perf.compare_checkouts(args, environment)
+    try:
+        status = perf.compare_checkouts(args, environment)
+    except perf.CommandFailure as error:
+        raise CollectionFailure("functional-failure", str(error), child_exit_code=error.status, stage="build/inventory") from error
     report = json.loads((output / "report.json").read_text())
     report.update(environment=launch, uncovered=GAPS,
                   performance_policy="informative costs; functional/invalid collection failures exit nonzero")
@@ -763,7 +768,7 @@ def launch_container(args):
             if event_process.returncode not in (0, -15, 143) or (output / "fixture-events.stderr").read_text().strip():
                 raise ValueError("fixture event observer failed or reported diagnostics")
             events = [json.loads(line) for line in (output / "fixture-events.jsonl").read_text().splitlines()]
-            report = json.loads((output / "report.json").read_text())
+            report = suite_observer_report(output, status)
             save(output / "fixture-events-observed.json", check_fixture_events(events, fixture_images, report, markers))
             save(output / "fixture-images-after.json", verify_fixture_images(fixture_images, output))
         if pip33:
@@ -849,6 +854,11 @@ def check_fixture_events(events, images, report=None, markers=None):
             observed.append({"container_id": actor["ID"], "reference": reference, "image_id": references[reference], "created_epoch_ns": event["timeNano"]})
     if set(captured) != {"ready", "end"} or captured["ready"] >= captured["end"] or len({row["container_id"] for row in observed}) != len(observed):
         raise ValueError("fixture event collection is empty, truncated or duplicated")
+    if report.get("stage") == "build/inventory":
+        if report.get("state") != "functional-failure" or report.get("metrics") is not None or not isinstance(report.get("child_exit_code"), int) or report["child_exit_code"] == 0 or observed:
+            raise ValueError("failed build cannot credit observed fixtures or successful collection")
+        return {"markers": markers, "captured_epoch_ns": captured, "observed": [], "observations": [],
+                "state": report["state"], "scope": "build/inventory aborted before observations; no fixture-use coverage"}
     proofs = []
     claimed = set()
     for side in ("base", "candidate"):
@@ -881,6 +891,18 @@ def check_fixture_events(events, images, report=None, markers=None):
         raise ValueError("fixture create is outside all attributed valid observations")
     return {"markers": markers, "captured_epoch_ns": captured, "observed": observed, "observations": proofs,
             "scope": "per-observation positive fixture use; instance-count completeness is not claimed"}
+
+
+def suite_observer_report(output, status):
+    report = output / "report.json"
+    if report.is_file():
+        return json.loads(report.read_text())
+    failure = output / "campaign-failure.json"
+    if status != 0 and failure.is_file():
+        result = json.loads(failure.read_text())
+        if result.get("stage") == "build/inventory" and result.get("state") == "functional-failure" and isinstance(result.get("child_exit_code"), int) and result["child_exit_code"] != 0 and result.get("metrics") is None:
+            return result
+    raise ValueError("suite lacks a report or a verified failed build diagnostic")
 
 
 def run_functional_contract(command, cwd, stdout, stderr):
@@ -1530,7 +1552,7 @@ def main():
         output = args.output.resolve()
         if output.is_dir() and not any(output.is_relative_to(checkout) for checkout in (args.base, args.candidate)):
             save(output / "campaign-failure.json", {"state": getattr(error, "state", "invalid-collection"),
-                 "report_state": "partial", "reason": str(error), "metrics": None,
+                 "report_state": "partial", "stage": getattr(error, "stage", None), "reason": str(error), "metrics": None,
                  "collector_exit_code": getattr(error, "collector_exit_code", None),
                  "child_exit_code": getattr(error, "child_exit_code", None), "uncovered": GAPS})
             write_artifact_manifest(output)
