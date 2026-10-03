@@ -77,6 +77,9 @@ Each reference uses a separate campaign-owned Cargo target directory and execute
 This preserves both absolute `CARGO_BIN_EXE_*` paths and companions resolved relative to `current_exe()`.
 The scalable-topic suite explicitly builds its cross-package `magnetarctl` companion before timing.
 Other companions are discovered from compiler env-dep records and matched to Cargo's non-test executable artifacts; an unresolved child is invalid.
+When `cargo test` emits a profile-root companion without an adjacent `.d`, the driver requires exactly one byte-identical executable under Cargo's `deps` directory and retains that executable's dep-info.
+The compiler rule must name the associated executable; missing or ambiguous matches, a foreign rule or a path outside the reference-owned target directory are invalid.
+The resolution mode, original dep-info path and compiler executable digest remain in the execution closure.
 The execution closure records every harness/companion's SHA-256, ELF build ID, raw compiler env-dep/dep-info and compiled sources.
 Copies preserve the Cargo-relative layout under `execution/` for immutable raw artifacts; actual execution paths remain in the reference-owned target directory.
 Executable, retained-copy, dep-info and compiled-source digests are checked before and after measurements.
@@ -304,6 +307,7 @@ The image pins Debian Go 1.19.8 (`golang-go` 2:1.19~1 and `golang-1.19-go` 1.19.
 Go is required by the existing all-features FIPS build; aws-lc-fips-sys 0.14.2 requires at least 1.17.13.
 An unsuccessful suite build or catalogue command persists the original command diagnostic and child exit code as `functional-failure`, with stage `build/inventory` and null metrics.
 The fixture observer still verifies its ready/end barriers after that failure but credits no test or fixture-use coverage; a successful launch without a suite report remains invalid.
+An internal invalid collection without a report remains fatal and preserves its original structured reason, status and stage through the outer launcher; it cannot provide executed or fixture-use coverage.
 The final `campaign-artifacts.json` is generated after container exit and includes the inner `artifacts.json`, environment, raw image inspection, launch container and exit status; hashes can be checked with `verify_artifact_manifest`.
 Each collection writes a structured `.collection.json`; child failures are `functional-failure`, profiler/format failures are `invalid-collection`, and campaign failures persist `campaign-failure.json` with null metrics.
 An identical ELF is explicitly `calibration-identical-elf` and has no product effect verdict, even when ranges are disjoint; the report separately summarizes base/base observations.

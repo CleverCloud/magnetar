@@ -45,6 +45,43 @@ def record_mock_runtime(command, cwd, env):
 
 
 class MeasurementContracts(unittest.TestCase):
+    def test_companion_dep_info_requires_one_identical_compiler_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"; checkout.mkdir()
+            (checkout / "src").mkdir()
+            (checkout / "Cargo.toml").write_text('[package]\nname="witness"\nversion="0.1.0"\n')
+            (checkout / "src/main.rs").write_text("fn main() {}\n")
+            target = root / "target"; deps = target / "release/deps"; deps.mkdir(parents=True)
+            binary = target / "release/probe-child"; binary.write_bytes(b"child ELF"); binary.chmod(0o755)
+            matched = deps / "probe_child-one"; matched.write_bytes(binary.read_bytes()); matched.chmod(0o755)
+            dep_info = matched.with_suffix(".d")
+            dep_info.write_text(str(matched) + ": src/main.rs\n")
+            output = root / "output"; output.mkdir()
+            with mock.patch.object(PERF, "read_command", return_value="Build ID: 012345"):
+                artifact = PERF.retain_execution_artifact(binary, "src/main.rs", checkout, target, output, "companion")
+            self.assertEqual(artifact["compiler_dep_info_resolution"]["mode"], "matched-deps-executable")
+            self.assertEqual(artifact["compiler_dep_info_resolution"]["compiler_executable"], str(matched))
+            self.assertEqual(Path(artifact["compiler_dep_info"]).read_bytes(), dep_info.read_bytes())
+            self.assertEqual(artifact["compiler_sources"], {"src/main.rs": PERF.digest(checkout / "src/main.rs")})
+            PERF.check_execution_closure({"execution_closure": [artifact]}, checkout)
+            for case in ("different-bytes", "ambiguous", "missing-dep-info", "wrong-target", "adjacent-wrong-target"):
+                with self.subTest(case=case):
+                    matched.write_bytes(binary.read_bytes())
+                    dep_info.write_text(str(matched) + ": src/main.rs\n")
+                    other = deps / "probe_child-two"
+                    if case == "different-bytes": matched.write_bytes(b"foreign ELF")
+                    if case == "ambiguous":
+                        other.write_bytes(binary.read_bytes()); other.chmod(0o755)
+                        other.with_suffix(".d").write_text(str(other) + ": src/main.rs\n")
+                    if case == "missing-dep-info": dep_info.unlink()
+                    if case == "wrong-target": dep_info.write_text(str(deps / "foreign") + ": src/main.rs\n")
+                    if case == "adjacent-wrong-target": binary.with_suffix(".d").write_text(str(deps / "foreign") + ": src/main.rs\n")
+                    with self.assertRaises(ValueError):
+                        PERF.retain_execution_artifact(binary, "src/main.rs", checkout, target, output, "companion")
+                    for path in (other, other.with_suffix(".d"), binary.with_suffix(".d")):
+                        path.unlink(missing_ok=True)
+
     def test_runtime_context_is_applied_and_mutation_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -654,7 +691,7 @@ class MeasurementContracts(unittest.TestCase):
                     binary = Path(env["CARGO_TARGET_DIR"]) / target["name"]
                     binary.parent.mkdir(exist_ok=True)
                     binary.write_text("ELF witness")
-                    binary.with_suffix('.d').write_text('suite: ' + target['src_path'] + '\n')
+                    binary.with_suffix('.d').write_text(str(binary) + ': ' + target['src_path'] + '\n')
                     artifacts.append({"reason": "compiler-artifact", "package_id": "selected-id", "profile": {"test": True}, "target": target, "executable": str(binary)})
                 Path(stdout).write_text('\n'.join(json.dumps(a) for a in artifacts))
                 Path(stderr).write_text("")

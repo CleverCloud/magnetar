@@ -651,6 +651,34 @@ def reconcile_reports(plans, reports):
             "reason": "union and functional work reconciled; unmeasured metric/dimension gaps remain"}
 
 
+def execution_dep_info(binary, checkout, target_directory):
+    compiler_binary = binary
+    dep_info = binary.with_suffix(".d")
+    mode = "adjacent"
+    if not dep_info.is_file():
+        # `cargo test` installs CARGO_BIN_EXE binaries at the profile root,
+        # but retains rustc's executable and dep-info under deps/<crate>-<hash>.
+        matches = [path.resolve() for path in (binary.parent / "deps").glob(binary.name.replace("-", "_") + "-*")
+                   if path.is_file() and os.access(path, os.X_OK) and digest(path) == digest(binary)]
+        if len(matches) != 1:
+            raise ValueError("compiler dep-info requires exactly one byte-identical Cargo executable: " + str(binary))
+        compiler_binary = matches[0]
+        dep_info = compiler_binary.with_suffix(".d")
+        mode = "matched-deps-executable"
+    if not compiler_binary.is_relative_to(target_directory) or not dep_info.resolve().is_relative_to(target_directory) or not dep_info.is_file():
+        raise ValueError("compiler dep-info is missing or escapes the reference-specific target directory")
+    targets = []
+    for line in dep_info.read_text().replace("\\\n", " ").splitlines():
+        if line and not line.startswith("#") and ": " in line:
+            for name in shlex.split(line.split(": ", 1)[0]):
+                path = Path(name)
+                targets.append((path if path.is_absolute() else checkout / path).resolve())
+    if compiler_binary not in targets:
+        raise ValueError("compiler dep-info does not name its associated executable")
+    return dep_info, {"mode": mode, "origin": str(dep_info), "compiler_executable": str(compiler_binary),
+                      "compiler_executable_sha256": digest(compiler_binary)}
+
+
 def retain_execution_artifact(binary, source, checkout, target_directory, output, role):
     binary = Path(binary).resolve()
     if not binary.is_relative_to(target_directory):
@@ -660,7 +688,7 @@ def retain_execution_artifact(binary, source, checkout, target_directory, output
     retained.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(binary, retained)
     retained.chmod(0o755)
-    dep_info = binary.with_suffix(".d")
+    dep_info, resolution = execution_dep_info(binary, checkout, target_directory)
     retained_dep_info = retained.with_suffix(".d")
     retained_dep_info.write_bytes(dep_info.read_bytes())
     notes = read_command(["readelf", "-n", str(binary)], checkout)
@@ -673,6 +701,7 @@ def retain_execution_artifact(binary, source, checkout, target_directory, output
     return {"role": role, "build_id": build_id.group(1), "elf_notes": str(notes_path), "elf_notes_sha256": digest(notes_path),
             "compiler_environment": compiler_environment, "source": source, "binary": str(binary), "binary_sha256": digest(binary),
             "retained_binary": str(retained), "compiler_dep_info": str(retained_dep_info),
+            "compiler_dep_info_resolution": resolution,
             "compiler_dep_info_sha256": digest(retained_dep_info),
             **scenario_identity(checkout, source, [], retained_dep_info)}
 

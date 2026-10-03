@@ -20,6 +20,35 @@ SPEC.loader.exec_module(CAMPAIGN)
 
 
 class CampaignContracts(unittest.TestCase):
+    def test_inner_invalid_collection_keeps_its_original_machine_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); output = root / "output"; output.mkdir()
+            original = {"state": "invalid-collection", "report_state": "partial", "stage": None,
+                        "reason": "compiler input association failed before test execution", "metrics": None,
+                        "collector_exit_code": None, "child_exit_code": None}
+            CAMPAIGN.save(output / "campaign-failure.json", original)
+            with self.assertRaises(CAMPAIGN.CollectionFailure) as raised:
+                CAMPAIGN.suite_observer_report(output, 2)
+            self.assertEqual(raised.exception.state, original["state"])
+            self.assertEqual(str(raised.exception), original["reason"])
+            self.assertEqual(raised.exception.stage, original["stage"])
+            arguments = ["performance_campaign.py", "--base", str(root / "base"), "--candidate", str(root / "candidate"),
+                         "--expected-base-sha", "a" * 40, "--expected-candidate-sha", "b" * 40,
+                         "--output", str(output), "--suite", "--launch", "--image-id", "sha256:" + "c" * 64,
+                         "--cargo-cache", str(root / "cargo")]
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(CAMPAIGN, "launch_container",
+                    side_effect=lambda args: CAMPAIGN.suite_observer_report(args.output, 2)):
+                with self.assertRaises(CAMPAIGN.CollectionFailure): CAMPAIGN.main()
+            self.assertEqual(json.loads((output / "campaign-failure.json").read_text()), dict(original, uncovered=CAMPAIGN.GAPS))
+            for changed in (dict(original, reason=""), dict(original, report_state="complete"),
+                            {key: value for key, value in original.items() if key != "metrics"}):
+                CAMPAIGN.save(output / "campaign-failure.json", changed)
+                with self.assertRaises(ValueError) as invalid: CAMPAIGN.suite_observer_report(output, 2)
+                self.assertNotIsInstance(invalid.exception, CAMPAIGN.CollectionFailure)
+            CAMPAIGN.save(output / "campaign-failure.json", original)
+            with self.assertRaises(ValueError) as invalid: CAMPAIGN.suite_observer_report(output, 0)
+            self.assertNotIsInstance(invalid.exception, CAMPAIGN.CollectionFailure)
+
     def test_suite_compilation_failure_keeps_original_machine_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -900,6 +900,11 @@ def suite_observer_report(output, status):
     failure = output / "campaign-failure.json"
     if status != 0 and failure.is_file():
         result = json.loads(failure.read_text())
+        if result.get("state") == "invalid-collection" and result.get("report_state") == "partial" and "metrics" in result and result["metrics"] is None and isinstance(result.get("reason"), str) and result["reason"]:
+            # Preserve the verified inner failure. It remains fatal and cannot
+            # supply observation or fixture coverage to the reconciliation.
+            raise CollectionFailure("invalid-collection", result["reason"], result.get("collector_exit_code"),
+                                    result.get("child_exit_code"), stage=result.get("stage"))
         if result.get("stage") == "build/inventory" and result.get("state") == "functional-failure" and isinstance(result.get("child_exit_code"), int) and result["child_exit_code"] != 0 and result.get("metrics") is None:
             return result
     raise ValueError("suite lacks a report or a verified failed build diagnostic")
