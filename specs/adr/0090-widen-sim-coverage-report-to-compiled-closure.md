@@ -53,8 +53,8 @@ Replaying real history through the widened gate on 2026-07-31:
 | `--base HEAD~25` (merged since release 1.2.0) | 450 lines across 15 files, plus 20 files on the advisory `not gated` path — dominated by `magnetar-runtime-tokio/src/client.rs` (191), `.../src/consumer.rs` (61) and `magnetar-proto/src/conn.rs` (142) |
 
 **Why a backlog exists at all.**
-The gate has effectively never run per-PR.
-[`.github/workflows/xtask-gates.yml`](../../.github/workflows/xtask-gates.yml) runs it only on a schedule against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the diff empty and the check short-circuits with "nothing to verify".
+Before ADR-0092, the gate had effectively never run per-PR.
+At that time [`.github/workflows/xtask-gates.yml`](../../.github/workflows/xtask-gates.yml) ran it only on a schedule against `main`, where `merge-base(origin/main, HEAD) == HEAD` makes the diff empty and the check short-circuits with "nothing to verify".
 The proof that this is the cause, and not the widening, is `magnetar-runtime-moonpool` itself: gated since ADR-0024, inside the old 16-record report the whole time, and still carrying 43 uncovered added lines over `HEAD~25`.
 
 **Why the 450 is never charged to a future changeset.**

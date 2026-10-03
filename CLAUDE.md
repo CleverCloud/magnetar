@@ -150,10 +150,9 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
-# deterministic-simulation suite. Local-only per ADR-0036 (fixed seeds
-# in per-PR CI were wasted compute since each (commit, seed) pair is
-# bit-for-bit reproducible). CI runs a 128-random-seed sweep daily in
-# `.github/workflows/moonpool-seed-sweep.yml`.
+# deterministic-simulation suite. performance.yml also replays fixed
+# seeds 1..32 plus open registry anchors on every PR, without buggify.
+# The daily 128-random-seed workflow remains additive discovery.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --no-default-features --features crypto-aws-lc-rs \
@@ -184,8 +183,10 @@ Locally that is **two** steps, not one: `docker compose -f docker-compose.replic
 
 The auto-format hook handles `cargo fmt` / `gofmt` / `ruff format` on edited files; lints and tests stay manual.
 
-Two of the three heavy / diff-shaped xtask gates (`check-runtime-test-parity`, `check-crypto-matrix`) are local-first but also run in CI via the scheduled [`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml) (daily cron + `workflow_dispatch`), which keeps per-PR [`ci.yml`](.github/workflows/ci.yml) fast.
-`check-sim-coverage` runs in both places: [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) added a per-PR `check-sim-coverage` job to `ci.yml`, and the scheduled copy stays for dispatching against a branch with no PR open.
+`check-runtime-test-parity` and `check-crypto-matrix` run locally and on every pull request in [`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml), which also retains daily cron and `workflow_dispatch`.
+The crypto gate checks 16 isolated build cells; it does not execute a crypto test matrix.
+`check-sim-coverage` runs in [`ci.yml`](.github/workflows/ci.yml) for pull requests targeting `main`, and in `xtask-gates.yml` for other pull-request targets, daily cron and manual dispatch.
+Every pull request gets the existing 180-minute sim budget; cron/manual retain 90 minutes. The sim diff uses the PR target as its comparison base; scheduled/manual runs use `main`.
 It is a diff gate, so its scheduled `main` run short-circuits ("nothing to verify"), and so does any PR whose added production `.rs` lines are all excluded — that is why a job this heavy can sit on every pull request.
 The bail is keyed on the exclusion lists, **not** on the gated crates: a PR touching only the façade, `magnetar-admin` or `magnetarctl` still pays the full instrumented build and then prints those files as advisory `not gated` (10% of the last 40 merged PRs; kept deliberately, since bailing early would suppress the ADR-0088 report).
 Every invocation now enforces, the chain entry above included; `--enforce` is redundant and kept only as an explicit override.

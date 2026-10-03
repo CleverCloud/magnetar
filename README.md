@@ -30,6 +30,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full rationale.
 Magnetar is independent of the existing `pulsar-rs` crate — it shares neither code nor dependencies.
 The goal is feature-complete parity with the Apache Pulsar Java client.
 
+The [performance measurement harness](docs/performance.md) inventories executable test families, reports native suite costs and runs separate client collector passes in one frozen image. [performance.yml](.github/workflows/performance.yml) runs on every PR, compares exact main/head references, reconciles workspace and fixed/open-seed Moonpool families, and reports informative main / PR / absolute / relative costs with explicit coverage gaps.
+Its current coverage is explicitly partial; a baseline must be qualified before production optimizations are evaluated.
+
 [`magnetar-proto`]: crates/magnetar-proto
 [`magnetar-runtime-tokio`]: crates/magnetar-runtime-tokio
 [`magnetar-runtime-moonpool`]: crates/magnetar-runtime-moonpool
@@ -817,6 +820,10 @@ cargo run -p xtask -- check-no-channels   # greps src/** for banned channel crat
 cargo run -p xtask -- check-no-io-deps    # magnetar-proto must not depend on any I/O crate
 cargo run -p xtask -- codegen --check     # asserts proto codegen has no drift
 ```
+
+Runtime test parity and the 16-cell crypto build matrix run on every pull request in [xtask-gates.yml](.github/workflows/xtask-gates.yml), as well as daily and on manual dispatch.
+Sim patch coverage runs in `ci.yml` for PRs targeting `main` and in `xtask-gates.yml` for other PR targets; the latter also retains scheduled/manual execution.
+The crypto matrix is build-only evidence; test execution and measured performance coverage remain separate.
 
 ---
 

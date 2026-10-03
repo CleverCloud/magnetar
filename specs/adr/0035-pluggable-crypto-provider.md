@@ -82,7 +82,7 @@ The only compile-time guard is a single `compile_error!("magnetar: enable at lea
 **Harder**
 
 - One more dimension of CI matrix (four cells, eight if moonpool variants are tracked separately).
-  Mitigated by `cargo xtask check-crypto-matrix` and the per-provider runner gate (PR labels can opt into the OpenSSL / FIPS rows on demand).
+  Mitigated by `cargo xtask check-crypto-matrix`: `xtask-gates.yml` checks every provider in 16 isolated build cells on every pull request, including OpenSSL and FIPS, with daily/manual runs retained. This is build compatibility evidence; test execution is separate.
 - `crypto-fips` requires `cmake` + a C toolchain at build time.
   Fedora dev hosts and most CI runners ship these by default; document the requirement in `README.md` § TLS crypto provider.
 - The default-feature shift (`default = ["tokio", "crypto-aws-lc-rs"]`) silently switches downstream users from a ring-implicit build to an aws-lc-rs default build.

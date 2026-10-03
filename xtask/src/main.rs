@@ -35,6 +35,7 @@
 //!   ADR-0035). Complements `cargo build --workspace --all-features` (which exercises the cfg
 //!   cascade) by proving each single-provider cell compiles cleanly.
 //! - `vendor-proto --rev <sha>`: refresh vendored `PulsarApi.proto`.
+//! - `performance -- <args>`: run the external measurement driver.
 //!
 //! Codegen drives `prost-build` against `crates/magnetar-proto/proto/`, writes
 //! the generated Rust into `crates/magnetar-proto/src/pb/`, and (with `--check`)
@@ -195,6 +196,13 @@ enum Cmd {
     /// baseline (which goes through the cfg cascade in
     /// `magnetar-runtime-{tokio,moonpool}/src/tls_crypto.rs`).
     CheckCryptoMatrix,
+    /// Run the versioned external performance driver (Python standard library).
+    ///
+    /// Output must be outside product checkouts. Pass driver arguments after `--`.
+    Performance {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Refresh the vendored Pulsar proto from a given upstream commit.
     VendorProto {
         /// Apache Pulsar commit SHA to vendor from.
@@ -233,6 +241,19 @@ fn dispatch() -> Result<()> {
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
         Cmd::CheckKnownFailingSeeds => check_known_failing_seeds(),
         Cmd::CheckCryptoMatrix => check_crypto_matrix(),
+        Cmd::Performance { args } => {
+            let root = workspace_root()?;
+            let status = StdCommand::new("python3")
+                .arg(root.join("scripts/performance.py"))
+                .args(args)
+                .current_dir(root)
+                .status()
+                .context("could not launch performance driver; Python 3 is required")?;
+            if !status.success() {
+                bail!("performance driver failed: {status}");
+            }
+            Ok(())
+        }
         Cmd::VendorProto { rev, source } => vendor_proto(&rev, source.as_deref()),
     }
 }

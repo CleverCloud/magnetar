@@ -1,0 +1,171 @@
+name: performance
+
+# Exact main and PR head, including PRs targeting a branch other than main.
+# Costs are informative. Functional failures and invalid collection fail CI.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  prepare:
+    name: performance inputs and contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      main_sha: ${{ steps.prepare.outputs.main_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - name: Resolve main separately from the PR target and prepare exact inputs
+        id: prepare
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main
+          MAIN_SHA=$(git rev-parse FETCH_HEAD)
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          python3 scripts/performance.py campaign ci prepare \
+            --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
+            --expected-base-sha "$MAIN_SHA" --expected-candidate-sha "$HEAD_SHA" \
+            --output "$RUNNER_TEMP/performance-prepared" --shards 4 --seed-workers 4
+      - name: Upload frozen tools image, plans, contracts and provenance
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  workers:
+    name: performance (${{ matrix.kind }} ${{ matrix.worker }})
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+      # Dependency sources only. Every ref uses its own Cargo.lock --locked;
+      # CARGO_TARGET_DIR stays outside checkouts and distinct for each ref.
+      - uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/performance-cargo
+          key: performance-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/performance/Dockerfile') }}
+          restore-keys: performance-cargo-${{ runner.os }}-
+      - name: Execute all assigned families or all assigned replay seeds
+        env:
+          WORKER_KIND: ${{ matrix.kind }}
+          WORKER_INDEX: ${{ matrix.worker }}
+        run: |
+          set -euo pipefail
+          python3 scripts/performance.py campaign ci worker \
+            --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
+            --prepared "$RUNNER_TEMP/performance-prepared" \
+            --kind "$WORKER_KIND" --worker "$WORKER_INDEX" --cpu-count 2 \
+            --cargo-cache "$RUNNER_TEMP/performance-cargo" \
+            --build-cache "$RUNNER_TEMP/performance-targets" \
+            --output "$RUNNER_TEMP/performance-output"
+      - name: Preserve raw permissions, execution closures and sources in one archive
+        if: always()
+        env:
+          WORKER_KIND: ${{ matrix.kind }}
+          WORKER_INDEX: ${{ matrix.worker }}
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP/performance-output" -czf \
+            "$RUNNER_TEMP/performance-worker-$WORKER_KIND-$WORKER_INDEX.tar.gz" .
+      - name: Upload immutable raw observations even after a functional failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-worker-${{ matrix.kind }}-${{ matrix.worker }}
+          path: ${{ runner.temp }}/performance-worker-${{ matrix.kind }}-${{ matrix.worker }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  reconcile:
+    name: performance coverage and report
+    if: always()
+    needs: [prepare, workers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download exact input plans
+        uses: actions/download-artifact@v8
+        with:
+          name: performance-prepared
+          path: ${{ runner.temp }}/performance-prepared
+      - name: Download available raw shards (absence is checked by reconciliation)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: performance-worker-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/performance-workers
+      - name: Verify exhaustive union, completed work and collection validity
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/performance.py campaign ci reconcile \
+            --prepared "$RUNNER_TEMP/performance-prepared" \
+            --workers "$RUNNER_TEMP/performance-workers" \
+            --output "$RUNNER_TEMP/performance-report"
+      - name: Upload main / PR / absolute delta / relative delta / scope tables
+        id: report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-report
+          path: ${{ runner.temp }}/performance-report
+          if-no-files-found: error
+          retention-days: 7
+      - name: Link complete tables and raw artifacts from the compact summary
+        if: always()
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '\n[Complete comparison tables](%s) · [Raw worker and image artifacts](%s)\n' \
+            "$REPORT_URL" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"
