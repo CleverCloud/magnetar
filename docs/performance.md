@@ -143,6 +143,12 @@ Different lockfiles remain visible because dependency changes belong to the cand
 A changed executable catalogue, test/helper source, scope, denominator or completed work makes that family incomparable even when both sides report the same number of passed cases.
 The scenario digest reads the executable's rustc dep-info (`.d`) file, including `#[path]`, `include!`, and embedded-file inputs wherever they live in the checkout.
 Missing dep-info is an invalid inventory; ignored compiled fixtures cannot silently disappear.
+Cargo build scripts may declare a [directory input](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed), including the CLI's Git reference directory in a regular checkout.
+Such inputs expand into every directory marker (including empty directories) and regular file leaf in both compiler and scenario maps.
+Expansion and digests derive from one recursive snapshot, then a second read must match before acceptance; overlapping inputs with conflicting digests are refused.
+File entries retain their content SHA-256; `directory-sha256:` digests cover sorted paths, entry types and file digests, so membership, type and content changes are detected before and after execution, even if a file contains the exact directory encoding.
+Symlinks, special files and escaping directory inputs are refused; Git metadata has no exclusion from an explicit compiler rule.
+The retained source archive includes the directory markers and every expanded leaf without implicit recursive traversal.
 The digest additionally includes every file in that crate's `tests/` directory conservatively.
 For embedded unit tests it also includes that crate's `src/` directory because production code and test bodies share those files; changing such a source may leave native/RSS coverage valid while refusing its suite comparison.
 Integration suite comparisons can still compare changed production implementations when the fixed test/helper closure is identical.

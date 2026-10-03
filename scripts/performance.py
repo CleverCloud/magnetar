@@ -190,6 +190,45 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def directory_inputs(path):
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("compiled directory input is not a regular directory: " + str(path))
+    entries = {".": {"type": "directory"}}
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        for child in sorted(directory.iterdir()):
+            relative = child.relative_to(path).as_posix()
+            if child.is_symlink():
+                raise ValueError("compiled directory input contains a symlink: " + str(child))
+            if child.is_dir():
+                entries[relative] = {"type": "directory"}
+                pending.append(child)
+            elif child.is_file():
+                entries[relative] = {"type": "file", "sha256": digest(child)}
+            else:
+                raise ValueError("compiled directory input contains a nonregular entry: " + str(child))
+    return entries
+
+
+def directory_digest(entries):
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    return "directory-sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def compiled_input_digest(path, checkout):
+    path = Path(path)
+    relative = path.relative_to(checkout).as_posix()
+    if not path.resolve().is_relative_to(checkout) and (path.is_dir() or not relative.startswith("target/")):
+        raise ValueError("compiled input escapes checkout: " + str(path))
+    if path.is_symlink():
+        raise ValueError("compiled input is a symlink: " + str(path))
+    if path.is_file():
+        return digest(path)
+    return directory_digest(directory_inputs(path))
+
+
 def output_directory(path, checkouts):
     path = Path(path).resolve()
     for checkout in checkouts:
@@ -438,12 +477,30 @@ def scenario_identity(checkout, source, tests, dep_info):
         raise ValueError(f"missing or malformed compiler dep-info: {dep_info}") from error
     if not dependencies:
         raise ValueError(f"compiler dep-info has no compiled inputs: {dep_info}")
-    compiler_paths = set()
+    compiler_inputs = {}
     for dependency in dependencies:
         path = Path(dependency)
         path = Path(os.path.abspath(path if path.is_absolute() else checkout / path))
-        paths.add(path)
-        compiler_paths.add(path)
+        if not path.is_relative_to(checkout) or (path.is_dir() and not path.resolve().is_relative_to(checkout)):
+            raise ValueError(f"compiled scenario input escapes checkout or is missing: {path}")
+        if path.is_dir():
+            snapshot = directory_inputs(path)
+            expansion = {}
+            for relative, entry in snapshot.items():
+                if entry["type"] == "file":
+                    value = entry["sha256"]
+                else:
+                    subtree = {Path(member).relative_to(relative).as_posix(): item
+                               for member, item in snapshot.items() if Path(member).is_relative_to(relative)}
+                    value = directory_digest(subtree)
+                expansion[path / relative] = value
+        else:
+            expansion = {path: compiled_input_digest(path, checkout)}
+        for member, value in expansion.items():
+            if member in compiler_inputs and compiler_inputs[member] != value:
+                raise ValueError(f"conflicting compiled input snapshots: {member}")
+            compiler_inputs[member] = value
+        paths.update(expansion)
     # Conservative closure: every local test/fixture/helper, and all src files for embedded tests.
     directories = [root / "tests"]
     if (checkout / source).is_relative_to(root / "src"):
@@ -453,16 +510,19 @@ def scenario_identity(checkout, source, tests, dep_info):
             paths.update(path for path in directory.rglob("*") if path.is_file())
     sources = {}
     for path in sorted(paths):
-        if not path.is_relative_to(checkout) or not path.is_file():
+        if not path.is_relative_to(checkout) or not (path.is_file() or path.is_dir()):
             raise ValueError(f"compiled scenario input escapes checkout or is missing: {path}")
         relative = path.relative_to(checkout).as_posix()
         if not path.resolve().is_relative_to(checkout) and not relative.startswith("target/"):
             raise ValueError(f"scenario helper escapes checkout: {path}")
-        sources[relative] = digest(path)
+        sources[relative] = compiler_inputs[path] if path in compiler_inputs else compiled_input_digest(path, checkout)
+    for path, expected in compiler_inputs.items():
+        if compiled_input_digest(path, checkout) != expected:
+            raise ValueError(f"compiled input changed during snapshot: {path}")
     encoded = json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
     catalogue = json.dumps(tests, sort_keys=True, separators=(",", ":")).encode()
     return {"scenario_sources": sources,
-            "compiler_sources": {path.relative_to(checkout).as_posix(): sources[path.relative_to(checkout).as_posix()] for path in sorted(compiler_paths)},
+            "compiler_sources": {path.relative_to(checkout).as_posix(): compiler_inputs[path] for path in sorted(compiler_inputs)},
             "scenario_sha256": hashlib.sha256(encoded).hexdigest(),
             "catalogue_sha256": hashlib.sha256(catalogue).hexdigest()}
 
@@ -722,7 +782,7 @@ def check_execution_closure(entry, checkout):
         if artifact.get("compiler_dep_info") and digest(artifact["compiler_dep_info"]) != artifact["compiler_dep_info_sha256"]:
             raise ValueError("execution closure compiler dep-info changed")
         for source, expected in artifact.get("scenario_sources", {}).items():
-            if digest(checkout / source) != expected:
+            if compiled_input_digest(checkout / source, checkout) != expected:
                 raise ValueError("execution closure compiled source changed: " + source)
 
 
@@ -873,7 +933,7 @@ def execute_doctest(entry, checkout, output):
         if digest(entry["rustdoc_dep_info"]) != entry["rustdoc_dep_info_sha256"]:
             raise ValueError("rustdoc input manifest changed before execution")
         for source, expected in entry["scenario_sources"].items():
-            if digest(checkout / source) != expected:
+            if compiled_input_digest(checkout / source, checkout) != expected:
                 raise ValueError(f"doctest compiled input changed before execution: {source}")
         env = dict(os.environ, **PROFILE_ENV, CARGO_TARGET_DIR=entry["cargo_target_directory"])
         if sys.platform == "linux":
@@ -883,7 +943,7 @@ def execute_doctest(entry, checkout, output):
         if digest(entry["rustdoc_dep_info"]) != entry["rustdoc_dep_info_sha256"]:
             raise ValueError("rustdoc input manifest changed during execution")
         for source, expected in entry["scenario_sources"].items():
-            if digest(checkout / source) != expected:
+            if compiled_input_digest(checkout / source, checkout) != expected:
                 raise ValueError(f"doctest compiled input changed during execution: {source}")
         observation.update(state="valid" if completed else "unmeasured", completed=completed,
                            reason=None if completed else "no nonignored executable doctests")
@@ -940,7 +1000,7 @@ def measure_family(entry, checkout, output, repetition):
         if digest(entry["binary"]) != entry["binary_sha256"]:
             raise ValueError("compiled binary changed after inventory")
         for source, expected in entry.get("scenario_sources", {}).items():
-            if digest(checkout / source) != expected:
+            if compiled_input_digest(checkout / source, checkout) != expected:
                 raise ValueError(f"scenario compiled input changed after inventory: {source}")
         cwd, env = runtime_launch_context(entry)
         actual_runtime = Path(str(prefix) + ".runtime.json")
@@ -964,7 +1024,7 @@ def measure_family(entry, checkout, output, repetition):
         completed = test_completion(text, len(entry["tests"]), sum(test["ignored"] for test in entry["tests"]))
         metrics = parse_time(Path(str(prefix) + ".time").read_text())
         for source, expected in entry.get("scenario_sources", {}).items():
-            if digest(checkout / source) != expected:
+            if compiled_input_digest(checkout / source, checkout) != expected:
                 raise ValueError(f"scenario compiled input changed during execution: {source}")
         metrics.update(elapsed_ns=elapsed_ns)
         observation["elapsed_resolution_ns"] = max(1, math.ceil(time.get_clock_info("perf_counter").resolution * 1_000_000_000))

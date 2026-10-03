@@ -45,6 +45,114 @@ def record_mock_runtime(command, cwd, env):
 
 
 class MeasurementContracts(unittest.TestCase):
+    def test_compiler_directory_snapshot_rejects_membership_race(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").write_text('[package]\nname="witness"\nversion="0.1.0"\n')
+            (root / "main.rs").write_text("fn main() {}\n")
+            inputs = root / "inputs"; inputs.mkdir()
+            dep_info = root / "binary.d"
+            dep_info.write_text("binary: main.rs inputs\n")
+            scan = PERF.directory_inputs
+            calls = []
+
+            def add_after_snapshot(path):
+                snapshot = scan(path)
+                calls.append(path)
+                if len(calls) == 1:
+                    (inputs / "late").write_text("added after membership snapshot\n")
+                return snapshot
+
+            with mock.patch.object(PERF, "directory_inputs", side_effect=add_after_snapshot):
+                with self.assertRaisesRegex(ValueError, "changed|conflict"):
+                    PERF.scenario_identity(root, "main.rs", [], dep_info)
+            leaf = inputs / "late"
+            dep_info.write_text("binary: main.rs inputs inputs/late\n")
+
+            def change_after_snapshot(path):
+                snapshot = scan(path)
+                leaf.write_text("different overlapping input\n")
+                return snapshot
+
+            with mock.patch.object(PERF, "directory_inputs", side_effect=change_after_snapshot):
+                with self.assertRaisesRegex(ValueError, "conflicting compiled input snapshots"):
+                    PERF.scenario_identity(root, "main.rs", [], dep_info)
+
+    def test_compiler_directory_inputs_retain_empty_membership_and_guard_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").write_text('[package]\nname="witness"\nversion="0.1.0"\n')
+            (root / "src").mkdir()
+            (root / "src/main.rs").write_text("fn main() {}\n")
+            refs = root / ".git/refs/heads"; refs.mkdir(parents=True)
+            dep_info = root / "binary.d"
+            dep_info.write_text("binary: src/main.rs .git/refs/heads\n")
+            binary = root / "binary"; binary.write_bytes(b"compiled ELF")
+            empty = PERF.scenario_identity(root, "src/main.rs", [], dep_info)
+            self.assertIn(".git/refs/heads", empty["compiler_sources"])
+            self.assertNotEqual(empty["compiler_sources"][".git/refs/heads"], PERF.hashlib.sha256(b"").hexdigest())
+            empty_entry = {"execution_closure": [dict(empty, binary=str(binary), binary_sha256=PERF.digest(binary))]}
+            PERF.check_execution_closure(empty_entry, root)
+            refs.rmdir()
+            # A file containing the directory's exact canonical bytes must still differ in type.
+            refs.write_text(json.dumps({".": {"type": "directory"}}, sort_keys=True, separators=(",", ":")))
+            with self.assertRaises(ValueError): PERF.check_execution_closure(empty_entry, root)
+            refs.unlink(); refs.mkdir()
+            (refs / "nested").mkdir()
+            branch = refs / "nested/branch"; branch.write_text("reference bytes\n")
+            # An overlapping file dependency must be retained exactly once.
+            dep_info.write_text("binary: src/main.rs .git/refs/heads .git/refs/heads/nested/branch\n")
+            identity = PERF.scenario_identity(root, "src/main.rs", [], dep_info)
+            self.assertEqual(set(identity["compiler_sources"]), {"src/main.rs", ".git/refs/heads", ".git/refs/heads/nested", ".git/refs/heads/nested/branch"})
+            self.assertEqual(identity["scenario_sources"], identity["compiler_sources"])
+            self.assertTrue(all(isinstance(value, str) for value in identity["compiler_sources"].values()))
+            artifact = dict(identity, binary=str(binary), binary_sha256=PERF.digest(binary))
+            entry = {"execution_closure": [artifact]}
+            PERF.check_execution_closure(entry, root)
+            for case in ("content", "addition", "deletion", "rename", "type", "empty-directory", "symlink", "fifo"):
+                with self.subTest(case=case):
+                    if case == "content": branch.write_text("changed reference\n")
+                    if case == "addition": (refs / "another").write_text("new reference\n")
+                    if case == "deletion": branch.unlink()
+                    if case == "rename": branch.rename(refs / "nested/renamed")
+                    if case == "type": branch.unlink(); branch.mkdir()
+                    if case == "empty-directory": (refs / "empty").mkdir()
+                    if case == "symlink": (refs / "link").symlink_to(root / "src/main.rs")
+                    if case == "fifo": os.mkfifo(refs / "pipe")
+                    with self.assertRaises(ValueError): PERF.check_execution_closure(entry, root)
+                    for child in refs.iterdir():
+                        if child.name == "nested": continue
+                        if child.is_dir() and not child.is_symlink(): child.rmdir()
+                        else: child.unlink()
+                    for child in (refs / "nested").iterdir():
+                        if child.is_dir(): child.rmdir()
+                        else: child.unlink()
+                    branch.write_text("reference bytes\n")
+                    PERF.check_execution_closure(entry, root)
+
+    def test_compiler_directory_inputs_reject_escape_and_symlink_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); checkout = root / "checkout"; checkout.mkdir()
+            (checkout / "Cargo.toml").write_text('[package]\nname="witness"\nversion="0.1.0"\n')
+            (checkout / "main.rs").write_text("fn main() {}\n")
+            outside = root / "outside"; outside.mkdir()
+            (checkout / "link").symlink_to(outside, target_is_directory=True)
+            dep_info = root / "binary.d"
+            for path in (str(outside), "link", "missing-directory"):
+                with self.subTest(path=path):
+                    dep_info.write_text("binary: main.rs " + path + "\n")
+                    with self.assertRaises(ValueError): PERF.scenario_identity(checkout, "main.rs", [], dep_info)
+            parent = checkout / "inputs"; (parent / "nested").mkdir(parents=True)
+            (parent / "nested/input").write_text("unchanged input\n")
+            dep_info.write_text("binary: main.rs inputs/nested\n")
+            identity = PERF.scenario_identity(checkout, "main.rs", [], dep_info)
+            binary = checkout / "binary"; binary.write_bytes(b"compiled ELF")
+            entry = {"execution_closure": [dict(identity, binary=str(binary), binary_sha256=PERF.digest(binary))]}
+            PERF.check_execution_closure(entry, checkout)
+            parent.rename(outside / "moved")
+            parent.symlink_to(outside / "moved", target_is_directory=True)
+            with self.assertRaises(ValueError): PERF.check_execution_closure(entry, checkout)
+
     def test_companion_dep_info_requires_one_identical_compiler_executable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
