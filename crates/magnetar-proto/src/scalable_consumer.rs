@@ -23,7 +23,7 @@
 //! An assignment whose `layout_epoch` does not advance is **rejected**, not
 //! applied: the broker recomputes assignments per layout, so an out-of-order
 //! push would hand the consumer segments that no longer exist. The
-//! [`DagWatchSession`](crate::dag_watch::DagWatchSession) epoch guard and this
+//! [`DagWatchSession`] epoch guard and this
 //! one are the same rule applied to the two halves of the protocol.
 
 use std::collections::BTreeSet;
@@ -796,7 +796,7 @@ mod tests {
             w.topics().is_empty(),
             "no matching set before the first update"
         );
-        assert!(w.topics().is_empty());
+        assert_eq!(w.topics(), [] as [std::string::String; 0]);
     }
 
     /// The consumer-type enum round-trips and saturates unknown wire values,

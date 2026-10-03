@@ -299,6 +299,19 @@ fn observe_ack(out: &mut BytesMut, ack: &pb::CommandAck) -> WireEvent {
     }
 }
 
+fn try_take_release(releases: &AtomicUsize) -> bool {
+    let mut current = releases.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        match releases.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn serve_connection(mut stream: TcpStream, control: Arc<BrokerControl>) {
     let mut read = BytesMut::with_capacity(64 * 1024);
@@ -374,14 +387,7 @@ async fn serve_connection(mut stream: TcpStream, control: Arc<BrokerControl>) {
             }
         }
 
-        while !pending_receipts.is_empty()
-            && control
-                .releases
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                    count.checked_sub(1)
-                })
-                .is_ok()
-        {
+        while !pending_receipts.is_empty() && try_take_release(&control.releases) {
             let (producer_id, sequence) = pending_receipts
                 .pop_front()
                 .expect("pending receipt exists");

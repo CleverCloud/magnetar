@@ -9,7 +9,7 @@
 //! [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
 //! sans-io contract. The runtime engines drive it from inside their
 //! connection lock and translate the returned [`DagDelta`] into
-//! [`ConnectionEvent`](crate::ConnectionEvent) variants.
+//! [`ConnectionEvent`] variants.
 //!
 //! # One session, no separate subscribe
 //!
@@ -496,7 +496,7 @@ mod tests {
         assert!(s.is_resolved());
         assert_eq!(delta.epoch, 4);
         assert_eq!(delta.added.len(), 2);
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [SegmentId; 0]);
         assert!(
             !delta.is_consume_affecting(),
             "initial layout is not a change"

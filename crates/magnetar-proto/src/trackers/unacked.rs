@@ -243,7 +243,10 @@ mod tests {
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::ZERO);
         assert!(t.is_disabled());
         t.add(mid(1), Instant::now());
-        assert!(t.poll(Instant::now() + Duration::from_mins(1)).is_empty());
+        assert_eq!(
+            t.poll(Instant::now() + Duration::from_mins(1)),
+            [] as [UnackedAction; 0]
+        );
     }
 
     #[test]
@@ -252,7 +255,10 @@ mod tests {
         let t0 = Instant::now();
         t.add(mid(1), t0);
         t.add(mid(2), t0);
-        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(50)),
+            [] as [UnackedAction; 0]
+        );
         let actions = t.poll(t0 + Duration::from_millis(101));
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -269,7 +275,7 @@ mod tests {
         t.add(mid(1), t0);
         t.remove(&mid(1));
         let actions = t.poll(t0 + Duration::from_secs(10));
-        assert!(actions.is_empty());
+        assert_eq!(actions, [] as [UnackedAction; 0]);
     }
 
     #[test]
@@ -287,7 +293,10 @@ mod tests {
         t.add_with_redelivery_count(mid(1), 0, t0);
         t.add_with_redelivery_count(mid(2), 1, t0);
         // 99ms: nothing due.
-        assert!(t.poll(t0 + Duration::from_millis(99)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(99)),
+            [] as [UnackedAction; 0]
+        );
         // 110ms: mid(1) is due (100ms deadline), mid(2) is not yet (200ms deadline).
         let actions = t.poll(t0 + Duration::from_millis(110));
         assert_eq!(actions.len(), 1);
@@ -320,7 +329,10 @@ mod tests {
         let t0 = Instant::now();
         t.add_with_redelivery_count(mid(5), 0, t0);
         t.remove(&mid(5));
-        assert!(t.poll(t0 + Duration::from_secs(10)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_secs(10)),
+            [] as [UnackedAction; 0]
+        );
     }
 
     #[test]
@@ -330,7 +342,10 @@ mod tests {
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
         let t0 = Instant::now();
         t.add_with_redelivery_count(mid(1), 7, t0);
-        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(50)),
+            [] as [UnackedAction; 0]
+        );
         let actions = t.poll(t0 + Duration::from_millis(101));
         assert_eq!(actions.len(), 1);
     }
@@ -386,7 +401,10 @@ mod tests {
         // Broker re-delivers; we add the same id again at a later time.
         let t1 = t0 + Duration::from_millis(150);
         t.add(mid(1), t1);
-        assert!(t.poll(t1 + Duration::from_millis(50)).is_empty());
+        assert_eq!(
+            t.poll(t1 + Duration::from_millis(50)),
+            [] as [UnackedAction; 0]
+        );
         let second = t.poll(t1 + Duration::from_millis(101));
         assert_eq!(second.len(), 1);
         match &second[0] {
@@ -450,6 +468,9 @@ mod tests {
         t.add(mid(1), Instant::now());
         t.remove(&mid(1));
         t.remove(&mid(999));
-        assert!(t.poll(Instant::now() + Duration::from_mins(1)).is_empty());
+        assert_eq!(
+            t.poll(Instant::now() + Duration::from_mins(1)),
+            [] as [UnackedAction; 0]
+        );
     }
 }

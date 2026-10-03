@@ -18560,7 +18560,10 @@ mod consumer_stall_and_recovery_tests {
         // window, so with no dispatch no further episode can open at all.
         for extra in [1u64, 600, 86_400] {
             conn.handle_timeout(at + Duration::from_secs(extra));
-            assert!(drain_stall_events(&mut conn).is_empty());
+            assert_eq!(
+                drain_stall_events(&mut conn),
+                [] as [(ConsumerHandle, u32, std::time::Duration); 0]
+            );
             let (subs, _) = drain_outbound(&mut conn, handle);
             assert!(subs.is_empty(), "no recovery traffic resumes on its own");
         }

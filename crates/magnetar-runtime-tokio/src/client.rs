@@ -2191,7 +2191,7 @@ fn parse_direct_broker_url(
         ))
     };
     let endpoint_scheme =
-        magnetar_proto::broker_endpoint_scheme(broker_url).ok_or_else(&unusable)?;
+        magnetar_proto::broker_endpoint_scheme(broker_url).ok_or_else(unusable)?;
     let authority =
         magnetar_proto::broker_authority(broker_url, Some(bootstrap_scheme.default_port()))
             .ok_or_else(unusable)?;

@@ -33,6 +33,7 @@ The cost is the same one issue #426 carried: the broker may hand a consumer twic
 - **Zero the permit mirrors at every `CommandSubscribe` emission**, making `granted_permits != 0` a sufficient guard on its own with no new state. Semantically right — the broker recreates its dispatcher slot at zero permits — but it changes the post-seek resubscribe's live permit accounting mid-flight, where `flow_stats` and `adjust_receiver_queue` read those mirrors. A wider blast radius than the decision needs.
 
   > **Corrected by [ADR-0108](0108-close-then-resubscribe-for-in-place-consumer-recovery.md) (2026-09-18).** "The broker recreates its dispatcher slot at zero permits" holds for a `CommandSubscribe` naming a consumer id the broker does not already have; it is false for one it does, where `ServerCnx.handleSubscribe` replies `sendSuccessResponse(requestId)` and touches neither dispatcher nor `availablePermits`. This alternative's rejection stands unchanged — it rests on the blast radius, not on that parenthetical.
+
 - **Drop the #307 re-arm and let the engines own every grant.** Refused: the re-arm is the only path that restores flow to a consumer whose mirrors a churn boundary zeroed without a re-subscribe following, and `maybe_flow` cannot substitute for it (it only fires once messages have been consumed, and none can arrive at zero permits).
 
 ## Decision

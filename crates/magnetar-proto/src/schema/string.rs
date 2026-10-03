@@ -93,7 +93,7 @@ mod tests {
         let encoded = schema.encode(&String::new()).unwrap();
         assert!(encoded.is_empty());
         let decoded = schema.decode(&encoded).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, "");
     }
 
     #[test]

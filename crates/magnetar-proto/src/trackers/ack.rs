@@ -196,9 +196,9 @@ mod tests {
     fn groups_until_window_elapses() {
         let mut t = AckGroupingTracker::new(ConsumerHandle(2), Duration::from_millis(100));
         let t0 = Instant::now();
-        assert!(t.add_individual(mid(1, 1), t0).is_empty());
-        assert!(t.add_individual(mid(1, 2), t0).is_empty());
-        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(t.add_individual(mid(1, 1), t0), [] as [AckAction; 0]);
+        assert_eq!(t.add_individual(mid(1, 2), t0), [] as [AckAction; 0]);
+        assert_eq!(t.poll(t0 + Duration::from_millis(50)), [] as [AckAction; 0]);
         let actions = t.poll(t0 + Duration::from_millis(101));
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -234,10 +234,10 @@ mod tests {
     fn individual_after_cumulative_stays_grouped() {
         let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
         let t0 = Instant::now();
-        assert!(t.add_cumulative(mid(5, 5), t0).is_empty());
-        assert!(t.add_individual(mid(5, 6), t0).is_empty());
+        assert_eq!(t.add_cumulative(mid(5, 5), t0), [] as [AckAction; 0]);
+        assert_eq!(t.add_individual(mid(5, 6), t0), [] as [AckAction; 0]);
         // Still within the grouping window — nothing emitted.
-        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(t.poll(t0 + Duration::from_millis(50)), [] as [AckAction; 0]);
     }
 
     /// Java `testAckTracker` line 127, 140, 150: a `flush` must surface both the pending
@@ -297,7 +297,7 @@ mod tests {
         let deadline = t.next_deadline().expect("deadline after re-add");
         assert!(deadline >= t1 + Duration::from_millis(100));
         // Polling before the new window elapses must not emit anything.
-        assert!(t.poll(t1 + Duration::from_millis(50)).is_empty());
+        assert_eq!(t.poll(t1 + Duration::from_millis(50)), [] as [AckAction; 0]);
     }
 
     /// Java `testAckTracker` lines 113-115: `isDuplicate(msg1)` must return `true` after the
@@ -312,7 +312,7 @@ mod tests {
             let actions = t.add_individual(mid(5, entry), t0);
             assert!(actions.is_empty(), "no immediate emission within window");
         }
-        assert!(t.poll(t0 + Duration::from_millis(99)).is_empty());
+        assert_eq!(t.poll(t0 + Duration::from_millis(99)), [] as [AckAction; 0]);
         let actions = t.poll(t0 + Duration::from_millis(101));
         assert_eq!(actions.len(), 1);
         match &actions[0] {
