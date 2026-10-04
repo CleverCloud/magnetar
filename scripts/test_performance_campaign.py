@@ -22,6 +22,68 @@ SPEC.loader.exec_module(CAMPAIGN)
 
 
 class CampaignContracts(unittest.TestCase):
+    def test_proxy_gateway_binds_only_its_assigned_shard_and_preserves_pip33_bindings(self):
+        families = [{"family_id": source + "::test", "source": source} for source in (
+            "crates/magnetar/tests/e2e_pulsar_proxy.rs", "crates/magnetar/tests/e2e_replicated_subscriptions.rs",
+            "crates/magnetar/tests/e2e_batch_chunk.rs")]
+        plans = [{"families": families}, {"families": families}]
+        for shard in range(8):
+            required = CAMPAIGN.worker_fixture_requirements(plans, shard, 8)
+            self.assertEqual(required["proxy"], CAMPAIGN.perf.shard_matches(families[0]["family_id"], shard, 8))
+            self.assertEqual(required["pip33"], CAMPAIGN.perf.shard_matches(families[1]["family_id"], shard, 8))
+        pip33 = {"bindings": dict(zip(CAMPAIGN.PIP33_BINDINGS, ("pulsar://localhost:16650", "pulsar://localhost:16651", "http://localhost:18081")))}
+        proxy = {"gateway": "172.17.0.1"}
+        expected = {**pip33["bindings"], CAMPAIGN.PROXY_GATEWAY: proxy["gateway"]}
+        bindings = [name + "=" + value for name, value in expected.items()]
+        self.assertEqual(CAMPAIGN.fixture_bindings(bindings, pip33, proxy), expected)
+        self.assertEqual(CAMPAIGN.fixture_bindings([], None, None), {})
+        self.assertEqual(CAMPAIGN.fixture_bindings([CAMPAIGN.PROXY_GATEWAY + "=172.17.0.1"], None, proxy), {CAMPAIGN.PROXY_GATEWAY: "172.17.0.1"})
+        for invalid in (bindings + ["UNKNOWN_TOKEN=excluded"], bindings + [bindings[0]], bindings[:-1],
+                        bindings[:-1] + [CAMPAIGN.PROXY_GATEWAY + "=172.18.0.1"]):
+            with self.subTest(bindings=invalid), self.assertRaises(ValueError):
+                CAMPAIGN.fixture_bindings(invalid, pip33, proxy)
+        with self.assertRaises(ValueError):
+            CAMPAIGN.fixture_bindings(bindings, pip33, None)
+        with self.assertRaises(ValueError):
+            CAMPAIGN.fixture_bindings(bindings, None, proxy)
+        with self.assertRaises(ValueError):
+            CAMPAIGN.fixture_bindings([], {"bindings": {}}, None)
+
+    def test_proxy_bridge_identity_refuses_unknown_ambiguous_or_changed_network(self):
+        network = {"Id": "a" * 64, "Name": "bridge", "Driver": "bridge", "Scope": "local", "Internal": False,
+                   "EnableIPv4": True, "EnableIPv6": False, "IPAM": {"Driver": "default", "Options": None,
+                   "Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]},
+                   "Options": {"com.docker.network.bridge.default_bridge": "true"}, "Containers": {}}
+        frozen = CAMPAIGN.proxy_network_identity(network)
+        self.assertEqual(frozen["gateway"], "172.17.0.1")
+        self.assertNotIn("Containers", frozen["network"])
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            for invalid in ({}, {"network": {}}, {"network": frozen["network"], "gateway": "unknown"}):
+                with self.subTest(prerequisite=invalid), self.assertRaises(ValueError):
+                    CAMPAIGN.inspect_proxy_network(invalid, output, "before")
+            changed = json.loads(json.dumps(network)); changed["Containers"] = {"expected-child": {"Name": "test"}}
+            with mock.patch.object(CAMPAIGN.perf, "read_command", return_value=json.dumps([changed])) as read:
+                self.assertEqual(CAMPAIGN.inspect_proxy_network(frozen, output, "after"), frozen)
+                read.assert_called_once_with(["docker", "network", "inspect", network["Id"]], output)
+            for mutation in ("gateway", "id", "options"):
+                changed = json.loads(json.dumps(network))
+                if mutation == "gateway": changed["IPAM"]["Config"][0]["Gateway"] = "172.17.0.2"
+                elif mutation == "id": changed["Id"] = "b" * 64
+                else: changed["Options"]["com.docker.network.bridge.name"] = "different"
+                with mock.patch.object(CAMPAIGN.perf, "read_command", return_value=json.dumps([changed])), self.assertRaisesRegex(ValueError, "changed"):
+                    CAMPAIGN.inspect_proxy_network(frozen, output, "after")
+        for mutation in ("missing", "ambiguous", "outside", "custom", "disabled", "malformed"):
+            changed = json.loads(json.dumps(network))
+            if mutation == "missing": changed["IPAM"]["Config"] = []
+            elif mutation == "ambiguous": changed["IPAM"]["Config"].append({"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1"})
+            elif mutation == "outside": changed["IPAM"]["Config"][0]["Gateway"] = "172.18.0.1"
+            elif mutation == "custom": changed["Name"] = "custom"
+            elif mutation == "disabled": changed["EnableIPv4"] = False
+            else: changed["IPAM"]["Config"] = [{}]
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                CAMPAIGN.proxy_network_identity(changed)
+
     def test_ci_workspace_capacity_preserves_worker_caps_and_exhaustive_union(self):
         workflow = Path(CAMPAIGN.__file__).resolve().parents[1] / ".github/workflows/performance.yml"
         text = workflow.read_text()
@@ -80,15 +142,16 @@ class CampaignContracts(unittest.TestCase):
         tag = re.search(r'const DEFAULT_IMAGE_TAG: &str = "([^"]+)";', text).group(1)
         self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
 
-    def test_baseline_overlay_copies_only_the_two_audited_harness_sources(self):
+    def test_baseline_overlay_copies_only_the_three_audited_harness_sources(self):
         fixture = "crates/magnetar/tests/e2e_reconnect_safety.rs"
+        proxy = "crates/magnetar/tests/e2e_pulsar_proxy.rs"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); base = root / "base"; candidate = root / "candidate"
             output = root / "output"; output.mkdir()
             revisions = {}
             for checkout, label in ((base, "base"), (candidate, "candidate")):
                 checkout.mkdir()
-                for path in (CAMPAIGN.EXAMPLE_SOURCE, fixture, "scripts/performance.py",
+                for path in (CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy, "scripts/performance.py",
                              "scripts/performance_campaign.py", "scripts/performance/Dockerfile",
                              "scripts/performance/control.c", "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml"):
                     target = checkout / path; target.parent.mkdir(parents=True, exist_ok=True)
@@ -102,13 +165,14 @@ class CampaignContracts(unittest.TestCase):
                                                   check=True, capture_output=True, text=True).stdout.strip()
             overlay = CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
             files = json.loads(overlay.read_text())["files"]
-            self.assertEqual({row["path"] for row in files}, {CAMPAIGN.EXAMPLE_SOURCE, fixture})
+            self.assertEqual({row["path"] for row in files}, {CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy})
             for row in files:
                 self.assertEqual(row["status"], " M")
                 self.assertEqual((base / row["path"]).read_bytes(), (candidate / row["path"]).read_bytes())
                 self.assertEqual(row["sha256"], CAMPAIGN.perf.digest(candidate / row["path"]))
             harness = CAMPAIGN.ci_harness(candidate)
             self.assertEqual(harness[fixture], CAMPAIGN.perf.digest(candidate / fixture))
+            self.assertEqual(harness[proxy], CAMPAIGN.perf.digest(candidate / proxy))
             (candidate / fixture).write_text("changed fixture")
             self.assertNotEqual(harness[fixture], CAMPAIGN.ci_harness(candidate)[fixture])
             (base / "unexpected-product.rs").write_text("not an audited harness input")

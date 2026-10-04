@@ -304,7 +304,7 @@ let unicode = '\u{7FFF}';
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             common = {"PATH": "/usr/bin", "CARGO_HOME": str(root / "cargo-home"), "MOONPOOL_SEED": "17",
-                      "MAGNETAR_PIP33_CLUSTER_A_URL": "pulsar://localhost:6650"}
+                      "MAGNETAR_PIP33_CLUSTER_A_URL": "pulsar://localhost:6650", "MAGNETAR_E2E_DOCKER_HOST_GATEWAY": "172.17.0.1"}
 
             def capture(name, checkout, changes=None):
                 package_root = checkout / "crate"; package_root.mkdir(parents=True, exist_ok=True)
@@ -338,7 +338,8 @@ let unicode = '\u{7FFF}';
                            "catalogue_sha256": "same cases", "scope": "suite", "denominator": "cases", "completed": 1,
                            "state": "valid", "binary_sha256": baseline["runtime_context"]["binary_sha256"],
                            "runtime_identity": baseline["runtime_identity"], "metrics": {"elapsed_ns": 10, "peak_rss_kib": 20}}
-            for key, changed in (("MOONPOOL_SEED", "18"), ("PATH", "/bin"), ("MAGNETAR_PIP33_CLUSTER_A_URL", "pulsar://localhost:6651")):
+            for key, changed in (("MOONPOOL_SEED", "18"), ("PATH", "/bin"), ("MAGNETAR_PIP33_CLUSTER_A_URL", "pulsar://localhost:6651"),
+                                 ("MAGNETAR_E2E_DOCKER_HOST_GATEWAY", "172.17.0.2")):
                 with self.subTest(environment_key=key):
                     candidate = capture(key, root / "head-checkout", {key: changed})
                     self.assertEqual(candidate["runtime_context"]["environment"][key], changed)

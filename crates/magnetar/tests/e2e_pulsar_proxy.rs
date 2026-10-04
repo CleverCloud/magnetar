@@ -27,10 +27,11 @@
 //! are started — a standalone broker (~30 s startup), and a proxy
 //! (~10 s startup once the broker is healthy). The proxy needs network
 //! reachability back to the standalone's mapped Zookeeper port. On
-//! Linux the test uses the standalone container's bridge IP
-//! (`get_bridge_ip_address`) so the proxy can reach Zookeeper directly.
-//! Falls back to `host.docker.internal` when the bridge IP is
-//! unavailable (Docker Desktop on macOS / Windows).
+//! Linux the operator supplies the routable Docker bridge gateway through
+//! `MAGNETAR_E2E_DOCKER_HOST_GATEWAY`; Docker Desktop may use
+//! `host.docker.internal`. The proxy uses the standalone's `standalone`
+//! cluster name, required by its OpenTelemetry initialization. The standalone
+//! explicitly enables `ZooKeeper` so the proxy can use the exposed metadata port.
 
 use std::time::Duration;
 
@@ -93,7 +94,13 @@ async fn start_standalone() -> Result<
         ))
         .with_startup_timeout(Duration::from_mins(2))
         .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
+        .with_env_var("PULSAR_STANDALONE_USE_ZOOKEEPER", "1")
+        .with_cmd(vec![
+            "bash".to_owned(),
+            "-c".to_owned(),
+            "set -eu; set -- $(hostname -i); test \"$#\" -eq 1; exec bin/pulsar standalone --advertised-address \"$1\""
+                .to_owned(),
+        ])
         .start()
         .await?;
     let host = container.get_host().await?;
@@ -122,9 +129,10 @@ async fn start_proxy(
     // start the proxy.
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(PROXY_BINARY_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Started ProxyService at"))
+        .with_wait_for(WaitFor::message_on_stdout("Started Pulsar Proxy at"))
         .with_startup_timeout(Duration::from_mins(1))
         .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
+        .with_env_var("PULSAR_PREFIX_clusterName", "standalone")
         .with_env_var("PULSAR_PREFIX_zookeeperServers", &zk_servers)
         .with_env_var("PULSAR_PREFIX_configurationStoreServers", &zk_servers)
         .with_env_var("PULSAR_PREFIX_servicePort", PROXY_BINARY_PORT.to_string())

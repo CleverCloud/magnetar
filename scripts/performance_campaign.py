@@ -20,6 +20,7 @@ import copy
 import gzip
 import socket
 import stat
+import ipaddress
 import urllib.request
 
 sys.dont_write_bytecode = True
@@ -48,7 +49,9 @@ FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apac
                 "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest", "athenz/athenz-zts-server:1.12.41")
 SEED_REGISTRY = "crates/magnetar-runtime-moonpool/seeds/known-failing.toml"
 EXAMPLE_SOURCE = "crates/magnetar/examples/performance.rs"
-BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs")
+BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs", "crates/magnetar/tests/e2e_pulsar_proxy.rs")
+PROXY_GATEWAY = "MAGNETAR_E2E_DOCKER_HOST_GATEWAY"
+PIP33_BINDINGS = ("MAGNETAR_PIP33_CLUSTER_A_URL", "MAGNETAR_PIP33_CLUSTER_B_URL", "MAGNETAR_PIP33_ADMIN_B_URL")
 
 
 def save(path, data):
@@ -637,6 +640,71 @@ def container_execution_options(cargo_home, docker_socket=False):
     return identity, options
 
 
+def proxy_network_identity(network):
+    fields = ("Id", "Name", "Driver", "Scope", "Internal", "EnableIPv4", "EnableIPv6", "IPAM", "Options")
+    if (not isinstance(network, dict) or any(field not in network for field in fields)
+            or not isinstance(network["Id"], str) or not re.fullmatch(r"[0-9a-f]{64}", network["Id"])
+            or network["Name"] != "bridge" or network["Driver"] != "bridge" or network["Scope"] != "local"
+            or network["Internal"] is not False or network["EnableIPv4"] is not True
+            or not isinstance(network["Options"], dict) or not isinstance(network["IPAM"], dict)
+            or network["Options"].get("com.docker.network.bridge.default_bridge") != "true"
+            or network["IPAM"].get("Driver") != "default"):
+        raise ValueError("proxy requires an inspected IPv4 default Docker bridge")
+    gateways = []
+    configurations = network["IPAM"].get("Config", [])
+    if not isinstance(configurations, list):
+        raise ValueError("proxy bridge IPAM configuration is invalid")
+    for config in configurations:
+        if not isinstance(config, dict) or not isinstance(config.get("Subnet"), str) or not isinstance(config.get("Gateway"), str):
+            raise ValueError("proxy bridge lacks an inspected subnet/gateway")
+        subnet = ipaddress.ip_network(config["Subnet"])
+        gateway = ipaddress.ip_address(config["Gateway"])
+        if gateway not in subnet:
+            raise ValueError("proxy gateway is outside its inspected subnet")
+        if gateway.version == 4:
+            gateways.append(str(gateway))
+    if len(gateways) != 1:
+        raise ValueError("proxy requires exactly one inspected IPv4 gateway")
+    return {"network": {field: copy.deepcopy(network[field]) for field in fields}, "gateway": gateways[0]}
+
+
+def inspect_proxy_network(expected, output, phase):
+    if (not isinstance(expected, dict) or set(expected) != {"network", "gateway"}
+            or proxy_network_identity(expected["network"]) != expected):
+        raise ValueError("proxy network prerequisite lacks a known normalized identity")
+    observed = json.loads(perf.read_command(["docker", "network", "inspect", expected["network"]["Id"]], output))
+    if len(observed) != 1 or proxy_network_identity(observed[0]) != expected:
+        raise ValueError("proxy network/gateway changed from the frozen worker binding")
+    save(output / ("proxy-network-" + phase + ".json"), observed[0])
+    return expected
+
+
+def fixture_bindings(bindings, pip33=None, proxy_network=None):
+    expected = {}
+    if pip33 is not None:
+        if set(pip33["bindings"]) != set(PIP33_BINDINGS):
+            raise ValueError("PIP-33 fixture lacks its exact three bindings")
+        expected.update(pip33["bindings"])
+    if proxy_network is not None:
+        expected[PROXY_GATEWAY] = proxy_network["gateway"]
+    observed = {}
+    for binding in bindings:
+        name, value = binding.split("=", 1)
+        if name not in (*PIP33_BINDINGS, PROXY_GATEWAY) or name in observed:
+            raise ValueError("unknown or duplicate private fixture binding")
+        observed[name] = value
+    if observed != expected:
+        raise ValueError("child fixture bindings differ from inspected PIP-33/proxy prerequisites")
+    return observed
+
+
+def worker_fixture_requirements(plans, shard, shards):
+    sources = {row["source"] for plan in plans for row in plan["families"]
+               if perf.shard_matches(row["family_id"], shard, shards)}
+    return {"pip33": "crates/magnetar/tests/e2e_replicated_subscriptions.rs" in sources,
+            "proxy": "crates/magnetar/tests/e2e_pulsar_proxy.rs" in sources}
+
+
 def launch_container(args):
     for checkout, expected in ((args.base, args.expected_base_sha), (args.candidate, args.expected_candidate_sha)):
         perf.check_expected_revision(checkout, expected)
@@ -673,10 +741,16 @@ def launch_container(args):
         pip33 = json.loads(args.pip33_fixture.read_text())
         pip33["containers"] = json.loads(perf.read_command(["docker", "inspect", *[row["Id"] for row in pip33["containers"]]], output))
         perf.check_pip33_fixture(pip33)
-        if dict(binding.split("=", 1) for binding in args.binding) != pip33["bindings"]:
-            raise ValueError("PIP-33 child bindings differ from inspected fixture")
         launch["pip33_fixture"] = pip33
         save(output / "pip33-before.json", pip33)
+    proxy_network = None
+    if args.proxy_network:
+        if not args.suite or not args.docker_socket:
+            raise ValueError("proxy gateway is available only to the explicit fixture-owning suite worker")
+        proxy_network = inspect_proxy_network(json.loads(args.proxy_network.read_text()), output, "before")
+        launch["proxy_network"] = proxy_network
+    bindings = fixture_bindings(args.binding, pip33, proxy_network)
+    launch["fixture_bindings"] = bindings
     environment = output / "environment.json"
     save(environment, launch)
     cargo_home = args.cargo_cache.resolve()
@@ -718,10 +792,7 @@ def launch_container(args):
             command.extend(["--build-session", args.build_session])
     if args.docker_socket:
         command[2:2] = ["--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock"]
-    for binding in args.binding:
-        name, value = binding.split("=", 1)
-        if name not in ("MAGNETAR_PIP33_CLUSTER_A_URL", "MAGNETAR_PIP33_CLUSTER_B_URL", "MAGNETAR_PIP33_ADMIN_B_URL"):
-            raise ValueError("unknown private fixture binding")
+    for name, value in bindings.items():
         command[2:2] = ["-e", name + "=" + value]
     if args.fixture_images:
         fixture_images = json.loads(args.fixture_images.read_text())
@@ -757,6 +828,8 @@ def launch_container(args):
             raise ValueError("actual campaign container image or CPU bindings differ")
         expected_groups = [str(execution_identity["docker_socket_gid"])] if args.docker_socket else []
         actual_environment = dict(value.split("=", 1) for value in container["Config"]["Env"])
+        if {name: actual_environment[name] for name in (*PIP33_BINDINGS, PROXY_GATEWAY) if name in actual_environment} != bindings:
+            raise ValueError("actual campaign fixture bindings differ")
         if (container["Config"]["User"] != f"{execution_identity['uid']}:{execution_identity['gid']}"
                 or (container["HostConfig"]["GroupAdd"] or []) != expected_groups
                 or actual_environment.get("HOME") != execution_identity["home"]
@@ -766,11 +839,14 @@ def launch_container(args):
         save(output / "container-inspect.json", container)
         save(output / "container.json", {"id": container_id, "image": container["Image"], "cpu_affinity": container["HostConfig"]["CpusetCpus"],
              "command": container["Config"]["Cmd"], "user": container["Config"]["User"], "groups": expected_groups,
-             "home": actual_environment["HOME"], "cargo_home": actual_environment["CARGO_HOME"], "tmpfs": container["HostConfig"]["Tmpfs"]})
+             "home": actual_environment["HOME"], "cargo_home": actual_environment["CARGO_HOME"], "tmpfs": container["HostConfig"]["Tmpfs"],
+             "fixture_bindings": bindings})
         result = subprocess.run(["docker", "start", "--attach", container_id], check=False)
         final = json.loads(perf.read_command(["docker", "inspect", container_id], output))[0]
         status = final["State"]["ExitCode"]
         save(output / "container-exit.json", {"status": status, "docker_attach_status": result.returncode})
+        if proxy_network is not None:
+            inspect_proxy_network(proxy_network, output, "after")
         if args.fixture_images:
             if event_process.poll() is not None:
                 raise ValueError("fixture event observer exited before the suite finished")
@@ -1276,14 +1352,23 @@ def ci_worker(args):
     save(output / "fixture-images.json", images)
     save(output / "fixture-images-observed.json", verify_fixture_images(images, output))
     prefix = "magnetar-perf-" + uuid.uuid4().hex[:16]
-    owned = []; bindings = {}
+    owned = []; bindings = {}; pip33 = None; proxy_network = None
     save(output / "resources-before.json", resource_snapshot(output, args.build_cache))
     try:
         if args.kind == "workspace":
             plans = [json.loads((prepared / "plans/workspace-all-features" / side / "plan.json").read_text()) for side in ("base", "candidate")]
-            if any(row["source"].endswith("/e2e_replicated_subscriptions.rs") and perf.shard_matches(row["family_id"], args.worker, payload["shards"]) for plan in plans for row in plan["families"]):
-                fixture = start_pip33(candidate, images, output, prefix)
-                owned = [row["Id"] for row in fixture["containers"]]; bindings = fixture["bindings"]
+            requirements = worker_fixture_requirements(plans, args.worker, payload["shards"])
+            if requirements["pip33"]:
+                pip33 = start_pip33(candidate, images, output, prefix)
+                owned = [row["Id"] for row in pip33["containers"]]; bindings = dict(pip33["bindings"])
+            if requirements["proxy"]:
+                observed = json.loads(perf.read_command(["docker", "network", "inspect", "bridge"], output))
+                if len(observed) != 1:
+                    raise ValueError("proxy worker requires exactly one default Docker bridge")
+                save(output / "proxy-network-inspect.json", observed[0])
+                proxy_network = proxy_network_identity(observed[0])
+                save(output / "proxy-network.json", proxy_network)
+                bindings[PROXY_GATEWAY] = proxy_network["gateway"]
         if args.kind == "scenarios":
             image = images["apachepulsar/pulsar:4.2.4"]
             container_id = perf.read_command(["docker", "create", "--name", prefix, "--label", "magnetar.performance.fixture=" + prefix,
@@ -1311,8 +1396,10 @@ def ci_worker(args):
             else:
                 command.extend(["--suite", "--axis", axis, "--seed", str(seed), "--shard", str(shard), "--shards", str(shards),
                                 "--build-session", args.kind, "--docker-socket", "--fixture-images", str(output / "fixture-images.json")])
-                if bindings:
+                if pip33 is not None:
                     command.extend(["--pip33-fixture", str(output / "pip33.json")])
+                if proxy_network is not None:
+                    command.extend(["--proxy-network", str(output / "proxy-network.json")])
                 for name, value in bindings.items():
                     command.extend(["--binding", name + "=" + value])
             save(output / (directory.name + "-command.json"), command)
@@ -1540,9 +1627,10 @@ def main():
     parser.add_argument("--axis", choices=perf.AXES, default="workspace-all-features")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--docker-socket", action="store_true", help="allow testcontainers on this private suite runner")
-    parser.add_argument("--binding", action="append", default=[], help="private PIP33 NAME=URL binding")
+    parser.add_argument("--binding", action="append", default=[], help="inspected private PIP33/proxy NAME=value binding")
     parser.add_argument("--fixture-images", type=Path, help="inspected image identities of suite fixtures")
     parser.add_argument("--pip33-fixture", type=Path, help="owned default-port fixture inspection for the exact main PIP-33 tests")
+    parser.add_argument("--proxy-network", type=Path, help="frozen default-bridge IPv4 prerequisite for the assigned Pulsar proxy test")
     parser.add_argument("--service-url", default="not-applicable")
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--scenario", choices=("producer", "consumer", "roundtrip", "idle"), default="roundtrip")
