@@ -47,7 +47,7 @@ jobs:
           python3 scripts/performance.py campaign ci prepare \
             --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
             --expected-base-sha "$MAIN_SHA" --expected-candidate-sha "$HEAD_SHA" \
-            --output "$RUNNER_TEMP/performance-prepared" --shards 4 --seed-workers 4
+            --output "$RUNNER_TEMP/performance-prepared" --shards 8 --seed-workers 4
       - name: Upload frozen tools image, plans, contracts and provenance
         if: always()
         uses: actions/upload-artifact@v7

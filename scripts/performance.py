@@ -23,7 +23,7 @@ import tomllib
 sys.dont_write_bytecode = True
 SCHEMA_VERSION = 1
 PROFILE_ENV = {"CARGO_PROFILE_RELEASE_DEBUG": "1", "CARGO_PROFILE_RELEASE_STRIP": "none"}
-EXECUTION_CONTRACT_FIELDS = ("harness_sha256", "profile", "features", "toolchain", "image_id", "dockerfile_sha256", "seed")
+EXECUTION_CONTRACT_FIELDS = ("harness_sha256", "profile", "features", "toolchain", "image_id", "dockerfile_sha256", "docker_cli", "seed")
 # Cross-package executable resolved by current_exe(), rather than Cargo env-dep.
 EXECUTION_COMPANIONS = {"crates/magnetar/tests/e2e_scalable_topic.rs": ("magnetarctl", "magnetarctl")}
 METRICS = {"elapsed_ns": "ns/suite-launcher-lifetime", "peak_rss_kib": "KiB/process-and-waited-descendants-peak"}
@@ -266,8 +266,11 @@ def doctest_completion(text, tests):
     actual = []
     expected = {test["name"]: test["ignored"] for test in tests}
     for name, status in re.findall(r"^test (.+) \.\.\. (ok|ignored)$", text, re.MULTILINE):
-        if name not in expected and name.endswith(" - compile fail"):
-            name = name.removesuffix(" - compile fail")
+        if name not in expected:
+            for suffix in (" - compile fail", " - compile"):
+                if name.endswith(suffix):
+                    name = name.removesuffix(suffix)
+                    break
         actual.append({"name": name, "ignored": status == "ignored"})
     if sorted(actual, key=lambda row: row["name"]) != sorted(tests, key=lambda row: row["name"]):
         raise ValueError("doctest executed catalogue differs from inventory")
@@ -1150,7 +1153,7 @@ def session_target(args, output, side, checkout, overlay, environment):
     contract = {"snapshot": source_snapshot(checkout, overlay), "lockfile": digest(checkout / "Cargo.lock"),
                 "axis": getattr(args, "axis", "workspace-all-features"), "profile": PROFILE_ENV,
                 "harness_sha256": digest(__file__),
-                "environment": {key: (environment or {}).get(key) for key in ("image_id", "dockerfile_sha256", "toolchain", "features")}}
+                "environment": {key: (environment or {}).get(key) for key in ("image_id", "dockerfile_sha256", "docker_cli", "toolchain", "features")}}
     marker = target.parent / (side + "-session.json")
     if marker.exists() and json.loads(marker.read_text()) != contract:
         raise ValueError("build session source/configuration differs from its frozen contract")

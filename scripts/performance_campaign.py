@@ -26,6 +26,8 @@ sys.dont_write_bytecode = True
 import performance as perf
 
 IMAGE_BASE = "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
+DOCKER_CLI_SOURCE = "docker@sha256:3f4743208d2338c934d7b8bcfbe1bb54c0b2355c510ad5e0f31c0c4a54bd704e"
+DOCKER_CLI_VERSION = "29.7.2"
 CPU_RESOLUTION_SECONDS = 0.01
 MODES = ("native", "syscalls", "allocations", "copies")
 UNITS = {"native_run_ns": "ns/client-run-window", "elapsed_ns": "ns/launcher-process-lifetime",
@@ -42,10 +44,11 @@ GAPS = ["doctest performance (functional compilation/execution only)", "effectiv
         "explicit feature/fault isolated scenarios", "quiescent RSS/retention after drain",
         "all Rust allocations (glibc dynamic malloc-family only)", "inlined/kernel/DMA copy bytes",
         "client-only attribution of whole-lifecycle instrumented totals"]
-FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apachepulsar/pulsar:4.2.4",
+FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apachepulsar/pulsar:4.2.3", "apachepulsar/pulsar:4.2.4",
                 "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest", "athenz/athenz-zts-server:1.12.41")
 SEED_REGISTRY = "crates/magnetar-runtime-moonpool/seeds/known-failing.toml"
 EXAMPLE_SOURCE = "crates/magnetar/examples/performance.rs"
+BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs")
 
 
 def save(path, data):
@@ -80,8 +83,18 @@ def check_image(image, expected_id, dockerfile_sha256):
     labels = image.get("Config", {}).get("Labels") or {}
     if image.get("Id") != expected_id or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_id):
         raise ValueError("an exact locally inspected image ID is required")
-    if labels.get("org.opencontainers.image.base.digest") != IMAGE_BASE or labels.get("magnetar.performance.dockerfile-sha256") != dockerfile_sha256:
+    if labels.get("org.opencontainers.image.base.digest") != IMAGE_BASE or labels.get("magnetar.performance.dockerfile-sha256") != dockerfile_sha256 or labels.get("magnetar.performance.docker-cli-source") != DOCKER_CLI_SOURCE:
         raise ValueError("inspected image base/Dockerfile build labels differ from audited source")
+
+
+def docker_cli_identity(output, executable=Path("/usr/local/bin/docker")):
+    if shutil.which("docker") != str(executable) or executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError("Docker CLI must resolve to the copied regular executable")
+    version = perf.read_command([str(executable), "--version"], output)
+    if not re.fullmatch(r"Docker version " + re.escape(DOCKER_CLI_VERSION) + r", build [0-9a-f]+", version):
+        raise ValueError("Docker CLI version differs from pinned image source")
+    return {"source_image": DOCKER_CLI_SOURCE, "executable": str(executable),
+            "sha256": perf.digest(executable), "version": version}
 
 
 def verify_fixture_images(images, output):
@@ -476,7 +489,7 @@ def internal_scenarios(args):
     launch = json.loads(args.environment.read_text())
     tools = {package: perf.read_command(["dpkg-query", "-W", "-f=${Version}", package], output) for package in PACKAGES}
     check_environment(launch, tools, perf.read_command(["rustc", "-V"], output), os.sched_getaffinity(0))
-    launch.update(packages=tools, compiler=perf.read_command(["rustc", "-Vv"], output),
+    launch.update(packages=tools, docker_cli=docker_cli_identity(output), compiler=perf.read_command(["rustc", "-Vv"], output),
                   cargo=perf.read_command(["cargo", "-V"], output), kernel=platform.release(),
                   cpuinfo_sha256=perf.digest("/proc/cpuinfo"), harness_sha256=perf.digest(__file__),
                   example_sha256=perf.digest(args.candidate / "crates/magnetar/examples/performance.rs"))
@@ -523,7 +536,7 @@ def internal_scenarios(args):
                            "source_artifact_sha256": perf.digest(source_tar), "build_command": command,
                            "input_manifest": inputs, "dep_info_sha256": perf.digest(dep_info),
                            "input_scope": "compiler dependency closure plus conservative local test/fixture closure"}
-        configuration = {key: launch[key] for key in ("compiler", "cargo", "image_id", "image_base", "dockerfile_sha256", "harness_sha256", "example_sha256", "profile", "features")}
+        configuration = {key: launch[key] for key in ("compiler", "cargo", "image_id", "image_base", "dockerfile_sha256", "docker_cli", "harness_sha256", "example_sha256", "profile", "features")}
         configuration["build_command"] = command
         work = {"scenario_id": args.scenario, "scenario_revision": launch["example_sha256"], "runtime": args.runtime,
                 "messages": args.messages, "payload_bytes": args.payload_bytes, "seed": 17, "batching": False, "control_cost_multiplier": 1}
@@ -572,7 +585,9 @@ def suite_environment(launch, output):
     tools = {package: perf.read_command(["dpkg-query", "-W", "-f=${Version}", package], output) for package in PACKAGES}
     compiler = perf.read_command(["rustc", "-Vv"], output)
     check_environment(launch, tools, compiler, os.sched_getaffinity(0), suite=True)
+    launch["docker_cli"] = docker_cli_identity(output)
     return {"image_id": launch["image_id"], "dockerfile_sha256": launch["dockerfile_sha256"],
+            "docker_cli": launch["docker_cli"],
             "runner": launch["runner_identity"], "cpu_affinity": launch["cpu_affinity"],
             "broker_digests": launch.get("fixture_image_ids", [launch["broker"]["image"]] if launch.get("broker") else []),
             "fixture_scope": launch.get("fixture_scope", "external-private-broker"), "toolchain": compiler, "features": launch["features"],
@@ -932,14 +947,15 @@ def ci_checkout(candidate, base, expected_base, expected_candidate, output):
         perf.read_command(["git", "fetch", "--no-tags", "origin", expected_base], candidate)
         perf.read_command(["git", "worktree", "add", "--detach", str(base), expected_base], candidate)
     perf.check_expected_revision(base, expected_base)
-    source = base / EXAMPLE_SOURCE
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes((candidate / EXAMPLE_SOURCE).read_bytes())
+    for relative in BASELINE_HARNESS_SOURCES:
+        source = base / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes((candidate / relative).read_bytes())
     records = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"], cwd=base,
                              check=True, text=True, capture_output=True).stdout.split("\0")
     dirty = [{"status": record[:2], "path": record[3:], "sha256": perf.digest(base / record[3:])}
              for record in records if record]
-    if any(row["path"] != EXAMPLE_SOURCE for row in dirty):
+    if any(row["path"] not in BASELINE_HARNESS_SOURCES for row in dirty):
         raise ValueError("CI baseline overlay contains an unaudited product change")
     overlay = output / "base-overlay.json"
     save(overlay, {"schema_version": 1, "measured_sha": expected_base, "files": dirty})
@@ -950,7 +966,7 @@ def ci_checkout(candidate, base, expected_base, expected_candidate, output):
 
 def ci_harness(candidate):
     files = ("scripts/performance.py", "scripts/performance_campaign.py", "scripts/performance/Dockerfile",
-             "scripts/performance/control.c", EXAMPLE_SOURCE,
+             "scripts/performance/control.c", *BASELINE_HARNESS_SOURCES,
              "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml")
     return {path: perf.digest(candidate / path) for path in files}
 
@@ -961,6 +977,7 @@ def ci_plan(args):
     payload = json.loads(args.payload.read_text())
     compiler = perf.read_command(["rustc", "-Vv"], output)
     tools = {package: perf.read_command(["dpkg-query", "-W", "-f=${Version}", package], output) for package in PACKAGES}
+    client = docker_cli_identity(output)
     if tools != PACKAGES or not compiler.startswith("rustc 1.98.1 "):
         raise ValueError("planning compiler/tools differ from the qualified image")
     for axis in perf.AXES:
@@ -968,6 +985,7 @@ def ci_plan(args):
             directory = output / "plans" / axis / side
             directory.mkdir(parents=True)
             environment = {"image_id": payload["image_id"], "dockerfile_sha256": payload["dockerfile_sha256"],
+                           "docker_cli": client,
                            "toolchain": compiler, "features": perf.axis_configuration(axis, [])[2], "seed": "17"}
             plan = perf.plan_inventory(checkout, directory, [], payload["revisions"][side],
                                        args.base_overlay if side == "base" else None, args.shards if axis == "workspace-all-features" else 1,
@@ -977,7 +995,7 @@ def ci_plan(args):
                     replay = copy.deepcopy(plan)
                     replay["execution_contract"]["seed"] = str(seed)
                     save(directory / (str(seed) + ".json"), replay)
-    save(output / "planning-tools.json", {"compiler": compiler, "packages": tools,
+    save(output / "planning-tools.json", {"compiler": compiler, "packages": tools, "docker_cli": client,
          "execution_identity": {"uid": os.getuid(), "gid": os.getgid(), "home": os.environ["HOME"], "cargo_home": os.environ["CARGO_HOME"]}})
 
 
@@ -1028,6 +1046,7 @@ def ci_prepare(args):
     if planning_tools["execution_identity"] != {key: execution_identity[key] for key in ("uid", "gid", "home", "cargo_home")}:
         raise ValueError("planning container user, private HOME or Cargo cache differs")
     payload["compiler"] = planning_tools["compiler"]
+    payload["docker_cli"] = planning_tools["docker_cli"]
     payload["source_snapshots"] = {side: json.loads((output / "plans/workspace-all-features" / side / "plan.json").read_text())["snapshot"] for side in ("base", "candidate")}
     save(output / "ci-input.json", payload)
     contract_command = common + ["cargo", "test", "--manifest-path", str(candidate / "Cargo.toml"), "-p", "magnetar-driver",
@@ -1326,6 +1345,7 @@ def validate_scenario_report(report, payload, run, root):
         raise ValueError("scenario report state/content differs from retained artifact")
     environment = report["environment"]
     for field, wanted in (("image_id", payload["image_id"]), ("dockerfile_sha256", payload["dockerfile_sha256"]),
+                          ("docker_cli", payload["docker_cli"]),
                           ("compiler", payload["compiler"]), ("harness_sha256", payload["harness"]["scripts/performance_campaign.py"]),
                           ("example_sha256", payload["harness"][EXAMPLE_SOURCE]), ("profile", perf.PROFILE_ENV),
                           ("features", ["moonpool", "scalable-topics"])):

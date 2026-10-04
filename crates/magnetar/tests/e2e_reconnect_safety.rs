@@ -41,6 +41,7 @@ struct ReconnectGate {
     block_broker_frames: Arc<AtomicBool>,
     broker_frames_released: Arc<Notify>,
     sessions: Arc<AtomicUsize>,
+    closed_sessions: Arc<AtomicUsize>,
     observations: Arc<Mutex<Observations>>,
     changed: Arc<Notify>,
 }
@@ -63,6 +64,7 @@ impl ReconnectGate {
         let block_broker_frames = Arc::new(AtomicBool::new(false));
         let broker_frames_released = Arc::new(Notify::new());
         let sessions = Arc::new(AtomicUsize::new(0));
+        let closed_sessions = Arc::new(AtomicUsize::new(0));
         let observations = Arc::new(Mutex::new(Observations::default()));
         let changed = Arc::new(Notify::new());
 
@@ -71,6 +73,7 @@ impl ReconnectGate {
         let task_block = block_broker_frames.clone();
         let task_released = broker_frames_released.clone();
         let task_sessions = sessions.clone();
+        let task_closed_sessions = ToOwned::to_owned(&closed_sessions);
         let task_observations = observations.clone();
         let task_changed = changed.clone();
         tokio::spawn(async move {
@@ -87,6 +90,7 @@ impl ReconnectGate {
                 let session_released = task_released.clone();
                 let session_observations = task_observations.clone();
                 let session_changed = task_changed.clone();
+                let session_closed_sessions = ToOwned::to_owned(&task_closed_sessions);
                 tokio::spawn(async move {
                     let (client_read, client_write) = client.into_split();
                     let (broker_read, broker_write) = broker.into_split();
@@ -95,7 +99,7 @@ impl ReconnectGate {
                         block_broker_frames: session_block,
                         broker_frames_released: session_released,
                         observations: session_observations,
-                        changed: session_changed,
+                        changed: ToOwned::to_owned(&session_changed),
                     };
                     tokio::select! {
                         _ = relay_frames(
@@ -112,6 +116,8 @@ impl ReconnectGate {
                         ) => {}
                         () = session_cut.notified() => {}
                     }
+                    session_closed_sessions.fetch_add(1, Ordering::SeqCst);
+                    session_changed.notify_waiters();
                 });
             }
         });
@@ -123,6 +129,7 @@ impl ReconnectGate {
             block_broker_frames,
             broker_frames_released,
             sessions,
+            closed_sessions,
             observations,
             changed,
         })
@@ -130,6 +137,22 @@ impl ReconnectGate {
 
     fn cut_current(&self) {
         self.cut.notify_waiters();
+    }
+
+    async fn cut_current_and_wait(&self) {
+        let expected_closed = self.sessions.load(Ordering::SeqCst);
+        self.cut_current();
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.closed_sessions.load(Ordering::SeqCst) >= expected_closed {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("requested proxy sessions did not terminate before releasing broker frames");
     }
 
     fn drop_next_receipt_and_cut(&self) {
@@ -646,7 +669,7 @@ async fn exercise_unconfirmed_high_ack_reconnect(
     consumer.negative_ack(lower.message_id);
     gate.wait_for_redeliveries(redelivery_count + 1).await;
 
-    gate.cut_current();
+    gate.cut_current_and_wait().await;
     gate.release_broker_frames();
     gate.wait_for_sessions(2).await;
     let ack_result = tokio::time::timeout(WAIT, ack_task).await??;

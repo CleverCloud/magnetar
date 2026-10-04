@@ -750,6 +750,17 @@ class MeasurementContracts(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 PERF.doctest_completion(invalid, tests)
 
+    def test_no_run_doctest_compilation_matches_the_listed_case(self):
+        tests = [{"name": "src/lib.rs - (line 15)", "ignored": False}]
+        text = ("test src/lib.rs - (line 15) - compile ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n")
+        self.assertEqual(PERF.doctest_completion(text, tests), 1)
+        for invalid in [text.replace("line 15", "line 16"), text + text,
+                        text.replace(" - compile ...", " - compile unknown ..."),
+                        text.replace("0 filtered out", "1 filtered out")]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                PERF.doctest_completion(invalid, tests)
+
     def test_expected_revision_refuses_swaps_and_nonimmutable_names(self):
         with mock.patch.object(PERF, "read_command", return_value="a" * 40):
             PERF.check_expected_revision(Path("/checkout"), "a" * 40)
@@ -835,6 +846,7 @@ class MeasurementContracts(unittest.TestCase):
                         "scope": "partial-package-selection", "packages": ["synthetic-fixture"],
                         "families": [{"family_id": family, "kind": "doctest" if family == "doctest" else "executable", "fixture_policy": {"scope": "fixture-free", "basis": "synthetic target"}} for family in families]} for side in ("base", "candidate")}
         contract = {"harness_sha256": "a" * 64, "profile": "release-symbolized", "features": ["all"],
+                    "docker_cli": {"source_image": "docker@sha256:" + "c" * 64, "executable": "/usr/local/bin/docker", "sha256": "b" * 64, "version": "Docker version 29.7.2, build 1234567"},
                     "image_id": "sha256:" + "e" * 64, "dockerfile_sha256": "d" * 64, "toolchain": "rustc frozen",
                     "seed": "17", "runner": "frozen image", "kernel": "test kernel", "cpu": "same local CPU", "broker_digests": ["sha256:" + "f" * 64]}
         for plan in plans.values():

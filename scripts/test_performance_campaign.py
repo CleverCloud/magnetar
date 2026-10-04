@@ -9,6 +9,8 @@ import unittest
 import json
 import os
 import stat
+import subprocess
+import re
 import tempfile
 from unittest import mock
 
@@ -20,6 +22,99 @@ SPEC.loader.exec_module(CAMPAIGN)
 
 
 class CampaignContracts(unittest.TestCase):
+    def test_ci_workspace_capacity_preserves_worker_caps_and_exhaustive_union(self):
+        workflow = Path(CAMPAIGN.__file__).resolve().parents[1] / ".github/workflows/performance.yml"
+        text = workflow.read_text()
+        shards, seed_workers = map(int, re.search(r"--shards (\d+) --seed-workers (\d+)", text).groups())
+        self.assertEqual((shards, seed_workers), (8, 4))
+        worker_job = text.split("  workers:\n", 1)[1].split("  reconcile:\n", 1)[0]
+        self.assertIn("timeout-minutes: 180", worker_job)
+        self.assertIn("max-parallel: 4", worker_job)
+        self.assertIn("fail-fast: false", worker_job)
+        families = [f"crate/tests/family-{index}.rs::family-{index}" for index in range(53)]
+        assigned = [[family for family in families if CAMPAIGN.perf.shard_matches(family, shard, shards)]
+                    for shard in range(shards)]
+        CAMPAIGN.check_union(families, assigned)
+        with self.assertRaises(ValueError):
+            CAMPAIGN.check_union(families, assigned[:-1])
+        with self.assertRaises(ValueError):
+            CAMPAIGN.check_union(families, assigned + [assigned[0]])
+        payload = {"shards": shards, "seed_workers": seed_workers, "seed_union": {"seeds": list(range(1, 33))},
+                   "revisions": {"base": "a" * 40, "candidate": "b" * 40}}
+        workers = []
+        for kind, index in ([("workspace", index) for index in range(shards)] +
+                            [("moonpool", index) for index in range(seed_workers)] + [("scenarios", 0)]):
+            runs = [{"axis": axis, "seed": seed, "shard": shard, "runtime": runtime, "scenario": scenario}
+                    for axis, seed, shard, _, runtime, scenario in CAMPAIGN.ci_expected_runs(payload, kind, index)]
+            workers.append({"kind": kind, "worker": index, "revisions": payload["revisions"], "runs": runs})
+        self.assertEqual(len(workers), 13)
+        CAMPAIGN.check_ci_workers(payload, workers)
+
+    def test_docker_cli_identity_rejects_version_path_and_file_type_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); executable = root / "docker"
+            executable.write_bytes(b"copied client bytes"); executable.chmod(0o755)
+            version = "Docker version 29.7.2, build 1234567"
+            with mock.patch.object(CAMPAIGN.shutil, "which", return_value=str(executable)), mock.patch.object(CAMPAIGN.perf, "read_command", return_value=version) as read:
+                identity = CAMPAIGN.docker_cli_identity(root, executable)
+                self.assertEqual(identity, {"source_image": CAMPAIGN.DOCKER_CLI_SOURCE, "executable": str(executable),
+                                            "sha256": CAMPAIGN.perf.digest(executable), "version": version})
+                read.assert_called_once_with([str(executable), "--version"], root)
+                read.return_value = "Docker version 20.10.24, build 1234567"
+                with self.assertRaisesRegex(ValueError, "version differs"):
+                    CAMPAIGN.docker_cli_identity(root, executable)
+                read.return_value = version
+                executable.chmod(0o644)
+                with self.assertRaisesRegex(ValueError, "regular executable"):
+                    CAMPAIGN.docker_cli_identity(root, executable)
+                executable.unlink(); executable.symlink_to(root / "outside")
+                with self.assertRaisesRegex(ValueError, "regular executable"):
+                    CAMPAIGN.docker_cli_identity(root, executable)
+            with mock.patch.object(CAMPAIGN.shutil, "which", return_value="/another/docker"), self.assertRaisesRegex(ValueError, "regular executable"):
+                CAMPAIGN.docker_cli_identity(root, executable)
+
+    def test_batch_chunk_default_image_is_preloaded_and_frozen(self):
+        source = Path(CAMPAIGN.__file__).resolve().parents[1] / "crates/magnetar/tests/e2e_batch_chunk.rs"
+        text = source.read_text()
+        repository = re.search(r'const DEFAULT_IMAGE_REPO: &str = "([^"]+)";', text).group(1)
+        tag = re.search(r'const DEFAULT_IMAGE_TAG: &str = "([^"]+)";', text).group(1)
+        self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
+
+    def test_baseline_overlay_copies_only_the_two_audited_harness_sources(self):
+        fixture = "crates/magnetar/tests/e2e_reconnect_safety.rs"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); base = root / "base"; candidate = root / "candidate"
+            output = root / "output"; output.mkdir()
+            revisions = {}
+            for checkout, label in ((base, "base"), (candidate, "candidate")):
+                checkout.mkdir()
+                for path in (CAMPAIGN.EXAMPLE_SOURCE, fixture, "scripts/performance.py",
+                             "scripts/performance_campaign.py", "scripts/performance/Dockerfile",
+                             "scripts/performance/control.c", "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml"):
+                    target = checkout / path; target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(label + " " + path)
+                subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+                subprocess.run(["git", "add", "."], cwd=checkout, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.name=Contract", "-c", "user.email=contract@example.invalid",
+                                "-c", "commit.gpgsign=false", "commit", "-qm", label],
+                               cwd=checkout, check=True, capture_output=True)
+                revisions[label] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
+                                                  check=True, capture_output=True, text=True).stdout.strip()
+            overlay = CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
+            files = json.loads(overlay.read_text())["files"]
+            self.assertEqual({row["path"] for row in files}, {CAMPAIGN.EXAMPLE_SOURCE, fixture})
+            for row in files:
+                self.assertEqual(row["status"], " M")
+                self.assertEqual((base / row["path"]).read_bytes(), (candidate / row["path"]).read_bytes())
+                self.assertEqual(row["sha256"], CAMPAIGN.perf.digest(candidate / row["path"]))
+            harness = CAMPAIGN.ci_harness(candidate)
+            self.assertEqual(harness[fixture], CAMPAIGN.perf.digest(candidate / fixture))
+            (candidate / fixture).write_text("changed fixture")
+            self.assertNotEqual(harness[fixture], CAMPAIGN.ci_harness(candidate)[fixture])
+            (base / "unexpected-product.rs").write_text("not an audited harness input")
+            with self.assertRaisesRegex(ValueError, "unaudited product change"):
+                CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
+
     def test_inner_invalid_collection_keeps_its_original_machine_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); output = root / "output"; output.mkdir()
@@ -118,8 +213,11 @@ class CampaignContracts(unittest.TestCase):
         launch.update(seed=17, dockerfile_sha256="c" * 64, pip33_fixture={"prefix": "owned"})
         def command(argv, _):
             return "rustc 1.98.1 (pinned)" if argv[0] == "rustc" else CAMPAIGN.PACKAGES[argv[-1]]
-        with mock.patch.object(CAMPAIGN.perf, "read_command", side_effect=command), mock.patch.object(os, "sched_getaffinity", return_value={2, 3}):
+        client = {"source_image": CAMPAIGN.DOCKER_CLI_SOURCE, "executable": "/usr/local/bin/docker", "sha256": "d" * 64,
+                  "version": "Docker version 29.7.2, build 1234567"}
+        with mock.patch.object(CAMPAIGN.perf, "read_command", side_effect=command), mock.patch.object(os, "sched_getaffinity", return_value={2, 3}), mock.patch.object(CAMPAIGN, "docker_cli_identity", return_value=client):
             environment = CAMPAIGN.suite_environment(launch, Path("."))
+        self.assertEqual(environment["campaign_environment"]["docker_cli"], client)
         self.assertEqual(environment["pip33_fixture"], launch["pip33_fixture"])
 
         with self.assertRaises(ValueError):
@@ -153,11 +251,12 @@ class CampaignContracts(unittest.TestCase):
             root = Path(temporary)
             payload = {"revisions": {"base": "a" * 40, "candidate": "b" * 40},
                        "image_id": "sha256:" + "c" * 64, "dockerfile_sha256": "d" * 64, "compiler": "rustc fixed",
+                       "docker_cli": {"source_image": CAMPAIGN.DOCKER_CLI_SOURCE, "executable": "/usr/local/bin/docker", "sha256": "a" * 64, "version": "Docker version 29.7.2, build 1234567"},
                        "harness": {"scripts/performance_campaign.py": "e" * 64, CAMPAIGN.EXAMPLE_SOURCE: "f" * 64},
                        "scenario_contract": {"messages": 2, "payload_bytes": 16, "seed": 17, "batching": False, "control_cost_multiplier": 1, "repetitions": 2}}
             payload["source_snapshots"] = {side: {"source_tree_sha256": side + " sources", "source_manifest": {"Cargo.lock": side + " lock"}} for side in ("base", "candidate")}
             report = {"state": "partial", "environment": {"image_id": payload["image_id"], "dockerfile_sha256": payload["dockerfile_sha256"],
-                      "compiler": payload["compiler"], "harness_sha256": payload["harness"]["scripts/performance_campaign.py"],
+                      "compiler": payload["compiler"], "docker_cli": payload["docker_cli"], "harness_sha256": payload["harness"]["scripts/performance_campaign.py"],
                       "example_sha256": payload["harness"][CAMPAIGN.EXAMPLE_SOURCE], "profile": CAMPAIGN.perf.PROFILE_ENV, "features": ["moonpool", "scalable-topics"]}, "manifests": {},
                       "observations": {"base": [], "candidate": [], "calibration": []}}
             run = {"runtime": "tokio", "scenario": "roundtrip"}
@@ -194,6 +293,15 @@ class CampaignContracts(unittest.TestCase):
             CAMPAIGN.save(root / "scenario-report.json", report)
             CAMPAIGN.write_artifact_manifest(root, "campaign-artifacts.json")
             self.assertEqual(CAMPAIGN.validate_scenario_report(report, payload, run, root), ("tokio", "roundtrip"))
+            for field, value in (("sha256", "b" * 64), ("version", "Docker version 20.10.24, build 1234567")):
+                drift = json.loads(json.dumps(report))
+                drift["environment"]["docker_cli"][field] = value
+                CAMPAIGN.save(root / "scenario-report.json", drift)
+                CAMPAIGN.write_artifact_manifest(root, "campaign-artifacts.json")
+                with self.subTest(docker_cli=field), self.assertRaisesRegex(ValueError, "docker_cli"):
+                    CAMPAIGN.validate_scenario_report(drift, payload, run, root)
+            CAMPAIGN.save(root / "scenario-report.json", report)
+            CAMPAIGN.write_artifact_manifest(root, "campaign-artifacts.json")
             changed = json.loads(json.dumps(report))
             for sample in changed["observations"]["candidate"]:
                 sample["request"]["runtime"] = "moonpool"; sample["workload_identity"]["runtime"] = "moonpool"; sample["observation"]["runtime"] = "moonpool"
@@ -539,6 +647,7 @@ realloc|          2           4096              0  (nomove:0, dec:0, free:0)
         digest = "a" * 64
         image = {"Id": "sha256:" + "b" * 64, "Config": {"Labels": {
             "magnetar.performance.dockerfile-sha256": digest,
+            "magnetar.performance.docker-cli-source": "docker@sha256:3f4743208d2338c934d7b8bcfbe1bb54c0b2355c510ad5e0f31c0c4a54bd704e",
             "org.opencontainers.image.base.digest": CAMPAIGN.IMAGE_BASE}}}
         CAMPAIGN.check_image(image, image["Id"], digest)
         for field in image["Config"]["Labels"]:
