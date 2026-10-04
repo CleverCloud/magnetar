@@ -173,7 +173,7 @@ async fn topic_compaction_status_decodes_long_running_process_status() {
         .await
         .expect("status returns 200");
     assert_eq!(st.status, "RUNNING");
-    assert!(st.last_error.is_empty());
+    assert_eq!(st.last_error, "");
 }
 
 #[tokio::test]

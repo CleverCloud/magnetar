@@ -43,6 +43,15 @@ use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 const CLUSTER_A_URL: &str = "pulsar://localhost:16650";
 const CLUSTER_B_URL: &str = "pulsar://localhost:16651";
 
+fn cluster_a_url() -> String {
+    std::env::var("MAGNETAR_PIP33_CLUSTER_A_URL").unwrap_or_else(|_| CLUSTER_A_URL.to_owned())
+}
+
+fn cluster_b_admin_url() -> String {
+    std::env::var("MAGNETAR_PIP33_ADMIN_B_URL")
+        .unwrap_or_else(|_| "http://localhost:18081".to_owned())
+}
+
 async fn build_client(url: &str) -> Result<PulsarClient, Box<dyn std::error::Error>> {
     Ok(PulsarClient::builder().service_url(url).build().await?)
 }
@@ -75,7 +84,7 @@ async fn consumer_resumes_within_one_second_after_cluster_failover()
     // first publish.) Every await is timeout-bounded so environmental broker
     // death fails the test fast instead of hanging (same hygiene as the
     // `e2e_reconnect` send loop).
-    let client_a = build_client(CLUSTER_A_URL).await?;
+    let client_a = build_client(&cluster_a_url()).await?;
     let producer = client_a.producer(&topic).create().await?;
     let consumer_a = client_a
         .consumer(&topic)
@@ -119,7 +128,8 @@ async fn consumer_resumes_within_one_second_after_cluster_failover()
     // cluster-b — the cross-cluster snapshot/update cycle is asynchronous,
     // so a fixed sleep is a race, not a barrier.
     let subs_url = format!(
-        "http://localhost:18081/admin/v2/persistent/public/default/{topic_name}/subscriptions"
+        "{}/admin/v2/persistent/public/default/{topic_name}/subscriptions",
+        cluster_b_admin_url()
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut materialized = false;
@@ -144,7 +154,9 @@ async fn consumer_resumes_within_one_second_after_cluster_failover()
     client_a.close().await;
 
     // (6) Reconnect to cluster-b and consume.
-    let client_b = build_client(CLUSTER_B_URL).await?;
+    let cluster_b =
+        std::env::var("MAGNETAR_PIP33_CLUSTER_B_URL").unwrap_or_else(|_| CLUSTER_B_URL.to_owned());
+    let client_b = build_client(&cluster_b).await?;
     let consumer_b = tokio::time::timeout(
         Duration::from_secs(15),
         client_b
@@ -209,7 +221,7 @@ async fn replicated_subscription_materializes_on_remote_cluster()
     );
     let topic = format!("persistent://public/default/{topic_name}");
     let subscription = "sub-pip-33-observe";
-    let client = build_client(CLUSTER_A_URL).await?;
+    let client = build_client(&cluster_a_url()).await?;
     let producer = client.producer(&topic).create().await?;
     let consumer = client
         .consumer(&topic)
@@ -237,7 +249,8 @@ async fn replicated_subscription_materializes_on_remote_cluster()
     // materializes, keeping a paced ack'd trickle alive so the
     // snapshot/update cycle has traffic to ride on.
     let subs_url = format!(
-        "http://localhost:18081/admin/v2/persistent/public/default/{topic_name}/subscriptions"
+        "{}/admin/v2/persistent/public/default/{topic_name}/subscriptions",
+        cluster_b_admin_url()
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut materialized = false;

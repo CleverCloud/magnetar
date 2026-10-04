@@ -245,7 +245,7 @@ done
 ```
 
 In CI, the per-PR / per-push pipeline ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) exercises the moonpool suite under the default seed via the regular `test` job.
-A dedicated [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) workflow runs **daily** with **128 freshly-rolled random `u64` seeds in parallel** — see [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) for the rationale (fixed seeds in per-PR CI are wasted compute since each `(commit, seed)` pair is bit-for-bit reproducible; random seeds rolled daily cover the seed space far better over time).
+[performance.yml](../.github/workflows/performance.yml) additionally runs the complete no-buggify Moonpool package on every PR with seeds 1..32 and the deduplicated open anchors from both exact references. The dedicated [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) workflow keeps daily discovery with 128 freshly rolled random `u64` seeds; see the 2026-10-03 amendment in [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) and [measurement scope](performance.md).
 Failing seeds are echoed in the run summary — reproduce locally with `MOONPOOL_SEED=<hex> cargo test -p magnetar-runtime-moonpool …`.
 
 ## Differential equivalence harness
@@ -285,8 +285,6 @@ Moonpool 0.8's `TokioTaskProvider` uses `tokio::spawn`, while `SimTaskProvider` 
 
 ## What is _not_ yet exercised under simulation
 
-- **Property-based seed sweeps** in per-PR CI: the per-PR pipeline runs the test binary on the moonpool default seed only.
-  Multi-seed scheduling is covered by the daily 128-random-seed sweep ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)), not by per-PR CI.
 - **Adversarial in-handshake byte mutation** under `SimProviders` network chaos is not yet swept; corrupt-record rejection is covered by `tls_handshake_chaos.rs` on both engines (1:1), but mutating handshake bytes mid-flight as a network-chaos scenario is open work.
 
 When one of these items moves from "known gap" to "ready to dispatch", it is added to [`follow-ups.md`](follow-ups.md) with the standard **Gap** / **Why it stays open** / `/goal` entry shape.

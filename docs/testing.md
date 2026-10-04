@@ -40,8 +40,9 @@ cargo test -p magnetar-runtime-moonpool \
 cargo clippy -p magnetar-runtime-moonpool \
   --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 
-# Same, swept across seeds 1..32 (local pre-flight; CI runs a 128-random-seed
-# sweep daily — see .github/workflows/moonpool-seed-sweep.yml / ADR-0036).
+# Same, swept across seeds 1..32 locally and on every PR in performance.yml.
+# Open registry anchors are deduplicated across references; daily random
+# discovery remains additive — see performance.md / ADR-0036.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --no-default-features --features crypto-aws-lc-rs \
@@ -66,6 +67,8 @@ cargo test -p magnetar --tests
 
 Contributors with a FIPS toolchain installed locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 `cargo run -p xtask -- check-crypto-matrix` is the authoritative per-provider sweep regardless.
+It checks 16 isolated build cells and runs with runtime test parity on every pull request in [xtask-gates.yml](../.github/workflows/xtask-gates.yml), plus daily and manual runs.
+The crypto matrix does not execute test cases. Sim patch coverage uses the PR target as its diff base: `ci.yml` covers targets named `main`, while `xtask-gates.yml` covers other PR targets and scheduled/manual runs.
 
 The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** in one local command.
 Per ADR-0098, per-PR CI executes the same surface as one non-e2e matrix cell and four e2e cells so they run concurrently and each stays below the 180-minute ceiling.
@@ -226,6 +229,19 @@ docker compose -f docker-compose.replicated-subs.yml up -d
 
 `up -d` bootstraps each cluster's own metadata (the `pulsar-init` service) and leaves both brokers healthy, but it cannot register the two clusters as each other's peers — that needs the admin REST endpoints, which only answer once the brokers are up.
 Skip `configure_replicated_subs.sh` and the replicated-subscription tests have nothing to replicate between.
+
+For a separately provisioned private fixture, the test endpoints can be set without changing its assertions or deadlines:
+
+| Variable                       | Default                    |
+| ------------------------------ | -------------------------- |
+| `MAGNETAR_PIP33_CLUSTER_A_URL` | `pulsar://localhost:16650` |
+| `MAGNETAR_PIP33_CLUSTER_B_URL` | `pulsar://localhost:16651` |
+| `MAGNETAR_PIP33_ADMIN_B_URL`   | `http://localhost:18081`   |
+
+The fixture must advertise the same addresses to client lookups and to its peer brokers.
+Setting these variables does not provision, qualify or modify the fixture.
+The performance campaign must use a task-owned fixture and must never target an ambient shared PIP-33 instance.
+
 Tear down with `docker compose -f docker-compose.replicated-subs.yml down -v`.
 
 ## The `#[ignore]` policy

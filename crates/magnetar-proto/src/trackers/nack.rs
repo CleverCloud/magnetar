@@ -184,7 +184,10 @@ mod tests {
         let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_millis(100));
         let t0 = Instant::now();
         t.add(mid(1), t0);
-        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(50)),
+            [] as [NackAction; 0]
+        );
         let actions = t.poll(t0 + Duration::from_millis(101));
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -202,7 +205,7 @@ mod tests {
         let t0 = Instant::now();
         t.add(mid(1), t0);
         t.remove(&mid(1));
-        assert!(t.poll(t0 + Duration::from_secs(10)).is_empty());
+        assert_eq!(t.poll(t0 + Duration::from_secs(10)), [] as [NackAction; 0]);
     }
 
     #[test]
@@ -212,7 +215,7 @@ mod tests {
         // Override with a tiny delay so the redelivery fires almost immediately.
         t.add_with_delay(mid(7), Duration::from_millis(5), t0);
         // 4ms in — not yet due.
-        assert!(t.poll(t0 + Duration::from_millis(4)).is_empty());
+        assert_eq!(t.poll(t0 + Duration::from_millis(4)), [] as [NackAction; 0]);
         // 10ms in — past the explicit deadline (well under the 10s default).
         let actions = t.poll(t0 + Duration::from_millis(10));
         assert_eq!(actions.len(), 1);
@@ -248,7 +251,10 @@ mod tests {
         t.add(mid(1), t0);
         t.add(mid(1), t0 + Duration::from_millis(50)); // second add — later deadline
         // 110ms in: first add's deadline would fire, but the second add pushed it to 150ms.
-        assert!(t.poll(t0 + Duration::from_millis(110)).is_empty());
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(110)),
+            [] as [NackAction; 0]
+        );
         // 160ms in: now past the overwritten deadline.
         let actions = t.poll(t0 + Duration::from_millis(160));
         assert_eq!(actions.len(), 1);
@@ -292,7 +298,10 @@ mod tests {
         let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_millis(100));
         t.remove(&mid(42));
         assert!(t.is_empty());
-        assert!(t.poll(Instant::now() + Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            t.poll(Instant::now() + Duration::from_secs(1)),
+            [] as [NackAction; 0]
+        );
     }
 
     #[test]

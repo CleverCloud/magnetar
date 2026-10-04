@@ -1508,7 +1508,7 @@ mod outgoing_message_tests {
     fn incoming_replicate_to_helpers() {
         let empty = message_with(pb::MessageMetadata::default());
         assert!(!empty.has_replicate_to());
-        assert!(empty.replicate_to().is_empty());
+        assert_eq!(empty.replicate_to(), [] as [std::string::String; 0]);
 
         let stamped = message_with(pb::MessageMetadata {
             replicate_to: vec!["a".to_owned(), "b".to_owned()],
@@ -1619,7 +1619,10 @@ mod outgoing_message_tests {
             applied: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut msg = OutgoingMessage::with_payload("hi");
-        assert!(msg.properties.is_empty());
+        assert_eq!(
+            msg.properties,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         i.before_send(&mut msg);
         assert_eq!(msg.properties.len(), 1);
         assert_eq!(msg.properties[0].0, "trace-id");

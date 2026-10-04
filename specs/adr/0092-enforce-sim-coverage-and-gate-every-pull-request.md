@@ -5,6 +5,8 @@
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, xtask, moonpool, ci, adr-0024
 
+> **Amendment (2026-10-03).** The combined pull-request domain includes every target branch: `ci.yml` runs this gate for PRs targeting `main`; `xtask-gates.yml` runs it for other PR targets and retains cron/manual execution. PR runs use the target branch as the diff base and a 180-minute job budget; cron/manual use `main` and retain 90 minutes. This changes workflow routing, not enforcement or coverage scope.
+
 ## Context
 
 [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) requires 100% moonpool patch coverage on every diff.

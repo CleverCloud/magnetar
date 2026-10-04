@@ -1,7 +1,6 @@
-name: xtask gates (scheduled)
+name: xtask gates
 
-# The three xtask validation-chain gates that are too heavy or too
-# diff-shaped to gate every PR / push, but that CLAUDE.md / GUIDELINES.md
+# The three xtask validation-chain gates that CLAUDE.md / GUIDELINES.md
 # (ADR-0024, ADR-0035) require to be CI-enforced:
 #
 #   - check-runtime-test-parity : tokio <-> moonpool 1:1 test count (ADR-0024)
@@ -9,23 +8,25 @@ name: xtask gates (scheduled)
 #   - check-sim-coverage        : 100% patch coverage on the diff, over every
 #                                 crate the sim run instruments (ADR-0024)
 #
-# They run daily on a cron (like the moonpool seed sweep, ADR-0036) and on
-# manual dispatch, keeping per-PR `ci.yml` fast.
+# Runtime parity and the crypto build matrix run on every pull request, daily
+# on a cron (like the moonpool seed sweep, ADR-0036), and on manual dispatch.
+# Sim coverage already runs in `ci.yml` for pull requests targeting `main`;
+# this workflow's copy covers every other pull-request target as well as
+# scheduled and manually dispatched runs.
 #
 # NOTE on check-sim-coverage: it is a *diff* gate (lines added relative to
 # `git merge-base origin/main HEAD`). On the scheduled run against `main`
 # that diff is empty, so it short-circuits with "nothing to verify" and
-# never builds the instrumented binaries. It only does real work on a
-# `workflow_dispatch` from a feature branch whose diff touches one of the
-# gated crates.
+# never builds the instrumented binaries. It does real work on a
+# `workflow_dispatch` from a feature branch or on a pull request targeting a
+# branch other than `main` when the diff touches one of the gated crates.
 #
-# Per-PR gating is NOT this job's responsibility and no longer belongs to
-# the developer's local validation chain alone: ADR-0092 added a
-# `check-sim-coverage` job to `ci.yml` that runs on every `pull_request`
-# (making it a required check is a branch-protection step outside this tree
-# — see ADR-0092). This copy stays for the dispatchable-against-any-branch
-# case (measuring a diff without opening a PR) and for the daily heartbeat
-# that proves the gate still builds.
+# Sim-coverage gating for pull requests targeting `main` remains `ci.yml`'s
+# responsibility and no longer belongs to the developer's local validation
+# chain alone: ADR-0092 added its `check-sim-coverage` job there (making it a
+# required check is a branch-protection step outside this tree — see ADR-0092).
+# This copy covers other pull-request targets, the dispatchable-against-any-
+# branch case, and the daily heartbeat that proves the gate still builds.
 #
 # SCOPE of check-sim-coverage: the run executes only the moonpool +
 # differential test binaries, but it reports coverage over every crate that
@@ -48,11 +49,17 @@ name: xtask gates (scheduled)
 # this workflow.
 
 on:
+  pull_request:
   schedule:
     # 04:17 UTC daily. Off-the-hour, and offset from the 03:17 seed sweep to
     # avoid contention.
-    - cron: '17 4 * * *'
+    - cron: "17 4 * * *"
   workflow_dispatch:
+
+# Every job is read-only. Keep pull requests from forks on the repository's
+# least-privilege token instead of inheriting a mutable repository default.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -76,6 +83,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-runtime-test-parity
@@ -94,6 +103,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
@@ -134,6 +145,7 @@ jobs:
 
   sim-coverage:
     name: sim-coverage (patch coverage, sim-instrumented crates)
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'main' }}
     runs-on: ubuntu-latest
     # Budget for one instrumented `--all-features` build of the moonpool +
     # differential test binaries and their dependency closure
@@ -141,23 +153,29 @@ jobs:
     # report to the six crates named in the header note cost no extra
     # compilation — it is a second `cargo llvm-cov report` over artifacts
     # already on disk — so this number did not move with that change. It
-    # only ever binds a `workflow_dispatch` run: the scheduled `main` run
-    # short-circuits before the build. The two comparable `--all-features`
-    # jobs (crypto-matrix above, `test` in ci.yml) both sit at 180, so raise
-    # this if a dispatched cold-cache run is ever cancelled here.
-    timeout-minutes: 90
+    # Pull requests get the same 180-minute budget as the equivalent per-PR
+    # copy in `ci.yml`; a cold-cache cancellation would be a false red. The
+    # existing scheduled and manually dispatched domains retain 90 minutes.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 180 || 90 }}
     steps:
-      # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
-      # `git merge-base origin/main HEAD` resolves. On the scheduled `main`
-      # run the merge-base is HEAD, so the check short-circuits.
+      # fetch-depth: 0 + the explicit comparison-base fetch below make the
+      # xtask's `git merge-base origin/main HEAD` resolve. On the scheduled
+      # `main` run the merge-base is HEAD, so the check short-circuits.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # `--force` + leading `+`: see the identical step in ci.yml. Without
-      # them a non-fast-forward update is rejected and the old fallback
-      # (`|| git fetch origin main`) could not repair it, since that form
-      # writes only FETCH_HEAD.
-      - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
+          persist-credentials: false
+      # The xtask compares against the local `origin/main` name. For a pull
+      # request targeting another branch, map that target to the local name;
+      # scheduled and manual runs keep `main`. `BASE_REF` is an existing base
+      # repository ref, passed through the environment and quoted in the
+      # refspec instead of being interpolated into the shell program.
+      # `--force` + leading `+` let the mapping replace any checkout-created
+      # remote-tracking ref that points elsewhere.
+      - name: Fetch comparison base
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: git fetch --force origin "+refs/heads/${BASE_REF}:refs/remotes/origin/main"
       # check-sim-coverage runs `cargo llvm-cov --all-features` over the
       # moonpool + differential test binaries — which builds aws-lc-fips-sys
       # under coverage instrumentation — then re-exports the same profile

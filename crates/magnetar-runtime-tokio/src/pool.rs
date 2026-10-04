@@ -475,7 +475,10 @@ mod tests {
     fn fresh_pool_is_empty() {
         let pool = ProxyConnectionPool::new(dummy_factory());
         assert_eq!(pool.len(), 0);
-        assert!(pool.keys().is_empty());
+        assert_eq!(
+            pool.keys(),
+            [] as [(std::string::String, std::string::String, usize); 0]
+        );
     }
 
     #[test]

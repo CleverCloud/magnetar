@@ -13,7 +13,13 @@
 > `moonpool-core` and `moonpool-sim` now use crates.io caret requirements at `^0.7.0`; `Cargo.lock` plus the `--locked` validation chain is the reproducibility anchor for `(commit, seed)` replay.
 > Nothing else in this ADR changes.
 
-## Context
+> **Amendment (2026-10-03).** The daily/manual cadence no longer limits runtime test parity or the crypto build matrix: `xtask-gates.yml` runs both on every pull request, with read-only repository permission and no persisted checkout credentials. Its crypto evidence is 16 isolated builds, not test execution.
+> Sim patch coverage runs in `ci.yml` for PRs targeting `main` and in `xtask-gates.yml` for other PR targets; scheduled/manual copies remain. PR sim runs use the existing 180-minute budget and their target branch as diff base; scheduled/manual runs retain 90 minutes and compare against `main`.
+> The historical cost arguments below do not exempt these gates from every-PR execution.
+
+> **Amendment (2026-10-03, exhaustive PR performance delivery).** Every PR now runs fixed seeds 1–32 and the deduplicated open failing-seed anchors from both exact main/head references through `performance.yml`, using the complete runtime-moonpool package without default features and with crypto-aws-lc-rs. The daily 128-random-seed workflow remains additive discovery. The original rejection of fixed PR replay below is superseded for this measurement/functional coverage contract; reproducibility does not exempt a required family or seed. Four replay workers run their assigned seeds sequentially and retain separate per-reference Cargo execution closures. See [performance.md](../../docs/performance.md) for coverage and resource limits.
+
+## Historical context
 
 [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) §"Decision" #3 specifies a deterministic seed sweep over `seed ∈ 1..32` on every validation pass, mirrored by the `moonpool-sim` matrix job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).
 That job fans out 32 parallel runners on every push to `main` and every PR synchronisation, each running the full `magnetar-runtime-moonpool` test suite under one fixed `MOONPOOL_SEED`.
@@ -32,7 +38,7 @@ Fresh random seeds, rolled each run, do that strictly better than a fixed list: 
 [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) §"What is _not_ yet exercised under simulation" already notes that property-style seed sweeps were a known gap.
 This ADR closes that gap by moving the sweep out of the per-PR gate (where deterministic re-execution buys nothing) and into a daily cron job that rolls fresh seeds each run.
 
-## Decision
+## Original decision, amended above
 
 The moonpool seed sweep moves from per-PR / per-push to a dedicated **daily** workflow with **128 random seeds in parallel** (originally 16, bumped per the 2026-06-01 amendment above).
 
@@ -76,11 +82,11 @@ Concretely:
 **Neutral**
 
 - The deterministic-simulation suite itself is unchanged; only the cadence and seed source change.
-- Local validation chain still runs `seq 1 32` — developers who want the per-PR fixed sweep behaviour can `act`-run the old job or call the shell snippet directly.
+- Local validation still runs `seq 1 32`; the 2026-10-03 PR performance workflow also requires those seeds and open anchors.
 
 ## Alternatives considered
 
-- **Keep per-PR fixed sweep, add daily random sweep on top.** Rejected: doubles compute, doesn't fix the "fixed seeds are useless after the first green run" problem.
+- **Keep per-PR fixed sweep, add daily random sweep on top.** Rejected originally, then adopted for the exhaustive PR measurement contract on 2026-10-03. Original rationale: doubles compute, doesn't fix the "fixed seeds are useless after the first green run" problem.
 - **Per-PR random sweep (16 random seeds rolled per PR — the count matches the original daily figure; under the 2026-06-01 amendment the daily count is 128).** Rejected: loses determinism — a flake under one PR's roll can't be reproduced on a rebase.
   The seed-sweep value is in the _reproducible failure_, which only random-but- recorded provides.
 - **Weekly cadence instead of daily.** Rejected: a regression can sit for a week before being noticed; that's too long given how often the moonpool surface changes.
