@@ -552,10 +552,67 @@ def reconcile_families(expected, shards):
         raise ValueError(f"family union differs: missing={dict(wanted - actual)}, unexpected_or_duplicate={dict(actual - wanted)}")
 
 
+def rust_code(contents):
+    """Mask the inert regions handled by xtask's skip_inert_region scanner."""
+    code = list(contents)
+    index = 0
+    raw_string = re.compile(r"(?<!\w)(?:[bc]?r)(?P<hashes>#+)?\"")
+    char_literal = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|[^\n])|[^'\\\n])'")
+    while index < len(contents):
+        end = None
+        if contents.startswith("//", index):
+            newline = contents.find("\n", index + 2)
+            end = len(contents) if newline < 0 else newline
+        elif contents.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < len(contents) and depth:
+                if contents.startswith("/*", end):
+                    depth += 1; end += 2
+                elif contents.startswith("*/", end):
+                    depth -= 1; end += 2
+                else:
+                    end += 1
+            if depth:
+                raise ValueError("unterminated Rust block comment in fixture declaration")
+        else:
+            raw = raw_string.match(contents, index)
+            if raw:
+                delimiter = '"' + (raw.group("hashes") or "")
+                closing = contents.find(delimiter, raw.end())
+                if closing < 0:
+                    raise ValueError("unterminated Rust raw string in fixture declaration")
+                end = closing + len(delimiter)
+            elif contents[index] == '"':
+                end = index + 1
+                while end < len(contents):
+                    if contents[end] == "\\":
+                        end += 2
+                    elif contents[end] == '"':
+                        end += 1
+                        break
+                    else:
+                        end += 1
+                else:
+                    raise ValueError("unterminated Rust string in fixture declaration")
+            elif contents[index] == "'":
+                char = char_literal.match(contents, index)
+                if char:
+                    end = char.end()
+                # A lifetime is code, not a char literal.
+        if end is None:
+            index += 1
+        else:
+            code[index:end] = ["\n" if char == "\n" else " " for char in contents[index:end]]
+            index = end
+    return "".join(code)
+
+
 def fixture_policy(checkout, source):
-    required = "GenericImage::new" in (checkout / source).read_text()
+    required = re.search(r"(?<!\w)(?:r#)?GenericImage\s*::\s*(?:r#)?new\s*\(",
+                         rust_code((checkout / source).read_text())) is not None
     return {"scope": "fixture-required" if required else "fixture-free", "source": source, "source_sha256": digest(checkout / source),
-            "basis": "assigned target declares GenericImage::new" if required else "assigned target has no GenericImage::new declaration; any observed child creation contradicts this scope"}
+            "basis": "assigned target declares a GenericImage::new call outside Rust comments/literals" if required else "assigned target has no GenericImage::new call outside Rust comments/literals; any observed child creation contradicts this scope"}
 
 
 def metadata_families(checkout, metadata, packages):

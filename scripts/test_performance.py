@@ -45,6 +45,42 @@ def record_mock_runtime(command, cwd, env):
 
 
 class MeasurementContracts(unittest.TestCase):
+    def test_fixture_policy_ignores_rust_comments_and_literals(self):
+        inert = r'''
+/// Walks GenericImage::new(...) builder chains.
+/* outer GenericImage::new(...) /* nested GenericImage::new(...) */ */
+const NORMAL: &str = "escaped \" GenericImage::new(...)";
+const RAW: &str = r###"a quote " GenericImage::new(...)"###;
+const BYTE: &[u8] = b"GenericImage::new(...)";
+const RAW_BYTE: &[u8] = br##"GenericImage::new(...)"##;
+const C_STRING: &CStr = c"GenericImage::new(...)";
+const RAW_C: &CStr = cr#"GenericImage::new(...)"#;
+let quote = '"'; let escaped_quote = '\''; let byte_quote = b'"';
+let unicode = '\u{7FFF}';
+// GenericImage::new("broker", "tag")
+'''
+        cases = [(inert, False), ("let x = MyGenericImage::new();", False),
+                 (inert + '\nlet x = GenericImage::new("broker", "tag");', True),
+                 ("let x = GenericImage /* note */ :: new(\"broker\", \"tag\");", True),
+                 ("fn fixture<'a>(x: &'a str) { GenericImage::new(x, \"tag\"); }", True)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "fixture.rs"
+            for contents, required in cases:
+                with self.subTest(contents=contents):
+                    source.write_text(contents)
+                    self.assertEqual(PERF.fixture_policy(root, "fixture.rs")["scope"],
+                                     "fixture-required" if required else "fixture-free")
+                    self.assertEqual(PERF.fixture_policy(root, "fixture.rs")["source_sha256"], PERF.digest(source))
+
+    def test_fixture_policy_refuses_unterminated_rust_regions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "fixture.rs"
+            for contents in ('/* GenericImage::new()', '"GenericImage::new()', 'r##"GenericImage::new()'):
+                with self.subTest(contents=contents):
+                    source.write_text(contents)
+                    with self.assertRaisesRegex(ValueError, "unterminated"):
+                        PERF.fixture_policy(root, "fixture.rs")
+
     def test_compiler_directory_snapshot_rejects_membership_race(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
