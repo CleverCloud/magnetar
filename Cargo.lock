@@ -3064,9 +3064,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-openssl"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d67ff7ccc9938b2b7cee4ccc7efd33da2afe904ab7bd644f008defb259f288a2"
+checksum = "ddabe409dbf2e374bae07c4b8cc90dbb890de5a47890312c46951661eb78760c"
 dependencies = [
  "foreign-types",
  "once_cell",
@@ -3575,7 +3575,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
