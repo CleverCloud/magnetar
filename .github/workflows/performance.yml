@@ -85,7 +85,7 @@ jobs:
           path: ${{ runner.temp }}/performance-prepared
       # Dependency sources only. Every ref uses its own Cargo.lock --locked;
       # CARGO_TARGET_DIR stays outside checkouts and distinct for each ref.
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/performance-cargo
           key: performance-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/performance/Dockerfile') }}
