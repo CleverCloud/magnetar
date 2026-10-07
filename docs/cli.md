@@ -33,6 +33,8 @@ cargo build -p magnetarctl --release
                              default: $HOME/.config/pulsar/config
 --context <name>             Select a named context (overrides current-context).
 --admin-timeout-secs <n>     Admin request timeout (seconds).      default: 60
+--format, -F <json|human>    Output format.                        [env MAGNETAR_FORMAT]
+                             default: json
 -v, --verbose                Increase logging verbosity.
                              (default) magnetar=warn
                              -v      magnetar=info
@@ -47,6 +49,35 @@ All flags are global — `magnetarctl admin -vv tenants list` is equivalent to `
 The `MAGNETAR_*` environment variables seed the same flags so CI pipelines and shell aliases don't have to repeat them.
 
 `--service-url` and `--admin-url` no longer carry a built-in clap default: when neither the flag/env nor an active context supplies a value, the localhost fallback is applied in code, so a context can override the default while an explicit value always wins.
+
+## Output format
+
+Every command prints its result as pretty JSON by default, and that stays the default so existing `| jq` pipelines are untouched.
+`--format human` (alias `-F human`, or `MAGNETAR_FORMAT=human` to make it the shell-wide default) switches to a two-column `LABEL  VALUE` table: one line per field, the label column left-aligned and padded to the widest label.
+Human output uses command-specific labels and unit-aware values; JSON keeps the broker field names and numeric values.
+For retention, durations are expressed in days, hours and minutes without rounding, sizes use `MB`, and `-1` is displayed as `∞`.
+Rates are shown with two decimals (`msg/s`, `B/s`), as are byte sizes.
+Field labels are uppercase and blue on a terminal; piping the output or setting a non-empty `NO_COLOR` disables color.
+
+```sh
+$ magnetarctl admin namespaces get-retention public/default -F human
+RETENTION DURATION  366 days
+RETENTION SIZE      ∞
+```
+
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains` and `admin clusters get-failure-domain` honour `human`; every other command still prints JSON whatever the flag says.
+`admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
+Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
+
+`admin topics stats -F human` displays rates in `msg/s`, throughput in `B/s`, `KB/s`, `MB/s`, etc., and sizes in `B`, `KB`, `MB`, etc., followed by compact tables with one row per producer, subscription and consumer.
+Byte quantities use base 1000 and two decimal places (`214990 B` becomes `214.99 KB`); JSON retains the original numeric values.
+Missing table values display `—`; empty producer, subscription and consumer tables are omitted.
+JSON retains the full producer and subscription details.
+
+`admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line.
+
+`admin clusters list-failure-domains <cluster> -F human` displays a `DOMAIN` / `BROKERS` table with one row per broker; the domain is named on the first row of its group and the cell is left blank on the following rows, so each domain reads as a block. A domain without brokers shows `—`.
+`admin clusters get-failure-domain <cluster> <domain> -F human` prints the same table with the requested domain as its single group.
 
 ## Config file & contexts
 

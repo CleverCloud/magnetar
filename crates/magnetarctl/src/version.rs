@@ -71,7 +71,7 @@ pub(crate) fn long() -> &'static str {
 /// Honors `NO_COLOR` (any non-empty value disables, per
 /// <https://no-color.org>) and falls back to a stdout `is_terminal()`
 /// check. Cached per-process — the banner is built once at parse time.
-fn should_color() -> bool {
+pub(crate) fn should_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
         return false;
     }

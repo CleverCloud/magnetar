@@ -17,8 +17,8 @@ use clap::error::ErrorKind;
 mod cli;
 
 use cli::{
-    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, PackagesCmd, ShadowCmd, SinksCmd, SourcesCmd,
-    SubscriptionsCmd, TenantsCmd, TopicsCmd,
+    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, OutputFormat, PackagesCmd, ShadowCmd, SinksCmd,
+    SourcesCmd, SubscriptionsCmd, TenantsCmd, TopicsCmd,
 };
 use magnetar_admin::PackageType;
 
@@ -1117,4 +1117,79 @@ fn admin_namespaces_set_retention_still_accepts_positive_values() {
         }
         other => panic!("unexpected cmd: {other:?}"),
     }
+}
+
+#[test]
+fn format_defaults_to_json() {
+    // The historical output shape stays the default so `| jq` pipelines
+    // written before `--format` existed keep working unchanged.
+    let cli = parse(&["magnetar", "admin", "namespaces", "get-retention", "t/ns"]);
+    assert_eq!(cli.format, OutputFormat::Json);
+}
+
+#[test]
+fn format_long_flag_selects_human() {
+    let cli = parse(&[
+        "magnetar",
+        "--format",
+        "human",
+        "admin",
+        "namespaces",
+        "get-retention",
+        "t/ns",
+    ]);
+    assert_eq!(cli.format, OutputFormat::Human);
+}
+
+#[test]
+fn format_short_alias_is_capital_f() {
+    // `-F` rather than `-f`: lowercase `-f` is left free for a future
+    // `--file`-style flag, as on pulsarctl.
+    let cli = parse(&[
+        "magnetar",
+        "-F",
+        "human",
+        "admin",
+        "namespaces",
+        "get-retention",
+        "t/ns",
+    ]);
+    assert_eq!(cli.format, OutputFormat::Human);
+}
+
+#[test]
+fn format_is_global_and_accepted_after_subcommand() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "namespaces",
+        "get-retention",
+        "t/ns",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(cli.format, OutputFormat::Json);
+    assert!(matches!(
+        cli.cmd,
+        Cmd::Admin {
+            sub: AdminCmd::Namespaces {
+                sub: NamespacesCmd::GetRetention { .. }
+            }
+        }
+    ));
+}
+
+#[test]
+fn format_rejects_unknown_value() {
+    let err = Cli::try_parse_from([
+        "magnetar",
+        "--format",
+        "yaml",
+        "admin",
+        "namespaces",
+        "get-retention",
+        "t/ns",
+    ])
+    .expect_err("yaml is not an output format");
+    assert_eq!(err.kind(), ErrorKind::InvalidValue);
 }
