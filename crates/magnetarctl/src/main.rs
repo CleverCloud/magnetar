@@ -38,6 +38,17 @@ mod config;
 pub(crate) mod output;
 mod version;
 
+/// `println!` for command output: a reader that closed the pipe (`| head`)
+/// ends the process quietly instead of panicking. See [`write_stdout`].
+macro_rules! outln {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), true) };
+}
+
+/// `print!` counterpart of [`outln!`].
+macro_rules! out {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), false) };
+}
+
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -2391,13 +2402,13 @@ fn run_context(
             }
             cfg.current_context.clone_from(&name);
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Switched to context \"{name}\".");
+            outln!("Switched to context \"{name}\".");
             Ok(())
         }
         ContextCmd::Set { .. } => {
             let name = context_set(&mut cfg, globals, cmd);
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Context \"{name}\" set.");
+            outln!("Context \"{name}\" set.");
             Ok(())
         }
         ContextCmd::Delete { name } => {
@@ -2414,7 +2425,7 @@ fn run_context(
                 );
             }
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Context \"{name}\" deleted.");
+            outln!("Context \"{name}\" deleted.");
             Ok(())
         }
         ContextCmd::Get => {
@@ -2425,7 +2436,7 @@ fn run_context(
             if cfg.current_context.is_empty() {
                 return Err(CliError::BadArg("no current context set".to_owned()));
             }
-            println!("{}", cfg.current_context);
+            outln!("{}", cfg.current_context);
             Ok(())
         }
         ContextCmd::Rename { old, new, force } => {
@@ -2462,7 +2473,7 @@ fn run_context(
             if overwriting {
                 eprintln!("warning: overwrote existing context \"{new}\".");
             }
-            println!("Context \"{old}\" renamed to \"{new}\".");
+            outln!("Context \"{old}\" renamed to \"{new}\".");
             Ok(())
         }
     }
@@ -2584,9 +2595,12 @@ fn load_or_default(resolved: &config::ResolvedPath) -> Result<config::PulsarConf
 /// BOOKIE SERVICE URL`, `*` on the current context.
 #[allow(clippy::print_literal)]
 fn print_context_table(cfg: &config::PulsarConfig) {
-    println!(
+    outln!(
         "{:<8} {:<28} {:<28} {}",
-        "CURRENT", "NAME", "ADMIN SERVICE URL", "BOOKIE SERVICE URL"
+        "CURRENT",
+        "NAME",
+        "ADMIN SERVICE URL",
+        "BOOKIE SERVICE URL"
     );
     for (name, ctx) in &cfg.contexts {
         let marker = if *name == cfg.current_context {
@@ -2594,9 +2608,12 @@ fn print_context_table(cfg: &config::PulsarConfig) {
         } else {
             ""
         };
-        println!(
+        outln!(
             "{:<8} {:<28} {:<28} {}",
-            marker, name, ctx.admin_service_url, ctx.bookie_service_url
+            marker,
+            name,
+            ctx.admin_service_url,
+            ctx.bookie_service_url
         );
     }
 }
@@ -2619,29 +2636,33 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
         .lookup_scalable_topic(topic)
         .await
         .map_err(|e| CliError::BadArg(format!("scalable lookup failed: {e}")))?;
-    println!("topic: {topic}");
+    outln!("topic: {topic}");
     if let Some(resolved) = lookup.resolved_topic_name.as_deref() {
-        println!("resolved: {resolved}");
+        outln!("resolved: {resolved}");
     }
-    println!(
+    outln!(
         "controller-broker: {}",
         lookup.controller_broker_url.as_deref().unwrap_or("-")
     );
-    println!("layout-epoch: {}", lookup.epoch);
-    println!(
+    outln!("layout-epoch: {}", lookup.epoch);
+    outln!(
         "{:<10} {:<18} {:<10} BROKER",
-        "SEGMENT", "KEY-RANGE", "STATE"
+        "SEGMENT",
+        "KEY-RANGE",
+        "STATE"
     );
     for seg in &lookup.segments {
         let state = format!("{:?}", seg.state);
         // A sealed segment the broker no longer serves carries no placement.
         let broker = seg.broker_url.as_deref().unwrap_or("-");
-        println!(
+        outln!(
             "{:<10} [{:>5},{:>5}) {state:<10} {broker}",
-            seg.segment_id.0, seg.key_range.start, seg.key_range.end,
+            seg.segment_id.0,
+            seg.key_range.start,
+            seg.key_range.end,
         );
     }
-    println!("({} segment(s))", lookup.segments.len());
+    outln!("({} segment(s))", lookup.segments.len());
     Ok(())
 }
 
@@ -2754,7 +2775,7 @@ async fn run_admin_clusters(
             match format {
                 OutputFormat::Json => print_json(&domains),
                 OutputFormat::Human => {
-                    print!(
+                    out!(
                         "{}",
                         output::render_failure_domains(&domains, version::should_color())
                     );
@@ -2770,7 +2791,7 @@ async fn run_admin_clusters(
                     // Same `DOMAIN` / `BROKERS` table as `list-failure-domains`,
                     // with the requested domain as the single group.
                     let single = serde_json::json!({ domain: details });
-                    print!(
+                    out!(
                         "{}",
                         output::render_failure_domains(&single, version::should_color())
                     );
@@ -2799,7 +2820,7 @@ async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), C
             // JSON — print it verbatim rather than re-wrapping in a
             // JSON string for a script-friendly exit.
             let body = admin.brokers_health_check().await?;
-            println!("{body}");
+            outln!("{body}");
             Ok(())
         }
         BrokersCmd::OwnedNamespaces { cluster, broker } => {
@@ -3436,7 +3457,7 @@ async fn run_admin_topics(
                         }
                     }
                     let topics = output::collapse_partitioned_topics(&topics, &counts);
-                    print!(
+                    out!(
                         "{}",
                         output::render_topics(&topics, version::should_color())
                     );
@@ -3464,7 +3485,7 @@ async fn run_admin_topics(
                 admin.topic_stats(&topic).await?
             };
             if format == OutputFormat::Human {
-                print!(
+                out!(
                     "{}",
                     output::render_topic_stats(&stats, partitions, version::should_color())
                 );
@@ -4050,9 +4071,39 @@ fn build_admin(conn: &ResolvedConnection, timeout_secs: u64) -> Result<AdminClie
     Ok(builder.build()?)
 }
 
+/// Exit status when stdout's reader went away: the value a shell reports for
+/// a process killed by `SIGPIPE`, which is what `cat | head` yields.
+const EXIT_BROKEN_PIPE: u8 = 141;
+
+/// Write command output to stdout and flush it.
+///
+/// `std`'s `print!` panics when the write fails, so `magnetarctl … | head`
+/// used to end with a `failed printing to stdout: Broken pipe` backtrace once
+/// `head` closed its end. The workspace forbids `unsafe`, so `SIGPIPE` cannot
+/// be reset to its default disposition; instead a `BrokenPipe` error ends the
+/// process quietly with the same status a signal death would show. Any other
+/// write error is reported on stderr and exits 1.
+pub(crate) fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let written = stdout.write_fmt(args).and_then(|()| {
+        if newline {
+            stdout.write_all(b"\n")?;
+        }
+        stdout.flush()
+    });
+    if let Err(err) = written {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(i32::from(EXIT_BROKEN_PIPE));
+        }
+        eprintln!("magnetarctl: failed writing to stdout: {err}");
+        std::process::exit(1);
+    }
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
     let s = serde_json::to_string_pretty(value)?;
-    println!("{s}");
+    outln!("{s}");
     Ok(())
 }
 
@@ -4066,7 +4117,7 @@ fn print_formatted_list(
         OutputFormat::Json => print_json(&values),
         OutputFormat::Human => {
             let rows: Vec<_> = values.iter().map(|value| [value.clone()]).collect();
-            print!(
+            out!(
                 "{}",
                 output::render_table([label], &rows, version::should_color())
             );
@@ -4085,7 +4136,7 @@ fn print_formatted<T: serde::Serialize + output::HumanOutput>(
         OutputFormat::Json => print_json(value),
         OutputFormat::Human => {
             let s = output::render_rows(&value.human_fields(), version::should_color());
-            print!("{s}");
+            out!("{s}");
             Ok(())
         }
     }
@@ -4274,9 +4325,12 @@ async fn run_produce(
             msg = msg.property(k, v);
         }
         let receipt = producer.send(msg.into()).await?;
-        println!(
+        outln!(
             "produced #{idx} -> ledger={} entry={} partition={} batch_index={}",
-            receipt.ledger_id, receipt.entry_id, receipt.partition, receipt.batch_index,
+            receipt.ledger_id,
+            receipt.entry_id,
+            receipt.partition,
+            receipt.batch_index,
         );
     }
     producer.close().await?;
@@ -4307,7 +4361,7 @@ async fn run_consume(
     for idx in 0..count {
         let msg = consumer.receive().await?;
         let payload = String::from_utf8_lossy(&msg.payload);
-        println!(
+        outln!(
             "received #{idx} id=(ledger={} entry={} partition={} batch_index={}) payload={}",
             msg.message_id.ledger_id,
             msg.message_id.entry_id,
