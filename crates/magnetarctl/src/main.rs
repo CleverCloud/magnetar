@@ -153,7 +153,7 @@ pub(crate) struct Cli {
     /// JSON; `human` prints a two-column `FIELD  VALUE` table. Only
     /// namespace and topic `get-retention`, `admin topics list` / `stats`,
     /// `admin clusters list` / `list-failure-domains` / `get-failure-domain`
-    /// honour `human` so far —
+    /// and `admin tenants list` honour `human` so far —
     /// every other command still prints JSON whatever the flag says.
     #[arg(
         long,
@@ -2654,7 +2654,7 @@ async fn run_admin(
     let admin = build_admin(conn, timeout_secs)?;
     match cmd {
         AdminCmd::Clusters { sub } => run_admin_clusters(&admin, format, sub).await,
-        AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
+        AdminCmd::Tenants { sub } => run_admin_tenants(&admin, format, sub).await,
         AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, format, sub).await,
         AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
@@ -3001,9 +3001,13 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
     }
 }
 
-async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), CliError> {
+async fn run_admin_tenants(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: TenantsCmd,
+) -> Result<(), CliError> {
     match cmd {
-        TenantsCmd::List => print_json(&admin.tenants_list().await?),
+        TenantsCmd::List => print_formatted_list(format, "tenant", &admin.tenants_list().await?),
         TenantsCmd::Create {
             name,
             admin_role,
