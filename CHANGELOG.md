@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`magnetarctl --format` / `-F` / `MAGNETAR_FORMAT` selects the output format: `json` (unchanged default) or `human`.**
+  `human` prints command-specific labels with unit-aware values: a two-column `LABEL  VALUE` table for `admin namespaces get-retention` and `admin topics get-retention` (durations in days/hours/minutes, sizes in `MB`, `-1` shown as `∞`), aligned tables for `admin topics list` (physical partitions collapsed under their parent with the declared count), `admin clusters list`, `admin clusters list-failure-domains` and `admin clusters get-failure-domain` (one row per broker, the domain named once per group), and an aggregate block followed by per-producer, per-subscription and per-consumer tables for `admin topics stats` (rates and byte sizes with two decimals, decimal SI units).
+  Labels are uppercase and blue on a terminal; a pipe or a non-empty `NO_COLOR` disables color.
+  Every other command still prints JSON whatever the flag says, and `json` output is byte-for-byte unchanged.
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed

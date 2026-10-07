@@ -35,6 +35,7 @@ compile_error!(
 );
 
 mod config;
+pub(crate) mod output;
 mod version;
 
 use std::process::ExitCode;
@@ -148,8 +149,37 @@ pub(crate) struct Cli {
     )]
     pub(crate) admin_timeout_secs: u64,
 
+    /// Output format. `json` (default) prints the broker payload as pretty
+    /// JSON; `human` prints a two-column `FIELD  VALUE` table. Only
+    /// namespace and topic `get-retention`, `admin topics list` / `stats`,
+    /// `admin clusters list` / `list-failure-domains` / `get-failure-domain`
+    /// honour `human` so far —
+    /// every other command still prints JSON whatever the flag says.
+    #[arg(
+        long,
+        short = 'F',
+        env = "MAGNETAR_FORMAT",
+        value_enum,
+        default_value_t = OutputFormat::Json,
+        global = true
+    )]
+    pub(crate) format: OutputFormat,
+
     #[command(subcommand)]
     pub(crate) cmd: Cmd,
+}
+
+/// How a command renders its result on stdout (`--format` / `-F` /
+/// `MAGNETAR_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Pretty-printed JSON — the historical (and still default) shape, kept
+    /// stable for scripts that pipe into `jq`.
+    #[default]
+    Json,
+    /// A two-column `FIELD  VALUE` table, one top-level field per line, for a
+    /// person reading a terminal.
+    Human,
 }
 
 /// Top-level subcommands.
@@ -2036,7 +2066,7 @@ async fn run(cli: Cli, token_from_flag: bool) -> Result<(), CliError> {
             )
             .await
         }
-        Cmd::Admin { sub } => run_admin(&conn, cli.admin_timeout_secs, sub).await,
+        Cmd::Admin { sub } => run_admin(&conn, cli.admin_timeout_secs, cli.format, sub).await,
         Cmd::Context { .. } => unreachable!("handled above"),
         #[cfg(feature = "scalable-topics")]
         Cmd::TopicInfo { topic } => {
@@ -2618,14 +2648,15 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
 async fn run_admin(
     conn: &ResolvedConnection,
     timeout_secs: u64,
+    format: OutputFormat,
     cmd: AdminCmd,
 ) -> Result<(), CliError> {
     let admin = build_admin(conn, timeout_secs)?;
     match cmd {
-        AdminCmd::Clusters { sub } => run_admin_clusters(&admin, sub).await,
+        AdminCmd::Clusters { sub } => run_admin_clusters(&admin, format, sub).await,
         AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
-        AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, sub).await,
-        AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
+        AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, format, sub).await,
+        AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
         AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
         AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
@@ -2711,14 +2742,41 @@ async fn run_admin_subscriptions(
     }
 }
 
-async fn run_admin_clusters(admin: &AdminClient, cmd: ClustersCmd) -> Result<(), CliError> {
+async fn run_admin_clusters(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: ClustersCmd,
+) -> Result<(), CliError> {
     match cmd {
-        ClustersCmd::List => print_json(&admin.cluster_list().await?),
+        ClustersCmd::List => print_formatted_list(format, "cluster", &admin.cluster_list().await?),
         ClustersCmd::ListFailureDomains { cluster } => {
-            print_json(&admin.cluster_failure_domains_list(&cluster).await?)
+            let domains = admin.cluster_failure_domains_list(&cluster).await?;
+            match format {
+                OutputFormat::Json => print_json(&domains),
+                OutputFormat::Human => {
+                    print!(
+                        "{}",
+                        output::render_failure_domains(&domains, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
         }
         ClustersCmd::GetFailureDomain { cluster, domain } => {
-            print_json(&admin.cluster_failure_domain_get(&cluster, &domain).await?)
+            let details = admin.cluster_failure_domain_get(&cluster, &domain).await?;
+            match format {
+                OutputFormat::Json => print_json(&details),
+                OutputFormat::Human => {
+                    // Same `DOMAIN` / `BROKERS` table as `list-failure-domains`,
+                    // with the requested domain as the single group.
+                    let single = serde_json::json!({ domain: details });
+                    print!(
+                        "{}",
+                        output::render_failure_domains(&single, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
         }
         ClustersCmd::ListNamespaceIsolationPolicies { cluster } => {
             print_json(&admin.namespace_isolation_policies_list(&cluster).await?)
@@ -2970,7 +3028,11 @@ async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), C
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result<(), CliError> {
+async fn run_admin_namespaces(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: NamespacesCmd,
+) -> Result<(), CliError> {
     match cmd {
         NamespacesCmd::List { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
         NamespacesCmd::Create { namespace } => {
@@ -2982,7 +3044,7 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetRetention { namespace } => {
-            print_json(&admin.namespace_get_retention(&namespace).await?)
+            print_formatted(format, &admin.namespace_get_retention(&namespace).await?)
         }
         NamespacesCmd::SetRetention {
             namespace,
@@ -3349,9 +3411,35 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), CliError> {
+async fn run_admin_topics(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: TopicsCmd,
+) -> Result<(), CliError> {
     match cmd {
-        TopicsCmd::List { namespace } => print_json(&admin.topics_list(&namespace).await?),
+        TopicsCmd::List { namespace } => {
+            let topics = admin.topics_list(&namespace).await?;
+            match format {
+                OutputFormat::Json => print_json(&topics),
+                OutputFormat::Human => {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for topic in &topics {
+                        if let Some((parent, _)) = output::partition_parent(topic) {
+                            if !counts.contains_key(parent) {
+                                let count = admin.topic_partitions_count(parent).await?;
+                                counts.insert(parent.to_owned(), count);
+                            }
+                        }
+                    }
+                    let topics = output::collapse_partitioned_topics(&topics, &counts);
+                    print!(
+                        "{}",
+                        output::render_topics(&topics, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         TopicsCmd::Create { topic, partitions } => {
             admin.topic_create_partitioned(&topic, partitions).await?;
             Ok(())
@@ -3371,6 +3459,13 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             } else {
                 admin.topic_stats(&topic).await?
             };
+            if format == OutputFormat::Human {
+                print!(
+                    "{}",
+                    output::render_topic_stats(&stats, partitions, version::should_color())
+                );
+                return Ok(());
+            }
             // `TopicStats` derives `Deserialize` but not `Serialize` (it is
             // permissive); re-emit it via a manual JSON object so the CLI
             // output is human-friendly.
@@ -3421,7 +3516,9 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             let id = admin.topic_get_message_id_by_index(&topic, index).await?;
             print_json(&message_id_to_json(&id))
         }
-        TopicsCmd::GetRetention { topic } => print_json(&admin.topic_get_retention(&topic).await?),
+        TopicsCmd::GetRetention { topic } => {
+            print_formatted(format, &admin.topic_get_retention(&topic).await?)
+        }
         TopicsCmd::SetRetention {
             topic,
             time_minutes,
@@ -3953,6 +4050,41 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
     let s = serde_json::to_string_pretty(value)?;
     println!("{s}");
     Ok(())
+}
+
+/// Shared format selection for single-column named lists.
+fn print_formatted_list(
+    format: OutputFormat,
+    label: &str,
+    values: &[String],
+) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => print_json(&values),
+        OutputFormat::Human => {
+            let rows: Vec<_> = values.iter().map(|value| [value.clone()]).collect();
+            print!(
+                "{}",
+                output::render_table([label], &rows, version::should_color())
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Print `value` in the requested [`OutputFormat`]: pretty JSON, or the
+/// command-specific human presentation.
+fn print_formatted<T: serde::Serialize + output::HumanOutput>(
+    format: OutputFormat,
+    value: &T,
+) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => print_json(value),
+        OutputFormat::Human => {
+            let s = output::render_rows(&value.human_fields(), version::should_color());
+            print!("{s}");
+            Ok(())
+        }
+    }
 }
 
 /// Render a [`MessageId`] as the canonical CLI JSON object, mirroring Java's
