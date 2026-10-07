@@ -79,6 +79,11 @@ JSON retains the full producer and subscription details.
 `admin clusters list-failure-domains <cluster> -F human` displays a `DOMAIN` / `BROKERS` table with one row per broker; the domain is named on the first row of its group and the cell is left blank on the following rows, so each domain reads as a block. A domain without brokers shows `—`.
 `admin clusters get-failure-domain <cluster> <domain> -F human` prints the same table with the requested domain as its single group.
 
+### Piping
+
+Output is written to stdout and flushed per command.
+When the reader closes the pipe early (`magnetarctl admin tenants list | head`), `magnetarctl` ends quietly with status 141, the value a shell reports for a `SIGPIPE` death, instead of panicking with a `Broken pipe` backtrace.
+
 ## Config file & contexts
 
 `magnetarctl` reads the standard pulsarctl config file as-is and can edit it with the [`context`](#context) command group, so an existing pulsarctl setup works with zero extra flags.

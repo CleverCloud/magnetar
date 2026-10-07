@@ -183,6 +183,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `rustls` is no longer asked for its `logging` feature, so the `rustls` instance magnetar builds stops emitting `log` records unless another crate in the build enables the feature; nothing in this workspace consumes them, because no `log` to `tracing` bridge is active in any build.
   Floors are unchanged.
 
+### Fixed
+
+- **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
+  Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed
