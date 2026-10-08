@@ -336,6 +336,37 @@ async fn run_with_config(
                 };
                 stream.push(event);
             }
+            Op::SendThroughBatchingProducer {
+                payloads,
+                max_batch_bytes,
+            } => {
+                let req = crate::trace::batching_producer_request(&trace.topic, *max_batch_bytes);
+                let batching = client.open_producer_with(req, None).await?;
+                let sends: Vec<_> = payloads
+                    .iter()
+                    .map(|p| batching.send(crate::trace::plain_message(p)))
+                    .collect();
+                let mut outcomes = Vec::with_capacity(sends.len());
+                for send in sends {
+                    outcomes.push(send.await.map_err(|e| classify(&e)));
+                }
+                stream.push(Event::SentAll { outcomes });
+            }
+            Op::SendCompressedBatch {
+                payloads,
+                codec,
+                layout,
+            } => {
+                let msg = crate::trace::compressed_batch_message(payloads, *codec, *layout);
+                let event = match producer.as_ref() {
+                    Some(p) => match p.send(msg).await {
+                        Ok(message_id) => Event::Sent { message_id },
+                        Err(e) => Event::SendError { kind: classify(&e) },
+                    },
+                    None => producer_dropped_send_error(),
+                };
+                stream.push(event);
+            }
             Op::SendWithSourceId {
                 source_msg_id,
                 payload,

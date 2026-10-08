@@ -45,7 +45,9 @@ pub mod runner_moonpool;
 pub mod runner_tokio;
 pub mod trace;
 
-pub use crate::trace::{Event, EventStream, Op, Trace, pack_batch_body};
+pub use crate::trace::{
+    BatchLayout, Event, EventStream, Op, Trace, compressed_batch_message, pack_batch_body,
+};
 
 /// Wall-clock anti-hang backstop for the differential equivalence runners.
 ///

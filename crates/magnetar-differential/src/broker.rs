@@ -75,6 +75,13 @@ struct StoredMessage {
     /// messages, because that is what makes "one entry" and "one permit" stop
     /// being the same thing.
     batch_size: i32,
+    /// Issue #860: the producer's `MessageMetadata.compression` stamp, echoed back on dispatch —
+    /// a real broker never decompresses or re-packs an entry.
+    compression: Option<i32>,
+    /// The producer's `MessageMetadata.uncompressed_size`, kept only alongside a
+    /// [`Self::compression`] stamp: every pre-#860 trace sends uncompressed and so still pushes
+    /// byte-identical frames.
+    uncompressed_size: Option<u32>,
 }
 
 /// One entry the broker is about to push, plus the per-dispatch framing a real
@@ -1519,6 +1526,11 @@ fn handle_frame(
                         // unbatched send leaves the field absent, which stores `0` and keeps
                         // the pushed frame byte-identical to every pre-#436 trace.
                         batch_size: payload.metadata.num_messages_in_batch.unwrap_or(0),
+                        compression: payload.metadata.compression,
+                        uncompressed_size: payload
+                            .metadata
+                            .compression
+                            .and(payload.metadata.uncompressed_size),
                     };
                     let partition = partition_index_of(&topic);
                     // PIP-180 / ADR-0033: if the client asserted a source-topic
@@ -1586,7 +1598,13 @@ fn handle_frame(
                         .entry(partition)
                         .or_default()
                         .push((ledger_id, entry_id));
-                    emit_send_receipt(out, s.producer_id, s.sequence_id, ledger_id, entry_id);
+                    emit_send_receipt(
+                        out,
+                        s.producer_id,
+                        (s.sequence_id, s.highest_sequence_id),
+                        ledger_id,
+                        entry_id,
+                    );
                 }
             }
         }
@@ -2856,10 +2874,14 @@ fn emit_success(out: &mut BytesMut, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
+/// `(sequence_id, highest_sequence_id)` is echoed from the `CommandSend`, as a real broker
+/// does: a batching producer's frame covers `sequence_id..=highest_sequence_id`, and its receipt
+/// must too (issue #860 review). An unbatched send carries no `highest_sequence_id` and keeps
+/// the `Some(0)` every pre-#860 trace was recorded with.
 fn emit_send_receipt(
     out: &mut BytesMut,
     producer_id: u64,
-    sequence_id: u64,
+    (sequence_id, highest_sequence_id): (u64, Option<u64>),
     ledger_id: u64,
     entry_id: u64,
 ) {
@@ -2877,7 +2899,7 @@ fn emit_send_receipt(
                 batch_size: Some(0),
                 first_chunk_message_id: None,
             }),
-            highest_sequence_id: Some(0),
+            highest_sequence_id: Some(highest_sequence_id.unwrap_or(0)),
         }),
         ..Default::default()
     };
@@ -2985,7 +3007,9 @@ fn emit_message(out: &mut BytesMut, consumer_id: u64, dispatch: &Dispatch) {
     // `batch_index = -1` because the id addresses the WHOLE entry. `batch_size == 0` (an
     // unbatched send) reproduces the pre-#436 frame exactly: no `num_messages_in_batch`,
     // `batch_size: Some(0)`.
-    let batched = stored.batch_size > 1;
+    // Issue #860 review: any declared count is echoed — a one-member batch included, which a
+    // real broker forwards verbatim and a Java consumer reads as a batch.
+    let batched = stored.batch_size > 0;
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Message as i32,
         message: Some(pb::CommandMessage {
@@ -3017,6 +3041,8 @@ fn emit_message(out: &mut BytesMut, consumer_id: u64, dispatch: &Dispatch) {
         encryption_algo: stored.encryption_algo.clone(),
         encryption_param: stored.encryption_param.clone(),
         num_messages_in_batch: batched.then_some(stored.batch_size),
+        compression: stored.compression,
+        uncompressed_size: stored.uncompressed_size,
         ..Default::default()
     };
     // payload encoding will compute the CRC over [meta_size][meta][payload].

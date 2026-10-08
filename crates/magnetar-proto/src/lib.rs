@@ -78,6 +78,7 @@ pub mod auth;
 pub mod backoff;
 pub mod buggify;
 pub mod cluster_failover;
+pub mod compress;
 pub mod conn;
 pub(crate) mod conn_types;
 pub mod consumer;

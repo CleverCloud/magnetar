@@ -137,7 +137,6 @@ fn message_frame(handle: ConsumerHandle, entry_id: u64, payload: &[u8]) -> Bytes
         producer_name: "stall-test-producer".to_owned(),
         sequence_id: entry_id,
         publish_time: 1_700_000_000_000,
-        num_messages_in_batch: Some(1),
         ..Default::default()
     };
     let mut frame = BytesMut::new();

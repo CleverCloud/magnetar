@@ -14668,7 +14668,6 @@ mod conn_state_tests {
             producer_name: "producer".to_owned(),
             sequence_id: 1,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         }
     }
@@ -16388,8 +16387,7 @@ mod conn_state_tests {
         let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
-        let mut meta = marker_metadata(21); // TXN_COMMIT
-        meta.num_messages_in_batch = Some(1);
+        let meta = marker_metadata(21); // TXN_COMMIT
         let frame = message_frame(handle.0, &meta, b"txn-payload");
         conn.handle_bytes(Instant::now(), &frame)
             .expect("handle txn marker frame");
@@ -16915,7 +16913,6 @@ mod conn_state_tests {
             producer_name: "magnetar-test-prod".to_owned(),
             sequence_id: 1,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         };
         let cmd = deliver_cmd(handle, ledger, entry);
@@ -17876,7 +17873,6 @@ mod consumer_stall_and_recovery_tests {
             producer_name: "producer".to_owned(),
             sequence_id: entry_id,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         };
         let mut buf = bytes::BytesMut::new();
@@ -20233,7 +20229,6 @@ mod dead_letter_flow_refund_tests {
             producer_name: "dlq-flow-refund-producer".to_owned(),
             sequence_id: entry_id,
             publish_time: 1_700_000_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         };
         let mut buf = bytes::BytesMut::new();

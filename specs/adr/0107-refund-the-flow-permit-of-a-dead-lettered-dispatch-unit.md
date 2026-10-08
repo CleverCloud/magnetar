@@ -1,6 +1,6 @@
 # ADR-0107 — Refund the flow permit of a dead-lettered dispatch unit
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0112](0112-compress-and-decompress-a-batch-as-one-body.md), which adds a fifth refund site under the same rule — a charged batch position no layout could decode — everything else below remains binding)
 - **Date**: 2026-09-17
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, flow-control, dead-letter, java-parity, issue-437

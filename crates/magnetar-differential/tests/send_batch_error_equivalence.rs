@@ -14,6 +14,10 @@
 //! 2. **the send itself fails** — the connection went terminal under the publish, so the batched
 //!    `send()` future resolves `Err` and must be classified exactly as the plain one is.
 //!
+//! Issue #860 added [`Op::SendCompressedBatch`], whose runner arms spell out the same two
+//! outcomes; each trace below publishes one right behind the uncompressed batch, so a compressed
+//! batch is held to the same buckets.
+//!
 //! Both are pinned here across BOTH engines rather than on one, because the point of every file in
 //! this crate is that tokio and moonpool agree; an error bucket that differed between them would be
 //! a divergence no single-engine test could see. The mechanics are lifted from
@@ -31,12 +35,24 @@
 #![forbid(unsafe_code)]
 
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::{
+    BatchLayout, Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio,
+};
+use magnetar_proto::types::CompressionKind;
 
 /// Payloads packed into the batched entry each trace attempts to publish. Two is enough to make it
 /// a batch; the content never reaches a broker in either scenario.
 fn payloads() -> Vec<Vec<u8>> {
     vec![b"batch-error-0".to_vec(), b"batch-error-1".to_vec()]
+}
+
+/// The issue #860 sibling of the batched publish: the same payloads, as a Java-layout LZ4 entry.
+fn compressed_batch() -> Op {
+    Op::SendCompressedBatch {
+        payloads: payloads(),
+        codec: CompressionKind::Lz4,
+        layout: BatchLayout::Java,
+    }
 }
 
 /// Publishing a batched entry after [`Op::DropProducer`] must surface the harness's stable
@@ -57,6 +73,7 @@ async fn send_batch_after_producer_drop_is_equivalent_across_engines() {
             Op::Send {
                 payload: b"plain-after-drop".to_vec(),
             },
+            compressed_batch(),
         ],
     );
 
@@ -88,8 +105,8 @@ async fn send_batch_after_producer_drop_is_equivalent_across_engines() {
     );
     assert_eq!(
         tokio_stream.events.len(),
-        3,
-        "the drop and both publishes must each surface an event, got {:?}",
+        4,
+        "the drop and all three publishes must each surface an event, got {:?}",
         tokio_stream.events,
     );
     assert_eq!(
@@ -107,6 +124,10 @@ async fn send_batch_after_producer_drop_is_equivalent_across_engines() {
         matches!(tokio_stream.events[1], Event::SendError { .. }),
         "publishing with no producer must surface a SendError, got {:?}",
         tokio_stream.events[1],
+    );
+    assert_eq!(
+        tokio_stream.events[3], tokio_stream.events[2],
+        "a compressed batched publish must land in the same bucket too",
     );
 }
 
@@ -130,6 +151,7 @@ async fn send_batch_on_a_terminal_connection_is_equivalent_across_engines() {
             Op::Send {
                 payload: b"plain-after-terminal-drop".to_vec(),
             },
+            compressed_batch(),
         ],
     );
 
@@ -170,8 +192,11 @@ async fn send_batch_on_a_terminal_connection_is_equivalent_across_engines() {
             Event::SendError {
                 kind: "peer-closed".to_owned(),
             },
+            Event::SendError {
+                kind: "peer-closed".to_owned(),
+            },
         ],
-        "the in-flight BATCHED publish and the plain send issued after the terminal drop must \
-         both surface the terminal peer-closed outcome on both engines",
+        "the in-flight BATCHED publish, and the plain and compressed batched sends issued after \
+         the terminal drop, must all surface the terminal peer-closed outcome on both engines",
     );
 }

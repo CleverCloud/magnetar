@@ -51,6 +51,30 @@ pub enum Op {
         /// Raw payload bytes of each packed message, in batch-index order.
         payloads: Vec<Vec<u8>>,
     },
+    /// Issue #860 review (send order): publish `payloads` through a SECOND producer on
+    /// [`Trace::topic`] that batches, with a batch byte cap of `max_batch_bytes` and a 10 ms
+    /// publish delay. Every send is enqueued before any is awaited, so a payload that does not
+    /// fit the pending batch meets it there — the wire must still carry the payloads in send
+    /// order. Resolves to ONE [`Event::SentAll`].
+    SendThroughBatchingProducer {
+        /// Raw payload bytes, in send order.
+        payloads: Vec<Vec<u8>>,
+        /// `CreateProducerRequest::max_batch_size_bytes` of the batching producer.
+        max_batch_bytes: usize,
+    },
+    /// Issue #860: publish ONE batched entry whose body is COMPRESSED with `codec`, laid out
+    /// as `layout` says. The runner builds the publish with [`compressed_batch_message`] — the
+    /// same bytes on both legs — through a producer that compresses nothing itself, so what
+    /// reaches the broker is exactly the hand-built body under the batch-level `compression`
+    /// and `uncompressed_size` stamps, which the scripted broker echoes back on dispatch.
+    SendCompressedBatch {
+        /// Raw payload bytes of each packed message, in batch-index order.
+        payloads: Vec<Vec<u8>>,
+        /// Codec stamped on the batch and used to build its body.
+        codec: magnetar_proto::types::CompressionKind,
+        /// How the compressed body is laid out.
+        layout: BatchLayout,
+    },
     /// Receive one message with the given timeout. The harness waits
     /// up to `timeout` for a message to arrive on the consumer's
     /// per-consumer queue before returning [`Event::RecvTimeout`].
@@ -336,6 +360,12 @@ pub enum Event {
         /// Sequence id the engine surfaced on success.
         message_id: MessageId,
     },
+    /// [`Op::SendThroughBatchingProducer`] resolved: one outcome per payload, in send order —
+    /// the broker-assigned id, or the error bucket [`Event::SendError`] would carry.
+    SentAll {
+        /// Per-payload outcomes.
+        outcomes: Vec<Result<MessageId, String>>,
+    },
     /// `Send` failed at the engine surface (e.g. closed connection).
     SendError {
         /// Human-readable error category. The harness collapses the
@@ -582,11 +612,94 @@ impl Default for EventStream {
     }
 }
 
+/// Issue #860: how [`Op::SendCompressedBatch`] lays out a compressed batched entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchLayout {
+    /// Java `BatchMessageContainerImpl`: the packed body compressed ONCE, `uncompressed_size`
+    /// its packed length — what a Java producer writes, and magnetar's since ADR-0112.
+    Java,
+    /// magnetar ≤ 1.7.2: every payload compressed on its own, the packed body left raw, and
+    /// `uncompressed_size` the sum of the COMPRESSED member sizes.
+    Legacy,
+    /// Bytes that decode in neither layout under the codec stamp — the entry ADR-0112 drops
+    /// and refunds.
+    Undecodable,
+}
+
+/// Build [`Op::SendCompressedBatch`]'s publish: `payloads` packed with [`pack_batch_body`],
+/// compressed with `codec` as `layout` says, and stamped with `num_messages_in_batch`, the
+/// batch-level `compression` and (through [`OutgoingMessage::uncompressed_size`], which the
+/// producer copies onto the metadata) `uncompressed_size`.
+///
+/// [`OutgoingMessage::uncompressed_size`]: magnetar_proto::producer::OutgoingMessage::uncompressed_size
+#[must_use]
+pub fn compressed_batch_message(
+    payloads: &[Vec<u8>],
+    codec: magnetar_proto::types::CompressionKind,
+    layout: BatchLayout,
+) -> magnetar_proto::producer::OutgoingMessage {
+    use magnetar_proto::compress::compress;
+    let packed = pack_batch_body(payloads);
+    let (body, uncompressed_size) = match layout {
+        BatchLayout::Java => (compress(codec, &packed).unwrap_or_default(), packed.len()),
+        BatchLayout::Legacy => {
+            let members: Vec<Vec<u8>> = payloads
+                .iter()
+                .map(|p| compress(codec, p).map(|m| m.to_vec()).unwrap_or_default())
+                .collect();
+            let total = members.iter().map(Vec::len).sum();
+            (pack_batch_body(&members), total)
+        }
+        BatchLayout::Undecodable => (Bytes::from(vec![0xA5u8; 64]), packed.len()),
+    };
+    let num_messages = i32::try_from(payloads.len()).unwrap_or(i32::MAX);
+    magnetar_proto::producer::OutgoingMessage {
+        payload: body,
+        metadata: magnetar_proto::pb::MessageMetadata {
+            num_messages_in_batch: Some(num_messages),
+            compression: Some(codec.to_pb() as i32),
+            ..Default::default()
+        },
+        uncompressed_size: u32::try_from(uncompressed_size).unwrap_or(u32::MAX),
+        num_messages,
+        txn_id: None,
+        source_message_id: None,
+    }
+}
+
+/// The batching producer [`Op::SendThroughBatchingProducer`] opens on `topic`.
+#[must_use]
+pub fn batching_producer_request(
+    topic: &str,
+    max_batch_bytes: usize,
+) -> magnetar_proto::CreateProducerRequest {
+    magnetar_proto::CreateProducerRequest {
+        topic: topic.to_owned(),
+        enable_batching: true,
+        max_batch_size_bytes: max_batch_bytes,
+        batching_max_publish_delay: Some(Duration::from_millis(10)),
+        ..Default::default()
+    }
+}
+
+/// A plain, uncompressed publish of `payload`.
+#[must_use]
+pub fn plain_message(payload: &[u8]) -> magnetar_proto::producer::OutgoingMessage {
+    magnetar_proto::producer::OutgoingMessage {
+        payload: Bytes::copy_from_slice(payload),
+        metadata: magnetar_proto::pb::MessageMetadata::default(),
+        uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        num_messages: 1,
+        txn_id: None,
+        source_message_id: None,
+    }
+}
+
 /// Frame `payloads` as one batched entry's body: a `(u32 big-endian single_size)
 /// (SingleMessageMetadata)(payload)` triple per packed message, concatenated.
 ///
 /// This is the exact wire layout `magnetar_proto::consumer::ConsumerState::deliver` walks
-/// when `MessageMetadata.num_messages_in_batch > 1`, and the one Java's
+/// when `MessageMetadata.num_messages_in_batch` is present, and the one Java's
 /// `BatchMessageContainerImpl` writes. Both runners build [`Op::SendBatch`]'s frame through
 /// here so the two legs publish byte-identical bodies (issue #436).
 #[must_use]

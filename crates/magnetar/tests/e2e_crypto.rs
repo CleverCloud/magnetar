@@ -461,3 +461,67 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
     client.close().await;
     Ok(())
 }
+
+/// Issue #860 review: an encrypting producer with LZ4 AND batching enabled round-trips every
+/// message. The engine compresses before it encrypts (PIP-4 puts the codec inside the envelope);
+/// a batch would drop the members' `encryption_keys` (ADR-0112 follow-up), so the state machine
+/// sends every encrypted message as its own entry. Before that, the batch went out keyless and
+/// the consumer could decode none of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_crypto_with_compression_and_batching() -> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let (crypto, _reader) = make_crypto("alice");
+    let bridge = bridge_for(crypto);
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let topic = fresh_topic("magnetar-e2e-crypto-lz4-batch");
+
+    let producer = client
+        .producer(&topic)
+        .compression(magnetar::proto::types::CompressionKind::Lz4)
+        .batching(10, 1_000_000)
+        .batching_max_publish_delay(Duration::from_millis(50))
+        .encryption(bridge.clone() as Arc<dyn MessageEncryptor>)
+        .create_with_encryption()
+        .await?;
+    let payloads: Vec<Vec<u8>> = (0..10)
+        .map(|i| {
+            format!("sealed-and-compressed-{i}|")
+                .repeat(16)
+                .into_bytes()
+        })
+        .collect();
+    let sends: Vec<_> = payloads
+        .iter()
+        .map(|p| producer.send(OutgoingMessage::with_payload(p.clone()).into()))
+        .collect();
+    for send in sends {
+        send.await?;
+    }
+    producer.close().await?;
+
+    let consumer = client
+        .consumer(&topic)
+        .subscription("magnetar-e2e-crypto-lz4-batch")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .encryption(bridge.clone() as Arc<dyn MessageDecryptor>)
+        .subscribe_with_decryption()
+        .await?;
+    for expected in &payloads {
+        let msg = tokio::time::timeout(Duration::from_secs(30), consumer.receive()).await??;
+        assert_eq!(
+            msg.payload.as_ref(),
+            expected.as_slice(),
+            "decrypted, then decompressed, in send order"
+        );
+        consumer.ack(msg.message_id).await?;
+    }
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}

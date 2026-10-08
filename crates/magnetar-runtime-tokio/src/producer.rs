@@ -308,11 +308,18 @@ impl Producer {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
 
-        // Compress the payload before handing it to the sans-io state machine. The producer
-        // state machine stamps `metadata.compression` based on its configured CompressionKind
-        // (per ProducerImpl.java:581-608); here we run the actual codec. Compression failure
-        // bubbles up as a SendError so the caller can retry or surface to the user.
-        if self.compression != CompressionKind::None {
+        // ADR-0112: the sans-io producer compresses — a batched message together with its whole
+        // batch body in `flush_batch`, an unbatched one on its own in `queue_send` — because only
+        // it knows, under the per-slot lock, whether the message joins a batch. Deciding here
+        // instead would race that decision. An ENCRYPTING producer is the exception: PIP-4 puts
+        // the compressed bytes inside the envelope (`ProducerImpl.java:986-1003`), so the codec
+        // has to run here, before `encrypt`, and the codec is named on the metadata right here.
+        // The state machine sees that stamp and the `encryption_keys` the encryptor adds, and
+        // neither compresses the ciphertext again nor batches it (a batch would drop the keys).
+        // Compression failure bubbles up as a SendError so the caller can retry or surface it.
+        let engine_compresses =
+            self.compression != CompressionKind::None && self.encryptor.is_some();
+        if engine_compresses {
             match crate::compress::compress(self.compression, &msg.payload) {
                 Ok(compressed) => {
                     msg.uncompressed_size = u32::try_from(msg.payload.len()).unwrap_or(u32::MAX);
@@ -336,6 +343,11 @@ impl Producer {
                 }
             }
         }
+
+        // The engine names the codec it applied; otherwise the caller's stamp (if any) stands.
+        msg.metadata.compression = engine_compresses
+            .then_some(self.compression.to_pb() as i32)
+            .or(msg.metadata.compression);
 
         // Encrypt the (compressed) payload if a PIP-4 encryptor is wired. Mirrors the Java
         // `ProducerImpl.java:986-1003` ordering — compression first, encryption second so the
@@ -404,10 +416,11 @@ impl Producer {
         }
     }
 
-    /// Hand the (compressed/encrypted) message to the sans-io state machine together with
-    /// its memory `reservation`, which moves into the publish's pending op and is released
-    /// when that op leaves the client (ADR-0111). On a synchronous rejection the state
-    /// machine releases it before this returns.
+    /// Hand the message to the sans-io state machine — uncompressed, or compressed and then
+    /// encrypted by an encrypting producer (the state machine compresses everything else,
+    /// ADR-0112) — together with its memory `reservation`, which moves into the publish's
+    /// pending op and is released when that op leaves the client (ADR-0111). On a synchronous
+    /// rejection the state machine releases it before this returns.
     ///
     /// ADR-0038 Phase 3 hot path: takes only the per-slot mutex via
     /// [`magnetar_proto::ProducerSlot::queue_send`] — does NOT acquire the
@@ -1120,6 +1133,154 @@ mod tests {
             0,
             "a failed encrypt must not enqueue a send"
         );
+    }
+
+    /// An uncompressed send of `payload` with default metadata.
+    fn plain_send(payload: &[u8]) -> OutgoingMessage {
+        OutgoingMessage {
+            payload: Bytes::copy_from_slice(payload),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: payload.len() as u32,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        }
+    }
+
+    /// Split a packed batch body back into its payloads.
+    fn unpack_batch(mut body: Bytes) -> Vec<Vec<u8>> {
+        use bytes::Buf as _;
+        let mut out = Vec::new();
+        while body.has_remaining() {
+            let size = body.get_u32() as usize;
+            let single: pb::SingleMessageMetadata =
+                prost::Message::decode(body.split_to(size)).expect("SingleMessageMetadata");
+            out.push(body.split_to(single.payload_size as usize).to_vec());
+        }
+        out
+    }
+
+    /// A tokio producer opened with `codec` (both the engine and the state machine see it,
+    /// as `open_producer` arranges) and the given batching cap / encryptor.
+    fn codec_producer(
+        codec: CompressionKind,
+        max_messages_in_batch: Option<usize>,
+        encryptor: Option<std::sync::Arc<dyn crate::crypto::MessageEncryptor>>,
+    ) -> (Producer, std::sync::Arc<magnetar_proto::ProducerSlot>) {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/codec-860".to_owned(),
+            compression: codec,
+            enable_batching: max_messages_in_batch.is_some(),
+            max_messages_in_batch: max_messages_in_batch.unwrap_or(1000),
+            ..Default::default()
+        });
+        let slot = slot_for(&shared, handle);
+        let producer = Producer::assemble(shared, handle, slot.clone(), codec, encryptor);
+        (producer, slot)
+    }
+
+    /// Issue #860 / ADR-0112: a batching tokio producer hands its payloads to the state machine
+    /// UNCOMPRESSED, so the flushed batch is ONE compressed body — the layout a Java consumer
+    /// decompresses before it splits. Before ADR-0112 the engine compressed every member on its
+    /// own and the concatenation went out raw under a batch-level codec stamp; Java
+    /// `pulsar-client consume` read 0/100 of such a topic. Tokio-only: the moonpool producer
+    /// refuses any codec, so it has no send path to mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_leaves_batched_compression_to_the_state_machine() {
+        let (producer, slot) = codec_producer(CompressionKind::Lz4, Some(3), None);
+        let members: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("batched-{i}|").repeat(16).into_bytes())
+            .collect();
+        let _pending: Vec<_> = members
+            .iter()
+            .map(|m| producer.send(plain_send(m)))
+            .collect();
+        let frame = slot
+            .state
+            .lock()
+            .next_outbound_frame()
+            .expect("the third send fills the batch");
+        let packed_len = frame.metadata.uncompressed_size.expect("uncompressed_size") as usize;
+        let packed = crate::compress::decompress(CompressionKind::Lz4, &frame.payload, packed_len)
+            .expect("the batch body must be ONE LZ4 block");
+        assert_eq!(unpack_batch(packed), members);
+    }
+
+    /// An unbatched tokio send is compressed exactly once — by the state machine now, no longer
+    /// by the engine — so the frame decodes in one codec call. Tokio-only for the same reason
+    /// as above.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbatched_send_is_compressed_exactly_once() {
+        let (producer, slot) = codec_producer(CompressionKind::Zstd, None, None);
+        let payload = b"unbatched|".repeat(32);
+        let _pending = producer.send(plain_send(&payload));
+        let frame = slot.state.lock().next_outbound_frame().expect("one frame");
+        assert_eq!(frame.metadata.uncompressed_size, Some(payload.len() as u32));
+        let plain =
+            crate::compress::decompress(CompressionKind::Zstd, &frame.payload, payload.len())
+                .expect("one Zstd frame, not two nested ones");
+        assert_eq!(plain.as_ref(), payload.as_slice());
+    }
+
+    /// The ADR-0112 exception: an ENCRYPTING producer still compresses in the engine, because
+    /// PIP-4 puts the compressed bytes inside the envelope (`ProducerImpl.java:986-1003`). The
+    /// encryptor must see the compressed bytes, the engine names the codec on the metadata, and
+    /// the state machine ships the ciphertext untouched — and, even on a BATCHING producer,
+    /// unbatched: a batch would drop the members' `encryption_keys` (the batched + encrypted
+    /// follow-up), so every encrypted message is its own decryptable entry. Tokio-only: the
+    /// moonpool producer refuses any codec.
+    #[tokio::test(flavor = "current_thread")]
+    async fn encrypting_send_compresses_before_encrypting() {
+        let encryptor = std::sync::Arc::new(XorEncryptor::default());
+        let (producer, slot) =
+            codec_producer(CompressionKind::Lz4, Some(3), Some(encryptor.clone()));
+        let payloads: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("secret-{i}|").repeat(32).into_bytes())
+            .collect();
+        let _pending: Vec<_> = payloads
+            .iter()
+            .map(|p| producer.send(plain_send(p)))
+            .collect();
+        let seen = encryptor
+            .seen_plaintext
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("encrypt ran");
+        let last = crate::compress::compress(CompressionKind::Lz4, &payloads[2]).expect("lz4");
+        assert_eq!(
+            seen,
+            last.to_vec(),
+            "the encryptor sees the COMPRESSED bytes"
+        );
+        for payload in &payloads {
+            let frame = slot
+                .state
+                .lock()
+                .next_outbound_frame()
+                .expect("one frame per encrypted send");
+            assert_eq!(
+                frame.metadata.num_messages_in_batch, None,
+                "an encrypted message is never batched"
+            );
+            assert_ne!(
+                frame.metadata.encryption_keys,
+                Vec::new(),
+                "the keys reach the wire"
+            );
+            assert_eq!(
+                frame.metadata.compression,
+                Some(pb::CompressionType::Lz4 as i32)
+            );
+            assert_eq!(frame.metadata.uncompressed_size, Some(payload.len() as u32));
+            // What a decrypt-first consumer does: decrypt, THEN decompress.
+            let compressed: Vec<u8> = frame.payload.iter().map(|b| b ^ XOR_KEY).collect();
+            let plain =
+                crate::compress::decompress(CompressionKind::Lz4, &compressed, payload.len())
+                    .expect("ciphertext wraps exactly one LZ4 block");
+            assert_eq!(plain.as_ref(), payload.as_slice());
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

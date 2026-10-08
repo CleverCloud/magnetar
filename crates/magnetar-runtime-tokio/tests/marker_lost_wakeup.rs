@@ -209,7 +209,6 @@ async fn serve_marker_broker(mut stream: TcpStream) {
                         producer_name: "regular".to_owned(),
                         sequence_id: 1,
                         publish_time: 0,
-                        num_messages_in_batch: Some(1),
                         ..Default::default()
                     };
                     let _ = encode_payload(&mut out, &msg, &regular_meta, b"user-payload");

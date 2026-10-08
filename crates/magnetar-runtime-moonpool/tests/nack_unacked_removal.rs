@@ -110,7 +110,6 @@ fn nack_drops_id_from_unacked_tracker_so_redelivery_fires_once() {
         producer_name: "magnetar-test-prod".to_owned(),
         sequence_id: 1,
         publish_time: 0,
-        num_messages_in_batch: Some(1),
         ..Default::default()
     };
     let mut frame = BytesMut::new();

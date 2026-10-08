@@ -1714,8 +1714,11 @@ enum PostProcessOutcome {
 /// sans-io state machine. Mirrors [`magnetar_runtime_tokio::consumer::post_process_message`]
 /// **minus the decompression step**: the moonpool producer refuses any non-`None`
 /// `CompressionKind` on send (see `Producer::send`), so there is never a consumer-side
-/// decompression branch to run here. `crypto_failure_action` governs what happens when the
-/// decryption step fails (see [`magnetar_proto::CryptoFailureAction`]).
+/// decompression branch to run here. A compressed BATCHED entry needs none either:
+/// `ConsumerState::deliver` decodes it before splitting it and clears the members'
+/// `compression` (ADR-0112), so its members reach this helper as plaintext. `crypto_failure_action`
+/// governs what happens when the decryption step fails (see
+/// [`magnetar_proto::CryptoFailureAction`]).
 ///
 /// The helper decrypts in place on `Deliver` (and leaves the ciphertext untouched under
 /// `Consume`); it NEVER acks and NEVER touches the connection — it only decides the outcome.
@@ -4959,78 +4962,5 @@ mod tests {
             Err(crate::client::ClientError::Closed) => {}
             other => panic!("expected Err(Closed) after local close, got {other:?}"),
         }
-    }
-
-    /// Parity placeholder for `magnetar-runtime-tokio::compress::tests
-    /// ::unchecked_uncompressed_size_is_rejected_before_allocation`. The
-    /// moonpool engine intentionally refuses non-`None` compression on
-    /// send (the comment in `ReceiveFut::poll` near line 1255 spells this
-    /// out), so there is no equivalent moonpool decompress path to harden
-    /// against a malicious `uncompressed_size`. We still record the
-    /// invariant here — "decompression is sans-engine on moonpool" — so
-    /// the parity gate (ADR-0024 / `check-runtime-test-parity`) stays
-    /// balanced and a future PR that wires moonpool decompression cannot
-    /// land without also wiring the same `MAX_FRAME_SIZE` cap.
-    #[tokio::test(flavor = "current_thread")]
-    async fn moonpool_decompress_path_is_absent_by_design() {
-        // The moonpool producer rejects compressed sends (see
-        // `Producer::send` and the matching comment in `post_process_message`
-        // near consumer.rs:1255). A symmetric receive path therefore has no
-        // decompressor to attack via `uncompressed_size = u32::MAX`. The
-        // assertion below is a sentinel: if a future change wires moonpool
-        // decompression without porting the tokio
-        // `UncompressedSizeTooLarge` guard, the placeholder MUST grow into
-        // a real round-trip + bounded-allocation test.
-        let shared = handshake_complete_shared();
-        let handle = {
-            let mut conn = shared.inner.lock();
-            conn.subscribe(SubscribeRequest {
-                topic: "persistent://public/default/no-decompress".to_owned(),
-                subscription: "s".to_owned(),
-                ..Default::default()
-            })
-        };
-        // Sanity: a freshly-subscribed consumer is not closed, has zero
-        // messages buffered, and is registered in the state machine. This
-        // pins the engine's surface so the test is non-vacuous.
-        let conn = shared.inner.lock();
-        let slot = conn.consumer(handle).expect("slot");
-        assert!(!slot.state.lock().closed);
-        assert_eq!(slot.state.lock().queue_len(), 0);
-    }
-
-    /// Parity placeholder for `magnetar-runtime-tokio::compress::tests
-    /// ::zstd_decompression_bomb_is_bounded`. The moonpool engine refuses
-    /// any non-`None` compression on send (`Producer::send` short-circuits;
-    /// `post_process_message` near consumer.rs:1255 documents the same),
-    /// so there is no moonpool decompressor a decompression-bomb could
-    /// target. The test records the invariant so the parity gate
-    /// (ADR-0024 / `check-runtime-test-parity`) stays balanced and a
-    /// future PR that wires moonpool decompression cannot land without
-    /// also porting the bounded-decompression cap.
-    #[tokio::test(flavor = "current_thread")]
-    async fn moonpool_decompress_bomb_path_is_absent_by_design() {
-        // No moonpool decompressor exists, so the bomb-shaped input has no
-        // attack surface here. We pin the absence-by-design invariant by
-        // freshly subscribing a consumer and asserting it carries no
-        // compressed-message buffer to decode — symmetric with the existing
-        // `moonpool_decompress_path_is_absent_by_design` placeholder but
-        // focused on the bomb-shape scenario rather than the
-        // `uncompressed_size = u32::MAX` scenario. If a future change wires
-        // a moonpool decompression path, the placeholder MUST grow into a
-        // real bounded-decode round-trip mirroring the tokio bomb test.
-        let shared = handshake_complete_shared();
-        let handle = {
-            let mut conn = shared.inner.lock();
-            conn.subscribe(SubscribeRequest {
-                topic: "persistent://public/default/no-bomb-decompress".to_owned(),
-                subscription: "s-bomb".to_owned(),
-                ..Default::default()
-            })
-        };
-        let conn = shared.inner.lock();
-        let slot = conn.consumer(handle).expect("slot");
-        assert!(!slot.state.lock().closed);
-        assert_eq!(slot.state.lock().queue_len(), 0);
     }
 }

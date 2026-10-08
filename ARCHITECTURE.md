@@ -150,7 +150,7 @@ Pattern / partition children discovered **after** subscribe inherit the listener
 ## Layering
 
 Magnetar is organised in four layers.
-Lower layers know nothing about higher ones — `magnetar-proto` is pure-Rust state machines with **zero I/O dependencies**, and the high-level façade is a thin re-export plus ergonomics layer.
+Lower layers know nothing about higher ones — `magnetar-proto` is state machines with **zero I/O dependencies** (pure Rust apart from the C `zstd-sys` and `libz-sys` its compression codecs link, ADR-0112), and the high-level façade is a thin re-export plus ergonomics layer.
 
 ```text
 +--------------------------------------------------------------------------+
@@ -1093,21 +1093,25 @@ Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/prod
                        peel PIP-90 broker_entry_metadata (if 0x0e02 present)
                                   │
                                   ▼
-                         decompress (CompressionKind)
+                  ConsumerState::deliver — a compressed BATCHED entry is
+                  decompressed as ONE body first (Java layout, else the
+                  magnetar ≤ 1.7.2 per-member layout), then split; members
+                  surface as plaintext with `compression` cleared. Charged
+                  positions no layout decodes: debit + refund, one warn!
                                   │
                                   ▼
-                    decrypt (if PIP-4 keys present + decryptor configured)
+                  queue IncomingMessage; wake any parked receive() Waker
+                                  │
+                                  ▼
+                  engine, after the pop: decrypt (PIP-4 keys + decryptor),
+                  then decompress an UNBATCHED message (CompressionKind)
                                   │
                                   ▼
                          schema decode (for TypedConsumer)
-                                  │
-                                  ▼
-                  ConsumerState::push_incoming(IncomingMessage)
-                                  │
-                                  ▼
-                  if a receive() future is parked → wake its Waker
-                  else                            → queue in receive_queue
 ```
+
+A Java producer compresses a batch's whole packed body (`BatchMessageContainerImpl`), so the split has to run over the decompressed bytes; splitting first read codec output as member sizes and queued nothing, which never refunded the batch's permits and stalled the consumer (issue #860, [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md)).
+The codecs therefore live in [`crates/magnetar-proto/src/compress.rs`](crates/magnetar-proto/src/compress.rs), and the producer side mirrors it: `ProducerState::flush_batch` compresses the whole concatenation once, and an unbatched payload is compressed in `queue_send` before the chunking decision.
 
 ### Ack grouping flush window
 
@@ -1352,7 +1356,7 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | [`producer.rs`](crates/magnetar-runtime-tokio/src/producer.rs)                           | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters; `SendFut` parks in `Reserving` on the client-wide memory budget under `ProducerBlock`.                                                                |
 | [`driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs)                               | Driver loop + supervised reconnect + auth-challenge dispatch + PIP-145 + PIP-188 forwarding.                                                                                                                                    |
 | [`auto_cluster_failover.rs`](crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs) | PIP-121 `AutoClusterFailover` with a `HealthProbe` trait + background prober.                                                                                                                                                   |
-| [`compress.rs`](crates/magnetar-runtime-tokio/src/compress.rs)                           | Encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`.                                                                                                                                                                |
+| [`lib.rs` `compress`](crates/magnetar-proto/src/compress.rs)                             | Re-export of `magnetar_proto::compress` (encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`), which moved into the sans-io core with ADR-0112.                                                                     |
 | [`transport.rs`](crates/magnetar-runtime-tokio/src/transport.rs)                         | TCP connect + optional `tokio-rustls` wrap, `connect_with_resolver` for `DnsResolver` plumbing.                                                                                                                                 |
 | [`tls_insecure.rs`](crates/magnetar-runtime-tokio/src/tls_insecure.rs)                   | `tls_allow_insecure_connection(true)` blanket override.                                                                                                                                                                         |
 | [`tls_no_hostname.rs`](crates/magnetar-runtime-tokio/src/tls_no_hostname.rs)             | `tls_hostname_verification_enable(false)` chain-on / hostname-off.                                                                                                                                                              |
