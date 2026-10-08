@@ -2677,7 +2677,7 @@ async fn run_admin(
         AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, format, sub).await,
         AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, format, sub).await,
-        AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
+        AdminCmd::Brokers { sub } => run_admin_brokers(&admin, format, sub).await,
         AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
@@ -2808,9 +2808,25 @@ async fn run_admin_clusters(
     }
 }
 
-async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), CliError> {
+async fn run_admin_brokers(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: BrokersCmd,
+) -> Result<(), CliError> {
     match cmd {
-        BrokersCmd::List { cluster } => print_json(&admin.brokers_list(&cluster).await?),
+        BrokersCmd::List { cluster } => {
+            let brokers = admin.brokers_list(&cluster).await?;
+            match format {
+                OutputFormat::Json => print_json(&brokers),
+                // The broker returns its set in hash order; a person reads
+                // hosts by number.
+                OutputFormat::Human => print_formatted_list(
+                    OutputFormat::Human,
+                    "broker",
+                    &output::natural_sorted(&brokers),
+                ),
+            }
+        }
         BrokersCmd::Leader => print_json(&admin.brokers_leader().await?),
         BrokersCmd::DynamicConfigKeys => print_json(&admin.brokers_dynamic_config_keys().await?),
         BrokersCmd::DynamicConfigOverrides => {

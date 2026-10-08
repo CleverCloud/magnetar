@@ -707,3 +707,52 @@ pub(crate) fn persistence_from_broker(
         )?,
     })
 }
+
+/// Compare two names so that embedded digit runs order numerically:
+/// `n2` before `n10`, which plain byte order gets wrong. Ties on the
+/// numeric value (`n02` vs `n2`) fall back to byte order so the ordering
+/// stays total.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a = a.chars().peekable();
+    let mut b = b.chars().peekable();
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let mut run_a = String::new();
+                while let Some(c) = a.next_if(char::is_ascii_digit) {
+                    run_a.push(c);
+                }
+                let mut run_b = String::new();
+                while let Some(c) = b.next_if(char::is_ascii_digit) {
+                    run_b.push(c);
+                }
+                // Compare as integers without overflow: longer stripped run
+                // wins, then lexicographic on equal lengths.
+                let (ta, tb) = (run_a.trim_start_matches('0'), run_b.trim_start_matches('0'));
+                let by_value = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                let by_value = by_value.then_with(|| run_a.cmp(&run_b));
+                if by_value != std::cmp::Ordering::Equal {
+                    return by_value;
+                }
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+/// `values` in natural order (see [`natural_cmp`]), for lists a person scans
+/// by host number.
+pub(crate) fn natural_sorted(values: &[String]) -> Vec<String> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| natural_cmp(a, b));
+    sorted
+}

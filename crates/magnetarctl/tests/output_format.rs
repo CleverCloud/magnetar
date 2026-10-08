@@ -772,3 +772,32 @@ fn namespace_of_topic_accepts_schemes_and_rejects_other_shapes() {
         assert!(cli::output::namespace_of_topic(bad).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn natural_sort_orders_host_numbers_numerically() {
+    let brokers: Vec<String> = [
+        "broker-n6:8080",
+        "broker-n10:8080",
+        "broker-n1:8080",
+        "broker-n2:8080",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    assert_eq!(
+        cli::output::natural_sorted(&brokers),
+        [
+            "broker-n1:8080",
+            "broker-n2:8080",
+            "broker-n6:8080",
+            "broker-n10:8080"
+        ]
+    );
+    // Leading zeros tie on value and settle on byte order; non-digit text
+    // stays in byte order; the empty list is fine.
+    let mixed: Vec<String> = ["b", "a10", "a9", "a09", "a"].map(str::to_owned).to_vec();
+    assert_eq!(
+        cli::output::natural_sorted(&mixed),
+        ["a", "a09", "a9", "a10", "b"]
+    );
+    assert!(cli::output::natural_sorted(&[]).is_empty());
+}
