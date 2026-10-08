@@ -592,3 +592,118 @@ fn plain_value(value: &serde_json::Value) -> String {
         other => other.to_string(),
     }
 }
+
+/// Which level supplied a resolved policy. Serialises as the lowercase
+/// level name (`"topic"`, `"namespace"`, `"broker"`) in JSON output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicySource {
+    /// The topic carries its own policy.
+    Topic,
+    /// No topic policy (or a namespace command): the namespace policy.
+    Namespace,
+    /// No policy at any level: the broker's configured default.
+    Broker,
+}
+
+impl PolicySource {
+    /// Wording for the human `SOURCE` row.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Topic => "topic policy",
+            Self::Namespace => "namespace policy",
+            Self::Broker => "broker default (no policy set)",
+        }
+    }
+}
+
+/// A policy together with the level that supplied it, so neither output
+/// format can pass a broker default off as something the namespace set.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Resolved<T> {
+    pub(crate) source: PolicySource,
+    pub(crate) value: T,
+}
+
+impl<T: HumanOutput> HumanOutput for Resolved<T> {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![("source", self.source.label().to_owned())];
+        fields.extend(self.value.human_fields());
+        fields
+    }
+}
+
+/// JSON for a resolved policy: the policy's own fields with a leading
+/// `source` key, so `.retentionTimeInMinutes`-style `jq` paths keep working
+/// and the provenance is still in the payload.
+pub(crate) fn resolved_json<T: serde::Serialize>(
+    resolved: &Resolved<T>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut object = serde_json::Map::new();
+    object.insert("source".to_owned(), serde_json::to_value(resolved.source)?);
+    if let serde_json::Value::Object(fields) = serde_json::to_value(&resolved.value)? {
+        object.extend(fields);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+/// The `tenant/namespace` of a topic name, with or without a
+/// `persistent://` / `non-persistent://` scheme. `None` when the name does
+/// not have exactly three `/`-separated segments.
+pub(crate) fn namespace_of_topic(topic: &str) -> Option<String> {
+    let path = topic
+        .strip_prefix("persistent://")
+        .or_else(|| topic.strip_prefix("non-persistent://"))
+        .unwrap_or(topic);
+    let mut segments = path.split('/');
+    let (tenant, namespace, name) = (segments.next()?, segments.next()?, segments.next()?);
+    if segments.next().is_some() || tenant.is_empty() || namespace.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{tenant}/{namespace}"))
+}
+
+/// One key of the broker runtime configuration (`GET
+/// /admin/v2/brokers/configuration/runtime`), whose values are all strings.
+fn broker_config_value<T: std::str::FromStr>(
+    config: &serde_json::Value,
+    key: &str,
+) -> Result<T, String> {
+    let raw = config
+        .get(key)
+        .ok_or_else(|| format!("key `{key}` is missing from the broker runtime configuration"))?;
+    let text = match raw {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    text.parse().map_err(|_| {
+        format!("key `{key}` has unexpected value `{text}` in the broker runtime configuration")
+    })
+}
+
+/// The retention a namespace without a policy of its own gets: the broker's
+/// `defaultRetentionTimeInMinutes` / `defaultRetentionSizeInMB`.
+pub(crate) fn retention_from_broker(
+    config: &serde_json::Value,
+) -> Result<RetentionPolicies, String> {
+    Ok(RetentionPolicies {
+        retention_time_in_minutes: broker_config_value(config, "defaultRetentionTimeInMinutes")?,
+        retention_size_in_mb: broker_config_value(config, "defaultRetentionSizeInMB")?,
+    })
+}
+
+/// The persistence a namespace without a policy of its own gets: the
+/// broker's `managedLedgerDefault*` quorums and mark-delete rate limit.
+pub(crate) fn persistence_from_broker(
+    config: &serde_json::Value,
+) -> Result<PersistencePolicies, String> {
+    Ok(PersistencePolicies {
+        bookkeeper_ensemble: broker_config_value(config, "managedLedgerDefaultEnsembleSize")?,
+        bookkeeper_write_quorum: broker_config_value(config, "managedLedgerDefaultWriteQuorum")?,
+        bookkeeper_ack_quorum: broker_config_value(config, "managedLedgerDefaultAckQuorum")?,
+        managed_ledger_max_mark_delete_rate: broker_config_value(
+            config,
+            "managedLedgerDefaultMarkDeleteRateLimit",
+        )?,
+    })
+}

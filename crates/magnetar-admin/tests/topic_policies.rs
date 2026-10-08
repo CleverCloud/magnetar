@@ -59,7 +59,8 @@ async fn topic_retention_get_set_remove_cycle() {
     let pol = admin
         .topic_get_retention("acme/svc/orders")
         .await
-        .expect("get topic retention");
+        .expect("get topic retention")
+        .expect("retention policy is set");
     assert_eq!(pol.retention_time_in_minutes, 1440);
     assert_eq!(pol.retention_size_in_mb, 10240);
 

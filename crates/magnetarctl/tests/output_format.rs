@@ -154,13 +154,182 @@ fn topics_get_retention_uses_shared_human_output_and_preserves_json() {
         if format == "human" {
             assert_eq!(
                 stdout,
-                "RETENTION DURATION  366 days\nRETENTION SIZE      ∞\n"
+                "SOURCE              topic policy\n\
+                 RETENTION DURATION  366 days\n\
+                 RETENTION SIZE      ∞\n"
             );
         } else {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&stdout).expect("JSON"),
-                serde_json::json!({"retentionTimeInMinutes": 527_040, "retentionSizeInMB": -1})
+                serde_json::json!({
+                    "source": "topic",
+                    "retentionTimeInMinutes": 527_040,
+                    "retentionSizeInMB": -1
+                })
             );
+        }
+    }
+}
+
+/// Serve `responses` in order, one HTTP/1.1 request per connection
+/// (`Connection: close`), asserting each request line's path. Returns the
+/// server thread to join once the CLI exits.
+fn serve_in_order(
+    listener: std::net::TcpListener,
+    responses: Vec<(&'static str, u16, &'static str)>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        for (path, status, body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "CLI never requested {path}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).expect("read request");
+                assert_ne!(count, 0, "request ended before headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+                "expected GET {path}, got: {request}"
+            );
+            write!(
+                socket,
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("respond");
+        }
+    })
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "two scenarios x two formats against an in-process HTTP server; splitting would duplicate the harness"
+)]
+fn topic_persistence_falls_back_to_namespace_then_broker_and_says_so() {
+    use std::process::Command;
+
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let config = config_dir.path().join("config.yaml");
+    std::fs::write(&config, "{}\n").expect("write config");
+    let broker_config = r#"{"managedLedgerDefaultEnsembleSize":"3","managedLedgerDefaultWriteQuorum":"3","managedLedgerDefaultAckQuorum":"2","managedLedgerDefaultMarkDeleteRateLimit":"1.0"}"#;
+    let namespace_policy = r#"{"bookkeeperEnsemble":5,"bookkeeperWriteQuorum":4,"bookkeeperAckQuorum":3,"managedLedgerMaxMarkDeleteRate":0.0}"#;
+    // (responses, expected human stdout, expected JSON stdout)
+    let scenarios = [
+        (
+            // Topic unset (204), namespace unset (200 empty): the broker's
+            // runtime configuration is the effective policy.
+            vec![
+                (
+                    "/admin/v2/persistent/public/default/orders/persistence",
+                    204,
+                    "",
+                ),
+                ("/admin/v2/namespaces/public/default/persistence", 200, ""),
+                (
+                    "/admin/v2/brokers/configuration/runtime",
+                    200,
+                    broker_config,
+                ),
+            ],
+            "SOURCE                   broker default (no policy set)\n\
+             BOOKKEEPER ENSEMBLE      3\n\
+             BOOKKEEPER WRITE QUORUM  3\n\
+             BOOKKEEPER ACK QUORUM    2\n\
+             MAX MARK-DELETE RATE     1 ops/s\n",
+            serde_json::json!({
+                "source": "broker",
+                "bookkeeperEnsemble": 3,
+                "bookkeeperWriteQuorum": 3,
+                "bookkeeperAckQuorum": 2,
+                "managedLedgerMaxMarkDeleteRate": 1.0
+            }),
+        ),
+        (
+            // Topic unset, namespace set: no broker call at all.
+            vec![
+                (
+                    "/admin/v2/persistent/public/default/orders/persistence",
+                    200,
+                    "null",
+                ),
+                (
+                    "/admin/v2/namespaces/public/default/persistence",
+                    200,
+                    namespace_policy,
+                ),
+            ],
+            "SOURCE                   namespace policy\n\
+             BOOKKEEPER ENSEMBLE      5\n\
+             BOOKKEEPER WRITE QUORUM  4\n\
+             BOOKKEEPER ACK QUORUM    3\n\
+             MAX MARK-DELETE RATE     disabled\n",
+            serde_json::json!({
+                "source": "namespace",
+                "bookkeeperEnsemble": 5,
+                "bookkeeperWriteQuorum": 4,
+                "bookkeeperAckQuorum": 3,
+                "managedLedgerMaxMarkDeleteRate": 0.0
+            }),
+        ),
+    ];
+    for (responses, expected_human, expected_json) in scenarios {
+        for format in ["human", "json"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = serve_in_order(listener, responses.clone());
+            let result = Command::new(env!("CARGO_BIN_EXE_magnetarctl"))
+                .env_remove("MAGNETAR_FORMAT")
+                .env_remove("MAGNETAR_CONTEXT")
+                .env_remove("MAGNETAR_TOKEN")
+                .env("NO_COLOR", "1")
+                .arg("--config")
+                .arg(&config)
+                .arg("--admin-url")
+                .arg(format!("http://{address}"))
+                .args([
+                    "admin",
+                    "topics",
+                    "get-persistence",
+                    "persistent://public/default/orders",
+                    "-F",
+                    format,
+                ])
+                .output()
+                .expect("run magnetarctl");
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            server.join().expect("server");
+            let stdout = String::from_utf8(result.stdout).expect("UTF-8");
+            if format == "human" {
+                assert_eq!(stdout, expected_human);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&stdout).expect("JSON"),
+                    expected_json
+                );
+            }
         }
     }
 }
@@ -510,4 +679,96 @@ fn persistence_policies_render_quorums_and_disabled_mark_delete_rate() {
         cli::output::render_rows(&throttled.human_fields(), false)
             .ends_with("MAX MARK-DELETE RATE     1.5 ops/s\n")
     );
+}
+
+#[test]
+fn resolved_policy_leads_with_its_source_in_both_formats() {
+    use cli::output::{HumanOutput, PolicySource, Resolved};
+    let resolved = Resolved {
+        source: PolicySource::Broker,
+        value: RetentionPolicies {
+            retention_time_in_minutes: 0,
+            retention_size_in_mb: 0,
+        },
+    };
+    assert_eq!(
+        cli::output::render_rows(&resolved.human_fields(), false),
+        "SOURCE              broker default (no policy set)\n\
+         RETENTION DURATION  0 minutes\n\
+         RETENTION SIZE      0 MB\n"
+    );
+    let json = cli::output::resolved_json(&resolved).expect("json");
+    assert_eq!(
+        serde_json::to_string(&json).expect("string"),
+        r#"{"source":"broker","retentionTimeInMinutes":0,"retentionSizeInMB":0}"#
+    );
+    for (source, label, name) in [
+        (PolicySource::Topic, "topic policy", "topic"),
+        (PolicySource::Namespace, "namespace policy", "namespace"),
+    ] {
+        assert_eq!(source.label(), label);
+        assert_eq!(serde_json::to_value(source).expect("json"), name);
+    }
+}
+
+#[test]
+fn broker_defaults_parse_the_string_valued_runtime_configuration() {
+    let config = serde_json::json!({
+        "defaultRetentionTimeInMinutes": "0",
+        "defaultRetentionSizeInMB": "-1",
+        "managedLedgerDefaultEnsembleSize": "3",
+        "managedLedgerDefaultWriteQuorum": "3",
+        "managedLedgerDefaultAckQuorum": "2",
+        "managedLedgerDefaultMarkDeleteRateLimit": "1.0",
+        "unrelated": "x"
+    });
+    let retention = cli::output::retention_from_broker(&config).expect("retention");
+    assert_eq!(retention.retention_time_in_minutes, 0);
+    assert_eq!(retention.retention_size_in_mb, -1);
+    let persistence = cli::output::persistence_from_broker(&config).expect("persistence");
+    assert_eq!(persistence.bookkeeper_ensemble, 3);
+    assert_eq!(persistence.bookkeeper_write_quorum, 3);
+    assert_eq!(persistence.bookkeeper_ack_quorum, 2);
+    assert!((persistence.managed_ledger_max_mark_delete_rate - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn broker_defaults_name_the_missing_or_malformed_key() {
+    let missing = serde_json::json!({ "defaultRetentionTimeInMinutes": "0" });
+    assert_eq!(
+        cli::output::retention_from_broker(&missing).expect_err("missing key"),
+        "key `defaultRetentionSizeInMB` is missing from the broker runtime configuration"
+    );
+    let malformed = serde_json::json!({
+        "defaultRetentionTimeInMinutes": "soon",
+        "defaultRetentionSizeInMB": "0"
+    });
+    assert_eq!(
+        cli::output::retention_from_broker(&malformed).expect_err("malformed value"),
+        "key `defaultRetentionTimeInMinutes` has unexpected value `soon` in the broker runtime configuration"
+    );
+}
+
+#[test]
+fn namespace_of_topic_accepts_schemes_and_rejects_other_shapes() {
+    assert_eq!(
+        cli::output::namespace_of_topic("persistent://acme/svc/orders").as_deref(),
+        Some("acme/svc")
+    );
+    assert_eq!(
+        cli::output::namespace_of_topic("non-persistent://acme/svc/orders").as_deref(),
+        Some("acme/svc")
+    );
+    assert_eq!(
+        cli::output::namespace_of_topic("acme/svc/orders").as_deref(),
+        Some("acme/svc")
+    );
+    for bad in [
+        "acme/svc",
+        "acme/svc/orders/extra",
+        "persistent://acme//orders",
+        "",
+    ] {
+        assert!(cli::output::namespace_of_topic(bad).is_none(), "{bad}");
+    }
 }
