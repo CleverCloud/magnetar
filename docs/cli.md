@@ -65,7 +65,7 @@ RETENTION DURATION  366 days
 RETENTION SIZE      ∞
 ```
 
-`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain` and `admin tenants list` honour `human`; every other command still prints JSON whatever the flag says.
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list` and `admin namespaces list` honour `human`; every other command still prints JSON whatever the flag says.
 `admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
 Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
 
@@ -74,7 +74,7 @@ Byte quantities use base 1000 and two decimal places (`214990 B` becomes `214.99
 Missing table values display `—`; empty producer, subscription and consumer tables are omitted.
 JSON retains the full producer and subscription details.
 
-`admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line; `admin tenants list -F human` does the same under a `TENANT` header.
+`admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line; `admin tenants list -F human` and `admin namespaces list -F human` do the same under a `TENANT` / `NAMESPACE` header, namespaces keeping their full `tenant/namespace` name so a row can be pasted into any `admin namespaces …` command.
 
 `admin clusters list-failure-domains <cluster> -F human` displays a `DOMAIN` / `BROKERS` table with one row per broker; the domain is named on the first row of its group and the cell is left blank on the following rows, so each domain reads as a block. A domain without brokers shows `—`.
 `admin clusters get-failure-domain <cluster> <domain> -F human` prints the same table with the requested domain as its single group.
