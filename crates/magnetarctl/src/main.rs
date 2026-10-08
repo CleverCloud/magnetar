@@ -2827,7 +2827,19 @@ async fn run_admin_brokers(
                 ),
             }
         }
-        BrokersCmd::Leader => print_json(&admin.brokers_leader().await?),
+        BrokersCmd::Leader => {
+            let leader = admin.brokers_leader().await?;
+            match format {
+                OutputFormat::Json => print_json(&leader),
+                OutputFormat::Human => {
+                    out!(
+                        "{}",
+                        output::render_leader(&leader, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         BrokersCmd::DynamicConfigKeys => print_json(&admin.brokers_dynamic_config_keys().await?),
         BrokersCmd::DynamicConfigOverrides => {
             print_json(&admin.brokers_dynamic_config_overrides().await?)
