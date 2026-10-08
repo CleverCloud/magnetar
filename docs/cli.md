@@ -70,7 +70,7 @@ RETENTION DURATION  366 days
 RETENTION SIZE      ∞
 ```
 
-`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
 `admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
 Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
 
@@ -80,6 +80,8 @@ Missing table values display `—`; empty producer, subscription and consumer ta
 JSON retains the full producer and subscription details.
 
 `admin namespaces get-persistence <ns> -F human` and `admin topics get-persistence <topic> -F human` display the `BookKeeper` ensemble, write quorum and ack quorum, then the managed-ledger mark-delete rate cap in `ops/s`, shown as `disabled` when the broker reports `0.0`.
+
+`admin bookies list -F human` flattens the broker's `{ bookies: [{ bookieId }] }` envelope into one `BOOKIE` column in natural host order.
 
 `admin brokers leader -F human` displays `BROKER ID` and `SERVICE URL`, followed by any further key a newer broker returns (`clusterName` becomes `CLUSTER NAME`), so nothing the broker sends is dropped.
 

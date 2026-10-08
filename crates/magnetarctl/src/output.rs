@@ -806,3 +806,26 @@ pub(crate) fn render_leader(leader: &serde_json::Value, colored: bool) -> String
         .collect();
     render_rows(&borrowed, colored)
 }
+
+/// `bookies list`: the broker's `BookiesClusterInfo` envelope,
+/// `{ bookies: [{ bookieId }] }` (`address` on older brokers). One `BOOKIE`
+/// column in natural host order; an unexpected shape prints as JSON.
+pub(crate) fn render_bookies(info: &serde_json::Value, colored: bool) -> String {
+    let Some(bookies) = info.get("bookies").and_then(serde_json::Value::as_array) else {
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(info).unwrap_or_default()
+        );
+    };
+    let names: Vec<String> = bookies
+        .iter()
+        .map(|bookie| {
+            bookie
+                .get("bookieId")
+                .or_else(|| bookie.get("address"))
+                .map_or_else(|| plain_value(bookie), plain_value)
+        })
+        .collect();
+    let rows: Vec<[String; 1]> = natural_sorted(&names).into_iter().map(|n| [n]).collect();
+    render_table(["bookie"], &rows, colored)
+}

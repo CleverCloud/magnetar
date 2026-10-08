@@ -392,8 +392,9 @@ impl AdminClient {
     /// read-only — as registered in `BookKeeper` metadata.
     ///
     /// `GET /admin/v2/bookies/all`. Returns the broker's
-    /// `BookiesClusterInfo` envelope — a `bookies: [{ address: "host:port" }]`
-    /// array. Raw JSON for forward-compat.
+    /// `BookiesClusterInfo` envelope — a `bookies: [{ bookieId: "host" }]`
+    /// array (`address: "host:port"` on brokers before the `BookieId`
+    /// rename). Raw JSON for forward-compat.
     /// Java: `BookiesBase#getAllAvailableBookies`.
     pub async fn bookies_list_all(&self) -> Result<serde_json::Value, AdminError> {
         let url = self.url(&["bookies", "all"])?;
