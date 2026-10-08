@@ -75,7 +75,11 @@ tokio              = { workspace = true, features = ["rt-multi-thread", "macros"
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde              = { workspace = true }
-serde_json         = { workspace = true, features = ["preserve_order"] }
+# NO `preserve_order`: the feature unifies into every crate built alongside
+# this one, and `magnetar-proto` derives JSON-schema field order from
+# `serde_json::Map` iteration, so it would change the schema bytes the CLI
+# emits versus the library (invariant #7). Human tables sort explicitly.
+serde_json         = { workspace = true }
 # YAML for the pulsarctl-compatible `~/.config/pulsar/config` context file.
 serde_norway       = { workspace = true }
 thiserror          = { workspace = true }

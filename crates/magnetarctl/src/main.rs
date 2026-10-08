@@ -4455,7 +4455,7 @@ fn print_resolved<T: serde::Serialize + output::HumanOutput>(
     resolved: &output::Resolved<T>,
 ) -> Result<(), CliError> {
     match format {
-        OutputFormat::Json => print_json(&output::resolved_json(resolved)?),
+        OutputFormat::Json => print_json(resolved),
         OutputFormat::Human => {
             let s = output::render_rows(
                 &output::HumanOutput::human_fields(resolved),

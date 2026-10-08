@@ -413,7 +413,10 @@ fn topic_list_collapses_confirmed_partitions_with_declared_count() {
             ("persistent://tenant/ns/orders-partition-9", None),
         ]
     );
-    assert!(cli::output::collapse_partitioned_topics(&[], &counts).is_empty());
+    assert_eq!(
+        cli::output::collapse_partitioned_topics(&[], &counts),
+        Vec::<cli::output::TopicRow>::new()
+    );
 }
 
 #[test]
@@ -600,7 +603,7 @@ fn consumer_table_preserves_subscription_and_formats_units_and_missing_fields() 
 }
 
 #[test]
-fn failure_domains_name_the_domain_once_per_group_in_payload_order() {
+fn failure_domains_name_the_domain_once_per_group_in_name_order() {
     let domains = serde_json::json!({
         "par7": {"brokers": ["broker-n3:8080", "broker-n4:8080"]},
         "par6": {"brokers": ["broker-n1:8080"]},
@@ -611,11 +614,11 @@ fn failure_domains_name_the_domain_once_per_group_in_payload_order() {
     assert_eq!(
         plain,
         "DOMAIN   BROKERS\n\
-         par7     broker-n3:8080\n\
-         \x20        broker-n4:8080\n\
-         par6     broker-n1:8080\n\
          empty    —\n\
-         missing  —\n"
+         missing  —\n\
+         par6     broker-n1:8080\n\
+         par7     broker-n3:8080\n\
+         \x20        broker-n4:8080\n"
     );
     let colored = cli::output::render_failure_domains(&domains, true);
     assert_eq!(
@@ -697,9 +700,8 @@ fn resolved_policy_leads_with_its_source_in_both_formats() {
          RETENTION DURATION  0 minutes\n\
          RETENTION SIZE      0 MB\n"
     );
-    let json = cli::output::resolved_json(&resolved).expect("json");
     assert_eq!(
-        serde_json::to_string(&json).expect("string"),
+        serde_json::to_string(&resolved).expect("string"),
         r#"{"source":"broker","retentionTimeInMinutes":0,"retentionSizeInMB":0}"#
     );
     for (source, label, name) in [
@@ -799,7 +801,7 @@ fn natural_sort_orders_host_numbers_numerically() {
         cli::output::natural_sorted(&mixed),
         ["a", "a09", "a9", "a10", "b"]
     );
-    assert!(cli::output::natural_sorted(&[]).is_empty());
+    assert_eq!(cli::output::natural_sorted(&[]), Vec::<String>::new());
 }
 
 #[test]
@@ -1017,11 +1019,7 @@ fn scalar_policies_render_sentinels_and_serialise_under_their_key() {
             source: PolicySource::Namespace,
             value: policy,
         };
-        assert_eq!(
-            serde_json::to_string(&cli::output::resolved_json(&resolved).expect("json"))
-                .expect("string"),
-            json
-        );
+        assert_eq!(serde_json::to_string(&resolved).expect("string"), json);
     }
 }
 
@@ -1085,7 +1083,7 @@ fn backlog_quotas_detect_unset_maps_and_render_each_type() {
         source: cli::output::PolicySource::Broker,
         value: default,
     };
-    let json = cli::output::resolved_json(&resolved).expect("json");
+    let json = serde_json::to_value(&resolved).expect("json");
     assert_eq!(json["source"], "broker");
     assert_eq!(json["message_age"]["limitTime"], 3600);
     assert_eq!(
