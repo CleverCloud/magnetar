@@ -556,7 +556,7 @@ fn ip_address(peer: &serde_json::Value) -> String {
 /// / `BROKERS` header, naming the domain on the first row of its group only
 /// and leaving the cell blank on the following rows, so each group reads as a
 /// block; a domain with no brokers prints a single `—` row.
-/// Domain order follows the broker payload (`preserve_order`).
+/// Domains come out in name order (`serde_json::Map` is sorted).
 pub(crate) fn render_failure_domains(domains: &serde_json::Value, colored: bool) -> String {
     let Some(domains) = domains.as_object() else {
         // Not the documented shape: fall back to pretty JSON so nothing is
@@ -622,9 +622,15 @@ impl PolicySource {
 
 /// A policy together with the level that supplied it, so neither output
 /// format can pass a broker default off as something the namespace set.
-#[derive(Debug, Clone, Copy)]
+///
+/// Serialises as the policy's own fields with a leading `source` key
+/// (`#[serde(flatten)]`, written straight to the output so the order holds
+/// without `preserve_order`): `.retentionTimeInMinutes`-style `jq` paths
+/// keep working and the provenance is still in the payload.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub(crate) struct Resolved<T> {
     pub(crate) source: PolicySource,
+    #[serde(flatten)]
     pub(crate) value: T,
 }
 
@@ -634,20 +640,6 @@ impl<T: HumanOutput> HumanOutput for Resolved<T> {
         fields.extend(self.value.human_fields());
         fields
     }
-}
-
-/// JSON for a resolved policy: the policy's own fields with a leading
-/// `source` key, so `.retentionTimeInMinutes`-style `jq` paths keep working
-/// and the provenance is still in the payload.
-pub(crate) fn resolved_json<T: serde::Serialize>(
-    resolved: &Resolved<T>,
-) -> Result<serde_json::Value, serde_json::Error> {
-    let mut object = serde_json::Map::new();
-    object.insert("source".to_owned(), serde_json::to_value(resolved.source)?);
-    if let serde_json::Value::Object(fields) = serde_json::to_value(&resolved.value)? {
-        object.extend(fields);
-    }
-    Ok(serde_json::Value::Object(object))
 }
 
 /// The `tenant/namespace` of a topic name, with or without a
