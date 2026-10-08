@@ -847,3 +847,37 @@ fn bookies_render_one_sorted_column_from_either_id_key() {
         "[\n  \"bk-n1\"\n]\n"
     );
 }
+
+#[test]
+fn racks_info_groups_bookies_by_rack_and_names_blocks_once() {
+    let info = serde_json::json!({
+        "default": {
+            "bk-n10": {"rack": "/par7/K16", "hostname": "bk-n10:3181"},
+            "bk-n8":  {"rack": "/par6/N1",  "hostname": "bk-n8:3181"},
+            "bk-n14": {"rack": "/par6/N1",  "hostname": "bk-n14:3181"},
+            "bk-n9":  {"rack": "/par6/N1"}
+        },
+        "other": {
+            "bk-x": {"hostname": "bk-x:3181"}
+        }
+    });
+    assert_eq!(
+        cli::output::render_racks_info(&info, false),
+        concat!(
+            "AFFINITY GROUP  RACK       BOOKIE  HOSTNAME\n",
+            "default         /par6/N1   bk-n8   bk-n8:3181\n",
+            "                           bk-n9   —\n",
+            "                           bk-n14  bk-n14:3181\n",
+            "                /par7/K16  bk-n10  bk-n10:3181\n",
+            "other           —          bk-x    bk-x:3181\n",
+        )
+    );
+    assert_eq!(
+        cli::output::render_racks_info(&serde_json::json!({}), false),
+        "AFFINITY GROUP  RACK  BOOKIE  HOSTNAME\n"
+    );
+    assert_eq!(
+        cli::output::render_racks_info(&serde_json::json!([1]), false),
+        "[\n  1\n]\n"
+    );
+}
