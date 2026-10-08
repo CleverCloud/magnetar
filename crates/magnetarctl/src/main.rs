@@ -2678,7 +2678,7 @@ async fn run_admin(
         AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, format, sub).await,
         AdminCmd::Brokers { sub } => run_admin_brokers(&admin, format, sub).await,
-        AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
+        AdminCmd::Bookies { sub } => run_admin_bookies(&admin, format, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
         AdminCmd::Sources { sub } => run_admin_sources(&admin, sub).await,
@@ -2868,9 +2868,22 @@ async fn run_admin_brokers(
     }
 }
 
-async fn run_admin_bookies(admin: &AdminClient, cmd: BookiesCmd) -> Result<(), CliError> {
+async fn run_admin_bookies(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: BookiesCmd,
+) -> Result<(), CliError> {
     match cmd {
-        BookiesCmd::List => print_json(&admin.bookies_list_all().await?),
+        BookiesCmd::List => {
+            let info = admin.bookies_list_all().await?;
+            match format {
+                OutputFormat::Json => print_json(&info),
+                OutputFormat::Human => {
+                    out!("{}", output::render_bookies(&info, version::should_color()));
+                    Ok(())
+                }
+            }
+        }
         BookiesCmd::RacksInfo => print_json(&admin.bookies_racks_info().await?),
         BookiesCmd::SetRack {
             bookie,

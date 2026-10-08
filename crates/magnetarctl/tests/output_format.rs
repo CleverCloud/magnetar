@@ -825,3 +825,25 @@ fn leader_renders_known_keys_first_then_extra_keys_with_derived_labels() {
         "\"n9\"\n"
     );
 }
+
+#[test]
+fn bookies_render_one_sorted_column_from_either_id_key() {
+    let info = serde_json::json!({"bookies": [
+        {"bookieId": "bk-n14"},
+        {"address": "bk-n2:3181"},
+        {"bookieId": "bk-n3"},
+        {"other": 1}
+    ]});
+    assert_eq!(
+        cli::output::render_bookies(&info, false),
+        "BOOKIE\nbk-n2:3181\nbk-n3\nbk-n14\n{\"other\":1}\n"
+    );
+    assert_eq!(
+        cli::output::render_bookies(&serde_json::json!({"bookies": []}), false),
+        "BOOKIE\n"
+    );
+    assert_eq!(
+        cli::output::render_bookies(&serde_json::json!(["bk-n1"]), false),
+        "[\n  \"bk-n1\"\n]\n"
+    );
+}
