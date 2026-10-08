@@ -151,15 +151,18 @@ async fn e2e_admin_namespace_and_diagnostics() -> Result<(), Box<dyn std::error:
         retention_size_in_mb: 1024,
     };
     admin.namespace_set_retention(ns, pol_set).await?;
-    let pol_got = admin.namespace_get_retention(ns).await?;
+    let pol_got = admin
+        .namespace_get_retention(ns)
+        .await?
+        .expect("retention policy was just set");
     assert_eq!(pol_got.retention_time_in_minutes, 60);
     assert_eq!(pol_got.retention_size_in_mb, 1024);
     admin.namespace_remove_retention(ns).await?;
+    // After `remove` the namespace carries no policy of its own: the
+    // getter reports `None` (the broker's `defaultRetention*` then applies)
+    // rather than a client-side `0/0`. Pin that as the post-remove invariant.
     let pol_default = admin.namespace_get_retention(ns).await?;
-    // The broker default for `public/default` is `0/0` (no retention).
-    // Pin that as the post-remove invariant.
-    assert_eq!(pol_default.retention_time_in_minutes, 0);
-    assert_eq!(pol_default.retention_size_in_mb, 0);
+    assert!(pol_default.is_none(), "{pol_default:?}");
 
     // --- Namespace policies — message TTL round-trip ---------------
 
@@ -375,7 +378,10 @@ async fn e2e_admin_namespace_policies_breadth() -> Result<(), Box<dyn std::error
         managed_ledger_max_mark_delete_rate: 1.0,
     };
     admin.namespace_set_persistence(ns, pers).await?;
-    let got = admin.namespace_get_persistence(ns).await?;
+    let got = admin
+        .namespace_get_persistence(ns)
+        .await?
+        .expect("persistence policy was just set");
     assert_eq!(got.bookkeeper_ensemble, 2);
     assert_eq!(got.bookkeeper_write_quorum, 2);
     assert_eq!(got.bookkeeper_ack_quorum, 2);
@@ -544,9 +550,10 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
     let got = await_topic_policy(
         "retention",
         || admin.topic_get_retention(topic),
-        |r| r.retention_time_in_minutes == -1 && r.retention_size_in_mb == -1,
+        |r| r.is_some_and(|r| r.retention_time_in_minutes == -1 && r.retention_size_in_mb == -1),
     )
     .await?;
+    let got = got.expect("predicate accepted a set policy");
     assert_eq!(got.retention_time_in_minutes, -1);
     assert_eq!(got.retention_size_in_mb, -1);
     admin.topic_remove_retention(topic).await?;

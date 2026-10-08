@@ -13,8 +13,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Labels are uppercase and blue on a terminal; a pipe or a non-empty `NO_COLOR` disables color.
   Every other command still prints JSON whatever the flag says, and `json` output is byte-for-byte unchanged.
 
+### Changed
+
+- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention` and `namespace_get_persistence` now return `Option<_>`, `None` when the policy is unset at that level.**
+  They used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0`, while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`.
+  The client therefore reported a replication layout the cluster never returned.
+  The three getters now share `json_ok_unset_policy`, which folds all four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; `topic_get_persistence` already behaved this way.
+
 ### Fixed
 
+- **`magnetarctl admin namespaces/topics get-retention` and `get-persistence` no longer print a client-side constant for an unset policy, and say which level supplied the value.**
+  A namespace without a policy of its own now gets the broker default read from the runtime configuration (`defaultRetention*`, `managedLedgerDefault*`); a topic without one falls back to its namespace, then to the broker.
+  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the unchanged policy fields, and human output a first `SOURCE` row.
 - **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
   Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
 

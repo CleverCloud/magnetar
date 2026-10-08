@@ -992,11 +992,20 @@ impl AdminClient {
     /// removed, surfaces as 204 / empty body / `null` — we fold those
     /// to `RetentionPolicies::default()` (broker semantic).
     /// Java: `NamespacesBase#getRetention`.
-    pub async fn namespace_get_retention(&self, ns: &str) -> Result<RetentionPolicies, AdminError> {
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`), which Java's admin client also
+    /// surfaces as `null`. The effective value then comes from the next level
+    /// up (the namespace for a topic, the broker configuration for a
+    /// namespace); it is NOT a client-side constant.
+    pub async fn namespace_get_retention(
+        &self,
+        ns: &str,
+    ) -> Result<Option<RetentionPolicies>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "retention"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok_or_default(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's retention policy.
@@ -1135,14 +1144,20 @@ impl AdminClient {
     /// managed-ledger mark-delete rate cap. `null` body decodes to
     /// `PersistencePolicies::default()` via `#[serde(default)]`.
     /// Java: `NamespacesBase#getPersistence`.
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`), which Java's admin client also
+    /// surfaces as `null`. The effective value then comes from the next level
+    /// up (the namespace for a topic, the broker configuration for a
+    /// namespace); it is NOT a client-side constant.
     pub async fn namespace_get_persistence(
         &self,
         ns: &str,
-    ) -> Result<PersistencePolicies, AdminError> {
+    ) -> Result<Option<PersistencePolicies>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "persistence"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok_or_default(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's persistence policy.
@@ -2062,11 +2077,20 @@ impl AdminClient {
     /// `null` (decoded as `RetentionPolicies::default()` via `#[serde(default)]`)
     /// when no override is in place — callers fall back to the namespace
     /// policy in that case. Java: `PersistentTopicsBase#getRetention`.
-    pub async fn topic_get_retention(&self, topic: &str) -> Result<RetentionPolicies, AdminError> {
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`), which Java's admin client also
+    /// surfaces as `null`. The effective value then comes from the next level
+    /// up (the namespace for a topic, the broker configuration for a
+    /// namespace); it is NOT a client-side constant.
+    pub async fn topic_get_retention(
+        &self,
+        topic: &str,
+    ) -> Result<Option<RetentionPolicies>, AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "retention"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok_or_default(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a topic's retention policy (overrides the namespace default).
@@ -4501,6 +4525,41 @@ where
     }
     serde_json::from_slice::<Option<T>>(&bytes)
         .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err))
+}
+
+/// Decode a 2xx policy getter whose broker leaves the policy *unset* rather
+/// than defaulted: `204`, an empty body, a literal `null` and an empty object
+/// `{}` all mean "no policy at this level" and fold to `None`. Anything else
+/// must decode as `T`.
+///
+/// Distinct from [`json_ok_or_default`]: a policy struct's `Default` is a
+/// client-side constant (`PersistencePolicies` is `2/2/2`), NOT the broker's
+/// effective configuration (`managedLedgerDefault*` can be `3/3/2`), so
+/// substituting it would report a value the cluster never returned.
+async fn json_ok_unset_policy<T>(api: ApiResponse) -> Result<Option<T>, AdminError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let api = ensure_status(api).await?;
+    let ApiResponse { method, url, resp } = api;
+    if resp.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let bytes = resp.bytes().await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err))?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(ref fields) if fields.is_empty() => Ok(None),
+        other => serde_json::from_value(other)
+            .map(Some)
+            .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err)),
+    }
 }
 
 /// Discard a successful no-content response body.

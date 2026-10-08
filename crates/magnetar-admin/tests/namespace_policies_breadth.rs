@@ -65,7 +65,8 @@ async fn persistence_get_set_remove_cycle() {
     let pol = admin
         .namespace_get_persistence("acme/svc")
         .await
-        .expect("get persistence");
+        .expect("get persistence")
+        .expect("persistence policy is set");
     assert_eq!(pol.bookkeeper_ensemble, 3);
     assert_eq!(pol.bookkeeper_write_quorum, 2);
     assert_eq!(pol.bookkeeper_ack_quorum, 2);

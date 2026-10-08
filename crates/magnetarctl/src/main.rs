@@ -3074,7 +3074,10 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetRetention { namespace } => {
-            print_formatted(format, &admin.namespace_get_retention(&namespace).await?)
+            let own = admin.namespace_get_retention(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::retention_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetRetention {
             namespace,
@@ -3145,7 +3148,10 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetPersistence { namespace } => {
-            print_formatted(format, &admin.namespace_get_persistence(&namespace).await?)
+            let own = admin.namespace_get_persistence(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::persistence_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetPersistence {
             namespace,
@@ -3547,7 +3553,18 @@ async fn run_admin_topics(
             print_json(&message_id_to_json(&id))
         }
         TopicsCmd::GetRetention { topic } => {
-            print_formatted(format, &admin.topic_get_retention(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_retention(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let own = admin
+                    .namespace_get_retention(&namespace_of_topic(&topic)?)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::retention_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetRetention {
             topic,
@@ -3608,19 +3625,18 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetPersistence { topic } => {
-            let policies = admin.topic_get_persistence(&topic).await?;
-            match (format, policies) {
-                (OutputFormat::Json, policies) => print_json(&policies),
-                (OutputFormat::Human, Some(policies)) => {
-                    print_formatted(OutputFormat::Human, &policies)
+            let resolved = if let Some(value) = admin.topic_get_persistence(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
                 }
-                // JSON prints `null` here: the topic carries no policy of
-                // its own and the namespace-level one applies.
-                (OutputFormat::Human, None) => {
-                    outln!("no topic-level persistence policy (the namespace policy applies)");
-                    Ok(())
-                }
-            }
+            } else {
+                let own = admin
+                    .namespace_get_persistence(&namespace_of_topic(&topic)?)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::persistence_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetPersistence {
             topic,
@@ -4143,20 +4159,58 @@ fn print_formatted_list(
     }
 }
 
-/// Print `value` in the requested [`OutputFormat`]: pretty JSON, or the
-/// command-specific human presentation.
-fn print_formatted<T: serde::Serialize + output::HumanOutput>(
+/// Print a resolved policy in the requested [`OutputFormat`]: pretty JSON
+/// with a leading `source` key, or the human table with a `SOURCE` row.
+fn print_resolved<T: serde::Serialize + output::HumanOutput>(
     format: OutputFormat,
-    value: &T,
+    resolved: &output::Resolved<T>,
 ) -> Result<(), CliError> {
     match format {
-        OutputFormat::Json => print_json(value),
+        OutputFormat::Json => print_json(&output::resolved_json(resolved)?),
         OutputFormat::Human => {
-            let s = output::render_rows(&value.human_fields(), version::should_color());
+            let s = output::render_rows(
+                &output::HumanOutput::human_fields(resolved),
+                version::should_color(),
+            );
             out!("{s}");
             Ok(())
         }
     }
+}
+
+/// A namespace-level policy as the cluster applies it: the namespace's own
+/// policy when it has one, else the broker default read from the runtime
+/// configuration. The level that answered travels with the value.
+///
+/// Reading the broker configuration is one extra admin call and happens only
+/// when the namespace is unset, so a set policy costs what it always did.
+async fn resolve_namespace_policy<T>(
+    admin: &AdminClient,
+    own: Option<T>,
+    from_broker: impl FnOnce(&serde_json::Value) -> Result<T, String>,
+) -> Result<output::Resolved<T>, CliError> {
+    if let Some(value) = own {
+        return Ok(output::Resolved {
+            source: output::PolicySource::Namespace,
+            value,
+        });
+    }
+    let config = admin.brokers_runtime_config().await?;
+    let value = from_broker(&config).map_err(CliError::BrokerConfig)?;
+    Ok(output::Resolved {
+        source: output::PolicySource::Broker,
+        value,
+    })
+}
+
+/// The `tenant/namespace` a topic belongs to, for the namespace step of a
+/// topic policy lookup.
+fn namespace_of_topic(topic: &str) -> Result<String, CliError> {
+    output::namespace_of_topic(topic).ok_or_else(|| {
+        CliError::BadArg(format!(
+            "topic `{topic}` is not of the form [persistent://]tenant/namespace/topic"
+        ))
+    })
 }
 
 /// Render a [`MessageId`] as the canonical CLI JSON object, mirroring Java's
@@ -4205,6 +4259,10 @@ pub(crate) enum CliError {
     /// I/O error while reading stdin or writing stdout.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The broker runtime configuration lacks, or mangles, a key the CLI
+    /// needs to resolve a policy default.
+    #[error("broker runtime configuration: {0}")]
+    BrokerConfig(String),
 }
 
 /// Parse a `MessageId` from the canonical CLI form

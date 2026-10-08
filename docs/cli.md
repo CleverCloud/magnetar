@@ -56,6 +56,11 @@ Every command prints its result as pretty JSON by default, and that stays the de
 `--format human` (alias `-F human`, or `MAGNETAR_FORMAT=human` to make it the shell-wide default) switches to a two-column `LABEL  VALUE` table: one line per field, the label column left-aligned and padded to the widest label.
 Human output uses command-specific labels and unit-aware values; JSON keeps the broker field names and numeric values.
 For retention, durations are expressed in days, hours and minutes without rounding, sizes use `MB`, and `-1` is displayed as `∞`.
+
+The retention and persistence getters report the policy the cluster actually applies, and say where it comes from.
+A namespace without a policy of its own gets the broker default read from `GET /admin/v2/brokers/configuration/runtime` (`defaultRetention*` for retention, `managedLedgerDefault*` for persistence); a topic without a policy of its own falls back to its namespace, then to the broker.
+JSON output carries a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row reading `topic policy`, `namespace policy` or `broker default (no policy set)`.
+The client never substitutes a constant of its own: an earlier version printed `2/2/2` for a namespace with no persistence policy while the broker's defaults were `3/3/2`.
 Rates are shown with two decimals (`msg/s`, `B/s`), as are byte sizes.
 Field labels are uppercase and blue on a terminal; piping the output or setting a non-empty `NO_COLOR` disables color.
 
@@ -75,7 +80,6 @@ Missing table values display `—`; empty producer, subscription and consumer ta
 JSON retains the full producer and subscription details.
 
 `admin namespaces get-persistence <ns> -F human` and `admin topics get-persistence <topic> -F human` display the `BookKeeper` ensemble, write quorum and ack quorum, then the managed-ledger mark-delete rate cap in `ops/s`, shown as `disabled` when the broker reports `0.0`.
-A topic without a policy of its own (JSON `null`) prints `no topic-level persistence policy (the namespace policy applies)`.
 
 `admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line; `admin tenants list -F human`, `admin namespaces list -F human` and `admin subscriptions list -F human` do the same under a `TENANT` / `NAMESPACE` / `SUBSCRIPTION` header, namespaces keeping their full `tenant/namespace` name so a row can be pasted into any `admin namespaces …` command.
 
