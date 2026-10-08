@@ -2677,7 +2677,7 @@ async fn run_admin(
         AdminCmd::Tenants { sub } => run_admin_tenants(&admin, format, sub).await,
         AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, format, sub).await,
         AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
-        AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
+        AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, format, sub).await,
         AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
         AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
@@ -2690,10 +2690,15 @@ async fn run_admin(
 
 async fn run_admin_subscriptions(
     admin: &AdminClient,
+    format: OutputFormat,
     cmd: SubscriptionsCmd,
 ) -> Result<(), CliError> {
     match cmd {
-        SubscriptionsCmd::List { topic } => print_json(&admin.subscriptions_list(&topic).await?),
+        SubscriptionsCmd::List { topic } => print_formatted_list(
+            format,
+            "subscription",
+            &admin.subscriptions_list(&topic).await?,
+        ),
         SubscriptionsCmd::ResetCursor {
             topic,
             subscription,
