@@ -2884,7 +2884,19 @@ async fn run_admin_bookies(
                 }
             }
         }
-        BookiesCmd::RacksInfo => print_json(&admin.bookies_racks_info().await?),
+        BookiesCmd::RacksInfo => {
+            let info = admin.bookies_racks_info().await?;
+            match format {
+                OutputFormat::Json => print_json(&info),
+                OutputFormat::Human => {
+                    out!(
+                        "{}",
+                        output::render_racks_info(&info, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         BookiesCmd::SetRack {
             bookie,
             group,

@@ -829,3 +829,61 @@ pub(crate) fn render_bookies(info: &serde_json::Value, colored: bool) -> String 
     let rows: Vec<[String; 1]> = natural_sorted(&names).into_iter().map(|n| [n]).collect();
     render_table(["bookie"], &rows, colored)
 }
+
+/// `bookies racks-info`: the broker's `group → bookie → { rack, hostname }`
+/// map, turned inside out into an `AFFINITY GROUP / RACK / BOOKIE / HOSTNAME`
+/// table so the bookies sharing a rack sit together. The group is the
+/// bookie-affinity group (`set-bookie-rack --group`, `default` when unset)
+/// a namespace's bookie-affinity policy can pin it to. Racks are in natural
+/// order, and bookies within a rack too; a group or rack is named on the
+/// first row of its block only. A missing `rack` / `hostname` prints `—`;
+/// an unexpected shape prints as JSON.
+pub(crate) fn render_racks_info(info: &serde_json::Value, colored: bool) -> String {
+    let Some(groups) = info.as_object() else {
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(info).unwrap_or_default()
+        );
+    };
+    let mut rows: Vec<[String; 4]> = Vec::new();
+    for (group, bookies) in groups {
+        let Some(bookies) = bookies.as_object() else {
+            rows.push([
+                group.clone(),
+                "—".to_owned(),
+                "—".to_owned(),
+                plain_value(bookies),
+            ]);
+            continue;
+        };
+        let mut entries: Vec<(String, String, String)> = bookies
+            .iter()
+            .map(|(bookie, details)| {
+                let field =
+                    |key: &str| details.get(key).map_or_else(|| "—".to_owned(), plain_value);
+                (field("rack"), bookie.clone(), field("hostname"))
+            })
+            .collect();
+        entries.sort_by(|a, b| natural_cmp(&a.0, &b.0).then_with(|| natural_cmp(&a.1, &b.1)));
+        let mut previous_rack: Option<&str> = None;
+        for (index, (rack, bookie, hostname)) in entries.iter().enumerate() {
+            let group_cell = if index == 0 {
+                group.clone()
+            } else {
+                String::new()
+            };
+            let rack_cell = if previous_rack == Some(rack.as_str()) {
+                String::new()
+            } else {
+                rack.clone()
+            };
+            previous_rack = Some(rack.as_str());
+            rows.push([group_cell, rack_cell, bookie.clone(), hostname.clone()]);
+        }
+    }
+    render_table(
+        ["affinity group", "rack", "bookie", "hostname"],
+        &rows,
+        colored,
+    )
+}

@@ -70,7 +70,7 @@ RETENTION DURATION  366 days
 RETENTION SIZE      ∞
 ```
 
-`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin bookies racks-info`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
 `admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
 Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
 
@@ -82,6 +82,8 @@ JSON retains the full producer and subscription details.
 `admin namespaces get-persistence <ns> -F human` and `admin topics get-persistence <topic> -F human` display the `BookKeeper` ensemble, write quorum and ack quorum, then the managed-ledger mark-delete rate cap in `ops/s`, shown as `disabled` when the broker reports `0.0`.
 
 `admin bookies list -F human` flattens the broker's `{ bookies: [{ bookieId }] }` envelope into one `BOOKIE` column in natural host order.
+`admin bookies racks-info -F human` turns the `group → bookie → { rack, hostname }` map into an `AFFINITY GROUP` / `RACK` / `BOOKIE` / `HOSTNAME` table, bookies grouped under their rack in natural order, the group and rack named on the first row of their block; a missing field shows `—`.
+The affinity group is the one `bookies set-rack --group` filed the bookie under (`default` when none was given); a namespace's bookie-affinity policy can restrict its ledgers to one group.
 
 `admin brokers leader -F human` displays `BROKER ID` and `SERVICE URL`, followed by any further key a newer broker returns (`clusterName` becomes `CLUSTER NAME`), so nothing the broker sends is dropped.
 
