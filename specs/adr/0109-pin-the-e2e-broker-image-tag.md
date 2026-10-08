@@ -19,6 +19,7 @@ Two fixes were possible: make the wait marker version-agnostic (`"public/default
 ## Decision
 
 1. `DEFAULT_IMAGE_TAG` is `"4.2.4"` in every suite that defaulted to `latest`; the two suites pinned at `4.0.4` and the one at `4.2.3` are unchanged.
+   The PIP-33 two-cluster fixture (`crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml`) pins the same tag in its six services: it also ran `latest`, and its bring-up step failed on CI once the tag moved.
    `MAGNETAR_PULSAR_IMAGE_TAG` / `MAGNETAR_PULSAR_IMAGE_REPO` keep overriding it, so a compatibility run against `5.0.0` or any other tag is one environment variable away.
 2. CI pre-pulls `4.2.4` in place of `latest`; `5.0.0-M1` and `4.0.4` stay pre-pulled for the suites that use them.
 3. Moving the default to a Pulsar 5.x tag is a separate decision: it needs the wait marker changed in every suite (the structured log no longer carries `Created namespace public/default`) and a review of the suite against the new major, and it must land on its own, not as a side effect of a tag that moved.
