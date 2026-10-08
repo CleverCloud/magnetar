@@ -485,3 +485,29 @@ fn get_failure_domain_wraps_the_single_domain_in_the_shared_table() {
          \x20       broker-n2:8080\n"
     );
 }
+
+#[test]
+fn persistence_policies_render_quorums_and_disabled_mark_delete_rate() {
+    use cli::output::HumanOutput;
+    let policies = magnetar_admin::PersistencePolicies {
+        bookkeeper_ensemble: 2,
+        bookkeeper_write_quorum: 2,
+        bookkeeper_ack_quorum: 2,
+        managed_ledger_max_mark_delete_rate: 0.0,
+    };
+    assert_eq!(
+        cli::output::render_rows(&policies.human_fields(), false),
+        "BOOKKEEPER ENSEMBLE      2\n\
+         BOOKKEEPER WRITE QUORUM  2\n\
+         BOOKKEEPER ACK QUORUM    2\n\
+         MAX MARK-DELETE RATE     disabled\n"
+    );
+    let throttled = magnetar_admin::PersistencePolicies {
+        managed_ledger_max_mark_delete_rate: 1.5,
+        ..policies
+    };
+    assert!(
+        cli::output::render_rows(&throttled.human_fields(), false)
+            .ends_with("MAX MARK-DELETE RATE     1.5 ops/s\n")
+    );
+}

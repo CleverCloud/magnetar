@@ -65,7 +65,7 @@ RETENTION DURATION  366 days
 RETENTION SIZE      ∞
 ```
 
-`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list` and `admin namespaces list` honour `human`; every other command still prints JSON whatever the flag says.
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
 `admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
 Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
 
@@ -73,6 +73,9 @@ Physical partitions are grouped under their parent, with the declared count from
 Byte quantities use base 1000 and two decimal places (`214990 B` becomes `214.99 KB`); JSON retains the original numeric values.
 Missing table values display `—`; empty producer, subscription and consumer tables are omitted.
 JSON retains the full producer and subscription details.
+
+`admin namespaces get-persistence <ns> -F human` and `admin topics get-persistence <topic> -F human` display the `BookKeeper` ensemble, write quorum and ack quorum, then the managed-ledger mark-delete rate cap in `ops/s`, shown as `disabled` when the broker reports `0.0`.
+A topic without a policy of its own (JSON `null`) prints `no topic-level persistence policy (the namespace policy applies)`.
 
 `admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line; `admin tenants list -F human` and `admin namespaces list -F human` do the same under a `TENANT` / `NAMESPACE` header, namespaces keeping their full `tenant/namespace` name so a row can be pasted into any `admin namespaces …` command.
 

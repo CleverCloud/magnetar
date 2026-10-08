@@ -161,10 +161,8 @@ pub(crate) struct Cli {
     pub(crate) admin_timeout_secs: u64,
 
     /// Output format. `json` (default) prints the broker payload as pretty
-    /// JSON; `human` prints a two-column `FIELD  VALUE` table. Only
-    /// namespace and topic `get-retention`, `admin topics list` / `stats`,
-    /// `admin clusters list` / `list-failure-domains` / `get-failure-domain`
-    /// and `admin tenants list` / `admin namespaces list` honour `human` so far —
+    /// JSON; `human` prints command-specific labelled tables. See
+    /// `docs/cli.md#output-format` for the commands that honour `human` —
     /// every other command still prints JSON whatever the flag says.
     #[arg(
         long,
@@ -3142,7 +3140,7 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetPersistence { namespace } => {
-            print_json(&admin.namespace_get_persistence(&namespace).await?)
+            print_formatted(format, &admin.namespace_get_persistence(&namespace).await?)
         }
         NamespacesCmd::SetPersistence {
             namespace,
@@ -3605,7 +3603,19 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetPersistence { topic } => {
-            print_json(&admin.topic_get_persistence(&topic).await?)
+            let policies = admin.topic_get_persistence(&topic).await?;
+            match (format, policies) {
+                (OutputFormat::Json, policies) => print_json(&policies),
+                (OutputFormat::Human, Some(policies)) => {
+                    print_formatted(OutputFormat::Human, &policies)
+                }
+                // JSON prints `null` here: the topic carries no policy of
+                // its own and the namespace-level one applies.
+                (OutputFormat::Human, None) => {
+                    outln!("no topic-level persistence policy (the namespace policy applies)");
+                    Ok(())
+                }
+            }
         }
         TopicsCmd::SetPersistence {
             topic,

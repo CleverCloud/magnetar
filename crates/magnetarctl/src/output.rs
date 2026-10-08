@@ -5,7 +5,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use magnetar_admin::RetentionPolicies;
+use magnetar_admin::{PersistencePolicies, RetentionPolicies};
 
 /// The human view is independent of the serialized broker representation.
 pub(crate) trait HumanOutput {
@@ -93,6 +93,31 @@ impl HumanOutput for RetentionPolicies {
             (
                 "retention size",
                 Limit::from_sentinel(self.retention_size_in_mb, SizeMegabytes).to_string(),
+            ),
+        ]
+    }
+}
+
+impl HumanOutput for PersistencePolicies {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("bookkeeper ensemble", self.bookkeeper_ensemble.to_string()),
+            (
+                "bookkeeper write quorum",
+                self.bookkeeper_write_quorum.to_string(),
+            ),
+            (
+                "bookkeeper ack quorum",
+                self.bookkeeper_ack_quorum.to_string(),
+            ),
+            (
+                "max mark-delete rate",
+                // `0.0` is the broker's "no throttle" sentinel.
+                if self.managed_ledger_max_mark_delete_rate == 0.0 {
+                    "disabled".to_owned()
+                } else {
+                    format!("{} ops/s", self.managed_ledger_max_mark_delete_rate)
+                },
             ),
         ]
     }
