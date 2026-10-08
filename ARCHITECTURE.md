@@ -404,6 +404,7 @@ The pattern is the same one [`quinn`] _would_ be using if it didn't ship its own
 | `Arc<T>`                                                     | `ConnectionShared`, `Arc<ProducerSlot>` / `Arc<ConsumerSlot>` on `Producer` / `Consumer`, `MessageEncryptor`, `MessageDecryptor`, `AuthProvider`, `MessageRouter`, interceptors | Cheap clone-and-share.                                                                                                                                                           |
 | `arc_swap::ArcSwap`                                          | rare config-rotation slots                                                                                                                                                      | Lock-free swap.                                                                                                                                                                  |
 | `slab::Slab`                                                 | per-future Waker keyspace                                                                                                                                                       | O(1) insertion + removal.                                                                                                                                                        |
+| `parking_lot::Mutex<BTreeMap<u64, Waker>>`                   | `magnetar_proto::MemoryLimitController.waiters` (one per client)                                                                                                                | Parked `ProducerBlock` sends keyed by never-reused ids; a leaf lock (ADR-0111).                                                                                                  |
 
 Anything not on this list either has a justification in [GUIDELINES.md](GUIDELINES.md) or is a candidate for removal.
 
@@ -418,6 +419,11 @@ The two layers — global Connection mutex and per-slot mutex — are acquired i
 
 The producer-send hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection-wide outbound buffer under the global lock via `poll_transmit` (`drain_producer_outbound`).
 The reconnect rebuild path (`Connection::rebuild_producers` / `rebuild_consumers`) takes the global lock and each per-slot lock in canonical order.
+
+A third lock sits below both: the waiter mutex of the client-wide `magnetar_proto::MemoryLimitController` ([ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md)).
+It is a **leaf**: nothing is acquired while it is held, and no waker is woken or dropped under it.
+Releasing a publish's memory reservation takes it, and that may happen under the global lock — an `OpSend` dropped by the receipt arm — but never under a per-slot lock: the producer state machine hands every removed `OpSend` back to its `Connection` caller, which drops it after the slot guard.
+The full order is **global → per-slot → memory-limit waiters**.
 
 #### Schema — state layout (where each field lives)
 
@@ -1343,7 +1349,7 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`client.rs`](crates/magnetar-runtime-tokio/src/client.rs)                               | `Client::connect` + `connect_auth` + `connect_with` + transaction-coordinator helpers, partitioned-metadata lookup, topic-list watcher entry point.                                                                             |
 | [`consumer.rs`](crates/magnetar-runtime-tokio/src/consumer.rs)                           | `Consumer` façade — `receive`, `receive_with_timeout`, `receive_batch_with_bytes_cap`, ack variants (individual / cumulative / batch / with-properties / with-txn / partial-batch), nack, seek, pause/resume, DLQ drain, stats. |
-| [`producer.rs`](crates/magnetar-runtime-tokio/src/producer.rs)                           | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters, `MemoryReserveFut` for `ProducerBlock` policy.                                                                                                        |
+| [`producer.rs`](crates/magnetar-runtime-tokio/src/producer.rs)                           | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters; `SendFut` parks in `Reserving` on the client-wide memory budget under `ProducerBlock`.                                                                |
 | [`driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs)                               | Driver loop + supervised reconnect + auth-challenge dispatch + PIP-145 + PIP-188 forwarding.                                                                                                                                    |
 | [`auto_cluster_failover.rs`](crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs) | PIP-121 `AutoClusterFailover` with a `HealthProbe` trait + background prober.                                                                                                                                                   |
 | [`compress.rs`](crates/magnetar-runtime-tokio/src/compress.rs)                           | Encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`.                                                                                                                                                                |
@@ -1351,7 +1357,7 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | [`tls_insecure.rs`](crates/magnetar-runtime-tokio/src/tls_insecure.rs)                   | `tls_allow_insecure_connection(true)` blanket override.                                                                                                                                                                         |
 | [`tls_no_hostname.rs`](crates/magnetar-runtime-tokio/src/tls_no_hostname.rs)             | `tls_hostname_verification_enable(false)` chain-on / hostname-off.                                                                                                                                                              |
 | [`dns.rs`](crates/magnetar-runtime-tokio/src/dns.rs)                                     | `DnsResolver` trait + `TokioDnsResolver`.                                                                                                                                                                                       |
-| [`lib.rs`](crates/magnetar-runtime-tokio/src/lib.rs)                                     | `ConnectionShared` (state, atomic counters, `memory_used` + `memory_wakers` slab) + `TopicListChange`.                                                                                                                          |
+| [`lib.rs`](crates/magnetar-runtime-tokio/src/lib.rs)                                     | `ConnectionShared` (state, atomic counters, the client-wide `memory_limit` controller) + `TopicListChange`.                                                                                                                     |
 
 ### `magnetar-runtime-moonpool` — deterministic simulation
 
@@ -1360,7 +1366,7 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | [`lib.rs`](crates/magnetar-runtime-moonpool/src/lib.rs)             | `ConnectionShared`, `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` / `connect_plain_with_resolver` / `connect_plain_supervised` / `connect_tls`. |
 | [`driver.rs`](crates/magnetar-runtime-moonpool/src/driver.rs)       | Driver loop + supervised reconnect over the moonpool byte pipe. Mirrors `magnetar-runtime-tokio::driver`.                                                                      |
 | [`client.rs`](crates/magnetar-runtime-moonpool/src/client.rs)       | `Client<P>` façade — `connect_plain`, `connect_plain_supervised`, partitioned-metadata lookup, txn coordinator helpers.                                                        |
-| [`producer.rs`](crates/magnetar-runtime-moonpool/src/producer.rs)   | `Producer<P>` façade — `send`, `flush`, `close`, stats. Surface mirrors `magnetar-runtime-tokio::producer` (1:1 method set; `FailImmediately` only on the memory-limit knob).  |
+| [`producer.rs`](crates/magnetar-runtime-moonpool/src/producer.rs)   | `Producer<P>` façade — `send`, `flush`, `close`, stats. Surface mirrors `magnetar-runtime-tokio::producer` (1:1 method set; both memory-limit policies).                       |
 | [`consumer.rs`](crates/magnetar-runtime-moonpool/src/consumer.rs)   | `Consumer<P>` façade — `receive`, ack variants, nack, seek, pause/resume, DLQ drain.                                                                                           |
 | [`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs)             | `RustlsByteAdapter` — drives sans-io `rustls::ClientConnection` over a `NetworkProvider`-supplied byte pipe. Sans-io composition end to end.                                   |
 | [`transport.rs`](crates/magnetar-runtime-moonpool/src/transport.rs) | Plaintext byte pipe over the configured `NetworkProvider::TcpStream`.                                                                                                          |
@@ -1462,36 +1468,38 @@ ADR-0011 (clock injection) is unaffected — the prober uses tokio's wall clock 
 
 ## memory_limit runtime accounting
 
-Java's `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)` is enforced via an `AtomicU64` CAS reservation in `Producer::send`:
+Java's `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)` is ONE budget per client: one `MemoryLimitController` per `PulsarClientImpl`, shared by every producer whatever connection it rides.
+Magnetar mirrors it with one `magnetar_proto::MemoryLimitController` per runtime `Client`, shared by every physical connection ([ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md)):
 
-```
-ClientBuilder::memory_limit(bytes, FailImmediately)
+```text
+ClientBuilder::memory_limit(bytes, policy)
    |
-   v  (config.memory_limit_bytes = bytes)
-ConnectionConfig (magnetar-proto, just a u64; 0 = unlimited)
+   v  (config.memory_limit_bytes / memory_limit_policy)
+bootstrap ConnectionShared::with_auth(config)
+   + memory_limit: Arc<MemoryLimitController>    (built from the config; 0 = unlimited)
    |
-   v
-ConnectionShared (magnetar-runtime-tokio)
-  + memory_limit_bytes: u64    (copied from config at construction)
-  + memory_used: AtomicU64     (in-flight reserved bytes)
+   v  Client lifts the Arc into its ConnectionFactory (beside operation_retry)
+every pooled ConnectionShared (connections_per_broker siblings, proxy entries, replacements)
+   + memory_limit: the SAME Arc
 
 Producer::send(msg):
-  let n = msg.payload.len() as u64;
-  shared.try_reserve_memory(n)?
-      // CAS loop: load(Acquire) -> check current+n <= limit -> compare_exchange(AcqRel)
-      // Err(MemoryLimitExceeded { current, limit, requested }) on overflow.
-  let result = conn.send(handle, msg, ...);
-  match result {
-    Ok(seq) => SendFut { reserved_bytes: n, ... },         // released on Poll::Ready
-    Err(_)  => { shared.release_memory(n); SendFut { reserved_bytes: 0 } }
+  let n = msg.payload.len()                        // after compression + encryption
+  match shared.memory_limit.try_reserve(n) {
+    Ok(reservation) => slot.queue_send_reserved(msg, reservation)   // moves into the OpSend
+    Err(e) if FailImmediately => SendFut::Failed(MemoryLimitExceeded { current, limit, requested })
+    Err(_)  /* ProducerBlock */ => SendFut::Reserving { msg, n, waiter: None }
   }
 
-SendFut::poll -> Ready -> release_memory(self.reserved_bytes)
-SendFut::drop -> release if not already released (caller cancelled)
+SendFut::Reserving::poll -> memory_limit.poll_reserve(n, &mut waiter, cx.waker())
+                            Ready(reservation) => conn.send_reserved(handle, msg, reservation)
+
+drop(OpSend)  // receipt, send error, send timeout, close ack, open failure, terminal failure
+  -> drop(MemoryReservation) -> used -= n; wake every parked waiter
 ```
 
-`MemoryLimitPolicy::ProducerBlock` is the other half: on overflow, `Producer::send` parks on a `Waker` slab inside `ConnectionShared`; `release_memory` drains the slab so parked producers re-poll the CAS.
-See [`docs/memory-limit.md`](docs/memory-limit.md) and [ADR-0020](specs/adr/0020-memory-limit-producer-block.md).
+The reservation is scoped to the publish, not to the caller's future: dropping a `SendFut` whose publish is queued keeps its bytes reserved until the op leaves the client, and a reconnect snapshot neither releases nor re-charges it.
+`ProducerBlock` waiters are keyed by never-reused ids, so a woken send that parks again cannot cancel anyone's live registration, and a release on one connection wakes parked sends on every other.
+See [`docs/memory-limit.md`](docs/memory-limit.md), [ADR-0017](specs/adr/0017-memory-limit-atomic-reservation.md), [ADR-0020](specs/adr/0020-memory-limit-producer-block.md) and [ADR-0022](specs/adr/0022-memory-limit-producer-block-moonpool.md), all three amended by ADR-0111.
 
 ---
 

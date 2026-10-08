@@ -3,15 +3,20 @@
 //! E2E: `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)`.
 //!
 //! Java parity: `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. See
-//! [ADR-0017](../../../specs/adr/0017-memory-limit-atomic-reservation.md).
+//! [ADR-0017](../../../specs/adr/0017-memory-limit-atomic-reservation.md) and
+//! [ADR-0111](../../../specs/adr/0111-share-one-memory-limit-controller-per-client.md).
 //!
-//! Two scenarios:
+//! Three scenarios:
 //!   1. **Reject path** — limit = 1 KiB, send a 2 KiB message. Expect
 //!      `ClientError::MemoryLimitExceeded` (synchronous reservation failure; the bytes never reach
 //!      the wire).
 //!   2. **`ProducerBlock` path** — saturate a 1 KiB budget with one send, poll a second send before
 //!      yielding to the driver, and require it to stay pending until the first receipt releases the
 //!      reservation.
+//!   3. **One budget across connections** (issue #867) — with `connections_per_broker(2)` two
+//!      producers ride two physical connections; 600 B on each exceeds the ONE 1 KiB client-wide
+//!      budget, so under `FailImmediately` the second send is rejected and under `ProducerBlock` it
+//!      parks without being queued until the first receipt arrives.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046).
 
@@ -26,7 +31,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.13";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
@@ -163,5 +168,104 @@ async fn e2e_memory_limit_producer_block_waits_for_budget() -> Result<(), Box<dy
 
     producer.close().await?;
     client.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_memory_limit_is_one_budget_across_connections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    for policy in [
+        MemoryLimitPolicy::FailImmediately,
+        MemoryLimitPolicy::ProducerBlock,
+    ] {
+        // `connections_per_broker(2)` round-robins the two producers onto the
+        // bootstrap connection and its sibling: two physical connections, one
+        // client, one 1 KiB budget.
+        let client = PulsarClient::builder()
+            .service_url(service_url.clone())
+            .memory_limit(1024, policy)
+            .connections_per_broker(2)
+            .build()
+            .await?;
+        let suffix = match policy {
+            MemoryLimitPolicy::FailImmediately => "fail",
+            MemoryLimitPolicy::ProducerBlock => "block",
+        };
+        let producer_a = client
+            .producer(format!(
+                "persistent://public/default/magnetar-e2e-memory-limit-client-wide-a-{suffix}"
+            ))
+            .create()
+            .await?;
+        let producer_b = client
+            .producer(format!(
+                "persistent://public/default/magnetar-e2e-memory-limit-client-wide-b-{suffix}"
+            ))
+            .create()
+            .await?;
+
+        // A current-thread runtime cannot run the driver between these
+        // immediately-ready polls, so the first receipt is retained until the
+        // second send has been polled once.
+        let mut first =
+            Box::pin(producer_a.send(OutgoingMessage::with_payload(vec![0xA1; 600]).into()));
+        assert!(
+            poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "600 B fit the budget: the first send queues"
+        );
+        let mut second =
+            Box::pin(producer_b.send(OutgoingMessage::with_payload(vec![0xB2; 600]).into()));
+        let second_poll = poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx))).await;
+
+        match policy {
+            MemoryLimitPolicy::FailImmediately => {
+                match second_poll {
+                    Poll::Ready(Err(ClientError::MemoryLimitExceeded {
+                        current,
+                        limit,
+                        requested,
+                    })) => {
+                        assert_eq!(
+                            (current, limit, requested),
+                            (600, 1024, 600),
+                            "the other connection's 600 B count against the same budget"
+                        );
+                    }
+                    other => panic!(
+                        "600 + 600 B exceed the client-wide 1 KiB budget across two \
+                         connections; expected MemoryLimitExceeded, got {other:?}"
+                    ),
+                }
+                tokio::time::timeout(Duration::from_secs(10), first).await??;
+                // The receipt freed the budget for the other connection.
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    producer_b.send(OutgoingMessage::with_payload(vec![0xB3; 600]).into()),
+                )
+                .await??;
+            }
+            MemoryLimitPolicy::ProducerBlock => {
+                assert!(
+                    second_poll.is_pending(),
+                    "ProducerBlock parks the second send while the budget is full"
+                );
+                assert_eq!(
+                    producer_b.pending_count(),
+                    0,
+                    "the parked send must not be queued: the aggregate never exceeds the limit"
+                );
+                tokio::time::timeout(Duration::from_secs(10), first).await??;
+                tokio::time::timeout(Duration::from_secs(10), second).await??;
+            }
+        }
+
+        producer_a.close().await?;
+        producer_b.close().await?;
+        client.close().await;
+    }
     Ok(())
 }

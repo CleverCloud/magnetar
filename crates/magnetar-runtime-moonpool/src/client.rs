@@ -289,6 +289,8 @@ impl<P: Providers> Client<P> {
             addr: addr.to_owned(),
             bootstrap_config: config,
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            // ADR-0111: every pooled connection shares the bootstrap's budget.
+            memory_limit: shared.memory_limit.clone(),
             providers: engine.providers().clone(),
             service_url_provider,
             dns_resolver,

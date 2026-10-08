@@ -124,23 +124,38 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the global publish memory budget for the client. Mirrors Java
+    /// Set the publish memory budget for the client. Mirrors Java
     /// `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. `bytes = 0`
     /// disables the limit (matches Java default).
     ///
-    /// **Enforcement**: under `MemoryLimitPolicy::FailImmediately`, every
-    /// `Producer::send` reserves the payload bytes against the budget via
-    /// an `AtomicU64` CAS loop on `ConnectionShared::memory_used` BEFORE
-    /// the payload reaches the sans-io state machine. Sends that would
-    /// push past the limit are rejected synchronously with
-    /// [`magnetar_runtime_tokio::ClientError::MemoryLimitExceeded`]. The
-    /// reservation is released on `SendFut` completion (success or
-    /// error) and on cancellation (via `Drop`).
+    /// **One budget per client**: every producer, partition and topic of
+    /// the built client draws on the same bytes, whichever physical
+    /// connection it rides — the bootstrap connection, every
+    /// [`Self::connections_per_broker`] sibling, every proxy pool entry and
+    /// every replacement connection. Separately built clients do not share
+    /// a budget.
     ///
-    /// Under `MemoryLimitPolicy::ProducerBlock`, the send future parks
-    /// on a `Notify`-based wait until the budget frees up — both engines
-    /// (`TokioEngine`, `MoonpoolEngine<P>`) implement this policy; see
-    /// [`docs/memory-limit.md`](https://github.com/FlorentinDUBOIS/magnetar/blob/main/docs/memory-limit.md).
+    /// **Enforcement**: every `Producer::send` reserves the payload bytes
+    /// (after compression and encryption) against the budget with a
+    /// lock-free compare-and-swap BEFORE the payload reaches the sans-io
+    /// state machine. The reservation is held for as long as the client
+    /// retains the publish and released when the broker acknowledges or
+    /// rejects it, when its send times out, or when its producer or
+    /// connection fails it — not when the send future completes or is
+    /// dropped. This is not a limit on the process's memory.
+    ///
+    /// Under `MemoryLimitPolicy::FailImmediately`, a send that would push
+    /// the client past the limit is rejected synchronously with
+    /// [`magnetar_runtime_tokio::ClientError::MemoryLimitExceeded`]. Under
+    /// `MemoryLimitPolicy::ProducerBlock`, the send future parks until a
+    /// release anywhere in the client makes room. A parked send whose future
+    /// is dropped before it reserved is cancelled and never published, and a
+    /// fire-and-forget producer (dropping the futures `send` returns) reaches
+    /// that state once its in-flight publishes fill the budget: await the
+    /// future, or use `FailImmediately` and observe the error — both engines
+    /// (`TokioEngine`, `MoonpoolEngine<P>`) implement both policies; see
+    /// [`docs/memory-limit.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/memory-limit.md)
+    /// and [ADR-0111](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0111-share-one-memory-limit-controller-per-client.md).
     #[must_use]
     pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
         self.memory_limit = Some(MemoryLimit { bytes, policy });
@@ -552,11 +567,11 @@ impl ClientBuilder {
         if let Some(sv) = self.supervisor {
             config.supervisor = Some(sv);
         }
-        // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime so
-        // `Producer::send` reserves payload bytes against `ConnectionShared::memory_limit_bytes`
-        // before queueing. Both `FailImmediately` and `ProducerBlock` are honored by the
-        // tokio and moonpool engines (the latter parks the send future on a `Notify` wait
-        // until the budget frees up).
+        // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime. The
+        // bootstrap connection builds the client-wide `MemoryLimitController` from these two
+        // fields and the runtime client shares it with every pooled connection (ADR-0111), so
+        // `Producer::send` reserves payload bytes against one budget before queueing. Both
+        // `FailImmediately` and `ProducerBlock` are honored by the tokio and moonpool engines.
         if let Some(limit) = self.memory_limit {
             // Cast saturates rather than truncates so a 64-bit limit on a 32-bit usize host
             // (effectively impossible — magnetar requires 64-bit pointers — but cheap to

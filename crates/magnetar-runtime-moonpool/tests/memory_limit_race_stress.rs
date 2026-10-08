@@ -1,33 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stress tests that probabilistically exercise the lost-wakeup race
-//! window inside `ConnectionShared::try_reserve_memory_or_register`.
+//! Stress tests for the client-wide publish memory budget
+//! (`magnetar_proto::MemoryLimitController`, issue #867, ADR-0111) under
+//! thread contention, reached through `ConnectionShared::memory_limit`.
 //!
-//! The "won the recheck" path (the second `try_reserve_memory` call in
-//! that helper) only fires when a concurrent
-//! `ConnectionShared::release_memory` lands between the failed initial
-//! CAS and the slab insert. With a single thread there is no interleave
-//! point, so the path is unreachable from a deterministic unit test;
-//! this fixture spins many short-lived contending threads to hit the
-//! window often enough that `cargo-llvm-cov` records execution on at
-//! least one iteration.
-//!
-//! The test does not assert that the race fires on every run (the
-//! window is genuinely narrow). It DOES assert that:
-//! - every parked future eventually completes (no lost wakeups);
+//! A `ProducerBlock` reservation attempts and registers under the
+//! controller's leaf lock, and every release takes that lock after
+//! decrementing the counter, so a release either lands before an attempt
+//! (which then succeeds) or after a registration (which it then wakes).
+//! These fixtures spin many short-lived contending threads and assert that:
+//! - every parked reserver is woken (no lost wakeups);
 //! - the budget bookkeeping balances back to zero after all work drains (no leaked reservations);
-//! - cancellations via `cancel_memory_waker` are idempotent under contention.
+//! - cancellations via `cancel_waiter` are idempotent and owner-safe under contention.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Wake;
+use std::task::{Poll, Wake};
 use std::thread;
 
 use magnetar_proto::{ConnectionConfig, MemoryLimitPolicy};
 use magnetar_runtime_moonpool::ConnectionShared;
 
 /// Counting waker for tests — increments on every wake call so we can
-/// confirm parked futures actually receive wakeups under contention.
+/// confirm parked reservations actually receive wakeups under contention.
 struct CountingWaker(AtomicUsize);
 
 impl Wake for CountingWaker {
@@ -48,14 +43,13 @@ fn shared(limit: u64) -> Arc<ConnectionShared> {
     ConnectionShared::new(cfg)
 }
 
-/// Spin N reservation threads against M release threads, all racing the
-/// same `ConnectionShared`. Each reservation thread tries to park on the
-/// waker slab then claim budget; each release thread frees it. Across
-/// thousands of iterations the recheck-won path inside
-/// `try_reserve_memory_or_register` (the second CAS) is hit at least
-/// once.
+/// Spin N parking reservers against M releasers, all racing the same
+/// budget. A reserver that parks must have been woken by the time every
+/// releaser has finished (no lost wakeup), and the bookkeeping must balance
+/// back to zero once every reservation is dropped (no leak, no double
+/// release).
 #[test]
-fn memory_limit_race_recheck_path_under_contention() {
+fn memory_limit_reserve_and_release_race_balances_to_zero() {
     const ITERS: usize = 200;
     const RESERVERS: usize = 4;
     const RELEASERS: usize = 4;
@@ -64,147 +58,204 @@ fn memory_limit_race_recheck_path_under_contention() {
 
     for _ in 0..ITERS {
         let shared = shared(LIMIT);
-        // Saturate the budget so every reserve attempt initially fails
-        // the fast-path CAS and enters the slow path.
-        shared
-            .try_reserve_memory(LIMIT)
-            .expect("initial saturation must succeed");
+        // Saturate the budget in PAYLOAD-sized chunks, one per releaser.
+        let chunks: Vec<_> = (0..RELEASERS)
+            .map(|_| {
+                shared
+                    .memory_limit
+                    .try_reserve(PAYLOAD)
+                    .expect("initial saturation must succeed")
+            })
+            .collect();
+        assert_eq!(shared.memory_limit.used_bytes(), LIMIT);
 
-        let mut handles = Vec::with_capacity(RESERVERS + RELEASERS);
-
+        let mut reservers = Vec::with_capacity(RESERVERS);
         for _ in 0..RESERVERS {
             let s = Arc::clone(&shared);
-            handles.push(thread::spawn(move || {
+            reservers.push(thread::spawn(move || {
                 let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
                 let waker = std::task::Waker::from(counter.clone());
-                // Try once. If we win the recheck, great — the helper
-                // returns Ok and the test path is hit. Otherwise we
-                // cancel and let another thread carry on.
-                match s.try_reserve_memory_or_register(PAYLOAD, &waker) {
-                    Ok(()) => {
-                        // Won the recheck OR the fast path; release
-                        // immediately so the next reserver can race.
-                        s.release_memory(PAYLOAD);
+                let mut waiter = None;
+                match s.memory_limit.poll_reserve(PAYLOAD, &mut waiter, &waker) {
+                    Poll::Ready(reservation) => {
+                        drop(reservation);
+                        None
                     }
-                    Err(key) => {
-                        s.cancel_memory_waker(key);
-                    }
+                    Poll::Pending => Some((counter, waiter)),
                 }
             }));
         }
-
-        for _ in 0..RELEASERS {
+        let mut releasers = Vec::with_capacity(RELEASERS);
+        for chunk in chunks {
             let s = Arc::clone(&shared);
-            handles.push(thread::spawn(move || {
-                // Release the saturating chunk, then immediately re-
-                // saturate to keep pressure high.
-                s.release_memory(PAYLOAD);
-                let _ = s.try_reserve_memory(PAYLOAD);
+            releasers.push(thread::spawn(move || {
+                drop(chunk);
+                // Re-take and give back a chunk to keep pressure high.
+                drop(s.memory_limit.try_reserve(PAYLOAD));
             }));
         }
-
-        for h in handles {
-            h.join().expect("worker thread panicked");
+        let parked: Vec<_> = reservers
+            .into_iter()
+            .map(|h| h.join().expect("reserver thread panicked"))
+            .collect();
+        for h in releasers {
+            h.join().expect("releaser thread panicked");
         }
 
-        // Drain any leftover budget so the next iteration starts at zero.
-        shared.release_memory(LIMIT);
+        for (counter, waiter) in parked.into_iter().flatten() {
+            assert!(
+                counter.0.load(Ordering::SeqCst) >= 1,
+                "a reserver that parked must be woken by a later release",
+            );
+            if let Some(id) = waiter {
+                shared.memory_limit.cancel_waiter(id);
+            }
+        }
         assert_eq!(
-            shared.memory_used.load(Ordering::Acquire),
+            shared.memory_limit.used_bytes(),
             0,
             "budget bookkeeping must balance back to zero after each iteration",
         );
+        assert_eq!(shared.memory_limit.parked_waiters(), 0);
     }
 }
 
-/// `cancel_memory_waker` is documented as idempotent — calling it twice
-/// for the same key (or after `release_memory` has already drained the
-/// slot) must not panic and must leave the slab valid. We hammer this
-/// invariant under thread contention.
+/// `cancel_waiter` is idempotent and owner-safe: cancelling a registration
+/// that a concurrent release already drained, or cancelling it twice, never
+/// disturbs any other registration.
 #[test]
-fn cancel_memory_waker_is_idempotent_under_contention() {
+fn cancel_waiter_is_idempotent_under_contention() {
     const ITERS: usize = 100;
     const LIMIT: u64 = 256;
 
     for _ in 0..ITERS {
         let shared = shared(LIMIT);
-        shared.try_reserve_memory(LIMIT).expect("saturate");
+        let full = shared.memory_limit.try_reserve(LIMIT).expect("saturate");
 
         let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(counter);
+        let mut waiter = None;
+        assert!(
+            shared
+                .memory_limit
+                .poll_reserve(128, &mut waiter, &waker)
+                .is_pending(),
+            "must park with the budget full",
+        );
+        let id = waiter.expect("parked");
 
-        // Park a waker; we know it will fail because budget is full.
-        let key = shared
-            .try_reserve_memory_or_register(128, &waker)
-            .expect_err("must fail with budget full");
-
-        // Race the release against the cancel.
-        let s1 = Arc::clone(&shared);
-        let s2 = Arc::clone(&shared);
-        let key_copy = key;
-        let release_handle = thread::spawn(move || {
-            s1.release_memory(LIMIT);
-        });
-        let cancel_handle = thread::spawn(move || {
-            s2.cancel_memory_waker(key_copy);
-        });
+        let s = Arc::clone(&shared);
+        let release_handle = thread::spawn(move || drop(full));
+        let cancel_handle = thread::spawn(move || s.memory_limit.cancel_waiter(id));
         release_handle.join().unwrap();
         cancel_handle.join().unwrap();
 
         // Cancel again — must be a no-op.
-        shared.cancel_memory_waker(key);
+        shared.memory_limit.cancel_waiter(id);
+        assert_eq!(shared.memory_limit.parked_waiters(), 0);
 
-        // The slab is in a consistent state: a fresh reserve should
-        // succeed against the now-empty budget.
+        // A fresh reservation succeeds against the now-empty budget.
         let counter2 = Arc::new(CountingWaker(AtomicUsize::new(0)));
         let waker2 = std::task::Waker::from(counter2);
-        shared
-            .try_reserve_memory_or_register(64, &waker2)
-            .expect("fresh reserve against empty budget must succeed");
-        shared.release_memory(64);
+        let mut fresh = None;
+        assert!(
+            shared
+                .memory_limit
+                .poll_reserve(64, &mut fresh, &waker2)
+                .is_ready(),
+            "fresh reserve against empty budget must succeed",
+        );
+        assert_eq!(shared.memory_limit.used_bytes(), 0);
     }
 }
 
-/// `release_memory` drains every parked waker exactly once; this is the
-/// load-bearing wake-up invariant. Under contention we confirm that
-/// at least one waker fires per release cycle (no "I parked but never
-/// got woken" cases).
+/// A release drains EVERY parked reserver exactly once (Java
+/// `MemoryLimitController` signals all waiters on the downward crossing).
 #[test]
-fn release_memory_wakes_at_least_one_parked_reserver_under_contention() {
+fn release_wakes_every_parked_reserver() {
     const RESERVERS: usize = 8;
     const LIMIT: u64 = 256;
     const PAYLOAD: u64 = 128;
 
     let shared = shared(LIMIT);
-    shared.try_reserve_memory(LIMIT).expect("saturate");
+    let full = shared.memory_limit.try_reserve(LIMIT).expect("saturate");
 
     let counters: Vec<_> = (0..RESERVERS)
         .map(|_| Arc::new(CountingWaker(AtomicUsize::new(0))))
         .collect();
 
-    // Park all reservers. They MUST all return Err(key) because budget
-    // is fully saturated and no release has fired yet.
-    let mut slab_keys = Vec::with_capacity(RESERVERS);
+    let mut waiters = Vec::with_capacity(RESERVERS);
     for counter in &counters {
         let waker = std::task::Waker::from(counter.clone());
-        let key = shared
-            .try_reserve_memory_or_register(PAYLOAD, &waker)
-            .expect_err("must park because budget is saturated");
-        slab_keys.push(key);
+        let mut waiter = None;
+        assert!(
+            shared
+                .memory_limit
+                .poll_reserve(PAYLOAD, &mut waiter, &waker)
+                .is_pending(),
+            "must park because budget is saturated",
+        );
+        waiters.push(waiter.expect("parked"));
     }
+    assert_eq!(shared.memory_limit.parked_waiters(), RESERVERS);
 
-    // Single release. It must wake the entire slab (the
-    // `drain_memory_wakers` path).
-    shared.release_memory(LIMIT);
+    drop(full);
 
-    let total_wakes: usize = counters.iter().map(|c| c.0.load(Ordering::Acquire)).sum();
-    assert!(
-        total_wakes >= 1,
-        "at least one parked waker must fire on release (saw {total_wakes})",
-    );
-
-    // Cleanup: cancel the keys so the slab drops cleanly.
-    for key in slab_keys {
-        shared.cancel_memory_waker(key);
+    for counter in &counters {
+        assert_eq!(
+            counter.0.load(Ordering::Acquire),
+            1,
+            "every parked reserver is woken exactly once",
+        );
     }
+    assert_eq!(shared.memory_limit.parked_waiters(), 0);
+    // Stale ids: cancelling them is a no-op.
+    for id in waiters {
+        shared.memory_limit.cancel_waiter(id);
+    }
+}
+
+/// The reservation compare-and-swap never over-admits under contention:
+/// many threads reserving and releasing single bytes against a tiny budget
+/// retry each other's lost races, yet the reservations alive at any instant
+/// never exceed the limit and the counter returns to zero.
+#[test]
+fn concurrent_reservations_never_exceed_the_limit() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 20_000;
+    const LIMIT: u64 = 4;
+
+    let shared = shared(LIMIT);
+    let live = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(std::sync::Barrier::new(THREADS));
+    let workers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let s = Arc::clone(&shared);
+            let live = Arc::clone(&live);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                let mut admitted = 0usize;
+                for _ in 0..ITERS {
+                    if let Ok(reservation) = s.memory_limit.try_reserve(1) {
+                        let now_live = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        assert!(
+                            now_live as u64 <= LIMIT,
+                            "{now_live} live reservations exceed the {LIMIT} B budget"
+                        );
+                        admitted += 1;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        drop(reservation);
+                    }
+                }
+                admitted
+            })
+        })
+        .collect();
+    let admitted: usize = workers
+        .into_iter()
+        .map(|w| w.join().expect("worker thread panicked"))
+        .sum();
+    assert!(admitted > 0, "the budget admitted nothing");
+    assert_eq!(shared.memory_limit.used_bytes(), 0);
 }

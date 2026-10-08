@@ -420,20 +420,24 @@ impl Client {
         // Clone the connect-time inputs into a `ConnectionFactory` so the proxy pool can
         // lazily open per-broker pinned connections later (ADR-0039). The bootstrap conn
         // itself does NOT set `proxy_to_broker_url` (it's the lookup-and-control plane).
-        let factory = ConnectionFactory {
-            url: url.clone(),
-            tls_config: tls_config.clone(),
-            bootstrap_config: config.clone(),
-            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
-            auth_provider: auth_provider.clone(),
-            service_url_provider: service_url_provider.clone(),
-            dns_resolver: dns_resolver.clone(),
-        };
+        let bootstrap_config = config.clone();
 
         // Snapshot the post-dial handshake budget before `config` is moved
         // into `ConnectionShared` (ADR-0052, extended to the handshake).
         let operation_timeout = config.operation_timeout;
-        let shared = ConnectionShared::with_auth(config, auth_provider);
+        let shared = ConnectionShared::with_auth(config, auth_provider.clone());
+
+        let factory = ConnectionFactory {
+            url: url.clone(),
+            tls_config: tls_config.clone(),
+            bootstrap_config,
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            // ADR-0111: every pooled connection shares the bootstrap's budget.
+            memory_limit: shared.memory_limit.clone(),
+            auth_provider,
+            service_url_provider: service_url_provider.clone(),
+            dns_resolver: dns_resolver.clone(),
+        };
 
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();

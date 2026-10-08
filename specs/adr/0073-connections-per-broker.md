@@ -1,6 +1,6 @@
 # ADR-0073 — `connections_per_broker`: round-robin producer/consumer fan-out across N connections per broker
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0111](0111-share-one-memory-limit-controller-per-client.md): sibling connections share the client's one `memory_limit` budget instead of each carrying their own — everything else below remains binding)
 - **Date**: 2026-06-24
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, connection-pool, throughput, determinism, java-parity

@@ -35,6 +35,7 @@ use std::task::Waker;
 use bytes::Bytes;
 
 use crate::error::ProducerError;
+use crate::memory_limit::MemoryReservation;
 use crate::pb;
 use crate::types::{CompressionKind, MessageId, ProducerHandle, RequestId, SequenceId};
 
@@ -143,6 +144,21 @@ pub struct OpSend {
     /// Payload bytes inside [`OutboundFrame`] are `bytes::Bytes`, so cloning the vector
     /// is refcounted and cheap.
     pub replay_frames: Vec<OutboundFrame>,
+    /// Bytes this publish holds against the client-wide memory budget (issue #867,
+    /// ADR-0111). Released exactly once, when this `OpSend` is dropped — that is, when the
+    /// publish leaves the client for good. Every method that removes an op from the pending
+    /// queue hands it back to its caller, which drops it after releasing the per-slot lock.
+    /// Moving the op into a reset snapshot and back neither releases nor re-charges it.
+    pub(crate) reservation: MemoryReservation,
+}
+
+impl OpSend {
+    /// Bytes this publish holds against the client-wide memory budget; `0` when no budget
+    /// is configured or the publish was enqueued without a reservation.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reservation.bytes()
+    }
 }
 
 /// Per-producer state.
@@ -190,6 +206,12 @@ pub struct ProducerState {
     outbound: VecDeque<OutboundFrame>,
     /// Closed flag — once set, all subsequent sends fail with [`ProducerError::Closed`].
     pub closed: bool,
+    /// Request id of the `CommandCloseProducer` this client last issued for this slot.
+    /// Only the broker's acknowledgement of THAT request fails the slot's still-pending
+    /// sends (issue #867, ADR-0111): a late ack of an older close for the same producer id
+    /// — the issue #406 re-close of an abandoned id that a new producer has since
+    /// re-attached under — must not.
+    pub(crate) close_request: Option<RequestId>,
     /// Whether the broker has acked this producer's (re-)attachment on the
     /// CURRENT session via `CommandProducerSuccess`. Starts `false`; flipped
     /// true by the `ProducerSuccess` handler, back to `false` on session
@@ -407,11 +429,35 @@ impl ProducerSlot {
         publish_time_ms: u64,
         now: std::time::Instant,
     ) -> Result<SequenceId, crate::error::ProtocolError> {
-        let mut state = self.state.lock();
-        let _decision = state.queue_send(msg, publish_time_ms, now).map_err(|_| {
-            crate::error::ProtocolError::InvariantViolation("producer rejected send")
-        })?;
-        Ok(SequenceId(state.last_sequence_id_pushed.max(0) as u64))
+        self.queue_send_reserved(msg, MemoryReservation::default(), publish_time_ms, now)
+    }
+
+    /// [`Self::queue_send`] for a publish that already holds `reservation` against the
+    /// client-wide memory budget (issue #867, ADR-0111). The reservation moves into the
+    /// publish's [`OpSend`] and is released when that op leaves the client. When the state
+    /// machine rejects the send, the reservation is released here — after the per-slot guard
+    /// is gone, so no parked producer is woken under it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::queue_send`].
+    pub fn queue_send_reserved(
+        &self,
+        msg: OutgoingMessage,
+        reservation: MemoryReservation,
+        publish_time_ms: u64,
+        now: std::time::Instant,
+    ) -> Result<SequenceId, crate::error::ProtocolError> {
+        let mut reservation = reservation;
+        let queued = {
+            let mut state = self.state.lock();
+            state
+                .queue_send_reserved(msg, &mut reservation, publish_time_ms, now)
+                .map(|_| SequenceId(state.last_sequence_id_pushed.max(0) as u64))
+        };
+        drop(reservation);
+        queued
+            .map_err(|_| crate::error::ProtocolError::InvariantViolation("producer rejected send"))
     }
 
     /// Force a batch flush. Takes only the per-slot mutex.
@@ -660,6 +706,7 @@ impl ProducerState {
             batch: BatchContainer::default(),
             outbound: VecDeque::new(),
             closed: false,
+            close_request: None,
             broker_ready: false,
             has_ever_attached: false,
             open_request_id: None,
@@ -714,13 +761,11 @@ impl ProducerState {
     }
 
     /// Drain every in-flight `OpSend` whose `enqueued_at + send_timeout` has passed.
-    /// Returns the `(sequence_id, waker)` pairs the caller should wake — each one's
-    /// corresponding `OpOutcome::SendError` is registered by the connection layer.
+    /// Returns the removed ops, each still carrying the waker the caller should wake — the
+    /// corresponding `OpOutcome::SendError` is registered by the connection layer, which
+    /// drops each op (releasing its memory reservation) after the per-slot lock is gone.
     /// Mirrors Java's `ClientCnx#timedOutSendOps` sweep.
-    pub fn drain_timed_out_sends(
-        &mut self,
-        now: std::time::Instant,
-    ) -> Vec<(SequenceId, Option<Waker>)> {
+    pub fn drain_timed_out_sends(&mut self, now: std::time::Instant) -> Vec<OpSend> {
         let Some(timeout) = self.send_timeout else {
             return Vec::new();
         };
@@ -736,9 +781,9 @@ impl ProducerState {
             // entry. Use `if let Some` over `.expect` so the panic-free contract holds even
             // under concurrent mutation (not possible today — `&mut self` — but defensive
             // for the invariant audit).
-            if let Some(mut op) = self.pending.pop_front() {
+            if let Some(op) = self.pending.pop_front() {
                 self.pending_index.remove(&op.sequence_id);
-                out.push((op.sequence_id, op.waker.take()));
+                out.push(op);
             } else {
                 break;
             }
@@ -933,6 +978,25 @@ impl ProducerState {
         publish_time_ms: u64,
         now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
+        self.queue_send_reserved(msg, &mut MemoryReservation::default(), publish_time_ms, now)
+    }
+
+    /// [`Self::queue_send`] for a publish holding a client-wide memory `reservation`
+    /// (issue #867, ADR-0111). On success the reservation is moved into the publish's
+    /// [`OpSend`] — one op per logical message, batched or chunked — and `*reservation` is
+    /// left empty. On error it is left untouched, so the caller releases it once it has
+    /// dropped the per-slot lock.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::queue_send`].
+    pub fn queue_send_reserved(
+        &mut self,
+        msg: OutgoingMessage,
+        reservation: &mut MemoryReservation,
+        publish_time_ms: u64,
+        now: std::time::Instant,
+    ) -> Result<SendDecision, ProducerError> {
         if self.closed {
             return Err(ProducerError::Closed);
         }
@@ -967,24 +1031,26 @@ impl ProducerState {
             }
             // The Codex Q3 invariant: if can_add_to_batch returned true, total_chunks must be 1.
             // We enforce it by going through the batched path only when can_batch holds.
+            let reservation = std::mem::take(reservation);
             if can_batch {
                 // can_batch returning true on a payload larger than max_message_size is
                 // possible only if max_batch_size_bytes >= max_message_size, which is rare but
                 // legal; the Java client honours the batch path in that case.
-                let decision = self.add_to_batch(msg, publish_time_ms, now)?;
+                let decision = self.add_to_batch(msg, reservation, publish_time_ms, now);
                 self.flush_batch_if_full(publish_time_ms, now);
                 return Ok(decision);
             }
-            return self.emit_chunked(msg, publish_time_ms, now);
+            return Ok(self.emit_chunked(msg, reservation, publish_time_ms, now));
         }
 
+        let reservation = std::mem::take(reservation);
         if can_batch {
-            let decision = self.add_to_batch(msg, publish_time_ms, now)?;
+            let decision = self.add_to_batch(msg, reservation, publish_time_ms, now);
             self.flush_batch_if_full(publish_time_ms, now);
             return Ok(decision);
         }
 
-        self.emit_single(msg, publish_time_ms, now)
+        Ok(self.emit_single(msg, reservation, publish_time_ms, now))
     }
 
     /// Force-flush the batch when adding the latest message hit
@@ -1013,9 +1079,10 @@ impl ProducerState {
     fn emit_single(
         &mut self,
         mut msg: OutgoingMessage,
+        reservation: MemoryReservation,
         publish_time_ms: u64,
         now: std::time::Instant,
-    ) -> Result<SendDecision, ProducerError> {
+    ) -> SendDecision {
         // Pulsar invariant: even a non-chunked, non-batched send must declare exactly one chunk
         // — explicitly setting `total_chunks` is what the broker uses to disambiguate from a
         // legacy non-PIP-37 client. We omit the field (broker default == 1).
@@ -1083,19 +1150,21 @@ impl ProducerState {
             error: None,
             enqueued_at: now,
             replay_frames,
+            reservation,
         };
         self.pending_index.insert(seq, self.pending.len());
         self.pending.push_back(op);
-        Ok(SendDecision::Emit { count: 1 })
+        SendDecision::Emit { count: 1 }
     }
 
     /// Buffer a message in the batch container.
     fn add_to_batch(
         &mut self,
         msg: OutgoingMessage,
+        reservation: MemoryReservation,
         publish_time_ms: u64,
         now: std::time::Instant,
-    ) -> Result<SendDecision, ProducerError> {
+    ) -> SendDecision {
         let _ = publish_time_ms; // publish time gets stamped at flush
         let payload = msg.payload;
         let mut single = pb::SingleMessageMetadata::default();
@@ -1157,6 +1226,9 @@ impl ProducerState {
             // batch, so reconnect cannot replay it once per logical send. Reset resolves these
             // entries with a deterministic send error instead.
             replay_frames: Vec::new(),
+            // Each batched message holds its own reservation: the receipt fan-out releases
+            // them one op at a time.
+            reservation,
         };
         self.pending_index
             .insert(SequenceId(msg_seq), self.pending.len());
@@ -1168,7 +1240,7 @@ impl ProducerState {
         if self.batch.first_added_at.is_none() {
             self.batch.first_added_at = Some(now);
         }
-        Ok(SendDecision::Batched)
+        SendDecision::Batched
     }
 
     /// Wall-clock deadline at which the batch should be force-flushed. Returns `None`
@@ -1316,9 +1388,10 @@ impl ProducerState {
     fn emit_chunked(
         &mut self,
         msg: OutgoingMessage,
+        reservation: MemoryReservation,
         publish_time_ms: u64,
         now: std::time::Instant,
-    ) -> Result<SendDecision, ProducerError> {
+    ) -> SendDecision {
         let txn_id = msg.txn_id;
         // PIP-180 / ADR-0033: every chunk frame of a replicator-style chunked publish
         // carries the same source-topic `MessageId` (one logical message, multiple
@@ -1442,11 +1515,13 @@ impl ProducerState {
             error: None,
             enqueued_at: now,
             replay_frames,
+            // One reservation for the whole logical message, held by its single op.
+            reservation,
         };
         self.pending_index
             .insert(ctx.sequence_id, self.pending.len());
         self.pending.push_back(op);
-        Ok(SendDecision::Emit { count: emitted })
+        SendDecision::Emit { count: emitted }
     }
 
     /// Pop the next outbound frame, if any.
@@ -1459,8 +1534,10 @@ impl ProducerState {
         self.outbound.len()
     }
 
-    /// Apply a `CommandSendReceipt` to the pending queue. Returns the matching sequence id +
-    /// message id if we had it pending.
+    /// Apply a `CommandSendReceipt` to the pending queue. Returns the removed op — its
+    /// `receipt` filled in, its waker still parked on it — plus the message id, if we had the
+    /// sequence id pending. The caller drops the op (releasing its memory reservation) after
+    /// the per-slot lock is gone.
     ///
     /// `now` is the engine-injected monotonic instant ([ADR-0011], [ADR-0086]); the broker
     /// round-trip latency recorded into [`Self::send_latency_hist`] is `now - op.enqueued_at`,
@@ -1472,7 +1549,7 @@ impl ProducerState {
         &mut self,
         receipt: &pb::CommandSendReceipt,
         now: std::time::Instant,
-    ) -> Option<(SequenceId, MessageId, Option<Waker>)> {
+    ) -> Option<(OpSend, MessageId)> {
         let seq = SequenceId(receipt.sequence_id);
         let _idx = self.pending_index.remove(&seq)?;
         let position = self.pending.iter().position(|op| op.sequence_id == seq)?;
@@ -1505,7 +1582,6 @@ impl ProducerState {
             h.saturating_record(latency_ms);
         }
         op.receipt = Some(mid);
-        let waker = op.waker.take();
         // Decrement indices for entries shifted left by the
         // `VecDeque::remove(position)` above. In-place: every entry whose
         // stored idx > `position` lost one slot, so subtract one. This is
@@ -1513,21 +1589,22 @@ impl ProducerState {
         // rebuild but reuses the existing hash slots (no rehash, no
         // re-allocation).
         self.shift_pending_index_left(position);
-        Some((seq, mid, waker))
+        Some((op, mid))
     }
 
-    /// Apply a `CommandSendError` to the pending queue.
+    /// Apply a `CommandSendError` to the pending queue. Returns the removed op (its waker
+    /// still parked on it) with the broker's error code and message; the caller drops the op
+    /// (releasing its memory reservation) after the per-slot lock is gone.
     pub fn apply_send_error(
         &mut self,
         err: &pb::CommandSendError,
-    ) -> Option<(SequenceId, Option<Waker>, i32, String)> {
+    ) -> Option<(OpSend, i32, String)> {
         let seq = SequenceId(err.sequence_id);
         let _idx = self.pending_index.remove(&seq)?;
         let position = self.pending.iter().position(|op| op.sequence_id == seq)?;
-        let mut op = self.pending.remove(position)?;
-        let waker = op.waker.take();
+        let op = self.pending.remove(position)?;
         self.shift_pending_index_left(position);
-        Some((seq, waker, err.error, err.message.clone()))
+        Some((op, err.error, err.message.clone()))
     }
 
     /// Decrement every `pending_index` value strictly greater than
@@ -1575,16 +1652,17 @@ impl ProducerState {
         }
     }
 
-    /// Drain every in-flight `OpSend` and return the `(sequence_id, waker)` pairs that
-    /// were registered by user-facing send futures. The caller is responsible for
-    /// installing a `SessionLost` outcome and waking each future. Also clears the batch
+    /// Drain every in-flight `OpSend` and return the removed ops, each still carrying the
+    /// waker registered by its user-facing send future. The caller is responsible for
+    /// installing an outcome, waking each future, and dropping each op (which releases its
+    /// memory reservation) after the per-slot lock is gone. Also clears the batch
     /// container so partial in-flight batches do not survive a reconnect. Mirrors Java
     /// `ProducerImpl#connectionClosed`'s synthetic-failure pass over `pendingMessages`.
-    pub fn drain_pending_sends(&mut self) -> Vec<(SequenceId, Option<Waker>)> {
+    pub fn drain_pending_sends(&mut self) -> Vec<OpSend> {
         let mut out = Vec::with_capacity(self.pending.len());
-        while let Some(mut op) = self.pending.pop_front() {
+        while let Some(op) = self.pending.pop_front() {
             self.pending_index.remove(&op.sequence_id);
-            out.push((op.sequence_id, op.waker.take()));
+            out.push(op);
         }
         // Batch container holds messages that never made it to the wire — drop them so
         // a stale batch does not re-emit on the freshly-handshaked connection.
@@ -1598,13 +1676,15 @@ impl ProducerState {
     ///
     /// - `replay_wakers`: the user-facing send-future wakers removed from replayable sends so the
     ///   caller can wake them exactly once *after* the snapshot has been stashed.
-    /// - `dropped`: sequence ids and wakers for non-replayable sends. Batched sends use one shared
-    ///   wire frame and therefore cannot be replayed through the per-message snapshot mechanism;
-    ///   the caller must resolve each of them with a terminal send error.
+    /// - `dropped`: the removed non-replayable sends, each still carrying its waker. Batched sends
+    ///   use one shared wire frame and therefore cannot be replayed through the per-message
+    ///   snapshot mechanism; the caller must resolve each of them with a terminal send error and
+    ///   then drop it, which releases its memory reservation outside the per-slot lock.
     /// - `snapshots`: the drained [`OpSend`] entries, in original FIFO order, each with its `waker`
     ///   field already cleared. Sequence ids, num-messages, and the cached [`OutboundFrame`] vector
     ///   are preserved so [`Self::replay_snapshots`] can re-issue the publish verbatim on the new
-    ///   session.
+    ///   session. Each keeps its memory reservation: a replayed publish is neither released nor
+    ///   charged again.
     ///
     /// Also clears the batch container — unflushed batched messages are the caller's
     /// responsibility to re-send (matches Java `ProducerImpl#connectionClosed` which drops
@@ -1618,11 +1698,7 @@ impl ProducerState {
     #[allow(clippy::type_complexity)]
     pub fn snapshot_pending_sends(
         &mut self,
-    ) -> (
-        Vec<(SequenceId, Option<Waker>)>,
-        Vec<(SequenceId, Option<Waker>)>,
-        Vec<OpSend>,
-    ) {
+    ) -> (Vec<(SequenceId, Option<Waker>)>, Vec<OpSend>, Vec<OpSend>) {
         // The session is gone — the broker must re-ack the attachment before
         // any send may flow again (drain gate, see `broker_ready`).
         self.broker_ready = false;
@@ -1631,20 +1707,19 @@ impl ProducerState {
         let mut snapshots = Vec::with_capacity(self.pending.len());
         while let Some(mut op) = self.pending.pop_front() {
             self.pending_index.remove(&op.sequence_id);
-            // Take the waker — the caller wakes the future exactly once with the
-            // pre-reset outcome (transparent replay = no outcome stored). Clearing here
-            // also prevents `apply_receipt` from later double-waking the same future
-            // when the replayed receipt lands.
-            let w = op.waker.take();
             // Per-message batched `OpSend` entries carry no `replay_frames`, even after
             // `flush_batch`: one ranged wire frame represents the whole batch and copying it into
             // every per-message operation would replay that batch repeatedly. Report these sends
             // explicitly so reset can fail them instead of orphaning their futures.
             if op.replay_frames.is_empty() {
-                dropped.push((op.sequence_id, w));
+                dropped.push(op);
                 self.total_send_failed = self.total_send_failed.saturating_add(1);
             } else {
-                replay_wakers.push((op.sequence_id, w));
+                // Take the waker — the caller wakes the future exactly once with the
+                // pre-reset outcome (transparent replay = no outcome stored). Clearing here
+                // also prevents `apply_receipt` from later double-waking the same future
+                // when the replayed receipt lands.
+                replay_wakers.push((op.sequence_id, op.waker.take()));
                 snapshots.push(op);
             }
         }
@@ -1888,10 +1963,10 @@ mod tests {
             }),
             highest_sequence_id: None,
         };
-        let (seq, mid, _) = p
+        let (op, mid) = p
             .apply_receipt(&r, std::time::Instant::now())
             .expect("receipt matched");
-        assert_eq!(seq.0, 0);
+        assert_eq!(op.sequence_id.0, 0);
         assert_eq!(mid.ledger_id, 5);
         assert_eq!(p.pending.len(), 0);
         assert_eq!(p.last_sequence_id_published, 0);
@@ -2628,7 +2703,7 @@ mod tests {
                 .is_none_or(hdrhistogram::Histogram::is_empty)
         );
 
-        let (_seq, _mid, _waker) = p
+        let (_op, _mid) = p
             .apply_receipt(&latency_receipt(), receipt_at)
             .expect("receipt matched");
         assert_eq!(
@@ -2699,7 +2774,7 @@ mod tests {
         let _ = p.queue_send(small_message(b"abc"), 100, enqueued).unwrap();
         let _ = p.next_outbound_frame();
 
-        let (_seq, _mid, _waker) = p
+        let (_op, _mid) = p
             .apply_receipt(&latency_receipt(), base)
             .expect("receipt matched");
         assert_eq!(
@@ -2857,7 +2932,10 @@ mod tests {
         assert!(replay_wakers.is_empty());
         assert!(snapshots.is_empty());
         assert_eq!(
-            dropped.iter().map(|(seq, _)| seq.0).collect::<Vec<_>>(),
+            dropped
+                .iter()
+                .map(|op| op.sequence_id.0)
+                .collect::<Vec<_>>(),
             vec![0, 1],
             "a ranged batch frame cannot be replayed once per logical send"
         );
@@ -2979,7 +3057,7 @@ mod tests {
         let outcome = p
             .apply_receipt(&receipt, std::time::Instant::now())
             .expect("receipt resolves OpSend");
-        assert_eq!(outcome.0, seq);
+        assert_eq!(outcome.0.sequence_id, seq);
         assert_eq!(outcome.1, source_id);
     }
 
@@ -3200,5 +3278,281 @@ mod tests {
         // The clamp protects against `Instant + Duration::MAX` panics.
         // `batch_deadline_elapsed` must not panic either.
         assert!(!p.batch_deadline_elapsed(now));
+    }
+
+    // ---------------------------------------------------------------
+    // Client-wide memory budget: op-scoped reservation lifetime
+    // (issue #867, ADR-0111).
+    // ---------------------------------------------------------------
+
+    fn budget(limit: u64) -> std::sync::Arc<crate::MemoryLimitController> {
+        crate::MemoryLimitController::new(limit, crate::MemoryLimitPolicy::FailImmediately)
+    }
+
+    fn receipt(sequence_id: u64) -> pb::CommandSendReceipt {
+        pb::CommandSendReceipt {
+            producer_id: 1,
+            sequence_id,
+            message_id: Some(pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: sequence_id,
+                ..Default::default()
+            }),
+            highest_sequence_id: None,
+        }
+    }
+
+    #[test]
+    fn queued_send_moves_its_reservation_into_the_op_until_the_op_is_dropped() {
+        let controller = budget(100);
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let mut reservation = controller.try_reserve(5).expect("fits");
+        p.queue_send_reserved(
+            small_message(b"hello"),
+            &mut reservation,
+            0,
+            std::time::Instant::now(),
+        )
+        .expect("queued");
+        assert_eq!(reservation.bytes(), 0, "moved out of the caller's slot");
+        drop(reservation);
+        assert_eq!(p.pending[0].reserved_bytes(), 5);
+        assert_eq!(controller.used_bytes(), 5, "the op holds the bytes");
+
+        let (op, _mid) = p
+            .apply_receipt(&receipt(0), std::time::Instant::now())
+            .expect("receipt matched");
+        assert!(p.pending.is_empty());
+        assert_eq!(
+            controller.used_bytes(),
+            5,
+            "the removed op is handed back; it releases when its holder drops it"
+        );
+        drop(op);
+        assert_eq!(controller.used_bytes(), 0);
+    }
+
+    #[test]
+    fn rejected_send_leaves_the_reservation_with_the_caller() {
+        let controller = budget(100);
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 4);
+        let mut reservation = controller.try_reserve(10).expect("fits");
+        let too_large = p.queue_send_reserved(
+            small_message(&[0; 10]),
+            &mut reservation,
+            0,
+            std::time::Instant::now(),
+        );
+        assert!(matches!(
+            too_large,
+            Err(ProducerError::MessageTooLarge { .. })
+        ));
+        assert_eq!(reservation.bytes(), 10, "still the caller's to release");
+        p.close();
+        let closed = p.queue_send_reserved(
+            small_message(b"x"),
+            &mut reservation,
+            0,
+            std::time::Instant::now(),
+        );
+        assert!(matches!(closed, Err(ProducerError::Closed)));
+        assert_eq!(controller.used_bytes(), 10);
+        drop(reservation);
+        assert_eq!(controller.used_bytes(), 0);
+    }
+
+    #[test]
+    fn slot_queue_send_reserved_releases_a_rejected_reservation_itself() {
+        let controller = budget(100);
+        let state = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let slot = ProducerSlot::new(
+            ProducerIdentity {
+                handle: ProducerHandle(1),
+                topic: "t".to_owned(),
+                access_mode: pb::ProducerAccessMode::Shared,
+            },
+            state,
+        );
+        let accepted = slot
+            .queue_send_reserved(
+                small_message(b"abc"),
+                controller.try_reserve(3).expect("fits"),
+                0,
+                std::time::Instant::now(),
+            )
+            .expect("queued");
+        assert_eq!(accepted, SequenceId(0));
+        assert_eq!(controller.used_bytes(), 3);
+        slot.state.lock().close();
+        assert!(
+            slot.queue_send_reserved(
+                small_message(b"defg"),
+                controller.try_reserve(4).expect("fits"),
+                0,
+                std::time::Instant::now(),
+            )
+            .is_err()
+        );
+        assert_eq!(controller.used_bytes(), 3, "the rejected 4 B were released");
+    }
+
+    #[test]
+    fn batched_sends_release_one_op_at_a_time() {
+        let controller = budget(100);
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        for payload in [&b"aaa"[..], &b"bb"[..]] {
+            let mut reservation = controller.try_reserve(payload.len() as u64).expect("fits");
+            let decision = p
+                .queue_send_reserved(
+                    small_message(payload),
+                    &mut reservation,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .expect("batched");
+            assert!(matches!(decision, SendDecision::Batched));
+        }
+        assert_eq!(controller.used_bytes(), 5, "batched bytes are counted");
+        assert_eq!(p.flush_batch(0, std::time::Instant::now()), 1);
+        assert_eq!(controller.used_bytes(), 5, "flushing moves no reservation");
+
+        let (first, _) = p
+            .apply_receipt(&receipt(0), std::time::Instant::now())
+            .expect("seq 0");
+        drop(first);
+        assert_eq!(
+            controller.used_bytes(),
+            2,
+            "the first message's 3 B are released"
+        );
+        let (second, _) = p
+            .apply_receipt(&receipt(1), std::time::Instant::now())
+            .expect("seq 1");
+        drop(second);
+        assert_eq!(controller.used_bytes(), 0);
+    }
+
+    /// A chunked publish is one logical message: one op, one reservation.
+    /// The op leaves the pending queue on the FIRST receipt carrying its
+    /// sequence id (chunk 0); the receipts of the remaining chunks then
+    /// match nothing, so the reservation is released exactly once. ADR-0111
+    /// records that Java releases on the last chunk's receipt instead.
+    #[test]
+    fn chunked_send_reserves_once_and_releases_once() {
+        let controller = budget(100);
+        let mut p =
+            ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
+        p.chunking_enabled = true;
+        let mut reservation = controller.try_reserve(25).expect("fits");
+        let decision = p
+            .queue_send_reserved(
+                small_message(&[b'a'; 25]),
+                &mut reservation,
+                0,
+                std::time::Instant::now(),
+            )
+            .expect("chunked");
+        assert!(matches!(decision, SendDecision::Emit { count: 3 }));
+        assert_eq!(p.pending.len(), 1, "one op for three chunks");
+        assert_eq!(p.pending[0].reserved_bytes(), 25);
+
+        let (op, _) = p
+            .apply_receipt(&receipt(0), std::time::Instant::now())
+            .expect("chunk 0");
+        drop(op);
+        assert_eq!(controller.used_bytes(), 0);
+        assert!(
+            p.apply_receipt(&receipt(0), std::time::Instant::now())
+                .is_none()
+        );
+        assert!(
+            p.apply_receipt(&receipt(0), std::time::Instant::now())
+                .is_none()
+        );
+        assert_eq!(controller.used_bytes(), 0, "no double release");
+    }
+
+    #[test]
+    fn reset_snapshot_and_replay_neither_release_nor_recharge() {
+        let controller = budget(100);
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let mut reservation = controller.try_reserve(4).expect("fits");
+        p.queue_send_reserved(
+            small_message(b"keep"),
+            &mut reservation,
+            0,
+            std::time::Instant::now(),
+        )
+        .expect("queued");
+        let (_wakers, dropped, snapshots) = p.snapshot_pending_sends();
+        assert!(dropped.is_empty());
+        assert_eq!(
+            controller.used_bytes(),
+            4,
+            "a retained publish keeps its bytes"
+        );
+        p.replay_snapshots(snapshots);
+        assert_eq!(controller.used_bytes(), 4, "replay charges nothing");
+        let (op, _) = p
+            .apply_receipt(&receipt(0), std::time::Instant::now())
+            .expect("replayed");
+        drop(op);
+        assert_eq!(controller.used_bytes(), 0);
+    }
+
+    #[test]
+    fn timed_out_and_drained_sends_hand_their_reservations_back() {
+        let controller = budget(100);
+        let at = std::time::Instant::now();
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.send_timeout = Some(std::time::Duration::from_secs(1));
+        for payload in [&b"one"[..], &b"three"[..]] {
+            let mut reservation = controller.try_reserve(payload.len() as u64).expect("fits");
+            p.queue_send_reserved(small_message(payload), &mut reservation, 0, at)
+                .expect("queued");
+        }
+        let timed_out = p.drain_timed_out_sends(at + std::time::Duration::from_secs(1));
+        assert_eq!(timed_out.len(), 2);
+        assert_eq!(
+            controller.used_bytes(),
+            8,
+            "released only when the ops drop"
+        );
+        drop(timed_out);
+        assert_eq!(controller.used_bytes(), 0);
+
+        let mut reservation = controller.try_reserve(2).expect("fits");
+        p.queue_send_reserved(small_message(b"hi"), &mut reservation, 0, at)
+            .expect("queued");
+        let drained = p.drain_pending_sends();
+        assert_eq!(drained.iter().map(OpSend::reserved_bytes).sum::<u64>(), 2);
+        drop(drained);
+        assert_eq!(controller.used_bytes(), 0);
     }
 }

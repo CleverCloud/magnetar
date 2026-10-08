@@ -288,6 +288,21 @@ impl Producer {
 
     /// Enqueue a send. The returned future resolves when the broker acknowledges the publish
     /// (a `CommandSendReceipt`) or rejects it (a `CommandSendError`).
+    ///
+    /// # Memory limit
+    ///
+    /// When the client has a [`memory_limit`](magnetar_proto::MemoryLimitController), the
+    /// payload is reserved against the ONE client-wide budget before it is queued, and the
+    /// reservation is held until the broker answers or the send is failed — dropping the
+    /// returned future does not release it (ADR-0111).
+    ///
+    /// Under `MemoryLimitPolicy::ProducerBlock`, a send that does not fit yet is held back in
+    /// the returned future until a release makes room. **If that future is dropped before it
+    /// reserved, the send is cancelled and the message is never published**, with no error
+    /// surfaced (a `debug!` records it). A fire-and-forget producer — one that drops the
+    /// futures `send` returns — reaches that state as soon as its in-flight publishes fill
+    /// the budget. Await the future, or use `MemoryLimitPolicy::FailImmediately` and observe
+    /// the `ClientError::MemoryLimitExceeded` it resolves with instead.
     pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
         let publish_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -317,7 +332,6 @@ impl Producer {
                         state: SendState::Failed {
                             error: Some(ClientError::Other(format!("compress: {err}"))),
                         },
-                        reserved_bytes: 0,
                     };
                 }
             }
@@ -339,70 +353,61 @@ impl Producer {
                         state: SendState::Failed {
                             error: Some(ClientError::Other(format!("encrypt: {err}"))),
                         },
-                        reserved_bytes: 0,
                     };
                 }
             }
         }
 
-        // Reserve memory against the configured global budget BEFORE handing the payload to
-        // the sans-io state machine. Mirrors Java `MemoryLimitController.reserveMemory(...)`.
-        // Two policies (Java parity):
-        //  - `FailImmediately`: try the CAS once; an overflow surfaces synchronously as
+        // Reserve the payload against the client-wide budget BEFORE handing it to the sans-io
+        // state machine (Java `MemoryLimitController.reserveMemory`, issue #867, ADR-0111). The
+        // controller is shared by every connection of the client, so this charges the one
+        // budget whichever connection the producer rides. What is counted is the payload
+        // length after compression and encryption. A limit of `0` reserves nothing.
+        //  - `FailImmediately`: an overflow surfaces synchronously as
         //    `ClientError::MemoryLimitExceeded`.
-        //  - `ProducerBlock`: park the send on a Waker slab until enough budget frees up; the
-        //    `Reserving` variant of `SendState` re-attempts the CAS on every poll.
-        // `try_reserve_memory` is a no-op when `memory_limit_bytes = 0` (the default).
-        let reserved_bytes = msg.payload.len() as u64;
-        match self.shared.memory_limit_policy {
-            magnetar_proto::MemoryLimitPolicy::FailImmediately => {
-                if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
-                    // Caller-visible rejection whose rate scales with send
-                    // throughput under overload — `debug!` per ADR-0054
-                    // §2.1 (never `warn!` on a per-message path).
-                    tracing::debug!(
-                        payload_len = reserved_bytes,
-                        "send rejected: memory limit exceeded"
-                    );
-                    return SendFut {
-                        shared: self.shared.clone(),
-                        handle: self.handle,
-                        state: SendState::Failed { error: Some(err) },
-                        reserved_bytes: 0,
-                    };
-                }
-                self.queue_send(msg, publish_time_ms, reserved_bytes)
-            }
-            magnetar_proto::MemoryLimitPolicy::ProducerBlock => {
-                // Fast path: budget has room right now. The slow path inside `Reserving`
-                // takes over otherwise; we don't synchronously park here so callers that
-                // never `.await` (e.g. `Pin::poll` from a custom executor) still get a
-                // future they can drive.
-                if self.shared.try_reserve_memory(reserved_bytes).is_ok() {
-                    return self.queue_send(msg, publish_time_ms, reserved_bytes);
-                }
+        //  - `ProducerBlock`: the send parks in `SendState::Reserving` until a release anywhere in
+        //    the client makes room.
+        let payload_len = msg.payload.len() as u64;
+        match self.shared.memory_limit.try_reserve(payload_len) {
+            Ok(reservation) => self.queue_send(msg, publish_time_ms, reservation),
+            Err(exceeded)
+                if self.shared.memory_limit.policy()
+                    == magnetar_proto::MemoryLimitPolicy::FailImmediately =>
+            {
+                // Caller-visible rejection whose rate scales with send throughput under
+                // overload — `debug!` per ADR-0054 §2.1 (never `warn!` on a per-message path).
+                tracing::debug!(payload_len, "send rejected: memory limit exceeded");
                 SendFut {
                     shared: self.shared.clone(),
                     handle: self.handle,
-                    state: SendState::Reserving {
-                        msg: Some(Box::new(msg)),
-                        publish_time_ms,
-                        bytes: reserved_bytes,
-                        slab_key: None,
+                    state: SendState::Failed {
+                        error: Some(ClientError::MemoryLimitExceeded {
+                            current: exceeded.current,
+                            limit: exceeded.limit,
+                            requested: exceeded.requested,
+                        }),
                     },
-                    // `Reserving` owns the reservation lifecycle itself: it only
-                    // transitions to `Pending` AFTER a successful CAS, at which point
-                    // it copies `bytes` into the outer `reserved_bytes`. Until then
-                    // there is no reservation outstanding.
-                    reserved_bytes: 0,
                 }
             }
+            // `ProducerBlock`: no synchronous park here, so callers that never `.await`
+            // (e.g. `Pin::poll` from a custom executor) still get a future they can drive.
+            Err(_) => SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Reserving {
+                    msg: Box::new(msg),
+                    publish_time_ms,
+                    bytes: payload_len,
+                    waiter: None,
+                },
+            },
         }
     }
 
-    /// Hand the (compressed/encrypted) message to the sans-io state machine. Assumes the
-    /// `reserved_bytes` reservation has already been taken; releases it on synchronous
-    /// failure so the budget reflects only actually-in-flight bytes.
+    /// Hand the (compressed/encrypted) message to the sans-io state machine together with
+    /// its memory `reservation`, which moves into the publish's pending op and is released
+    /// when that op leaves the client (ADR-0111). On a synchronous rejection the state
+    /// machine releases it before this returns.
     ///
     /// ADR-0038 Phase 3 hot path: takes only the per-slot mutex via
     /// [`magnetar_proto::ProducerSlot::queue_send`] — does NOT acquire the
@@ -413,7 +418,7 @@ impl Producer {
         &self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
-        reserved_bytes: u64,
+        reservation: magnetar_proto::MemoryReservation,
     ) -> SendFut {
         // Precondition (ADR-0038): the per-slot Arc this `Producer` was built
         // with must denote the same producer as `self.handle`. The hot path
@@ -427,8 +432,11 @@ impl Producer {
             self.slot.identity.handle, self.handle,
         );
 
+        let payload_len = msg.payload.len();
         let now = std::time::Instant::now();
-        let result = self.slot.queue_send(msg, publish_time_ms, now);
+        let result = self
+            .slot
+            .queue_send_reserved(msg, reservation, publish_time_ms, now);
 
         // Wake the driver so it can drain the freshly-queued frame.
         self.shared.driver_waker.notify_one();
@@ -448,23 +456,16 @@ impl Producer {
                 // per-slot guard inside `ProducerSlot::queue_send` has been
                 // released), two integer fields, and the disabled-level cost
                 // is a cached callsite check (ADR-0038 stays intact).
-                tracing::trace!(
-                    sequence_id = seq.0,
-                    payload_len = reserved_bytes,
-                    "send queued"
-                );
+                tracing::trace!(sequence_id = seq.0, payload_len, "send queued");
                 SendFut {
                     shared: self.shared.clone(),
                     handle: self.handle,
                     state: SendState::Pending { sequence_id: seq },
-                    reserved_bytes,
                 }
             }
             Err(err) => {
-                // The state machine rejected the send (e.g. producer not yet open); release
-                // the reservation so the budget reflects only actually-in-flight bytes.
-                self.shared.release_memory(reserved_bytes);
-                // Expected anomaly surfaced as `Err` to the caller —
+                // The state machine rejected the send (e.g. producer not yet open) and already
+                // released the reservation. Expected anomaly surfaced as `Err` to the caller —
                 // `debug!` per ADR-0054 §2.1.
                 tracing::debug!(error = %err, "send rejected by producer state machine");
                 // ADR-0059: `fail_all_pending` flips the
@@ -494,7 +495,6 @@ impl Producer {
                     shared: self.shared.clone(),
                     handle: self.handle,
                     state: SendState::Failed { error: Some(error) },
-                    reserved_bytes: 0,
                 }
             }
         }
@@ -744,36 +744,34 @@ async fn wait_request(
 /// Polls until the matching [`OpOutcome::SendReceipt`] / [`OpOutcome::SendError`] lands inside
 /// the sans-io state machine. NO oneshot channel.
 ///
-/// Holds the memory-budget reservation taken in [`Producer::send`] and releases it on
-/// completion (success OR error). Mirrors Java `MemoryLimitController.releaseMemory(...)`.
+/// The future holds no memory reservation once the publish is queued: the reservation
+/// travels with the publish's pending op and is released when the broker answers, the send
+/// times out, or the producer or connection fails it — dropping this future does not release
+/// it, exactly like Java, where a publish's memory is released by `ProducerImpl` and not by its
+/// `CompletableFuture` (issue #867, ADR-0111). While `ProducerBlock` holds the send back, the
+/// future owns only its parked waiter, which `Drop` cancels.
 #[derive(Debug)]
 pub struct SendFut {
     shared: Arc<ConnectionShared>,
     handle: ProducerHandle,
     state: SendState,
-    /// Bytes reserved against `shared.memory_limit_bytes` for this send. Released
-    /// exactly once when the future returns `Poll::Ready`. `0` when no reservation
-    /// was taken (the budget is unlimited, or the send failed synchronously and the
-    /// reservation was already released in `send()`).
-    reserved_bytes: u64,
 }
 
 impl Drop for SendFut {
     fn drop(&mut self) {
-        // The future may be dropped before completion (caller cancelled). Release
-        // the reservation so the budget doesn't permanently leak.
-        if self.reserved_bytes > 0 {
-            self.shared.release_memory(self.reserved_bytes);
-            self.reserved_bytes = 0;
-        }
-        // If dropped while parked on the budget waker slab, evict the slot so
-        // a later `release_memory` doesn't try to wake a dead future.
-        if let SendState::Reserving {
-            slab_key: Some(key),
-            ..
-        } = &self.state
-        {
-            self.shared.cancel_memory_waker(*key);
+        // Dropped while `ProducerBlock` still held the send back: the message never reached
+        // the state machine, so it is cancelled — never published, no error surfaced (ADR-0111).
+        // Cancel the registration so a later release does not wake a dead future; a drained
+        // (stale) id is a no-op.
+        if let SendState::Reserving { bytes, waiter, .. } = &self.state {
+            tracing::debug!(
+                producer_id = self.handle.0,
+                payload_len = *bytes,
+                "send dropped while waiting for memory budget; message not published"
+            );
+            if let Some(waiter) = waiter {
+                self.shared.memory_limit.cancel_waiter(*waiter);
+            }
         }
     }
 }
@@ -788,16 +786,16 @@ enum SendState {
     Failed {
         error: Option<ClientError>,
     },
-    /// `MemoryLimitPolicy::ProducerBlock` saw the budget full on the synchronous fast
-    /// path. Each `poll` retries the CAS via `try_reserve_memory_or_register`; on
-    /// success the state transitions to `Pending`; on failure the waker is parked in
-    /// the runtime's slab and dispatched when capacity frees up. `msg` is boxed so
-    /// this variant doesn't dominate the `SendState` discriminant size.
+    /// `MemoryLimitPolicy::ProducerBlock` saw the client-wide budget full on the synchronous
+    /// fast path. Each `poll` retries through `MemoryLimitController::poll_reserve`; on
+    /// success the reserved message is queued and the state transitions to `Pending`; on
+    /// failure the waker stays parked under `waiter` until a release anywhere in the client.
+    /// `msg` is boxed so this variant doesn't dominate the `SendState` discriminant size.
     Reserving {
-        msg: Option<Box<OutgoingMessage>>,
+        msg: Box<OutgoingMessage>,
         publish_time_ms: u64,
         bytes: u64,
-        slab_key: Option<usize>,
+        waiter: Option<magnetar_proto::MemoryWaiterId>,
     },
 }
 
@@ -810,58 +808,36 @@ impl Future for SendFut {
         let shared = self.shared.clone();
 
         // `Reserving` needs to move out of `self.state`; handle it before the borrow.
-        if matches!(self.state, SendState::Reserving { .. }) {
-            let prev = std::mem::replace(&mut self.state, SendState::Failed { error: None });
-            let SendState::Reserving {
-                mut msg,
-                publish_time_ms,
-                bytes,
-                slab_key,
-            } = prev
+        if let SendState::Reserving { bytes, waiter, .. } = &mut self.state {
+            let Poll::Ready(reservation) =
+                shared.memory_limit.poll_reserve(*bytes, waiter, cx.waker())
             else {
-                unreachable!()
+                return Poll::Pending;
             };
-            match shared.try_reserve_memory_or_register(bytes, cx.waker()) {
-                Ok(()) => {
-                    if let Some(prior) = slab_key {
-                        shared.cancel_memory_waker(prior);
-                    }
-                    let owned = *msg.take().expect("Reserving polled with no message");
-                    let result = {
-                        let now = std::time::Instant::now();
-                        let mut conn = shared.inner.lock();
-                        conn.send(handle, owned, publish_time_ms, now)
-                    };
-                    shared.driver_waker.notify_one();
-                    match result {
-                        Ok(seq) => {
-                            self.state = SendState::Pending { sequence_id: seq };
-                            self.reserved_bytes = bytes;
-                            // Loop back to attempt to take the outcome now that
-                            // we're in `Pending`; falls through to the normal match.
-                        }
-                        Err(err) => {
-                            shared.release_memory(bytes);
-                            return Poll::Ready(Err(ClientError::Protocol(err)));
-                        }
-                    }
-                }
-                Err(new_key) => {
-                    if let Some(prior) = slab_key {
-                        shared.cancel_memory_waker(prior);
-                    }
-                    self.state = SendState::Reserving {
-                        msg,
-                        publish_time_ms,
-                        bytes,
-                        slab_key: Some(new_key),
-                    };
-                    return Poll::Pending;
+            // Reserved (and the registration removed): move the message out of the state.
+            let reserved = std::mem::replace(&mut self.state, SendState::Failed { error: None });
+            if let SendState::Reserving {
+                msg,
+                publish_time_ms,
+                ..
+            } = reserved
+            {
+                let result = {
+                    let now = std::time::Instant::now();
+                    let mut conn = shared.inner.lock();
+                    conn.send_reserved(handle, *msg, reservation, publish_time_ms, now)
+                };
+                shared.driver_waker.notify_one();
+                match result {
+                    // Fall through to the normal match so the outcome is taken immediately.
+                    Ok(seq) => self.state = SendState::Pending { sequence_id: seq },
+                    // The state machine rejected the send and released the reservation.
+                    Err(err) => return Poll::Ready(Err(ClientError::Protocol(err))),
                 }
             }
         }
 
-        let outcome = match &mut self.state {
+        match &mut self.state {
             SendState::Failed { error } => {
                 let err = error
                     .take()
@@ -880,15 +856,7 @@ impl Future for SendFut {
                 }
             }
             SendState::Reserving { .. } => unreachable!("Reserving handled above"),
-        };
-        if matches!(outcome, Poll::Ready(_)) && self.reserved_bytes > 0 {
-            // Release the budget reservation. `Drop` would also catch the cancellation
-            // path; this branch covers the normal completion path so the count is
-            // current the instant the user observes the result.
-            self.shared.release_memory(self.reserved_bytes);
-            self.reserved_bytes = 0;
         }
-        outcome
     }
 }
 
@@ -1518,7 +1486,7 @@ mod tests {
         );
         // Budget has 1024 free bytes; the 4-byte payload reserves
         // synchronously and takes the fast-path `queue_send` return.
-        let _fut = producer.send(OutgoingMessage {
+        let fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"fast"),
             metadata: pb::MessageMetadata::default(),
             uncompressed_size: 4,
@@ -1527,21 +1495,28 @@ mod tests {
             source_message_id: None,
         });
         assert_eq!(
-            shared
-                .memory_used
-                .load(std::sync::atomic::Ordering::Acquire),
+            shared.memory_limit.used_bytes(),
             4,
             "ProducerBlock fast path must reserve synchronously",
         );
-        assert!(
-            shared.memory_wakers.lock().is_empty(),
-            "fast path must not register a waker slot",
+        assert_eq!(
+            shared.memory_limit.parked_waiters(),
+            0,
+            "fast path must not park a waiter",
         );
+        // ADR-0111: the reservation belongs to the queued publish, not to the future.
+        drop(fut);
+        assert_eq!(
+            shared.memory_limit.used_bytes(),
+            4,
+            "dropping the future of a queued publish keeps its bytes reserved",
+        );
+        assert_eq!(producer.pending_count(), 1);
     }
 
-    /// `ProducerBlock`: when `conn.send` errors after a successful memory
-    /// reservation, [`SendFut::poll`] must release the reservation and
-    /// surface a [`ClientError::Other`] (the `Err` arm of the inner
+    /// `ProducerBlock`: when `conn.send_reserved` errors after a successful
+    /// memory reservation, the state machine releases the reservation and
+    /// [`SendFut::poll`] surfaces the error (the `Err` arm of the inner
     /// `match result {}`). We force the error by sending against an
     /// unregistered [`ProducerHandle`] — the proto layer rejects with
     /// `ProtocolError::InvariantViolation("unknown producer handle")`,
@@ -1566,7 +1541,7 @@ mod tests {
             conn.handle_bytes(Instant::now(), &frame)
                 .expect("connected");
         }
-        shared.try_reserve_memory(16).expect("seed budget");
+        let seed = shared.memory_limit.try_reserve(16).expect("seed budget");
         let bogus_handle = ProducerHandle(u64::MAX);
         let producer = Producer::assemble(
             shared.clone(),
@@ -1585,13 +1560,13 @@ mod tests {
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
-        // First poll: budget full → register on slab → Pending.
+        // First poll: budget full → park a waiter → Pending.
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert_eq!(shared.memory_limit.parked_waiters(), 1);
 
-        // Release the seed so the next poll proceeds through the success
-        // branch of `try_reserve_memory_or_register` AND lands the
-        // synchronous `conn.send` error.
-        shared.release_memory(16);
+        // Release the seed so the next poll reserves AND lands the
+        // synchronous `conn.send_reserved` error.
+        drop(seed);
         let outcome = Pin::new(&mut fut).poll(&mut cx);
         match outcome {
             Poll::Ready(Err(ClientError::Protocol(
@@ -1608,21 +1583,19 @@ mod tests {
         }
         // The reservation must have been released along the error path.
         assert_eq!(
-            shared
-                .memory_used
-                .load(std::sync::atomic::Ordering::Acquire),
+            shared.memory_limit.used_bytes(),
             0,
             "Err arm must release the reservation it took",
         );
+        assert_eq!(shared.memory_limit.parked_waiters(), 0);
     }
 
     /// `ProducerBlock`: re-polling a `Reserving` future while the budget
-    /// is still full must evict the prior slab entry before inserting a
-    /// new one. Two polls park the same future twice; the slab must
-    /// carry exactly one entry after the second poll (the prior slot
-    /// must have been cancelled, not leaked).
+    /// is still full refreshes its one registration instead of adding a
+    /// second, and dropping the future cancels it (ADR-0111 owner-safe
+    /// waiter ids).
     #[tokio::test(flavor = "current_thread")]
-    async fn producer_block_re_park_cancels_prior_waker_slot() {
+    async fn producer_block_re_park_keeps_one_registration() {
         use std::future::Future as _;
         use std::pin::Pin;
         use std::task::{Context, Poll};
@@ -1640,7 +1613,7 @@ mod tests {
             conn.handle_bytes(Instant::now(), &frame)
                 .expect("connected");
         }
-        shared.try_reserve_memory(4).expect("seed budget");
+        let _seed = shared.memory_limit.try_reserve(4).expect("seed budget");
 
         let handle = {
             let mut conn = shared.inner.lock();
@@ -1666,16 +1639,22 @@ mod tests {
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
-        // First poll: lands in `Reserving { slab_key: Some(_) }`.
+        // First poll: lands in `Reserving { waiter: Some(_) }`.
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
-        assert_eq!(shared.memory_wakers.lock().len(), 1);
-        // Second poll: the budget is still full, so the slow path
-        // re-registers and evicts the prior slot.
+        assert_eq!(shared.memory_limit.parked_waiters(), 1);
+        // Second poll: the budget is still full, so the registration is
+        // refreshed in place.
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
         assert_eq!(
-            shared.memory_wakers.lock().len(),
+            shared.memory_limit.parked_waiters(),
             1,
-            "re-park must cancel the prior waker before inserting a new one",
+            "re-park must refresh the registration, not add a second one",
+        );
+        drop(fut);
+        assert_eq!(
+            shared.memory_limit.parked_waiters(),
+            0,
+            "dropping a parked send cancels its registration",
         );
     }
 

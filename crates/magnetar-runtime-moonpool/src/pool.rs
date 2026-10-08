@@ -72,6 +72,10 @@ pub(crate) struct ConnectionFactory<P: Providers> {
     /// Runtime-owned operation retry policy, separate from the public
     /// `ConnectionConfig` source-compatible surface.
     pub(crate) operation_retry: Arc<Mutex<magnetar_proto::OperationRetryConfig>>,
+    /// The client-wide publish memory budget (issue #867, ADR-0111), shared
+    /// with the bootstrap connection: every pool entry draws on this one
+    /// controller. Mirrors the tokio factory's field of the same name.
+    pub(crate) memory_limit: Arc<magnetar_proto::MemoryLimitController>,
     /// Moonpool providers — the pool re-uses them to spawn the per-entry
     /// supervised driver. `Providers` is `Clone` so a fresh snapshot per
     /// entry is cheap.
@@ -588,7 +592,8 @@ async fn build_entry_async<P: Providers>(
     )
     .await?;
 
-    let shared = make_shared_with_providers::<P>(&factory.providers, cfg);
+    let shared =
+        make_shared_with_providers::<P>(&factory.providers, cfg, factory.memory_limit.clone());
     shared
         .inner
         .lock()
@@ -662,6 +667,9 @@ mod tests {
                 ..ConnectionConfig::default()
             },
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            memory_limit: magnetar_proto::MemoryLimitController::from_config(
+                &ConnectionConfig::default(),
+            ),
             providers: TokioProviders::new(),
             service_url_provider: None,
             dns_resolver: None,

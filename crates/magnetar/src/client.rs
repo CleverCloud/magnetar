@@ -813,13 +813,13 @@ impl PulsarClient<crate::TokioEngine> {
         crate::client_builder::ClientBuilder::default()
     }
 
-    /// The global publish memory budget configured at build time, if any.
+    /// The client-wide publish memory budget configured at build time, if any.
     /// Mirrors Java `PulsarClient#getMemoryLimit`. `None` means no limit was
     /// configured (the Java default).
     ///
-    /// **Note**: today this is configuration-only — the runtime does not yet
-    /// enforce the limit. See [`crate::ClientBuilder::memory_limit`] for the planned
-    /// follow-up.
+    /// Both engines enforce it as one budget shared by every connection of
+    /// this client; see [`crate::ClientBuilder::memory_limit`] for what is
+    /// counted and when a reservation is released.
     #[must_use]
     pub fn memory_limit(&self) -> Option<MemoryLimit> {
         self.memory_limit
