@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
   **BREAKING (CLI JSON) for the single-valued getters**: TTL, deduplication, snapshot interval, compaction threshold and the max-* counts are now wrapped in an object under their Java field name (`{"source": "broker", "messageTTLInSeconds": 0}`) where they printed a bare value or `null`; the struct-valued getters keep their fields unchanged.
   Human output renders the sentinels (`unlimited`, `disabled`) and units (durations, decimal SI sizes, `msg/s`) per policy.
+- **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
+  Every shard had been failing with `WaitContainer(StartupTimeout)`; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag.
 - **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
   Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
 
