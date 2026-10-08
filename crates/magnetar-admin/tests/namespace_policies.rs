@@ -57,7 +57,8 @@ async fn retention_get_set_remove_cycle() {
     let pol = admin
         .namespace_get_retention("acme/svc")
         .await
-        .expect("get retention");
+        .expect("get retention")
+        .expect("retention policy is set");
     assert_eq!(pol.retention_time_in_minutes, 1440);
     assert_eq!(pol.retention_size_in_mb, 10240);
 
@@ -85,8 +86,9 @@ async fn retention_get_handles_post_remove_empty_body() {
     // on the JAX-RS config, a literal `null` text body). Strict
     // `json_ok` decoding errors with `EOF while parsing a value` /
     // `invalid type: null, expected struct RetentionPolicies`. The
-    // tolerant decoder folds either case to `RetentionPolicies::default()`
-    // — matching the broker semantic "policy unset = broker default".
+    // tolerant decoder folds every case to `None` — "policy unset at this
+    // level" — and never to a client-side default, which would report a
+    // value the broker never returned.
     for (body, status) in [
         (None, 204_u16),                      // No Content
         (Some(serde_json::Value::Null), 200), // literal `null`
@@ -109,8 +111,7 @@ async fn retention_get_handles_post_remove_empty_body() {
             .namespace_get_retention("acme/svc")
             .await
             .expect("post-remove get must not surface as EOF / type error");
-        assert_eq!(pol.retention_time_in_minutes, 0);
-        assert_eq!(pol.retention_size_in_mb, 0);
+        assert!(pol.is_none(), "unset policy must be None, got {pol:?}");
     }
 }
 

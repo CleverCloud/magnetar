@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`magnetarctl --format` / `-F` / `MAGNETAR_FORMAT` selects the output format: `json` (unchanged default) or `human`.**
+  `human` prints command-specific labels with unit-aware values: a two-column `LABEL  VALUE` table for `admin namespaces get-retention` and `admin topics get-retention` (durations in days/hours/minutes, sizes in `MB`, `-1` shown as `∞`) and for `admin namespaces get-persistence` and `admin topics get-persistence` (`BookKeeper` quorums, mark-delete rate cap in `ops/s` or `disabled`), aligned tables for `admin topics list` (physical partitions collapsed under their parent with the declared count), `admin clusters list`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list` (in natural host order), `admin brokers leader`, `admin bookies list` (one `BOOKIE` column in natural host order), `admin bookies racks-info` (bookies grouped under their rack), `admin clusters list-failure-domains` and `admin clusters get-failure-domain` (one row per broker, the domain named once per group), and an aggregate block followed by per-producer, per-subscription and per-consumer tables for `admin topics stats` (rates and byte sizes with two decimals, decimal SI units).
+  Labels are uppercase and blue on a terminal; a pipe or a non-empty `NO_COLOR` disables color.
+  Every other command still prints JSON whatever the flag says, and `json` output is byte-for-byte unchanged.
+
+### Changed
+
+- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention`, `namespace_get_persistence`, `namespace_get_dispatch_rate`, `namespace_get_subscription_dispatch_rate`, `namespace_get_replicator_dispatch_rate` and `namespace_get_publish_rate` now return `Option<_>`, `None` when the policy is unset at that level.**
+  Retention, persistence, dispatch rate and publish rate used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0` while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`, and `DispatchRate::default()` is `-1` (unlimited) whatever the broker's `dispatchThrottlingRatePer*`.
+  The client therefore reported values the cluster never returned.
+  The subscription and replicator dispatch-rate getters used the strict decoder instead and failed with a decode error on the same empty body.
+  All seven now share `json_ok_unset_policy`, which folds the four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; the topic-level getters already behaved this way.
+
+### Fixed
+
+- **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
+  Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.
+  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
+  **BREAKING (CLI JSON) for the single-valued getters**: TTL, deduplication, snapshot interval, compaction threshold and the max-* counts are now wrapped in an object under their Java field name (`{"source": "broker", "messageTTLInSeconds": 0}`) where they printed a bare value or `null`; the struct-valued getters keep their fields unchanged.
+  Human output renders the sentinels (`unlimited`, `disabled`) and units (durations, decimal SI sizes, `msg/s`) per policy.
+- **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
+  Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
+- **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
+  Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed

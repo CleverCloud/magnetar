@@ -127,7 +127,11 @@ async fn invariant_set_then_get_returns_set_value_for_retention() {
         )
         .await
         .unwrap();
-    let got = admin.namespace_get_retention("acme/svc").await.unwrap();
+    let got = admin
+        .namespace_get_retention("acme/svc")
+        .await
+        .unwrap()
+        .expect("retention policy is set");
     assert_eq!(got.retention_time_in_minutes, 1440);
     assert_eq!(got.retention_size_in_mb, 10240);
 }

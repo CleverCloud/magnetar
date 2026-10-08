@@ -33,6 +33,8 @@ cargo build -p magnetarctl --release
                              default: $HOME/.config/pulsar/config
 --context <name>             Select a named context (overrides current-context).
 --admin-timeout-secs <n>     Admin request timeout (seconds).      default: 60
+--format, -F <json|human>    Output format.                        [env MAGNETAR_FORMAT]
+                             default: json
 -v, --verbose                Increase logging verbosity.
                              (default) magnetar=warn
                              -v      magnetar=info
@@ -47,6 +49,56 @@ All flags are global — `magnetarctl admin -vv tenants list` is equivalent to `
 The `MAGNETAR_*` environment variables seed the same flags so CI pipelines and shell aliases don't have to repeat them.
 
 `--service-url` and `--admin-url` no longer carry a built-in clap default: when neither the flag/env nor an active context supplies a value, the localhost fallback is applied in code, so a context can override the default while an explicit value always wins.
+
+## Output format
+
+Every command prints its result as pretty JSON by default, and that stays the default so existing `| jq` pipelines are untouched.
+`--format human` (alias `-F human`, or `MAGNETAR_FORMAT=human` to make it the shell-wide default) switches to a two-column `LABEL  VALUE` table: one line per field, the label column left-aligned and padded to the widest label.
+Human output uses command-specific labels and unit-aware values; JSON keeps the broker field names and numeric values.
+For retention, durations are expressed in days, hours and minutes without rounding, sizes use `MB`, and `-1` is displayed as `∞`.
+
+Every policy getter (`get-retention`, `get-persistence`, `get-backlog-quotas`, `get-message-ttl`, the three `get-*dispatch-rate`, `get-publish-rate`, `get-deduplication`, `get-deduplication-snapshot-interval`, `get-compaction-threshold`, `get-delayed-delivery`, `get-max-producers*`, `get-max-consumers*`, `get-max-unacked-messages-per-*`) reports the policy the cluster actually applies, and says where it comes from.
+A namespace without a policy of its own gets the broker default read from `GET /admin/v2/brokers/configuration/runtime` (`defaultRetention*`, `managedLedgerDefault*`, `backlogQuotaDefault*`, `ttlDurationDefaultInSeconds`, `dispatchThrottlingRatePer*`, `maxPublishRatePerTopic*`, `brokerDeduplication*`, `brokerServiceCompactionThresholdInBytes`, `delayedDelivery*`, `maxProducersPerTopic`, `maxConsumersPerTopic`, `maxUnackedMessagesPer*`); a topic without a policy of its own falls back to its namespace, then to the broker.
+JSON output carries a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row reading `topic policy`, `namespace policy` or `broker default (no policy set)`.
+Single-valued policies (TTL, deduplication, thresholds, counts) are wrapped in an object under their Java field name so the `source` key has somewhere to live: `{"source": "broker", "messageTTLInSeconds": 0}` where an earlier version printed the bare `0` or `null`.
+Human output spells the sentinels out: a rate or count of `0` / `-1` reads `unlimited`, a TTL or compaction threshold of `0` reads `disabled`, durations are in days/hours/minutes/seconds and sizes in decimal SI units.
+The broker's single default backlog quota applies to both quota types, so a `broker default` answer lists `destination_storage` and `message_age` with the same limits.
+The client never substitutes a constant of its own: an earlier version printed `2/2/2` for a namespace with no persistence policy while the broker's defaults were `3/3/2`, and `-1` (unlimited) for an unset dispatch rate whatever the broker's throttle.
+Rates are shown with two decimals (`msg/s`, `B/s`), as are byte sizes.
+Field labels are uppercase and blue on a terminal; piping the output or setting a non-empty `NO_COLOR` disables color.
+
+```sh
+$ magnetarctl admin namespaces get-retention public/default -F human
+RETENTION DURATION  366 days
+RETENTION SIZE      ∞
+```
+
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin bookies racks-info`, and every namespace and topic policy getter listed above honour `human`; every other command still prints JSON whatever the flag says.
+`admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
+Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
+
+`admin topics stats -F human` displays rates in `msg/s`, throughput in `B/s`, `KB/s`, `MB/s`, etc., and sizes in `B`, `KB`, `MB`, etc., followed by compact tables with one row per producer, subscription and consumer.
+Byte quantities use base 1000 and two decimal places (`214990 B` becomes `214.99 KB`); JSON retains the original numeric values.
+Missing table values display `—`; empty producer, subscription and consumer tables are omitted.
+JSON retains the full producer and subscription details.
+
+`admin namespaces get-persistence <ns> -F human` and `admin topics get-persistence <topic> -F human` display the `BookKeeper` ensemble, write quorum and ack quorum, then the managed-ledger mark-delete rate cap in `ops/s`, shown as `disabled` when the broker reports `0.0`.
+
+`admin bookies list -F human` flattens the broker's `{ bookies: [{ bookieId }] }` envelope into one `BOOKIE` column in natural host order.
+`admin bookies racks-info -F human` turns the `group → bookie → { rack, hostname }` map into an `AFFINITY GROUP` / `RACK` / `BOOKIE` / `HOSTNAME` table, bookies grouped under their rack in natural order, the group and rack named on the first row of their block; a missing field shows `—`.
+The affinity group is the one `bookies set-rack --group` filed the bookie under (`default` when none was given); a namespace's bookie-affinity policy can restrict its ledgers to one group.
+
+`admin brokers leader -F human` displays `BROKER ID` and `SERVICE URL`, followed by any further key a newer broker returns (`clusterName` becomes `CLUSTER NAME`), so nothing the broker sends is dropped.
+
+`admin clusters list -F human` displays a blue `CLUSTER` header and one cluster name per line; `admin tenants list -F human`, `admin namespaces list -F human`, `admin subscriptions list -F human` and `admin brokers list -F human` do the same under a `TENANT` / `NAMESPACE` / `SUBSCRIPTION` / `BROKER` header; brokers are listed in natural order (`n2` before `n10`) while JSON keeps the broker's own order, namespaces keeping their full `tenant/namespace` name so a row can be pasted into any `admin namespaces …` command.
+
+`admin clusters list-failure-domains <cluster> -F human` displays a `DOMAIN` / `BROKERS` table with one row per broker; the domain is named on the first row of its group and the cell is left blank on the following rows, so each domain reads as a block. A domain without brokers shows `—`.
+`admin clusters get-failure-domain <cluster> <domain> -F human` prints the same table with the requested domain as its single group.
+
+### Piping
+
+Output is written to stdout and flushed per command.
+When the reader closes the pipe early (`magnetarctl admin tenants list | head`), `magnetarctl` ends quietly with status 141, the value a shell reports for a `SIGPIPE` death, instead of panicking with a `Broken pipe` backtrace.
 
 ## Config file & contexts
 

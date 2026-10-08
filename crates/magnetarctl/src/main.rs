@@ -35,7 +35,19 @@ compile_error!(
 );
 
 mod config;
+pub(crate) mod output;
 mod version;
+
+/// `println!` for command output: a reader that closed the pipe (`| head`)
+/// ends the process quietly instead of panicking. See [`write_stdout`].
+macro_rules! outln {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), true) };
+}
+
+/// `print!` counterpart of [`outln!`].
+macro_rules! out {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), false) };
+}
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -148,8 +160,35 @@ pub(crate) struct Cli {
     )]
     pub(crate) admin_timeout_secs: u64,
 
+    /// Output format. `json` (default) prints the broker payload as pretty
+    /// JSON; `human` prints command-specific labelled tables. See
+    /// `docs/cli.md#output-format` for the commands that honour `human` —
+    /// every other command still prints JSON whatever the flag says.
+    #[arg(
+        long,
+        short = 'F',
+        env = "MAGNETAR_FORMAT",
+        value_enum,
+        default_value_t = OutputFormat::Json,
+        global = true
+    )]
+    pub(crate) format: OutputFormat,
+
     #[command(subcommand)]
     pub(crate) cmd: Cmd,
+}
+
+/// How a command renders its result on stdout (`--format` / `-F` /
+/// `MAGNETAR_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Pretty-printed JSON — the historical (and still default) shape, kept
+    /// stable for scripts that pipe into `jq`.
+    #[default]
+    Json,
+    /// A two-column `FIELD  VALUE` table, one top-level field per line, for a
+    /// person reading a terminal.
+    Human,
 }
 
 /// Top-level subcommands.
@@ -2036,7 +2075,7 @@ async fn run(cli: Cli, token_from_flag: bool) -> Result<(), CliError> {
             )
             .await
         }
-        Cmd::Admin { sub } => run_admin(&conn, cli.admin_timeout_secs, sub).await,
+        Cmd::Admin { sub } => run_admin(&conn, cli.admin_timeout_secs, cli.format, sub).await,
         Cmd::Context { .. } => unreachable!("handled above"),
         #[cfg(feature = "scalable-topics")]
         Cmd::TopicInfo { topic } => {
@@ -2361,13 +2400,13 @@ fn run_context(
             }
             cfg.current_context.clone_from(&name);
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Switched to context \"{name}\".");
+            outln!("Switched to context \"{name}\".");
             Ok(())
         }
         ContextCmd::Set { .. } => {
             let name = context_set(&mut cfg, globals, cmd);
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Context \"{name}\" set.");
+            outln!("Context \"{name}\" set.");
             Ok(())
         }
         ContextCmd::Delete { name } => {
@@ -2384,7 +2423,7 @@ fn run_context(
                 );
             }
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
-            println!("Context \"{name}\" deleted.");
+            outln!("Context \"{name}\" deleted.");
             Ok(())
         }
         ContextCmd::Get => {
@@ -2395,7 +2434,7 @@ fn run_context(
             if cfg.current_context.is_empty() {
                 return Err(CliError::BadArg("no current context set".to_owned()));
             }
-            println!("{}", cfg.current_context);
+            outln!("{}", cfg.current_context);
             Ok(())
         }
         ContextCmd::Rename { old, new, force } => {
@@ -2432,7 +2471,7 @@ fn run_context(
             if overwriting {
                 eprintln!("warning: overwrote existing context \"{new}\".");
             }
-            println!("Context \"{old}\" renamed to \"{new}\".");
+            outln!("Context \"{old}\" renamed to \"{new}\".");
             Ok(())
         }
     }
@@ -2554,9 +2593,12 @@ fn load_or_default(resolved: &config::ResolvedPath) -> Result<config::PulsarConf
 /// BOOKIE SERVICE URL`, `*` on the current context.
 #[allow(clippy::print_literal)]
 fn print_context_table(cfg: &config::PulsarConfig) {
-    println!(
+    outln!(
         "{:<8} {:<28} {:<28} {}",
-        "CURRENT", "NAME", "ADMIN SERVICE URL", "BOOKIE SERVICE URL"
+        "CURRENT",
+        "NAME",
+        "ADMIN SERVICE URL",
+        "BOOKIE SERVICE URL"
     );
     for (name, ctx) in &cfg.contexts {
         let marker = if *name == cfg.current_context {
@@ -2564,9 +2606,12 @@ fn print_context_table(cfg: &config::PulsarConfig) {
         } else {
             ""
         };
-        println!(
+        outln!(
             "{:<8} {:<28} {:<28} {}",
-            marker, name, ctx.admin_service_url, ctx.bookie_service_url
+            marker,
+            name,
+            ctx.admin_service_url,
+            ctx.bookie_service_url
         );
     }
 }
@@ -2589,46 +2634,51 @@ async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Resul
         .lookup_scalable_topic(topic)
         .await
         .map_err(|e| CliError::BadArg(format!("scalable lookup failed: {e}")))?;
-    println!("topic: {topic}");
+    outln!("topic: {topic}");
     if let Some(resolved) = lookup.resolved_topic_name.as_deref() {
-        println!("resolved: {resolved}");
+        outln!("resolved: {resolved}");
     }
-    println!(
+    outln!(
         "controller-broker: {}",
         lookup.controller_broker_url.as_deref().unwrap_or("-")
     );
-    println!("layout-epoch: {}", lookup.epoch);
-    println!(
+    outln!("layout-epoch: {}", lookup.epoch);
+    outln!(
         "{:<10} {:<18} {:<10} BROKER",
-        "SEGMENT", "KEY-RANGE", "STATE"
+        "SEGMENT",
+        "KEY-RANGE",
+        "STATE"
     );
     for seg in &lookup.segments {
         let state = format!("{:?}", seg.state);
         // A sealed segment the broker no longer serves carries no placement.
         let broker = seg.broker_url.as_deref().unwrap_or("-");
-        println!(
+        outln!(
             "{:<10} [{:>5},{:>5}) {state:<10} {broker}",
-            seg.segment_id.0, seg.key_range.start, seg.key_range.end,
+            seg.segment_id.0,
+            seg.key_range.start,
+            seg.key_range.end,
         );
     }
-    println!("({} segment(s))", lookup.segments.len());
+    outln!("({} segment(s))", lookup.segments.len());
     Ok(())
 }
 
 async fn run_admin(
     conn: &ResolvedConnection,
     timeout_secs: u64,
+    format: OutputFormat,
     cmd: AdminCmd,
 ) -> Result<(), CliError> {
     let admin = build_admin(conn, timeout_secs)?;
     match cmd {
-        AdminCmd::Clusters { sub } => run_admin_clusters(&admin, sub).await,
-        AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
-        AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, sub).await,
-        AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
-        AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
-        AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
-        AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
+        AdminCmd::Clusters { sub } => run_admin_clusters(&admin, format, sub).await,
+        AdminCmd::Tenants { sub } => run_admin_tenants(&admin, format, sub).await,
+        AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, format, sub).await,
+        AdminCmd::Topics { sub } => run_admin_topics(&admin, format, sub).await,
+        AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, format, sub).await,
+        AdminCmd::Brokers { sub } => run_admin_brokers(&admin, format, sub).await,
+        AdminCmd::Bookies { sub } => run_admin_bookies(&admin, format, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
         AdminCmd::Sources { sub } => run_admin_sources(&admin, sub).await,
@@ -2639,10 +2689,15 @@ async fn run_admin(
 
 async fn run_admin_subscriptions(
     admin: &AdminClient,
+    format: OutputFormat,
     cmd: SubscriptionsCmd,
 ) -> Result<(), CliError> {
     match cmd {
-        SubscriptionsCmd::List { topic } => print_json(&admin.subscriptions_list(&topic).await?),
+        SubscriptionsCmd::List { topic } => print_formatted_list(
+            format,
+            "subscription",
+            &admin.subscriptions_list(&topic).await?,
+        ),
         SubscriptionsCmd::ResetCursor {
             topic,
             subscription,
@@ -2711,14 +2766,41 @@ async fn run_admin_subscriptions(
     }
 }
 
-async fn run_admin_clusters(admin: &AdminClient, cmd: ClustersCmd) -> Result<(), CliError> {
+async fn run_admin_clusters(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: ClustersCmd,
+) -> Result<(), CliError> {
     match cmd {
-        ClustersCmd::List => print_json(&admin.cluster_list().await?),
+        ClustersCmd::List => print_formatted_list(format, "cluster", &admin.cluster_list().await?),
         ClustersCmd::ListFailureDomains { cluster } => {
-            print_json(&admin.cluster_failure_domains_list(&cluster).await?)
+            let domains = admin.cluster_failure_domains_list(&cluster).await?;
+            match format {
+                OutputFormat::Json => print_json(&domains),
+                OutputFormat::Human => {
+                    out!(
+                        "{}",
+                        output::render_failure_domains(&domains, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
         }
         ClustersCmd::GetFailureDomain { cluster, domain } => {
-            print_json(&admin.cluster_failure_domain_get(&cluster, &domain).await?)
+            let details = admin.cluster_failure_domain_get(&cluster, &domain).await?;
+            match format {
+                OutputFormat::Json => print_json(&details),
+                OutputFormat::Human => {
+                    // Same `DOMAIN` / `BROKERS` table as `list-failure-domains`,
+                    // with the requested domain as the single group.
+                    let single = serde_json::json!({ domain: details });
+                    out!(
+                        "{}",
+                        output::render_failure_domains(&single, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
         }
         ClustersCmd::ListNamespaceIsolationPolicies { cluster } => {
             print_json(&admin.namespace_isolation_policies_list(&cluster).await?)
@@ -2726,10 +2808,38 @@ async fn run_admin_clusters(admin: &AdminClient, cmd: ClustersCmd) -> Result<(),
     }
 }
 
-async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), CliError> {
+async fn run_admin_brokers(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: BrokersCmd,
+) -> Result<(), CliError> {
     match cmd {
-        BrokersCmd::List { cluster } => print_json(&admin.brokers_list(&cluster).await?),
-        BrokersCmd::Leader => print_json(&admin.brokers_leader().await?),
+        BrokersCmd::List { cluster } => {
+            let brokers = admin.brokers_list(&cluster).await?;
+            match format {
+                OutputFormat::Json => print_json(&brokers),
+                // The broker returns its set in hash order; a person reads
+                // hosts by number.
+                OutputFormat::Human => print_formatted_list(
+                    OutputFormat::Human,
+                    "broker",
+                    &output::natural_sorted(&brokers),
+                ),
+            }
+        }
+        BrokersCmd::Leader => {
+            let leader = admin.brokers_leader().await?;
+            match format {
+                OutputFormat::Json => print_json(&leader),
+                OutputFormat::Human => {
+                    out!(
+                        "{}",
+                        output::render_leader(&leader, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         BrokersCmd::DynamicConfigKeys => print_json(&admin.brokers_dynamic_config_keys().await?),
         BrokersCmd::DynamicConfigOverrides => {
             print_json(&admin.brokers_dynamic_config_overrides().await?)
@@ -2741,7 +2851,7 @@ async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), C
             // JSON — print it verbatim rather than re-wrapping in a
             // JSON string for a script-friendly exit.
             let body = admin.brokers_health_check().await?;
-            println!("{body}");
+            outln!("{body}");
             Ok(())
         }
         BrokersCmd::OwnedNamespaces { cluster, broker } => {
@@ -2758,10 +2868,35 @@ async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), C
     }
 }
 
-async fn run_admin_bookies(admin: &AdminClient, cmd: BookiesCmd) -> Result<(), CliError> {
+async fn run_admin_bookies(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: BookiesCmd,
+) -> Result<(), CliError> {
     match cmd {
-        BookiesCmd::List => print_json(&admin.bookies_list_all().await?),
-        BookiesCmd::RacksInfo => print_json(&admin.bookies_racks_info().await?),
+        BookiesCmd::List => {
+            let info = admin.bookies_list_all().await?;
+            match format {
+                OutputFormat::Json => print_json(&info),
+                OutputFormat::Human => {
+                    out!("{}", output::render_bookies(&info, version::should_color()));
+                    Ok(())
+                }
+            }
+        }
+        BookiesCmd::RacksInfo => {
+            let info = admin.bookies_racks_info().await?;
+            match format {
+                OutputFormat::Json => print_json(&info),
+                OutputFormat::Human => {
+                    out!(
+                        "{}",
+                        output::render_racks_info(&info, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         BookiesCmd::SetRack {
             bookie,
             group,
@@ -2943,9 +3078,13 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
     }
 }
 
-async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), CliError> {
+async fn run_admin_tenants(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: TenantsCmd,
+) -> Result<(), CliError> {
     match cmd {
-        TenantsCmd::List => print_json(&admin.tenants_list().await?),
+        TenantsCmd::List => print_formatted_list(format, "tenant", &admin.tenants_list().await?),
         TenantsCmd::Create {
             name,
             admin_role,
@@ -2970,9 +3109,15 @@ async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), C
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result<(), CliError> {
+async fn run_admin_namespaces(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: NamespacesCmd,
+) -> Result<(), CliError> {
     match cmd {
-        NamespacesCmd::List { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
+        NamespacesCmd::List { tenant } => {
+            print_formatted_list(format, "namespace", &admin.namespaces_list(&tenant).await?)
+        }
         NamespacesCmd::Create { namespace } => {
             admin.namespace_create(&namespace).await?;
             Ok(())
@@ -2982,7 +3127,10 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetRetention { namespace } => {
-            print_json(&admin.namespace_get_retention(&namespace).await?)
+            let own = admin.namespace_get_retention(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::retention_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetRetention {
             namespace,
@@ -3005,7 +3153,10 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetBacklogQuotas { namespace } => {
-            print_json(&admin.namespace_get_backlog_quotas(&namespace).await?)
+            let own = output::backlog_quotas(admin.namespace_get_backlog_quotas(&namespace).await?);
+            let resolved =
+                resolve_namespace_policy(admin, own, output::backlog_quotas_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetBacklogQuota {
             namespace,
@@ -3037,7 +3188,17 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetMessageTtl { namespace } => {
-            print_json(&admin.namespace_get_message_ttl(&namespace).await?)
+            let own = admin
+                .namespace_get_message_ttl(&namespace)
+                .await?
+                .map(output::message_ttl);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("ttlDurationDefaultInSeconds", output::message_ttl),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetMessageTtl {
             namespace,
@@ -3053,7 +3214,10 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetPersistence { namespace } => {
-            print_json(&admin.namespace_get_persistence(&namespace).await?)
+            let own = admin.namespace_get_persistence(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::persistence_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetPersistence {
             namespace,
@@ -3080,7 +3244,11 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetDispatchRate { namespace } => {
-            print_json(&admin.namespace_get_dispatch_rate(&namespace).await?)
+            let own = admin.namespace_get_dispatch_rate(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::topic_dispatch_rate_from_broker)
+                    .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDispatchRate {
             namespace,
@@ -3106,11 +3274,18 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin.namespace_remove_dispatch_rate(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetSubscriptionDispatchRate { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetSubscriptionDispatchRate { namespace } => {
+            let own = admin
                 .namespace_get_subscription_dispatch_rate(&namespace)
-                .await?,
-        ),
+                .await?;
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::subscription_dispatch_rate_from_broker,
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetSubscriptionDispatchRate {
             namespace,
             rate_msg,
@@ -3137,11 +3312,15 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetReplicatorDispatchRate { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetReplicatorDispatchRate { namespace } => {
+            let own = admin
                 .namespace_get_replicator_dispatch_rate(&namespace)
-                .await?,
-        ),
+                .await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::replicator_dispatch_rate_from_broker)
+                    .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetReplicatorDispatchRate {
             namespace,
             rate_msg,
@@ -3169,7 +3348,10 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetPublishRate { namespace } => {
-            print_json(&admin.namespace_get_publish_rate(&namespace).await?)
+            let own = admin.namespace_get_publish_rate(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::publish_rate_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetPublishRate {
             namespace,
@@ -3192,7 +3374,17 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetDeduplication { namespace } => {
-            print_json(&admin.namespace_get_deduplication(&namespace).await?)
+            let own = admin
+                .namespace_get_deduplication(&namespace)
+                .await?
+                .map(output::deduplication);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("brokerDeduplicationEnabled", output::deduplication),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDeduplication { namespace, enabled } => {
             admin
@@ -3204,11 +3396,22 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin.namespace_remove_deduplication(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetDeduplicationSnapshotInterval { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetDeduplicationSnapshotInterval { namespace } => {
+            let own = admin
                 .namespace_get_deduplication_snapshot_interval(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::deduplication_snapshot_interval);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "brokerDeduplicationSnapshotIntervalSeconds",
+                    output::deduplication_snapshot_interval,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetDeduplicationSnapshotInterval {
             namespace,
             interval_entries,
@@ -3225,7 +3428,20 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetCompactionThreshold { namespace } => {
-            print_json(&admin.namespace_get_compaction_threshold(&namespace).await?)
+            let own = admin
+                .namespace_get_compaction_threshold(&namespace)
+                .await?
+                .map(output::compaction_threshold);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "brokerServiceCompactionThresholdInBytes",
+                    output::compaction_threshold,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetCompactionThreshold {
             namespace,
@@ -3243,7 +3459,10 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             Ok(())
         }
         NamespacesCmd::GetDelayedDelivery { namespace } => {
-            print_json(&admin.namespace_get_delayed_delivery(&namespace).await?)
+            let own = admin.namespace_get_delayed_delivery(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::delayed_delivery_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDelayedDelivery {
             namespace,
@@ -3265,11 +3484,19 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin.namespace_remove_delayed_delivery(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxProducersPerTopic { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxProducersPerTopic { namespace } => {
+            let own = admin
                 .namespace_get_max_producers_per_topic(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_producers_per_topic);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("maxProducersPerTopic", output::max_producers_per_topic),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxProducersPerTopic {
             namespace,
             max_producers,
@@ -3285,11 +3512,19 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxConsumersPerTopic { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxConsumersPerTopic { namespace } => {
+            let own = admin
                 .namespace_get_max_consumers_per_topic(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_consumers_per_topic);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("maxConsumersPerTopic", output::max_consumers_per_topic),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxConsumersPerTopic {
             namespace,
             max_consumers,
@@ -3305,11 +3540,22 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxUnackedMessagesPerConsumer { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxUnackedMessagesPerConsumer { namespace } => {
+            let own = admin
                 .namespace_get_max_unacked_messages_per_consumer(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_unacked_messages_per_consumer);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "maxUnackedMessagesPerConsumer",
+                    output::max_unacked_messages_per_consumer,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxUnackedMessagesPerConsumer {
             namespace,
             max_unacked,
@@ -3325,11 +3571,22 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxUnackedMessagesPerSubscription { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxUnackedMessagesPerSubscription { namespace } => {
+            let own = admin
                 .namespace_get_max_unacked_messages_per_subscription(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_unacked_messages_per_subscription);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "maxUnackedMessagesPerSubscription",
+                    output::max_unacked_messages_per_subscription,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxUnackedMessagesPerSubscription {
             namespace,
             max_unacked,
@@ -3349,9 +3606,35 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), CliError> {
+async fn run_admin_topics(
+    admin: &AdminClient,
+    format: OutputFormat,
+    cmd: TopicsCmd,
+) -> Result<(), CliError> {
     match cmd {
-        TopicsCmd::List { namespace } => print_json(&admin.topics_list(&namespace).await?),
+        TopicsCmd::List { namespace } => {
+            let topics = admin.topics_list(&namespace).await?;
+            match format {
+                OutputFormat::Json => print_json(&topics),
+                OutputFormat::Human => {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for topic in &topics {
+                        if let Some((parent, _)) = output::partition_parent(topic) {
+                            if !counts.contains_key(parent) {
+                                let count = admin.topic_partitions_count(parent).await?;
+                                counts.insert(parent.to_owned(), count);
+                            }
+                        }
+                    }
+                    let topics = output::collapse_partitioned_topics(&topics, &counts);
+                    out!(
+                        "{}",
+                        output::render_topics(&topics, version::should_color())
+                    );
+                    Ok(())
+                }
+            }
+        }
         TopicsCmd::Create { topic, partitions } => {
             admin.topic_create_partitioned(&topic, partitions).await?;
             Ok(())
@@ -3371,6 +3654,13 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             } else {
                 admin.topic_stats(&topic).await?
             };
+            if format == OutputFormat::Human {
+                out!(
+                    "{}",
+                    output::render_topic_stats(&stats, partitions, version::should_color())
+                );
+                return Ok(());
+            }
             // `TopicStats` derives `Deserialize` but not `Serialize` (it is
             // permissive); re-emit it via a manual JSON object so the CLI
             // output is human-friendly.
@@ -3421,7 +3711,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             let id = admin.topic_get_message_id_by_index(&topic, index).await?;
             print_json(&message_id_to_json(&id))
         }
-        TopicsCmd::GetRetention { topic } => print_json(&admin.topic_get_retention(&topic).await?),
+        TopicsCmd::GetRetention { topic } => {
+            let resolved = if let Some(value) = admin.topic_get_retention(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let own = admin
+                    .namespace_get_retention(&namespace_of_topic(&topic)?)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::retention_from_broker).await?
+            };
+            print_resolved(format, &resolved)
+        }
         TopicsCmd::SetRetention {
             topic,
             time_minutes,
@@ -3443,7 +3746,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetBacklogQuotas { topic } => {
-            print_json(&admin.topic_get_backlog_quotas(&topic).await?)
+            let resolved = if let Some(value) =
+                output::backlog_quotas(admin.topic_get_backlog_quotas(&topic).await?)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own =
+                    output::backlog_quotas(admin.namespace_get_backlog_quotas(&namespace).await?);
+                resolve_namespace_policy(admin, own, output::backlog_quotas_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetBacklogQuota {
             topic,
@@ -3470,7 +3786,29 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetMessageTtl { topic } => {
-            print_json(&admin.topic_get_message_ttl(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_message_ttl(&topic)
+                .await?
+                .map(output::message_ttl)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_message_ttl(&namespace)
+                    .await?
+                    .map(output::message_ttl);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("ttlDurationDefaultInSeconds", output::message_ttl),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMessageTtl { topic, ttl_seconds } => {
             admin.topic_set_message_ttl(&topic, ttl_seconds).await?;
@@ -3481,7 +3819,18 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetPersistence { topic } => {
-            print_json(&admin.topic_get_persistence(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_persistence(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let own = admin
+                    .namespace_get_persistence(&namespace_of_topic(&topic)?)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::persistence_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetPersistence {
             topic,
@@ -3508,7 +3857,18 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetDispatchRate { topic } => {
-            print_json(&admin.topic_get_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_dispatch_rate(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin.namespace_get_dispatch_rate(&namespace).await?;
+                resolve_namespace_policy(admin, own, output::topic_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetDispatchRate {
             topic,
@@ -3535,7 +3895,22 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetSubscriptionDispatchRate { topic } => {
-            print_json(&admin.topic_get_subscription_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) =
+                admin.topic_get_subscription_dispatch_rate(&topic).await?
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_subscription_dispatch_rate(&namespace)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::subscription_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetSubscriptionDispatchRate {
             topic,
@@ -3564,7 +3939,22 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetReplicatorDispatchRate { topic } => {
-            print_json(&admin.topic_get_replicator_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) =
+                admin.topic_get_replicator_dispatch_rate(&topic).await?
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_replicator_dispatch_rate(&namespace)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::replicator_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetReplicatorDispatchRate {
             topic,
@@ -3591,7 +3981,17 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetPublishRate { topic } => {
-            print_json(&admin.topic_get_publish_rate(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_publish_rate(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin.namespace_get_publish_rate(&namespace).await?;
+                resolve_namespace_policy(admin, own, output::publish_rate_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetPublishRate {
             topic,
@@ -3614,7 +4014,29 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetMaxProducers { topic } => {
-            print_json(&admin.topic_get_max_producers(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_max_producers(&topic)
+                .await?
+                .map(output::topic_max_producers)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_max_producers_per_topic(&namespace)
+                    .await?
+                    .map(output::topic_max_producers);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("maxProducersPerTopic", output::topic_max_producers),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMaxProducers {
             topic,
@@ -3628,7 +4050,29 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetMaxConsumers { topic } => {
-            print_json(&admin.topic_get_max_consumers(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_max_consumers(&topic)
+                .await?
+                .map(output::topic_max_consumers)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_max_consumers_per_topic(&namespace)
+                    .await?
+                    .map(output::topic_max_consumers);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("maxConsumersPerTopic", output::topic_max_consumers),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMaxConsumers {
             topic,
@@ -3949,10 +4393,113 @@ fn build_admin(conn: &ResolvedConnection, timeout_secs: u64) -> Result<AdminClie
     Ok(builder.build()?)
 }
 
+/// Exit status when stdout's reader went away: the value a shell reports for
+/// a process killed by `SIGPIPE`, which is what `cat | head` yields.
+const EXIT_BROKEN_PIPE: u8 = 141;
+
+/// Write command output to stdout and flush it.
+///
+/// `std`'s `print!` panics when the write fails, so `magnetarctl … | head`
+/// used to end with a `failed printing to stdout: Broken pipe` backtrace once
+/// `head` closed its end. The workspace forbids `unsafe`, so `SIGPIPE` cannot
+/// be reset to its default disposition; instead a `BrokenPipe` error ends the
+/// process quietly with the same status a signal death would show. Any other
+/// write error is reported on stderr and exits 1.
+pub(crate) fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let written = stdout.write_fmt(args).and_then(|()| {
+        if newline {
+            stdout.write_all(b"\n")?;
+        }
+        stdout.flush()
+    });
+    if let Err(err) = written {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(i32::from(EXIT_BROKEN_PIPE));
+        }
+        eprintln!("magnetarctl: failed writing to stdout: {err}");
+        std::process::exit(1);
+    }
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
     let s = serde_json::to_string_pretty(value)?;
-    println!("{s}");
+    outln!("{s}");
     Ok(())
+}
+
+/// Shared format selection for single-column named lists.
+fn print_formatted_list(
+    format: OutputFormat,
+    label: &str,
+    values: &[String],
+) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => print_json(&values),
+        OutputFormat::Human => {
+            let rows: Vec<_> = values.iter().map(|value| [value.clone()]).collect();
+            out!(
+                "{}",
+                output::render_table([label], &rows, version::should_color())
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Print a resolved policy in the requested [`OutputFormat`]: pretty JSON
+/// with a leading `source` key, or the human table with a `SOURCE` row.
+fn print_resolved<T: serde::Serialize + output::HumanOutput>(
+    format: OutputFormat,
+    resolved: &output::Resolved<T>,
+) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => print_json(resolved),
+        OutputFormat::Human => {
+            let s = output::render_rows(
+                &output::HumanOutput::human_fields(resolved),
+                version::should_color(),
+            );
+            out!("{s}");
+            Ok(())
+        }
+    }
+}
+
+/// A namespace-level policy as the cluster applies it: the namespace's own
+/// policy when it has one, else the broker default read from the runtime
+/// configuration. The level that answered travels with the value.
+///
+/// Reading the broker configuration is one extra admin call and happens only
+/// when the namespace is unset, so a set policy costs what it always did.
+async fn resolve_namespace_policy<T>(
+    admin: &AdminClient,
+    own: Option<T>,
+    from_broker: impl FnOnce(&serde_json::Value) -> Result<T, String>,
+) -> Result<output::Resolved<T>, CliError> {
+    if let Some(value) = own {
+        return Ok(output::Resolved {
+            source: output::PolicySource::Namespace,
+            value,
+        });
+    }
+    let config = admin.brokers_runtime_config().await?;
+    let value = from_broker(&config).map_err(CliError::BrokerConfig)?;
+    Ok(output::Resolved {
+        source: output::PolicySource::Broker,
+        value,
+    })
+}
+
+/// The `tenant/namespace` a topic belongs to, for the namespace step of a
+/// topic policy lookup.
+fn namespace_of_topic(topic: &str) -> Result<String, CliError> {
+    output::namespace_of_topic(topic).ok_or_else(|| {
+        CliError::BadArg(format!(
+            "topic `{topic}` is not of the form [persistent://]tenant/namespace/topic"
+        ))
+    })
 }
 
 /// Render a [`MessageId`] as the canonical CLI JSON object, mirroring Java's
@@ -4001,6 +4548,10 @@ pub(crate) enum CliError {
     /// I/O error while reading stdin or writing stdout.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The broker runtime configuration lacks, or mangles, a key the CLI
+    /// needs to resolve a policy default.
+    #[error("broker runtime configuration: {0}")]
+    BrokerConfig(String),
 }
 
 /// Parse a `MessageId` from the canonical CLI form
@@ -4138,9 +4689,12 @@ async fn run_produce(
             msg = msg.property(k, v);
         }
         let receipt = producer.send(msg.into()).await?;
-        println!(
+        outln!(
             "produced #{idx} -> ledger={} entry={} partition={} batch_index={}",
-            receipt.ledger_id, receipt.entry_id, receipt.partition, receipt.batch_index,
+            receipt.ledger_id,
+            receipt.entry_id,
+            receipt.partition,
+            receipt.batch_index,
         );
     }
     producer.close().await?;
@@ -4171,7 +4725,7 @@ async fn run_consume(
     for idx in 0..count {
         let msg = consumer.receive().await?;
         let payload = String::from_utf8_lossy(&msg.payload);
-        println!(
+        outln!(
             "received #{idx} id=(ledger={} entry={} partition={} batch_index={}) payload={}",
             msg.message_id.ledger_id,
             msg.message_id.entry_id,
