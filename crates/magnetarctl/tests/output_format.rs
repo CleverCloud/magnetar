@@ -801,3 +801,27 @@ fn natural_sort_orders_host_numbers_numerically() {
     );
     assert!(cli::output::natural_sorted(&[]).is_empty());
 }
+
+#[test]
+fn leader_renders_known_keys_first_then_extra_keys_with_derived_labels() {
+    let leader = serde_json::json!({
+        "serviceUrl": "http://broker-n9:8080",
+        "brokerId": "broker-n9:8080",
+        "clusterName": "c3",
+        "someFlag": true
+    });
+    assert_eq!(
+        cli::output::render_leader(&leader, false),
+        "BROKER ID     broker-n9:8080\n\
+         SERVICE URL   http://broker-n9:8080\n\
+         CLUSTER NAME  c3\n\
+         SOME FLAG     true\n"
+    );
+    assert_eq!(cli::output::label_from_camel("brokerId"), "broker id");
+    assert_eq!(cli::output::label_from_camel("id"), "id");
+    assert_eq!(cli::output::label_from_camel("TLS"), "t l s");
+    assert_eq!(
+        cli::output::render_leader(&serde_json::json!("n9"), false),
+        "\"n9\"\n"
+    );
+}

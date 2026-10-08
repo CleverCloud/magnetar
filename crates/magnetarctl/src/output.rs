@@ -756,3 +756,53 @@ pub(crate) fn natural_sorted(values: &[String]) -> Vec<String> {
     sorted.sort_by(|a, b| natural_cmp(a, b));
     sorted
 }
+
+/// `brokerId` → `broker id`: a human label derived from a JSON camelCase
+/// key, for payloads the CLI keeps as raw JSON for forward compatibility.
+pub(crate) fn label_from_camel(key: &str) -> String {
+    let mut label = String::with_capacity(key.len() + 4);
+    for (index, c) in key.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if index > 0 {
+                label.push(' ');
+            }
+            label.push(c.to_ascii_lowercase());
+        } else {
+            label.push(c);
+        }
+    }
+    label
+}
+
+/// `brokers leader`: `{ serviceUrl, brokerId }` today, with `clusterName`
+/// and similar on newer brokers. Known keys come first with their labels;
+/// every other key follows in payload order under a label derived from its
+/// name, so a newer broker's extra fields are shown rather than dropped.
+pub(crate) fn render_leader(leader: &serde_json::Value, colored: bool) -> String {
+    const KNOWN: [(&str, &str); 2] = [("brokerId", "broker id"), ("serviceUrl", "service url")];
+    let Some(fields) = leader.as_object() else {
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(leader).unwrap_or_default()
+        );
+    };
+    let mut rows: Vec<(String, String)> = KNOWN
+        .iter()
+        .filter_map(|(key, label)| {
+            fields
+                .get(*key)
+                .map(|v| ((*label).to_owned(), plain_value(v)))
+        })
+        .collect();
+    rows.extend(
+        fields
+            .iter()
+            .filter(|(key, _)| !KNOWN.iter().any(|(known, _)| known == key))
+            .map(|(key, value)| (label_from_camel(key), plain_value(value))),
+    );
+    let borrowed: Vec<(&str, String)> = rows
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.clone()))
+        .collect();
+    render_rows(&borrowed, colored)
+}
