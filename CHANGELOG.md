@@ -15,16 +15,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention` and `namespace_get_persistence` now return `Option<_>`, `None` when the policy is unset at that level.**
-  They used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0`, while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`.
-  The client therefore reported a replication layout the cluster never returned.
-  The three getters now share `json_ok_unset_policy`, which folds all four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; `topic_get_persistence` already behaved this way.
+- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention`, `namespace_get_persistence`, `namespace_get_dispatch_rate`, `namespace_get_subscription_dispatch_rate`, `namespace_get_replicator_dispatch_rate` and `namespace_get_publish_rate` now return `Option<_>`, `None` when the policy is unset at that level.**
+  Retention, persistence, dispatch rate and publish rate used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0` while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`, and `DispatchRate::default()` is `-1` (unlimited) whatever the broker's `dispatchThrottlingRatePer*`.
+  The client therefore reported values the cluster never returned.
+  The subscription and replicator dispatch-rate getters used the strict decoder instead and failed with a decode error on the same empty body.
+  All seven now share `json_ok_unset_policy`, which folds the four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; the topic-level getters already behaved this way.
 
 ### Fixed
 
-- **`magnetarctl admin namespaces/topics get-retention` and `get-persistence` no longer print a client-side constant for an unset policy, and say which level supplied the value.**
-  A namespace without a policy of its own now gets the broker default read from the runtime configuration (`defaultRetention*`, `managedLedgerDefault*`); a topic without one falls back to its namespace, then to the broker.
-  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the unchanged policy fields, and human output a first `SOURCE` row.
+- **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
+  Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.
+  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
+  **BREAKING (CLI JSON) for the single-valued getters**: TTL, deduplication, snapshot interval, compaction threshold and the max-* counts are now wrapped in an object under their Java field name (`{"source": "broker", "messageTTLInSeconds": 0}`) where they printed a bare value or `null`; the struct-valued getters keep their fields unchanged.
+  Human output renders the sentinels (`unlimited`, `disabled`) and units (durations, decimal SI sizes, `msg/s`) per policy.
 - **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
   Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
 

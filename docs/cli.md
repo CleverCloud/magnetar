@@ -57,10 +57,13 @@ Every command prints its result as pretty JSON by default, and that stays the de
 Human output uses command-specific labels and unit-aware values; JSON keeps the broker field names and numeric values.
 For retention, durations are expressed in days, hours and minutes without rounding, sizes use `MB`, and `-1` is displayed as `∞`.
 
-The retention and persistence getters report the policy the cluster actually applies, and say where it comes from.
-A namespace without a policy of its own gets the broker default read from `GET /admin/v2/brokers/configuration/runtime` (`defaultRetention*` for retention, `managedLedgerDefault*` for persistence); a topic without a policy of its own falls back to its namespace, then to the broker.
+Every policy getter (`get-retention`, `get-persistence`, `get-backlog-quotas`, `get-message-ttl`, the three `get-*dispatch-rate`, `get-publish-rate`, `get-deduplication`, `get-deduplication-snapshot-interval`, `get-compaction-threshold`, `get-delayed-delivery`, `get-max-producers*`, `get-max-consumers*`, `get-max-unacked-messages-per-*`) reports the policy the cluster actually applies, and says where it comes from.
+A namespace without a policy of its own gets the broker default read from `GET /admin/v2/brokers/configuration/runtime` (`defaultRetention*`, `managedLedgerDefault*`, `backlogQuotaDefault*`, `ttlDurationDefaultInSeconds`, `dispatchThrottlingRatePer*`, `maxPublishRatePerTopic*`, `brokerDeduplication*`, `brokerServiceCompactionThresholdInBytes`, `delayedDelivery*`, `maxProducersPerTopic`, `maxConsumersPerTopic`, `maxUnackedMessagesPer*`); a topic without a policy of its own falls back to its namespace, then to the broker.
 JSON output carries a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row reading `topic policy`, `namespace policy` or `broker default (no policy set)`.
-The client never substitutes a constant of its own: an earlier version printed `2/2/2` for a namespace with no persistence policy while the broker's defaults were `3/3/2`.
+Single-valued policies (TTL, deduplication, thresholds, counts) are wrapped in an object under their Java field name so the `source` key has somewhere to live: `{"source": "broker", "messageTTLInSeconds": 0}` where an earlier version printed the bare `0` or `null`.
+Human output spells the sentinels out: a rate or count of `0` / `-1` reads `unlimited`, a TTL or compaction threshold of `0` reads `disabled`, durations are in days/hours/minutes/seconds and sizes in decimal SI units.
+The broker's single default backlog quota applies to both quota types, so a `broker default` answer lists `destination_storage` and `message_age` with the same limits.
+The client never substitutes a constant of its own: an earlier version printed `2/2/2` for a namespace with no persistence policy while the broker's defaults were `3/3/2`, and `-1` (unlimited) for an unset dispatch rate whatever the broker's throttle.
 Rates are shown with two decimals (`msg/s`, `B/s`), as are byte sizes.
 Field labels are uppercase and blue on a terminal; piping the output or setting a non-empty `NO_COLOR` disables color.
 
@@ -70,7 +73,7 @@ RETENTION DURATION  366 days
 RETENTION SIZE      ∞
 ```
 
-`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin bookies racks-info`, `admin namespaces get-persistence` and `admin topics get-persistence` honour `human`; every other command still prints JSON whatever the flag says.
+`admin namespaces get-retention`, `admin topics get-retention`, `admin topics list`, `admin topics stats`, `admin clusters list`, `admin clusters list-failure-domains`, `admin clusters get-failure-domain`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list`, `admin brokers leader`, `admin bookies list`, `admin bookies racks-info`, and every namespace and topic policy getter listed above honour `human`; every other command still prints JSON whatever the flag says.
 `admin topics list -F human` displays aligned `TOPIC` and `PARTITIONS` columns with blue uppercase headers, preserving broker order.
 Physical partitions are grouped under their parent, with the declared count from broker metadata in `PARTITIONS`; non-partitioned topics display `—`.
 

@@ -3153,7 +3153,10 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetBacklogQuotas { namespace } => {
-            print_json(&admin.namespace_get_backlog_quotas(&namespace).await?)
+            let own = output::backlog_quotas(admin.namespace_get_backlog_quotas(&namespace).await?);
+            let resolved =
+                resolve_namespace_policy(admin, own, output::backlog_quotas_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetBacklogQuota {
             namespace,
@@ -3185,7 +3188,17 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetMessageTtl { namespace } => {
-            print_json(&admin.namespace_get_message_ttl(&namespace).await?)
+            let own = admin
+                .namespace_get_message_ttl(&namespace)
+                .await?
+                .map(output::message_ttl);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("ttlDurationDefaultInSeconds", output::message_ttl),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetMessageTtl {
             namespace,
@@ -3231,7 +3244,11 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetDispatchRate { namespace } => {
-            print_json(&admin.namespace_get_dispatch_rate(&namespace).await?)
+            let own = admin.namespace_get_dispatch_rate(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::topic_dispatch_rate_from_broker)
+                    .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDispatchRate {
             namespace,
@@ -3257,11 +3274,18 @@ async fn run_admin_namespaces(
             admin.namespace_remove_dispatch_rate(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetSubscriptionDispatchRate { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetSubscriptionDispatchRate { namespace } => {
+            let own = admin
                 .namespace_get_subscription_dispatch_rate(&namespace)
-                .await?,
-        ),
+                .await?;
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::subscription_dispatch_rate_from_broker,
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetSubscriptionDispatchRate {
             namespace,
             rate_msg,
@@ -3288,11 +3312,15 @@ async fn run_admin_namespaces(
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetReplicatorDispatchRate { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetReplicatorDispatchRate { namespace } => {
+            let own = admin
                 .namespace_get_replicator_dispatch_rate(&namespace)
-                .await?,
-        ),
+                .await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::replicator_dispatch_rate_from_broker)
+                    .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetReplicatorDispatchRate {
             namespace,
             rate_msg,
@@ -3320,7 +3348,10 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetPublishRate { namespace } => {
-            print_json(&admin.namespace_get_publish_rate(&namespace).await?)
+            let own = admin.namespace_get_publish_rate(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::publish_rate_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetPublishRate {
             namespace,
@@ -3343,7 +3374,17 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetDeduplication { namespace } => {
-            print_json(&admin.namespace_get_deduplication(&namespace).await?)
+            let own = admin
+                .namespace_get_deduplication(&namespace)
+                .await?
+                .map(output::deduplication);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("brokerDeduplicationEnabled", output::deduplication),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDeduplication { namespace, enabled } => {
             admin
@@ -3355,11 +3396,22 @@ async fn run_admin_namespaces(
             admin.namespace_remove_deduplication(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetDeduplicationSnapshotInterval { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetDeduplicationSnapshotInterval { namespace } => {
+            let own = admin
                 .namespace_get_deduplication_snapshot_interval(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::deduplication_snapshot_interval);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "brokerDeduplicationSnapshotIntervalSeconds",
+                    output::deduplication_snapshot_interval,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetDeduplicationSnapshotInterval {
             namespace,
             interval_entries,
@@ -3376,7 +3428,20 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetCompactionThreshold { namespace } => {
-            print_json(&admin.namespace_get_compaction_threshold(&namespace).await?)
+            let own = admin
+                .namespace_get_compaction_threshold(&namespace)
+                .await?
+                .map(output::compaction_threshold);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "brokerServiceCompactionThresholdInBytes",
+                    output::compaction_threshold,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetCompactionThreshold {
             namespace,
@@ -3394,7 +3459,10 @@ async fn run_admin_namespaces(
             Ok(())
         }
         NamespacesCmd::GetDelayedDelivery { namespace } => {
-            print_json(&admin.namespace_get_delayed_delivery(&namespace).await?)
+            let own = admin.namespace_get_delayed_delivery(&namespace).await?;
+            let resolved =
+                resolve_namespace_policy(admin, own, output::delayed_delivery_from_broker).await?;
+            print_resolved(format, &resolved)
         }
         NamespacesCmd::SetDelayedDelivery {
             namespace,
@@ -3416,11 +3484,19 @@ async fn run_admin_namespaces(
             admin.namespace_remove_delayed_delivery(&namespace).await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxProducersPerTopic { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxProducersPerTopic { namespace } => {
+            let own = admin
                 .namespace_get_max_producers_per_topic(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_producers_per_topic);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("maxProducersPerTopic", output::max_producers_per_topic),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxProducersPerTopic {
             namespace,
             max_producers,
@@ -3436,11 +3512,19 @@ async fn run_admin_namespaces(
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxConsumersPerTopic { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxConsumersPerTopic { namespace } => {
+            let own = admin
                 .namespace_get_max_consumers_per_topic(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_consumers_per_topic);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar("maxConsumersPerTopic", output::max_consumers_per_topic),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxConsumersPerTopic {
             namespace,
             max_consumers,
@@ -3456,11 +3540,22 @@ async fn run_admin_namespaces(
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxUnackedMessagesPerConsumer { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxUnackedMessagesPerConsumer { namespace } => {
+            let own = admin
                 .namespace_get_max_unacked_messages_per_consumer(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_unacked_messages_per_consumer);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "maxUnackedMessagesPerConsumer",
+                    output::max_unacked_messages_per_consumer,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxUnackedMessagesPerConsumer {
             namespace,
             max_unacked,
@@ -3476,11 +3571,22 @@ async fn run_admin_namespaces(
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetMaxUnackedMessagesPerSubscription { namespace } => print_json(
-            &admin
+        NamespacesCmd::GetMaxUnackedMessagesPerSubscription { namespace } => {
+            let own = admin
                 .namespace_get_max_unacked_messages_per_subscription(&namespace)
-                .await?,
-        ),
+                .await?
+                .map(output::max_unacked_messages_per_subscription);
+            let resolved = resolve_namespace_policy(
+                admin,
+                own,
+                output::broker_scalar(
+                    "maxUnackedMessagesPerSubscription",
+                    output::max_unacked_messages_per_subscription,
+                ),
+            )
+            .await?;
+            print_resolved(format, &resolved)
+        }
         NamespacesCmd::SetMaxUnackedMessagesPerSubscription {
             namespace,
             max_unacked,
@@ -3640,7 +3746,20 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetBacklogQuotas { topic } => {
-            print_json(&admin.topic_get_backlog_quotas(&topic).await?)
+            let resolved = if let Some(value) =
+                output::backlog_quotas(admin.topic_get_backlog_quotas(&topic).await?)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own =
+                    output::backlog_quotas(admin.namespace_get_backlog_quotas(&namespace).await?);
+                resolve_namespace_policy(admin, own, output::backlog_quotas_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetBacklogQuota {
             topic,
@@ -3667,7 +3786,29 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetMessageTtl { topic } => {
-            print_json(&admin.topic_get_message_ttl(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_message_ttl(&topic)
+                .await?
+                .map(output::message_ttl)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_message_ttl(&namespace)
+                    .await?
+                    .map(output::message_ttl);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("ttlDurationDefaultInSeconds", output::message_ttl),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMessageTtl { topic, ttl_seconds } => {
             admin.topic_set_message_ttl(&topic, ttl_seconds).await?;
@@ -3716,7 +3857,18 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetDispatchRate { topic } => {
-            print_json(&admin.topic_get_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_dispatch_rate(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin.namespace_get_dispatch_rate(&namespace).await?;
+                resolve_namespace_policy(admin, own, output::topic_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetDispatchRate {
             topic,
@@ -3743,7 +3895,22 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetSubscriptionDispatchRate { topic } => {
-            print_json(&admin.topic_get_subscription_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) =
+                admin.topic_get_subscription_dispatch_rate(&topic).await?
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_subscription_dispatch_rate(&namespace)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::subscription_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetSubscriptionDispatchRate {
             topic,
@@ -3772,7 +3939,22 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetReplicatorDispatchRate { topic } => {
-            print_json(&admin.topic_get_replicator_dispatch_rate(&topic).await?)
+            let resolved = if let Some(value) =
+                admin.topic_get_replicator_dispatch_rate(&topic).await?
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_replicator_dispatch_rate(&namespace)
+                    .await?;
+                resolve_namespace_policy(admin, own, output::replicator_dispatch_rate_from_broker)
+                    .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetReplicatorDispatchRate {
             topic,
@@ -3799,7 +3981,17 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetPublishRate { topic } => {
-            print_json(&admin.topic_get_publish_rate(&topic).await?)
+            let resolved = if let Some(value) = admin.topic_get_publish_rate(&topic).await? {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin.namespace_get_publish_rate(&namespace).await?;
+                resolve_namespace_policy(admin, own, output::publish_rate_from_broker).await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetPublishRate {
             topic,
@@ -3822,7 +4014,29 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetMaxProducers { topic } => {
-            print_json(&admin.topic_get_max_producers(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_max_producers(&topic)
+                .await?
+                .map(output::topic_max_producers)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_max_producers_per_topic(&namespace)
+                    .await?
+                    .map(output::topic_max_producers);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("maxProducersPerTopic", output::topic_max_producers),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMaxProducers {
             topic,
@@ -3836,7 +4050,29 @@ async fn run_admin_topics(
             Ok(())
         }
         TopicsCmd::GetMaxConsumers { topic } => {
-            print_json(&admin.topic_get_max_consumers(&topic).await?)
+            let resolved = if let Some(value) = admin
+                .topic_get_max_consumers(&topic)
+                .await?
+                .map(output::topic_max_consumers)
+            {
+                output::Resolved {
+                    source: output::PolicySource::Topic,
+                    value,
+                }
+            } else {
+                let namespace = namespace_of_topic(&topic)?;
+                let own = admin
+                    .namespace_get_max_consumers_per_topic(&namespace)
+                    .await?
+                    .map(output::topic_max_consumers);
+                resolve_namespace_policy(
+                    admin,
+                    own,
+                    output::broker_scalar("maxConsumersPerTopic", output::topic_max_consumers),
+                )
+                .await?
+            };
+            print_resolved(format, &resolved)
         }
         TopicsCmd::SetMaxConsumers {
             topic,

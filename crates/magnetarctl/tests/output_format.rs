@@ -881,3 +881,273 @@ fn racks_info_groups_bookies_by_rack_and_names_blocks_once() {
         "[\n  1\n]\n"
     );
 }
+
+fn runtime_config_sample() -> serde_json::Value {
+    serde_json::json!({
+        "dispatchThrottlingRatePerTopicInMsg": "0",
+        "dispatchThrottlingRatePerTopicInByte": "1048576",
+        "dispatchThrottlingRateRelativeToPublishRate": "true",
+        "dispatchThrottlingRatePerSubscriptionInMsg": "500",
+        "dispatchThrottlingRatePerSubscriptionInByte": "0",
+        "dispatchThrottlingRatePerReplicatorInMsg": "0",
+        "dispatchThrottlingRatePerReplicatorInByte": "0",
+        "maxPublishRatePerTopicInMessages": "0",
+        "maxPublishRatePerTopicInBytes": "2000",
+        "backlogQuotaDefaultLimitBytes": "-1",
+        "backlogQuotaDefaultLimitSecond": "3600",
+        "backlogQuotaDefaultRetentionPolicy": "producer_request_hold",
+        "ttlDurationDefaultInSeconds": "0",
+        "brokerDeduplicationEnabled": "false",
+        "brokerDeduplicationSnapshotIntervalSeconds": "120",
+        "brokerServiceCompactionThresholdInBytes": "0",
+        "delayedDeliveryEnabled": "true",
+        "delayedDeliveryTickTimeMillis": "1000",
+        "maxProducersPerTopic": "200",
+        "maxConsumersPerTopic": "0",
+        "maxUnackedMessagesPerConsumer": "0",
+        "maxUnackedMessagesPerSubscription": "50000"
+    })
+}
+
+fn rows<T: cli::output::HumanOutput>(policy: &T) -> String {
+    cli::output::render_rows(&policy.human_fields(), false)
+}
+
+#[test]
+fn dispatch_and_publish_rates_render_unlimited_for_non_positive_values() {
+    let config = runtime_config_sample();
+    let topic = cli::output::topic_dispatch_rate_from_broker(&config).expect("topic rate");
+    assert_eq!(
+        rows(&topic),
+        "MESSAGE RATE              unlimited\n\
+         BYTE RATE                 1.05 MB/s\n\
+         RATE PERIOD               1 s\n\
+         RELATIVE TO PUBLISH RATE  yes\n"
+    );
+    assert_eq!(
+        topic.dispatch_throttling_rate_in_msg, -1,
+        "0 in the broker config is a disabled throttle"
+    );
+    let subscription =
+        cli::output::subscription_dispatch_rate_from_broker(&config).expect("subscription rate");
+    assert!(rows(&subscription).starts_with("MESSAGE RATE              500 msg/s\n"));
+    assert!(rows(&subscription).contains("RELATIVE TO PUBLISH RATE  no\n"));
+    let period = magnetar_admin::DispatchRate {
+        dispatch_throttling_rate_in_msg: 10,
+        dispatch_throttling_rate_in_byte: -1,
+        rate_period_in_second: 5,
+        relative_to_publish_rate: false,
+    };
+    assert!(rows(&period).starts_with("MESSAGE RATE              10 msg/5 s\n"));
+    let publish = cli::output::publish_rate_from_broker(&config).expect("publish rate");
+    assert_eq!(
+        rows(&publish),
+        "MESSAGE RATE  unlimited\nBYTE RATE     2.00 KB/s\n"
+    );
+}
+
+#[test]
+fn scalar_policies_render_sentinels_and_serialise_under_their_key() {
+    use cli::output::{PolicySource, Resolved};
+    let cases: Vec<(cli::output::ScalarPolicy, &str, &str)> = vec![
+        (
+            cli::output::message_ttl(0),
+            "MESSAGE TTL  disabled\n",
+            r#"{"source":"namespace","messageTTLInSeconds":0}"#,
+        ),
+        (
+            cli::output::message_ttl(90_061),
+            "MESSAGE TTL  1 day 1 hour 1 minute 1 second\n",
+            r#"{"source":"namespace","messageTTLInSeconds":90061}"#,
+        ),
+        (
+            cli::output::deduplication(true),
+            "DEDUPLICATION  enabled\n",
+            r#"{"source":"namespace","deduplicationEnabled":true}"#,
+        ),
+        (
+            cli::output::deduplication_snapshot_interval(120),
+            "DEDUPLICATION SNAPSHOT INTERVAL  2 minutes\n",
+            r#"{"source":"namespace","deduplicationSnapshotIntervalSeconds":120}"#,
+        ),
+        (
+            cli::output::compaction_threshold(0),
+            "COMPACTION THRESHOLD  disabled\n",
+            r#"{"source":"namespace","compactionThreshold":0}"#,
+        ),
+        (
+            cli::output::compaction_threshold(104_857_600),
+            "COMPACTION THRESHOLD  104.86 MB\n",
+            r#"{"source":"namespace","compactionThreshold":104857600}"#,
+        ),
+        (
+            cli::output::max_producers_per_topic(0),
+            "MAX PRODUCERS PER TOPIC  unlimited\n",
+            r#"{"source":"namespace","maxProducersPerTopic":0}"#,
+        ),
+        (
+            cli::output::max_consumers_per_topic(12),
+            "MAX CONSUMERS PER TOPIC  12\n",
+            r#"{"source":"namespace","maxConsumersPerTopic":12}"#,
+        ),
+        (
+            cli::output::max_unacked_messages_per_consumer(0),
+            "MAX UNACKED MESSAGES PER CONSUMER  unlimited\n",
+            r#"{"source":"namespace","maxUnackedMessagesPerConsumer":0}"#,
+        ),
+        (
+            cli::output::max_unacked_messages_per_subscription(50_000),
+            "MAX UNACKED MESSAGES PER SUBSCRIPTION  50000\n",
+            r#"{"source":"namespace","maxUnackedMessagesPerSubscription":50000}"#,
+        ),
+        (
+            cli::output::topic_max_producers(3),
+            "MAX PRODUCERS  3\n",
+            r#"{"source":"namespace","maxProducers":3}"#,
+        ),
+        (
+            cli::output::topic_max_consumers(0),
+            "MAX CONSUMERS  unlimited\n",
+            r#"{"source":"namespace","maxConsumers":0}"#,
+        ),
+    ];
+    for (policy, human, json) in cases {
+        assert_eq!(rows(&policy), human);
+        let resolved = Resolved {
+            source: PolicySource::Namespace,
+            value: policy,
+        };
+        assert_eq!(
+            serde_json::to_string(&cli::output::resolved_json(&resolved).expect("json"))
+                .expect("string"),
+            json
+        );
+    }
+}
+
+#[test]
+fn broker_scalar_reads_and_wraps_the_runtime_key() {
+    let config = runtime_config_sample();
+    let ttl = cli::output::broker_scalar("ttlDurationDefaultInSeconds", cli::output::message_ttl)(
+        &config,
+    )
+    .expect("ttl");
+    assert_eq!(rows(&ttl), "MESSAGE TTL  disabled\n");
+    let producers = cli::output::broker_scalar(
+        "maxProducersPerTopic",
+        cli::output::max_producers_per_topic,
+    )(&config)
+    .expect("producers");
+    assert_eq!(rows(&producers), "MAX PRODUCERS PER TOPIC  200\n");
+    let dedup = cli::output::broker_scalar(
+        "brokerDeduplicationEnabled",
+        cli::output::deduplication,
+    )(&config)
+    .expect("dedup");
+    assert_eq!(rows(&dedup), "DEDUPLICATION  disabled\n");
+    let err =
+        cli::output::broker_scalar("nope", cli::output::message_ttl)(&config).expect_err("missing");
+    assert!(err.contains("`nope` is missing"), "{err}");
+}
+
+#[test]
+fn delayed_delivery_renders_state_and_tick() {
+    let policy =
+        cli::output::delayed_delivery_from_broker(&runtime_config_sample()).expect("delayed");
+    assert_eq!(
+        rows(&policy),
+        "DELAYED DELIVERY  enabled\nTICK TIME         1000 ms\n"
+    );
+}
+
+#[test]
+fn backlog_quotas_detect_unset_maps_and_render_each_type() {
+    assert!(cli::output::backlog_quotas(serde_json::json!({})).is_none());
+    assert!(cli::output::backlog_quotas(serde_json::json!(null)).is_none());
+    let own = cli::output::backlog_quotas(serde_json::json!({
+        "destination_storage": {"limitSize": 10_737_418_240_i64, "limitTime": -1, "policy": "producer_exception"},
+        "future_type": {"weird": true}
+    }))
+    .expect("set");
+    assert_eq!(
+        rows(&own),
+        "DESTINATION STORAGE QUOTA  size 10.74 GB, time unlimited, policy producer_exception\n\
+         QUOTA                      future_type: size unlimited, time unlimited, policy —\n"
+    );
+    let default =
+        cli::output::backlog_quotas_from_broker(&runtime_config_sample()).expect("broker");
+    assert_eq!(
+        rows(&default),
+        "DESTINATION STORAGE QUOTA  size unlimited, time 1 hour, policy producer_request_hold\n\
+         MESSAGE AGE QUOTA          size unlimited, time 1 hour, policy producer_request_hold\n"
+    );
+    let resolved = cli::output::Resolved {
+        source: cli::output::PolicySource::Broker,
+        value: default,
+    };
+    let json = cli::output::resolved_json(&resolved).expect("json");
+    assert_eq!(json["source"], "broker");
+    assert_eq!(json["message_age"]["limitTime"], 3600);
+    assert_eq!(
+        json["destination_storage"]["policy"],
+        "producer_request_hold"
+    );
+}
+
+#[test]
+fn namespace_message_ttl_falls_back_to_the_broker_with_a_scalar_json_shape() {
+    use std::process::Command;
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let config = config_dir.path().join("config.yaml");
+    std::fs::write(&config, "{}\n").expect("write config");
+    for (format, expected) in [
+        (
+            "human",
+            "SOURCE       broker default (no policy set)\nMESSAGE TTL  disabled\n",
+        ),
+        (
+            "json",
+            "{\n  \"source\": \"broker\",\n  \"messageTTLInSeconds\": 0\n}\n",
+        ),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = serve_in_order(
+            listener,
+            vec![
+                ("/admin/v2/namespaces/public/default/messageTTL", 204, ""),
+                (
+                    "/admin/v2/brokers/configuration/runtime",
+                    200,
+                    r#"{"ttlDurationDefaultInSeconds":"0"}"#,
+                ),
+            ],
+        );
+        let result = Command::new(env!("CARGO_BIN_EXE_magnetarctl"))
+            .env_remove("MAGNETAR_FORMAT")
+            .env_remove("MAGNETAR_CONTEXT")
+            .env_remove("MAGNETAR_TOKEN")
+            .env("NO_COLOR", "1")
+            .arg("--config")
+            .arg(&config)
+            .arg("--admin-url")
+            .arg(format!("http://{address}"))
+            .args([
+                "admin",
+                "namespaces",
+                "get-message-ttl",
+                "public/default",
+                "-F",
+                format,
+            ])
+            .output()
+            .expect("run magnetarctl");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        server.join().expect("server");
+        assert_eq!(String::from_utf8(result.stdout).expect("UTF-8"), expected);
+    }
+}

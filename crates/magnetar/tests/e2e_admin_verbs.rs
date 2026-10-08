@@ -396,7 +396,10 @@ async fn e2e_admin_namespace_policies_breadth() -> Result<(), Box<dyn std::error
         relative_to_publish_rate: false,
     };
     admin.namespace_set_dispatch_rate(ns, rate).await?;
-    let got = admin.namespace_get_dispatch_rate(ns).await?;
+    let got = admin
+        .namespace_get_dispatch_rate(ns)
+        .await?
+        .expect("dispatch rate was just set");
     assert_eq!(got.dispatch_throttling_rate_in_msg, 1000);
     assert_eq!(got.dispatch_throttling_rate_in_byte, 1_048_576);
     admin.namespace_remove_dispatch_rate(ns).await?;
@@ -445,7 +448,10 @@ async fn e2e_admin_namespace_policies_breadth() -> Result<(), Box<dyn std::error
         publish_throttling_rate_in_byte: 524_288,
     };
     admin.namespace_set_publish_rate(ns, pr).await?;
-    let got = admin.namespace_get_publish_rate(ns).await?;
+    let got = admin
+        .namespace_get_publish_rate(ns)
+        .await?
+        .expect("publish rate was just set");
     assert_eq!(got.publish_throttling_rate_in_msg, 500);
     admin.namespace_remove_publish_rate(ns).await?;
 

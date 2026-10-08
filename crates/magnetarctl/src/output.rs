@@ -5,7 +5,10 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use magnetar_admin::{PersistencePolicies, RetentionPolicies};
+use magnetar_admin::{
+    BacklogQuota, DelayedDeliveryPolicies, DispatchRate, PersistencePolicies, PublishRate,
+    RetentionPolicies,
+};
 
 /// The human view is independent of the serialized broker representation.
 pub(crate) trait HumanOutput {
@@ -886,4 +889,380 @@ pub(crate) fn render_racks_info(info: &serde_json::Value, colored: bool) -> Stri
         &rows,
         colored,
     )
+}
+
+/// Duration stored in seconds; formatting preserves every second.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DurationSeconds(pub(crate) i64);
+
+impl fmt::Display for DurationSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 < 0 {
+            return write!(f, "{} seconds", self.0);
+        }
+        let (minutes, seconds) = (self.0 / 60, self.0 % 60);
+        let head = DurationMinutes(minutes).to_string();
+        match (minutes, seconds) {
+            (0, s) => write!(f, "{s} second{}", if s == 1 { "" } else { "s" }),
+            (_, 0) => f.write_str(&head),
+            (_, s) => write!(f, "{head} {s} second{}", if s == 1 { "" } else { "s" }),
+        }
+    }
+}
+
+/// A throttle where `<= 0` means "no limit" (Pulsar's `-1`, and the broker
+/// configuration's `0` for a disabled throttle).
+fn throttle(value: i64, render: impl FnOnce(i64) -> String) -> String {
+    if value <= 0 {
+        "unlimited".to_owned()
+    } else {
+        render(value)
+    }
+}
+
+/// `yes` / `no` for a boolean policy row.
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+impl HumanOutput for DispatchRate {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        let period = i64::from(self.rate_period_in_second.max(1));
+        let per = if period == 1 {
+            "s".to_owned()
+        } else {
+            format!("{period} s")
+        };
+        vec![
+            (
+                "message rate",
+                throttle(i64::from(self.dispatch_throttling_rate_in_msg), |v| {
+                    format!("{v} msg/{per}")
+                }),
+            ),
+            (
+                "byte rate",
+                throttle(self.dispatch_throttling_rate_in_byte, |v| {
+                    format!("{}/{per}", SizeBytes::from_counter(v))
+                }),
+            ),
+            ("rate period", format!("{period} s")),
+            (
+                "relative to publish rate",
+                yes_no(self.relative_to_publish_rate).to_owned(),
+            ),
+        ]
+    }
+}
+
+impl HumanOutput for PublishRate {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "message rate",
+                throttle(i64::from(self.publish_throttling_rate_in_msg), |v| {
+                    format!("{v} msg/s")
+                }),
+            ),
+            (
+                "byte rate",
+                throttle(self.publish_throttling_rate_in_byte, |v| {
+                    format!("{}/s", SizeBytes::from_counter(v))
+                }),
+            ),
+        ]
+    }
+}
+
+impl HumanOutput for DelayedDeliveryPolicies {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "delayed delivery",
+                if self.active { "enabled" } else { "disabled" }.to_owned(),
+            ),
+            ("tick time", format!("{} ms", self.tick_time_millis)),
+        ]
+    }
+}
+
+/// A single-valued policy (`messageTTLInSeconds`, `maxProducers`, …): its
+/// JSON key, its human label, the raw value and the human rendering, so
+/// `Resolved<ScalarPolicy>` serialises as `{ source, <key>: value }` and
+/// renders as a `SOURCE` row plus one labelled row.
+#[derive(Debug, Clone)]
+pub(crate) struct ScalarPolicy {
+    key: &'static str,
+    label: &'static str,
+    value: serde_json::Value,
+    human: String,
+}
+
+impl serde::Serialize for ScalarPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.key, &self.value)?;
+        map.end()
+    }
+}
+
+impl HumanOutput for ScalarPolicy {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![(self.label, self.human.clone())]
+    }
+}
+
+fn scalar(
+    key: &'static str,
+    label: &'static str,
+    value: impl Into<serde_json::Value>,
+    human: String,
+) -> ScalarPolicy {
+    ScalarPolicy {
+        key,
+        label,
+        value: value.into(),
+        human,
+    }
+}
+
+/// `0` seconds disables the TTL.
+pub(crate) fn message_ttl(seconds: i32) -> ScalarPolicy {
+    let human = if seconds == 0 {
+        "disabled".to_owned()
+    } else {
+        DurationSeconds(i64::from(seconds)).to_string()
+    };
+    scalar("messageTTLInSeconds", "message ttl", seconds, human)
+}
+
+pub(crate) fn deduplication(enabled: bool) -> ScalarPolicy {
+    let human = if enabled { "enabled" } else { "disabled" }.to_owned();
+    scalar("deduplicationEnabled", "deduplication", enabled, human)
+}
+
+pub(crate) fn deduplication_snapshot_interval(seconds: i32) -> ScalarPolicy {
+    scalar(
+        "deduplicationSnapshotIntervalSeconds",
+        "deduplication snapshot interval",
+        seconds,
+        DurationSeconds(i64::from(seconds)).to_string(),
+    )
+}
+
+/// `0` bytes disables compaction.
+pub(crate) fn compaction_threshold(bytes: i64) -> ScalarPolicy {
+    let human = if bytes <= 0 {
+        "disabled".to_owned()
+    } else {
+        SizeBytes::from_counter(bytes).to_string()
+    };
+    scalar("compactionThreshold", "compaction threshold", bytes, human)
+}
+
+/// A count where `0` means "no limit".
+fn count_limit(key: &'static str, label: &'static str, count: i32) -> ScalarPolicy {
+    scalar(
+        key,
+        label,
+        count,
+        throttle(i64::from(count), |v| v.to_string()),
+    )
+}
+
+pub(crate) fn max_producers_per_topic(count: i32) -> ScalarPolicy {
+    count_limit("maxProducersPerTopic", "max producers per topic", count)
+}
+
+pub(crate) fn max_consumers_per_topic(count: i32) -> ScalarPolicy {
+    count_limit("maxConsumersPerTopic", "max consumers per topic", count)
+}
+
+pub(crate) fn max_unacked_messages_per_consumer(count: i32) -> ScalarPolicy {
+    count_limit(
+        "maxUnackedMessagesPerConsumer",
+        "max unacked messages per consumer",
+        count,
+    )
+}
+
+pub(crate) fn max_unacked_messages_per_subscription(count: i32) -> ScalarPolicy {
+    count_limit(
+        "maxUnackedMessagesPerSubscription",
+        "max unacked messages per subscription",
+        count,
+    )
+}
+
+/// Topic-level keys (`maxProducers` / `maxConsumers`), used for every level
+/// of a topic command so the JSON key reflects the command, not the level.
+pub(crate) fn topic_max_producers(count: i32) -> ScalarPolicy {
+    count_limit("maxProducers", "max producers", count)
+}
+
+pub(crate) fn topic_max_consumers(count: i32) -> ScalarPolicy {
+    count_limit("maxConsumers", "max consumers", count)
+}
+
+/// A broker-default extractor for a scalar policy: read `key` from the
+/// runtime configuration and wrap it with `policy`.
+pub(crate) fn broker_scalar<T: std::str::FromStr>(
+    key: &'static str,
+    policy: fn(T) -> ScalarPolicy,
+) -> impl Fn(&serde_json::Value) -> Result<ScalarPolicy, String> {
+    move |config| broker_config_value::<T>(config, key).map(policy)
+}
+
+/// A broker throttle (`0` = disabled) as Pulsar's rate sentinel (`-1`).
+fn broker_throttle<T: std::str::FromStr + Into<i64>>(
+    config: &serde_json::Value,
+    key: &str,
+) -> Result<i64, String> {
+    let value: T = broker_config_value(config, key)?;
+    let value = value.into();
+    Ok(if value <= 0 { -1 } else { value })
+}
+
+fn dispatch_rate_from_broker(
+    config: &serde_json::Value,
+    msg_key: &str,
+    byte_key: &str,
+    relative: bool,
+) -> Result<DispatchRate, String> {
+    Ok(DispatchRate {
+        dispatch_throttling_rate_in_msg: i32::try_from(broker_throttle::<i64>(config, msg_key)?)
+            .map_err(|_| format!("key `{msg_key}` does not fit a 32-bit rate"))?,
+        dispatch_throttling_rate_in_byte: broker_throttle::<i64>(config, byte_key)?,
+        rate_period_in_second: 1,
+        relative_to_publish_rate: relative,
+    })
+}
+
+/// `dispatchThrottlingRatePerTopic*`: the per-topic dispatch rate a
+/// namespace without a policy gets.
+pub(crate) fn topic_dispatch_rate_from_broker(
+    config: &serde_json::Value,
+) -> Result<DispatchRate, String> {
+    let relative = broker_config_value(config, "dispatchThrottlingRateRelativeToPublishRate")?;
+    dispatch_rate_from_broker(
+        config,
+        "dispatchThrottlingRatePerTopicInMsg",
+        "dispatchThrottlingRatePerTopicInByte",
+        relative,
+    )
+}
+
+pub(crate) fn subscription_dispatch_rate_from_broker(
+    config: &serde_json::Value,
+) -> Result<DispatchRate, String> {
+    dispatch_rate_from_broker(
+        config,
+        "dispatchThrottlingRatePerSubscriptionInMsg",
+        "dispatchThrottlingRatePerSubscriptionInByte",
+        false,
+    )
+}
+
+pub(crate) fn replicator_dispatch_rate_from_broker(
+    config: &serde_json::Value,
+) -> Result<DispatchRate, String> {
+    dispatch_rate_from_broker(
+        config,
+        "dispatchThrottlingRatePerReplicatorInMsg",
+        "dispatchThrottlingRatePerReplicatorInByte",
+        false,
+    )
+}
+
+/// `maxPublishRatePerTopic*` (`0` = disabled) as a `PublishRate`.
+pub(crate) fn publish_rate_from_broker(config: &serde_json::Value) -> Result<PublishRate, String> {
+    Ok(PublishRate {
+        publish_throttling_rate_in_msg: i32::try_from(broker_throttle::<i64>(
+            config,
+            "maxPublishRatePerTopicInMessages",
+        )?)
+        .map_err(|_| {
+            "key `maxPublishRatePerTopicInMessages` does not fit a 32-bit rate".to_owned()
+        })?,
+        publish_throttling_rate_in_byte: broker_throttle::<i64>(
+            config,
+            "maxPublishRatePerTopicInBytes",
+        )?,
+    })
+}
+
+pub(crate) fn delayed_delivery_from_broker(
+    config: &serde_json::Value,
+) -> Result<DelayedDeliveryPolicies, String> {
+    Ok(DelayedDeliveryPolicies {
+        active: broker_config_value(config, "delayedDeliveryEnabled")?,
+        tick_time_millis: broker_config_value(config, "delayedDeliveryTickTimeMillis")?,
+    })
+}
+
+/// The `Map<BacklogQuotaType, BacklogQuota>` a namespace or topic returns,
+/// kept as JSON so quota types newer than the client still show. Serialises
+/// transparently, so `Resolved<BacklogQuotas>` is `{ source, <type>: {…} }`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct BacklogQuotas(pub(crate) serde_json::Map<String, serde_json::Value>);
+
+/// `Some` when the broker returned a non-empty quota map; `{}` and `null`
+/// mean no quota is set at this level.
+pub(crate) fn backlog_quotas(value: serde_json::Value) -> Option<BacklogQuotas> {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => Some(BacklogQuotas(map)),
+        _ => None,
+    }
+}
+
+/// The broker's single default quota (`backlogQuotaDefault*`), which it
+/// applies to both quota types when a topic has none of its own.
+pub(crate) fn backlog_quotas_from_broker(
+    config: &serde_json::Value,
+) -> Result<BacklogQuotas, String> {
+    let quota = serde_json::json!({
+        "limitSize": broker_config_value::<i64>(config, "backlogQuotaDefaultLimitBytes")?,
+        "limitTime": broker_config_value::<i32>(config, "backlogQuotaDefaultLimitSecond")?,
+        "policy": broker_config_value::<String>(config, "backlogQuotaDefaultRetentionPolicy")?,
+    });
+    let mut map = serde_json::Map::new();
+    map.insert("destination_storage".to_owned(), quota.clone());
+    map.insert("message_age".to_owned(), quota);
+    Ok(BacklogQuotas(map))
+}
+
+impl HumanOutput for BacklogQuotas {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        self.0
+            .iter()
+            .map(|(quota_type, quota)| {
+                let label = match quota_type.as_str() {
+                    "destination_storage" => "destination storage quota",
+                    "message_age" => "message age quota",
+                    _ => "quota",
+                };
+                let rendered = match serde_json::from_value::<BacklogQuota>(quota.clone()) {
+                    Ok(q) => format!(
+                        "size {}, time {}, policy {}",
+                        throttle(q.limit_size, |v| SizeBytes::from_counter(v).to_string()),
+                        throttle(i64::from(q.limit_time), |v| DurationSeconds(v).to_string()),
+                        if q.policy.is_empty() {
+                            "—"
+                        } else {
+                            q.policy.as_str()
+                        },
+                    ),
+                    Err(_) => plain_value(quota),
+                };
+                let rendered = if label == "quota" {
+                    format!("{quota_type}: {rendered}")
+                } else {
+                    rendered
+                };
+                (label, rendered)
+            })
+            .collect()
+    }
 }
