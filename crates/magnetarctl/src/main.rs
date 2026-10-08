@@ -164,7 +164,7 @@ pub(crate) struct Cli {
     /// JSON; `human` prints a two-column `FIELD  VALUE` table. Only
     /// namespace and topic `get-retention`, `admin topics list` / `stats`,
     /// `admin clusters list` / `list-failure-domains` / `get-failure-domain`
-    /// and `admin tenants list` honour `human` so far —
+    /// and `admin tenants list` / `admin namespaces list` honour `human` so far —
     /// every other command still prints JSON whatever the flag says.
     #[arg(
         long,
@@ -3059,7 +3059,9 @@ async fn run_admin_namespaces(
     cmd: NamespacesCmd,
 ) -> Result<(), CliError> {
     match cmd {
-        NamespacesCmd::List { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
+        NamespacesCmd::List { tenant } => {
+            print_formatted_list(format, "namespace", &admin.namespaces_list(&tenant).await?)
+        }
         NamespacesCmd::Create { namespace } => {
             admin.namespace_create(&namespace).await?;
             Ok(())
