@@ -1196,11 +1196,18 @@ impl AdminClient {
     /// the per-namespace consumer-dispatch throttle (msg/sec, byte/sec,
     /// window in seconds). `-1` on either dimension means unlimited.
     /// Java: `NamespacesBase#getDispatchRate`.
-    pub async fn namespace_get_dispatch_rate(&self, ns: &str) -> Result<DispatchRate, AdminError> {
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`). The effective rate then comes
+    /// from the broker configuration; it is NOT a client-side constant.
+    pub async fn namespace_get_dispatch_rate(
+        &self,
+        ns: &str,
+    ) -> Result<Option<DispatchRate>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "dispatchRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok_or_default(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's consumer dispatch-rate policy.
@@ -1238,14 +1245,18 @@ impl AdminClient {
     /// Reuses the [`DispatchRate`] body shape — the policy applies per
     /// subscription rather than aggregated across all consumers.
     /// Java: `NamespacesBase#getSubscriptionDispatchRate`.
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`). The effective rate then comes
+    /// from the broker configuration; it is NOT a client-side constant.
     pub async fn namespace_get_subscription_dispatch_rate(
         &self,
         ns: &str,
-    ) -> Result<DispatchRate, AdminError> {
+    ) -> Result<Option<DispatchRate>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "subscriptionDispatchRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's per-subscription dispatch-rate policy.
@@ -1286,14 +1297,18 @@ impl AdminClient {
     /// Reuses the [`DispatchRate`] body shape — the policy throttles
     /// outbound geo-replication traffic from this cluster.
     /// Java: `NamespacesBase#getReplicatorDispatchRate`.
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`). The effective rate then comes
+    /// from the broker configuration; it is NOT a client-side constant.
     pub async fn namespace_get_replicator_dispatch_rate(
         &self,
         ns: &str,
-    ) -> Result<DispatchRate, AdminError> {
+    ) -> Result<Option<DispatchRate>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "replicatorDispatchRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's cross-cluster replicator dispatch-rate policy.
@@ -1334,11 +1349,18 @@ impl AdminClient {
     /// the producer-side throttle (msg/sec + byte/sec). `-1` on either
     /// dimension means unlimited.
     /// Java: `NamespacesBase#getPublishRate`.
-    pub async fn namespace_get_publish_rate(&self, ns: &str) -> Result<PublishRate, AdminError> {
+    ///
+    /// `None` when the broker reports the policy as unset at this level
+    /// (`204`, empty body, `null` or `{}`). The effective rate then comes
+    /// from the broker configuration; it is NOT a client-side constant.
+    pub async fn namespace_get_publish_rate(
+        &self,
+        ns: &str,
+    ) -> Result<Option<PublishRate>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "publishRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok_or_default(resp).await
+        json_ok_unset_policy(resp).await
     }
 
     /// Set a namespace's publish-rate policy.
