@@ -22,7 +22,7 @@
 //! in their respective crates — search for `lookup_redirect_chain`.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker
-//! on the host with `apachepulsar/pulsar:latest` reachable.
+//! on the host with `apachepulsar/pulsar:4.2.4` reachable.
 
 #![allow(clippy::too_many_lines)]
 // Two-broker router topology: `_a` / `_b` suffixes (router A vs target B) are
@@ -43,7 +43,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

@@ -13,8 +13,8 @@
 //!
 //! ## Image
 //!
-//! Uses `apachepulsar/pulsar:latest` (Pulsar 4.0 LTS, our minimum supported
-//! broker version per `ask-magnetar-decisions.md`). Override with
+//! Uses `apachepulsar/pulsar:4.2.4` (pinned per ADR-0109; 4.0 LTS is the
+//! minimum supported broker version per `ask-magnetar-decisions.md`). Override with
 //! `MAGNETAR_PULSAR_IMAGE` env var if you need a different tag locally.
 
 use std::time::Duration;
@@ -26,7 +26,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
