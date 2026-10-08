@@ -146,7 +146,7 @@ jobs:
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -543,7 +543,7 @@ jobs:
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
         with:

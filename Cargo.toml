@@ -55,7 +55,7 @@ bytes           = "^1.12.1"
 crc32c          = "^0.6.8"
 
 # Async runtime (engines only, NEVER magnetar-proto)
-tokio           = { version = "^1.53.1", default-features = false }
+tokio           = { version = "^1.53.2", default-features = false }
 tokio-util      = { version = "^0.7.19", default-features = false }
 futures         = { version = "^0.3.34", default-features = false }
 futures-util    = { version = "^0.3.34", default-features = false }
@@ -83,7 +83,7 @@ tokio-rustls         = { version = "^0.26.6", default-features = false }
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "^0.4.1", default-features = false }
+rustls-openssl       = { version = "^0.4.2", default-features = false }
 
 # Compression — Pulsar's four codecs
 lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
@@ -105,7 +105,7 @@ apache-avro = "^0.22.0"
 schemars    = { version = "^1.2.2", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.26.1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.27.0", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
@@ -117,7 +117,7 @@ aws-lc-rs  = { version = "^1.18.1", default-features = false, features = ["aws-l
 ring       = { version = "^0.17.14", default-features = false }
 # Defense-in-depth: zero parsed-key material on drop. Used by the Athenz
 # concrete JwtSigner backends (ADR-0030).
-zeroize    = { version = "^1.9.0", default-features = false }
+zeroize    = { version = "^1.9.1", default-features = false }
 # URL-safe-without-padding base64 for the JWS compact serialisation
 # emitted by the Athenz JwtSigner backends (RFC 7515 §3.1).
 base64     = { version = "^0.23.1", default-features = false, features = ["std"] }

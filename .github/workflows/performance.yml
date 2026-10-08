@@ -27,7 +27,7 @@ env:
 jobs:
   prepare:
     name: performance inputs and contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     # actions:read lets a nightly find the head its last successful run measured.
     permissions:
@@ -43,10 +43,10 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - name: Resolve the base revision and prepare exact inputs
         id: prepare
@@ -93,7 +93,7 @@ jobs:
     name: performance (${{ matrix.kind }} ${{ matrix.worker }})
     needs: prepare
     if: needs.prepare.result == 'success' && needs.prepare.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -105,10 +105,10 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: actions/download-artifact@v8
         with:
@@ -116,7 +116,7 @@ jobs:
           path: ${{ runner.temp }}/performance-prepared
       # Dependency sources only. Every ref uses its own Cargo.lock --locked;
       # CARGO_TARGET_DIR stays outside checkouts and distinct for each ref.
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/performance-cargo
           key: performance-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'scripts/performance/Dockerfile') }}
@@ -157,7 +157,7 @@ jobs:
     name: performance coverage and report
     if: always() && needs.prepare.outputs.run == 'true'
     needs: [prepare, workers]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

@@ -275,7 +275,6 @@ cargo +nightly fuzz run encode_roundtrip
 
 Round-trip-encodes `BaseCommand` shapes and asserts re-decode equality.
 Lives in [`crates/magnetar-proto/fuzz/`](../crates/magnetar-proto/fuzz/).
-Requires nightly; orthogonal to the moonpool engine. The fuzz harness has an
-independent Cargo workspace so its `libfuzzer-sys` dependency cannot enter the
-published workspace. Its direct `prost` requirement follows the same release
-line as `magnetar-proto`; Dependabot monitors both Cargo workspaces separately.
+Requires nightly; orthogonal to the moonpool engine.
+The fuzz harness has an independent Cargo workspace so its `libfuzzer-sys` dependency cannot enter the published workspace.
+Its direct `prost` requirement follows the same release line as `magnetar-proto`; Dependabot monitors both Cargo workspaces separately.
