@@ -223,6 +223,10 @@ async fn tokio_layout() -> Vec<usize> {
         .await
         .expect("tokio open_producer did not time out")
         .expect("tokio open_producer ok");
+        assert!(
+            p.is_ready(),
+            "an acknowledged tokio producer attachment must be ready for routing"
+        );
         producers.push(p);
     }
 
@@ -268,6 +272,10 @@ async fn moonpool_layout() -> Vec<usize> {
         .await
         .expect("moonpool open_producer did not time out")
         .expect("moonpool open_producer ok");
+        assert!(
+            p.is_ready(),
+            "an acknowledged moonpool producer attachment must be ready for routing"
+        );
         producers.push(p);
     }
 

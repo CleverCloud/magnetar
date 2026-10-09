@@ -287,6 +287,16 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// `Producer#isConnected`.
     fn is_connected(&self) -> bool;
 
+    /// `true` only while this producer's broker attachment can drain sends on
+    /// the current connection. Unlike `is_connected`, this detects an
+    /// individual child waiting for `CommandProducerSuccess` after a broker
+    /// close or a reconnect. Custom engines may override this with their
+    /// broker-attachment state; the compatibility default uses transport
+    /// readiness, preserving existing external `ProducerApi` implementations.
+    fn is_ready(&self) -> bool {
+        self.is_connected()
+    }
+
     /// Topic this producer publishes to.
     fn topic(&self) -> String;
 

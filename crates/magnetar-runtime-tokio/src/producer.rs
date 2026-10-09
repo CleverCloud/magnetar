@@ -604,6 +604,16 @@ impl Producer {
         self.shared.inner.lock().is_connected()
     }
 
+    /// `true` only when the connection is up and this producer's own broker
+    /// attachment has acknowledged its current `CommandProducer`. A live
+    /// connection can still carry a detached producer awaiting re-attachment.
+    /// Reads the slot's atomic routing hint; no connection or slot lock on the
+    /// partitioned producer's send path (ADR-0110).
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.slot.is_routing_ready()
+    }
+
     /// Mirrors `org.apache.pulsar.client.api.Producer#getLastDisconnectedTimestamp`: wall-clock
     /// time at which the underlying connection most recently went down. `None` if the
     /// connection has never been disconnected.

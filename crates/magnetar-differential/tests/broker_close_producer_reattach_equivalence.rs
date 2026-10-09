@@ -44,7 +44,16 @@ use magnetar_proto::{
 /// The observable reaction the two engines must agree on for one
 /// `CommandCloseProducer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentReadiness {
+    before_close: bool,
+    after_close: bool,
+    after_ack: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Reaction {
+    /// Attachment eligibility around the close and re-attach acknowledgement.
+    readiness: AttachmentReadiness,
     /// `ProducerClosedByBroker` surfaced for this handle?
     saw_close_event: bool,
     /// `Some(epoch)` when a fresh `CommandProducer` was re-emitted on the same
@@ -195,6 +204,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     conn.handle_bytes(t0, &close_producer_frame(handle, None))
         .expect("handle close mid-open");
     feed_producer_success(conn, open_rid, t0);
+    let ready_before_close = conn.producer(handle).expect("slot").is_routing_ready();
 
     // One publish on the healthy attachment, drained off the wire but left
     // unacked — the broker never receipts it, so the re-attach must replay it.
@@ -213,6 +223,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
         .state
         .lock()
         .broker_ready;
+    let ready_after_close = conn.producer(handle).expect("slot").is_routing_ready();
 
     // A publish staged behind the gate must not reach the wire.
     let _ = conn.send(handle, outgoing(b"staged"), 0, t0).expect("send");
@@ -225,10 +236,16 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     // Ack the re-attach (only meaningful when one was emitted; harmless
     // otherwise — an unmatched ProducerSuccess is ignored).
     feed_producer_success(conn, reattach_rid, t0);
+    let ready_after_ack = conn.producer(handle).expect("slot").is_routing_ready();
     let _ = drain_close_event(conn, handle);
     let (_opens2, send_frames_after_ack) = drain_outbound(conn, handle);
 
     Reaction {
+        readiness: AttachmentReadiness {
+            before_close: ready_before_close,
+            after_close: ready_after_close,
+            after_ack: ready_after_ack,
+        },
         saw_close_event,
         reattach_epoch,
         gate_closed_after_close,
@@ -259,6 +276,11 @@ fn run_both(url: Option<String>) -> (Reaction, Reaction) {
 /// still-unacked pre-close publish), producer left open.
 fn expected_in_place_reaction() -> Reaction {
     Reaction {
+        readiness: AttachmentReadiness {
+            before_close: true,
+            after_close: false,
+            after_ack: true,
+        },
         saw_close_event: false,
         reattach_epoch: Some(1),
         gate_closed_after_close: true,
