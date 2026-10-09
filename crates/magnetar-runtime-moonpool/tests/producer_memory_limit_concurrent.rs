@@ -61,6 +61,18 @@
 //! termination rather than unconditional connect success under the same
 //! default chaos.
 //!
+//! The same default network also flips bits in delivered bytes
+//! ([ADR-0055](../../../specs/adr/0055-bit-flip-survivability-model.md)).
+//! A flip in the uncovered 4-byte size prefix of the under-limit
+//! `CommandSend` or of its `CommandSendReceipt` inflates the frame length,
+//! so the receiving decoder waits for bytes that never come: no receipt
+//! ever resolves the send, and the producer's `send_timeout` fails it with
+//! `code=-1, "send timeout"` (Java-parity, ADR-0072). The reservation CAS
+//! already succeeded by then, so that is a *transport* outcome like a
+//! mid-flight `PeerClosed`, not a memory-limit violation; the seed records
+//! it as non-failing, exactly as `sim_chaos.rs`'s `classify_send_outcome`
+//! treats a chaos-lost receipt.
+//!
 //! ## Runtime-test-parity
 //!
 //! Two `#[test]` functions live here; the mirrored
@@ -110,6 +122,14 @@ const BROKER_PORT: u16 = 6650;
 /// determinism (ADR-0011, ADR-0036).
 const RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 
+/// Per-send timeout pinned on the producer. The Java-parity default
+/// (30 s, ADR-0072) equals [`RUN_TIME_BUDGET`], so a send whose frame or
+/// receipt the bit-flip chaos corrupts in flight would only resolve after
+/// the orchestrator's budget had already fired. Pinned well inside the
+/// budget, as `sim_chaos.rs`'s `CHAOS_PRODUCE_SEND_TIMEOUT` does, so that
+/// transport outcome resolves within the run.
+const UNDER_LIMIT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Total memory budget for the connection. Small enough that a single
 /// modest payload can exceed it, large enough that the under-limit send
 /// fits with room to spare.
@@ -151,8 +171,10 @@ fn outgoing(len: usize) -> OutgoingMessage {
 struct SendOutcome {
     /// `Some(reason)` when `connect` / `open_producer` surfaced a bounded
     /// failure under the default `ConnectFailureMode::Probabilistic` chaos
-    /// (ADR-0052), so the workload never reached the reservation path.
-    /// `None` when a producer was opened and the contract below applies.
+    /// (ADR-0052), so the workload never reached the reservation path, or
+    /// when the under-limit send's wire round-trip was lost to chaos
+    /// (`PeerClosed`, `Closed`, or a `send timeout` after a corrupted frame,
+    /// ADR-0055). `None` when the contract below applies.
     connect_blocked: Option<String>,
     /// `Some(true)` when the under-limit send resolved `Ok(MessageId)`;
     /// `Some(false)` if it errored; `None` if the workload never reached it.
@@ -408,6 +430,7 @@ impl Workload for ClientWorkload {
             .open_producer(CreateProducerRequest {
                 topic: "persistent://public/default/mem-limit".to_owned(),
                 enable_batching: false,
+                send_timeout: Some(UNDER_LIMIT_SEND_TIMEOUT),
                 ..Default::default()
             })
             .await
@@ -427,17 +450,26 @@ impl Workload for ClientWorkload {
         // chaos network (ADR-0052), which can tear the connection down
         // mid-flight: an unsupervised `connect_plain` driver then resolves
         // the pending send with `OpOutcome::Terminal` → `PeerClosed` (or
-        // `Closed` on a local close race). That is a *transport* outcome, not
+        // `Closed` on a local close race). A bit flip can instead corrupt the
+        // size prefix of the `CommandSend` or of its receipt (ADR-0055): the
+        // stream stalls without a decode error, so the send resolves with the
+        // producer's `send_timeout` error. Each is a *transport* outcome, not
         // a memory-limit violation — the reservation CAS already succeeded —
         // so treat it like a connect-blocked seed: record it and return `Ok`
         // without asserting the contract. Any other error (a genuine send
         // failure on a live wire) flows through to the contract gate below.
         let under_res = producer.send(outgoing(UNDER_LIMIT_PAYLOAD)).await;
-        if matches!(
-            under_res,
-            Err(magnetar_runtime_moonpool::ClientError::PeerClosed
-                | magnetar_runtime_moonpool::ClientError::Closed)
-        ) {
+        let transport_outcome = match &under_res {
+            Err(
+                magnetar_runtime_moonpool::ClientError::PeerClosed
+                | magnetar_runtime_moonpool::ClientError::Closed,
+            ) => true,
+            Err(magnetar_runtime_moonpool::ClientError::Broker { code: -1, message }) => {
+                message == "send timeout"
+            }
+            _ => false,
+        };
+        if transport_outcome {
             self.outcome.lock().connect_blocked =
                 Some(format!("under-limit send: {:?}", under_res.err()));
             client.close().await;
@@ -554,9 +586,10 @@ fn moonpool_producer_memory_limit_fail_immediately_smoke() {
 /// regression in the reservation CAS or the policy dispatch would flip
 /// `failed_runs`. Seeds whose dial is bounded by the default
 /// `ConnectFailureMode::Probabilistic` chaos before a producer exists
-/// (ADR-0052) record a non-failing `connect_blocked` outcome — they exercise
-/// no reservation, so they cannot fail the contract, but the non-vacuity
-/// guard below requires at least one seed to have actually exercised it.
+/// (ADR-0052), or whose under-limit send is lost in flight (ADR-0055),
+/// record a non-failing `connect_blocked` outcome — they exercise no
+/// end-to-end contract, so they cannot fail it, but the non-vacuity guard
+/// below requires at least one seed to have actually exercised it.
 #[test]
 fn moonpool_producer_memory_limit_fail_immediately_sweep_8_seeds() {
     let client = ClientWorkload::new();
