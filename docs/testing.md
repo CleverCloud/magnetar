@@ -40,7 +40,7 @@ cargo test -p magnetar-runtime-moonpool \
 cargo clippy -p magnetar-runtime-moonpool \
   --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
 
-# Same, swept across seeds 1..32 locally and on every PR in performance.yml.
+# Same, swept across seeds 1..32 locally and nightly on main in performance.yml (ADR-0113).
 # Open registry anchors are deduplicated across references; daily random
 # discovery remains additive — see performance.md / ADR-0036.
 for seed in $(seq 1 32); do

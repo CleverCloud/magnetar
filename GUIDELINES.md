@@ -157,7 +157,7 @@ A record-less file inside a crate that did emit records stays advisory — it si
   Hard requirement.
 
 **Seed sweep** — the local validation pass runs `MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for `seed ∈ 1..32` to catch seed-dependent flakiness in the deterministic-simulation suite.
-[performance.yml](.github/workflows/performance.yml) replays the complete no-buggify Moonpool package for fixed seeds 1..32 plus the deduplicated open anchors from both exact references on every PR. The daily 128-random-seed sweep remains additive discovery, as amended in [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md). Coverage, resource scope and execution limits are documented in [performance.md](docs/performance.md).
+[performance.yml](.github/workflows/performance.yml) replays the complete no-buggify Moonpool package for fixed seeds 1..32 plus the deduplicated open anchors from both exact references nightly on `main` and on manual dispatch ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md)); `ci.yml`'s `seed-replay` replays the open anchors on every PR. The daily 128-random-seed sweep remains additive discovery, as amended in [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md). Coverage, resource scope and execution limits are documented in [performance.md](docs/performance.md).
 
 **Exemptions** — docs-only, comment-only, formatter-only, and dependency bumps with no functional impact.
 Author justifies in the commit message; reviewer enforces.

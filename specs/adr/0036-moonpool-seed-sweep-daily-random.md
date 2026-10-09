@@ -19,6 +19,9 @@
 
 > **Amendment (2026-10-03, exhaustive PR performance delivery).** Every PR now runs fixed seeds 1–32 and the deduplicated open failing-seed anchors from both exact main/head references through `performance.yml`, using the complete runtime-moonpool package without default features and with crypto-aws-lc-rs. The daily 128-random-seed workflow remains additive discovery. The original rejection of fixed PR replay below is superseded for this measurement/functional coverage contract; reproducibility does not exempt a required family or seed. Four replay workers run their assigned seeds sequentially and retain separate per-reference Cargo execution closures. See [performance.md](../../docs/performance.md) for coverage and resource limits.
 
+> **Amendment (2026-10-09, [ADR-0113](0113-run-performance-measurement-nightly.md)).** `performance.yml` no longer runs on pull requests, so the fixed seeds 1–32 and open failing-seed anchors above now run nightly on `main` against the head the last successful nightly measured, and on manual dispatch.
+> Open registry seeds are still replayed on every PR by `ci.yml`'s `seed-replay` job ([ADR-0047](0047-failing-seed-registry-per-pr-replay.md)); the daily 128-random-seed sweep is unchanged.
+
 ## Historical context
 
 [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) §"Decision" #3 specifies a deterministic seed sweep over `seed ∈ 1..32` on every validation pass, mirrored by the `moonpool-sim` matrix job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).

@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
 - **A detached partition no longer parks a bounded keyless producer pipeline.** Round-robin sends now scan the ready child producers and route to one that can drain a send; recovered children rejoin the rotation. Non-empty keys retain their partition for ordering, as do explicit single-partition and custom routes. If every child is unavailable, sends still receive their configured timeout or terminal error. `PartitionedProducer::not_ready_partitions()` reports child indices observed unavailable during its scan; its readiness path reads an atomic broker-attachment hint without a connection or slot lock. The protocol send-drain gate remains authoritative if an attachment changes concurrently. (issue #463; [ADR-0110](specs/adr/0110-route-around-unready-partitioned-producer-children.md))
 
+### Changed
+
+- **The `performance` workflow runs nightly on `main` instead of on every pull request.**
+  It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.
+  Pull requests no longer wait on its thirteen release builds; the fixed Moonpool seeds 1–32 it replayed per PR now run nightly, while `ci.yml`'s `seed-replay` keeps the open registry seeds on every PR.
+  ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md))
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed
