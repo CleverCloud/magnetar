@@ -242,7 +242,6 @@ async fn serve_failover_flow_strict_broker(
                     producer_name: "backlog".to_owned(),
                     sequence_id: entry,
                     publish_time: 0,
-                    num_messages_in_batch: Some(1),
                     ..Default::default()
                 };
                 let _ = encode_payload(&mut out, &msg, &meta, format!("entry-{entry}").as_bytes());
@@ -770,7 +769,6 @@ async fn serve_failover_broker_close_midstream(
                     producer_name: "backlog".to_owned(),
                     sequence_id: entry,
                     publish_time: 0,
-                    num_messages_in_batch: Some(1),
                     ..Default::default()
                 };
                 let _ = encode_payload(&mut out, &msg, &meta, format!("entry-{entry}").as_bytes());

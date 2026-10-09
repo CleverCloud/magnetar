@@ -677,12 +677,18 @@ pub struct IncomingMessage {
     /// the same parsed metadata instead of `clone()`-ing it N times per
     /// batch (a 100-message batch was 100 metadata deep-clones; with the
     /// `Arc` it is 100 refcount bumps).
+    ///
+    /// A member of a compressed batch carries `compression = None` (ADR-0112):
+    /// `deliver` decoded the batch before splitting it, so the member's payload
+    /// is already plaintext and no engine decompresses it again. The
+    /// producer's `uncompressed_size` stamp is left as it arrived.
     pub metadata: std::sync::Arc<pb::MessageMetadata>,
     /// Optional single-message metadata if the message was part of a batch.
     pub single_metadata: Option<pb::SingleMessageMetadata>,
-    /// The payload bytes (post-decompression by the consumer driver; the state machine itself
-    /// surfaces raw bytes — decompression happens above us because the codec lives in the
-    /// runtime crate to avoid pulling compression algorithm crates into `magnetar-proto`).
+    /// The payload bytes. A batch member is surfaced already decompressed — the state machine
+    /// decodes a compressed batched entry before it splits it (ADR-0112). An unbatched message
+    /// is surfaced as it arrived, and the engine decrypts and then decompresses it after the
+    /// pop (PIP-4 puts the compressed bytes inside the encryption envelope).
     pub payload: Bytes,
     /// Broker-supplied redelivery count.
     pub redelivery_count: u32,

@@ -1951,7 +1951,9 @@ dependencies = [
  "apache-avro",
  "bytes",
  "crc32c",
+ "flate2",
  "hdrhistogram",
+ "lz4_flex",
  "parking_lot",
  "proptest",
  "prost",
@@ -1962,11 +1964,13 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
+ "snap",
  "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -2000,9 +2004,7 @@ name = "magnetar-runtime-tokio"
 version = "1.7.2"
 dependencies = [
  "bytes",
- "flate2",
  "hdrhistogram",
- "lz4_flex",
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
@@ -2014,7 +2016,6 @@ dependencies = [
  "rustls-openssl",
  "rustls-pki-types",
  "serde_json",
- "snap",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2024,7 +2025,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wiremock",
- "zstd",
 ]
 
 [[package]]

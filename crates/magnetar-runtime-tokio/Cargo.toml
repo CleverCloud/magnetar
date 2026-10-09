@@ -62,11 +62,6 @@ rustls              = { workspace = true }
 rustls-pki-types    = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-openssl      = { workspace = true, optional = true }
-# Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
-lz4_flex            = { workspace = true }
-flate2              = { workspace = true }
-zstd                = { workspace = true }
-snap                = { workspace = true }
 tracing             = { workspace = true }
 thiserror           = { workspace = true }
 url                 = { workspace = true }

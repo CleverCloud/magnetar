@@ -1431,6 +1431,10 @@ enum PostProcessOutcome {
 ///
 /// `crypto_failure_action` governs what happens when the decryption step fails (see
 /// [`magnetar_proto::CryptoFailureAction`]).
+///
+/// A member of a compressed batch arrives with `compression = None`: the state machine decoded
+/// the whole batch before splitting it (ADR-0112), so the decompression step below only ever
+/// runs for an unbatched message.
 fn post_process_message(
     msg: &mut IncomingMessage,
     decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
@@ -4121,6 +4125,111 @@ mod tests {
              decompress (compressed plaintext → user plaintext); legacy reverse \
              order would have failed at decompress on raw ciphertext"
         );
+    }
+
+    /// Subscribe a consumer on a handshaken connection and feed it one inbound entry carrying
+    /// `metadata` over `body`. Returns the assembled tokio `Consumer`.
+    fn consumer_fed_with(topic: &str, metadata: &pb::MessageMetadata, body: &[u8]) -> Consumer {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: topic.to_owned(),
+            subscription: "s".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 0,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, metadata, body).expect("encode inbound entry");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &buf)
+            .expect("handle inbound entry");
+        let slot = consumer_slot_for(&shared, handle);
+        Consumer::assemble(shared, handle, slot, None)
+    }
+
+    /// Issue #860 / ADR-0112: a NON-batched compressed message is still decompressed after the
+    /// pop, exactly as before — only batched entries moved into `ConsumerState::deliver`.
+    /// Tokio-only: the moonpool consumer has no post-pop decompression (its producer refuses
+    /// every codec), so there is no branch to mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decompresses_an_unbatched_compressed_message() {
+        use magnetar_proto::types::CompressionKind;
+
+        let plaintext = b"unbatched-compressed|".repeat(16);
+        let body = crate::compress::compress(CompressionKind::Snappy, &plaintext).expect("snappy");
+        let consumer = consumer_fed_with(
+            "persistent://public/default/unbatched-860",
+            &pb::MessageMetadata {
+                producer_name: "java".to_owned(),
+                compression: Some(pb::CompressionType::Snappy as i32),
+                uncompressed_size: Some(plaintext.len() as u32),
+                ..Default::default()
+            },
+            &body,
+        );
+        let msg = consumer.receive().await.expect("decompressed receive");
+        assert_eq!(msg.payload.as_ref(), plaintext.as_slice());
+    }
+
+    /// Issue #860 / ADR-0112: a Java-layout compressed batch — the WHOLE packed body compressed
+    /// once — reaches `receive_batch` as plaintext members, through both post-pop paths
+    /// (`ReceiveFut` for the first, `post_process_message` for the rest), neither of which may
+    /// decompress a member a second time. Before ADR-0112 nothing surfaced at all.
+    /// Tokio-only: the skipped branch is the tokio post-pop decompression moonpool lacks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_hands_back_java_layout_members_decoded_once() {
+        use magnetar_proto::types::CompressionKind;
+        use prost::Message as _;
+
+        let members: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("java-member-{i}|").repeat(12).into_bytes())
+            .collect();
+        let mut packed = BytesMut::new();
+        for member in &members {
+            let single = pb::SingleMessageMetadata {
+                payload_size: member.len() as i32,
+                ..Default::default()
+            };
+            packed.extend_from_slice(&(single.encoded_len() as u32).to_be_bytes());
+            single
+                .encode(&mut packed)
+                .expect("encode SingleMessageMetadata");
+            packed.extend_from_slice(member);
+        }
+        let body = crate::compress::compress(CompressionKind::Lz4, &packed).expect("lz4");
+        let consumer = consumer_fed_with(
+            "persistent://public/default/java-batch-860",
+            &pb::MessageMetadata {
+                producer_name: "java".to_owned(),
+                num_messages_in_batch: Some(4),
+                compression: Some(pb::CompressionType::Lz4 as i32),
+                uncompressed_size: Some(packed.len() as u32),
+                ..Default::default()
+            },
+            &body,
+        );
+        let batch = consumer
+            .receive_batch(8, std::time::Duration::from_secs(1))
+            .await
+            .expect("receive_batch");
+        let payloads: Vec<Vec<u8>> = batch.iter().map(|m| m.payload.to_vec()).collect();
+        assert_eq!(payloads, members, "every member, once decoded, in order");
     }
 
     #[tokio::test(flavor = "current_thread")]

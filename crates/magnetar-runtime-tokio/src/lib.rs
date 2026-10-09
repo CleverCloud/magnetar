@@ -68,7 +68,17 @@
 pub mod auth_file;
 pub mod auto_cluster_failover;
 mod client;
-pub mod compress;
+/// Pulsar payload compression / decompression — a re-export of [`magnetar_proto::compress`].
+///
+/// The codecs moved into the sans-io core with ADR-0112: a batched entry has to be
+/// decompressed as ONE body before `ConsumerState::deliver` can split it, and
+/// `ProducerState::flush_batch` compresses the concatenated body it builds, so both sides of
+/// the batch layout now need the codecs below the engine. This module keeps the
+/// `magnetar_runtime_tokio::compress::{compress, decompress, kind_from_pb, CompressionError}`
+/// path working for existing callers.
+pub mod compress {
+    pub use magnetar_proto::compress::*;
+}
 mod consumer;
 pub mod crypto;
 pub mod dns;

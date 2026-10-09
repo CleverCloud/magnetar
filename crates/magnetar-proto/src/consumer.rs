@@ -6,8 +6,9 @@
 //!
 //! - Bounded receiver queue (`max_receiver_queue_size`).
 //! - Permit accounting → emit `CommandFlow` when the receiver queue drains below the threshold.
-//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch > 1` is split into one
-//!   [`IncomingMessage`] per position the broker still lists as unacked in
+//! - Batch explosion: a `CommandMessage` carrying `num_messages_in_batch` — `Some(1)` included, as
+//!   Java reads it — is decompressed as one body when it is compressed (ADR-0112), then split into
+//!   one [`IncomingMessage`] per position the broker still lists as unacked in
 //!   [`pb::CommandMessage::ack_set`], each with `batch_index` set. A first dispatch carries no
 //!   `ack_set` and therefore surfaces all N; a re-dispatch of a partially-acked entry surfaces only
 //!   the positions that still owe an acknowledgement (ADR-0105, issue #436).
@@ -203,6 +204,9 @@ pub struct ConsumerState {
     ///   `classify_and_queue` — reassembly is still pending — but the broker already dispatched
     ///   it).
     /// - Once per PIP-33 marker in [`Self::record_marker_consumed`].
+    /// - Once per batch position the broker charged but no batch layout could decode, in
+    ///   [`Self::deliver`] (issue #860, ADR-0112): it never reaches `classify_and_queue`, but the
+    ///   broker spent the permit all the same.
     ///
     /// Force-zeroed everywhere `granted_permits` is zeroed so the two counters never drift apart
     /// at a churn boundary. `flow_stats` feeds this — not `granted_permits` — into
@@ -253,10 +257,11 @@ pub struct ConsumerState {
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
     ///
-    /// Written in exactly one place, [`Self::record_broker_permit_consumed`], from four
+    /// Written in exactly one place, [`Self::record_broker_permit_consumed`], from five
     /// callers — [`Self::pop_message`], the incomplete-chunk buffer in [`Self::deliver`],
-    /// [`Self::record_marker_consumed`], and the dead-letter branch of
-    /// `classify_and_queue` (issue #437) — and zeroed by [`Self::maybe_flow`] when it
+    /// [`Self::record_marker_consumed`], the dead-letter branch of
+    /// `classify_and_queue` (issue #437), and the undecodable batch members in
+    /// [`Self::deliver`] (issue #860, ADR-0112) — and zeroed by [`Self::maybe_flow`] when it
     /// grants, plus at the churn boundaries that zero the permit mirrors. It is
     /// refund-driven, not pop-driven: the invariant it holds up is
     /// `granted window == permit_balance + consumed_since_flow + queue.len()`.
@@ -1168,7 +1173,8 @@ impl ConsumerState {
     /// "refunded" is a dispatch unit debited from `permit_balance` that never credits
     /// `consumed_since_flow`, and every client-side path that used to do that is closed:
     /// a dead-lettered unit refunds in `classify_and_queue`'s DLQ branch and an incomplete
-    /// chunk refunds in `deliver`, both at buffering time (ADR-0107). What remains is a
+    /// chunk refunds in `deliver`, both at buffering time (ADR-0107), and a batch member no
+    /// layout could decode refunds in `deliver` at delivery (ADR-0112). What remains is a
     /// broker-side debit the client mirror missed, which no well-formed wire frame
     /// produces — hence the twin `failover_starved_reflow.rs` tests manufacturing the state
     /// by direct slot mutation rather than by feeding frames.
@@ -1209,14 +1215,16 @@ impl ConsumerState {
     /// Credit the flow ledger for ONE dispatch unit the broker charged and the client will
     /// not (or no longer) hold against the receiver queue.
     ///
-    /// Four callers, one rule: a unit is refunded the moment the client decides it will
+    /// Five callers, one rule: a unit is refunded the moment the client decides it will
     /// never be popped, or the moment it actually is. [`Self::pop_message`] refunds a
     /// delivered message at the pop; the incomplete-chunk buffer in [`Self::deliver`] and
     /// the dead-letter branch of `classify_and_queue` (issue #437) refund at buffering,
-    /// because neither will ever reach a pop; and [`Self::record_marker_consumed`] refunds a
-    /// PIP-33 marker the conn-level filter drops. Nothing else may call it — a
-    /// `DeliverOutcome::Dropped` frame moves neither side of the mirror, and neither does an
-    /// ADR-0105 `ack_set`-cleared batch position, which the broker never charged.
+    /// because neither will ever reach a pop; [`Self::record_marker_consumed`] refunds a
+    /// PIP-33 marker the conn-level filter drops; and [`Self::deliver`] refunds every charged
+    /// position of a batched entry no layout could decode (issue #860, ADR-0112). Nothing else may
+    /// call it — a `DeliverOutcome::Dropped` frame moves neither side of the mirror, and
+    /// neither does an ADR-0105 `ack_set`-cleared batch position, which the broker never
+    /// charged.
     ///
     /// Deliberately does NOT touch [`Self::permit_balance`]: that is the live arrival mirror
     /// and belongs to [`Self::record_dispatch_unit`]. A site that owes both calls both.
@@ -1970,9 +1978,12 @@ impl ConsumerState {
             }
         }
 
-        // Batched message path.
-        let num_in_batch = metadata.num_messages_in_batch.unwrap_or(1);
-        if num_in_batch > 1 {
+        // Batched message path. Java takes the single-message path only when the field is
+        // ABSENT (`numMessages == 1 && !hasNumMessagesInBatch()` in
+        // `ConsumerImpl.messageReceived`): `num_messages_in_batch = Some(1)` — what
+        // `ProducerState::flush_batch` stamps on a one-message flush — is a batch of one
+        // whose body still carries the `[u32][SingleMessageMetadata]` framing (ADR-0112).
+        if let Some(num_in_batch) = metadata.num_messages_in_batch {
             // Issue #436 / ADR-0105: the broker re-dispatches a partially-acked batched entry as
             // ONE entry and names the positions that are still outstanding in
             // `CommandMessage.ack_set` (bit SET ⇒ still unacked — the same convention as the
@@ -2003,6 +2014,16 @@ impl ConsumerState {
                 .entry((message_id.ledger_id, message_id.entry_id))
                 .and_modify(|existing| existing.intersect_delivered(&delivered_ack_set))
                 .or_insert_with(|| delivered_ack_set.clone());
+            // ADR-0112: resolve the batch layout BEFORE splitting. A Java producer compresses the
+            // WHOLE packed body (`BatchMessageContainerImpl`), so the split has to run over the
+            // decompressed bytes, exactly as `ConsumerImpl.uncompressPayloadIfNeeded` runs before
+            // `receiveIndividualMessagesFromBatch`. Splitting the compressed bytes read codec
+            // output as member sizes, a guard fired, and no member was ever queued (issue #860).
+            // Members surfaced from a decoded body carry `compression = None`, which is what
+            // keeps both engines' post-pop decompression off them.
+            let mut metadata = metadata;
+            let members = unpack_batch_members(&mut metadata, body, num_in_batch);
+            let decoded = members.len();
             // Wrap the per-batch metadata once so every sub-message shares
             // a refcount instead of deep-cloning. For a 100-message batch
             // this collapses 100 `MessageMetadata::clone()` calls (each of
@@ -2010,26 +2031,8 @@ impl ConsumerState {
             // into 100 Arc bumps.
             let shared_meta = std::sync::Arc::new(metadata);
             let shared_bem = broker_entry_metadata.map(std::sync::Arc::new);
-            let mut cursor = body;
             let mut delivered = 0usize;
-            for idx in 0..num_in_batch {
-                if cursor.remaining() < 4 {
-                    break;
-                }
-                let single_size = cursor.get_u32() as usize;
-                if cursor.remaining() < single_size {
-                    break;
-                }
-                let single_bytes = cursor.split_to(single_size);
-                let single = match pb::SingleMessageMetadata::decode(single_bytes) {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let payload_size = single.payload_size as usize;
-                if cursor.remaining() < payload_size {
-                    break;
-                }
-                let payload = cursor.split_to(payload_size);
+            for (idx, (single, payload)) in (0..num_in_batch).zip(members) {
                 // Issue #436 / ADR-0105: a position whose delivered bit is CLEAR was already
                 // acknowledged, so it is decoded (the payload cursor has to keep advancing for
                 // the positions behind it to parse at all) and then dropped. Skipping means
@@ -2066,6 +2069,36 @@ impl ConsumerState {
                 };
                 self.classify_and_queue(im, redelivery, now);
                 delivered += 1;
+            }
+            // ADR-0112: every position the broker charged and no layout could decode is debited
+            // AND refunded here, at delivery, like a dead-lettered unit (ADR-0107): it will
+            // never be popped, so `pop_message` would never refund it, and once the loss passed
+            // half the receiver queue `maybe_flow` became unreachable and the consumer wedged
+            // with nothing logged (issue #860). An ADR-0105 `ack_set`-cleared position is skipped
+            // as above — the broker never charged it. Java refunds ONE permit when it discards a
+            // corrupted entry (`ConsumerImpl.discardCorruptedMessage`) although the broker
+            // charged `numMessagesInBatch`; refunding every charged position is the deliberate
+            // deviation ADR-0112 records.
+            let undecoded = (0..num_in_batch)
+                .skip(decoded)
+                .filter(|idx| delivered_ack_set.is_unacked(*idx))
+                .count();
+            if undecoded > 0 {
+                for _ in 0..undecoded {
+                    self.record_dispatch_unit();
+                    self.record_broker_permit_consumed();
+                }
+                tracing::warn!(
+                    target: "magnetar_proto::consumer",
+                    consumer_id = self.handle.0,
+                    ledger_id = message_id.ledger_id,
+                    entry_id = message_id.entry_id,
+                    num_messages_in_batch = num_in_batch,
+                    decoded,
+                    undecoded,
+                    compression = shared_meta.compression.unwrap_or(0),
+                    "dropped the undecodable members of a batched entry and refunded their permits",
+                );
             }
             self.wake_receivers();
             return Ok(DeliverOutcome::Delivered { count: delivered });
@@ -2112,9 +2145,10 @@ impl ConsumerState {
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             // Issue #437: a unit the broker charged is refunded to the flow
             // ledger the moment the client decides it will never be popped.
-            // All four refund sites follow that one rule — `pop_message`, the
-            // incomplete-chunk buffer, `record_marker_consumed`, and this
-            // branch — and it mirrors `ConsumerImpl.messageReceived`, which
+            // All five refund sites follow that one rule — `pop_message`, the
+            // incomplete-chunk buffer, `record_marker_consumed`, the undecodable
+            // batch members (ADR-0112), and this branch — and it mirrors
+            // `ConsumerImpl.messageReceived`, which
             // calls `increaseAvailablePermits(cnx)` straight after it skips an
             // over-redelivered message, and `receiveIndividualMessagesFromBatch`,
             // which accumulates `skippedMessages` and calls
@@ -2259,12 +2293,127 @@ impl ConsumerState {
     }
 }
 
+/// One member of a batched entry: its `SingleMessageMetadata` and its payload bytes.
+type BatchMember = (pb::SingleMessageMetadata, Bytes);
+
+/// Resolve the members of a batched entry (ADR-0112), trying the two layouts a compressed
+/// batch can arrive in.
+///
+/// An uncompressed entry is split as it always was, and keeps the members that parsed before
+/// the first malformed one. A compressed entry is tried as:
+///
+/// 1. **Java layout** — the whole packed body compressed once, `uncompressed_size` naming its
+///    decompressed length (`BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload`). The
+///    body must decompress to EXACTLY that length and split into all `num_in_batch` members; the
+///    exact-size check is what tells this layout from the next one, so it is never relaxed.
+/// 2. **magnetar ≤ 1.7.2 layout** — a raw packed body whose members were each compressed on their
+///    own, with `uncompressed_size` holding the sum of the COMPRESSED member sizes. No field names
+///    a member's real size, so each member is decoded by [`crate::compress::decompress_within`]
+///    under one [`crate::MAX_FRAME_SIZE`] budget shared by the whole entry. No client could read
+///    this layout before ADR-0112: the post-pop decompression checked every member against the
+///    batch-level size and rejected it.
+///
+/// Members are committed only when a layout decodes in full, so a Java attempt that fails
+/// halfway can never surface a member twice; only when the legacy layout fails too does a Java
+/// body that decoded to exactly `uncompressed_size` but split short surface the members before
+/// the malformed one, as Java's split does. On success `metadata.compression` is cleared:
+/// the surfaced payloads are plaintext, and that is what keeps both engines' post-pop
+/// decompression off them. An unknown codec, or a body neither layout decodes, yields no
+/// member and leaves `metadata` untouched; the caller refunds every charged position.
+fn unpack_batch_members(
+    metadata: &mut pb::MessageMetadata,
+    body: Bytes,
+    num_in_batch: i32,
+) -> Vec<BatchMember> {
+    let codec = match metadata.compression.map(pb::CompressionType::try_from) {
+        None | Some(Ok(pb::CompressionType::None)) => {
+            return split_batch_body(body, num_in_batch).0;
+        }
+        Some(Ok(codec)) => crate::compress::kind_from_pb(codec),
+        Some(Err(_)) => return Vec::new(),
+    };
+    let java = metadata
+        .uncompressed_size
+        .and_then(|size| crate::compress::decompress(codec, &body, size as usize).ok())
+        .map(|whole| split_batch_body(whole, num_in_batch));
+    let members = match java {
+        Some((members, true)) => members,
+        // A body that decoded to exactly `uncompressed_size` but split short is still the Java
+        // layout: like `receiveIndividualMessagesFromBatch`, deliver what parsed.
+        java => legacy_batch_members(codec, body, num_in_batch)
+            .or_else(|| java.map(|(prefix, _)| prefix))
+            .unwrap_or_default(),
+    };
+    if !members.is_empty() {
+        metadata.compression = None;
+    }
+    members
+}
+
+/// Decode the magnetar ≤ 1.7.2 batch layout: a raw packed body whose every member payload was
+/// compressed on its own with `codec`. `None` unless the body splits into all `num_in_batch`
+/// members AND every member decodes within the entry's shared [`crate::MAX_FRAME_SIZE`] budget.
+fn legacy_batch_members(
+    codec: crate::types::CompressionKind,
+    body: Bytes,
+    num_in_batch: i32,
+) -> Option<Vec<BatchMember>> {
+    let (members, complete) = split_batch_body(body, num_in_batch);
+    let mut budget = crate::MAX_FRAME_SIZE;
+    complete
+        .then_some(members)?
+        .into_iter()
+        .map(|(single, payload)| {
+            let plain = crate::compress::decompress_within(codec, &payload, budget).ok()?;
+            budget = budget.saturating_sub(plain.len());
+            Some((single, plain))
+        })
+        .collect()
+}
+
+/// Split a packed batch body into its `[u32 BE size][SingleMessageMetadata][payload]` members —
+/// the layout `BatchMessageContainerImpl` writes. Returns the members that parsed before the
+/// first malformed one, and whether all `num_in_batch` did.
+fn split_batch_body(mut body: Bytes, num_in_batch: i32) -> (Vec<BatchMember>, bool) {
+    let wanted = usize::try_from(num_in_batch).unwrap_or(0);
+    let members: Vec<BatchMember> = std::iter::from_fn(|| next_batch_member(&mut body))
+        .take(wanted)
+        .collect();
+    let complete = members.len() == wanted;
+    (members, complete)
+}
+
+/// Pop one `[u32 BE size][SingleMessageMetadata][payload]` member off the front of `body`, or
+/// `None` when what is left is too short or does not decode. Never panics on any input
+/// (invariant #6): every `get_u32` / `split_to` is preceded by its own length check.
+fn next_batch_member(body: &mut Bytes) -> Option<BatchMember> {
+    let single_size = (body.remaining() >= 4).then(|| body.get_u32() as usize)?;
+    let single_bytes = (body.remaining() >= single_size).then(|| body.split_to(single_size))?;
+    let single = pb::SingleMessageMetadata::decode(single_bytes).ok()?;
+    let payload_size = usize::try_from(single.payload_size).ok()?;
+    let payload = (body.remaining() >= payload_size).then(|| body.split_to(payload_size))?;
+    Some((single, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
 
     use super::*;
 
+    /// Metadata of a plain, unbatched message: no `num_messages_in_batch` at all, the shape
+    /// Java's `ConsumerImpl.messageReceived` reads as a single message.
+    fn single_metadata() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        }
+    }
+
+    /// Metadata of a batched entry declaring `num_in_batch` members — `Some(1)` included,
+    /// which is a batch of one (ADR-0112).
     fn metadata(num_in_batch: i32) -> pb::MessageMetadata {
         pb::MessageMetadata {
             producer_name: "p".to_owned(),
@@ -2307,7 +2456,7 @@ mod tests {
         for _ in 0..2 {
             c.deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"x"),
                 std::time::Instant::now(),
@@ -2326,7 +2475,7 @@ mod tests {
         let outcome = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2424,7 +2573,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(5),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2449,7 +2598,7 @@ mod tests {
         assert_eq!(c.permit_balance, 100);
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             std::time::Instant::now(),
@@ -2572,7 +2721,7 @@ mod tests {
         assert_eq!(c.permit_balance, 100);
         c.deliver(
             &message_cmd(5),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"poison"),
             std::time::Instant::now(),
@@ -2601,7 +2750,7 @@ mod tests {
         for _ in 0..4 {
             c.deliver(
                 &message_cmd(2),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"poison"),
                 std::time::Instant::now(),
@@ -2635,7 +2784,7 @@ mod tests {
         for _ in 0..8 {
             c.deliver(
                 &message_cmd(2),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"poison"),
                 std::time::Instant::now(),
@@ -2666,7 +2815,7 @@ mod tests {
         let _ = c.initial_flow();
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"good"),
             std::time::Instant::now(),
@@ -2678,7 +2827,7 @@ mod tests {
         for _ in 0..3 {
             c.deliver(
                 &message_cmd(2),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"poison"),
                 std::time::Instant::now(),
@@ -2733,7 +2882,7 @@ mod tests {
         for _ in 0..4 {
             c.deliver(
                 &message_cmd(2),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"poison"),
                 std::time::Instant::now(),
@@ -2796,7 +2945,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -2805,7 +2954,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hello"),
                 std::time::Instant::now(),
@@ -2820,7 +2969,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(5),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"DROPPED"),
                 std::time::Instant::now(),
@@ -2839,7 +2988,7 @@ mod tests {
             let _ = c
                 .deliver(
                     &message_cmd(5),
-                    metadata(1),
+                    single_metadata(),
                     None,
                     Bytes::from_static(b"poison"),
                     std::time::Instant::now(),
@@ -3264,7 +3413,7 @@ mod tests {
         let outcome = c
             .deliver(
                 &batch_cmd_with_ack_set(vec![0]),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"plain"),
                 std::time::Instant::now(),
@@ -3334,7 +3483,7 @@ mod tests {
         let _ = c.initial_flow();
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             arrived,
@@ -3376,7 +3525,7 @@ mod tests {
             let _ = c.initial_flow();
             c.deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"x"),
                 arrived,
@@ -3411,7 +3560,7 @@ mod tests {
         let _ = c.initial_flow();
         c.deliver(
             &message_cmd(0),
-            metadata(1),
+            single_metadata(),
             None,
             Bytes::from_static(b"x"),
             arrived,
@@ -4324,7 +4473,7 @@ mod tests {
         let outcome = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -4372,7 +4521,7 @@ mod tests {
         let _ = c
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"hi"),
                 std::time::Instant::now(),
@@ -4661,6 +4810,330 @@ mod tests {
         );
         assert!(c.chunk_reassembly.is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // Issue #860 / ADR-0112 — compressed batched entries.
+    //
+    // A Java producer compresses the WHOLE packed batch body
+    // (`BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload`), so `deliver` has to
+    // decompress a batched entry before it can split it. Every body below is packed and
+    // compressed by hand — never by magnetar's own producer — so no test can pass because both
+    // ends share the same mistake.
+    // -------------------------------------------------------------------
+
+    /// The four Pulsar codecs.
+    const ALL_CODECS: [crate::types::CompressionKind; 4] = [
+        crate::types::CompressionKind::Lz4,
+        crate::types::CompressionKind::Zlib,
+        crate::types::CompressionKind::Zstd,
+        crate::types::CompressionKind::Snappy,
+    ];
+
+    /// `n` distinct, compressible payloads.
+    fn compressible_payloads(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| format!("member-{i}|").repeat(16).into_bytes())
+            .collect()
+    }
+
+    fn payload_refs(payloads: &[Vec<u8>]) -> Vec<&[u8]> {
+        payloads.iter().map(Vec::as_slice).collect()
+    }
+
+    /// Java layout: the packed body compressed ONCE, `uncompressed_size` = packed length.
+    fn java_layout(
+        codec: crate::types::CompressionKind,
+        payloads: &[Vec<u8>],
+    ) -> (pb::MessageMetadata, Bytes) {
+        let packed = batch_body(&payload_refs(payloads));
+        let body = crate::compress::compress(codec, &packed).unwrap();
+        let mut meta = metadata(payloads.len() as i32);
+        meta.compression = Some(codec.to_pb() as i32);
+        meta.uncompressed_size = Some(packed.len() as u32);
+        (meta, body)
+    }
+
+    /// magnetar ≤ 1.7.2 layout: every payload compressed on its own, the packed body raw, and
+    /// `uncompressed_size` = the sum of the COMPRESSED member sizes.
+    fn legacy_layout(
+        codec: crate::types::CompressionKind,
+        payloads: &[Vec<u8>],
+    ) -> (pb::MessageMetadata, Bytes) {
+        let members: Vec<Bytes> = payloads
+            .iter()
+            .map(|p| crate::compress::compress(codec, p).unwrap())
+            .collect();
+        let refs: Vec<&[u8]> = members.iter().map(Bytes::as_ref).collect();
+        let mut meta = metadata(payloads.len() as i32);
+        meta.compression = Some(codec.to_pb() as i32);
+        meta.uncompressed_size = Some(members.iter().map(Bytes::len).sum::<usize>() as u32);
+        (meta, batch_body(&refs))
+    }
+
+    /// Pop everything queued and return the payloads, asserting each surfaced member is
+    /// plaintext-marked (`compression` cleared) so no engine decompresses it a second time.
+    fn drain_plaintext(c: &mut ConsumerState) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(msg) = c.pop_message(std::time::Instant::now()) {
+            assert_eq!(
+                msg.metadata.compression, None,
+                "a member surfaced from a decoded batch must not be decompressed again"
+            );
+            out.push(msg.payload.to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn java_layout_compressed_batch_surfaces_every_member_and_reflows() {
+        const RQ: usize = 8;
+        let payloads = compressible_payloads(RQ);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), RQ);
+            let _ = c.initial_flow();
+            let (meta, body) = java_layout(codec, &payloads);
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(
+                matches!(outcome, DeliverOutcome::Delivered { count: RQ }),
+                "{codec:?}: a Java-layout batch must surface all {RQ} members, got {outcome:?}"
+            );
+            assert_eq!(c.permit_balance, 0, "{codec:?}: one entry spent the window");
+            // `maybe_flow`'s threshold is RQ / 2 = 4: three pops stay quiet, the fourth
+            // replenishes. Before ADR-0112 nothing was queued, so nothing could be popped and
+            // this flow never existed — the issue #860 Reader stall.
+            for _ in 0..3 {
+                assert!(c.pop_message(std::time::Instant::now()).is_some());
+                assert!(
+                    c.maybe_flow().is_none(),
+                    "{codec:?}: below the half-queue threshold"
+                );
+            }
+            assert!(c.pop_message(std::time::Instant::now()).is_some());
+            let flow = c
+                .maybe_flow()
+                .expect("half the queue popped must re-arm flow");
+            assert_eq!(flow.message_permits, 4, "{codec:?}");
+            let rest = drain_plaintext(&mut c);
+            assert_eq!(
+                rest,
+                payloads[4..].to_vec(),
+                "{codec:?}: plaintext, in order"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_layout_compressed_batch_surfaces_every_member_decoded() {
+        let payloads = compressible_payloads(4);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let (meta, body) = legacy_layout(codec, &payloads);
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(
+                matches!(outcome, DeliverOutcome::Delivered { count: 4 }),
+                "{codec:?}: got {outcome:?}"
+            );
+            assert_eq!(
+                drain_plaintext(&mut c),
+                payloads,
+                "{codec:?}: a legacy member must be decoded on its own, not handed over compressed"
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_compressed_batch_debits_and_refunds_every_charged_member() {
+        const RQ: usize = 8;
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), RQ);
+        let _ = c.initial_flow();
+        let mut meta = metadata(RQ as i32);
+        meta.compression = Some(pb::CompressionType::Lz4 as i32);
+        meta.uncompressed_size = Some(512);
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                meta,
+                None,
+                Bytes::from(vec![0xA5u8; 96]),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DeliverOutcome::Delivered { count: 0 }),
+            "garbage decodes in neither layout, got {outcome:?}"
+        );
+        assert_eq!(c.queue_len(), 0);
+        assert_eq!(
+            c.permit_balance, 0,
+            "every member the broker charged is debited from the live mirror"
+        );
+        let flow = c
+            .maybe_flow()
+            .expect("the refund alone must re-arm flow — nothing will ever be popped");
+        assert_eq!(flow.message_permits, RQ as u32);
+        assert_eq!(c.permit_balance, RQ as u32, "the grant restores the window");
+    }
+
+    #[test]
+    fn undecodable_batch_refund_skips_ack_set_cleared_positions() {
+        // ADR-0105: the broker charged only the still-unacked positions of a re-dispatched
+        // entry, so only those are refunded. Positions 0..=5 cleared, 6 and 7 outstanding.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let mut cmd = message_cmd(1);
+        cmd.ack_set = vec![0b1100_0000];
+        let mut meta = metadata(8);
+        meta.compression = Some(pb::CompressionType::Zstd as i32);
+        meta.uncompressed_size = Some(512);
+        c.deliver(
+            &cmd,
+            meta,
+            None,
+            Bytes::from(vec![0x5Au8; 64]),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(c.permit_balance, 6, "two charged positions debited");
+        assert_eq!(c.consumed_since_flow, 2, "and the same two refunded");
+    }
+
+    #[test]
+    fn unknown_codec_batch_is_refunded_not_surfaced() {
+        let payloads = compressible_payloads(4);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Lz4, &payloads);
+        meta.compression = Some(99);
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 0 }));
+        assert_eq!(c.permit_balance, 4);
+        assert_eq!(c.consumed_since_flow, 4);
+    }
+
+    #[test]
+    fn oversized_uncompressed_size_is_refused_before_decoding() {
+        // `uncompressed_size = u32::MAX` must be refused before any codec allocates for it;
+        // the entry is then undecodable and refunded rather than wedging the consumer.
+        let payloads = compressible_payloads(4);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Zlib, &payloads);
+        meta.uncompressed_size = Some(u32::MAX);
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 0 }));
+        assert_eq!(
+            c.consumed_since_flow, 4,
+            "all four charged members refunded"
+        );
+    }
+
+    #[test]
+    fn truncated_uncompressed_batch_surfaces_its_prefix_and_refunds_the_rest() {
+        // An uncompressed body declaring 8 members but carrying 3: the 3 surface as they
+        // always did, and the 5 the broker charged for but no parser can reach are refunded.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                metadata(8),
+                None,
+                batch_body(&[b"a".as_ref(), b"b".as_ref(), b"c".as_ref()]),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 3 }));
+        assert_eq!(c.permit_balance, 0, "8 members charged, 8 debited");
+        assert_eq!(c.consumed_since_flow, 5, "the 5 unreachable ones refunded");
+        assert_eq!(c.queue_len(), 3);
+    }
+
+    /// The bytes a popped payload keeps alive: its `Bytes` handed back as the unique owner of
+    /// its buffer, whose capacity is what the allocation really holds.
+    fn retained_capacity(payload: Bytes) -> usize {
+        payload
+            .try_into_mut()
+            .expect("a decoded legacy member owns its buffer")
+            .capacity()
+    }
+
+    #[test]
+    fn legacy_member_holds_only_its_decoded_length() {
+        // ADR-0112 review: the legacy decoder sizes LZ4's output buffer from the entry budget
+        // (up to 255 x the member) and the streaming codecs grow theirs by doubling; a queued
+        // member must not keep that headroom alive — a 1000-message legacy queue held GBs.
+        let payloads = compressible_payloads(4);
+        for codec in ALL_CODECS {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let (meta, body) = legacy_layout(codec, &payloads);
+            c.deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            while let Some(msg) = c.pop_message(std::time::Instant::now()) {
+                let len = msg.payload.len();
+                assert_eq!(
+                    retained_capacity(msg.payload),
+                    len,
+                    "{codec:?}: a legacy member must hold exactly its decoded bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_member_batch_is_unframed() {
+        // Java takes the single-message path only when `numMessagesInBatch == 1` is ABSENT
+        // (`ConsumerImpl.messageReceived`); `num_messages_in_batch = Some(1)` — what
+        // `flush_batch` stamps on a one-message flush — is a batch of one, uncompressed or not.
+        let only = vec![b"only-member".repeat(4)];
+        let uncompressed = batch_body(&payload_refs(&only));
+        let (java_meta, java_body) = java_layout(crate::types::CompressionKind::Lz4, &only);
+        for (meta, body) in [(metadata(1), uncompressed), (java_meta, java_body)] {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+            let _ = c.initial_flow();
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+            assert!(matches!(outcome, DeliverOutcome::Delivered { count: 1 }));
+            let msg = c.pop_message(std::time::Instant::now()).unwrap();
+            assert_eq!(
+                msg.payload.to_vec(),
+                only[0],
+                "the member, without its [u32][SingleMessageMetadata] framing"
+            );
+            assert_eq!(
+                (msg.message_id.batch_index, msg.message_id.batch_size),
+                (0, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn java_layout_batch_that_splits_short_surfaces_its_prefix() {
+        // A Java-layout body that decompresses to exactly `uncompressed_size` but packs 3 of
+        // the 8 members it declares: like Java's `receiveIndividualMessagesFromBatch`, the 3
+        // that parse are delivered, and the 5 the broker charged for are refunded.
+        let members = compressible_payloads(3);
+        let (mut meta, body) = java_layout(crate::types::CompressionKind::Zstd, &members);
+        meta.num_messages_in_batch = Some(8);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 3 }));
+        assert_eq!(c.consumed_since_flow, 5, "the 5 missing members refunded");
+        assert_eq!(drain_plaintext(&mut c), members);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4689,7 +5162,6 @@ mod stall_watchdog_tests {
             producer_name: "p".to_owned(),
             sequence_id: 1,
             publish_time: 1_700_000_000,
-            num_messages_in_batch: Some(1),
             ..Default::default()
         }
     }

@@ -40,6 +40,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Only the acknowledgement of the close this client last issued for the producer does so, never the late acknowledgement of an older close for a reused producer id (issue #406).
   (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
 
+- **A consumer or `Reader` over a topic of compressed batches now reads it, instead of delivering nothing and stalling for good.**
+  A Java producer compresses the WHOLE packed batch body (`BatchMessageContainerImpl`), and a Java consumer decompresses it before it splits it into members (`ConsumerImpl.uncompressPayloadIfNeeded`, then `receiveIndividualMessagesFromBatch`).
+  `ConsumerState::deliver` split first, so it read the codec's output as member sizes, a length guard fired, and no member was queued.
+  Nothing queued meant nothing popped, so the `numMessagesInBatch` permits the broker charged for the entry were never refunded, and once the loss passed half the receiver queue no `CommandFlow` was ever sent again — with nothing logged.
+  Reproduced on `apachepulsar/pulsar:4.0.4`: `pulsar-perf produce -bm 20 -z LZ4` in, zero messages out of a `receiver_queue_size(1000)` Reader, and the broker reporting `availablePermits = -1000`.
+  The issue's first hypothesis, a permit debited per entry rather than per member, was ruled out: uncompressed batches always streamed.
+  `deliver` now decompresses a compressed batched entry as one body before splitting it, and a member surfaced that way carries `compression = None` so neither engine decompresses it a second time; an unbatched compressed message is still decompressed after the pop, as before.
+  A batched entry no layout can decode — an unknown codec, an `uncompressed_size` above the frame ceiling, a corrupt body — no longer wedges the consumer: every position the broker charged for it is debited and refunded at delivery, and the entry logs one structured `warn!`.
+  That is one permit per charged position, where Java's `discardCorruptedMessage` refunds one for the whole entry.
+  The entry is not acknowledged, so a durable subscription's mark-delete position stays behind it.
+  The moonpool consumer gains the same reading of compressed batches through the shared state machine; its producer still refuses every codec.
+  (issue #860; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A compressed batch magnetar produces is now readable by Java, and by magnetar — this changes its wire layout.**
+  The tokio engine compressed each payload in `Producer::send`, before the state machine decided to batch it, and `ProducerState::flush_batch` then stamped a batch-level `compression` and `uncompressed_size` on a concatenation nothing compressed, with `uncompressed_size` holding the sum of the compressed member sizes.
+  Java `pulsar-client consume` read 0 of 100 messages from such a topic.
+  magnetar could not read it either: each member reached `receive()` as `decompress: decompressed size mismatch`, because the post-pop decompression checked it against the batch-level size.
+  `flush_batch` now compresses the whole concatenation once and stamps its pre-compression length as `uncompressed_size`, the Java layout, and an unbatched payload is compressed in `queue_send` before the chunking decision, so the chunk count comes from the compressed size.
+  The codecs moved into `magnetar_proto::compress` for this; `magnetar_runtime_tokio::compress` re-exports them, and `magnetar-proto` now links two C libraries, `zstd-sys` and `libz-sys`.
+  The batch byte budget and the tokio memory reservation now count uncompressed bytes, as Java's do.
+  magnetar still reads the old layout, and now actually decodes it, so existing backlogs — `access-logs-forwarder` produces with LZ4 and batching — drain.
+  **A magnetar consumer at 1.7.2 or older wedges on the new layout** exactly as it wedges on Java's — nothing delivered, no `CommandFlow`, nothing logged — so in a mixed fleet upgrade every consumer before any producer.
+  (issue #860; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A one-message batch now reaches the application as its payload, not as its batch framing.**
+  `ProducerState::flush_batch` stamps `num_messages_in_batch = Some(1)` when it flushes a single message — a publish-delay flush of one send — but `ConsumerState::deliver` treated only `num_messages_in_batch > 1` as a batch, so a magnetar consumer handed `[u32][SingleMessageMetadata][payload]` to the application as the payload, with no error.
+  `deliver` now treats any entry carrying `num_messages_in_batch` as a batch, as Java's `ConsumerImpl.messageReceived` does.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **A send that does not fit the pending batch no longer overtakes it on the wire.**
+  `ProducerState::queue_send` emitted such a message at once while the batch it could not join waited for its flush, so three 400-byte sends against a 1000-byte batch cap left the client as sequence 2, then 0 and 1 — reordered for every consumer, and with broker deduplication enabled the lower sequence ids arriving second would be dropped.
+  It now flushes the pending batch first and starts the next batch with the new message (Java `ProducerImpl.doBatchSendAndAdd`); a message too large for any batch is sent on its own right after the flush.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
+- **An encrypting producer with batching enabled now sends every message as its own entry, so its consumers can decrypt it.**
+  `flush_batch` builds the batch's metadata fresh, so a batch of encrypted members went out without their `encryption_keys` and no consumer could decrypt it.
+  Until batched + encrypted is Java-compatible, a payload whose metadata already carries `encryption_keys` or names a codec is never batched and never compressed again; the engine compresses an encrypting producer's payload before it encrypts it and names the codec itself.
+  Expect more, smaller entries from such a producer.
+  (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
+
 ### Changed
 
 - **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
@@ -48,8 +88,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `OpSend` gains a crate-private reservation, so it can no longer be constructed outside `magnetar-proto`, and a `reserved_bytes()` accessor; `ProducerState::apply_receipt`, `apply_send_error`, `drain_timed_out_sends`, `drain_pending_sends` and `snapshot_pending_sends` now return the removed `OpSend`s so the caller releases their reservations outside the per-slot lock.
   The `magnetar` façade surface is unchanged.
   (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
-
-### Changed
 
 - **The `performance` workflow runs nightly on `main` instead of on every pull request.**
   It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.

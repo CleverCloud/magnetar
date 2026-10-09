@@ -1,6 +1,6 @@
 # ADR-0044 — Port the PIP-4 message-crypto bridge to the moonpool engine
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0112](0112-compress-and-decompress-a-batch-as-one-body.md) for batched entries: `ConsumerState::deliver` now decodes a compressed batch on both engines, so the moonpool receive path does see decompressed batch members; the producer refusal and the unbatched receive path below are unchanged)
 - **Date**: 2026-05-29
 - **Decider**: Florentin Dubois
 - **Tags**: moonpool, encryption, pip-4, engine-parity, sans-io

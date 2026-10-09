@@ -67,6 +67,17 @@ parking_lot  = { workspace = true }
 # `batch_ack_tracker` hot maps. SipHash is overkill on u64-shaped
 # keys we control end-to-end.
 rustc-hash   = { workspace = true }
+# Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
+# They moved here from `magnetar-runtime-tokio` with ADR-0112: the batched-entry
+# layout (one compressed body holding every member) means both `deliver`'s split
+# and `flush_batch`'s concatenation need a codec below the engine. All four are
+# in-memory transforms with no I/O — `cargo run -p xtask -- check-no-io-deps`
+# stays green — but `zstd` links the C `zstd-sys` and `flate2`'s `zlib` feature
+# the C `libz-sys`, so this crate is no longer pure Rust (recorded in ADR-0112).
+lz4_flex     = { workspace = true }
+flate2       = { workspace = true }
+zstd         = { workspace = true }
+snap         = { workspace = true }
 
 [dev-dependencies]
 proptest  = { workspace = true }

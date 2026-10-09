@@ -2,11 +2,14 @@
 
 //! Pulsar payload compression / decompression.
 //!
-//! The sans-io producer in `magnetar-proto` stamps
-//! [`pb::MessageMetadata::compression`](magnetar_proto::pb::MessageMetadata::compression)
-//! and [`pb::MessageMetadata::uncompressed_size`] but never touches the payload bytes —
-//! compression is the runtime engine's job. Mirrors `ProducerImpl.java:581-608` where
-//! non-batch payload bytes are compressed in-place before chunking + encryption.
+//! The codecs live in the sans-io core because the batch layout depends on them (ADR-0112):
+//! a Java producer compresses the WHOLE packed batch body (`BatchMessageContainerImpl`), so
+//! `ConsumerState::deliver` has to decompress a batched entry before it can split it
+//! into members, and `ProducerState::flush_batch` has to compress the concatenated body
+//! it builds. Every codec crate below is pure computation over in-memory buffers — no
+//! I/O, no async — so `cargo run -p xtask -- check-no-io-deps` stays green.
+//! `magnetar_runtime_tokio::compress` re-exports this module so its public path keeps
+//! working.
 //!
 //! This module exposes [`compress`] / [`decompress`] helpers indexed by
 //! [`CompressionKind`] (the Rust analogue of `pb::CompressionType`). All four Pulsar codecs
@@ -18,8 +21,9 @@
 //! malicious peers from triggering OOMs.
 
 use bytes::Bytes;
-use magnetar_proto::pb;
-use magnetar_proto::types::CompressionKind;
+
+use crate::pb;
+use crate::types::CompressionKind;
 
 /// Bound on inflation during `decompress()` — caps each codec's working buffer at
 /// `MAX_INFLATE_RATIO × uncompressed_size` to defuse decompression bombs.
@@ -47,13 +51,14 @@ pub enum CompressionError {
     /// can otherwise drive an arbitrarily large `Vec::with_capacity` through
     /// the `expires_in`-style allocation hint and exhaust the process heap
     /// without ever producing a real frame. Capped at
-    /// [`magnetar_proto::MAX_FRAME_SIZE`] (5 MiB), matching the wire ceiling
+    /// [`crate::MAX_FRAME_SIZE`] (5 MiB), matching the wire ceiling
     /// the frame codec already enforces on the outer length.
     #[error("uncompressed_size {got} exceeds frame ceiling {ceiling}")]
     UncompressedSizeTooLarge {
         /// Broker-advertised uncompressed size.
         got: usize,
-        /// Per-frame ceiling — currently [`magnetar_proto::MAX_FRAME_SIZE`].
+        /// Ceiling the call enforced — [`crate::MAX_FRAME_SIZE`] for [`decompress`], the
+        /// caller's remaining budget (never above it) for [`decompress_within`].
         ceiling: usize,
     },
 }
@@ -113,7 +118,7 @@ pub fn compress(kind: CompressionKind, plaintext: &[u8]) -> Result<Bytes, Compre
 /// the expected output size (and as the safety bound).
 ///
 /// Every codec path is **bounded**: the decompressor cannot allocate more than
-/// [`magnetar_proto::MAX_FRAME_SIZE`] regardless of what the codec's internal
+/// [`crate::MAX_FRAME_SIZE`] regardless of what the codec's internal
 /// length header claims. This blocks the "tiny ciphertext expands to GB"
 /// decompression-bomb pattern (CWE-409) that bypasses the
 /// `uncompressed_size`-based pre-cap.
@@ -123,7 +128,7 @@ pub fn compress(kind: CompressionKind, plaintext: &[u8]) -> Result<Bytes, Compre
 /// size disagrees with the broker-stamped value (which would indicate a tampered payload or a
 /// broker bug), plus [`CompressionError::UncompressedSizeTooLarge`] when the codec's own
 /// length header (Snappy / LZ4 size-prepended frames) or its actual decoded output exceeds
-/// [`magnetar_proto::MAX_FRAME_SIZE`].
+/// [`crate::MAX_FRAME_SIZE`].
 pub fn decompress(
     kind: CompressionKind,
     ciphertext: &[u8],
@@ -136,13 +141,13 @@ pub fn decompress(
     // the process heap, never producing a real frame. The outer wire codec
     // already rejects frames larger than `MAX_FRAME_SIZE`; cap the inflated
     // payload at the same ceiling.
-    if uncompressed_size > magnetar_proto::MAX_FRAME_SIZE {
+    if uncompressed_size > crate::MAX_FRAME_SIZE {
         return Err(CompressionError::UncompressedSizeTooLarge {
             got: uncompressed_size,
-            ceiling: magnetar_proto::MAX_FRAME_SIZE,
+            ceiling: crate::MAX_FRAME_SIZE,
         });
     }
-    let ceiling = magnetar_proto::MAX_FRAME_SIZE;
+    let ceiling = crate::MAX_FRAME_SIZE;
     let bound = uncompressed_size.saturating_mul(MAX_INFLATE_RATIO).max(64);
     match kind {
         CompressionKind::None => Ok(Bytes::copy_from_slice(ciphertext)),
@@ -245,6 +250,80 @@ pub fn decompress(
     }
 }
 
+/// Upper bound on how far one LZ4 block can inflate. Every input byte adds at most 255
+/// output bytes — a match-length extension byte encodes 255 more bytes of the match — so a
+/// block of `n` bytes never decodes to more than `255 × n`. Used to size the output buffer
+/// when the wire does not name the uncompressed size (see [`decompress_within`]).
+const LZ4_MAX_INFLATE_RATIO: usize = 255;
+
+/// Decompress `ciphertext` when the wire does NOT carry its exact uncompressed size, refusing
+/// to produce more than `limit` bytes (itself capped at [`crate::MAX_FRAME_SIZE`]).
+///
+/// The one caller is the batch layout magnetar's producer wrote up to and including 1.7.2
+/// (ADR-0112): it compressed every batch member on its own and stamped the batch's
+/// `uncompressed_size` with the sum of the COMPRESSED member sizes, so no field names any
+/// member's real size. [`decompress`] cannot read such a member — its exact-size check is what
+/// rejects it — so this variant keeps the decompression-bomb ceiling and drops only the
+/// exact-size verification. The ceiling still applies before any codec allocates: Snappy's
+/// announced length and LZ4's output buffer are both bounded by `limit`, and the two streaming
+/// codecs stop reading one byte past it.
+///
+/// # Errors
+/// Codec-specific decode failures, plus [`CompressionError::UncompressedSizeTooLarge`] when the
+/// decoded (or, for Snappy, announced) size exceeds `limit`.
+pub fn decompress_within(
+    kind: CompressionKind,
+    ciphertext: &[u8],
+    limit: usize,
+) -> Result<Bytes, CompressionError> {
+    let limit = limit.min(crate::MAX_FRAME_SIZE);
+    let mut out = match kind {
+        CompressionKind::None => ciphertext.to_vec(),
+        CompressionKind::Lz4 => {
+            let capacity = limit.min(ciphertext.len().saturating_mul(LZ4_MAX_INFLATE_RATIO));
+            lz4_flex::decompress(ciphertext, capacity)
+                .map_err(|e| CompressionError::Lz4(e.to_string()))?
+        }
+        CompressionKind::Zlib => read_within(flate2::read::ZlibDecoder::new(ciphertext), limit)?,
+        CompressionKind::Zstd => zstd::stream::Decoder::new(ciphertext)
+            .and_then(|decoder| read_within(decoder, limit))
+            .map_err(|e| CompressionError::Zstd(e.to_string()))?,
+        CompressionKind::Snappy => {
+            let announced = snap::raw::decompress_len(ciphertext)
+                .map_err(|e| CompressionError::Snappy(e.to_string()))?;
+            ensure_within(announced, limit)?;
+            snap::raw::Decoder::new()
+                .decompress_vec(ciphertext)
+                .map_err(|e| CompressionError::Snappy(e.to_string()))?
+        }
+    };
+    ensure_within(out.len(), limit)?;
+    // LZ4's buffer was sized from `limit` (up to 255 x the input) and the streaming codecs
+    // grow theirs by doubling. `Bytes::from` keeps the whole allocation alive for as long as
+    // the payload is queued, so hand back only the decoded bytes (ADR-0112).
+    out.shrink_to_fit();
+    Ok(Bytes::from(out))
+}
+
+/// Drain `reader` into a buffer, reading at most one byte past `limit` so an over-long
+/// stream is detectable by [`ensure_within`] instead of being silently truncated.
+fn read_within(reader: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Reject a decoded size above `ceiling`.
+fn ensure_within(got: usize, ceiling: usize) -> Result<(), CompressionError> {
+    if got > ceiling {
+        return Err(CompressionError::UncompressedSizeTooLarge { got, ceiling });
+    }
+    Ok(())
+}
+
 fn verify_size(buf: &[u8], expected: usize) -> Result<(), CompressionError> {
     if buf.len() != expected {
         return Err(CompressionError::SizeMismatch {
@@ -315,7 +394,7 @@ mod tests {
     /// multi-GiB output buffer. The Zlib path used `Vec::with_capacity(
     /// uncompressed_size)` directly, so without the cap a peer could drive
     /// the process to OOM with a tiny payload that claims `u32::MAX` bytes
-    /// of plaintext. The ceiling matches `magnetar_proto::MAX_FRAME_SIZE`,
+    /// of plaintext. The ceiling matches `crate::MAX_FRAME_SIZE`,
     /// which the frame codec already enforces on the outer wire length.
     #[test]
     fn unchecked_uncompressed_size_is_rejected_before_allocation() {
@@ -329,7 +408,7 @@ mod tests {
         match err {
             super::CompressionError::UncompressedSizeTooLarge { got, ceiling } => {
                 assert_eq!(got, huge);
-                assert_eq!(ceiling, magnetar_proto::MAX_FRAME_SIZE);
+                assert_eq!(ceiling, crate::MAX_FRAME_SIZE);
             }
             other => panic!("expected UncompressedSizeTooLarge, got {other:?}"),
         }
@@ -337,7 +416,7 @@ mod tests {
         // The cap applies uniformly across codecs — Zstd / LZ4 / Snappy must
         // not be a bypass route. `uncompressed_size = MAX_FRAME_SIZE + 1` is
         // the smallest over-cap value; using it locks the boundary check.
-        let over = magnetar_proto::MAX_FRAME_SIZE + 1;
+        let over = crate::MAX_FRAME_SIZE + 1;
         for kind in [
             CompressionKind::Zlib,
             CompressionKind::Zstd,
@@ -392,7 +471,7 @@ mod tests {
         let bomb_ciphertext = compress(CompressionKind::Zstd, &bomb_plaintext).expect("compress");
         // Sanity: the compressed form is much smaller than the wire ceiling.
         assert!(
-            bomb_ciphertext.len() < magnetar_proto::MAX_FRAME_SIZE,
+            bomb_ciphertext.len() < crate::MAX_FRAME_SIZE,
             "bomb ciphertext should be small (real attack shape); got {} bytes",
             bomb_ciphertext.len()
         );
@@ -409,7 +488,7 @@ mod tests {
                     got > ceiling,
                     "over-cap branch fired with got={got} ceiling={ceiling}"
                 );
-                assert_eq!(ceiling, magnetar_proto::MAX_FRAME_SIZE);
+                assert_eq!(ceiling, crate::MAX_FRAME_SIZE);
             }
             super::CompressionError::SizeMismatch {
                 got: _,

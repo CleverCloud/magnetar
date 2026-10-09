@@ -34,6 +34,11 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
 | 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                       | 🟡 deferred              |
 | 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                   | ⚡ ready to dispatch     |
+| 24  | [A Reader started inside a batch re-delivers the members before it](#24-a-reader-started-inside-a-batch-re-delivers-the-members-before-it)               | ⚡ ready to dispatch     |
+| 25  | [`permit_balance` cannot go negative](#25-permit_balance-cannot-go-negative)                                                                             | 🟡 deferred              |
+| 26  | [`receive_batch` inner pops do not wake the driver](#26-receive_batch-inner-pops-do-not-wake-the-driver)                                                 | ⚡ ready to dispatch     |
+| 27  | [An undecodable batched entry is dropped without an ack](#27-an-undecodable-batched-entry-is-dropped-without-an-ack)                                     | 🧠 needs design decision |
+| 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                          | 🧠 needs design decision |
 
 ---
 
@@ -157,6 +162,39 @@ Closing it means failing un-replayable batched ops on an in-place re-attach the 
 If the caller already dropped its `SendFut`, nothing ever takes that entry, so every fire-and-forget send leaves one permanent `outcomes` entry: the issue #241 leak shape, which the request paths already guard with "record only while a waker is parked".
 
 **Why it stays open.** It predates ADR-0111 on the receipt path, and the fix crosses both engines: the `Send` arms need the same waker-presence guard, and a `SendFut` dropped between the wake and its next poll must still find its outcome, so the guard and the future's `Drop` have to agree on who removes the entry.
+
+## 24. A Reader started inside a batch re-delivers the members before it
+
+**Gap.** A Reader opened at a start message id that points inside a batched entry receives the whole entry, members `0..k-1` included.
+Java skips those members and refunds their permits (`ConsumerImpl.java` around `:1318-1324` and `:1874-1875`).
+
+**Why it stays open.** Recorded by [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) as a follow-up; it is a Reader semantics change with its own test layers.
+
+## 25. `permit_balance` cannot go negative
+
+**Gap.** `ConsumerState::permit_balance` is a `u32` decremented with `saturating_sub`, so the negative balance a broker reaches after a forced whole-entry dispatch reads as `0` on the client.
+
+**Why it stays open.** The refund ledger, not the balance, drives `maybe_flow`, so this only blurs the starvation signal; widening the field is an API change on a public field.
+
+## 26. `receive_batch` inner pops do not wake the driver
+
+**Gap.** The tokio `Consumer::receive_batch_with_bytes_cap` pops every message after the first under the connection lock without calling `driver_waker.notify_one()`, so a `CommandFlow` one of those pops queues waits for the driver's next wake instead of leaving at once.
+
+**Why it stays open.** Latency rather than a wedge — any later wake flushes it — and found while fixing issue #860, outside its scope.
+
+## 27. An undecodable batched entry is dropped without an ack
+
+**Gap.** Since [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) a batched entry no layout can decode is refunded and logged, but never acknowledged, so a durable subscription's mark-delete position stays behind it.
+Java's `discardCorruptedMessage` acknowledges such an entry with a validation error.
+
+**Why it stays open.** Acknowledging deletes data a fixed client could still read, so whether to follow Java is a product decision.
+
+## 28. Batched + encrypted messages are not Java-compatible
+
+**Gap.** Producer side: Java encrypts the whole compressed batch body once and stamps the keys on the batch metadata; `ProducerState::flush_batch` builds the batch's `MessageMetadata` fresh, so since [ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md) an encrypted message is never batched at all — an encrypting producer with batching enabled sends one entry per message.
+Consumer side: a Java batched + encrypted entry has to be decrypted as one body, then decompressed, then split; `ConsumerState::deliver` cannot decrypt — the decryptor lives in the engine, after the pop — so such an entry is undecodable and is dropped and refunded with one `warn!`.
+
+**Why it stays open.** Both halves are a wire change of their own: the encryptor has to run over the batch body inside `flush_batch`, and the decryptor has to reach `deliver` (or the split has to move after the engine's decrypt step).
 
 ## Notes on this file
 

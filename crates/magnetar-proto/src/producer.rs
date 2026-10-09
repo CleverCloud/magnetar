@@ -11,14 +11,22 @@
 //! - Mutual exclusion between batching and chunking — `can_add_to_batch ⇒ total_chunks == 1` per
 //!   [GUIDELINES.md] §"Protocol-correctness invariants" rule 5.
 //!
-//! The state machine is **encode-only**. Compression and encryption are applied by callers
-//! (the runtime crate) BEFORE the payload reaches [`ProducerState::queue_send`], because both
-//! pull in algorithm-specific dependencies that the sans-io core must not host.
+//! The state machine owns compression (ADR-0112): it is the only layer that knows whether a
+//! message joins a batch, and the two cases compress differently — a batched message is
+//! compressed together with its whole batch body in [`ProducerState::flush_batch`]
+//! (`BatchMessageContainerImpl`), an unbatched one on its own before the chunking decision
+//! (`ProducerImpl.sendAsync` / `serializeAndSendMessage`). Encryption stays with the caller (the
+//! runtime crate), which is the one exception: an encrypting engine compresses the payload
+//! itself before encrypting it, because PIP-4 puts the compressed bytes inside the envelope, and
+//! names the codec on the metadata. A payload whose metadata already carries `encryption_keys` or
+//! a codec is never batched and never compressed again (see `already_encoded`).
 //!
 //! # References
 //!
 //! - `ProducerImpl.java:419` (constructor)
 //! - `ProducerImpl.java:581-608` (sendAsync entry — compression order)
+//! - `BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload` (whole-body batch
+//!   compression, ADR-0112)
 //! - `ProducerImpl.java:621-628` (can-batch decision)
 //! - `ProducerImpl.java:630-654` (chunking-vs-batching mutual exclusion)
 //! - `ProducerImpl.java:696-704` (chunk loop, first send)
@@ -63,14 +71,17 @@ pub(crate) fn new_latency_histogram() -> Option<hdrhistogram::Histogram<u64>> {
 /// Outbound publish queued by the user.
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {
-    /// Final payload bytes (post-compression, post-encryption). Sequence-id assignment is the
+    /// Payload bytes as the caller hands them over: uncompressed, unless an encrypting engine
+    /// already compressed and then encrypted them (ADR-0112). Sequence-id assignment is the
     /// state machine's job; callers leave `metadata.sequence_id == 0`.
     pub payload: Bytes,
     /// Pulsar message metadata. The producer state machine will fill `producer_name`,
     /// `sequence_id`, `publish_time`, `compression`, `uncompressed_size`, and chunking
     /// fields. Other fields (partition key, properties, etc.) are passed through.
     pub metadata: pb::MessageMetadata,
-    /// Original, uncompressed payload size (callers compress before reaching us).
+    /// Original, uncompressed payload size. Overwritten by the state machine when it compresses
+    /// an unbatched payload itself (ADR-0112); an encrypting engine that compressed before it
+    /// encrypted sets it to the pre-compression length and names the codec on the metadata.
     pub uncompressed_size: u32,
     /// Number of single messages this OutgoingMessage represents (1 unless caller bundled).
     pub num_messages: i32,
@@ -176,8 +187,10 @@ pub struct ProducerState {
     pub topic: String,
     /// Producer name (assigned by broker if not user-specified).
     pub name: Option<String>,
-    /// Compression codec configured for this producer. The codec itself runs above us; we
-    /// just stamp `metadata.compression` so the broker knows what bytes it received.
+    /// Compression codec configured for this producer. The state machine runs it (ADR-0112):
+    /// on the whole concatenated body in [`Self::flush_batch`], on the payload of an unbatched
+    /// message in [`Self::queue_send`]. A payload the caller already encoded — encrypted, or with
+    /// a codec named on its metadata — is left as it is.
     pub compression: CompressionKind,
     /// Maximum payload size (in bytes) above which a message must be chunked.
     /// Default: `5 MiB` (Pulsar default).
@@ -577,6 +590,16 @@ impl ProducerStats {
 
         agg
     }
+}
+
+/// `true` when the caller already encoded this payload: it carries PIP-4 `encryption_keys`, or
+/// its metadata names a codec. The state machine then neither batches it — a batch would drop the
+/// keys and compress codec output a second time — nor compresses it (ADR-0112).
+fn already_encoded(metadata: &pb::MessageMetadata) -> bool {
+    !metadata.encryption_keys.is_empty()
+        || metadata
+            .compression
+            .is_some_and(|codec| codec != pb::CompressionType::None as i32)
 }
 
 /// In-memory batch container.
@@ -992,7 +1015,7 @@ impl ProducerState {
     /// Same as [`Self::queue_send`].
     pub fn queue_send_reserved(
         &mut self,
-        msg: OutgoingMessage,
+        mut msg: OutgoingMessage,
         reservation: &mut MemoryReservation,
         publish_time_ms: u64,
         now: std::time::Instant,
@@ -1012,14 +1035,28 @@ impl ProducerState {
         // PIP-180 / ADR-0033: replicator-style sends propagate the source-topic
         // `MessageId` on `CommandSend.message_id`. They are written one entry at a
         // time (mirrors Java `org.apache.pulsar.broker.service.persistent.Replicator`,
-        // which has batching disabled), so route any send carrying
-        // `source_message_id` directly to the single / chunked path and force a
-        // flush of any in-flight batch first so wire order is preserved.
-        let has_source_id = msg.source_message_id.is_some();
-        if has_source_id && self.batching_enabled && !self.batch.is_empty() {
+        // which has batching disabled), so a send carrying `source_message_id` never
+        // joins a batch. Neither does a payload the caller already encoded (ADR-0112):
+        // a batch would drop its `encryption_keys` and compress its codec output again.
+        let batchable = msg.source_message_id.is_none() && !already_encoded(&msg.metadata);
+        let mut can_batch = batchable && self.can_add_to_batch(payload_size, msg.num_messages);
+        // A message that cannot join the pending batch flushes it FIRST, so it never overtakes
+        // the batch on the wire — with broker deduplication the lower sequence ids arriving
+        // second would be dropped. A batchable one then starts the next batch (Java
+        // `ProducerImpl.doBatchSendAndAdd`), unless it is too large for even an empty one.
+        if !can_batch && !self.batch.is_empty() {
             let _ = self.flush_batch(publish_time_ms, now);
+            can_batch = batchable && self.can_add_to_batch(payload_size, msg.num_messages);
         }
-        let can_batch = !has_source_id && self.can_add_to_batch(payload_size, msg.num_messages);
+        // ADR-0112: a message that will not join a batch is compressed here, on its own and
+        // BEFORE the chunking decision, so the chunk count is taken from the compressed size
+        // (`ProducerImpl.serializeAndSendMessage`). A batched one stays uncompressed until
+        // `flush_batch` compresses its whole batch body, so the batch byte budget above counts
+        // uncompressed bytes, as Java's does.
+        if !can_batch {
+            self.compress_unbatched(&mut msg);
+        }
+        let payload_size = msg.payload.len();
 
         // Chunking path: too big AND we cannot batch it.
         if payload_size > self.max_message_size {
@@ -1051,6 +1088,29 @@ impl ProducerState {
         }
 
         Ok(self.emit_single(msg, reservation, publish_time_ms, now))
+    }
+
+    /// Compress the payload of a message that leaves [`Self::queue_send`] unbatched, and stamp
+    /// the codec on its metadata (ADR-0112) — `ProducerImpl.sendAsync` compresses a payload it
+    /// will not batch, and `serializeAndSendMessage` one that missed the batch.
+    ///
+    /// A payload the caller [already encoded](already_encoded) is left exactly as it is: an
+    /// encrypting engine compressed before it encrypted and named the codec itself (PIP-4 puts
+    /// the compressed bytes inside the envelope, `ProducerImpl.java:986-1003`), and compressing
+    /// any ciphertext here would put the codec outside it. A codec failure — none of the four
+    /// in-memory codecs fails on a payload this state machine can hold — ships the payload
+    /// uncompressed and unstamped, which is still a well-formed frame.
+    fn compress_unbatched(&self, msg: &mut OutgoingMessage) {
+        if self.compression == CompressionKind::None || already_encoded(&msg.metadata) {
+            return;
+        }
+        let compressed = crate::compress::compress(self.compression, &msg.payload).map(|body| {
+            msg.uncompressed_size = u32::try_from(msg.payload.len()).unwrap_or(u32::MAX);
+            msg.payload = body;
+        });
+        if compressed.is_ok() {
+            msg.metadata.compression = Some(self.compression.to_pb() as i32);
+        }
     }
 
     /// Force-flush the batch when adding the latest message hit
@@ -1092,9 +1152,6 @@ impl ProducerState {
         msg.metadata.uuid = None;
         if msg.uncompressed_size > 0 {
             msg.metadata.uncompressed_size = Some(msg.uncompressed_size);
-        }
-        if self.compression != CompressionKind::None {
-            msg.metadata.compression = Some(self.compression.to_pb() as i32);
         }
         // Pulsar's `TopicTransactionBuffer.appendBufferToTxn` is keyed on the
         // `txnid_*` fields of the **MessageMetadata**, not `CommandSend`. Java's
@@ -1263,9 +1320,12 @@ impl ProducerState {
         self.next_batch_deadline().is_some_and(|d| now >= d)
     }
 
-    /// Flush the batch container into one SEND frame. The caller is responsible for compression
-    /// and any encryption of the concatenated payload. We hand back the raw concatenated bytes
-    /// (singles' length-prefixed metadata followed by payload).
+    /// Flush the batch container into one SEND frame: the members are concatenated as
+    /// `[u32 BE single_meta_size][SingleMessageMetadata][payload]` and, when the producer has a
+    /// codec, the WHOLE concatenation is compressed once and stamped with its pre-compression
+    /// length as `uncompressed_size` — Java `BatchMessageContainerImpl`'s layout (ADR-0112). No
+    /// member is ever encrypted or already compressed: [`Self::queue_send`] keeps such payloads
+    /// out of the batch.
     ///
     /// `now` is the caller-supplied monotonic timestamp recorded on the resulting `OpSend`
     /// so the sans-io state machine never reads its own clock.
@@ -1298,7 +1358,24 @@ impl ProducerState {
             let _ = sm.encode(&mut concatenated);
             concatenated.extend_from_slice(&payload);
         }
-        let payload = concatenated.freeze();
+        let concatenated = concatenated.freeze();
+        // ADR-0112: compress the WHOLE concatenation, like
+        // `BatchMessageContainerImpl.getCompressedBatchMetadataAndPayload`. Before this the
+        // engine compressed each member on its own and the concatenation went out raw under a
+        // batch-level codec stamp, a body no Java consumer could decompress and no magnetar
+        // consumer could split.
+        let uncompressed_len = concatenated.len();
+        let compressed = (self.compression != CompressionKind::None)
+            .then(|| crate::compress::compress(self.compression, &concatenated).ok())
+            .flatten();
+        let (payload, codec, payload_total) = match compressed {
+            Some(body) => (body, self.compression, uncompressed_len),
+            None => (
+                concatenated,
+                CompressionKind::None,
+                self.batch.current_size_bytes,
+            ),
+        };
         let lowest = self
             .batch
             .lowest_sequence_id
@@ -1335,10 +1412,10 @@ impl ProducerState {
         if highest > lowest {
             metadata.highest_sequence_id = Some(highest);
         }
-        if self.compression != CompressionKind::None {
-            metadata.compression = Some(self.compression.to_pb() as i32);
+        if codec != CompressionKind::None {
+            metadata.compression = Some(codec.to_pb() as i32);
         }
-        if let Ok(payload_total) = self.batch.current_size_bytes.try_into() {
+        if let Ok(payload_total) = payload_total.try_into() {
             metadata.uncompressed_size = Some(payload_total);
         }
 
@@ -1445,9 +1522,6 @@ impl ProducerState {
             if ctx.metadata.producer_name.is_empty() {
                 ctx.metadata.producer_name = name.clone();
             }
-        }
-        if self.compression != CompressionKind::None {
-            ctx.metadata.compression = Some(self.compression.to_pb() as i32);
         }
         ctx.metadata.uncompressed_size = Some(ctx.uncompressed_size);
         ctx.metadata.uuid = Some(uuid);
@@ -3554,5 +3628,251 @@ mod tests {
         assert_eq!(drained.iter().map(OpSend::reserved_bytes).sum::<u64>(), 2);
         drop(drained);
         assert_eq!(controller.used_bytes(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #860 / ADR-0112 — the state machine owns compression.
+    // -------------------------------------------------------------------
+
+    /// The four Pulsar codecs.
+    const ALL_CODECS: [CompressionKind; 4] = [
+        CompressionKind::Lz4,
+        CompressionKind::Zlib,
+        CompressionKind::Zstd,
+        CompressionKind::Snappy,
+    ];
+
+    /// A batching producer with `codec`, a flush only on explicit `flush_batch`.
+    fn batching_producer(codec: CompressionKind) -> ProducerState {
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), codec, 5 * 1024 * 1024);
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 1000;
+        p.max_batch_size_bytes = 1024 * 1024;
+        p
+    }
+
+    /// Split a packed batch body back into its payloads, the way a Java consumer's
+    /// `receiveIndividualMessagesFromBatch` does.
+    fn unpack(mut body: Bytes) -> Vec<Vec<u8>> {
+        use bytes::Buf as _;
+        use prost::Message as _;
+        let mut out = Vec::new();
+        while body.has_remaining() {
+            let size = body.get_u32() as usize;
+            let single = pb::SingleMessageMetadata::decode(body.split_to(size)).unwrap();
+            out.push(body.split_to(single.payload_size as usize).to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn flush_batch_compresses_the_whole_body_once() {
+        let payloads: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("batched-{i}|").repeat(20).into_bytes())
+            .collect();
+        for codec in ALL_CODECS {
+            let mut p = batching_producer(codec);
+            for payload in &payloads {
+                let decision = p.queue_send(small_message(payload), 100, std::time::Instant::now());
+                assert!(matches!(decision, Ok(SendDecision::Batched)));
+            }
+            assert_eq!(
+                p.batch.current_size_bytes,
+                payloads.iter().map(Vec::len).sum::<usize>(),
+                "{codec:?}: the batch budget counts UNCOMPRESSED bytes, as Java's does"
+            );
+            assert_eq!(p.flush_batch(100, std::time::Instant::now()), 1);
+            let frame = p.next_outbound_frame().unwrap();
+            assert_eq!(frame.metadata.compression, Some(codec.to_pb() as i32));
+            let uncompressed = frame.metadata.uncompressed_size.unwrap() as usize;
+            // Java layout: ONE codec call over the packed body, sized by `uncompressed_size`.
+            let packed = crate::compress::decompress(codec, &frame.payload, uncompressed)
+                .unwrap_or_else(|e| panic!("{codec:?}: body is not one compressed block: {e}"));
+            assert_eq!(unpack(packed), payloads, "{codec:?}: members are plaintext");
+        }
+    }
+
+    #[test]
+    fn unbatched_payload_is_compressed_by_the_state_machine() {
+        let payload = b"not-batched|".repeat(40);
+        for codec in ALL_CODECS {
+            let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), codec, 1024 * 1024);
+            let _ = p
+                .queue_send(small_message(&payload), 100, std::time::Instant::now())
+                .unwrap();
+            let frame = p.next_outbound_frame().unwrap();
+            assert_eq!(frame.metadata.compression, Some(codec.to_pb() as i32));
+            assert_eq!(frame.metadata.uncompressed_size, Some(payload.len() as u32));
+            let plain = crate::compress::decompress(codec, &frame.payload, payload.len()).unwrap();
+            assert_eq!(plain.as_ref(), payload.as_slice(), "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn chunking_decision_uses_the_compressed_size() {
+        // 8 KiB that LZ4 shrinks far below the 2 KiB frame budget: one frame, no chunks —
+        // `ProducerImpl` takes the chunk count from the COMPRESSED size.
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::Lz4,
+            2048,
+        );
+        p.chunking_enabled = true;
+        let compressible = vec![b'z'; 8 * 1024];
+        let _ = p
+            .queue_send(small_message(&compressible), 100, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(p.outbound_len(), 1, "fits once compressed");
+        let frame = p.next_outbound_frame().unwrap();
+        assert_eq!(frame.metadata.num_chunks_from_msg, None);
+        // An incompressible payload still chunks, every chunk stamped with the codec.
+        let incompressible: Vec<u8> = (0..8 * 1024u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let _ = p
+            .queue_send(
+                small_message(&incompressible),
+                100,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(p.outbound_len() > 1, "still too large once compressed");
+        let mut joined = Vec::new();
+        while let Some(chunk) = p.next_outbound_frame() {
+            assert_eq!(
+                chunk.metadata.compression,
+                Some(pb::CompressionType::Lz4 as i32)
+            );
+            assert_eq!(
+                chunk.metadata.uncompressed_size,
+                Some(incompressible.len() as u32)
+            );
+            joined.extend_from_slice(&chunk.payload);
+        }
+        let plain =
+            crate::compress::decompress(CompressionKind::Lz4, &joined, incompressible.len())
+                .unwrap();
+        assert_eq!(plain.as_ref(), incompressible.as_slice());
+    }
+
+    /// An outgoing message whose metadata already names its encoding.
+    fn encoded(
+        payload: &[u8],
+        encrypted: bool,
+        compression: Option<CompressionKind>,
+    ) -> OutgoingMessage {
+        let mut msg = small_message(payload);
+        if encrypted {
+            msg.metadata.encryption_keys = vec![pb::EncryptionKeys {
+                key: "k".to_owned(),
+                value: Bytes::from_static(b"v"),
+                metadata: Vec::new(),
+            }];
+        }
+        msg.metadata.compression = compression.map(|c| c.to_pb() as i32);
+        msg
+    }
+
+    #[test]
+    fn pre_encoded_payload_is_never_batched_or_compressed_again() {
+        let now = std::time::Instant::now();
+        let mut single = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::Zstd,
+            1024,
+        );
+        // An encrypting engine compressed, stamped the codec, then encrypted: left alone.
+        let _ = single
+            .queue_send(
+                encoded(b"sealed", true, Some(CompressionKind::Zstd)),
+                100,
+                now,
+            )
+            .unwrap();
+        let frame = single.next_outbound_frame().unwrap();
+        assert_eq!(frame.payload.as_ref(), b"sealed");
+        assert_eq!(
+            frame.metadata.compression,
+            Some(pb::CompressionType::Zstd as i32)
+        );
+        // Forwarded ciphertext with no codec stamp: compressing it would put the codec OUTSIDE
+        // the envelope, which no decrypt-first consumer can read. Neither compressed nor stamped.
+        let _ = single
+            .queue_send(encoded(b"forwarded", true, None), 100, now)
+            .unwrap();
+        let frame = single.next_outbound_frame().unwrap();
+        assert_eq!(frame.payload.as_ref(), b"forwarded");
+        assert_eq!(frame.metadata.compression, None);
+        // A payload whose caller already compressed it (and said so) keeps its own codec.
+        let lz4 = crate::compress::compress(CompressionKind::Lz4, b"pre-compressed").unwrap();
+        let mut msg = encoded(b"", false, Some(CompressionKind::Lz4));
+        msg.payload = lz4.clone();
+        let _ = single.queue_send(msg, 100, now).unwrap();
+        let frame = single.next_outbound_frame().unwrap();
+        assert_eq!(frame.payload, lz4, "not compressed a second time");
+        assert_eq!(
+            frame.metadata.compression,
+            Some(pb::CompressionType::Lz4 as i32)
+        );
+
+        // Batching producer: an encrypted message never joins a batch — the batch would drop its
+        // `encryption_keys` (ADR-0112 follow-up) — and the pending batch is flushed first, so the
+        // wire keeps the send order.
+        let mut batched = batching_producer(CompressionKind::Zstd);
+        let _ = batched.queue_send(small_message(b"p0"), 100, now).unwrap();
+        let decision = batched
+            .queue_send(encoded(b"c1", true, Some(CompressionKind::Zstd)), 100, now)
+            .unwrap();
+        assert!(
+            matches!(decision, SendDecision::Emit { count: 1 }),
+            "{decision:?}"
+        );
+        let batch = batched
+            .next_outbound_frame()
+            .expect("pending batch flushed first");
+        assert_eq!(batch.sequence_id, SequenceId(0));
+        assert_eq!(batch.metadata.num_messages_in_batch, Some(1));
+        let sealed = batched
+            .next_outbound_frame()
+            .expect("then the encrypted message");
+        assert_eq!(sealed.sequence_id, SequenceId(1));
+        assert_eq!(sealed.payload.as_ref(), b"c1");
+        assert_eq!(sealed.metadata.num_messages_in_batch, None);
+        assert!(
+            !sealed.metadata.encryption_keys.is_empty(),
+            "keys reach the wire"
+        );
+    }
+
+    #[test]
+    fn send_that_overflows_the_batch_flushes_it_first() {
+        // Java `ProducerImpl.doBatchSendAndAdd`: a message that does not fit the pending batch
+        // flushes it, then starts the next one — it never overtakes the batch on the wire.
+        let now = std::time::Instant::now();
+        let mut p = batching_producer(CompressionKind::None);
+        p.max_batch_size_bytes = 1000;
+        for _ in 0..3 {
+            let _ = p.queue_send(small_message(&[7u8; 400]), 100, now).unwrap();
+        }
+        let first = p.next_outbound_frame().expect("the full batch went out");
+        assert_eq!(
+            first.sequence_id,
+            SequenceId(0),
+            "seq 0 first, not the overflowing seq 2"
+        );
+        assert_eq!(first.metadata.num_messages_in_batch, Some(2));
+        assert!(
+            p.next_outbound_frame().is_none(),
+            "seq 2 waits in the next batch"
+        );
+        // A message larger than the whole batch budget goes out alone — after the batch.
+        let _ = p.queue_send(small_message(&[9u8; 1200]), 100, now).unwrap();
+        let second = p.next_outbound_frame().expect("pending batch flushed");
+        assert_eq!(second.sequence_id, SequenceId(2));
+        let third = p.next_outbound_frame().expect("then the oversized message");
+        assert_eq!(third.sequence_id, SequenceId(3));
+        assert_eq!(third.metadata.num_messages_in_batch, None);
     }
 }

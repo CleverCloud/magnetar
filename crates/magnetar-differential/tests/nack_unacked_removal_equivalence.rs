@@ -112,7 +112,6 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Vec<Redelivery> {
         producer_name: "magnetar-test-prod".to_owned(),
         sequence_id: 1,
         publish_time: 0,
-        num_messages_in_batch: Some(1),
         ..Default::default()
     };
     let mut frame = BytesMut::new();
