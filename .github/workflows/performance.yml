@@ -43,7 +43,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6
         with:
           docker-images: false
           tool-cache: false
@@ -105,7 +105,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6
         with:
           docker-images: false
           tool-cache: false
