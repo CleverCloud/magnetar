@@ -98,6 +98,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `matchit` stays at 0.8.4 because `axum` 0.8.9 requires that exact version.
 - **Fuzz workspace:** `crates/magnetar-proto/fuzz` now commits its `Cargo.lock`, moves `prost` 0.13→0.14 to match the main workspace, and raises `libfuzzer-sys`, `arbitrary` and `bytes` to explicit current floors.
 
+- **Dependabot version updates are removed.**
+  `.github/dependabot.yml` is deleted: its Cargo PRs bumped `Cargo.lock` alone, which the workspace does not take, and stayed open after the manifest floors moved.
+  Dependency and action bumps land by hand, raising manifest floors and refreshing the lockfiles in the same changeset; Dependabot alerts and security updates are repository settings and unchanged.
+  ([ADR-0114](specs/adr/0114-bump-dependencies-through-manifest-floors-without-dependabot.md))
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed
