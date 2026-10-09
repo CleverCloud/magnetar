@@ -18,6 +18,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.
   Pull requests no longer wait on its thirteen release builds; the fixed Moonpool seeds 1–32 it replayed per PR now run nightly, while `ci.yml`'s `seed-replay` keeps the open registry seeds on every PR.
   ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md))
+- **Dependencies:** bumped workspace manifest floors — `opentelemetry` 0.32.0→0.33.0, `opentelemetry_sdk` 0.32.1→0.33.0, `tokio` 1.53.1→1.53.2, `tokio-rustls` 0.26.5→0.26.6, `rustls-openssl` 0.4.1→0.4.2, `uuid` 1.26.1→1.27.0, `zeroize` 1.9.0→1.9.1, and `thiserror` 2.0.20→2.0.21 — and refreshed `Cargo.lock`.
+  The `opentelemetry` feature's `otel::extract_context` and `otel::attach_context` families return `opentelemetry` types, so an application enabling that feature must move its own `opentelemetry` dependency to 0.33 as well.
+  `matchit` stays at 0.8.4 because `axum` 0.8.9 requires that exact version.
+- **Fuzz workspace:** `crates/magnetar-proto/fuzz` now commits its `Cargo.lock`, moves `prost` 0.13→0.14 to match the main workspace, and raises `libfuzzer-sys`, `arbitrary` and `bytes` to explicit current floors.
 
 ## [1.7.2] - 2026-09-21
 

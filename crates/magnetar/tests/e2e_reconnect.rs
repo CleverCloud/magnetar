@@ -82,7 +82,7 @@ const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
 /// max far more than an 8× CPU oversubscription did.
 ///
 /// That 25.7 s is a **lower bound**: no run on this workstation crossed 30 s, so the profile never
-/// reproduced the overrun this test hits on smaller machines. A GitHub `ubuntu-latest` runner has
+/// reproduced the overrun this test hits on smaller machines. A GitHub `ubuntu-26.04` runner has
 /// ~4 cores / 16 GiB (≈5× less CPU, ≈4× less RAM) and keeps the PIP-33 compose fixture resident all
 /// job, so its worst case is materially higher than anything measured here. 90 s is therefore 3.5×
 /// the measured worst case rather than the 2× a captured tail would justify.

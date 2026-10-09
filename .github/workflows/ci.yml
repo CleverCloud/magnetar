@@ -39,7 +39,7 @@ env:
 jobs:
   fmt:
     name: fmt (nightly)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min covers `--workspace --all-features` clippy on a cold
     # cache (aws-lc-fips-sys + bindgen for libgssapi dominate, ~15 min
     # alone) plus the lint pass on every test binary the admin /
@@ -84,7 +84,7 @@ jobs:
 
   build:
     name: build (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min: same rationale as clippy — `--all-features` cold-cache
     # build on the runner takes ~20–25 min for the FIPS C build, plus
     # the workspace + every test binary's rlibs. Beta toolchain can
@@ -110,7 +110,7 @@ jobs:
     name: test (${{ matrix.name }})
     # ADR-0098 replaces the aggregate job with one non-e2e cell and four e2e
     # cells. ADR-0046 still governs semantics: no e2e feature gate or #[ignore].
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -139,14 +139,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -160,10 +160,13 @@ jobs:
           # the harness waits for, so every shard timed out at container start.
           docker pull apachepulsar/pulsar:4.2.4
           docker pull apachepulsar/pulsar:5.0.0-M1
-          docker pull apachepulsar/pulsar:4.0.4
+          docker pull apachepulsar/pulsar:4.0.13
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
         if: ${{ matrix.suite == 'e2e' }}
-        run: docker pull gcavalcante8808/krb5-server:latest || true
+        run: docker pull gcavalcante8808/krb5-server:alpine_3.19.0
+      - name: Pre-pull Athenz ZTS image
+        if: ${{ matrix.suite == 'e2e' }}
+        run: docker pull athenz/athenz-zts-server:1.12.47
       - name: Bring up two-cluster Pulsar fixture (PIP-33)
         if: ${{ matrix.pip33 }}
         working-directory: crates/magnetar/tests/fixtures
@@ -279,7 +282,7 @@ jobs:
     # already-known regressions get caught before they can re-merge.
     # No-op (trivially green) when the registry is empty.
     name: seed-replay (regression guard)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -291,8 +294,8 @@ jobs:
         run: |
           set -euo pipefail
           # Parse the TOML; emit `<value>` per `[[seed]]` with status="open".
-          # Python 3.11+ ships `tomllib` in the stdlib; the ubuntu-latest
-          # runner image carries 3.12.
+          # Python 3.11+ ships `tomllib` in the stdlib; the pinned runner
+          # image carries a supported Python version.
           mapfile -t seeds < <(python3 - <<'PY'
           import tomllib, os, sys
           path = os.environ["REGISTRY"]
@@ -342,7 +345,7 @@ jobs:
 
   doc:
     name: doc
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 60 min: rustdoc on the workspace under `-D warnings` has the same
     # cold-cache compile cost as the build job (it depends on every
     # crate's `cargo check` graph) plus the doc generation pass.
@@ -359,7 +362,7 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -367,7 +370,7 @@ jobs:
 
   no-channels:
     name: no-channels
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -377,7 +380,7 @@ jobs:
 
   no-io-deps:
     name: no-io-deps (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -393,7 +396,7 @@ jobs:
     # (clock-injection-sans-io) as amended by ADR-0084. The sans-io state
     # machine must receive `now: Instant` / `wall_clock` providers from the
     # engine.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -407,7 +410,7 @@ jobs:
     # workspace code carries at least one structured field (`debug!` /
     # `trace!` exempt). Macro invocations are parsed parenthesis-balanced so
     # multi-line invocations are classified whole. Mirrors ADR-0054.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -423,7 +426,7 @@ jobs:
     # standalones stall brokers past `operation_timeout` and surface as a
     # flaky timeout in whichever unrelated test is running. Mirrors
     # docs/testing.md § "e2e container memory budget".
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -439,7 +442,7 @@ jobs:
     # accidental use of newer language or `std` features fails CI rather
     # than slipping into a release. Mirrors the `build` job but with the
     # toolchain pinned exactly to the MSRV, not the rolling stable.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 90 min: same cold-cache cost as the `build` job (FIPS C build,
     # workspace `--all-features`, bindgen via libclang).
     timeout-minutes: 90
@@ -460,7 +463,7 @@ jobs:
     # regenerating from the vendored proto files would produce. Mirrors
     # the validation chain documented in `CLAUDE.md`; without this gate
     # proto codegen drift would go silent.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -503,7 +506,7 @@ jobs:
     # short-circuit, 60% build and can produce a verdict, 10% build for a
     # verdict that is impossible. Keeping that 10% is deliberate — bailing
     # early would suppress the `not gated` report ADR-0088 exists to print.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
     # copy budgets. That 90 was only ever binding on a `workflow_dispatch`
@@ -533,14 +536,14 @@ jobs:
       # data over the wider report package set. Reclaim disk like the heavy
       # build jobs.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -548,7 +551,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
       # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
       # so the MIT KRB5 / libclang headers go in like every other
       # --all-features job. `clang` and `llvm` are the crypto-matrix
@@ -585,26 +588,26 @@ jobs:
 
   mutants-smoke:
     name: cargo-mutants smoke (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-mutants --locked
+      - run: cargo install cargo-mutants --version 27.1.0 --locked
       - run: cargo mutants --package magnetar-proto --timeout 60 --no-shuffle
 
   fuzz-smoke:
     name: cargo-fuzz smoke (magnetar-proto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz decode_one (60s budget)
         working-directory: crates/magnetar-proto
         run: cargo +nightly fuzz run decode_one -- -max_total_time=60 -timeout=10

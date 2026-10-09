@@ -27,7 +27,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.3";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
@@ -60,7 +60,7 @@ fn image_tag() -> String {
 
 #[test]
 fn default_image_tag_tracks_latest_pulsar_four() {
-    assert_eq!(DEFAULT_IMAGE_TAG, "4.2.3");
+    assert_eq!(DEFAULT_IMAGE_TAG, "4.2.4");
 }
 
 fn init_tracing() {
@@ -99,7 +99,7 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-/// Start Pulsar 4.2.3 with an 8,192-byte broker message limit so each
+/// Start Pulsar 4.2.4 with an 8,192-byte broker message limit so each
 /// 35,840-byte issue-#331 payload is split into exactly five 7,168-byte chunks.
 async fn start_small_message_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),

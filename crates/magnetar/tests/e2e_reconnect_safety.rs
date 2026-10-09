@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 const PULSAR_IMAGE: &str = "apachepulsar/pulsar";
-const PULSAR_TAG: &str = "4.0.4";
+const PULSAR_TAG: &str = "4.0.13";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";

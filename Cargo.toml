@@ -55,7 +55,7 @@ bytes           = "^1.12.1"
 crc32c          = "^0.6.8"
 
 # Async runtime (engines only, NEVER magnetar-proto)
-tokio           = { version = "^1.53.1", default-features = false }
+tokio           = { version = "^1.53.2", default-features = false }
 tokio-util      = { version = "^0.7.19", default-features = false }
 futures         = { version = "^0.3.34", default-features = false }
 futures-util    = { version = "^0.3.34", default-features = false }
@@ -78,12 +78,12 @@ rustls               = { version = "^0.23.45", default-features = false, feature
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
 rustls-pki-types     = { version = "^1.15.1", features = ["std"] }
 rustls-native-certs  = "^0.8.4"
-tokio-rustls         = { version = "^0.26.5", default-features = false }
+tokio-rustls         = { version = "^0.26.6", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "^0.4.1", default-features = false }
+rustls-openssl       = { version = "^0.4.2", default-features = false }
 
 # Compression — Pulsar's four codecs
 lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
@@ -105,7 +105,7 @@ apache-avro = "^0.22.0"
 schemars    = { version = "^1.2.2", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.26.1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.27.0", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
@@ -117,7 +117,7 @@ aws-lc-rs  = { version = "^1.18.1", default-features = false, features = ["aws-l
 ring       = { version = "^0.17.14", default-features = false }
 # Defense-in-depth: zero parsed-key material on drop. Used by the Athenz
 # concrete JwtSigner backends (ADR-0030).
-zeroize    = { version = "^1.9.0", default-features = false }
+zeroize    = { version = "^1.9.1", default-features = false }
 # URL-safe-without-padding base64 for the JWS compact serialisation
 # emitted by the Athenz JwtSigner backends (RFC 7515 §3.1).
 base64     = { version = "^0.23.1", default-features = false, features = ["std"] }
@@ -157,11 +157,11 @@ http    = "^1.5.0"
 clap    = { version = "^4.6.7", features = ["derive", "env"] }
 
 # Telemetry + errors
-opentelemetry      = { version = "^0.32.0", default-features = false, features = ["trace"] }
-opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features = ["trace"] }
+opentelemetry      = { version = "^0.33.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk  = { version = "^0.33.0", default-features = false, features = ["trace"] }
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
-thiserror          = "^2.0.20"
+thiserror          = "^2.0.21"
 anyhow             = "^1.0.104"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 

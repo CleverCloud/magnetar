@@ -40,7 +40,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_KDC_IMAGE_REPO: &str = "gcavalcante8808/krb5-server";
-const DEFAULT_KDC_IMAGE_TAG: &str = "latest";
+// Docker Hub's alpine_3.19.0 and latest currently resolve to the same digest;
+// the named tag keeps this fixture stable when latest moves.
+const DEFAULT_KDC_IMAGE_TAG: &str = "alpine_3.19.0";
 const KDC_PORT: u16 = 88;
 
 // No `PULSAR_MEM` budget here: this suite starts a Kerberos KDC

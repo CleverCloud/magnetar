@@ -47,9 +47,9 @@ const IMAGE_REPO: &str = "apachepulsar/pulsar";
 /// The first published Pulsar release carrying PIP-460. A milestone, not GA —
 /// see ADR-0093 §D1. Overridable so a later RC can be tried without an edit.
 const DEFAULT_SCALABLE_IMAGE_TAG: &str = "5.0.0-M1";
-/// A v4 broker, for the negotiation-refusal test. Matches the tag the rest of
-/// the e2e suite pins (`CLAUDE.md` § Validation chain).
-const V4_IMAGE_TAG: &str = "4.0.4";
+/// A v4 broker, for the negotiation-refusal test. Stay on the latest 4.0.x
+/// compatibility line while the v5 scalable-topic cell uses its own image.
+const V4_IMAGE_TAG: &str = "4.0.13";
 
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;

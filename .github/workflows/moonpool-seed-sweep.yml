@@ -49,7 +49,7 @@ env:
 jobs:
   generate-seeds:
     name: roll 128 random seeds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       seeds: ${{ steps.roll.outputs.seeds }}
@@ -71,7 +71,7 @@ jobs:
   moonpool-sim:
     name: moonpool-sim (seed=${{ matrix.seed }})
     needs: generate-seeds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -125,7 +125,7 @@ jobs:
     name: open issues for newly-failed seeds
     needs: moonpool-sim
     if: failure()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7

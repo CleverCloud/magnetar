@@ -79,7 +79,7 @@ jobs:
     # Greps the tokio + moonpool test-attribute counts; no build, no apt
     # deps. Compiling the xtask binary itself does not need protoc (only
     # `xtask codegen` does — see ci.yml's codegen-check job).
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -95,7 +95,7 @@ jobs:
     # {tokio, tokio+moonpool} plus the magnetar-auth-athenz signer matrix.
     # The FIPS cells build aws-lc-fips-sys's C library, so reclaim runner
     # disk like the test / e2e jobs do.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 180 min covers the 16-cell build matrix on a cold cache. The FIPS
     # cells alone take ~10–15 min each on the runner; non-FIPS cells
     # ~3–5 min. Previous 120 was tight and led to mid-matrix cancels on
@@ -106,14 +106,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -146,7 +146,7 @@ jobs:
   sim-coverage:
     name: sim-coverage (patch coverage, sim-instrumented crates)
     if: ${{ github.event_name != 'pull_request' || github.base_ref != 'main' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Budget for one instrumented `--all-features` build of the moonpool +
     # differential test binaries and their dependency closure
     # (aws-lc-fips-sys included) plus the sim run itself. Widening the
@@ -182,14 +182,14 @@ jobs:
       # data over the wider report package set. Reclaim disk like the heavy
       # build jobs.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           docker-images: false
-          tool-cache: false
+          preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -197,7 +197,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
       # --all-features can transitively pull libgssapi (auth-sasl-kerberos),
       # so the MIT KRB5 / libclang headers go in like every other
       # --all-features job. `clang` and `llvm` are the crypto-matrix
