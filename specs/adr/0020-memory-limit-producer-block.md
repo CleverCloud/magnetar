@@ -1,6 +1,6 @@
 # ADR-0020 — `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0111](0111-share-one-memory-limit-controller-per-client.md): the `ConnectionShared` `Slab<Waker>` and its `try_reserve_memory_or_register` / `cancel_memory_waker` helpers are replaced by the client-wide controller's never-reused waiter ids, and `SendFut::drop` no longer releases a queued publish's bytes — the policy, the drain-all wake and the decision tree remain binding)
 - **Date**: 2026-05-21
 - **Decider**: Florentin Dubois
 - **Tags**: memory-limit, back-pressure, sans-io, no-channels, java-parity

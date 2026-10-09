@@ -11,6 +11,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
   Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
 - **A detached partition no longer parks a bounded keyless producer pipeline.** Round-robin sends now scan the ready child producers and route to one that can drain a send; recovered children rejoin the rotation. Non-empty keys retain their partition for ordering, as do explicit single-partition and custom routes. If every child is unavailable, sends still receive their configured timeout or terminal error. `PartitionedProducer::not_ready_partitions()` reports child indices observed unavailable during its scan; its readiness path reads an atomic broker-attachment hint without a connection or slot lock. The protocol send-drain gate remains authoritative if an attachment changes concurrently. (issue #463; [ADR-0110](specs/adr/0110-route-around-unready-partitioned-producer-children.md))
+- **`memory_limit` is now one budget per client, shared by every physical connection, instead of one full budget per connection.**
+  `ClientBuilder::memory_limit(bytes, policy)` is documented as Java's `ClientBuilder#memoryLimit`, where one `MemoryLimitController` per `PulsarClientImpl` bounds every producer of the client.
+  Magnetar kept the counter on each runtime `ConnectionShared`, and every pool entry — each `connections_per_broker` sibling, each proxy pool entry, each replacement connection — built its own, so a client with N connections admitted N times the configured bytes.
+  One `magnetar_proto::MemoryLimitController` is now built by the bootstrap connection and shared with every connection the client opens, on both engines; `MemoryLimitExceeded.current` reports the client-wide aggregate.
+  Under `ProducerBlock`, a release on one connection now wakes sends parked for any other.
+  A connection built without a client keeps a private budget, a limit of `0` still means unlimited, and the strict `current + requested > limit` rejection is unchanged.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A publish now holds its memory reservation until it leaves the client, so a dropped send future no longer frees bytes the client still retains.**
+  The reservation used to be released when the `SendFut` completed or was dropped, so a fire-and-forget send gave its bytes back immediately while its payload stayed in the producer's pending queue for receipt correlation and reconnect replay — the budget could be exceeded without bound.
+  The reservation now travels inside the publish's `OpSend` and is released exactly once when that op leaves the client: the broker's receipt (each message of a batch on its own), the broker's send error, the send timeout, the producer's close acknowledgement, a producer-open or terminal connection failure, or the reset of a batch that cannot be replayed.
+  A reconnect that replays a retained publish neither releases nor charges it again.
+  This is Java's lifetime: `ProducerImpl` releases a publish's memory when the op leaves `pendingMessages`, never when the caller's future is cancelled.
+  What is counted is unchanged — the payload length after the runtime's compression and encryption — and it is still not a process memory limit.
+  Consequence for fire-and-forget under `ProducerBlock`: a send held back by a full budget owns its message until it reserves, so dropping its future before then cancels it — the message is never published and no error surfaces, only a `debug!`.
+  A producer that drops the futures `send` returns reaches that state once its in-flight publishes fill the budget; await the future, or use `FailImmediately` and observe `MemoryLimitExceeded`.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A `ProducerBlock` send can no longer park forever after a partial release.**
+  The parked-waker `Slab` freed its keys on every release, so a woken send whose re-check still failed re-registered under the same key and then cancelled its "previous" key — its own fresh registration — and was never woken again; the same stale cancel could evict another parked send.
+  Parked sends are now keyed by ids that are never reused, so cancelling a stale id is a no-op.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **A send still pending when the broker acknowledges its producer's close now fails instead of hanging, and releases its bytes.**
+  `close()` stops batch flushing, so a message left in the batch container never reached the broker and its future never resolved.
+  On the close acknowledgement the producer's remaining sends now resolve with a terminal error (`PeerClosed` on both engines), mirroring Java's `ProducerImpl#closeAndClearPendingMessages`.
+  Only the acknowledgement of the close this client last issued for the producer does so, never the late acknowledgement of an older close for a reused producer id (issue #406).
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+### Changed
+
+- **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
+  On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.
+  `magnetar_proto` gains `MemoryLimitController`, `MemoryReservation`, `MemoryWaiterId`, `MemoryLimitExceeded`, `ProducerSlot::queue_send_reserved`, `ProducerState::queue_send_reserved` and `Connection::send_reserved`.
+  `OpSend` gains a crate-private reservation, so it can no longer be constructed outside `magnetar-proto`, and a `reserved_bytes()` accessor; `ProducerState::apply_receipt`, `apply_send_error`, `drain_timed_out_sends`, `drain_pending_sends` and `snapshot_pending_sends` now return the removed `OpSend`s so the caller releases their reservations outside the per-slot lock.
+  The `magnetar` façade surface is unchanged.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
 
 ### Changed
 

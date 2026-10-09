@@ -80,7 +80,8 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
     A holder of `slot.state.lock()` MUST NOT then take the connection-wide mutex.
     The hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection buffer under the global lock via `poll_transmit`.
     The reverse acquisition order deadlocks under contention.
-    ([ADR-0038](specs/adr/0038-split-connection-mutex.md))
+    The client-wide `MemoryLimitController`'s waiter mutex sits below both as a leaf lock: nothing is acquired while it is held, no waker runs under it, and a memory reservation is never dropped under a per-slot mutex.
+    ([ADR-0038](specs/adr/0038-split-connection-mutex.md), [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
 
 ## Workflow
 

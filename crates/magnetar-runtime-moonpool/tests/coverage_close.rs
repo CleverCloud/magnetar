@@ -345,8 +345,8 @@ fn connection_shared_debug_implementation() {
 }
 
 /// `EngineError::Debug` for the `MemoryLimitExceeded` arm — the
-/// budget-exceeded variant is constructed through `try_reserve_memory`
-/// inside the engine, but the resulting Display / Debug strings are
+/// budget-exceeded variant is constructed by `Producer::send` from the
+/// client-wide controller's refusal, but the resulting Display / Debug strings are
 /// only formatted by tests / tracing, so the line is otherwise
 /// unexercised.
 #[test]

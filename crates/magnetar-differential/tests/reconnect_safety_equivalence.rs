@@ -302,13 +302,20 @@ fn tokio_memory_projection() -> (bool, usize, bool) {
         memory_limit_policy: magnetar_proto::MemoryLimitPolicy::ProducerBlock,
         ..ConnectionConfig::default()
     });
-    shared.try_reserve_memory(64).expect("fill budget");
+    let full = shared.memory_limit.try_reserve(64).expect("fill budget");
     let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
     let waker = std::task::Waker::from(wake.clone());
-    let parked = shared.try_reserve_memory_or_register(64, &waker).is_err();
-    shared.release_memory(64);
+    let mut waiter = None;
+    let parked = shared
+        .memory_limit
+        .poll_reserve(64, &mut waiter, &waker)
+        .is_pending();
+    drop(full);
     let wake_count = wake.0.load(Ordering::SeqCst);
-    let progressed = shared.try_reserve_memory(64).is_ok();
+    let progressed = shared
+        .memory_limit
+        .poll_reserve(64, &mut waiter, &waker)
+        .is_ready();
     (parked, wake_count, progressed)
 }
 
@@ -318,13 +325,20 @@ fn moonpool_memory_projection() -> (bool, usize, bool) {
         memory_limit_policy: magnetar_proto::MemoryLimitPolicy::ProducerBlock,
         ..ConnectionConfig::default()
     });
-    shared.try_reserve_memory(64).expect("fill budget");
+    let full = shared.memory_limit.try_reserve(64).expect("fill budget");
     let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
     let waker = std::task::Waker::from(wake.clone());
-    let parked = shared.try_reserve_memory_or_register(64, &waker).is_err();
-    shared.release_memory(64);
+    let mut waiter = None;
+    let parked = shared
+        .memory_limit
+        .poll_reserve(64, &mut waiter, &waker)
+        .is_pending();
+    drop(full);
     let wake_count = wake.0.load(Ordering::SeqCst);
-    let progressed = shared.try_reserve_memory(64).is_ok();
+    let progressed = shared
+        .memory_limit
+        .poll_reserve(64, &mut waiter, &waker)
+        .is_ready();
     (parked, wake_count, progressed)
 }
 

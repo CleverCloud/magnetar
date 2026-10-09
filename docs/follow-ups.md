@@ -32,6 +32,8 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection) | 🧠 needs design decision |
 | 20  | [No deadline on a pending `ProducerOpen` / `Subscribe` request](#20-no-deadline-on-a-pending-produceropen--subscribe-request)                            | ⚡ ready to dispatch     |
 | 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
+| 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                       | 🟡 deferred              |
+| 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                   | ⚡ ready to dispatch     |
 
 ---
 
@@ -139,6 +141,22 @@ That reproduces the issue #451 symptom exactly — every publish resolves `code=
 
 **Why it stays open.** It is shared by every re-attach path — the ADR-0080 retry leg, the reconnect rebuilds, the issue #307 consumer re-subscribe and ADR-0106's producer re-attach — so it belongs to the request-deadline surface as a whole, not to any one of them.
 Java covers it with `operationTimeout` applied to every pending request; the equivalent here is a per-kind deadline on `pending_requests` plus the terminalization each kind already has.
+
+## 22. Memory reservations of publishes the broker will never answer
+
+**Gap.** Since [ADR-0111](../specs/adr/0111-share-one-memory-limit-controller-per-client.md) a publish holds its bytes against the client-wide `memory_limit` until its op leaves the pending queue, so an op the broker will never answer holds budget for EVERY producer of the client until something fails it.
+Two known cases: batched sends already flushed but unacknowledged when the broker closes the producer and it re-attaches in place ([ADR-0106](../specs/adr/0106-reattach-broker-closed-producer-in-place.md)) — their per-message ops carry empty `replay_frames`, so `ProducerState::replay_pending_outbound` never re-sends them — and the sends of a producer whose `CommandCloseProducer` the broker rejected.
+The default 30 s `send_timeout` fails and releases them; with `send_timeout: None` they are held for the life of the client.
+
+**Why it stays open.** The ops themselves predate ADR-0111 (their futures already hung or timed out); only the budget they hold is new.
+Closing it means failing un-replayable batched ops on an in-place re-attach the way `Connection::reset` already does on a reconnect, and deciding what a rejected close leaves pending — each with the ADR-0024 five layers.
+
+## 23. Dropped send futures leave their outcome behind
+
+**Gap.** When an op resolves — receipt, send error, send timeout, terminal failure, and since ADR-0111 the acknowledgement of its producer's close — `Connection` records an `OpOutcome` under its `PendingOpKey::Send` unconditionally.
+If the caller already dropped its `SendFut`, nothing ever takes that entry, so every fire-and-forget send leaves one permanent `outcomes` entry: the issue #241 leak shape, which the request paths already guard with "record only while a waker is parked".
+
+**Why it stays open.** It predates ADR-0111 on the receipt path, and the fix crosses both engines: the `Send` arms need the same waker-presence guard, and a `SendFut` dropped between the wake and its next poll must still find its outcome, so the guard and the future's `Drop` have to agree on who removes the entry.
 
 ## Notes on this file
 

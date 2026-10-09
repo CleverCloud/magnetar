@@ -69,6 +69,13 @@ pub(crate) struct ConnectionFactory {
     /// `ConnectionConfig` field, preserving source compatibility for
     /// downstream exhaustive config literals.
     pub(crate) operation_retry: Arc<Mutex<magnetar_proto::OperationRetryConfig>>,
+    /// The client-wide publish memory budget (issue #867, ADR-0111). Every
+    /// pool entry — proxy entry, `connections_per_broker` sibling or
+    /// replacement — draws on this one controller, the one the bootstrap
+    /// connection uses, so the configured bytes bound the whole client.
+    /// Like `operation_retry` it rides the factory rather than a new
+    /// `ConnectionConfig` field.
+    pub(crate) memory_limit: Arc<magnetar_proto::MemoryLimitController>,
     /// Optional in-band auth provider for `CommandAuthChallenge`. Each pool
     /// entry shares the same provider, so a refreshed token propagates
     /// naturally across every pinned broker connection.
@@ -328,7 +335,11 @@ impl ProxyConnectionPool {
         )
         .await?;
 
-        let shared = ConnectionShared::with_auth(cfg, self.factory.auth_provider.clone());
+        let shared = ConnectionShared::with_auth_and_memory_limit(
+            cfg,
+            self.factory.auth_provider.clone(),
+            self.factory.memory_limit.clone(),
+        );
         shared
             .inner
             .lock()
@@ -465,6 +476,9 @@ mod tests {
                 ..ConnectionConfig::default()
             },
             operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
+            memory_limit: magnetar_proto::MemoryLimitController::from_config(
+                &ConnectionConfig::default(),
+            ),
             auth_provider: None,
             service_url_provider: None,
             dns_resolver: None,

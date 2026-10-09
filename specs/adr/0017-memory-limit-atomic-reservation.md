@@ -1,6 +1,6 @@
 # ADR-0017 — `memory_limit` runtime accounting via atomic CAS reservation
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0111](0111-share-one-memory-limit-controller-per-client.md): the counter moved off `ConnectionShared` into one client-wide `magnetar_proto::MemoryLimitController`, and a reservation is released when its publish's `OpSend` leaves the client rather than when `SendFut` completes or drops — everything else below remains binding)
 - **Date**: 2026-05-21
 - **Decider**: Florentin Dubois
 - **Tags**: memory, backpressure, producer, java-parity

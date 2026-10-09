@@ -92,6 +92,7 @@ pub mod health_probe;
 pub(crate) mod log_fields;
 pub mod lookup;
 pub mod markers;
+pub mod memory_limit;
 pub mod operation_retry;
 pub mod producer;
 pub mod receiver_queue;
@@ -162,6 +163,9 @@ pub use crate::markers::{
     ClusterMessageId, MarkerDecodeError, MarkersMessageIdData, ReplicatedSubscriptionMarker,
     ReplicatedSubscriptionMarkerDetails, ReplicatedSubscriptionMarkerKind,
     decode_replicated_subscription_marker,
+};
+pub use crate::memory_limit::{
+    MemoryLimitController, MemoryLimitExceeded, MemoryReservation, MemoryWaiterId,
 };
 pub use crate::operation_retry::{OperationKind, OperationRetryConfig, is_retryable_broker_error};
 pub use crate::producer::{ProducerIdentity, ProducerSlot, ProducerStats};

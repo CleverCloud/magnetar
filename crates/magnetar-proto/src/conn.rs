@@ -41,8 +41,9 @@ use crate::error::ProtocolError;
 use crate::event::{ConnectionEvent, IncomingMessage, LookupOutcome, TxnRoundTrip};
 use crate::frame::{Frame, decode_one, encode_command, encode_payload, encode_payload_head};
 use crate::lookup::{LookupRegistry, LookupRequest, LookupSubmitError, is_partition_topic};
+use crate::memory_limit::MemoryReservation;
 use crate::pb;
-use crate::producer::{ProducerState, SendDecision};
+use crate::producer::{OpSend, ProducerState, SendDecision};
 use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
 use crate::txn::{TxnAction, TxnClient, TxnId};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
@@ -355,6 +356,10 @@ const BATCH_RESET_ERROR_CODE: i32 = -1;
 
 /// Message paired with [`BATCH_RESET_ERROR_CODE`].
 const BATCH_RESET_ERROR_MESSAGE: &str = "batched send cannot be replayed after connection reset";
+
+/// Terminal reason for a publish still pending when the broker acknowledged its producer's
+/// `CommandCloseProducer` (see `Connection::fail_sends_of_closed_producer`).
+const PRODUCER_CLOSED_REASON: &str = "producer closed before the send was acknowledged";
 
 /// Local error used when a caller supplies inconsistent producer-batch coordinates.
 const INVALID_BATCH_ACK_CODE: i32 = -1;
@@ -1015,14 +1020,15 @@ impl Connection {
                         w.wake();
                     }
                 }
-                for (seq, waker_opt) in dropped {
+                for mut op in dropped {
                     self.resolve_send_error(
                         handle,
-                        seq,
+                        op.sequence_id,
                         BATCH_RESET_ERROR_CODE,
                         BATCH_RESET_ERROR_MESSAGE,
-                        waker_opt,
+                        op.waker.take(),
                     );
+                    // Dropping the op releases its memory reservation (ADR-0111).
                 }
                 if !snapshots.is_empty() {
                     self.in_flight_publish_snapshots
@@ -1228,24 +1234,7 @@ impl Connection {
                 slot_state.drain_pending_sends()
             });
             let Some(drained) = drained else { continue };
-            for (seq, waker_opt) in drained {
-                let key = PendingOpKey::Send(handle, seq);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                // Prefer the producer-stored waker; drop any connection-level
-                // slab waker for this key too so it is not double-fired below.
-                if let Some(w) = waker_opt {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
+            self.terminalize_drained_sends(handle, drained, reason);
         }
 
         // (2b) Issue #369, Change 2 (separable from Change 1 — a reviewer can drop this
@@ -1383,22 +1372,7 @@ impl Connection {
             slot_state.drain_pending_sends()
         });
         if let Some(drained) = drained {
-            for (seq, waker_opt) in drained {
-                let key = PendingOpKey::Send(handle, seq);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                if let Some(w) = waker_opt {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
+            self.terminalize_drained_sends(handle, drained, reason);
         }
         // Sends extracted by `reset()` no longer live in the producer slot.
         // Terminalize those replay snapshots too; their futures re-registered
@@ -2340,7 +2314,7 @@ impl Connection {
                     sequence_id = receipt.sequence_id,
                     "send receipt received"
                 );
-                let resolved: Vec<(SequenceId, MessageId, Option<Waker>)> =
+                let resolved: Vec<(OpSend, MessageId)> =
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
                         // Batched sends now mint a per-message `OpSend` (`add_to_batch`); a
@@ -2362,7 +2336,7 @@ impl Connection {
                         } else {
                             lowest
                         };
-                        let mut resolved: Vec<(SequenceId, MessageId, Option<Waker>)> = Vec::new();
+                        let mut resolved: Vec<(OpSend, MessageId)> = Vec::new();
                         for seq in lowest..=highest {
                             let mut synth = receipt.clone();
                             synth.sequence_id = seq;
@@ -2381,7 +2355,11 @@ impl Connection {
                         Vec::new()
                     };
                 if !resolved.is_empty() {
-                    for (seq, mid, waker) in resolved {
+                    // The per-slot guard is gone: each op's memory reservation is released
+                    // when it drops at the end of its iteration (ADR-0111).
+                    for (mut op, mid) in resolved {
+                        let seq = op.sequence_id;
+                        let waker = op.waker.take();
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
                             key,
@@ -2408,7 +2386,7 @@ impl Connection {
                     "missing CommandSendError",
                 ))?;
                 let handle = ProducerHandle(err.producer_id);
-                let resolved: Option<(SequenceId, Option<Waker>, i32, String)> = if let Some(slot) =
+                let resolved: Option<(OpSend, i32, String)> = if let Some(slot) =
                     self.producers.get(&handle)
                 {
                     let mut producer = slot.state.lock();
@@ -2420,7 +2398,11 @@ impl Connection {
                 } else {
                     None
                 };
-                if let Some((seq, waker, code, message)) = resolved {
+                // The op drops (releasing its memory reservation) at the end of this block,
+                // after the per-slot guard is gone (ADR-0111).
+                if let Some((mut op, code, message)) = resolved {
+                    let seq = op.sequence_id;
+                    let waker = op.waker.take();
                     let key = PendingOpKey::Send(handle, seq);
                     self.outcomes.insert(
                         key,
@@ -2695,6 +2677,13 @@ impl Connection {
                         self.wake_for_request(request_id);
                     }
                     None => {}
+                }
+                if let Some(
+                    PendingRequestKind::ProducerClose { handle }
+                    | PendingRequestKind::ProducerCloseForgotten { handle },
+                ) = kind
+                {
+                    self.fail_sends_of_closed_producer(handle, request_id);
                 }
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     let (waiter_id, flow_now) = self
@@ -4600,12 +4589,12 @@ impl Connection {
         // Per-producer send-timeout sweep. Surface each timed-out send as an
         // `OpOutcome::SendError` so the caller's send future resolves with the configured
         // timeout error.
-        let mut send_timeouts: Vec<(ProducerHandle, SequenceId, Option<Waker>)> = Vec::new();
+        let mut send_timeouts: Vec<(ProducerHandle, OpSend)> = Vec::new();
         for (handle, slot) in &self.producers {
             let mut producer = slot.state.lock();
-            for (seq, waker) in producer.drain_timed_out_sends(now) {
+            for op in producer.drain_timed_out_sends(now) {
                 producer.total_send_failed = producer.total_send_failed.saturating_add(1);
-                send_timeouts.push((*handle, seq, waker));
+                send_timeouts.push((*handle, op));
             }
             // ADR-0089: rolling-rate sample for this producer — the PRODUCER-side
             // twin of the tick in the CONSUMER loop above, taken under the
@@ -4616,11 +4605,18 @@ impl Connection {
                 producer.record_rate_window(now);
             }
         }
-        for (handle, seq, waker) in send_timeouts {
+        for (handle, mut op) in send_timeouts {
             // Pulsar's ServerError enum has no TimeoutError; use the same `-1` sentinel
             // Java surfaces as TimeoutException with a descriptive message so callers can
-            // pattern-match on the error string.
-            self.resolve_send_error(handle, seq, SEND_TIMEOUT_CODE, SEND_TIMEOUT_MESSAGE, waker);
+            // pattern-match on the error string. Dropping the op afterwards releases its
+            // memory reservation, outside every per-slot lock (ADR-0111).
+            self.resolve_send_error(
+                handle,
+                op.sequence_id,
+                SEND_TIMEOUT_CODE,
+                SEND_TIMEOUT_MESSAGE,
+                op.waker.take(),
+            );
         }
 
         // Issue #369: send-timeout sweep for publishes RELOCATED by `reset()` into
@@ -4744,6 +4740,62 @@ impl Connection {
                     result: Err(message),
                 });
             }
+        }
+    }
+
+    /// Install an `OpOutcome::Terminal` for each op drained out of `handle`'s pending queue and
+    /// wake its future — through the op's own waker when it still carries one, through the
+    /// connection-wide slab otherwise. Each op is dropped after its wake, which releases its
+    /// memory reservation (ADR-0111); the caller has already released the per-slot lock.
+    ///
+    /// Shared by [`Self::fail_all_pending`], [`Self::fail_producer_open_with_broker_error`]
+    /// and [`Self::fail_sends_of_closed_producer`].
+    fn terminalize_drained_sends(
+        &mut self,
+        handle: ProducerHandle,
+        drained: Vec<OpSend>,
+        reason: &str,
+    ) {
+        for mut op in drained {
+            let key = PendingOpKey::Send(handle, op.sequence_id);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            // Prefer the producer-stored waker; drop any connection-level slab waker for
+            // this key too so it is not double-fired by a later sweep.
+            let slab_waker = self.wakers.remove(&key);
+            if let Some(w) = op.waker.take().or(slab_waker) {
+                w.wake();
+            }
+        }
+    }
+
+    /// Fail every publish of a producer whose `CommandCloseProducer` the broker acknowledged.
+    ///
+    /// Once the broker has acknowledged the close, the producer id is gone on its side, so
+    /// no receipt can ever arrive for whatever is still pending here — typically messages
+    /// still in the batch container, which `close` stops flushing. Mirrors Java
+    /// `ProducerImpl#closeAndClearPendingMessages`: the futures fail and the memory
+    /// reservations are released (issue #867, ADR-0111), instead of both lingering for as
+    /// long as the connection keeps the closed slot.
+    ///
+    /// Only the acknowledgement of the close this client last issued for the slot
+    /// (`close_request`) drains it: the fire-and-forget re-close of an abandoned producer id
+    /// (issue #406) can be acknowledged after [`Self::create_producer`] re-attached a new
+    /// producer under the same id — open, or since closed by its own user — and that
+    /// producer's sends must not be failed by the old id's close.
+    fn fail_sends_of_closed_producer(&mut self, handle: ProducerHandle, acked: RequestId) {
+        let drained = self.producers.get(&handle).and_then(|slot| {
+            let mut state = slot.state.lock();
+            (state.close_request == Some(acked)).then(|| state.drain_pending_sends())
+        });
+        if let Some(drained) = drained {
+            self.terminalize_drained_sends(handle, drained, PRODUCER_CLOSED_REASON);
+            self.terminalize_snapshot_bucket(handle, PRODUCER_CLOSED_REASON);
         }
     }
 
@@ -5490,20 +5542,50 @@ impl Connection {
         publish_time_ms: u64,
         now: Instant,
     ) -> Result<SequenceId, ProtocolError> {
+        self.send_reserved(
+            handle,
+            msg,
+            MemoryReservation::default(),
+            publish_time_ms,
+            now,
+        )
+    }
+
+    /// [`Self::send`] for a publish that already holds `reservation` against the client-wide
+    /// memory budget (issue #867, ADR-0111). The reservation moves into the publish's
+    /// [`OpSend`] and is released when that op leaves the client; on rejection it is released
+    /// here, after the per-slot guard is gone.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::send`].
+    pub fn send_reserved(
+        &mut self,
+        handle: ProducerHandle,
+        msg: crate::producer::OutgoingMessage,
+        reservation: MemoryReservation,
+        publish_time_ms: u64,
+        now: Instant,
+    ) -> Result<SequenceId, ProtocolError> {
+        let mut reservation = reservation;
         let slot = self
             .producers
             .get(&handle)
             .ok_or(ProtocolError::InvariantViolation("unknown producer handle"))?;
-        let seq_id = {
+        let queued = {
             let mut producer = slot.state.lock();
-            let decision = producer
-                .queue_send(msg, publish_time_ms, now)
-                .map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
-            match decision {
-                SendDecision::Emit { .. } | SendDecision::Batched => {}
-            }
-            SequenceId(producer.last_sequence_id_pushed.max(0) as u64)
+            producer
+                .queue_send_reserved(msg, &mut reservation, publish_time_ms, now)
+                .map(|decision| {
+                    match decision {
+                        SendDecision::Emit { .. } | SendDecision::Batched => {}
+                    }
+                    SequenceId(producer.last_sequence_id_pushed.max(0) as u64)
+                })
         };
+        drop(reservation);
+        let seq_id =
+            queued.map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
         self.drain_producer_outbound();
         Ok(seq_id)
     }
@@ -6716,7 +6798,10 @@ impl Connection {
         };
         let _ = self.encode_command(&base);
         if let Some(slot) = self.producers.get(&handle) {
-            slot.state.lock().close();
+            let mut state = slot.state.lock();
+            state.close();
+            state.close_request = Some(request_id);
+            drop(state);
             slot.set_routing_ready(false);
         }
         let kind = if forget {
@@ -20222,6 +20307,473 @@ mod dead_letter_flow_refund_tests {
                 .lock()
                 .is_flow_starved(),
             "permits alone must no longer wedge a poison-fed Shared consumer (#437)",
+        );
+    }
+}
+
+/// Issue #867 / ADR-0111: a publish's client-wide memory reservation lives
+/// in its `OpSend` and is released exactly once, when the op leaves the
+/// client — receipt, send error, send timeout, producer close, producer-open
+/// failure, terminal connection failure, or a non-replayable batch reset —
+/// while a reset snapshot keeps it.
+#[cfg(test)]
+mod memory_limit_release_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::MemoryLimitController;
+    use crate::producer::OutgoingMessage;
+
+    fn feed(conn: &mut Connection, at: Instant, cmd: &pb::BaseCommand) {
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, cmd).expect("encode");
+        conn.handle_bytes(at, &buf).expect("handle");
+    }
+
+    fn handshaked(at: Instant) -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(SystemTime::now),
+        );
+        conn.begin_handshake().expect("begin");
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        conn
+    }
+
+    fn open_producer(
+        conn: &mut Connection,
+        at: Instant,
+        request: CreateProducerRequest,
+    ) -> ProducerHandle {
+        let rid = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(request);
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: rid.0,
+                    producer_name: format!("p-{}", handle.0),
+                    last_sequence_id: Some(-1),
+                    schema_version: None,
+                    topic_epoch: None,
+                    producer_ready: Some(true),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+        handle
+    }
+
+    fn request(topic: &str) -> CreateProducerRequest {
+        CreateProducerRequest {
+            topic: format!("persistent://public/default/{topic}"),
+            send_timeout: None,
+            ..Default::default()
+        }
+    }
+
+    fn msg(len: usize) -> OutgoingMessage {
+        OutgoingMessage {
+            payload: bytes::Bytes::from(vec![7; len]),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: len as u32,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        }
+    }
+
+    fn budget(limit: u64) -> Arc<MemoryLimitController> {
+        MemoryLimitController::new(limit, MemoryLimitPolicy::FailImmediately)
+    }
+
+    fn send(
+        conn: &mut Connection,
+        handle: ProducerHandle,
+        budget: &Arc<MemoryLimitController>,
+        len: usize,
+        at: Instant,
+    ) -> SequenceId {
+        let reservation = budget.try_reserve(len as u64).expect("fits the budget");
+        conn.send_reserved(handle, msg(len), reservation, 0, at)
+            .expect("queued")
+    }
+
+    fn success(request_id: RequestId) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: request_id.0,
+                schema: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn receipt_and_send_error_release_through_the_connection() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("mem-receipt"));
+        let budget = budget(100);
+        let s0 = send(&mut conn, handle, &budget, 10, at);
+        let s1 = send(&mut conn, handle, &budget, 20, at);
+        assert_eq!(budget.used_bytes(), 30);
+
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: s0.0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 0,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 20, "the receipt released s0");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, s0)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: s1.0,
+                    error: pb::ServerError::PersistenceError as i32,
+                    message: "rejected".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 0, "the send error released s1");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, s1)),
+            Some(OpOutcome::SendError { .. })
+        ));
+    }
+
+    #[test]
+    fn send_reserved_releases_a_rejected_reservation() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let budget = budget(100);
+        let unknown = conn.send_reserved(
+            ProducerHandle(4242),
+            msg(8),
+            budget.try_reserve(8).expect("fits"),
+            0,
+            at,
+        );
+        assert!(unknown.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+
+        let handle = open_producer(&mut conn, at, request("mem-rejected"));
+        let _close = conn.close_producer(handle);
+        let closed =
+            conn.send_reserved(handle, msg(8), budget.try_reserve(8).expect("fits"), 0, at);
+        assert!(closed.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn close_ack_fails_pending_sends_and_releases_them() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let batching = |topic: &str| CreateProducerRequest {
+            enable_batching: true,
+            ..request(topic)
+        };
+        let closed = open_producer(&mut conn, at, batching("mem-close"));
+        let forgotten = open_producer(&mut conn, at, batching("mem-close-forget"));
+        let budget = budget(100);
+        // Batched with no publish delay: the bytes are reserved and nothing
+        // reaches the wire on its own.
+        let s_closed = send(&mut conn, closed, &budget, 30, at);
+        let s_forgotten = send(&mut conn, forgotten, &budget, 40, at);
+        assert_eq!(budget.used_bytes(), 70);
+
+        let close = conn.close_producer(closed);
+        assert_eq!(
+            budget.used_bytes(),
+            70,
+            "nothing is released before the broker acks"
+        );
+        feed(&mut conn, at, &success(close));
+        assert_eq!(budget.used_bytes(), 40);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(closed, s_closed)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(conn.producer_pending_count(closed), 0);
+
+        let forget = conn.close_producer_forget(forgotten);
+        feed(&mut conn, at, &success(forget));
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(forgotten, s_forgotten)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    /// Every command the connection has staged for the wire, decoded.
+    fn transmitted(conn: &mut Connection) -> Vec<pb::BaseCommand> {
+        let mut wire = conn.poll_transmit();
+        let mut commands = Vec::new();
+        while !wire.is_empty() {
+            commands.push(decode_one(&mut wire).expect("decode").command);
+        }
+        commands
+    }
+
+    /// Request ids of the `CommandCloseProducer`s staged for `handle`.
+    fn closes_of(commands: &[pb::BaseCommand], handle: ProducerHandle) -> Vec<RequestId> {
+        commands
+            .iter()
+            .filter_map(|c| c.close_producer.as_ref())
+            .filter(|c| c.producer_id == handle.0)
+            .map(|c| RequestId(c.request_id))
+            .collect()
+    }
+
+    /// Request id of the single `CommandProducer` staged in `commands`.
+    fn open_of(commands: &[pb::BaseCommand]) -> RequestId {
+        let opens: Vec<_> = commands
+            .iter()
+            .filter_map(|c| c.producer.as_ref())
+            .collect();
+        assert_eq!(opens.len(), 1, "one CommandProducer");
+        RequestId(opens[0].request_id)
+    }
+
+    /// Drive issue #406's recovery for real: an open is abandoned (its
+    /// cancel-time fire-and-forget close goes out), the retry is answered
+    /// `ProducerBusy` (the abandoned id is re-closed, fire-and-forget again),
+    /// and the next open re-attaches a NEW producer under the abandoned id.
+    /// Returns the re-attached handle and the two unacknowledged old closes.
+    fn reattach_under_an_abandoned_id(
+        conn: &mut Connection,
+        at: Instant,
+    ) -> (ProducerHandle, [RequestId; 2]) {
+        let pinned = || CreateProducerRequest {
+            producer_name: Some("pinned-867".to_owned()),
+            ..request("mem-close-reused")
+        };
+        let abandoned = conn.create_producer(pinned());
+        let _ = transmitted(conn);
+        conn.cancel_producer_open(abandoned);
+        let cancel_close = closes_of(&transmitted(conn), abandoned);
+        assert_eq!(
+            cancel_close.len(),
+            1,
+            "cancellation closes the abandoned id"
+        );
+
+        let retry = conn.create_producer(pinned());
+        assert_ne!(retry, abandoned);
+        let retry_open = open_of(&transmitted(conn));
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: retry_open.0,
+                    error: pb::ServerError::ProducerBusy as i32,
+                    message: "Producer with name 'pinned-867' is already connected".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        let reclose = closes_of(&transmitted(conn), abandoned);
+        assert_eq!(reclose.len(), 1, "ProducerBusy re-closes the abandoned id");
+
+        let reattached = conn.create_producer(pinned());
+        assert_eq!(
+            reattached, abandoned,
+            "the escalation re-attaches under the abandoned id"
+        );
+        let open = open_of(&transmitted(conn));
+        feed(
+            conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: open.0,
+                    producer_name: "pinned-867".to_owned(),
+                    last_sequence_id: Some(-1),
+                    schema_version: None,
+                    topic_epoch: None,
+                    producer_ready: Some(true),
+                }),
+                ..Default::default()
+            },
+        );
+        while conn.poll_event().is_some() {}
+        (reattached, [cancel_close[0], reclose[0]])
+    }
+
+    /// The old id's fire-and-forget closes (issue #406) may be acknowledged
+    /// after a new producer re-attached under the same id; their acks must not
+    /// fail that producer's sends.
+    #[test]
+    fn close_ack_for_a_reused_open_producer_id_fails_nothing() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let (handle, old_closes) = reattach_under_an_abandoned_id(&mut conn, at);
+        let budget = budget(100);
+        let seq = send(&mut conn, handle, &budget, 25, at);
+        for old in old_closes {
+            feed(&mut conn, at, &success(old));
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            1,
+            "the send stays pending"
+        );
+        assert_eq!(budget.used_bytes(), 25, "and keeps its reservation");
+        assert!(conn.take_outcome(PendingOpKey::Send(handle, seq)).is_none());
+    }
+
+    /// A producer re-attached under a reused id and then closed by the user
+    /// is drained by the ack of ITS close, never by the late ack of an old
+    /// close for the same id.
+    #[test]
+    fn only_the_ack_of_the_producers_own_close_fails_its_sends() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let (handle, old_closes) = reattach_under_an_abandoned_id(&mut conn, at);
+        let budget = budget(100);
+        let seq = send(&mut conn, handle, &budget, 25, at);
+        let own_close = conn.close_producer(handle);
+        for old in old_closes {
+            feed(&mut conn, at, &success(old));
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            1,
+            "an old close's ack must not fail the re-attached producer's sends"
+        );
+        assert_eq!(budget.used_bytes(), 25);
+
+        feed(&mut conn, at, &success(own_close));
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert_eq!(budget.used_bytes(), 0, "its own close's ack releases them");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, seq)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    #[test]
+    fn reset_releases_unreplayable_batches_and_keeps_retained_publishes() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let batched = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-reset-batched")
+            },
+        );
+        let plain = open_producer(&mut conn, at, request("mem-reset-plain"));
+        let budget = budget(100);
+        let s_batched = send(&mut conn, batched, &budget, 30, at);
+        let _ = conn.flush_producer(batched, 0, at);
+        let _s_plain = send(&mut conn, plain, &budget, 20, at);
+        assert_eq!(budget.used_bytes(), 50);
+
+        conn.reset();
+        assert_eq!(
+            budget.used_bytes(),
+            20,
+            "the non-replayable batch is failed and released; the retained publish keeps its bytes"
+        );
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(batched, s_batched)),
+            Some(OpOutcome::SendError { .. })
+        ));
+        assert_eq!(conn.in_flight_publish_snapshot_len(plain), 1);
+
+        conn.fail_all_pending("gave up");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "terminal failure releases the snapshot"
+        );
+    }
+
+    #[test]
+    fn terminal_failures_and_timeouts_release_live_sends() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let timed = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                send_timeout: Some(Duration::from_secs(1)),
+                ..request("mem-timeout")
+            },
+        );
+        let failed = open_producer(&mut conn, at, request("mem-open-failed"));
+        let live = open_producer(&mut conn, at, request("mem-terminal"));
+        let budget = budget(100);
+        let s_timed = send(&mut conn, timed, &budget, 10, at);
+        let _ = send(&mut conn, failed, &budget, 20, at);
+        let _ = send(&mut conn, live, &budget, 30, at);
+        assert_eq!(budget.used_bytes(), 60);
+
+        conn.handle_timeout(at + Duration::from_secs(2));
+        assert_eq!(budget.used_bytes(), 50, "the send timeout released its op");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(timed, s_timed)),
+            Some(OpOutcome::SendError { .. })
+        ));
+
+        conn.fail_producer_open(failed, "open failed");
+        assert_eq!(
+            budget.used_bytes(),
+            30,
+            "a terminal producer failure releases its ops"
+        );
+
+        conn.fail_all_pending("connection gone");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "a terminal connection failure releases every op"
         );
     }
 }

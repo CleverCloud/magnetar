@@ -28,7 +28,7 @@
 //! race to make the outcome seed-dependent (ADR-0011, ADR-0036).
 //!
 //! Determinism note: the reservation is a lock-free CAS on an `AtomicU64`
-//! (`ConnectionShared::try_reserve_memory`), not a scheduled timer, so it
+//! (`MemoryLimitController::try_reserve`, ADR-0111), not a scheduled timer, so it
 //! never perturbs the simulated schedule. Every seed is bit-for-bit
 //! reproducible.
 //!
@@ -593,23 +593,33 @@ fn moonpool_producer_block_waiter_progresses_after_budget_release() {
         memory_limit_policy: MemoryLimitPolicy::ProducerBlock,
         ..ConnectionConfig::default()
     });
-    shared
-        .try_reserve_memory(LIMIT_BYTES)
+    let first = shared
+        .memory_limit
+        .try_reserve(LIMIT_BYTES)
         .expect("first send fills budget");
     let wake = std::sync::Arc::new(CountingWake(std::sync::atomic::AtomicUsize::new(0)));
     let waker = std::task::Waker::from(wake.clone());
-    let token = shared
-        .try_reserve_memory_or_register(LIMIT_BYTES, &waker)
-        .expect_err("second send must park while budget is full");
+    let mut waiter = None;
+    assert!(
+        shared
+            .memory_limit
+            .poll_reserve(LIMIT_BYTES, &mut waiter, &waker)
+            .is_pending(),
+        "second send must park while budget is full"
+    );
 
-    shared.release_memory(LIMIT_BYTES);
+    drop(first);
     assert_eq!(
         wake.0.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "releasing the first send wakes the parked ProducerBlock waiter"
     );
-    shared.cancel_memory_waker(token);
-    shared
-        .try_reserve_memory(LIMIT_BYTES)
-        .expect("woken second send can reserve the released budget");
+    assert!(
+        shared
+            .memory_limit
+            .poll_reserve(LIMIT_BYTES, &mut waiter, &waker)
+            .is_ready(),
+        "woken second send can reserve the released budget"
+    );
+    assert_eq!(shared.memory_limit.parked_waiters(), 0);
 }
