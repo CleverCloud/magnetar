@@ -3399,7 +3399,7 @@ impl Connection {
                 // MIRRORS to 0 here so they track broker reality. Without this
                 // `granted_permits` stays stale (it is purely additive on the
                 // client side; it is never decremented as messages arrive).
-                // Issue #349: `permit_balance` (the REAL, decrementing balance)
+                // Issue #349: `permit_balance` (the client-accounted, decrementing balance)
                 // is zeroed in lock-step for the same reason — this is a churn
                 // boundary, not a natural drain, so both mirrors reset together.
                 // `consumed_since_flow` is reset in lock-step so the
@@ -3557,12 +3557,12 @@ impl Connection {
                 // rather than a second `receiver_queue_size` the broker would hold.
                 // Starved-corner extension (#331 lineage): `granted_permits` is the
                 // ADDITIVE mirror, so a consumer that was fed once and then drained
-                // to a real balance of zero — with too little queued to ever cross
+                // to a client-accounted balance of zero — with too little queued to ever cross
                 // the `maybe_flow` threshold again — fails the `== 0` gate forever.
                 // Promotion is its only exit: `maybe_flow` is provably unreachable
                 // (nothing left to pop), and the #414 stall watchdog requires
                 // `permit_balance > 0` for candidacy. `is_flow_starved` is that
-                // exact predicate, computed against the real balance (#349).
+                // exact predicate, computed against the client-accounted balance (#349).
                 let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
                     let mut consumer = slot.state.lock();
                     consumer.record_active_change(active);
@@ -4442,9 +4442,9 @@ impl Connection {
                 handle = ?handle,
                 permit_balance,
                 stalled_for_ms,
-                "consumer holds un-spent broker permits over an empty queue but has \
-                 received no dispatch for the stall window; the broker-side dispatcher \
-                 may be wedged (#414)"
+                "consumer has a positive client-accounted permit balance over an empty queue \
+                 but received no dispatch for the stall window; correlate actual delivery \
+                 and broker per-consumer statistics before attributing a stall (#414)"
             );
             self.events.push_back(ConnectionEvent::ConsumerStalled {
                 handle,
@@ -4461,9 +4461,9 @@ impl Connection {
             // returns `Some` at most once per stall episode, and an episode cannot close
             // more often than once per `consumer_stall_timeout`, so this can emit at most
             // one `CommandSubscribe` per consumer per window. The bound then caps the
-            // total, which is what stops a dispatcher-WIDE fault (issue #414's production
-            // shape: one fresh receiver-queue grant per attempt against an aggregate
-            // observed at `-177300`) from turning into an unbounded re-subscribe loop.
+            // total, which keeps a dispatcher-wide stall (as reported in issue #414)
+            // from turning into an unbounded re-subscribe loop. The incident's
+            // `-177300` was one ghost consumer's counter, not a measured aggregate.
             if let Some(max_attempts) = self.config.consumer_stall_auto_recovery {
                 let (attempts, is_active) = self.consumers.get(&handle).map_or((0, None), |slot| {
                     let consumer = slot.state.lock();
@@ -4533,9 +4533,9 @@ impl Connection {
                         max_attempts,
                         "stall watchdog exhausted its automatic in-place re-subscribe budget \
                          and is giving up on this consumer; the broker-side dispatcher is \
-                         likely wedged subscription-wide — check the broker's own \
-                         availablePermits for the subscription and escalate to \
-                         `pulsar-admin topics unload` (#414)"
+                         possibly stalled subscription-wide — check broker backlog, \
+                         per-consumer availablePermits, and actual delivery before \
+                         escalating to `pulsar-admin topics unload` (#414)"
                     );
                 }
             }
@@ -5437,7 +5437,7 @@ impl Connection {
         let Some(flow_cmd) = ({
             let mut consumer = self.consumers.get(&handle)?.state.lock();
             // `is_flow_starved` (issue #331 lineage): a previously-fed consumer whose
-            // real balance drained to zero with no way to reach `maybe_flow` again is
+            // client-accounted balance drained to zero with no way to reach `maybe_flow` again is
             // owed a grant exactly as much as an untouched one — the additive
             // `granted_permits` mirror alone cannot see the difference between "fed
             // and healthy" and "fed and starved". The predicate is `false` whenever
@@ -5684,12 +5684,12 @@ impl Connection {
             .map_or(0, |slot| slot.state.lock().queue.len())
     }
 
-    /// Number of dispatch permits the consumer still has with the broker — i.e. messages
-    /// it has authorised the broker to push and the broker has not yet spent. Returns `0`
-    /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    /// Client-accounted unspent dispatch permits: grants recorded locally minus dispatch
+    /// units received. Returns `0` for unknown handles. Mirrors the arithmetic of Java
+    /// `ConsumerBase#getAvailablePermits`, not broker admin `consumers[].availablePermits`.
     ///
-    /// Reads [`crate::consumer::ConsumerState::permit_balance`], the REAL decrementing
-    /// balance: one unit off per broker dispatch unit (plain message, batch member,
+    /// Reads [`crate::consumer::ConsumerState::permit_balance`], the local decrementing
+    /// estimate: one unit off per received dispatch unit (plain message, batch member,
     /// buffered chunk, PIP-33 marker), topped back up at every grant, and force-zeroed at
     /// every churn boundary.
     ///
@@ -5698,10 +5698,10 @@ impl Connection {
     /// counters but deliberately left this accessor on the additive one as out of scope.
     /// The additive value makes the wedge issue #414 reports undetectable from the
     /// client: it sits at the receiver-queue size forever whether the broker is
-    /// dispatching or has gone silent, so an application polling it can never tell a
-    /// draining consumer from a dead one. `permit_balance` moves under real dispatch,
-    /// which is both what Java's `getAvailablePermits` means and what makes the accessor
-    /// a usable liveness probe. ADR-0101 amends ADR-0082 §Consequences accordingly.
+    /// dispatching or has gone silent, so polling it cannot reveal dispatch silence.
+    /// `permit_balance` moves under real dispatch and supplies a client-side silence
+    /// signal; correlate it with broker stats and delivery before attributing a wedge.
+    /// ADR-0101 amends ADR-0082 §Consequences accordingly.
     ///
     /// For "how much have we told the broker it may use" — the question the #307
     /// failover-reflow gate and the `adjust_receiver_queue` want-have delta ask — read
@@ -8128,10 +8128,11 @@ impl Connection {
     ///
     /// # Scope
     ///
-    /// This repairs **this client's own slot** in the broker's dispatcher. Issue #414's
-    /// production failure is a dispatcher-WIDE corruption (the subscription's
-    /// `availablePermits` observed at `-177300` across every attached consumer) and this
-    /// does not clear it: the escalation is an operator-side `pulsar-admin topics unload`.
+    /// This repairs **this client's own slot** in the broker's dispatcher. Issue #414
+    /// observed `availablePermits = -177300` on one ghost consumer with an empty name,
+    /// while all fresh consumers stopped progressing; it did not measure an aggregate.
+    /// This operation alone cannot prove subscription-wide recovery; the escalation
+    /// is an operator-side `pulsar-admin topics unload`.
     /// See
     /// [`docs/consumer-stall-recovery.md`](https://github.com/CleverCloud/magnetar/blob/main/docs/consumer-stall-recovery.md).
     pub fn resubscribe_consumer_in_place(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
@@ -15783,7 +15784,7 @@ mod conn_state_tests {
 
     #[test]
     fn auto_policy_grows_target_under_starvation_and_emits_incremental_flow() {
-        // Issue #349: the broker's real permit BALANCE is drained by genuine
+        // Issue #349: the client-accounted permit balance is drained by genuine
         // dispatch (not a synthetic field write) and the byte budget is wide
         // open — the adjust tick doubles the target and emits an incremental
         // flow for the delta.
@@ -15791,7 +15792,7 @@ mod conn_state_tests {
         let t0 = Instant::now();
         let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
 
-        // Drain the broker-side permit BALANCE via real dispatch — 100
+        // Drain the client-accounted permit balance via real dispatch — 100
         // single-message deliveries against the 100-permit initial grant —
         // so `available_permits == 0` is the genuine starvation signal at
         // tick time, not a manually-zeroed mirror.
@@ -15829,9 +15830,9 @@ mod conn_state_tests {
         assert_eq!(
             conn.consumer_available_permits(handle),
             100,
-            "issue #414: the accessor now reports the REAL balance — dispatch drained the \
+            "issue #414: the accessor now reports the client-accounted balance — dispatch drained the \
              initial 100-permit grant to 0, so after the incremental top-up of 100 the \
-             broker holds exactly 100 un-spent permits, not the 200-permit cumulative \
+             client accounts for exactly 100 un-spent permits, not the 200-permit cumulative \
              grant the additive `granted_permits` mirror still records"
         );
         assert_eq!(
@@ -15906,7 +15907,7 @@ mod conn_state_tests {
         // starvation never registered as zero and `Auto` could never
         // observe the starvation signal it needs to grow. This test drives
         // genuine message deliveries — not a synthetic field write — until
-        // the broker-side permit balance is truly exhausted, then asserts
+        // the client-accounted permit balance reaches zero, then asserts
         // the adjust tick grows the target and emits an incremental flow.
         let interval = Duration::from_secs(1);
         let t0 = Instant::now();
@@ -18105,8 +18106,8 @@ mod consumer_stall_and_recovery_tests {
         assert_eq!(
             conn.consumer_available_permits(handle),
             RQ as u32,
-            "phase 1 must not touch the mirrors: the broker still holds this consumer \
-             exactly as it was, and a close it goes on to reject must leave a consumer \
+            "phase 1 must not touch the mirrors: no close has been accepted, and a \
+             close the broker goes on to reject must leave a consumer \
              the watchdog can still see (is_stall_candidate needs permit_balance > 0)"
         );
         let (subs, grants, closes) = drain_outbound_all(&mut conn, handle);
@@ -18271,8 +18272,8 @@ mod consumer_stall_and_recovery_tests {
         assert_eq!(
             conn.consumer_available_permits(handle),
             RQ as u32,
-            "the broker still holds this consumer's permits, so the mirrors must \
-             still describe them — and the watchdog needs permit_balance > 0 to \
+            "the rejected close must leave the client permit mirrors unchanged — \
+             and the watchdog needs permit_balance > 0 to \
              report the consumer at all"
         );
         assert!(
@@ -20190,7 +20191,7 @@ mod dead_letter_flow_refund_tests {
         assert_eq!(
             conn.consumer_available_permits(handle),
             RQ as u32,
-            "and the real balance is back to the full window",
+            "and the client-accounted balance is back to the full window",
         );
         assert_eq!(
             conn.drain_dead_letter(handle).len(),

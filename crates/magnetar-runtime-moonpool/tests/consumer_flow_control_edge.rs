@@ -294,7 +294,7 @@ fn flow_control_replenishes_without_permit_underrun() {
     );
 
     // Invariant 3: permits never under-run. Issue #414 re-pointed
-    // `available_permits` at the REAL decrementing balance, so the exact
+    // `available_permits` at the client-accounted decrementing balance, so the exact
     // arithmetic is now "everything granted, minus everything the broker
     // spent" — which is a strictly stronger statement than the cumulative
     // grant this used to assert, because it ties the wire grants AND the
@@ -403,7 +403,7 @@ fn flow_control_single_permit_window_never_underruns() {
 
         // After each window the broker holds exactly what it has been granted
         // minus what it has spent. Issue #414 re-pointed `available_permits` at
-        // the REAL balance, so a single-message window settles back at exactly
+        // the client-accounted balance, so a single-message window settles back at exactly
         // `RQ` after every push/pop pair rather than climbing with the
         // cumulative grant — the strictly stronger statement, since it pins the
         // dispatch side too.

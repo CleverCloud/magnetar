@@ -11,14 +11,15 @@
 //!
 //! Issue #414: a Pulsar **Shared** subscription wedges broker-side after
 //! consumer churn. The survivors receive their first ~20 messages and then
-//! nothing, forever. The broker's own `availablePermits` for the subscription
-//! goes hugely negative (`-177300` in production), `acks_failed` stays `0`, and
+//! nothing, forever. One ghost consumer with an empty name had broker-reported
+//! `availablePermits = -177300` in production; no aggregate was captured.
+//! `acks_failed` stayed `0`, and
 //! the client reports no error at all — only a superuser `topics unload`
 //! recovers it.
 //!
-//! The wire protocol carries only monotonic client → broker permit increments
-//! (`CommandFlow`), so the client cannot itself drive the broker's counter
-//! negative: the fault is broker-side. What the client CAN do is notice, and
+//! `CommandFlow` carries non-negative grants, but dispatch, detach and client
+//! operation timing also affect broker accounting. This trace cannot attribute
+//! the production ghost-consumer counter. What the client CAN do is notice, and
 //! offer a cheaper first rung on the recovery ladder than unloading the topic.
 //! The connection keepalive of ADR-0058 is no help — `PING` / `PONG` keeps
 //! flowing on a connection whose dispatcher wedged for ONE subscription, so
@@ -42,7 +43,7 @@
 //!    queue, and watchdog untouched — the client-side half of the churn window issue #414 reports.
 //! 4. ADR-0103's opt-in automatic recovery: disarmed it emits no wire traffic at all, armed it
 //!    re-subscribes at most `consumer_stall_auto_recovery` times per stall streak and then stops,
-//!    reporting the episode either way so the broker-side defect is never papered over.
+//!    reporting the episode either way so the unresolved stall is never papered over.
 //! 5. The budget resets on one broker dispatch unit actually arriving — and on nothing else, the
 //!    recovery's own re-subscribe included, which is what makes the bound a bound.
 //! 6. A consumer the in-place re-attach may not touch — a pending unsubscribe, the one ineligible
@@ -600,8 +601,8 @@ fn auto_recovery_resubscribes_up_to_the_bound_and_then_escalates() {
 
     // Budget exhausted. The broker never dispatched, so nothing reset the counter: the
     // next episode reports and escalates instead of re-subscribing a third time. This is
-    // the dispatcher-WIDE arm of issue #414 — one fresh grant per attempt cannot lift an
-    // aggregate observed at `-177300`, so the client stops and leaves `topics unload` to
+    // the dispatcher-wide model arm, not a replay of issue #414's per-consumer
+    // `-177300`. The client stops and leaves `topics unload` to
     // the operator rather than re-subscribing forever.
     at += WINDOW;
     let (stalls, resubscribe) = sweep(&shared, at);
@@ -687,7 +688,7 @@ fn a_broker_dispatch_between_stalls_restores_the_auto_recovery_budget() {
 #[test]
 fn a_consumer_the_recovery_may_not_touch_is_reported_but_never_re_subscribed() {
     // The refusal path, and the only state that reaches it: a pending unsubscribe is
-    // simultaneously a stall CANDIDATE (the broker still holds un-spent permits over an
+    // simultaneously a stall CANDIDATE (the client-accounted balance is positive over an
     // empty queue, nothing is closed, paused, seeking, terminal, or re-attaching) and
     // INELIGIBLE for an in-place re-attach, because that pending unsubscribe owns this
     // consumer's fate. Every other ineligible state also suppresses candidacy, so no
@@ -948,8 +949,7 @@ fn a_rejected_recovery_close_leaves_the_consumer_untouched_and_recoverable() {
     assert_eq!(
         shared.inner.lock().consumer_available_permits(handle),
         RQ as u32,
-        "the broker still holds this consumer's permits, so the client's mirror must \
-         still describe them"
+        "the rejected close must leave the client's permit mirror unchanged"
     );
 
     // Still detectable, and still recoverable: a rejected close is one spent attempt,

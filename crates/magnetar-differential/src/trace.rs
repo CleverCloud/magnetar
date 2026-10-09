@@ -477,11 +477,11 @@ pub enum Event {
     /// [`Op::OpenSharedConsumer`] resolved: the broker acked the subscribe and
     /// the engine armed the initial flow. `permits` is the balance read back
     /// through `Consumer::available_permits()` — issue #414 re-pointed that
-    /// accessor at the REAL decrementing balance, so both engines must report
+    /// accessor at the client-accounted decrementing balance, so both engines must report
     /// the same value here and it must equal the receiver-queue size before any
     /// dispatch lands.
     SharedConsumerOpened {
-        /// Un-spent broker permits right after the initial flow.
+        /// Client-accounted unspent permits right after the initial flow, not broker admin stats.
         permits: u32,
     },
     /// [`Op::DrainDeadLettersShared`] resolved: `count` messages were taken off the

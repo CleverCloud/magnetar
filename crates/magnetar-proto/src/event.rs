@@ -321,19 +321,19 @@ pub enum ConnectionEvent {
         active: bool,
     },
 
-    /// A consumer has held un-spent broker permits over an empty receive queue, in a
+    /// A consumer has held client-accounted unspent permits over an empty receive queue, in a
     /// dispatch-eligible state, for
     /// [`ConnectionConfig::consumer_stall_timeout`](crate::conn::ConnectionConfig)
     /// without a single dispatch unit arriving (issue #414).
     ///
     /// Emitted at most **once per stall episode**: the next dispatch unit re-arms the
-    /// watchdog, so a consumer that recovers and wedges again reports twice. `None` of
-    /// the client's own state explains the silence — not `pause`, not an in-flight seek,
+    /// watchdog, so a consumer that recovers and wedges again reports twice. None of
+    /// the checked local gates explains the silence — not `pause`, not an in-flight seek,
     /// not end-of-topic, not a re-attach in progress; all of those suppress the watchdog.
     ///
-    /// The wire protocol carries only monotonic client → broker permit increments
-    /// (`CommandFlow`), so the client cannot itself drive the broker's counter negative:
-    /// this event says the BROKER stopped dispatching against a grant it acknowledged.
+    /// `CommandFlow` carries non-negative grants, but dispatch, detach and client timing
+    /// also affect broker counters. This event reports observed delivery silence; it
+    /// does not attribute issue #414's negative ghost-consumer counter to either side.
     /// The connection is otherwise healthy — ADR-0058's keepalive keeps passing, which is
     /// precisely why it cannot detect this.
     ///

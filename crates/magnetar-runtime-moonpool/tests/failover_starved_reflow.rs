@@ -4,7 +4,7 @@
 //!
 //! ## The corner this pins
 //!
-//! A consumer that was fed once (`granted_permits > 0`) can drain its REAL permit
+//! A consumer that was fed once (`granted_permits > 0`) can drain its client-accounted permit
 //! balance (#349) to zero through dispatch units that are debited but never refunded.
 //! Issue #437 closed the client-side path into that state — a dead-lettered unit now
 //! credits the flow ledger at routing time, exactly as `pop_message`, the incomplete-chunk
@@ -163,8 +163,8 @@ fn drain_flow_permits(out: &mut Bytes) -> Vec<u32> {
     grants
 }
 
-/// Put the consumer in the starved state: the REAL balance at zero with `consumed_since_flow`
-/// and the queue both empty, so `maybe_flow` can never be reached again.
+/// Put the consumer in the starved state: the client-accounted balance at zero with
+/// `consumed_since_flow` and the queue both empty, so `maybe_flow` can never be reached again.
 ///
 /// Since issue #437 no well-formed wire frame produces this — every dispatch unit the broker
 /// charges is refunded when the client decides its fate, so the ledger cannot drift. What the

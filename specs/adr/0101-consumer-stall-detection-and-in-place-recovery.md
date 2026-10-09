@@ -9,16 +9,16 @@
 
 Issue #414: a Pulsar `Shared` subscription wedged broker-side after a consumer-churn window — a cursor reset performed with consumers still attached, a 12 → 1 scale-down, and an instance recycle mid-drain.
 The survivors received roughly twenty messages and then nothing, permanently.
-The broker's own `availablePermits` for the subscription was observed at `-177300`, `acks_failed` was `0`, and the client raised no error of any kind.
+One ghost consumer entry with an empty `consumerName` had broker-reported `availablePermits = -177300`; the capture did not report a subscription aggregate. `acks_failed` was `0`, and the client raised no error of any kind.
 Only a superuser `pulsar-admin topics unload` recovered the topic.
 
-**The root cause is broker-side, and the client cannot have caused it.**
-The wire protocol carries only monotonic client → broker permit increments (`CommandFlow`, `crates/magnetar-proto/src/consumer.rs`); there is no decrement on the wire, so no sequence of client behaviour drives the broker's counter negative.
-The client's own mirrors are zeroed in lock-step at every churn boundary — full reconnect reset, same-broker `CommandCloseConsumer` (the ADR-0069 / issue #307 arm), and terminal subscribe failure — so client-side drift is not a candidate either.
+**The exact cause of this per-consumer negative value has not been established.**
+The wire protocol carries client → broker permit increments (`CommandFlow`, `crates/magnetar-proto/src/consumer.rs`), but broker dispatch and detach also update permit counters. A non-negative wire grant alone does not prove that client flow, acknowledgement or churn timing made no contribution.
+The client's permit mirrors are reset at documented churn boundaries; they and the broker's slot state still need a correlated wire and broker trace for the reported incident.
 
-What issue #414 exposes is not a client bug but three client-side gaps, each of which turns a broker fault into an invisible, unrecoverable one:
+Regardless of the as-yet-unattributed cause, issue #414 exposed three client-side gaps that made the stall hard to observe or recover from:
 
-1. **No detection.** `Connection::consumer_available_permits` — and the `Consumer::available_permits()` chain on both engines above it — read `ConsumerState::granted_permits`, the purely-ADDITIVE grant mirror. [ADR-0082](0082-consumer-permit-balance-split.md) split that field from the real decrementing `permit_balance` for issue #349 but deliberately left this accessor on the additive one, recording the change as "a separate, unscoped change" (`specs/adr/0082-consumer-permit-balance-split.md`, §Decision and §Consequences). The additive value never moves under dispatch: it reads `receiver_queue_size` forever whether the broker is streaming or has gone silent. An application polling it cannot distinguish a healthy consumer from a dead one.
+1. **No detection.** `Connection::consumer_available_permits` — and the `Consumer::available_permits()` chain on both engines above it — read `ConsumerState::granted_permits`, the purely-ADDITIVE grant mirror. [ADR-0082](0082-consumer-permit-balance-split.md) split that field from the client-accounted decrementing `permit_balance` for issue #349 but deliberately left this accessor on the additive one, recording the change as "a separate, unscoped change" (`specs/adr/0082-consumer-permit-balance-split.md`, §Decision and §Consequences). The additive value never moves under dispatch: it reads `receiver_queue_size` forever whether the broker is streaming or has gone silent. An application polling it cannot distinguish a consumer receiving messages from one that has gone silent.
 2. **No signal.** ADR-0058's connection keepalive watchdog cannot see this. It ages `last_activity` off every decoded inbound frame, and a broker whose dispatcher has wedged for ONE subscription keeps answering `PING` with `PONG` — so the baseline never ages, no connection-level deadline fires, and the connection is by every measure healthy.
 3. **No cheap recovery.** Issue #307 built exactly the right machinery for a consumer whose broker-side dispatcher slot went bad — zero the permit mirrors, re-emit `CommandSubscribe` for the same consumer id, defer the initial `CommandFlow` to the broker's `Success` — but wired it to exactly one trigger: an inbound same-broker `CommandCloseConsumer` with `assigned_broker_service_url = None`. Issue #307's own re-arm on `CommandActiveConsumerChange` never fires for a `Shared` subscription; the broker only sends that command for `Failover`. A `Shared` consumer therefore had no self-healing path and no caller-driven one either. The only lever was `topics unload`, which is superuser-only and disrupts every other subscription on the topic.
 
@@ -27,7 +27,7 @@ The scripted broker in `magnetar-differential` could not even express the failur
 ### Alternatives considered
 
 - **Add a sibling accessor** (`available_permit_balance()`) and leave `available_permits()` additive. Rejected: it leaves the Java-parity name (`ConsumerBase#getAvailablePermits`, which IS a decrementing counter) on the wrong field, and every existing caller — including the parity matrix's own claim — keeps reading the value that cannot detect the fault.
-- **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would hide the broker-side defect that issue #414 is actually about. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
+- **Have the watchdog re-subscribe automatically.** Rejected: a broker hiccup would become a re-subscribe storm across every partition simultaneously, and it would obscure diagnosis of the unresolved issue #414 stall. A signal the operator can correlate and act on is worth more than an automatic action with no diagnosis.
 
   > **Amended by [ADR-0103](0103-bounded-automatic-consumer-stall-recovery.md).**
   > This rejection stands verbatim for the unconditional, unbounded form it was written about, and it stands as the shipped default.
@@ -39,20 +39,20 @@ The scripted broker in `magnetar-differential` could not even express the failur
 
 ## Decision
 
-### 1. `available_permits()` reports the real, decrementing balance
+### 1. `available_permits()` reports the client-accounted decrementing balance
 
-`Connection::consumer_available_permits` now reads `ConsumerState::permit_balance`: the grants issued, minus one per broker dispatch unit that has actually arrived (plain message, batch member, buffered chunk, PIP-33 marker), force-zeroed at every churn boundary.
+`Connection::consumer_available_permits` now reads `ConsumerState::permit_balance`: the locally recorded grants issued, minus one per broker dispatch unit received (plain message, batch member, buffered chunk, PIP-33 marker), force-zeroed at every churn boundary. This client estimate is not the broker's admin `consumers[].availablePermits` statistic.
 Both engines' `Consumer::available_permits()` and the façade's `ConsumerApi::available_permits` inherit it unchanged, since they delegate.
 
 This is a deliberate **semantic change**, not an addition.
-It makes the accessor mean what Java's `ConsumerBase#getAvailablePermits` means, and it makes a value pinned at the receiver-queue size while messages stop arriving a usable client-side signature of the #414 wedge.
+It matches the client-side arithmetic of Java's `ConsumerBase#getAvailablePermits`. A value pinned at the receiver-queue size while messages stop arriving signals silence to investigate; it does not prove the broker-side cause of #414.
 
 `ConsumerState::granted_permits` keeps its additive semantics and its two callers — the issue #307 failover-reflow gate and the `adjust_receiver_queue` want-have delta — both of which ask "how much have we told the broker it may use", which is exactly what an additive mirror answers correctly.
 
 ### 2. A per-consumer stall watchdog, off by default, event-only
 
 `ConnectionConfig::consumer_stall_timeout: Option<Duration>` (façade: `ClientBuilder::consumer_stall_timeout`, `Duration::ZERO` disables).
-When set, `Connection::handle_timeout` emits one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` per stall episode for a consumer that, for the whole window, held un-spent broker permits over an empty receive queue in a dispatch-eligible state without a single dispatch unit arriving.
+When set, `Connection::handle_timeout` emits one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }` per stall episode for a consumer whose client-accounted balance remained positive over an empty receive queue in a dispatch-eligible state without a single dispatch unit arriving for the whole window.
 
 The machine is progress-based, the ADR-0058 shape scoped to one consumer:
 
@@ -100,10 +100,10 @@ Non-`Shared` subscriptions keep the historical per-consumer walk verbatim, so ev
 
 ## Consequences
 
-- **An application can now detect the #414 wedge.** Poll `available_permits()`: a balance that stops falling while the broker's backlog is non-empty is the signature. Arm `consumer_stall_timeout` and the client reports it for you, once per episode, with the un-spent balance and the silence duration.
+- **An application can now detect sustained consumer silence.** Poll `available_permits()` and correlate a balance that stops falling with broker backlog and actual delivery across all expected consumers. Arm `consumer_stall_timeout` and the client reports the silence once per episode, with the un-spent balance and duration; this signal alone does not identify the cause of issue #414.
 - **`available_permits()` returns different numbers than before.** A caller that read it as "the cumulative grant" gets the un-spent balance instead. Three tests pinned the old arithmetic and were updated to the new — each to an exact value, not a loosened one; two of them (`consumer_flow_control_edge.rs`, both engines) became strictly stronger, since "every grant minus every dispatch" pins the dispatch side the cumulative form ignored. `ConsumerState::granted_permits` remains available for a caller that genuinely wants the cumulative grant.
 - **The watchdog reports silence, not fault.** A consumer that has drained its backlog on an idle topic satisfies the predicate exactly as a wedged one does: the client cannot see the broker's backlog, so it cannot tell them apart. That is why the event carries no verdict, why it never recovers on its own, and why the knob ships off. Correlate it with `AdminClient::topic_stats` (`subscriptions[].msgBacklog`, and the broker-truth `availablePermits`) before acting.
-- **`resubscribe()` repairs this client's slot, not the dispatcher.** Issue #414's production failure was dispatcher-WIDE — `availablePermits = -177300` across every attached consumer — and one consumer re-attaching does not necessarily clear that. The escalation ladder stays: `resubscribe()`, then `pulsar-admin topics unload`. `docs/consumer-stall-recovery.md` is the operator-facing form of that ladder.
+- **`resubscribe()` repairs this client's slot, not necessarily the dispatcher.** Issue #414 showed `availablePermits = -177300` on one ghost consumer with an empty name and delivery stopping across the fresh consumers; no aggregate counter was captured. One consumer re-attaching does not prove all slots or the dispatcher healthy. The escalation ladder stays: `resubscribe()`, then `pulsar-admin topics unload`. `docs/consumer-stall-recovery.md` is the operator-facing form of that ladder.
 - **One extra `u64` and one `Option<StallWatch>` per consumer.** No allocation, no task, no `select!` arm — the watchdog rides the existing `poll_timeout` / `handle_timeout` deadline loop, exactly as ADR-0089's rate sampling does.
 - **`resubscribe()` is on both runtime `Consumer` types, not on the façade's `ConsumerApi` trait.** Deliberate scope boundary: `ConsumerApi` is also the fan-out surface for `MultiTopicsConsumer` / `PatternConsumer`, and what a re-subscribe should mean across N children (all of them? only the stalled ones? what if one refuses?) is a product decision this ADR does not make. The runtime `Consumer` is what `ConsumerBuilder::subscribe()` hands back, so the method is reachable from the façade today without it.
 - **The event is drained silently by both drivers**, per ADR-0054's single-owner rule: `magnetar-proto` holds the richest context at the point of detection and emits the `warn!` there, and the engines drain the event only so it cannot accumulate in the proto queue.

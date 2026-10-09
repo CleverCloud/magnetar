@@ -280,7 +280,7 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 /// backlog plus any new publishes.
 ///
 /// **Issue #307 guard**: after the stand-by is promoted, it must hold positive
-/// broker-side permits (`available_permits() > 0`) — the
+/// client-accounted permits (`available_permits() > 0`) — the
 /// `CommandActiveConsumerChange` re-arms flow on promotion. Before the fix the
 /// promoted consumer sat at zero permits and `receive()` starved forever. The
 /// test asserts the positive permit count immediately after promotion (before
@@ -448,17 +448,17 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     // Regression guard (issue #307): on promotion to active, the broker sends
     // `CommandActiveConsumerChange { is_active: true }` and the proto layer must
     // re-arm flow. Before #307, the promoted stand-by sat at
-    // `available_permits == 0` — the broker had no permit to push the backlog
-    // and `receive()` starved forever. Assert the promoted consumer now holds a
-    // positive permit count, BEFORE any phase-2 publish drives a lazy
-    // replenishment, so this pins the on-promotion re-flow specifically.
+    // `available_permits == 0` — the client's grant mirror recorded no permit
+    // to push the backlog and `receive()` starved forever. Assert the promoted
+    // consumer now holds a positive client-accounted permit count, BEFORE any phase-2 publish
+    // drives a lazy replenishment, so this pins the on-promotion re-flow specifically.
     let promoted_permits = standby_opt
         .as_ref()
         .expect("standby was just set")
         .available_permits();
     assert!(
         promoted_permits > 0,
-        "promoted stand-by ({standby_name}) must hold positive broker permits after promotion \
+        "promoted stand-by ({standby_name}) must report positive client-accounted permits after promotion \
          (issue #307: ActiveConsumerChange must re-arm flow), got {promoted_permits}"
     );
 

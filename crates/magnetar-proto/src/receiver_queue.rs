@@ -66,10 +66,10 @@ pub struct FlowStats {
     /// nothing has arrived); a value near `current_queue_size` means the user
     /// is falling behind.
     pub queued_messages: usize,
-    /// Permits the broker still holds for us (grants minus dispatched); `0`
-    /// under load is the starvation signal: the broker has exhausted its
-    /// grant and will push nothing until we flow more. Issue #349: fed from
-    /// [`crate::consumer::ConsumerState::permit_balance`] — a REAL,
+    /// Client-accounted unspent permits (local grants minus received dispatch
+    /// units); `0` under load is the starvation signal for this policy, not a
+    /// read of broker admin statistics. Issue #349: fed from
+    /// [`crate::consumer::ConsumerState::permit_balance`] — a locally calculated,
     /// decrementing balance, not the purely-additive grant mirror
     /// ([`crate::consumer::ConsumerState::granted_permits`]) that never
     /// registered a genuine dispatch-driven starvation before this split.
@@ -148,9 +148,10 @@ impl ReceiverQueuePolicy for Fixed {
 ///
 /// # Invariants
 ///
-/// 1. **Never starve.** While the broker keeps draining our permits to zero (`available_permits ==
-///    0`) and the byte budget still has room, the target doubles (bounded by [`Self::max_bytes`])
-///    so the next flow grant is larger and steady-state `available_permits` stays above zero.
+/// 1. **Never starve.** While received dispatch units drain the client-accounted permits to zero
+///    (`available_permits == 0`) and the byte budget still has room, the target doubles (bounded by
+///    [`Self::max_bytes`]) so the next flow grant is larger and steady-state `available_permits`
+///    stays above zero.
 /// 2. **Never OOM.** The target is capped so the projected buffered bytes (`target *
 ///    avg_message_bytes`, summed across partitions) never exceed [`Self::max_bytes`]. When
 ///    `in_flight_bytes` approaches the budget the target shrinks.

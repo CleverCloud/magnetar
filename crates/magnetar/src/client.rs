@@ -1393,10 +1393,11 @@ impl Reader<magnetar_runtime_tokio::Consumer> {
         self.consumer.available_in_queue()
     }
 
-    /// Number of dispatch permits the broker still holds un-spent for this reader —
-    /// grants issued, minus one per dispatch unit that has actually arrived. Issue #414
-    /// re-pointed this from the purely-additive grant mirror to the real decrementing
-    /// balance, so the value moves under dispatch (ADR-0101 amending ADR-0082).
+    /// Client-accounted unspent dispatch permits for this reader: local grants
+    /// minus dispatch units received. Issue #414 re-pointed this from the
+    /// purely-additive grant mirror to the decrementing local estimate, so the
+    /// value moves under dispatch (ADR-0101 amending ADR-0082). It does not read
+    /// the broker's admin `availablePermits` statistic.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
         self.consumer.available_permits()

@@ -13,15 +13,15 @@ The reported production shape:
 | ---------------------------------------------- | ----------------------------------------------------------------------------------- |
 | Trigger                                        | cursor reset with consumers attached, 12 → 1 scale-down, instance recycle mid-drain |
 | Consumer behaviour                             | each survivor receives ~20 messages, then silence, indefinitely                     |
-| Broker `availablePermits` for the subscription | `-177300`                                                                           |
+| One ghost consumer's broker `availablePermits` | `-177300` (empty `consumerName`; not a subscription aggregate)                      |
 | Broker `acks_failed`                           | `0`                                                                                 |
 | Client-side errors                             | none                                                                                |
 | Connection health                              | fine — keepalive `PING` / `PONG` keeps passing                                      |
 | Recovery that worked                           | superuser `pulsar-admin topics unload`                                              |
 
-**The client cannot cause this.**
-The Pulsar wire protocol carries only monotonic client → broker permit increments (`CommandFlow`); there is no decrement on the wire, so no client behaviour drives the broker's counter negative.
-Magnetar additionally zeroes its own permit mirrors in lock-step at every churn boundary — reconnect reset, same-broker `CommandCloseConsumer`, terminal subscribe failure.
+The capture identifies a negative counter on one broker consumer entry whose `consumerName` was empty; it does not report the subscription's aggregate permit balance or establish which client or broker transition made that entry negative.
+`CommandFlow` carries permit increments, while dispatch and detach change broker counters; the absence of a negative wire grant does not exclude a client-side contribution through flow, acknowledgement, or churn timing.
+Magnetar's permit mirrors and broker-side accounting must therefore be checked against the same `Subscribe`/`Flow`/`CloseConsumer`/ack timeline before assigning cause.
 
 What the client owes you is the ability to **notice** and a **cheaper first recovery step** than unloading the topic.
 
@@ -41,10 +41,10 @@ Detecting this needs a **per-consumer** signal. That is what the two mechanisms 
 let permits = consumer.available_permits();
 ```
 
-Since [ADR-0101](../specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md) this reports the **real, decrementing** broker permit balance — the grants issued minus one per dispatch unit that actually arrived — matching Java's `ConsumerBase#getAvailablePermits`.
+Since [ADR-0101](../specs/adr/0101-consumer-stall-detection-and-in-place-recovery.md) this reports the **client-accounted, decrementing** permit balance — grants issued minus one per dispatch unit received — matching the arithmetic of Java's `ConsumerBase#getAvailablePermits`. It is not the broker's `consumers[].availablePermits` admin statistic: in-flight frames, churn, or broker accounting faults can make the two disagree.
 
-- A **healthy** consumer's balance falls as messages arrive and climbs again on each replenishment `CommandFlow`. It moves.
-- A **wedged** consumer's balance sits pinned near the receiver-queue size while nothing arrives.
+- A consumer receiving messages sees this local balance fall, then climb on each replenishment `CommandFlow`.
+- A balance pinned near the receiver-queue size while nothing arrives is a silence signal to correlate with broker statistics and actual delivery; it does not establish a broker wedge by itself.
 
 > **Semantic change.** Before ADR-0101 this accessor read the purely-additive grant mirror, which never moved under dispatch — it read `receiver_queue_size` forever whether the broker was streaming or dead. If you have code that treated it as a cumulative grant total, it now returns the un-spent balance instead. [ADR-0082](../specs/adr/0082-consumer-permit-balance-split.md)'s deferral of exactly this accessor is what ADR-0101 amends.
 
@@ -55,7 +55,7 @@ Until [ADR-0107](../specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dis
 A dead-lettered unit now returns its permit at routing time, so the balance climbs again on its own and the subscription keeps draining.
 What grows instead is the consumer's dead-letter buffer, which only `drain_dead_letter` / `republish_dead_letters` empties.
 
-And `permit_balance == 0` was never in scope for the watchdog below: `is_stall_candidate` requires `permit_balance > 0`, since a consumer holding no permits has told the broker nothing it is failing to honour.
+And `permit_balance == 0` was never in scope for the watchdog below: `is_stall_candidate` requires a positive client-accounted balance. A local zero does not prove the broker's own permit count is zero.
 A balance pinned at zero is therefore read here, by polling, and not reported as a `ConsumerStalled` event.
 
 ### 2. Arm the stall watchdog
@@ -71,7 +71,7 @@ let client = PulsarClient::builder()
     .await?;
 ```
 
-A consumer that holds un-spent broker permits over an **empty** receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces:
+A consumer whose client-accounted balance remains positive over an **empty** receive queue, in a dispatch-eligible state, for the whole window without a single dispatch unit arriving surfaces:
 
 - one `WARN` on target `magnetar_proto::conn` carrying `handle`, `permit_balance` and `stalled_for_ms`;
 - one `ConnectionEvent::ConsumerStalled { handle, permit_balance, stalled_for }`.
@@ -95,12 +95,13 @@ let stats = admin.topic_stats(&topic).await?;
 let subscription = &stats.subscriptions[&subscription_name];
 ```
 
-Two fields settle it:
+Correlate the broker's view with actual delivery before acting:
 
-- `msgBacklog` — messages the broker is holding for this subscription. A stall with a **zero** backlog is an idle topic, not a fault.
-- `availablePermits` — the broker's own counter for the subscription. A **negative** value is the issue #414 signature, and it is the one thing no amount of client-side inspection can infer.
+- `msgBacklog` — messages the broker is holding for this subscription. A zero backlog alone gives no evidence of a delivery stall.
+- `consumers[].availablePermits` and `consumers[].consumerName` — the broker's per-consumer counters and identities. Issue #414 captured one ghost consumer with an empty name at `-177300`; it did not capture an aggregate permit value.
+- Repeated `msgRateOut` and consumer stats, together with application receive and acknowledgement counts — establish whether every expected consumer is making progress while backlog remains. A single rate snapshot does not prove a permanent stall.
 
-Also worth a glance: `msgRateOut` at `0` alongside a non-zero `msgBacklog`, and `consumers[].availablePermits` per attached consumer.
+No amount of client-side permit inspection alone can infer the broker's per-consumer accounting.
 
 ## Recovery ladder
 
@@ -130,7 +131,7 @@ When a stall episode closes, the client performs rung 1 itself — the identical
 - **The diagnosis is never suppressed.** The `WARN` and the `ConsumerStalled` event fire on every episode whether or not recovery acts, each attempt logs its own `INFO` carrying `attempt` and `max_attempts`, and exhausting the budget logs one `WARN` naming `pulsar-admin topics unload`.
 - **Unset by default**; `0` disables it explicitly.
 
-**Keep the number small.** An attempt does not pay down a negative aggregate permit counter — since [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) one recovery is permit-neutral on the subscription's aggregate (see rung 1) — so a budget is a small number of chances for THIS consumer's own slot to come back, not a countdown toward repairing a subscription-wide fault. Issue #414's production failure was `-177300` deep; the point of the bound is to stop and escalate to `pulsar-admin topics unload`, not to re-subscribe forever against something this client cannot repair.
+**Keep the number small.** Since [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md), one recovery closes and re-subscribes this consumer instead of adding a second grant to a still-live slot. A budget is a small number of chances for this consumer's own slot to come back, followed by escalation if delivery remains stopped. Issue #414 measured `-177300` on one ghost consumer, not the subscription aggregate; no attempt budget is evidence that the reported fault is repaired.
 
 > **This is opt-in for a reason.** The watchdog reports silence, not fault, so an armed budget will occasionally close and re-subscribe a perfectly healthy consumer that is merely idle on a drained topic. Since ADR-0108 that is no longer free: the close is real, so anything the consumer was holding un-acked is redelivered. Arm it only where a duplicate is cheaper than a wedge, and prefer rung 1 by hand where it is not.
 
@@ -151,7 +152,7 @@ consumer.resubscribe()?;
 - Returns `Err` — mutating nothing — when the consumer is not eligible: closed, unsubscribing, terminally failed, mid-seek, already re-attaching, already awaiting a recovery close, **`Failover`**, or **non-durable** (see below).
 - If the broker **rejects** the close, nothing is mutated and no re-subscribe is sent. One `WARN` on `magnetar_proto::conn` records the rejection; the consumer is left exactly as it was — still wedged, still reported by the watchdog, still eligible for another attempt.
 
-> **Why the close is not optional.** A `CommandSubscribe` naming a consumer id that is still live on the connection is a **broker-side no-op**: `ServerCnx.handleSubscribe` finds the id in its own per-connection map, logs a warning, answers `CommandSuccess`, and returns without touching the dispatcher, the cursor, or `availablePermits` (identical at Pulsar v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and master `:2037-2044`). Before [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) this rung sent exactly that, and then granted a second full receiver-queue window on top of a slot the broker had never reset — adding permits the broker never agreed to, once per attempt, while repairing nothing. The close is what makes the re-attach real.
+> **Why the close is not optional.** A `CommandSubscribe` naming a consumer id that is still live on the connection is a **broker-side no-op**: `ServerCnx.handleSubscribe` finds the id in its own per-connection map, logs a warning, answers `CommandSuccess`, and returns without touching the dispatcher, the cursor, or `availablePermits` (identical at Pulsar v4.0.4 `ServerCnx.java:1320-1326`, v4.2.4 `:1408-1414` and master `:2037-2044`). Before [ADR-0108](../specs/adr/0108-close-then-resubscribe-for-in-place-consumer-recovery.md) this rung sent exactly that, and then granted a second full receiver-queue window on top of a slot the broker had never reset — adding permits without a matching close or debit, once per attempt, while repairing nothing. The close is what makes the re-attach real.
 
 **It costs redelivery.** The broker genuinely drops the consumer, so everything it was holding un-acked goes back to the subscription's redelivery pool — to this consumer after its re-attach, or to a `Shared` sibling meanwhile. Acks still buffered in the ack-grouping tracker when the close lands are dropped by the broker and their messages redelivered. At-least-once is preserved; **duplicates are not**. If your consumer is not idempotent, prefer rung 2, where you control the boundary.
 
@@ -162,9 +163,9 @@ consumer.resubscribe()?;
 
 **What it repairs:** this client's own slot in the broker's dispatcher.
 
-**What it does not repair:** a dispatcher-WIDE corruption. Issue #414's production failure had the subscription's `availablePermits` at `-177300` across every attached consumer, and this does not clear it. One recovery attempt is **permit-neutral** on the subscription's aggregate counter — the close returns this consumer's remaining permits and the re-subscribe's `CommandFlow` grants them back — so attempts do not add up to a repair the way the pre-ADR-0108 arithmetic claimed. `topics unload` is the answer to a negative aggregate, and rung 0's bound exists to reach it rather than to grind toward it.
+**What it does not establish:** that the subscription-wide stall has cleared. Issue #414 showed `availablePermits = -177300` on one ghost consumer with an empty name, while all fresh consumers stopped progressing after roughly one queue window; the capture did not expose an aggregate permit value. A close/re-subscribe may repair this client's slot, but cannot by itself prove that the ghost entry, shared dispatcher, or every sibling consumer is healthy. Check per-consumer broker stats, backlog and actual delivery for every attached consumer; if the stall persists, `topics unload` is the documented recovery that worked in production. An independently verified Pulsar aggregate-accounting bug is tracked separately in [apache/pulsar#26416](https://github.com/apache/pulsar/issues/26416).
 
-Give it a few seconds and re-check `available_permits()` and the broker's `msgRateOut`. If nothing moves, climb.
+Give it a few seconds and re-check backlog, the broker's per-consumer counters, and actual delivery for every expected consumer. If the stall persists, climb.
 
 ### Rung 2 — recreate the consumer
 

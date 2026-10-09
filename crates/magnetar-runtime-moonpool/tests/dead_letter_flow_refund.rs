@@ -187,7 +187,7 @@ fn dead_lettered_dispatch_refills_flow_on_the_same_frame() {
     assert_eq!(
         conn.consumer_available_permits(handle),
         RQ as u32,
-        "the real balance must be back to the full window, not parked at zero"
+        "the client-accounted balance must be back to the full window, not parked at zero"
     );
     assert!(
         !conn

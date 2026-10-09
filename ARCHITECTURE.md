@@ -546,7 +546,7 @@ Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permi
 - **`granted_permits: u32`** — a purely ADDITIVE record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CommandCloseConsumer`).
   Bumped at the three grant sites (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth branch); never decremented by dispatch.
   Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`), `adjust_receiver_queue`'s want-have delta, and `Connection::initial_flow`'s once-per-attach guard (ADR-0102) all need exactly that, so all three read this field.
-- **`permit_balance: u32`** — the REAL broker-side balance: `granted_permits` minus one unit per broker dispatch unit that has actually arrived.
+- **`permit_balance: u32`** — the client-accounted decrementing balance: grants recorded locally minus one unit per dispatch unit received. It is an estimate, not the broker's admin permit statistic.
   Incremented at the same three grant sites, by the identical delta.
   Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
   Force-zeroed everywhere `granted_permits` is zeroed, so the two never drift apart at a churn boundary.

@@ -29,8 +29,9 @@
 //!
 //! The invariant asserted: **one in-place recovery must leave the broker holding
 //! `receiver_queue_size` permits for that consumer, not `2 x receiver_queue_size`.**
-//! A client that over-grants is adding to the very counter issue #414 observed at
-//! `-177300`, in the opposite direction, without the broker ever having agreed.
+//! This tests a client over-grant on a live slot. Issue #414 reported a negative
+//! per-consumer value (`-177300`) on a ghost entry; this trace does not reproduce
+//! or attribute that production observation.
 
 use std::time::Duration;
 
