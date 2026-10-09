@@ -151,7 +151,8 @@ cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. performance.yml also replays fixed
-# seeds 1..32 plus open registry anchors on every PR, without buggify.
+# seeds 1..32 plus open registry anchors nightly on main, without buggify
+# (ADR-0113); ci.yml's seed-replay replays open registry seeds on every PR.
 # The daily 128-random-seed workflow remains additive discovery.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \

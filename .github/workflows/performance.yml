@@ -1,17 +1,25 @@
 name: performance
 
-# Exact main and PR head, including PRs targeting a branch other than main.
+# Nightly: main against the main revision the last successful nightly
+# measured; skipped when main has not moved (ADR-0113). Manual dispatch: the
+# dispatched ref against main, for any branch that needs a measurement.
 # Costs are informative. Functional failures and invalid collection fail CI.
 on:
-  pull_request:
+  schedule:
+    # 01:17 UTC daily. Off the hour, and ahead of the 03:17 seed sweep and
+    # the 04:17 xtask gates; a full campaign runs for several hours.
+    - cron: '17 1 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Nightly and manual runs use separate groups, so a dispatch on main never
+# cancels a running nightly; a nightly still running when the next one fires
+# makes it wait instead of cancelling it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
@@ -21,13 +29,18 @@ jobs:
     name: performance inputs and contracts
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # actions:read lets a nightly find the head its last successful run measured.
+    permissions:
+      contents: read
+      actions: read
     outputs:
+      run: ${{ steps.prepare.outputs.run }}
       matrix: ${{ steps.prepare.outputs.matrix }}
       main_sha: ${{ steps.prepare.outputs.main_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
@@ -35,21 +48,39 @@ jobs:
           docker-images: false
           tool-cache: false
           swap-storage: false
-      - name: Resolve main separately from the PR target and prepare exact inputs
+      - name: Resolve the base revision and prepare exact inputs
         id: prepare
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin refs/heads/main
-          MAIN_SHA=$(git rev-parse FETCH_HEAD)
+          BASE_SHA=$(git rev-parse FETCH_HEAD)
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          if [ "$EVENT_NAME" = schedule ]; then
+            # The head the last successful nightly measured, so consecutive
+            # nights cover main without a gap; a failed night widens the next.
+            BASE_SHA=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow performance.yml \
+              --event schedule --branch main --status success --limit 1 \
+              --json headSha --jq '.[0].headSha // ""')
+            if [ -z "$BASE_SHA" ] || ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+              BASE_SHA=$(git rev-list -1 --first-parent --before='24 hours ago' "$HEAD_SHA")
+            fi
+            if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "main has not moved since $BASE_SHA; nothing to measure." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
           python3 scripts/performance.py campaign ci prepare \
             --candidate "$GITHUB_WORKSPACE" --base "$RUNNER_TEMP/performance-main" \
-            --expected-base-sha "$MAIN_SHA" --expected-candidate-sha "$HEAD_SHA" \
+            --expected-base-sha "$BASE_SHA" --expected-candidate-sha "$HEAD_SHA" \
             --output "$RUNNER_TEMP/performance-prepared" --shards 8 --seed-workers 4
       - name: Upload frozen tools image, plans, contracts and provenance
-        if: always()
+        if: always() && steps.prepare.outputs.run != 'false'
         uses: actions/upload-artifact@v7
         with:
           name: performance-prepared
@@ -61,7 +92,7 @@ jobs:
   workers:
     name: performance (${{ matrix.kind }} ${{ matrix.worker }})
     needs: prepare
-    if: needs.prepare.result == 'success'
+    if: needs.prepare.result == 'success' && needs.prepare.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -71,7 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
@@ -124,14 +155,14 @@ jobs:
 
   reconcile:
     name: performance coverage and report
-    if: always()
+    if: always() && needs.prepare.outputs.run == 'true'
     needs: [prepare, workers]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download exact input plans
         uses: actions/download-artifact@v8
@@ -152,7 +183,7 @@ jobs:
             --prepared "$RUNNER_TEMP/performance-prepared" \
             --workers "$RUNNER_TEMP/performance-workers" \
             --output "$RUNNER_TEMP/performance-report"
-      - name: Upload main / PR / absolute delta / relative delta / scope tables
+      - name: Upload base / candidate / absolute delta / relative delta / scope tables
         id: report
         if: always()
         uses: actions/upload-artifact@v7

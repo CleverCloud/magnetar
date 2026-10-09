@@ -48,8 +48,8 @@ Reconciliation failures persist a machine-readable reason and distinguish known 
 Repetitions are bounded to 2–20.
 After both builds and doctest execution finish, the driver repeats the base binary first to record base/base variation, then alternates base/candidate order.
 The SHA arguments are immutable lowercase 40-character revisions supplied by the caller; each checkout must match its expected side before building.
-CI must resolve the requested `main` revision immutably and retain the exact pull-request head separately, together with the event contract.
-A pull request targeting another branch still compares performance against this frozen `main`; its target branch is not silently substituted.
+CI resolves both revisions immutably and retains them together with the event contract: a nightly compares `main`'s head against the `main` head its last successful nightly measured, and a manual dispatch compares the dispatched ref against `main`'s head.
+A dispatched branch targeting another branch still compares performance against this frozen `main`; its target branch is not silently substituted.
 
 ## Executable inventory and functional work
 
@@ -166,7 +166,7 @@ Invalid collections return an error status separately from performance verdicts.
 Current campaigns always report partial because scenario/instrumentation coverage and doctest performance measurements are incomplete; they cannot be presented as a qualified baseline.
 
 No privileged PR execution or external publisher is part of this initial driver.
-The complete workflow will execute all families on every PR with read-only repository permission, publish raw artifacts and append the Markdown to the Actions summary.
+The complete workflow executes all families nightly and on manual dispatch with read-only repository permission, publishes raw artifacts and appends the Markdown to the Actions summary.
 
 ## Existing isolated scenario example
 
@@ -326,9 +326,9 @@ Client scenario calibration also accepts identical conservative checkout inputs,
 GNU time CPU fields have 0.01-second granularity: zero reported fields are rendered `<0.01`, and CPU deltas/percentages are unavailable because quantization cannot prove an exact difference.
 This granularity is not an accuracy claim and is retained in both JSON and Markdown.
 
-## Every-PR delivery
+## Nightly and on-demand delivery
 
-[performance.yml](../.github/workflows/performance.yml) runs on every pull request, including targets other than main, and on manual dispatch. It resolves `refs/heads/main` independently from the PR target and preserves that exact SHA together with the exact PR head SHA. It checks out the head, never presents a merge ref or another PR target as a comparison against main. The same audited performance example is overlaid onto the base reference; each reference retains its own Cargo.lock and builds with `--locked`. The image is built once with verified Dockerfile/base labels, saved into a checksummed artifact and loaded/inspected by workers. No external image registry is published.
+[performance.yml](../.github/workflows/performance.yml) runs nightly at 01:17 UTC on `main` and on manual dispatch; it no longer runs on pull requests ([ADR-0113](../specs/adr/0113-run-performance-measurement-nightly.md)). A nightly takes the head SHA of the last successful scheduled run as its base and `main`'s current head as its candidate, so consecutive nights cover `main` without a gap; without such a run, or when that head is no longer an ancestor of `main`, the base is `main` as of 24 hours earlier. When base and candidate are equal it writes "nothing to measure" to the summary and skips the workers and reconciliation. A manual dispatch resolves `refs/heads/main` independently and preserves that exact SHA together with the exact dispatched head SHA, including a branch that targets something other than main; a pull request that needs a measurement before merge dispatches the workflow on its branch. The workflow checks out the candidate head and never presents a merge ref or another target as a comparison against main. Only the prepare job holds `actions: read`, to look up the previous nightly. Nightly and manual runs use separate concurrency groups: a dispatch never cancels a running nightly, and a nightly still running when the next one fires makes it wait. The same audited performance example is overlaid onto the base reference; each reference retains its own Cargo.lock and builds with `--locked`. The image is built once with verified Dockerfile/base labels, saved into a checksummed artifact and loaded/inspected by workers. No external image registry is published.
 
 The command entry points are also available through `cargo xtask performance -- campaign ci ...`; the driver remains external to measured binaries:
 
@@ -370,6 +370,6 @@ Prepare/worker/reconciliation job limits are 90/180/30 minutes, with thirteen wo
 
 The initial four-shard Actions execution reached the unchanged 180-minute job limit in its last workspace shard before completing the final base repetition. Its two reference builds reported 121 minutes 52 seconds in Cargo, followed by 38 minutes of completed native test-process time; these omit catalogue, provenance and launcher work. Eight workspace shards reduce the assigned targets per build and the fixture launches per worker while retaining every family and all six executable-family observations. The larger partition's duration, disk fit and complete union remain unqualified until an actual Actions execution finishes; no timeout or test deadline is increased.
 
-The Actions summary links a complete report and raw artifacts. Full tables show main, PR, absolute delta, relative delta, units and scope for time, memory and syscall metrics. JSON records requested/completed work, ignored cases, expected/executed/metric coverage and precise null reasons. Runtime parity and the 16-cell crypto build matrix are independent every-PR gates; crypto is build-only evidence. All checkout credentials are nonpersistent, permissions are contents:read, and this workflow has no secret, privileged comment or pull_request_target path.
+The Actions summary links a complete report and raw artifacts. Full tables show main, PR, absolute delta, relative delta, units and scope for time, memory and syscall metrics; "main" and "PR" label the base and candidate, which in a nightly are both `main` revisions identified by their SHAs. JSON records requested/completed work, ignored cases, expected/executed/metric coverage and precise null reasons. Runtime parity and the 16-cell crypto build matrix are independent every-PR gates; crypto is build-only evidence. All checkout credentials are nonpersistent, permissions are contents:read (plus actions:read on the prepare job), and this workflow has no secret, privileged comment or pull_request_target path.
 
 Local verification covers contracts, parser/guard mutations, actionlint, a real partial-package Cargo probe, and the earlier collector pipeline. The complete worker matrix, private fixed-port recipe, compressed image/raw upload size and timeout/disk fit still require the first real Actions execution. The observed tools image contains 765,290,295 uncompressed layer bytes; that is not a measured upload size. Historical local probes measured a 7m36s scenario build (37 MiB ELF, 1.2 GiB target) and a 102.1s partial proto route (12.8 MiB ELF, 394.5 MiB additional cache). These do not extrapolate into a qualified workspace budget or product gain. The new example split requires its own rebuilt ELF/scenario replay.
