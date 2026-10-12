@@ -285,38 +285,51 @@ async fn scalable_assignment_rebalance_parity() {
     let host_port = broker.host_port();
 
     let tokio_delta = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("tokio subscribe");
+            ),
+        )
+        .await
+        .expect("tokio subscribe did not time out")
+        .expect("tokio subscribe");
         wait_for_rebalance_tokio(&client).await
     };
 
     let moonpool_delta = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-a",
                 42,
                 ScalableConsumerType::Stream,
-            )
-            .await
-            .expect("moonpool subscribe");
+            ),
+        )
+        .await
+        .expect("moonpool subscribe did not time out")
+        .expect("moonpool subscribe");
         wait_for_rebalance_moonpool(&client).await
     };
 
@@ -395,20 +408,27 @@ async fn scalable_rejection_and_tc_discovery_parity() {
 
     // Consumer id 99 is the scripted rejection.
     let tokio_outcome = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        let rejected = client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
+        let rejected = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-denied",
                 99,
                 ScalableConsumerType::Checkpoint,
-            )
-            .await
-            .expect_err("tokio registration rejected")
-            .to_string();
+            ),
+        )
+        .await
+        .expect("tokio subscribe did not time out")
+        .expect_err("tokio registration rejected")
+        .to_string();
         let watch_id = client
             .watch_tc_assignments()
             .expect("tokio TC discovery opened");
@@ -419,21 +439,27 @@ async fn scalable_rejection_and_tc_discovery_parity() {
 
     let moonpool_outcome = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        let rejected = client
-            .scalable_topic_subscribe(
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
+        let rejected = tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_subscribe(
                 "topic://public/default/scaled",
                 "sub",
                 "consumer-denied",
                 99,
                 ScalableConsumerType::Checkpoint,
-            )
-            .await
-            .expect_err("moonpool registration rejected")
-            .to_string();
+            ),
+        )
+        .await
+        .expect("moonpool subscribe did not time out")
+        .expect_err("moonpool registration rejected")
+        .to_string();
         let watch_id = client
             .watch_tc_assignments()
             .expect("moonpool TC discovery opened");
@@ -520,9 +546,13 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
     let host_port = broker.host_port();
 
     let tokio_err = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
         // The timeout is the assertion: before the fix this call never returned.
         tokio::time::timeout(
             HANG_GUARD,
@@ -536,10 +566,13 @@ async fn scalable_lookup_rejection_errors_rather_than_hangs() {
 
     let moonpool_err = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
         tokio::time::timeout(
             HANG_GUARD,
             client.scalable_topic_lookup("topic://public/default/e2e-missing"),
@@ -718,26 +751,39 @@ async fn scalable_lookup_rejection_without_message_still_reports() {
     let host_port = broker.host_port();
 
     let tokio_err = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
-        client
-            .scalable_topic_lookup("topic://public/default/e2e-terse")
-            .await
-            .expect_err("terse rejection is an error")
-            .to_string()
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-terse"),
+        )
+        .await
+        .expect("tokio lookup did not time out")
+        .expect_err("terse rejection is an error")
+        .to_string()
     };
     let moonpool_err = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
-        client
-            .scalable_topic_lookup("topic://public/default/e2e-terse")
-            .await
-            .expect_err("terse rejection is an error")
-            .to_string()
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
+        tokio::time::timeout(
+            HANG_GUARD,
+            client.scalable_topic_lookup("topic://public/default/e2e-terse"),
+        )
+        .await
+        .expect("moonpool lookup did not time out")
+        .expect_err("terse rejection is an error")
+        .to_string()
     };
 
     assert_eq!(tokio_err, moonpool_err);
@@ -762,9 +808,13 @@ async fn scalable_watch_refusals_reach_the_client() {
     let host_port = broker.host_port();
 
     let tokio_seen = {
-        let client = TokioClient::connect(&url, ConnectionConfig::default())
-            .await
-            .expect("tokio connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            TokioClient::connect(&url, ConnectionConfig::default()),
+        )
+        .await
+        .expect("tokio connect did not time out")
+        .expect("tokio connect");
         // watch_id 1 — the scripted refusal for a `-deny` namespace.
         client
             .watch_scalable_topics("public/default-deny", vec![])
@@ -776,10 +826,13 @@ async fn scalable_watch_refusals_reach_the_client() {
 
     let moonpool_seen = {
         let engine = MoonpoolEngine::new(TokioProviders::new());
-        let client =
-            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default())
-                .await
-                .expect("moonpool connect");
+        let client = tokio::time::timeout(
+            HANG_GUARD,
+            MoonpoolClient::connect_plain(&engine, &host_port, ConnectionConfig::default()),
+        )
+        .await
+        .expect("moonpool connect did not time out")
+        .expect("moonpool connect");
         client
             .watch_scalable_topics("public/default-deny", vec![])
             .expect("watch opens");
@@ -913,9 +966,13 @@ async fn scalable_subscribe_errors_when_the_connection_closes() {
         // Drop closes the socket.
     });
 
-    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
-        .await
-        .expect("handshake completes before the hang-up");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("handshake completes before the hang-up");
 
     let err = tokio::time::timeout(
         HANG_GUARD,
@@ -938,10 +995,13 @@ async fn scalable_subscribe_errors_when_the_connection_closes() {
     // Same contract on the moonpool engine, against a second hang-up socket.
     let addr = spawn_hangup_broker().await;
     let engine = MoonpoolEngine::new(TokioProviders::new());
-    let mp_client =
-        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
-            .await
-            .expect("moonpool handshake completes before the hang-up");
+    let mp_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool handshake completes before the hang-up");
 
     let mp_err = tokio::time::timeout(
         HANG_GUARD,
@@ -1031,9 +1091,13 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 
     // The broker must still be serving: a fresh client completes a handshake and
     // a lookup after the malformed traffic.
-    let client = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
-        .await
-        .expect("broker still accepts connections");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("broker still accepts connections");
     let lookup = tokio::time::timeout(
         HANG_GUARD,
         client.scalable_topic_lookup("topic://public/default/scaled"),
@@ -1057,9 +1121,13 @@ async fn scripted_broker_tolerates_payloadless_scalable_frames() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_subscribe_errors_when_the_connection_resets() {
     let addr = spawn_resetting_broker().await;
-    let client = TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default())
-        .await
-        .expect("handshake completes before the reset");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        TokioClient::connect(&format!("pulsar://{addr}"), ConnectionConfig::default()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("handshake completes before the reset");
     let err = tokio::time::timeout(
         HANG_GUARD,
         client.scalable_topic_subscribe(
@@ -1080,10 +1148,13 @@ async fn scalable_subscribe_errors_when_the_connection_resets() {
 
     let addr = spawn_resetting_broker().await;
     let engine = MoonpoolEngine::new(TokioProviders::new());
-    let mp_client =
-        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default())
-            .await
-            .expect("moonpool handshake completes before the reset");
+    let mp_client = tokio::time::timeout(
+        HANG_GUARD,
+        MoonpoolClient::connect_plain(&engine, &addr.to_string(), ConnectionConfig::default()),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool handshake completes before the reset");
     let mp_err = tokio::time::timeout(
         HANG_GUARD,
         mp_client.scalable_topic_subscribe(

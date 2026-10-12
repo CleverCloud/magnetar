@@ -1196,6 +1196,15 @@ impl<P: Providers> Client<P> {
         };
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining (enroll-before-drain, see
+            // `next_replicated_subscription_marker`): `emit_scalable` pushes the
+            // event and then fires `notify_waiters()`, which stores no permit, so
+            // an event landing between the drain below and a later
+            // `notified()` would be buffered but never wake this caller.
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             // Drain the first terminal event for our session id. A rejected
             // session ends as `DagWatchClosed`, not `LookupResolved` — waiting
             // only for the success variant would hang the caller until the
@@ -1246,7 +1255,9 @@ impl<P: Providers> Client<P> {
                     "connection closed before scalable lookup resolved".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            // Neither a resolution nor a close: park on the pre-armed waiter,
+            // then re-loop and re-arm. A spurious wake just re-drains.
+            notified.await;
         }
     }
 
@@ -1293,6 +1304,12 @@ impl<P: Providers> Client<P> {
         }
         self.shared.driver_waker.notify_one();
         loop {
+            // Arm the wakeup BEFORE draining — same enroll-before-drain rule as
+            // `scalable_topic_lookup`.
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             let drained = {
                 let mut buf = self.shared.scalable_events.lock();
                 let pos = buf.iter().position(|ev| {
@@ -1319,7 +1336,7 @@ impl<P: Providers> Client<P> {
                     "connection closed before the scalable assignment landed".to_owned(),
                 ));
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1429,16 +1446,26 @@ impl<P: Providers> Client<P> {
 
     /// **Experimental** (PIP-460, ADR-0093). Await the next scalable-topic
     /// event. Mirrors the tokio engine's `Client::next_scalable_event`.
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]:
+    /// the `Notified` is armed before the buffer drain and the `is_closed()`
+    /// re-check, so an event the driver pushes (then `notify_waiters()`, which
+    /// stores no permit) in the gap between the check and the park wakes this
+    /// waiter instead of being stranded in the buffer.
     #[cfg(feature = "scalable-topics")]
     pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {
         loop {
+            let notified = self.shared.scalable_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(ev) = self.shared.scalable_events.lock().pop_front() {
                 return Some(ev);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.scalable_notify.notified().await;
+            notified.await;
         }
     }
 
