@@ -2366,6 +2366,7 @@ fn scalable_segment(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::Segme
         created_at_ms: 0,
         sealed_at_ms: None,
         legacy_topic_name: None,
+        entry_bucket_splits: Vec::new(),
     }
 }
 
@@ -2464,6 +2465,7 @@ fn scalable_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignme
                 hash_start: 0,
                 hash_end: 32_768,
                 segment_topic: format!("segment://public/default/scaled/{id}"),
+                bucket_ranges: Vec::new(),
             })
             .collect(),
     }

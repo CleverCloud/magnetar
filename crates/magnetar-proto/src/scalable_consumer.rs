@@ -101,6 +101,7 @@ impl AssignedSegment {
             hash_start: self.key_range.start,
             hash_end: self.key_range.end,
             segment_topic: self.segment_topic.clone(),
+            bucket_ranges: Vec::new(),
         }
     }
 }
@@ -515,6 +516,7 @@ mod tests {
             hash_start: start,
             hash_end: end,
             segment_topic: format!("segment://public/default/scaled/{id}"),
+            bucket_ranges: Vec::new(),
         }
     }
 

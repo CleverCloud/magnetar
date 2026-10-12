@@ -5352,6 +5352,9 @@ impl Connection {
                 })
                 .collect(),
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
+            // PIP-486 entry-bucket dispatch is for scalable-topic segment
+            // sharing only; a plain Key_Shared subscription leaves it unset.
+            entry_bucket_dispatch: None,
         });
         let start_message_id = resume_from.map(MessageId::to_pb);
         let consumer_metadata: Vec<pb::KeyValue> = req
@@ -7356,6 +7359,7 @@ impl Connection {
             scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
                 session_id,
                 topic: topic.to_owned(),
+                create_if_missing: None,
             }),
             ..Default::default()
         };
@@ -18882,6 +18886,7 @@ mod scalable_conn_tests {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
         }
     }
 

@@ -86,6 +86,7 @@ fn seg(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
         created_at_ms: 0,
         sealed_at_ms: None,
         legacy_topic_name: None,
+        entry_bucket_splits: Vec::new(),
     }
 }
 
@@ -391,6 +392,7 @@ fn consumer_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignme
                 hash_start: 0,
                 hash_end: 32_768,
                 segment_topic: format!("segment://public/default/scaled/{id}"),
+                bucket_ranges: Vec::new(),
             })
             .collect(),
     }
@@ -1054,6 +1056,7 @@ fn scalable_consumer_session_and_watch_accessors() {
         hash_start: 0,
         hash_end: 128,
         segment_topic: "segment://public/default/scaled/4".to_owned(),
+        bucket_ranges: Vec::new(),
     });
     assert_eq!(seg.to_pb().segment_id, 4);
     assert!(

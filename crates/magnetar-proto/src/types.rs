@@ -229,6 +229,7 @@ impl SegmentDescriptor {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: self.legacy_topic_name.clone(),
+            entry_bucket_splits: Vec::new(),
         };
         let address = self
             .broker_url

@@ -97,6 +97,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **BREAKING: the vendored `PulsarApi.proto` moves from `v5.0.0-M1` to the GA release `v5.0.0`.**
+  The revision is `apache/pulsar` `b7b03f72cd4f81d501570588fcf3433ee035629b`, taken as the "another §D4 bump" [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) §D1 foresaw; `PulsarMarkers.proto` is byte-identical and `ProtocolVersion` stays `v21`.
+  The change over M1 is purely additive: PIP-486 entry-bucketing fields (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`), `CommandScalableTopicLookup.create_if_missing`, and `BaseCommand` type 82, `CommandScalableTopicUnsubscribe`.
+  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): the generated `pb` surface follows the 5.0.0 schema, and the `magnetar` façade is unaffected. The six new fields are required in struct literals of `MessageMetadata`, `KeySharedMeta`, `SegmentInfoProto`, `ScalableAssignedSegment` and `CommandScalableTopicLookup`, `pb::base_command::Type` gains `ScalableTopicUnsubscribe` (an exhaustive `match` stops compiling), and `pb::ScalableAssignedSegment` no longer derives `Eq` or `Hash` because it now holds a message-typed field.
+  The wire bytes this client sends are unchanged by the bump itself.
+
 - **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
   On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.
   `magnetar_proto` gains `MemoryLimitController`, `MemoryReservation`, `MemoryWaiterId`, `MemoryLimitExceeded`, `ProducerSlot::queue_send_reserved`, `ProducerState::queue_send_reserved` and `Connection::send_reserved`.

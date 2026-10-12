@@ -83,6 +83,7 @@ fn seg(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
         created_at_ms: 0,
         sealed_at_ms: None,
         legacy_topic_name: None,
+        entry_bucket_splits: Vec::new(),
     }
 }
 
@@ -395,6 +396,7 @@ fn consumer_assignment(epoch: u64, segs: &[(u64, u32, u32)]) -> pb::ScalableCons
                 hash_start: start,
                 hash_end: end,
                 segment_topic: format!("segment://public/default/scaled/{id}"),
+                bucket_ranges: Vec::new(),
             })
             .collect(),
     }
