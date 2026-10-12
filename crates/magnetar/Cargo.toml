@@ -148,7 +148,6 @@ parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, optional = true, features = ["rt", "sync", "test-util"] }
 tracing                    = { workspace = true }
-url                        = { workspace = true }
 uuid                       = { workspace = true }
 
 [dev-dependencies]
@@ -172,6 +171,7 @@ serde_json         = { workspace = true }
 testcontainers     = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
+url                = { workspace = true }
 # `wiremock` powers the `e2e_oauth2` IDP stub. Pure dev-dep — not pulled
 # in for non-test builds.
 wiremock           = { workspace = true }

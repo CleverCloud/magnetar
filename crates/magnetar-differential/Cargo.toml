@@ -51,8 +51,7 @@ moonpool-core             = { workspace = true }
 # of `magnetar-proto`; this promotes the existing entry rather than adding a crate.
 prost                     = { workspace = true }
 parking_lot               = { workspace = true }
-tokio                     = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
-tracing                   = { workspace = true }
+tokio                     = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "test-util", "time", "sync"] }
@@ -81,3 +80,4 @@ async-trait = { workspace = true }
 # CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).
 # Dev-only; never compiled into the harness library itself.
 tracing-subscriber = { workspace = true }
+tracing            = { workspace = true }

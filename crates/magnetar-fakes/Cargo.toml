@@ -26,4 +26,3 @@ scalable-topics = ["magnetar-proto/scalable-topics"]
 magnetar-proto = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }
-tracing        = { workspace = true }
