@@ -125,6 +125,15 @@ crypto-fips = [
     "magnetar-auth-oauth2?/crypto-fips",
 ]
 
+# --- Pulsar schemas (`magnetar_proto::schema`). Always available, no
+# extra dependency: Bytes, String, the primitive / temporal schemas, JSON,
+# PROTOBUF, PROTOBUF_NATIVE, KeyValue, AutoConsume and AutoProduceBytes. ---
+#
+# AVRO (`AvroSchema`): advertises the Avro parsing canonical form as
+# `schema_data` so the broker registry dedups logically-identical schemas.
+# Pulls in `apache-avro`. Default OFF.
+schema-avro = ["magnetar-proto/schema-avro"]
+
 [dependencies]
 magnetar-proto             = { workspace = true }
 magnetar-runtime-tokio     = { workspace = true, optional = true }

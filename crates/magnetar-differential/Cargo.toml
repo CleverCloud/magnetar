@@ -39,7 +39,7 @@ buggify = [
 ]
 
 [dependencies]
-magnetar-proto            = { workspace = true }
+magnetar-proto            = { workspace = true , features = ["schema-avro"] }
 magnetar-runtime-tokio    = { workspace = true }
 magnetar-runtime-moonpool = { workspace = true }
 bytes                     = { workspace = true }

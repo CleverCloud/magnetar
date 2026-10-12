@@ -61,6 +61,7 @@ use crate::pb;
 
 mod auto_consume;
 mod auto_produce_bytes;
+#[cfg(feature = "schema-avro")]
 mod avro;
 mod bytes_schema;
 mod json;
@@ -72,6 +73,7 @@ mod string;
 
 pub use self::auto_consume::{AutoConsumeSchema, GenericRecord, GenericRecordField};
 pub use self::auto_produce_bytes::AutoProduceBytesSchema;
+#[cfg(feature = "schema-avro")]
 pub use self::avro::AvroSchema;
 pub use self::bytes_schema::BytesSchema;
 pub use self::json::JsonSchema;

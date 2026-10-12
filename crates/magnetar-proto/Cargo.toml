@@ -39,6 +39,8 @@ scalable-topics  = []
 # `Buggify::with_rng_and_filter` under ADR-0097 swarm configurations).
 # Tests opt in via the moonpool integration suite.
 buggify          = []
+# Avro schema support
+schema-avro = ["dep:apache-avro"]
 
 [dependencies]
 bytes        = { workspace = true }
@@ -55,7 +57,7 @@ slab         = { workspace = true }
 uuid         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-apache-avro  = { workspace = true }
+apache-avro  = { workspace = true , optional = true }
 schemars     = { workspace = true }
 hdrhistogram = { workspace = true }
 # Sync primitive only — no I/O, no async, no networking.
