@@ -525,14 +525,27 @@ async fn dropped_in_flight_send_keeps_its_bytes_until_the_receipt() {
     let mut b1 = Box::pin(b.send(msg(600)));
     assert_rejected(poll_once(&mut b1).await, 600);
 
+    // With `a1` dropped there is no future to await, so wait on the budget
+    // itself. Not on `a.pending_count()`: the receipt removes the op from
+    // the pending queue under the per-slot lock, and the connection drops it
+    // — releasing its reservation — only after that lock is gone (ADR-0111
+    // lock rule), so a per-slot read can see the queue empty while the bytes
+    // are still reserved.
+    let budget = client.shared().memory_limit.clone();
+    assert_eq!(
+        budget.used_bytes(),
+        600,
+        "the dropped send's op holds its bytes"
+    );
     broker.release(0);
     tokio::time::timeout(HANG_GUARD, async {
-        while a.pending_count() > 0 {
+        while budget.used_bytes() > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the receipt drains a's pending queue");
+    .expect("the receipt releases the dropped send's bytes");
+    assert_eq!(a.pending_count(), 0, "the receipt drains a's pending queue");
     let mut b2 = Box::pin(b.send(msg(600)));
     assert!(
         poll_once(&mut b2).await.is_pending(),
