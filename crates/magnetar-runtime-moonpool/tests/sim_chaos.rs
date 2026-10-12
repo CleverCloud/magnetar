@@ -528,6 +528,21 @@ fn emit_success(out: &mut BytesMut, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
+/// `CommandError` carrying `ServiceNotReady` — what an Apache Pulsar broker
+/// answers for a topic outside the bundles it serves.
+fn emit_service_not_ready(out: &mut BytesMut, request_id: u64, message: &str) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Error as i32,
+        error: Some(pb::CommandError {
+            request_id,
+            error: pb::ServerError::ServiceNotReady as i32,
+            message: message.to_owned(),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
 // Silence unused warnings for symbols reserved for the next chaos
 // commit — the broker only handles Connect / Ping / Lookup / Producer
 // today, but the dispatch table is wired to grow.
@@ -788,6 +803,12 @@ struct SharedBroker {
     /// broker already assigned. A replayed in-flight publish re-emits the
     /// existing receipt rather than appending a duplicate ledger entry.
     dedup: HashMap<(String, u64), (u64, u64)>,
+    /// Topics this broker has claimed in a LOOKUP response — the only topics
+    /// it serves. A real broker refuses a `SUBSCRIBE` / `PRODUCER` for a topic
+    /// outside its bundles; control frames carry no CRC (ADR-0055), so a bit
+    /// flip can rewrite the topic string into one that still decodes, and
+    /// accepting it would bind the consumer to a ledger nobody writes.
+    served_topics: HashSet<String>,
 }
 
 impl SharedBroker {
@@ -803,6 +824,7 @@ impl SharedBroker {
         self.next_entry_id.clear();
         self.cursors.clear();
         self.dedup.clear();
+        self.served_topics.clear();
     }
 }
 
@@ -1002,11 +1024,18 @@ fn handle_stateful_frame(
         pb::base_command::Type::Ping => emit_pong(out),
         pb::base_command::Type::Lookup => {
             if let Some(l) = &frame.command.lookup_topic {
+                // The response claims this topic for this broker; record it so
+                // the data-plane arms below serve exactly the claimed topics.
+                shared.lock().served_topics.insert(l.topic.clone());
                 emit_lookup_response(out, l.request_id);
             }
         }
         pb::base_command::Type::Producer => {
             if let Some(p) = &frame.command.producer {
+                if !shared.lock().served_topics.contains(&p.topic) {
+                    emit_service_not_ready(out, p.request_id, "topic not served by this broker");
+                    return;
+                }
                 // Per-session routing only — the durable next-entry-id lives in
                 // `SharedBroker.next_entry_id` keyed by topic, so a re-opened
                 // producer resumes the same entry-id sequence after a reconnect.
@@ -1067,6 +1096,17 @@ fn handle_stateful_frame(
         }
         pb::base_command::Type::Subscribe => {
             if let Some(s) = &frame.command.subscribe {
+                // Refuse a topic this broker never claimed in a LOOKUP response,
+                // as a real broker refuses one outside its bundles. A bit flip in
+                // the CRC-less SUBSCRIBE can rewrite the topic into a string that
+                // still decodes (`persistent://public/defa}lt/...`); answering
+                // Success would bind the consumer to an empty ledger for good,
+                // while `ServiceNotReady` makes the client look the topic up again
+                // and re-subscribe.
+                if !shared.lock().served_topics.contains(&s.topic) {
+                    emit_service_not_ready(out, s.request_id, "topic not served by this broker");
+                    return;
+                }
                 // Resume policy (ADR-0055 §3): the per-session DELIVERY position
                 // is seeded from an explicit `start_message_id` (resume = that
                 // entry_id + 1), else the durable per-subscription ACK cursor,
@@ -3365,14 +3405,17 @@ where
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
             handle_stateful_frame(&mut session, &shared, &source, &frame, &mut out_buf);
-            // Subscribe registers the consumer id with the shared
-            // swizzle state so the controller can see how many
-            // consumers exist.
+            // An accepted Subscribe registers the consumer id with the
+            // shared swizzle state so the controller can see how many
+            // consumers exist. A refused one (topic not served) is not a
+            // consumer and must never become a clog candidate.
             if let Ok(pb::base_command::Type::Subscribe) =
                 pb::base_command::Type::try_from(frame.command.r#type)
             {
                 if let Some(s) = &frame.command.subscribe {
-                    state.lock().registered.insert(s.consumer_id);
+                    if session.consumers.contains_key(&s.consumer_id) {
+                        state.lock().registered.insert(s.consumer_id);
+                    }
                 }
             }
         }
@@ -3449,7 +3492,8 @@ fn push_pending_messages_excluding(
 type ReceivedByConsumer = HashMap<u64, Vec<(u64, u64)>>;
 
 struct SwizzleClogClientWorkload {
-    /// Receives accumulated by consumer id; populated incrementally
+    /// Receives accumulated by wire consumer id (the broker's id space, which
+    /// `SwizzleSpec::restore_order` uses); populated incrementally
     /// by the per-consumer drain task. Wrapped under one mutex so the
     /// `check()` phase can pluck a consistent snapshot.
     received_per_consumer: Arc<Mutex<ReceivedByConsumer>>,
@@ -3672,12 +3716,17 @@ impl Workload for SwizzleClogClientWorkload {
                 }
             }
         });
-        for (idx, consumer) in consumers.into_iter().enumerate() {
+        for consumer in consumers {
             let received_for_task = received_per_consumer.clone();
             let time_for_task = time_provider.clone();
             let shutdown_for_task = shutdown.clone();
             let handle = task_provider.spawn_task("swizzle-consumer-drain", async move {
-                let cid = idx as u64;
+                // Key by the wire consumer id — the id the broker registers and
+                // the clog set holds — not by the subscribe index: a re-issued
+                // subscribe (a bit flip on its `CommandSuccess` request id, or a
+                // `ServiceNotReady` refusal) allocates a fresh id, so the two
+                // diverge.
+                let cid = consumer.handle().0;
                 let mut got = Vec::new();
                 // Dedup by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised
                 // reconnect redelivers the un-acked tail at-least-once, so the
@@ -3813,6 +3862,49 @@ fn sim_chaos_swizzle_clog_smoke() {
         report.failed_runs, 0,
         "swizzle smoke: the single iteration must satisfy the window properties: {report:?}"
     );
+}
+
+/// Regression pin for three swizzle-clog sub-seeds where a bit flip landed
+/// in a CRC-less setup control frame (ADR-0055) and still decoded. Under
+/// `MOONPOOL_SEED=0x936d7316eb89b85a` (sub-seed 7689309144478328151) and
+/// `0x6f63dd0a3c26bd19` (3305053875183104886) it rewrote the `SUBSCRIBE`
+/// topic (`persistent://public/defa}lt/...`, `persistent://public'DefaulT/...`);
+/// the broker answered Success and bound the consumer to a ledger nobody
+/// writes, so a clogged consumer never received. Under `0xc489a88e883a9265`
+/// (3907019257459817873) it turned a `CommandSuccess` request id 3 into 1;
+/// the subscribe was re-issued under a fresh consumer id, and the validation
+/// looked the broker's wire ids up in a map keyed by subscribe index. The
+/// broker now refuses a topic it never claimed in a LOOKUP response
+/// (`ServiceNotReady`, as a real broker refuses a topic outside its bundles),
+/// and the drain tasks key deliveries by wire consumer id. The swizzle-window
+/// assertions are unchanged.
+#[test]
+fn sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds() {
+    let broker = SwizzleClogBrokerWorkload::new(2, 100);
+    let swizzle_snapshot = Arc::new(Mutex::new(None));
+    let state_for_mirror = broker.state.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(SwizzleClogMirroringClient::new(
+            swizzle_snapshot,
+            state_for_mirror,
+        ))
+        .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(vec![
+            7_689_309_144_478_328_151,
+            3_305_053_875_183_104_886,
+            3_907_019_257_459_817_873,
+        ])
+        .set_iterations(3)
+        .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "swizzle invariant violation(s): {report:?}"
+    );
+    assert_eq!(report.successful_runs, 3, "report: {report:?}");
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }
 
 /// Thin client wrapper that mirrors the broker's
