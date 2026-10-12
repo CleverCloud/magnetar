@@ -493,3 +493,77 @@ MemoryLimitExceeded and fails the contract.
 RETAINED as a regression anchor — do NOT remove on a green replay: the
 per-PR seed-replay re-validates this fix.
 """
+
+[[seed]]
+value        = "0xc489a88e883a9265"
+discovered   = "2026-10-05"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37296570400"
+commit_sha   = "15e6ed6509a721a5ef450e0badbc0f1ce9568d22"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+note         = """
+Derived sub-seed 3907019257459817873: the sim's bit flip turned the
+broker's CommandSuccess request_id 3 into 1. The client dropped the
+unmatched id (as Java's ClientCnx does), subscribe[1] timed out and
+retry_setup re-subscribed under a fresh wire id, but the swizzle drain
+tasks keyed deliveries by subscribe index while the clog restore order held
+wire ids, so the controller reported "consumer 4 never received" although
+both clogged consumers drained 8/8. No report was filed: the sweep's report
+job dropped single-failure runs (fixed separately, #874).
+
+FIXED in the harness: drain tasks key deliveries by the consumer handle
+(the wire id). Pinned by
+`sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x936d7316eb89b85a"
+discovered   = "2026-10-09"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37918317074"
+commit_sha   = "a61ae482be9eaf5eb2c34e7c61fd070ae4f106cc"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+note         = """
+Derived sub-seed 7689309144478328151: the sim's bit flip corrupted the topic of a
+client->broker SUBSCRIBE in flight (e.g. `persistent://public/defa}lt/...`)
+while the frame still decoded. `SharedBroker` bound the consumer to that
+string and answered Success, so `drain_pending` never found its ledger and
+the clogged consumer never received. No report was filed: the sweep's
+report job dropped single-failure runs (fixed separately, #874).
+
+FIXED in the harness: the sim broker serves only the topics it claimed in a
+LOOKUP response and refuses any other SUBSCRIBE/PRODUCER with
+ServiceNotReady, so the client looks the topic up again; the swizzle
+session registers a consumer only once the broker accepted its bind. Pinned
+by `sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds`.
+The same seed's memory-limit failure was fixed by #873 and hid this one:
+the sweep's `cargo test` stopped at the first failing binary.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x6f63dd0a3c26bd19"
+discovered   = "2026-10-10"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/38042793494"
+commit_sha   = "a1546363368a5a6edb2c6c55bc6b783b4c1c7214"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+note         = """
+Derived sub-seed 3305053875183104886: the sim's bit flip corrupted the topic of a
+client->broker SUBSCRIBE in flight (e.g. `persistent://public/defa}lt/...`)
+while the frame still decoded. `SharedBroker` bound the consumer to that
+string and answered Success, so `drain_pending` never found its ledger and
+the clogged consumer never received. No report was filed: the sweep's
+report job dropped single-failure runs (fixed separately, #874).
+
+FIXED in the harness: the sim broker serves only the topics it claimed in a
+LOOKUP response and refuses any other SUBSCRIBE/PRODUCER with
+ServiceNotReady, so the client looks the topic up again; the swizzle
+session registers a consumer only once the broker accepted its bind. Pinned
+by `sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
