@@ -7,9 +7,9 @@
 # `cargo run -p xtask -- check-known-failing-seeds`. ADR-0047 binds
 # the policy; ADR-0036 stays in force for the daily discovery cadence.
 #
-# Local replay:
+# Local replay (the same invocation as the sweep and `seed-replay`):
 #   MOONPOOL_SEED=<value> cargo test -p magnetar-runtime-moonpool \
-#       --features crypto-aws-lc-rs --locked
+#       --no-default-features --features crypto-aws-lc-rs --locked --no-fail-fast
 #
 # Schema (one TOML array entry per failing seed):
 #

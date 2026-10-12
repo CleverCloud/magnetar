@@ -86,29 +86,33 @@ jobs:
       # `check-crypto-matrix` xtask). Same invocation as the per-PR
       # `seed-replay` job in `.github/workflows/ci.yml` so the
       # discovery axis and the replay axis are bit-for-bit comparable.
-      - name: Build moonpool engine
+      # Compiling the test targets does not depend on the seed, so a build
+      # failure here fails the job without marking the seed: a compile error
+      # is not a seed failure, and must not open one issue per rolled seed.
+      - name: Build moonpool engine and test targets
         run: |
-          cargo build -p magnetar-runtime-moonpool \
-            --no-default-features --features crypto-aws-lc-rs --locked
+          cargo test -p magnetar-runtime-moonpool \
+            --no-default-features --features crypto-aws-lc-rs --locked --no-run
+      # `--no-fail-fast` runs every test binary, so one failing binary does
+      # not hide a failure in a later one.
       - name: Run moonpool-sim test suite
+        id: sim
         env:
           MOONPOOL_SEED: ${{ matrix.seed }}
         run: |
           cargo test -p magnetar-runtime-moonpool \
-            --no-default-features --features crypto-aws-lc-rs --locked
-      # Record the seed for the report-failures job. We write the value
-      # to `failed.txt` only if the previous step failed; the artifact
-      # is always uploaded so the downstream job's `download-artifact`
-      # never errors on a missing artifact.
+            --no-default-features --features crypto-aws-lc-rs --locked --no-fail-fast
+      # Record the seed for the report-failures job, only when the test
+      # suite itself failed under this seed.
       - name: Record failing seed for downstream report
-        if: failure()
+        if: failure() && steps.sim.outcome == 'failure'
         env:
           MATRIX_SEED: ${{ matrix.seed }}
         run: |
           set -euo pipefail
           echo "${MATRIX_SEED}" > failed.txt
       - name: Upload failure marker
-        if: failure()
+        if: failure() && steps.sim.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
           # Hex seeds are alphanumeric; safe inside an artifact name.
@@ -158,9 +162,11 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Each `failing-seed-<seed>/failed.txt` contains the seed.
-          shopt -s nullglob
-          markers=(failure-markers/failing-seed-*/failed.txt)
+          # Each marker `failed.txt` contains the seed. With several
+          # artifacts they land in `failing-seed-<seed>/`; a single matching
+          # artifact is extracted straight into `failure-markers/`, so find
+          # them at any depth.
+          mapfile -t markers < <(find failure-markers -type f -name failed.txt 2>/dev/null | sort)
           if [ "${#markers[@]}" -eq 0 ]; then
             echo "No failure markers found; nothing to report."
             exit 0
@@ -186,7 +192,7 @@ jobs:
 
           \`\`\`
           MOONPOOL_SEED=${seed} cargo test -p magnetar-runtime-moonpool \\
-              --features crypto-aws-lc-rs --locked
+              --no-default-features --features crypto-aws-lc-rs --locked --no-fail-fast
           \`\`\`
 
           ### Workflow run

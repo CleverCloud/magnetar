@@ -5,6 +5,11 @@
 - **Decider**: Florentin Dubois
 - **Tags**: testing, moonpool, ci, process, regression-guard
 
+> **Amendment (2026-10-12).** §3's issue-per-new-failing-seed rule now holds for every sweep run: the report job finds failure markers at any depth, because a run with a single failing seed extracts its one artifact flat and the previous glob reported nothing for the 2026-10-05, 2026-10-09, 2026-10-10 and 2026-10-11 runs.
+> The sweep compiles its test targets in a seed-independent step first, so a compile error fails the run without marking any seed — the 2026-10-02 to 2026-10-04 compile error of `partitioned_dlq_republish` opened 384 seed issues, one per rolled seed.
+> It also runs `cargo test --no-fail-fast`, so one failing test binary no longer hides a failure in a later one.
+> §4's local reproduction needs `--no-default-features --features crypto-aws-lc-rs`, the invocation the sweep and `seed-replay` use; the issue body and the registry header now say so.
+
 ## Context
 
 [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) shifted the moonpool deterministic-simulation seed sweep from a fixed per-PR matrix to a **daily random** sweep (`.github/workflows/moonpool-seed-sweep.yml`).
