@@ -69,6 +69,12 @@ impl ScalableConsumerType {
 
 /// One segment assigned to this consumer, with the `segment://` topic to attach
 /// to.
+///
+/// The wire message also carries `bucket_ranges` (PIP-486): non-empty means the
+/// segment is shared by entry bucket, and the consumer must then subscribe
+/// `Key_Shared` sticky with `entryBucketDispatch` instead of `Exclusive`. It is
+/// dropped here and re-encoded empty — a known gap until the per-segment fan-out
+/// attaches to assigned segments (ADR-0093 amendment 2026-10-12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedSegment {
     /// Segment id within the topic's DAG.

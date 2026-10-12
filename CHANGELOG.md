@@ -102,6 +102,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The change over M1 is purely additive: PIP-486 entry-bucketing fields (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`), `CommandScalableTopicLookup.create_if_missing`, and `BaseCommand` type 82, `CommandScalableTopicUnsubscribe`.
   **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): the generated `pb` surface follows the 5.0.0 schema, and the `magnetar` façade is unaffected. The six new fields are required in struct literals of `MessageMetadata`, `KeySharedMeta`, `SegmentInfoProto`, `ScalableAssignedSegment` and `CommandScalableTopicLookup`, `pb::base_command::Type` gains `ScalableTopicUnsubscribe` (an exhaustive `match` stops compiling), and `pb::ScalableAssignedSegment` no longer derives `Eq` or `Hash` because it now holds a message-typed field.
   The wire bytes this client sends are unchanged by the bump itself.
+  (ADR-0093 amendment 2026-10-12)
+
+- **BREAKING: the scalable-topic lookup takes a `create_if_missing` flag and states it explicitly; the read-only lookup behind `magnetarctl topic-info` never creates a topic.**
+  On Pulsar 5.0.0-M1 a lookup of a missing `topic://` topic failed with "Scalable topic not found"; on 5.0.0 a lookup that leaves the new `create_if_missing` field unset (default `true`) auto-creates the topic, subject to the broker's auto-creation policy.
+  `Connection::open_scalable_topic_session`, `Client::scalable_topic_lookup` on both runtimes and the `ScalableTopicsApi::scalable_topic_lookup` trait method gain a `create_if_missing: bool` parameter, passed last, and the lookup command always carries it explicitly, `true` and `false` alike; an M1 broker skips the unknown field.
+  **BREAKING CHANGE** (`magnetar-proto`, re-exported as `magnetar::proto`, plus the two runtime `Client`s and the `ScalableTopicsApi` engine hook): any direct caller of those entries must pass the flag. The `PulsarClient` signatures are unchanged.
+  `PulsarClient::scalable_stream_consumer` opens a consumer, so it passes `true` as the Java v5 client does on every explicit single-topic path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799` at `v5.0.0`).
+  `PulsarClient::lookup_scalable_topic` passes `false`: it is read-only, so `magnetarctl topic-info` reports "not found" for a missing topic on M1 and 5.0.0 alike instead of creating it on 5.0.0.
+  `scalable_topic_subscribe` is unchanged; `CommandScalableTopicSubscribe` has no such field.
+  `CommandScalableTopicUnsubscribe` is decoded and never sent, an inbound frame of that type is skipped without an error, and the PIP-486 fields are decoded and ignored; all three are recorded as known gaps in `docs/follow-ups.md` §12.
+  (ADR-0093 amendment 2026-10-12)
 
 - **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
   On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.

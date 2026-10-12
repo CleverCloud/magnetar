@@ -216,8 +216,9 @@ pub(crate) enum Cmd {
     /// **Experimental** (PIP-460 / ADR-0093). Print a scalable topic's current
     /// segment DAG. Resolves a `topic://...` URL against the controller broker
     /// and prints each segment's id, key range, state, and broker URL.
-    /// Requires a Pulsar 5.0+ broker with PIP-460 enabled (no broker ships it
-    /// today — see `docs/scalable-topics.md`).
+    /// Read-only: a topic that does not exist is reported as not found, never
+    /// created. Requires a Pulsar 5.0+ broker with PIP-460 enabled (see
+    /// `docs/pip-features.md`).
     #[cfg(feature = "scalable-topics")]
     TopicInfo {
         /// Scalable topic URL (`topic://tenant/namespace/topic`).

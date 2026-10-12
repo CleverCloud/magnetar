@@ -12,7 +12,7 @@
 //! provider plumbing required, matching the `shadow_topic.rs` pattern.
 //!
 //! The frames here are ordinary `BaseCommand`s: since ADR-0093 the client
-//! speaks the upstream PIP-460 surface vendored from Pulsar 5.0.0-M1, so these
+//! speaks the upstream PIP-460 surface vendored from Pulsar 5.0.0, so these
 //! tests encode exactly what a real broker sends.
 //!
 //! Parity required by ADR-0024: the test count must match the tokio side
@@ -140,7 +140,7 @@ fn scalable_topic_url_parsing() {
 fn stream_consumer_happy_path_against_fake_broker() {
     let mut conn = connected_conn();
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
 
@@ -188,7 +188,7 @@ fn stream_consumer_happy_path_against_fake_broker() {
 fn stream_consumer_drops_on_dag_change() {
     let mut conn = connected_conn();
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
 
@@ -251,7 +251,7 @@ fn stream_consumer_drops_on_dag_change() {
 fn duplicate_layout_epoch_is_ignored_and_session_survives() {
     let mut conn = connected_conn();
     let session_id = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
 
@@ -318,7 +318,7 @@ fn scalable_lookup_refused_against_v4_broker() {
     assert!(!conn.broker_supports_scalable_topics());
 
     let err = conn
-        .open_scalable_topic_session("topic://public/default/scaled")
+        .open_scalable_topic_session("topic://public/default/scaled", true)
         .expect_err("v4 broker refuses the scalable surface");
     assert_eq!(err, magnetar_proto::ScalableTopicError::BrokerUnsupported);
     assert!(
@@ -694,4 +694,37 @@ fn tc_assignment_discovery_gated_on_its_own_flag() {
     assert_eq!(parallelism, 2);
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0].tc_id, 0);
+}
+
+/// (c) #11 — the lookup states the caller's `create_if_missing` explicitly,
+/// `true` and `false` alike (ADR-0093 amendment 2026-10-12).
+///
+/// Drives the real engine entry, `Connection::open_scalable_topic_session`, and
+/// decodes the bytes it queues: the field is present on the wire as `Some(true)`
+/// or `Some(false)` rather than left to the schema default, which is `true` on a
+/// 5.0.0 broker and absent altogether on 5.0.0-M1. `true` is the Java v5 client's
+/// single-topic value (`DagWatchClient.java:77-79`, `Commands.java:1793-1799`);
+/// `false` makes the lookup read-only.
+#[test]
+fn scalable_lookup_states_create_if_missing_explicitly() {
+    let mut conn = connected_conn();
+    for create_if_missing in [true, false] {
+        let session_id = conn
+            .open_scalable_topic_session("topic://public/default/scaled", create_if_missing)
+            .expect("broker supports scalable topics");
+
+        let mut out = conn.poll_transmit();
+        assert!(
+            out.ends_with(&[0x18, u8::from(create_if_missing)]),
+            "the lookup ends with field 3 (create_if_missing) = {create_if_missing}, got {:02x?}",
+            &out[..]
+        );
+        let frame = magnetar_proto::decode_one(&mut out).expect("decodes as a BaseCommand");
+        let lookup = frame
+            .command
+            .scalable_topic_lookup
+            .expect("lookup payload present");
+        assert_eq!(lookup.session_id, session_id);
+        assert_eq!(lookup.create_if_missing, Some(create_if_missing));
+    }
 }

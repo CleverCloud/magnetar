@@ -1409,7 +1409,17 @@ fn handle_frame(
                 // A topic whose name ends in `-missing` is the scripted
                 // rejection: the broker answers with an error and no layout, so
                 // both engines exercise the lookup-refused path.
-                if l.topic.ends_with("-missing") {
+                //
+                // A topic ending in `-absent` does not exist yet. Like a 5.0.0
+                // broker's `DagWatchSession` (`DagWatchSession.java:138-157`) it
+                // is auto-created — answered with the layout — only when the
+                // lookup asks for creation, and refused with the same not-found
+                // otherwise. `create_if_missing()` applies the schema default,
+                // so a lookup that leaves the field unset also creates, as
+                // upstream does.
+                if l.topic.ends_with("-missing")
+                    || (l.topic.ends_with("-absent") && !l.create_if_missing())
+                {
                     emit_scalable_layout_rejection(out, l.session_id, true);
                 } else if l.topic.ends_with("-terse") {
                     // Rejection with no `message`, so the client's fallback
