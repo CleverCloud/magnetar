@@ -437,3 +437,59 @@ fails. Pinned into CHAOS_REGRESSION_SEEDS in driver_mid_session_reject.rs.
 RETAINED as a regression anchor — do NOT remove on a green replay: the
 per-PR seed-replay re-validates this fix.
 """
+
+[[seed]]
+value        = "0xc364f2c842343a83"
+discovered   = "2026-10-06"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37448794181"
+commit_sha   = "15e6ed6509a721a5ef450e0badbc0f1ce9568d22"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/859"
+note         = """
+Derived sub-seed 275959541064554753: the sim's bit flip landed in the
+LOOKUP_RESPONSE `broker_service_url`, turning
+`pulsar://broker-sim.proxy.internal:6650` into
+`pulsar://broker-sim\\x0eproxy.internal:6650` (bit 5 of the `.`). The scheme
+survived, so the client pinned a proxy session to the corrupted authority;
+`ProxyThroughBroker` answered CONNECTED to any `proxy_to_broker_url` and
+served the producer on it, leaving no correctly-pinned session and no error
+for `retry_setup` to retry. Not a client defect: control frames carry no
+CRC (ADR-0055), and a real Pulsar Proxy refuses a target it cannot validate.
+
+FIXED in the harness: the emulated proxy refuses an unadvertised
+`proxy_to_broker_url`, so the client looks the topic up again and pins a
+clean session. Pinned by `sim_chaos_pulsar_proxy_corrupted_broker_host_sub_seed_859`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x259ebbc948254d15"
+discovered   = "2026-10-06"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37448794181"
+commit_sha   = "15e6ed6509a721a5ef450e0badbc0f1ce9568d22"
+test_name    = "moonpool_producer_memory_limit_fail_immediately_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/858"
+note         = """
+Derived sub-seed 6117353232429081445: the sim's bit flip landed in the
+uncovered 4-byte size prefix of the under-limit send's CommandSendReceipt
+(00 00 00 12 -> 00 00 02 12), so the client's decoder waited for 530 bytes
+that never came, no receipt resolved the send, and the producer's
+`send_timeout` failed it with `code=-1, "send timeout"` (Java parity,
+ADR-0072). The reservation had succeeded and the over-limit send was
+correctly rejected; the test only accepted PeerClosed/Closed as transport
+outcomes and counted the timeout as a memory-limit violation. The same
+cause, a flip in the CommandSend size prefix (sub-seed
+7689309144478328151), failed MOONPOOL_SEED=0x936d7316eb89b85a on
+2026-10-09 (run 37918317074, commit a61ae48).
+
+FIXED in the harness: a `send timeout` on the under-limit send is a
+transport outcome like PeerClosed, and the producer pins a 2 s
+`send_timeout` so it resolves inside the 30 s run budget (the 30 s default
+equalled it). A wrongly rejected under-limit send still surfaces as
+MemoryLimitExceeded and fails the contract.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""

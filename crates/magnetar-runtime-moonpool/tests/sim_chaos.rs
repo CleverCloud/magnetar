@@ -2496,7 +2496,9 @@ struct ProxySessionRecord {
 
 /// Broker workload emulating the Apache Pulsar Proxy: answers lookups
 /// with `proxy_through_service_url = true` and serves data ops on the
-/// pinned (`proxy_to_broker_url`-bearing) session.
+/// pinned (`proxy_to_broker_url`-bearing) session. Like the real proxy, it
+/// refuses a CONNECT whose `proxy_to_broker_url` names a broker it did not
+/// advertise.
 struct ProxyThroughBroker {
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
     /// Index of the session that first issues a Lookup — the real
@@ -2600,7 +2602,28 @@ where
                 continue;
             };
             match kind {
-                pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                pb::base_command::Type::Connect => {
+                    // A real Pulsar Proxy refuses a `proxy_to_broker_url` it
+                    // cannot validate and closes the connection. Emulate
+                    // that: the only backend this proxy can reach is the
+                    // one it advertised, so any other target — for example
+                    // a lookup response whose host chaos bit-flipped into a
+                    // string that still parses (#859) — gets no CONNECTED.
+                    // The client's handshake then fails and `retry_setup`
+                    // looks the topic up again, instead of a producer
+                    // opening on a session pinned to a broker no deployment
+                    // could reach. The bootstrap shape (`None`) is accepted.
+                    let target_unadvertised = frame
+                        .command
+                        .connect
+                        .as_ref()
+                        .and_then(|c| c.proxy_to_broker_url.as_deref())
+                        .is_some_and(|url| url != PROXY_ADVERTISED_BROKER_AUTHORITY);
+                    if target_unadvertised {
+                        return Ok(());
+                    }
+                    emit_connected(&mut out_buf);
+                }
                 pb::base_command::Type::Ping => emit_pong(&mut out_buf),
                 pb::base_command::Type::Lookup => {
                     if let Some(l) = &frame.command.lookup_topic {
@@ -2898,6 +2921,46 @@ fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
     assert_eq!(
         report.successful_runs,
         4,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+    assert_eq!(
+        report.failed_runs,
+        0,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+}
+
+/// Regression pin for the corrupted-broker-host sub-seed (#859, surfaced
+/// under `MOONPOOL_SEED=0xc364f2c842343a83`). A single bit flip in the
+/// lookup response's `broker_service_url` turned
+/// `pulsar://broker-sim.proxy.internal:6650` into
+/// `pulsar://broker-sim\x0eproxy.internal:6650`. The scheme survived, so the
+/// client pinned a proxy session to the corrupted authority, and
+/// `ProxyThroughBroker` — which then accepted any `proxy_to_broker_url` —
+/// served the producer on it, leaving no correctly-pinned session and no
+/// error for `retry_setup` to retry. The emulated proxy now refuses an
+/// unadvertised target the way the Apache Pulsar Proxy refuses a target it
+/// cannot validate, so the client re-looks-up and pins a clean session. Pin
+/// the exact failing sub-seed, independent of `MOONPOOL_SEED` derivation.
+#[test]
+fn sim_chaos_pulsar_proxy_corrupted_broker_host_sub_seed_859() {
+    let sessions = Arc::new(Mutex::new(Vec::<ProxySessionRecord>::new()));
+    let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(ProxyThroughBroker {
+            sessions: sessions.clone(),
+            bootstrap_session_idx: Arc::new(Mutex::new(None)),
+        })
+        .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
+        .set_debug_seeds(vec![275_959_541_064_554_753])
+        .set_iterations(1)
+        .run();
+    assert_eq!(
+        report.successful_runs,
+        1,
         "report: {report:?}; diagnostics: {:?}",
         diagnostics.lock()
     );
