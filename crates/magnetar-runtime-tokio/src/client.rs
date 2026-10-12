@@ -1447,15 +1447,25 @@ impl Client {
     ///
     /// The future is cancel-safe: dropping it without polling does not drop pending
     /// deltas, the next `next_topic_list_change` call still sees them.
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]: the
+    /// `Notified` is armed before the buffer drain and the `is_closed()` re-check, so a delta
+    /// the driver pushes (then `topic_list_notify.notify_waiters()`, which stores no permit)
+    /// in the gap between the check and the park wakes this waiter instead of being stranded
+    /// in the buffer.
     pub async fn next_topic_list_change(&self) -> Option<crate::TopicListChange> {
         loop {
+            let notified = self.shared.topic_list_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(change) = self.shared.topic_list_changes.lock().pop_front() {
                 return Some(change);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.topic_list_notify.notified().await;
+            notified.await;
         }
     }
 

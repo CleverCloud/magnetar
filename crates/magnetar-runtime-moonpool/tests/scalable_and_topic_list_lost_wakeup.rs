@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PIP-460 scalable-topic waiter lost-wakeup regression — moonpool engine twin of
-//! `crates/magnetar-runtime-tokio/tests/scalable_lost_wakeup.rs` (ADR-0024
-//! cross-runtime test parity, 1:1 test names).
+//! PIP-460 scalable-topic and PIP-145 topic-list waiter lost-wakeup regression — moonpool
+//! engine twin of `crates/magnetar-runtime-tokio/tests/scalable_and_topic_list_lost_wakeup.rs`
+//! (ADR-0024 cross-runtime test parity, 1:1 test names).
 //!
-//! `Client::scalable_topic_lookup`, `Client::scalable_topic_subscribe` and
-//! `Client::next_scalable_event` used to drain `scalable_events` and re-check
-//! `is_closed()` *before* creating the `Notified` they park on. The driver's
-//! `emit_scalable` pushes the event and then fires `scalable_notify.notify_waiters()`,
-//! which stores **no permit**: an event pushed between the drain and the
-//! (too-late) `notified()` was buffered, the waiter parked, and nothing woke
-//! it again — the scripted broker sends each of these events exactly once, so
-//! the `scalable_assignment_rebalance_parity` differential test hung until the
-//! CI job timeout. The fix arms the `Notified` *before* the drain (the
-//! enroll-before-drain idiom of `next_replicated_subscription_marker`),
-//! mirrored 1:1 across both engines.
+//! `Client::scalable_topic_lookup`, `Client::scalable_topic_subscribe`,
+//! `Client::next_scalable_event` and `Client::next_topic_list_change` used to drain their buffer
+//! (`scalable_events`, `topic_list_changes`) and re-check `is_closed()` *before* creating the
+//! `Notified` they park on. The driver pushes the event and then fires `notify_waiters()` on
+//! `scalable_notify` / `topic_list_notify`, which stores **no permit**: an event pushed between
+//! the drain and the (too-late) `notified()` was buffered, the waiter parked, and nothing woke
+//! it again. The scripted broker sends each scalable event exactly once, so the
+//! `scalable_assignment_rebalance_parity` differential test hung until the CI job timeout, and a
+//! topic-list delta is likewise a one-shot broker push. The fix arms the `Notified` *before* the
+//! drain (the enroll-before-drain idiom of `next_replicated_subscription_marker`), mirrored 1:1
+//! across both engines.
 //!
 //! The window is three synchronous statements wide (buffer unlock, `inner`
 //! lock for `is_closed()`, `notified()` creation), so no poll order, paused
@@ -29,8 +29,8 @@
 //!    `is_closed()`, where it blocks on the connection lock the test still holds;
 //! 3. the test's next buffer-lock acquisition queues behind that hand-off, so it returns only once
 //!    the waiter's drain is over: the waiter is now provably inside the window;
-//! 4. the test does exactly what `emit_scalable` does — push, then `notify_waiters()` — and
-//!    releases the connection lock.
+//! 4. the test does exactly what the driver does — push, then `notify_waiters()` — and releases the
+//!    connection lock.
 //!
 //! A waiter that enrolled before draining is woken by step 4 and returns the
 //! event; one that enrols after it parks forever and the `HANG_GUARD` fires.
@@ -44,27 +44,31 @@
 //! exactly as the tokio one does. `moonpool-sim` interleaves tasks only at yield
 //! points and the window has none, so a simulated schedule cannot reach it.
 //!
-//! ADR-0024: tokio twin `scalable_lost_wakeup.rs` (1:1, `check-runtime-test-parity`).
+//! ADR-0024: tokio twin `scalable_and_topic_list_lost_wakeup.rs` (1:1,
+//! `check-runtime-test-parity`).
 
-#![cfg(feature = "scalable-topics")]
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use magnetar_proto::{
-    ConnectionConfig, FrameError, ScalableConsumerType, decode_one, encode_command, pb,
-};
-use magnetar_runtime_moonpool::{Client, ConnectionShared, MoonpoolEngine, ScalableEvent};
+#[cfg(feature = "scalable-topics")]
+use magnetar_proto::ScalableConsumerType;
+use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
+#[cfg(feature = "scalable-topics")]
+use magnetar_runtime_moonpool::ScalableEvent;
+use magnetar_runtime_moonpool::{Client, ConnectionShared, MoonpoolEngine, TopicListChange};
 use moonpool_core::TokioProviders;
-use parking_lot::MutexGuard;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 mod common;
 use common::HANG_GUARD;
 
@@ -148,6 +152,7 @@ async fn connect_to_silent_broker() -> Arc<Client<TokioProviders>> {
     .await
     .expect("connect did not time out")
     .expect("connect ok");
+    #[cfg(feature = "scalable-topics")]
     assert!(
         client.broker_supports_scalable_topics(),
         "the silent broker must advertise PIP-460 or the client refuses the scalable commands"
@@ -173,16 +178,18 @@ fn bounded_on_this_thread<F: Future>(fut: F) -> Result<F::Output, tokio::time::e
         .block_on(async { tokio::time::timeout(HANG_GUARD, fut).await })
 }
 
-/// Run `waiter` on its own thread, drive it into the window between its buffer
-/// drain and its park, and deliver `event` there exactly as the driver's
-/// `emit_scalable` does (push, then `notify_waiters()`). Returns what the waiter
+/// Run `waiter` on its own thread, drive it into the window between its drain
+/// of `buffer` and its park on `notify`, and deliver `event` there exactly as the
+/// driver does (push, then `notify_waiters()`). Returns what the waiter
 /// returned. See the module docs for the lock hand-off that pins the waiter.
-fn deliver_in_the_race_window<T: Send + 'static>(
+fn deliver_in_the_race_window<E, T: Send + 'static>(
     shared: &ConnectionShared,
+    buffer: &Mutex<VecDeque<E>>,
+    notify: &Notify,
     waiter: impl FnOnce() -> T + Send + 'static,
-    event: ScalableEvent,
+    event: E,
 ) -> T {
-    let drain_gate = shared.scalable_events.lock();
+    let drain_gate = buffer.lock();
 
     let started = Arc::new(AtomicBool::new(false));
     let waiter = {
@@ -203,10 +210,10 @@ fn deliver_in_the_race_window<T: Send + 'static>(
     MutexGuard::unlock_fair(drain_gate);
 
     // Queued behind the hand-off: returns only once the waiter's drain is over.
-    let mut drain_gate = shared.scalable_events.lock();
+    let mut drain_gate = buffer.lock();
     drain_gate.push_back(event);
     drop(drain_gate);
-    shared.scalable_notify.notify_waiters();
+    notify.notify_waiters();
     drop(check_gate);
 
     waiter.join().expect("waiter thread panicked")
@@ -214,6 +221,7 @@ fn deliver_in_the_race_window<T: Send + 'static>(
 
 /// `next_scalable_event` must return an event the driver pushed after its
 /// drain found the buffer empty and before it parked.
+#[cfg(feature = "scalable-topics")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_scalable_event_catches_event_pushed_between_drain_and_park() {
     let client = connect_to_silent_broker().await;
@@ -221,6 +229,8 @@ async fn next_scalable_event_catches_event_pushed_between_drain_and_park() {
     let waiter_client = Arc::clone(&client);
     let outcome = deliver_in_the_race_window(
         client.shared(),
+        &client.shared().scalable_events,
+        &client.shared().scalable_notify,
         move || bounded_on_this_thread(waiter_client.next_scalable_event()),
         ScalableEvent::DagWatchClosed {
             session_id: 9,
@@ -242,6 +252,7 @@ async fn next_scalable_event_catches_event_pushed_between_drain_and_park() {
 /// `scalable_topic_lookup` must resolve on a layout the driver pushed after its
 /// drain found the buffer empty and before it parked. A fresh connection
 /// allocates scalable session id 1, which is the id the delivered event names.
+#[cfg(feature = "scalable-topics")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_lookup_catches_resolution_pushed_between_drain_and_park() {
     let client = connect_to_silent_broker().await;
@@ -249,6 +260,8 @@ async fn scalable_lookup_catches_resolution_pushed_between_drain_and_park() {
     let waiter_client = Arc::clone(&client);
     let outcome = deliver_in_the_race_window(
         client.shared(),
+        &client.shared().scalable_events,
+        &client.shared().scalable_notify,
         move || {
             bounded_on_this_thread(
                 waiter_client.scalable_topic_lookup("topic://public/default/lost-wakeup"),
@@ -280,6 +293,7 @@ async fn scalable_lookup_catches_resolution_pushed_between_drain_and_park() {
 
 /// `scalable_topic_subscribe` must surface a rejection the driver pushed after
 /// its drain found the buffer empty and before it parked.
+#[cfg(feature = "scalable-topics")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalable_subscribe_catches_rejection_pushed_between_drain_and_park() {
     let client = connect_to_silent_broker().await;
@@ -287,6 +301,8 @@ async fn scalable_subscribe_catches_rejection_pushed_between_drain_and_park() {
     let waiter_client = Arc::clone(&client);
     let outcome = deliver_in_the_race_window(
         client.shared(),
+        &client.shared().scalable_events,
+        &client.shared().scalable_notify,
         move || {
             bounded_on_this_thread(waiter_client.scalable_topic_subscribe(
                 "topic://public/default/lost-wakeup",
@@ -312,6 +328,39 @@ async fn scalable_subscribe_catches_rejection_pushed_between_drain_and_park() {
         err.contains("scripted rejection"),
         "the delivered reason reaches the caller: {err}"
     );
+
+    close_client(client).await;
+}
+
+/// `next_topic_list_change` must return a delta the driver pushed after its
+/// drain found the buffer empty and before it parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_topic_list_change_catches_delta_pushed_between_drain_and_park() {
+    let client = connect_to_silent_broker().await;
+
+    let waiter_client = Arc::clone(&client);
+    let outcome = deliver_in_the_race_window(
+        client.shared(),
+        &client.shared().topic_list_changes,
+        &client.shared().topic_list_notify,
+        move || bounded_on_this_thread(waiter_client.next_topic_list_change()),
+        TopicListChange {
+            added: vec!["persistent://public/default/lost-wakeup".to_owned()],
+            removed: Vec::new(),
+        },
+    );
+
+    let change = outcome
+        .expect(
+            "next_topic_list_change returned rather than hanging (a lost wakeup would hang here)",
+        )
+        .expect("connection still open");
+    assert_eq!(
+        change.added,
+        vec!["persistent://public/default/lost-wakeup".to_owned()],
+        "the delivered delta reaches the waiter"
+    );
+    assert_eq!(change.removed, Vec::<String>::new());
 
     close_client(client).await;
 }

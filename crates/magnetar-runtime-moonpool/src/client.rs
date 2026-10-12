@@ -1142,15 +1142,25 @@ impl<P: Providers> Client<P> {
     /// subscription. The future is cancel-safe: dropping it without polling
     /// does not lose pending deltas (they stay in the
     /// [`ConnectionShared::topic_list_changes`] queue).
+    ///
+    /// Enroll-before-drain, like [`Self::next_replicated_subscription_marker`]: the
+    /// `Notified` is armed before the buffer drain and the `is_closed()` re-check, so a delta
+    /// the driver pushes (then `topic_list_notify.notify_waiters()`, which stores no permit)
+    /// in the gap between the check and the park wakes this waiter instead of being stranded
+    /// in the buffer.
     pub async fn next_topic_list_change(&self) -> Option<TopicListChange> {
         loop {
+            let notified = self.shared.topic_list_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(change) = self.shared.topic_list_changes.lock().pop_front() {
                 return Some(change);
             }
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared.topic_list_notify.notified().await;
+            notified.await;
         }
     }
 

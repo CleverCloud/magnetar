@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **The scalable-topic waiters no longer lose a wakeup, so `scalable_topic_lookup`, `scalable_topic_subscribe` and `next_scalable_event` stop parking forever on an event that is already buffered.**
-  All three drained `scalable_events` and re-checked `is_closed()` before creating the `Notified` they park on, while the driver pushes the event and then calls `notify_waiters()`, which stores no permit.
+- **The scalable-topic and topic-list waiters no longer lose a wakeup, so `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_scalable_event` and `next_topic_list_change` stop parking forever on an event that is already buffered.**
+  All four drained their buffer (`scalable_events`, `topic_list_changes`) and re-checked `is_closed()` before creating the `Notified` they park on, while the driver pushes the event and then calls `notify_waiters()`, which stores no permit.
   An event pushed between the drain and the park was buffered and never woke the caller; the scripted broker sends each of these events exactly once, so nothing woke it afterwards either, which is how the `scalable_assignment_rebalance_parity` differential test could hang until the CI job timeout.
   Each waiter now arms its `Notified` before the drain, the enroll-before-drain idiom `next_replicated_subscription_marker` already used, on both engines.
   The `scalable_client_equivalence` differential tests also bound every `connect`, lookup and subscribe await by `HANG_GUARD`, so a regression fails in 60 seconds instead of at the job timeout.
