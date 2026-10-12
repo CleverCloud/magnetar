@@ -634,7 +634,8 @@ This keeps the production tokio engine and the deterministic moonpool simulation
 ## Scalable topics (PIP-460) — experimental
 
 > **⚠️ EXPERIMENTAL.** This surface lives behind the default-off `scalable-topics` feature.
-> It speaks the wire protocol vendored from Apache Pulsar **5.0.0-M1**, the first published release carrying [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md). M1 is a milestone, not a GA release, so the surface may still move before Pulsar 5.0 final.
+> It speaks the wire protocol vendored from Apache Pulsar **5.0.0** (GA), the release that carries [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md); the surface was first vendored from the 5.0.0-M1 milestone and moved to GA by an [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment on 2026-10-12.
+> It stays experimental because the consumer half is unfinished (see [Scalable topics out of scope](#scalable-topics-out-of-scope)), not because the wire may still move.
 > Against a **Pulsar 4.x** broker the client negotiates the capability away and refuses to emit a scalable-topic command — see [Broker compatibility](#scalable-topics-broker-compatibility) below.
 > See [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which supersedes [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
 
@@ -650,7 +651,8 @@ A bounded, experimental **StreamConsumer** surface with **drop-on-DAG-change** s
 - **`topic://...` URL scheme** recognition (`is_scalable_topic_url`), routed to the scalable lookup path.
   The `persistent://` / `non-persistent://` paths are untouched.
 - **Three wire commands**, vendored from upstream and encoded as ordinary `BaseCommand` frames: `CommandScalableTopicLookup` (which is also the subscribe), `CommandScalableTopicUpdate` (the initial layout and every pushed one), and `CommandScalableTopicClose`.
-- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types. `SegmentState` is `Active` or `Sealed` — upstream has no split/merge _state_, only topology edges. `broker_url` is optional: placement arrives in a parallel `SegmentBrokerAddress` list and a sealed segment may carry none. `MessageId` is **not** extended — Pulsar 5.0.0-M1's `MessageIdData` has no segment field, and segment identity travels in the `segment://` topic name.
+  Every lookup carries the caller's `create_if_missing` **explicitly**; see [Lookup auto-creation](#scalable-topics-lookup-auto-creation).
+- **`SegmentDescriptor` / `SegmentId` / `KeyRange` / `SegmentState`** types. `SegmentState` is `Active` or `Sealed` — upstream has no split/merge _state_, only topology edges. `broker_url` is optional: placement arrives in a parallel `SegmentBrokerAddress` list and a sealed segment may carry none. `MessageId` is **not** extended — Pulsar 5.0.0's `MessageIdData` has no segment field, and segment identity travels in the `segment://` topic name.
 - **`DagWatchSession`** — a sans-io state machine that tracks the current layout, orders updates by the **monotonic layout `epoch`**, replaces the layout wholesale on each _advancing_ update, and derives split / merge from the incoming segments' `parent_ids` / `child_ids` edges.
   An update whose `epoch` does **not** advance is ignored — `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open.
   That is not a detail: Pulsar 5.0.0-M1 answers the lookup with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup just opened, so treating a duplicate as a protocol error ended the watch before it had ever seen a change ([ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)).
@@ -700,10 +702,42 @@ A pure-**add** update (a fresh segment with no split / merge / removal) is _beni
 
 If the controller-broker connection closes, the surface emits `ConsumerEvent::Closed { reason }` and lets the caller decide — there is **no automatic re-lookup** (controller-election awareness is out of scope for the current scaffold).
 
+### Scalable topics lookup auto-creation
+
+Pulsar 5.0.0 added `create_if_missing` (field 3, default `true`) to `CommandScalableTopicLookup`.
+On the 5.0.0-M1 milestone a lookup of a missing `topic://` topic failed with "Scalable topic not found" (`DagWatchSession.java:127-137` at `v5.0.0-M1`); on 5.0.0 a lookup that leaves the field unset creates the topic, gated by the broker's and namespace's topic auto-creation policy (`DagWatchSession.java:138-157` at `v5.0.0`).
+An existing topic ignores the flag.
+Measured on 2026-10-12 against standalone brokers, `magnetarctl topic-info topic://public/default/never-created` resolves a one-segment layout on `apachepulsar/pulsar:5.0.0` and an admin `GET /admin/v2/scalable/public/default/never-created`, 404 before the lookup, then returns the persisted topic; on `apachepulsar/pulsar:5.0.0-M1` the command fails with "Scalable topic not found".
+
+The caller chooses, and magnetar writes the choice **explicitly** on every lookup, `true` and `false` alike, so a lookup means the same thing to a 5.0.0 broker whether or not the field's default moves again.
+A 5.0.0-M1 broker skips the unknown field.
+
+- **`PulsarClient::scalable_stream_consumer` sends `true`.**
+  It opens a consumer on an explicit single topic, which is what the Java v5 client does on every such path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799`, at `v5.0.0`).
+- **`PulsarClient::lookup_scalable_topic` sends `false`.**
+  It is the read-only path behind `magnetarctl topic-info`, and a diagnostic lookup of a mistyped name must not create a topic.
+  A missing topic is reported as not found on M1 and 5.0.0 alike.
+  The upstream schema comment limits the `true` default to explicit single-topic producers and consumers.
+- **`scalable_topic_subscribe` is unchanged.**
+  It sends `CommandScalableTopicSubscribe`, which has no such field.
+- **A namespace (multi-topic) consumer must send `false`** too, as the Java client's does (`MultiTopicQueueConsumer.java:169`), so a reconnecting per-topic watch cannot resurrect a deleted topic.
+  magnetar has no such consumer yet.
+
+The flag is a `create_if_missing: bool` parameter of `Connection::open_scalable_topic_session`, of `Client::scalable_topic_lookup` on both runtimes, and of the `ScalableTopicsApi::scalable_topic_lookup` trait method ([ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment 2026-10-12).
+`scalable_stream_consumer` is bound `where E::ClientState: Clone` and neither engine's client is `Clone` ([`follow-ups.md` §11](follow-ups.md#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)), so only its engine-level `true` path is exercised today.
+
 ### Scalable topics out of scope
 
 `QueueConsumer`, `CheckpointConsumer`, controller-election awareness, transparent segment failover during consume, in-place key-range repartition, and segment-aware sticky-key dispatch (Key_Shared across the full DAG) are all explicit follow-ups for when the broker side stabilises.
 The current `KeyRange` is **observation-only**.
+
+Two pieces of the 5.0.0 wire are vendored but not used, both tracked in [`follow-ups.md` §12](follow-ups.md#12-pip-460-per-segment-consumer-fan-out):
+
+- **`CommandScalableTopicUnsubscribe`** (type 82, acknowledged by `CommandSuccess`) is the clean leave of a scalable consumer.
+  It is decoded and never sent, so a registration is released by the broker only when the connection goes away.
+  An inbound frame of that type is skipped without an error.
+- **PIP-486 entry bucketing** (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`) is decoded and ignored.
+  A segment assigned with a non-empty `bucket_ranges` is shared by entry bucket, so a consumer attaching to it must subscribe `Key_Shared` sticky with `entryBucketDispatch = true` instead of `Exclusive`.
 
 ### Scalable topics broker compatibility
 
@@ -714,13 +748,13 @@ The surface is negotiated **per connection**, in both directions:
 3. Every scalable-topic command is gated on that answer. Against a peer that did not advertise support, opening a session returns `ScalableTopicError::BrokerUnsupported` and **writes nothing to the wire**.
 
 That covers a **Pulsar 4.x** broker, which has no PIP-460 surface at all, and a **5.x** broker started with `scalableTopicsEnabled=false`.
-The capability is a feature flag, not a protocol-version bump: upstream's `ProtocolVersion` still tops at `v21` in 5.0.0-M1, and the client advertises exactly that.
+The capability is a feature flag, not a protocol-version bump: upstream's `ProtocolVersion` still tops at `v21` in 5.0.0, and the client advertises exactly that.
 
 There is also a wire-level compatibility path in the other direction. For a regular, unmigrated topic the broker answers with a **synthetic single-segment layout** whose segment carries `legacy_topic_name`, wrapping the ordinary `persistent://...` topic; `SegmentDescriptor::is_legacy()` surfaces it.
 
 ### Scalable topics vendored wire commands
 
-The commands are vendored, not hand-written: `crates/magnetar-proto/proto/PulsarApi.proto` is pinned at `apache/pulsar` `8dae0236` (`v5.0.0-M1`) and `pb/pulsar.proto.rs` is generated from it, so there is no separate module and no bespoke envelope — a scalable-topic frame is an ordinary `BaseCommand` frame.
+The commands are vendored, not hand-written: `crates/magnetar-proto/proto/PulsarApi.proto` is pinned at `apache/pulsar` `b7b03f72` (`v5.0.0`) and `pb/pulsar.proto.rs` is generated from it, so there is no separate module and no bespoke envelope — a scalable-topic frame is an ordinary `BaseCommand` frame.
 Refreshing it is a dedicated `cargo run -p xtask -- vendor-proto --rev <sha>` commit per [ADR-0026 §D4](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
 
 Before [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) these commands lived in a hand-maintained `pb/scalable_topics.rs` written against the then-`Draft` proposal.

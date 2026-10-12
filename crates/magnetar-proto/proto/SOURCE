@@ -1,8 +1,8 @@
 Vendored from apache/pulsar:
 
   Repository: https://github.com/apache/pulsar
-  Commit:     8dae0236c0a0d405ed7f8303081080520fe91551
-  Date:       2026-06-16
+  Commit:     b7b03f72cd4f81d501570588fcf3433ee035629b
+  Date:       2026-10-01
   Files:      pulsar-common/src/main/proto/PulsarApi.proto
               pulsar-common/src/main/proto/PulsarMarkers.proto
 

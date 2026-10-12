@@ -1,10 +1,49 @@
 # ADR-0093 — PIP-460 on the upstream wire surface, negotiated per connection
 
-- **Status**: Accepted (epoch handling amended by [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md))
+- **Status**: Accepted (epoch handling amended by [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md); vendored revision and lookup flag amended 2026-10-12, see the Amendment below)
 - **Date**: 2026-08-03
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, segments, wire-format, vendored-proto, compatibility, experimental
 - **Supersedes**: [ADR-0031](0031-pip-460-scalable-subscription-scope.md)
+
+> **Amendment (2026-10-12).** The vendored revision moves from the milestone to the GA release.
+> This is the "another §D4 bump" that §D1 foresaw: a dedicated vendor commit per [ADR-0026 §D4](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md), so it needs no ADR of its own.
+> `crates/magnetar-proto/proto/SOURCE` now names `apache/pulsar` `b7b03f72cd4f81d501570588fcf3433ee035629b` (tag `v5.0.0`, commit dated 2026-10-01) in place of `8dae0236c0a0d405ed7f8303081080520fe91551` (`v5.0.0-M1`).
+> The change is purely additive over M1: nothing is renumbered or removed, `PulsarMarkers.proto` is byte-identical, `ProtocolVersion` stays `v21` and `FeatureFlags` is unchanged, so §D3's per-connection negotiation applies as written.
+> What GA adds, and what this client does with it:
+>
+> - **`CommandScalableTopicLookup.create_if_missing = 3`, default `true` — acted on (§D2 amended): the caller chooses.**
+>   On M1 a lookup of a missing `topic://` topic failed with "Scalable topic not found" (`DagWatchSession.java:127-137` at `v5.0.0-M1`).
+>   On GA a lookup that leaves the field unset auto-creates it, subject to the broker and namespace auto-creation policy (`DagWatchSession.java:138-157` at `v5.0.0`); an existing topic ignores the flag.
+>   Measured on 2026-10-12 against standalone brokers: with the field `true`, `magnetarctl topic-info topic://public/default/never-created` resolves a one-segment layout on `apachepulsar/pulsar:5.0.0`, and an admin `GET /admin/v2/scalable/public/default/never-created` that returned 404 before the lookup then returns the persisted topic; on `apachepulsar/pulsar:5.0.0-M1` the same command fails with "Scalable topic not found".
+>   A lookup that merely reads a layout must therefore never create a topic, and one that opens a consumer may.
+>   `Connection::open_scalable_topic_session` takes a `create_if_missing: bool` and writes it **explicitly**, `true` and `false` alike, so the request means the same thing whatever the peer's version; an M1 broker skips the unknown field.
+>   The flag is threaded through `Client::scalable_topic_lookup` on both runtimes and the `ScalableTopicsApi::scalable_topic_lookup` trait method, and the façade forks on it without changing a façade signature.
+>   `scalable_stream_consumer` opens a consumer on an explicit single topic, so it passes `true`.
+>   `lookup_scalable_topic`, the read-only path behind `magnetarctl topic-info`, passes `false`, so `topic-info` reports "not found" on M1 and GA alike instead of creating the topic.
+>   `scalable_topic_subscribe` sends `CommandScalableTopicSubscribe`, which has no such field, and is unchanged.
+>   `true` for a consumer is what the Java v5 client sends on every explicit single-topic path.
+>   `DagWatchClient`'s two-argument constructor passes `true` (`pulsar-client-v5/src/main/java/org/apache/pulsar/client/impl/v5/DagWatchClient.java:77-79`), and `ProducerBuilderV5.java:83`, `QueueConsumerBuilderV5.java:95`, `CheckpointConsumerBuilderV5.java:95` and `ScalableConsumerClient.java:159` all use it.
+>   `Commands.newScalableTopicLookup` always writes the field (`pulsar-common/src/main/java/org/apache/pulsar/common/protocol/Commands.java:1793-1799`; its two-argument overload defaults to `true`, `:1789-1791`).
+>   The upstream schema comment limits the `true` default to explicit single-topic producers and consumers, and `MultiTopicQueueConsumer.java:169` sends `false` so a reconnecting per-topic watch cannot resurrect a deleted topic.
+>   This client has no namespace consumer; when one lands it passes `false`.
+>   `scalable_stream_consumer` is bound `where E::ClientState: Clone` and neither engine's client is `Clone` (`docs/follow-ups.md` §11), so its `true` path is covered at the runtime and differential layers rather than through the façade.
+>   The scripted broker in `magnetar-differential` honours the flag for a topic whose name ends `-absent`.
+> - **`CommandScalableTopicUnsubscribe` (`BaseCommand` type 82), acknowledged by `CommandSuccess` — decoded, never sent: a known gap.**
+>   It is the clean leave of a scalable consumer: the controller deletes the registration and rebalances at once instead of after the disconnect grace period, which remains the fallback.
+>   Until the per-segment consumer fan-out of `docs/follow-ups.md` §12 lands there is no consumer lifetime to attach it to, so a registration is released by the broker only when the connection goes away.
+>   An inbound type-82 frame is skipped by the catch-all arm of `Connection::handle_frame` without an error, an event or a reply (pinned by `conn_skips_scalable_topic_unsubscribe_frame`).
+> - **PIP-486 entry bucketing — `MessageMetadata.entry_hash_min` / `entry_hash_max` (33, 34), `KeySharedMeta.entryBucketDispatch` (5), `SegmentInfoProto.entry_bucket_splits` (12), `ScalableAssignedSegment.bucket_ranges` (5) — decoded by `prost`, ignored by the client: a known gap.**
+>   Producers stamp the hash range and the broker dispatches whole entries by it.
+>   This client has no scalable-topic producer and no per-segment consumer yet, so nothing reads these fields and nothing sends them.
+>   No producer path stamps `entry_hash_min` / `entry_hash_max`, `Connection` leaves `entryBucketDispatch` unset, and `SegmentDescriptor` and `AssignedSegment` drop `entry_bucket_splits` and `bucket_ranges`.
+>   This is the common case on GA, not an exotic one: the same probe shows a newly created 5.0.0 topic carrying `entryBucketSplits=[16384,32768,49152]`.
+>   A non-empty `bucket_ranges` means the segment is shared by entry bucket.
+>   The consumer that attaches to it must then subscribe `Key_Shared` sticky with `entryBucketDispatch = true`, declaring exactly that list, instead of `Exclusive`; the §12 work has to read it.
+>
+> §D1's sentence that M1 "is a milestone, not a GA release", and the matching caveat that the surface may still move, are superseded.
+> The surface is now the GA one, and the `scalable-topics` feature stays experimental because the consumer half is unfinished, not because the wire may change.
+> The `MessageIdData` paragraph of the Consequences is unchanged: GA carries no segment field either.
 
 ## Context
 

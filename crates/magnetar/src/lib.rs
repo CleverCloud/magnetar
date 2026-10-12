@@ -194,7 +194,8 @@ pub mod v5;
 /// `feature = "scalable-topics"` (default off). Exposes the
 /// [`scalable::ScalableTopicsApi`] engine hook and the
 /// [`scalable::StreamConsumer`] (StreamConsumer-only, drops on DAG change).
-/// No broker ships PIP-460 today; e2e is gated on a Pulsar 5.0 RC.
+/// The wire surface is the one Apache Pulsar 5.0.0 (GA) ships; the e2e suite
+/// runs it against a real broker (ADR-0093).
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 pub mod scalable;
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]

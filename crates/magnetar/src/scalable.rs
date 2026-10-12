@@ -96,7 +96,7 @@ pub enum ConsumerEvent {
 ///
 /// `T` is the (future) per-message payload type; the surface is currently
 /// DAG-watch-centric. The wire surface itself ships — the client speaks the
-/// one Apache Pulsar 5.0.0-M1 implements (ADR-0093) — but the per-segment v4
+/// one Apache Pulsar 5.0.0 implements (ADR-0093) — but the per-segment v4
 /// consumer fan-out and typed receive are still ours to write, and are held
 /// on a design decision recorded in `docs/follow-ups.md` §12.
 /// Construct via [`crate::PulsarClient::scalable_stream_consumer`].
@@ -255,6 +255,12 @@ where
     /// [`ConsumerEvent`]s (drop-on-change). The session opened by the lookup
     /// stays open and keeps delivering layouts — there is no second subscribe.
     ///
+    /// Opening a consumer on an explicit single topic may create it: the lookup
+    /// carries `create_if_missing = true`, as the Java v5 client's does, so a
+    /// Pulsar 5.0.0 broker auto-creates a missing `topic://` topic when its
+    /// auto-creation policy allows. [`Self::lookup_scalable_topic`] is the
+    /// read-only alternative.
+    ///
     /// # Errors
     ///
     /// Returns the runtime client error if the scalable lookup fails — most
@@ -270,7 +276,9 @@ where
         let topic = topic.into();
         // The lookup opens the session and leaves it open — upstream has no
         // separate watch subscribe, so there is no second round-trip here.
-        let lookup = self.inner.scalable_topic_lookup(&topic).await?;
+        // Opening a consumer on an explicit single topic may create it, as the
+        // Java v5 client does (`DagWatchClient.java:77-79`): `create_if_missing`.
+        let lookup = self.inner.scalable_topic_lookup(&topic, true).await?;
         Ok(StreamConsumer {
             client: crate::PulsarClient {
                 inner: self.inner.clone(),
@@ -421,13 +429,20 @@ where
     /// scalable topic without opening a consumer — returns the current segment
     /// DAG + controller broker. Powers the CLI `topic-info` subcommand.
     ///
+    /// **Read-only**: the lookup carries `create_if_missing = false`, so a
+    /// topic that does not exist is reported as not found on every broker
+    /// version instead of being auto-created by a Pulsar 5.0.0 broker.
+    /// [`Self::scalable_stream_consumer`], which opens a consumer, is the path
+    /// that may create it.
+    ///
     /// # Errors
     ///
-    /// Returns the runtime client error if the lookup fails.
+    /// Returns the runtime client error if the lookup fails, including when the
+    /// topic does not exist.
     pub async fn lookup_scalable_topic(
         &self,
         topic: &str,
     ) -> Result<ScalableLookup, <E::ClientState as ScalableTopicsApi>::Error> {
-        self.inner.scalable_topic_lookup(topic).await
+        self.inner.scalable_topic_lookup(topic, false).await
     }
 }

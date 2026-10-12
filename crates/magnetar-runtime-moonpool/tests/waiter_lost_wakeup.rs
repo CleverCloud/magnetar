@@ -285,7 +285,7 @@ async fn scalable_lookup_catches_resolution_pushed_between_drain_and_park() {
         &client.shared().scalable_notify,
         move || {
             bounded_on_this_thread(
-                waiter_client.scalable_topic_lookup("topic://public/default/lost-wakeup"),
+                waiter_client.scalable_topic_lookup("topic://public/default/lost-wakeup", true),
             )
         },
         ScalableEvent::LookupResolved {

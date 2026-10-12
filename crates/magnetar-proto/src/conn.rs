@@ -3863,8 +3863,8 @@ impl Connection {
                 self.handle_tc_assignments_update(upd);
             }
             _ => {
-                // Unhandled command — we tolerate them silently for forward compatibility, but
-                // we DO push an event for the driver to log.
+                // Unhandled command — tolerated for forward compatibility: no error, no event,
+                // no reply. The only trace is the `trace!` below.
                 tracing::trace!(target: "magnetar_proto", cmd_type = ?cmd_type, "unhandled command type");
             }
         }
@@ -5352,6 +5352,9 @@ impl Connection {
                 })
                 .collect(),
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
+            // PIP-486 entry-bucket dispatch is for scalable-topic segment
+            // sharing only; a plain Key_Shared subscription leaves it unset.
+            entry_bucket_dispatch: None,
         });
         let start_message_id = resume_from.map(MessageId::to_pb);
         let consumer_metadata: Vec<pb::KeyValue> = req
@@ -7336,6 +7339,22 @@ impl Connection {
     /// `topic` may be a `topic://`, a `persistent://`, or a short name; the
     /// broker normalises it and returns the canonical identity in the update.
     ///
+    /// `create_if_missing` is written to the command **explicitly**, whichever
+    /// value it has (ADR-0093 amendment 2026-10-12), so the request means the
+    /// same thing whatever the peer's version. Pulsar 5.0.0 added the field with
+    /// a default of `true`: a lookup of a missing `topic://` topic then
+    /// auto-creates it, subject to the broker's auto-creation policy, where
+    /// 5.0.0-M1 answered not-found and had no such field. An M1 broker skips the
+    /// unknown field.
+    ///
+    /// The caller chooses. `true` is for a lookup that opens a consumer or
+    /// producer on an explicit single topic, which is what the Java v5 client
+    /// sends on every such path (`DagWatchClient.java:77-79`,
+    /// `Commands.java:1793-1799` at `v5.0.0`). `false` is for a read-only
+    /// lookup and for a namespace (multi-topic) consumer, so that a lookup, or a
+    /// reconnecting per-topic watch, never creates or resurrects a topic
+    /// (`MultiTopicQueueConsumer.java:169`). An existing topic ignores the flag.
+    ///
     /// # Errors
     ///
     /// [`crate::dag_watch::ScalableTopicError::BrokerUnsupported`] when the peer did not
@@ -7345,6 +7364,7 @@ impl Connection {
     pub fn open_scalable_topic_session(
         &mut self,
         topic: &str,
+        create_if_missing: bool,
     ) -> Result<u64, crate::dag_watch::ScalableTopicError> {
         if !self.broker_supports_scalable_topics() {
             return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
@@ -7356,6 +7376,7 @@ impl Connection {
             scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
                 session_id,
                 topic: topic.to_owned(),
+                create_if_missing: Some(create_if_missing),
             }),
             ..Default::default()
         };
@@ -18882,6 +18903,7 @@ mod scalable_conn_tests {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
         }
     }
 
@@ -18928,7 +18950,7 @@ mod scalable_conn_tests {
     fn conn_encodes_scalable_topic_lookup_as_base_command() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
 
         let mut out = conn.poll_transmit();
@@ -18945,6 +18967,101 @@ mod scalable_conn_tests {
         assert_eq!(lookup.topic, "topic://public/default/scaled");
     }
 
+    /// Layer (a) test (ADR-0093 amendment 2026-10-12): every lookup states the
+    /// caller's `create_if_missing` on the wire — `true` and `false` alike — instead
+    /// of leaving the field to the schema default.
+    ///
+    /// The default is `true`, so on a 5.0.0 broker an unset field would mean
+    /// `true`; on 5.0.0-M1 the field does not exist at all. Writing the value the
+    /// caller chose keeps the request's meaning independent of the peer's version,
+    /// and `false` is what makes a lookup read-only: it is what the Java v5 client
+    /// sends from its namespace consumer (`MultiTopicQueueConsumer.java:169`),
+    /// while its single-topic paths send `true` (`DagWatchClient.java:77-79`,
+    /// `Commands.java:1793-1799`).
+    ///
+    /// The assertion is on the **decoded `Option`** — `Some(true)` / `Some(false)`,
+    /// never `None` — because `Message::create_if_missing()` would answer `true`
+    /// for an absent field too and prove nothing. The raw-tail check pins the
+    /// encoding itself: field 3, varint wire type, value 1 or 0.
+    #[test]
+    fn conn_scalable_topic_lookup_states_create_if_missing_explicitly() {
+        let mut conn = connected_conn();
+        for create_if_missing in [true, false] {
+            for topic in [
+                "topic://public/default/scaled",
+                "persistent://public/default/scaled",
+                "scaled",
+            ] {
+                let session_id = conn
+                    .open_scalable_topic_session(topic, create_if_missing)
+                    .expect("broker supports scalable topics");
+
+                let mut out = conn.poll_transmit();
+                assert!(
+                    out.ends_with(&[0x18, u8::from(create_if_missing)]),
+                    "lookup for {topic} must end with field 3 (create_if_missing) = \
+                     {create_if_missing}, got {:02x?}",
+                    &out[..]
+                );
+                let frame =
+                    crate::frame::decode_one(&mut out).expect("decodes as a v5 BaseCommand");
+                let lookup = frame
+                    .command
+                    .scalable_topic_lookup
+                    .expect("lookup payload present");
+                assert_eq!(lookup.session_id, session_id);
+                assert_eq!(
+                    lookup.create_if_missing,
+                    Some(create_if_missing),
+                    "the field is present on the wire, not left to the schema default"
+                );
+            }
+        }
+    }
+
+    /// Layer (a) test: a `CommandScalableTopicUnsubscribe` (type 82, new in
+    /// 5.0.0) arriving on a connection is skipped — no error, no event, no
+    /// reply — and the connection keeps serving.
+    ///
+    /// The command is client→broker; a broker never sends it. It is still a
+    /// vendored `BaseCommand` type this client has no arm for, so this pins that
+    /// the catch-all arm tolerates it rather than ending the connection. Sending
+    /// it is a known gap (ADR-0093 amendment 2026-10-12, `docs/follow-ups.md`).
+    #[test]
+    fn conn_skips_scalable_topic_unsubscribe_frame() {
+        let mut conn = connected_conn();
+        let unsubscribe = pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+            scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                request_id: 7,
+                consumer_id: 3,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &unsubscribe).expect("encode unsubscribe");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("an unacted-on command type must not error the connection");
+        assert!(
+            conn.poll_event().is_none(),
+            "no event for a skipped command"
+        );
+        assert!(conn.poll_transmit().is_empty(), "and no reply");
+
+        // The connection is still serving: a Ping is answered with a Pong.
+        let ping = pb::BaseCommand {
+            r#type: pb::base_command::Type::Ping as i32,
+            ping: Some(pb::CommandPing {}),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &ping).expect("encode ping");
+        conn.handle_bytes(Instant::now(), &buf).expect("ping");
+        let mut out = conn.poll_transmit();
+        let frame = crate::frame::decode_one(&mut out).expect("pong decodes");
+        assert_eq!(frame.command.r#type, pb::base_command::Type::Pong as i32);
+    }
+
     /// Layer (a) test: the first `CommandScalableTopicUpdate` resolves the
     /// session and emits `ScalableTopicLookupResolved` with the layout, its
     /// epoch, and the canonical topic identity.
@@ -18952,7 +19069,7 @@ mod scalable_conn_tests {
     fn conn_emits_scalable_topic_lookup_resolved() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("persistent://public/default/scaled")
+            .open_scalable_topic_session("persistent://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 
@@ -19010,7 +19127,7 @@ mod scalable_conn_tests {
     fn conn_emits_dag_changed_on_split() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 
@@ -19070,7 +19187,7 @@ mod scalable_conn_tests {
 
         assert!(!conn.broker_supports_scalable_topics());
         let err = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect_err("v4 broker refuses the scalable surface");
         assert_eq!(err, crate::dag_watch::ScalableTopicError::BrokerUnsupported);
         assert!(
@@ -19112,7 +19229,7 @@ mod scalable_conn_tests {
     fn conn_close_scalable_session_is_idempotent() {
         let mut conn = connected_conn();
         let session_id = conn
-            .open_scalable_topic_session("topic://public/default/scaled")
+            .open_scalable_topic_session("topic://public/default/scaled", true)
             .expect("broker supports scalable topics");
         let _ = conn.poll_transmit();
 

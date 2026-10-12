@@ -50,7 +50,7 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 
 **Why it stays open.** The fix is a small API decision rather than a bug fix: either make both clients cheap-clone (each is already `Arc`-backed internally, so this is close to a `derive`), or drop the `Clone` bound and have `StreamConsumer` hold a borrow or an `Arc` of the client. Both change a published signature, so it wants a deliberate choice rather than the first thing that compiles.
 
-**Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same wire path `StreamConsumer` wraps. `crates/magnetar/tests/e2e_scalable_topic.rs` uses exactly that.
+**Workaround in the meantime.** The layout session is reachable directly — `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` — which is the same layout session `StreamConsumer` wraps, with one difference: `lookup_scalable_topic` is read-only (`create_if_missing = false`), so it never creates a missing topic, whereas `scalable_stream_consumer` sends `true`. No façade API sends `true` until this item is fixed. `crates/magnetar/tests/e2e_scalable_topic.rs` uses the read-only lookup and pre-creates its topics.
 
 ## 12. PIP-460 per-segment consumer fan-out
 
@@ -58,6 +58,12 @@ It went unnoticed because the four in-process test layers drive `magnetar_proto:
 `StreamConsumer` observes the layout; it does not yet deliver messages.
 
 **Why it stays open.** Needs a design decision on ordering across segments, on how per-segment cursors interact with the single subscription name, and on what happens to in-flight messages at a rebalance. `QueueConsumer` and `CheckpointConsumer` sit behind the same decision, and ADR-0093 deliberately left all three out of scope.
+
+**Wire gaps recorded at the Pulsar 5.0.0 vendoring (2026-10-12, [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment).** Each is vendored and either skipped or ignored today; the fan-out work has to close them.
+
+- **`CommandScalableTopicUnsubscribe`** (`BaseCommand` type 82, acknowledged by `CommandSuccess`) is never sent. It is the clean leave of a scalable consumer: the controller deletes the registration and rebalances at once instead of after the disconnect grace period. Send it when a registered consumer closes; an unknown `consumer_id` still succeeds, so it is idempotent. An inbound type-82 frame is already skipped without an error.
+- **PIP-486 entry bucketing is ignored.** A topic a 5.0.0 broker creates already carries `entryBucketSplits=[16384,32768,49152]` (measured 2026-10-12), so this is the common case. `ScalableAssignedSegment.bucket_ranges` is dropped by `AssignedSegment::from_pb`. A non-empty list means the segment is shared by entry bucket, so the consumer attaching to it must subscribe `Key_Shared` sticky with `KeySharedMeta.entryBucketDispatch = true`, declaring exactly that list, instead of `Exclusive`. `MessageMetadata.entry_hash_min` / `entry_hash_max` are set only by scalable-topic producers, and `SegmentInfoProto.entry_bucket_splits` is what they bucket by; a scalable producer would have to stamp and honour them.
+- **A namespace (multi-topic) consumer passes `create_if_missing = false`** to `open_scalable_topic_session` on its per-topic lookups, as the Java v5 client does (`MultiTopicQueueConsumer.java:169` at `v5.0.0`), so a reconnecting watch cannot resurrect a deleted topic. The parameter exists; the consumer does not.
 
 ## 14. `check-sim-coverage` can report over artifacts it did not build
 

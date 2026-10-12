@@ -433,6 +433,7 @@ mod tests {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
         }
     }
 

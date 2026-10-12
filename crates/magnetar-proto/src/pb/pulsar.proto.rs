@@ -223,6 +223,10 @@ pub struct MessageMetadata {
     pub compacted_batch_indexes: ::prost::alloc::vec::Vec<i32>,
     #[prost(bytes = "bytes", optional, tag = "32")]
     pub schema_id: ::core::option::Option<::prost::bytes::Bytes>,
+    #[prost(uint32, optional, tag = "33")]
+    pub entry_hash_min: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "34")]
+    pub entry_hash_max: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SingleMessageMetadata {
@@ -346,6 +350,8 @@ pub struct KeySharedMeta {
     pub hash_ranges: ::prost::alloc::vec::Vec<IntRange>,
     #[prost(bool, optional, tag = "4", default = "false")]
     pub allow_out_of_order_delivery: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "5", default = "false")]
+    pub entry_bucket_dispatch: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandSubscribe {
@@ -1201,6 +1207,8 @@ pub struct SegmentInfoProto {
     pub sealed_at_ms: ::core::option::Option<u64>,
     #[prost(string, optional, tag = "11")]
     pub legacy_topic_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, repeated, packed = "false", tag = "12")]
+    pub entry_bucket_splits: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SegmentBrokerAddress {
@@ -1232,6 +1240,8 @@ pub struct CommandScalableTopicLookup {
     pub session_id: u64,
     #[prost(string, required, tag = "2")]
     pub topic: ::prost::alloc::string::String,
+    #[prost(bool, optional, tag = "3", default = "true")]
+    pub create_if_missing: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandScalableTopicUpdate {
@@ -1251,7 +1261,7 @@ pub struct CommandScalableTopicClose {
     #[prost(uint64, required, tag = "1")]
     pub session_id: u64,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScalableAssignedSegment {
     #[prost(uint64, required, tag = "1")]
     pub segment_id: u64,
@@ -1261,6 +1271,8 @@ pub struct ScalableAssignedSegment {
     pub hash_end: u32,
     #[prost(string, required, tag = "4")]
     pub segment_topic: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub bucket_ranges: ::prost::alloc::vec::Vec<IntRange>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScalableConsumerAssignment {
@@ -1301,6 +1313,13 @@ pub struct CommandScalableTopicAssignmentUpdate {
     pub consumer_id: u64,
     #[prost(message, required, tag = "2")]
     pub assignment: ScalableConsumerAssignment,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommandScalableTopicUnsubscribe {
+    #[prost(uint64, required, tag = "1")]
+    pub request_id: u64,
+    #[prost(uint64, required, tag = "2")]
+    pub consumer_id: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandWatchScalableTopics {
@@ -1791,6 +1810,10 @@ pub struct BaseCommand {
     pub watch_tc_assignments_close: ::core::option::Option<
         CommandWatchTcAssignmentsClose,
     >,
+    #[prost(message, optional, tag = "82")]
+    pub scalable_topic_unsubscribe: ::core::option::Option<
+        CommandScalableTopicUnsubscribe,
+    >,
 }
 /// Nested message and enum types in `BaseCommand`.
 pub mod base_command {
@@ -1877,6 +1900,7 @@ pub mod base_command {
         WatchTcAssignments = 79,
         WatchTcAssignmentsUpdate = 80,
         WatchTcAssignmentsClose = 81,
+        ScalableTopicUnsubscribe = 82,
     }
     impl Type {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -1959,6 +1983,7 @@ pub mod base_command {
                 Self::WatchTcAssignments => "WATCH_TC_ASSIGNMENTS",
                 Self::WatchTcAssignmentsUpdate => "WATCH_TC_ASSIGNMENTS_UPDATE",
                 Self::WatchTcAssignmentsClose => "WATCH_TC_ASSIGNMENTS_CLOSE",
+                Self::ScalableTopicUnsubscribe => "SCALABLE_TOPIC_UNSUBSCRIBE",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2048,6 +2073,7 @@ pub mod base_command {
                 "WATCH_TC_ASSIGNMENTS" => Some(Self::WatchTcAssignments),
                 "WATCH_TC_ASSIGNMENTS_UPDATE" => Some(Self::WatchTcAssignmentsUpdate),
                 "WATCH_TC_ASSIGNMENTS_CLOSE" => Some(Self::WatchTcAssignmentsClose),
+                "SCALABLE_TOPIC_UNSUBSCRIBE" => Some(Self::ScalableTopicUnsubscribe),
                 _ => None,
             }
         }

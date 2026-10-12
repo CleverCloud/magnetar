@@ -1189,6 +1189,12 @@ impl<P: Providers> Client<P> {
     /// `persistent://`, or a short name — the broker returns the canonical
     /// identity in [`crate::ScalableLookup::resolved_topic_name`].
     ///
+    /// `create_if_missing` is sent to the broker verbatim: `true` lets a
+    /// Pulsar 5.0.0 broker auto-create a missing `topic://` topic (a consumer or
+    /// producer opening an explicit single topic), `false` makes the lookup
+    /// read-only, so a missing topic is reported as not found on every broker
+    /// version. See [`magnetar_proto::Connection::open_scalable_topic_session`].
+    ///
     /// # Errors
     ///
     /// Fails when the broker did not advertise `supports_scalable_topics` — a
@@ -1198,10 +1204,11 @@ impl<P: Providers> Client<P> {
     pub async fn scalable_topic_lookup(
         &self,
         topic: &str,
+        create_if_missing: bool,
     ) -> Result<crate::ScalableLookup, ClientError> {
         let session_id = {
             let mut conn = self.shared.inner.lock();
-            conn.open_scalable_topic_session(topic)
+            conn.open_scalable_topic_session(topic, create_if_missing)
                 .map_err(|err| ClientError::Other(err.to_string()))?
         };
         self.shared.driver_waker.notify_one();

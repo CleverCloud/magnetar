@@ -178,6 +178,10 @@ ADR-0107's list of the four sites that refund a charged dispatch unit — pop, i
 ADR-0107's invariant `granted window == permit_balance + consumed_since_flow + queue.len()` and its rule that a position the broker never charged is never refunded remain binding.
 ADR-0044's statement that the moonpool receive path has no decompression step is amended by the same ADR for batched entries only: `ConsumerState::deliver` decodes a compressed batch before splitting it on both engines, while the moonpool producer still refuses every codec and an unbatched compressed message is still not decompressed on moonpool.
 
+ADR-0093 §D1's pinned revision (`v5.0.0-M1`) and its caveat that the surface may still move are amended in place on 2026-10-12, the "another §D4 bump" §D1 foresaw: the vendored proto is now the GA `v5.0.0` (`b7b03f72cd4f81d501570588fcf3433ee035629b`), §D2's lookup states `create_if_missing` explicitly and the caller chooses it (`true` for a consumer, `false` for the read-only lookup), and `CommandScalableTopicUnsubscribe` plus the PIP-486 entry-bucketing fields are recorded as known gaps.
+A §D4 bump is a dedicated commit under [ADR-0026](adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md), so it needs no ADR of its own; the lookup decision is the only part that changes behaviour, and it is recorded as an amendment to the ADR that owns the lookup.
+Every other ADR-0093 decision, and ADR-0095, remain binding.
+
 ## How to add an ADR
 
 1. Pick the next free number (highest existing + 1).

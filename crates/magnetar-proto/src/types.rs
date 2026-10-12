@@ -209,7 +209,9 @@ impl SegmentDescriptor {
     /// this client only ever reads, so the encode side emits `0` / `None` for them
     /// rather than inventing a clock — `magnetar-proto` holds no clock at all
     /// (ADR-0011). Round-tripping a decoded descriptor therefore does not preserve
-    /// them; nothing in the client reads them back.
+    /// them; nothing in the client reads them back. `entry_bucket_splits`
+    /// (PIP-486) is likewise emitted empty — one bucket spanning the whole ring
+    /// — because the descriptor does not carry it.
     #[must_use]
     pub fn to_pb(
         &self,
@@ -229,6 +231,7 @@ impl SegmentDescriptor {
             created_at_ms: 0,
             sealed_at_ms: None,
             legacy_topic_name: self.legacy_topic_name.clone(),
+            entry_bucket_splits: Vec::new(),
         };
         let address = self
             .broker_url
@@ -518,7 +521,7 @@ mod tests {
         // Byte-identical guard: the wire `MessageIdData` has no segment field,
         // so `to_bytes` for a `None`-segment id matches a freshly-built v4 id
         // with the same coords. (The segment rides the lookup / DAG, not the
-        // per-message wire id, until the Pulsar 5.0 RC vendor bump.)
+        // per-message wire id; Pulsar 5.0.0's `MessageIdData` has no segment field.)
         let none_seg = mid(10, 20, 1);
         assert_eq!(
             none_seg.to_bytes(),

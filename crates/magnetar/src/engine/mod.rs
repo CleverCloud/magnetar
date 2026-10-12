@@ -1066,9 +1066,14 @@ pub trait ScalableTopicsApi: 'static + Send + Sync {
     /// Open a scalable-topic session and await its first layout. The session
     /// stays open, pushing later layouts through
     /// [`Self::next_scalable_event`], until it is closed.
+    ///
+    /// `create_if_missing` is the lookup's `create_if_missing` field: `true`
+    /// lets a Pulsar 5.0.0 broker auto-create a missing `topic://` topic,
+    /// `false` makes the lookup read-only.
     fn scalable_topic_lookup<'a>(
         &'a self,
         topic: &'a str,
+        create_if_missing: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ScalableLookup, Self::Error>> + Send + 'a>>;
 
     /// Whether the connected broker advertised the PIP-460 capability.
