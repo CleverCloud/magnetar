@@ -8,8 +8,9 @@
 //! `Notified` they park on. The driver pushes the event and then fires `notify_waiters()` on
 //! `scalable_notify` / `topic_list_notify`, which stores **no permit**: an event pushed between
 //! the drain and the (too-late) `notified()` was buffered, the waiter parked, and nothing woke
-//! it again. The scripted broker sends each scalable event exactly once, so the
-//! `scalable_assignment_rebalance_parity` differential test hung until the CI job timeout, and a
+//! it again. The scripted broker sends each scalable event exactly once, which likely explains
+//! why the `scalable_assignment_rebalance_parity` differential test sometimes hung until the CI
+//! job timeout (these tests show the window exists, not that it caused that run), and a
 //! topic-list delta is likewise a one-shot broker push. The fix arms the `Notified` *before* the
 //! drain (the enroll-before-drain idiom of `next_replicated_subscription_marker`), mirrored 1:1
 //! across both engines.
@@ -48,6 +49,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -72,8 +74,9 @@ const SETTLE: Duration = Duration::from_millis(250);
 /// Minimal broker: `CONNECT` -> `CONNECTED` advertising PIP-460, `PING` ->
 /// `PONG`, and silence for everything else. The silence is the point: the
 /// scalable commands the waiters emit are never answered, so the only event a
-/// waiter can see is the one the test delivers.
-async fn serve_scalable_broker(mut stream: TcpStream) {
+/// waiter can see is the one the test delivers. It drops the socket when
+/// `hang_up` fires, which is how a test kills the connection.
+async fn serve_scalable_broker(mut stream: TcpStream, hang_up: Arc<Notify>) {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
     let mut out = BytesMut::with_capacity(8 * 1024);
     loop {
@@ -119,7 +122,11 @@ async fn serve_scalable_broker(mut stream: TcpStream) {
             return;
         }
         let mut chunk = [0u8; 4096];
-        match stream.read(&mut chunk).await {
+        let read = tokio::select! {
+            read = stream.read(&mut chunk) => read,
+            () = hang_up.notified() => return,
+        };
+        match read {
             Ok(0) | Err(_) => return,
             Ok(n) => read_buf.extend_from_slice(&chunk[..n]),
         }
@@ -127,13 +134,15 @@ async fn serve_scalable_broker(mut stream: TcpStream) {
 }
 
 /// A handshaked client whose driver is idle: the broker never volunteers a
-/// scalable event.
-async fn connect_to_silent_broker() -> Arc<Client> {
+/// scalable event. The returned `Notify` makes the broker hang up.
+async fn connect_to_hangup_broker() -> (Arc<Client>, Arc<Notify>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
     let port = listener.local_addr().expect("local_addr").port();
+    let hang_up = Arc::new(Notify::new());
+    let broker_hang_up = Arc::clone(&hang_up);
     tokio::spawn(async move {
         if let Ok((stream, _peer)) = listener.accept().await {
-            serve_scalable_broker(stream).await;
+            serve_scalable_broker(stream, broker_hang_up).await;
         }
     });
     let stream = TcpStream::connect(("127.0.0.1", port))
@@ -151,7 +160,12 @@ async fn connect_to_silent_broker() -> Arc<Client> {
         client.broker_supports_scalable_topics(),
         "the silent broker must advertise PIP-460 or the client refuses the scalable commands"
     );
-    Arc::new(client)
+    (Arc::new(client), hang_up)
+}
+
+/// A handshaked client against a broker that stays silent for the whole test.
+async fn connect_to_silent_broker() -> Arc<Client> {
+    connect_to_hangup_broker().await.0
 }
 
 /// The waiter thread has been joined, so the test holds the only reference.
@@ -355,6 +369,40 @@ async fn next_topic_list_change_catches_delta_pushed_between_drain_and_park() {
         "the delivered delta reaches the waiter"
     );
     assert_eq!(change.removed, Vec::<String>::new());
+
+    close_client(client).await;
+}
+
+/// A `next_topic_list_change` parked on an open connection must resolve to
+/// `None` when the connection dies. The driver marks the connection disconnected
+/// and has to pulse `topic_list_notify` itself: the parked waiter only re-checks
+/// `is_closed()` when it is woken, and no further delta is coming.
+///
+/// The first poll is made by hand, so it returning `Pending` proves the waiter
+/// is parked before the broker hangs up — no settle, no race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_topic_list_change_returns_none_when_the_connection_dies() {
+    let (client, hang_up) = connect_to_hangup_broker().await;
+
+    {
+        let mut next = std::pin::pin!(client.next_topic_list_change());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            next.as_mut().poll(&mut cx).is_pending(),
+            "an open connection with an empty buffer parks the waiter"
+        );
+
+        hang_up.notify_one();
+
+        let change = tokio::time::timeout(HANG_GUARD, next).await.expect(
+            "next_topic_list_change woke when the connection died \
+                 (a missing close pulse would hang here)",
+        );
+        assert!(
+            change.is_none(),
+            "a dead connection ends the wait with None: {change:?}"
+        );
+    }
 
     close_client(client).await;
 }
