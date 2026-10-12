@@ -60,19 +60,12 @@ use std::time::Duration;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container. See
-/// `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Sub-messages packed into each batched broker entry. Wide enough that "one entry" and "one
 /// permit" are visibly different things — which is the whole premise of issue #436 — and small
@@ -109,25 +102,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMIN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Start a Pulsar 4.x standalone container with **batch-index acknowledgement enabled** and
+/// Start a Pulsar standalone container with **batch-index acknowledgement enabled** and
 /// return (`service_url`, `admin_url`, `container_handle`).
 ///
 /// `acknowledgmentAtBatchIndexLevelEnabled` is the switch that makes the broker track
@@ -135,40 +110,19 @@ fn init_tracing() {
 /// makes it attach `CommandMessage.ack_set` when it re-dispatches a partially-acked one. It is
 /// pinned here rather than assumed: the field this test exists to exercise is simply absent
 /// when the broker runs with the default, and the test would then pass for the wrong reason.
-/// The container's own `apply-config-from-env-with-prefix.py` writes it into
-/// `conf/standalone.conf` before the broker boots (the `e2e_reconnect_safety.rs` pattern).
+/// The shared fixture writes it into `conf/standalone.conf` with
+/// `bin/apply-config-from-env.py` before the broker boots (the `e2e_reconnect_safety.rs`
+/// pattern).
 async fn start_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_env_var(
-            "PULSAR_PREFIX_acknowledgmentAtBatchIndexLevelEnabled",
-            "true",
-        )
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ conf/standalone.conf && \
-             bin/pulsar standalone"
-                .to_owned(),
-        ])
+    let broker = Pulsar::new(Broker::Default)
+        .config("acknowledgmentAtBatchIndexLevelEnabled", "true")
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+    Ok(broker.into_parts())
 }
 
 /// The subscription object out of the broker's raw topic-stats JSON.

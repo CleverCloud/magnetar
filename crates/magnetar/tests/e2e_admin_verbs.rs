@@ -7,7 +7,7 @@
 //! broker / cluster diagnostics (brokers list, leader, failure-domains,
 //! namespace-isolation-policies).
 //!
-//! Drives a single `apachepulsar/pulsar:4.2.4` standalone container per
+//! Drives a single standalone container of the shared fixture's image per
 //! test — start-up amortised across many `AdminClient` calls. Per
 //! ADR-0046 the file ships as a regular test under `cargo test`; the
 //! suite is gated on Docker being reachable, not on a feature flag or
@@ -28,63 +28,10 @@ use magnetar_admin::{
     AdminClient, BacklogQuota, BacklogQuotaType, DelayedDeliveryPolicies, DispatchRate,
     PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
 };
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
-}
+use common::pulsar::start_pulsar;
 
 fn build_admin(admin_url: &str) -> Result<AdminClient, Box<dyn std::error::Error>> {
     Ok(AdminClient::builder()
@@ -526,7 +473,7 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
 
     // The Apache Pulsar `:latest` docker image (verified on 4.2.x) ships a `standalone.conf`
     // with `backlogQuotaDefaultLimitGB=10` (verified via
-    // `docker run apachepulsar/pulsar:4.2.4 cat /pulsar/conf/standalone.conf`).
+    // `docker run <the fixture's image> cat /pulsar/conf/standalone.conf`).
     // Per broker `checkBacklogQuota`, topic-level retention must
     // exceed the effective backlog quota; with a 10 GiB default
     // floor, any concrete retention <= 10 GiB on a freshly-created

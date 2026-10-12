@@ -10,8 +10,8 @@
 //! cargo test -p magnetar --test e2e_batch_chunk -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. See `e2e_pulsar.rs` for the broker container
-//! plumbing; this file uses the same image/wait strategy via a local helper.
+//! Requires Docker on the host. The broker container comes from the shared
+//! fixture in `common/pulsar.rs` (ADR-0115).
 //!
 //! PIP-37 (Large Message Size) requires producer chunking + batching disabled
 //! (chunks-never-batched). The chunked round-trip below mirrors that constraint.
@@ -22,14 +22,11 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 const PARTITIONS: usize = 12;
 const RECEIVER_QUEUE_SIZE: usize = 2_000;
@@ -43,93 +40,28 @@ struct PartitionReceive {
     received: usize,
 }
 
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-#[test]
-fn default_image_tag_tracks_latest_pulsar_four() {
-    assert_eq!(DEFAULT_IMAGE_TAG, "4.2.4");
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Start a Pulsar 4.x standalone container and return (`service_url`, `admin_url`,
+/// Start a Pulsar standalone container and return (`service_url`, `admin_url`,
 /// `container_handle`).
 async fn start_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
+    Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
 
-/// Start Pulsar 4.2.4 with an 8,192-byte broker message limit so each
+/// Start Pulsar with an 8,192-byte broker message limit so each
 /// 35,840-byte issue-#331 payload is split into exactly five 7,168-byte chunks.
 async fn start_small_message_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_env_var("PULSAR_PREFIX_maxMessageSize", "8192")
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd([
-            "bash",
-            "-lc",
-            "bin/apply-config-from-env.py conf/standalone.conf && exec bin/pulsar standalone",
-        ])
+    let broker = Pulsar::new(Broker::Default)
+        .config("maxMessageSize", "8192")
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    Ok((
-        format!("pulsar://{host}:{binary_port}"),
-        format!("http://{host}:{http_port}"),
-        container,
-    ))
+    Ok(broker.into_parts())
 }
 
 fn unique_topic(prefix: &str) -> String {

@@ -12,9 +12,12 @@
 //! - `check-log-fields`: assert every `error!` / `warn!` / `info!` tracing event in non-test
 //!   workspace code carries at least one structured field (`debug!` / `trace!` exempt). Mirrors
 //!   ADR-0054.
-//! - `check-e2e-container-memory`: assert every `pulsar standalone` container the e2e suite starts
-//!   caps its JVM with `.with_env_var("PULSAR_MEM", …)` before `.start()`. Mirrors
-//!   `docs/testing.md` § "e2e container memory budget".
+//! - `check-e2e-fixture`: assert the e2e suite boots Pulsar only through the shared fixture under
+//!   `crates/magnetar/tests/common/` (no `GenericImage::new` of an `apachepulsar/` image and no
+//!   `apachepulsar/pulsar:` reference anywhere else), that the fixture caps its JVM with
+//!   `.with_env_var("PULSAR_MEM", …)` before `.start()`, and that the fixture's tag constants, the
+//!   CI pre-pull list, the performance campaign's `FIXTURE_TAGS` and the PIP-33 compose fixture
+//!   agree. Mirrors ADR-0115 and `docs/testing.md` § "e2e container memory budget".
 //! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
 //!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
 //!   Mirrors ADR-0024. The moonpool + differential tests are the only ones that run, but the report
@@ -115,20 +118,27 @@ enum Cmd {
     /// ident-capture shorthand and passes as a field. `debug!` / `trace!`
     /// are exempt. See ADR-0054.
     CheckLogFields,
-    /// Assert every `pulsar standalone` container the e2e suite starts
-    /// caps its JVM heap.
+    /// Assert the e2e suite boots Pulsar only through the shared fixture.
     ///
     /// Walks each `GenericImage::new(…)` builder chain under
     /// `crates/magnetar/tests/`, resolves the image repository the first
     /// constructor argument denotes (string literal, `&str` const, or a
-    /// zero-argument accessor returning one), and requires every
-    /// `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)`
-    /// before `.start()`. Non-Pulsar containers — the Kerberos KDC and the
-    /// Athenz ZTS server — are out of scope; a chain whose image cannot be
-    /// resolved, or that never reaches `.start()`, is a violation rather
-    /// than a silent skip. Only the call's presence is checked: the budget
-    /// value lives in `docs/testing.md` § "e2e container memory budget".
-    CheckE2eContainerMemory,
+    /// zero-argument accessor returning one), and enforces three rules:
+    ///
+    /// 1. A chain whose repository is `apachepulsar/…`, and any `apachepulsar/pulsar:` reference at
+    ///    all, is allowed only under `crates/magnetar/tests/common/`.
+    /// 2. Every such chain there carries `.with_env_var("PULSAR_MEM", …)` before `.start()` on the
+    ///    same expression chain.
+    /// 3. The tag constants of `common/pulsar.rs` equal the `docker pull apachepulsar/pulsar:<tag>`
+    ///    set of the workflows under `.github/`, are a subset of `FIXTURE_TAGS` in
+    ///    `scripts/performance_campaign.py`, and the PIP-33 compose fixture pins `DEFAULT_TAG`.
+    ///
+    /// Non-Pulsar containers — the Kerberos KDC and the Athenz ZTS server —
+    /// are out of scope; a chain whose image cannot be resolved, or that never
+    /// reaches `.start()`, is a violation rather than a silent skip. Only the
+    /// `PULSAR_MEM` call's presence is checked: the budget value lives in
+    /// `docs/testing.md` § "e2e container memory budget".
+    CheckE2eFixture,
     /// Assert that every line added relative to the merge base is covered
     /// by at least one `magnetar-runtime-moonpool` test.
     ///
@@ -232,7 +242,7 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoIoDeps => check_no_io_deps(),
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::CheckLogFields => check_log_fields(),
-        Cmd::CheckE2eContainerMemory => check_e2e_container_memory(),
+        Cmd::CheckE2eFixture => check_e2e_fixture(),
         Cmd::CheckSimCoverage {
             base,
             reuse_lcov,
@@ -1209,25 +1219,49 @@ fn check_log_fields() -> Result<()> {
     Ok(())
 }
 
-/// Workspace-relative directory the container-memory gate scans. Only the
+/// Workspace-relative directory the e2e-fixture gate scans. Only the
 /// façade's e2e suite starts `testcontainers` images.
 const E2E_TESTS_DIR: &str = "crates/magnetar/tests";
+
+/// Workspace-relative directory of the shared fixture (ADR-0115). The only
+/// place a Pulsar container may be built and an `apachepulsar/pulsar:`
+/// reference may appear.
+const E2E_FIXTURE_DIR: &str = "crates/magnetar/tests/common";
+
+/// The PIP-33 two-cluster compose fixture, which pins the default broker tag.
+const COMPOSE_FIXTURE: &str = "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml";
+
+/// The fixture source that declares the image tag constants.
+const E2E_FIXTURE_SOURCE: &str = "crates/magnetar/tests/common/pulsar.rs";
 
 /// The `testcontainers` constructor every e2e container is built from.
 const CONTAINER_CTOR: &str = "GenericImage::new";
 
-/// A chain is governed by the container-memory budget iff its resolved
-/// image repository starts with this prefix. The suite also starts a
-/// Kerberos KDC (`gcavalcante8808/krb5-server`) and an Athenz ZTS server
-/// (`athenz/athenz-zts-server`); neither runs the Pulsar JVM, so neither
-/// is in scope.
+/// A chain is a Pulsar container iff its resolved image repository starts
+/// with this prefix. The suite also starts a Kerberos KDC
+/// (`gcavalcante8808/krb5-server`) and an Athenz ZTS server
+/// (`athenz/athenz-zts-server`); neither runs the Pulsar JVM, so neither is
+/// in scope.
 const PULSAR_IMAGE_PREFIX: &str = "apachepulsar/";
+
+/// A tagged Pulsar image reference. Outside [`E2E_FIXTURE_DIR`] it is a
+/// violation wherever it appears — code, string or comment — because a copy of
+/// the tag in prose drifts the way the `latest` comments did (ADR-0109).
+const PULSAR_TAGGED_IMAGE: &str = "apachepulsar/pulsar:";
 
 /// The env var every Pulsar container must set. The gate asserts the
 /// *presence* of a `.with_env_var("PULSAR_MEM", …)` call; the budget value
 /// itself is governed by `docs/testing.md` § "e2e container memory
 /// budget", not by this check.
 const PULSAR_MEM_ENV: &str = "PULSAR_MEM";
+
+/// Violation reason: a Pulsar container is built outside the shared fixture.
+const FIXTURE_CHAIN_OUTSIDE: &str = "builds a Pulsar container outside crates/magnetar/tests/common/; start it with \
+     `common::pulsar::Pulsar` (ADR-0115)";
+
+/// Violation reason: a tagged Pulsar image reference outside the shared fixture.
+const FIXTURE_LITERAL_OUTSIDE: &str = "names an `apachepulsar/pulsar:` image outside crates/magnetar/tests/common/; the shared \
+     fixture owns every tag (ADR-0115)";
 
 /// Violation reason: a Pulsar container reaches `.start()` uncapped.
 const CONTAINER_MEM_NO_ENV: &str =
@@ -1538,10 +1572,14 @@ fn find_container_chains(contents: &str) -> Vec<ContainerChain> {
     out
 }
 
-/// Classify one chain: `Ok(true)` for an in-scope, capped container,
-/// `Ok(false)` for a container the budget does not govern, `Err(reason)`
-/// for a violation.
-fn classify_container_chain(chain: &ContainerChain) -> std::result::Result<bool, &'static str> {
+/// Classify one chain: `Ok(true)` for a Pulsar container built by the
+/// shared fixture with its JVM capped, `Ok(false)` for a container the gate
+/// does not govern (non-Pulsar images), `Err(reason)` for a violation.
+/// `in_fixture` is true for files under [`E2E_FIXTURE_DIR`].
+fn classify_container_chain(
+    chain: &ContainerChain,
+    in_fixture: bool,
+) -> std::result::Result<bool, &'static str> {
     if chain.repos.is_empty() {
         return Err(CONTAINER_MEM_UNRESOLVED);
     }
@@ -1552,6 +1590,9 @@ fn classify_container_chain(chain: &ContainerChain) -> std::result::Result<bool,
     {
         return Ok(false);
     }
+    if !in_fixture {
+        return Err(FIXTURE_CHAIN_OUTSIDE);
+    }
     if !chain.started {
         return Err(CONTAINER_MEM_NOT_STARTED);
     }
@@ -1561,31 +1602,308 @@ fn classify_container_chain(chain: &ContainerChain) -> std::result::Result<bool,
     Ok(true)
 }
 
-/// Tally of one file's `GenericImage::new` chains.
+/// Tally of one file's Pulsar-container findings.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ContainerMemoryScan {
-    /// In-scope Pulsar chains that carry `PULSAR_MEM`.
+struct E2eFixtureScan {
+    /// Pulsar chains inside the fixture that carry `PULSAR_MEM`.
     capped: usize,
-    /// Chains the budget does not govern (non-Pulsar images).
+    /// Chains the gate does not govern (non-Pulsar images).
     out_of_scope: usize,
     /// `(line, reason)` per violation.
     violations: Vec<(usize, &'static str)>,
 }
 
-/// Scan one file's contents for uncapped Pulsar containers.
-fn scan_container_memory(contents: &str) -> ContainerMemoryScan {
-    let mut scan = ContainerMemoryScan::default();
+/// Scan one file's contents. `in_fixture` is true for files under
+/// [`E2E_FIXTURE_DIR`], the only place a Pulsar container may be built and a
+/// tagged `apachepulsar/pulsar:` reference may appear.
+fn scan_e2e_fixture(contents: &str, in_fixture: bool) -> E2eFixtureScan {
+    let mut scan = E2eFixtureScan::default();
     for chain in find_container_chains(contents) {
-        match classify_container_chain(&chain) {
+        match classify_container_chain(&chain, in_fixture) {
             Ok(true) => scan.capped += 1,
             Ok(false) => scan.out_of_scope += 1,
             Err(reason) => scan.violations.push((chain.line, reason)),
         }
     }
+    if !in_fixture {
+        for (index, line) in contents.lines().enumerate() {
+            if line.contains(PULSAR_TAGGED_IMAGE) {
+                scan.violations.push((index + 1, FIXTURE_LITERAL_OUTSIDE));
+            }
+        }
+        scan.violations.sort_unstable_by_key(|(line, _)| *line);
+    }
     scan
 }
 
-fn check_e2e_container_memory() -> Result<()> {
+/// The `(name, tag)` of every image-tag constant the fixture declares: a
+/// `const <NAME>_TAG: &str = "<digit…>"`.
+fn fixture_tag_constants(fixture_source: &str) -> Vec<(String, String)> {
+    const_str_table(fixture_source)
+        .into_iter()
+        .filter(|(name, value)| {
+            name.ends_with("_TAG") && value.starts_with(|c: char| c.is_ascii_digit())
+        })
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// The name every reference to the Pulsar image contains, whatever precedes it
+/// (`docker.io/`, a quote, a `${VAR:-…}` default) or follows it.
+const PULSAR_REPO_MARK: &str = "apachepulsar/pulsar";
+
+/// What a strict reader found in one file that names the Pulsar image.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PulsarRefs {
+    /// Tags of the references written in the one spelling the gate reads.
+    tags: Vec<String>,
+    /// One message per other reference. The tag rule fails closed on these: a
+    /// spelling the gate cannot read would otherwise drop out of the
+    /// comparison and let the lists drift unseen.
+    unrecognised: Vec<String>,
+}
+
+impl PulsarRefs {
+    fn extend(&mut self, other: Self) {
+        self.tags.extend(other.tags);
+        self.unrecognised.extend(other.unrecognised);
+    }
+}
+
+/// The tag at the start of `after` (`:4.2.4…`) and the text following it.
+fn tag_prefix(after: &str) -> Option<(&str, &str)> {
+    let after = after.strip_prefix(':')?;
+    let end = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(after.len());
+    (end > 0).then(|| after.split_at(end))
+}
+
+/// Read every non-comment line of `text` that names [`PULSAR_REPO_MARK`].
+/// `strict(before, after)` accepts one occurrence in the file's one expected
+/// spelling and returns its tag; an occurrence it refuses, or a line that
+/// mixes accepted and refused ones, is reported with `expected` so the fix is
+/// obvious. Whole-line `#` comments are ignored.
+fn pulsar_refs(
+    label: &str,
+    text: &str,
+    expected: &str,
+    strict: impl Fn(&str, &str) -> Option<String>,
+) -> PulsarRefs {
+    let mut refs = PulsarRefs::default();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with('#') || !line.contains(PULSAR_REPO_MARK) {
+            continue;
+        }
+        let mut tags = Vec::new();
+        let mut readable = true;
+        let mut from = 0;
+        while let Some(at) = line[from..].find(PULSAR_REPO_MARK).map(|at| from + at) {
+            let after = &line[at + PULSAR_REPO_MARK.len()..];
+            match strict(&line[..at], after) {
+                Some(tag) => tags.push(tag),
+                None => readable = false,
+            }
+            from = at + PULSAR_REPO_MARK.len();
+        }
+        if readable {
+            refs.tags.extend(tags);
+        } else {
+            refs.unrecognised.push(format!(
+                "{label}:{}: `{}` names `{PULSAR_REPO_MARK}` in a spelling the gate cannot read; \
+                 write it as {expected}",
+                index + 1,
+                line.trim()
+            ));
+        }
+    }
+    refs
+}
+
+/// `after` ends the tag where a shell word does: end of line, whitespace or `;`.
+fn ends_shell_word(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')
+}
+
+/// Every `docker pull apachepulsar/pulsar:<tag>` of a workflow; any other
+/// reference — a registry prefix, quotes, `docker image pull`, a `${VAR:-…}`
+/// default — is [`PulsarRefs::unrecognised`].
+fn workflow_refs(label: &str, workflow: &str) -> PulsarRefs {
+    pulsar_refs(
+        label,
+        workflow,
+        "`docker pull apachepulsar/pulsar:<tag>`",
+        |before, after| {
+            let (tag, rest) = tag_prefix(after)?;
+            (before.ends_with(char::is_whitespace)
+                && before.trim_end().ends_with("docker pull")
+                && ends_shell_word(rest))
+            .then(|| tag.to_owned())
+        },
+    )
+}
+
+/// Every `image: apachepulsar/pulsar:<tag>` of the PIP-33 compose fixture; any
+/// other reference (quoted, registry-prefixed, `${TAG:-…}`) is unrecognised.
+fn compose_refs(label: &str, compose: &str) -> PulsarRefs {
+    pulsar_refs(
+        label,
+        compose,
+        "an unquoted `image: apachepulsar/pulsar:<tag>`",
+        |before, after| {
+            let (tag, rest) = tag_prefix(after)?;
+            (before.ends_with(char::is_whitespace)
+                && before.trim() == "image:"
+                && (ends_shell_word(rest) || rest.starts_with('#')))
+            .then(|| tag.to_owned())
+        },
+    )
+}
+
+/// Every Pulsar image of the performance campaign, which must be a complete
+/// double-quoted `"apachepulsar/pulsar:<tag>"` literal.
+fn campaign_refs(label: &str, campaign: &str) -> PulsarRefs {
+    pulsar_refs(
+        label,
+        campaign,
+        "a double-quoted `\"apachepulsar/pulsar:<tag>\"` literal",
+        |before, after| {
+            let (tag, rest) = tag_prefix(after)?;
+            (before.ends_with('"') && rest.starts_with('"')).then(|| tag.to_owned())
+        },
+    )
+}
+
+/// Every Pulsar tag in the `FIXTURE_TAGS = (…)` tuple of the performance
+/// campaign — the images its nightly pre-pulls. The tuple holds string
+/// literals only, so its first `)` closes it.
+fn campaign_fixture_tags(campaign: &str) -> Vec<String> {
+    let Some(start) = campaign.find("FIXTURE_TAGS") else {
+        return Vec::new();
+    };
+    let tuple = &campaign[start..];
+    let Some(open) = tuple.find('(') else {
+        return Vec::new();
+    };
+    let body = &tuple[open..];
+    let close = body.find(')').unwrap_or(body.len());
+    let mut tags = Vec::new();
+    let mut rest = &body[..close];
+    while let Some(at) = rest.find(PULSAR_TAGGED_IMAGE) {
+        rest = &rest[at + PULSAR_TAGGED_IMAGE.len() - 1..];
+        if let Some((tag, after)) = tag_prefix(rest) {
+            tags.push(tag.to_owned());
+            rest = after;
+        }
+    }
+    tags
+}
+
+/// Lines that assign `FIXTURE_TAGS`: exactly one is read, so a second
+/// assignment (or `+=`) would add pre-pulls the comparison cannot see.
+fn campaign_fixture_tag_assignments(campaign: &str) -> usize {
+    campaign
+        .lines()
+        .filter(|line| {
+            line.trim_start()
+                .strip_prefix("FIXTURE_TAGS")
+                .is_some_and(|rest| {
+                    let rest = rest.trim_start();
+                    rest.starts_with('=') || rest.starts_with("+=") || rest.starts_with(':')
+                })
+        })
+        .count()
+}
+
+/// The cross-file tag rule: the fixture's tag constants equal the CI pre-pull
+/// set, are a subset of the campaign's `FIXTURE_TAGS`, and the compose
+/// fixture pins `DEFAULT_TAG`. Fails closed: a reference to the image in a
+/// spelling the readers do not accept is itself a violation. Returns one
+/// message per disagreement.
+fn fixture_tag_violations(
+    constants: &[(String, String)],
+    pulled: &PulsarRefs,
+    campaign_fixture: &[String],
+    campaign: &PulsarRefs,
+    campaign_assignments: usize,
+    compose: &PulsarRefs,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(pulled.unrecognised.iter().cloned());
+    out.extend(campaign.unrecognised.iter().cloned());
+    out.extend(compose.unrecognised.iter().cloned());
+    if campaign_assignments != 1 {
+        out.push(format!(
+            "scripts/performance_campaign.py assigns FIXTURE_TAGS {campaign_assignments} times; \
+             the gate reads exactly one tuple"
+        ));
+    }
+    if constants.is_empty() {
+        out.push(format!(
+            "{E2E_FIXTURE_SOURCE} declares no `const <NAME>_TAG: &str = \"<version>\"`, so no tag \
+             can be checked"
+        ));
+        out.sort();
+        out.dedup();
+        return out;
+    }
+    for (name, tag) in constants {
+        if !pulled.tags.contains(tag) {
+            out.push(format!(
+                "{name} = {tag} has no `docker pull {PULSAR_TAGGED_IMAGE}{tag}` in .github/workflows/"
+            ));
+        }
+        if !campaign_fixture.contains(tag) {
+            out.push(format!(
+                "{name} = {tag} is missing from FIXTURE_TAGS in scripts/performance_campaign.py"
+            ));
+        }
+    }
+    for tag in &pulled.tags {
+        if !constants.iter().any(|(_, value)| value == tag) {
+            out.push(format!(
+                "`docker pull {PULSAR_TAGGED_IMAGE}{tag}` in .github/workflows/ matches no tag \
+                 constant of {E2E_FIXTURE_SOURCE}"
+            ));
+        }
+    }
+    for tag in &campaign.tags {
+        if !campaign_fixture.contains(tag) {
+            out.push(format!(
+                "scripts/performance_campaign.py names {PULSAR_TAGGED_IMAGE}{tag}, which \
+                 FIXTURE_TAGS does not pre-pull"
+            ));
+        }
+    }
+    match constants.iter().find(|(name, _)| name == "DEFAULT_TAG") {
+        None => out.push(format!("{E2E_FIXTURE_SOURCE} declares no DEFAULT_TAG")),
+        Some((_, default)) => {
+            if compose.tags.is_empty() {
+                out.push(
+                    "the PIP-33 compose fixture pins no `image: apachepulsar/pulsar:<tag>`"
+                        .to_owned(),
+                );
+            }
+            for tag in &compose.tags {
+                if tag != default {
+                    out.push(format!(
+                        "the PIP-33 compose fixture pins {tag} but DEFAULT_TAG is {default}"
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Read `path` under `root`, naming it in the error.
+fn read_workspace_file(root: &Path, relative: &str) -> Result<String> {
+    fs::read_to_string(root.join(relative)).with_context(|| format!("reading {relative}"))
+}
+
+fn check_e2e_fixture() -> Result<()> {
     let workspace_root = workspace_root()?;
     let tests_dir = workspace_root.join(E2E_TESTS_DIR);
     if !tests_dir.is_dir() {
@@ -1601,7 +1919,8 @@ fn check_e2e_container_memory() -> Result<()> {
         }
         let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
         let rel = rel.to_string_lossy().replace('\\', "/");
-        let scan = scan_container_memory(contents);
+        let in_fixture = Path::new(&rel).starts_with(E2E_FIXTURE_DIR);
+        let scan = scan_e2e_fixture(contents, in_fixture);
         capped += scan.capped;
         out_of_scope += scan.out_of_scope;
         for (line, reason) in scan.violations {
@@ -1609,24 +1928,66 @@ fn check_e2e_container_memory() -> Result<()> {
         }
     })?;
 
-    if !offenders.is_empty() {
+    // The workflows live under `.github`, which `visit` skips, and the campaign
+    // and compose fixture are not Rust: read each one explicitly.
+    let fixture_source = read_workspace_file(&workspace_root, E2E_FIXTURE_SOURCE)?;
+    let campaign = read_workspace_file(&workspace_root, "scripts/performance_campaign.py")?;
+    let compose = read_workspace_file(&workspace_root, COMPOSE_FIXTURE)?;
+    let workflows_dir = workspace_root.join(".github/workflows");
+    let mut pulled = PulsarRefs::default();
+    for entry in fs::read_dir(&workflows_dir)
+        .with_context(|| format!("reading {}", workflows_dir.display()))?
+    {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        {
+            let label = format!(
+                ".github/workflows/{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?")
+            );
+            pulled.extend(workflow_refs(&label, &fs::read_to_string(&path)?));
+        }
+    }
+    let constants = fixture_tag_constants(&fixture_source);
+    let tag_violations = fixture_tag_violations(
+        &constants,
+        &pulled,
+        &campaign_fixture_tags(&campaign),
+        &campaign_refs("scripts/performance_campaign.py", &campaign),
+        campaign_fixture_tag_assignments(&campaign),
+        &compose_refs(COMPOSE_FIXTURE, &compose),
+    );
+
+    if !offenders.is_empty() || !tag_violations.is_empty() {
         offenders.sort();
         for line in &offenders {
-            eprintln!("uncapped e2e container — {line}");
+            eprintln!("e2e fixture violation — {line}");
+        }
+        for line in &tag_violations {
+            eprintln!("e2e fixture tag violation — {line}");
         }
         bail!(
-            "e2e-container-memory check failed: {} offender(s). Every `pulsar standalone` \
-             container the e2e suite starts must chain \
-             `.with_env_var(\"PULSAR_MEM\", PULSAR_MEM_LIMIT)` before `.start()` — see \
-             docs/testing.md § \"e2e container memory budget\".",
-            offenders.len()
+            "e2e-fixture check failed: {} placement/memory offender(s), {} tag disagreement(s). \
+             Pulsar containers are built only by the shared fixture under \
+             crates/magnetar/tests/common/, which chains `.with_env_var(\"PULSAR_MEM\", …)` \
+             before `.start()`, and its tag constants must equal the CI pre-pull list, sit in \
+             FIXTURE_TAGS and match the PIP-33 compose pin — see ADR-0115 and docs/testing.md \
+             § \"e2e container memory budget\".",
+            offenders.len(),
+            tag_violations.len()
         );
     }
-    // Report the non-Pulsar chains too: a silent drop in the capped count
-    // is the regression this gate exists to make visible.
+    // Report the counts: a silent drop in the capped count is the regression
+    // this gate exists to make visible.
     eprintln!(
-        "xtask check-e2e-container-memory: {capped} Pulsar container chain(s) carry PULSAR_MEM \
-         ({out_of_scope} non-Pulsar chain(s) out of scope)."
+        "xtask check-e2e-fixture: {capped} Pulsar container chain(s) in the shared fixture carry \
+         PULSAR_MEM ({out_of_scope} non-Pulsar chain(s) out of scope); {} tag constant(s) agree \
+         with the CI pre-pulls, FIXTURE_TAGS and the PIP-33 compose fixture.",
+        constants.len()
     );
     Ok(())
 }
@@ -3445,7 +3806,7 @@ fn run() {
         );
     }
 
-    // ── check-e2e-container-memory parser ───────────────────────────
+    // ── check-e2e-fixture scanner (memory budget, ADR-0115 placement + tags) ──
 
     /// The house e2e preamble: a Pulsar image const plus the accessor
     /// pair every `e2e_*.rs` copies.
@@ -3477,7 +3838,7 @@ async fn start_pulsar() {{
 }}
 "
         );
-        let scan = scan_container_memory(&src);
+        let scan = scan_e2e_fixture(&src, true);
         assert_eq!(scan.violations, vec![(15, CONTAINER_MEM_NO_ENV)]);
         assert_eq!(scan.capped, 0);
     }
@@ -3500,7 +3861,7 @@ async fn start_pulsar() {{
 }}
 "
         );
-        let scan = scan_container_memory(&src);
+        let scan = scan_e2e_fixture(&src, true);
         assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 1);
     }
@@ -3525,7 +3886,7 @@ async fn start_proxy() {{
 }}
 "
         );
-        let scan = scan_container_memory(&src);
+        let scan = scan_e2e_fixture(&src, true);
         assert_eq!(scan.violations, vec![(22, CONTAINER_MEM_NO_ENV)]);
         assert_eq!(scan.capped, 1);
     }
@@ -3562,7 +3923,7 @@ async fn start_zts() {
         .await;
 }
 "#;
-        let scan = scan_container_memory(src);
+        let scan = scan_e2e_fixture(src, true);
         assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 0);
         assert_eq!(scan.out_of_scope, 2);
@@ -3579,7 +3940,7 @@ async fn start_pulsar() {
 }
 "#;
         assert_eq!(
-            scan_container_memory(uncapped).violations,
+            scan_e2e_fixture(uncapped, true).violations,
             vec![(3, CONTAINER_MEM_NO_ENV)]
         );
 
@@ -3591,7 +3952,7 @@ async fn start_pulsar() {
         .await?;
 }
 "#;
-        let scan = scan_container_memory(capped);
+        let scan = scan_e2e_fixture(capped, true);
         assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 1);
     }
@@ -3610,7 +3971,7 @@ async fn start_pulsar() {{
 "
         );
         assert_eq!(
-            scan_container_memory(&src).violations,
+            scan_e2e_fixture(&src, true).violations,
             vec![(15, CONTAINER_MEM_NOT_STARTED)]
         );
     }
@@ -3627,7 +3988,7 @@ async fn start_pulsar() {
 }
 "#;
         assert_eq!(
-            scan_container_memory(src).violations,
+            scan_e2e_fixture(src, true).violations,
             vec![(4, CONTAINER_MEM_UNRESOLVED)]
         );
     }
@@ -3645,8 +4006,421 @@ fn explain() {
     let _ = MyGenericImage::new(image_repo(), image_tag());
 }
 "#;
-        let scan = scan_container_memory(src);
-        assert_eq!(scan, ContainerMemoryScan::default());
+        let scan = scan_e2e_fixture(src, true);
+        assert_eq!(scan, E2eFixtureScan::default());
+    }
+
+    // ── check-e2e-fixture: placement (ADR-0115 rule 1) ──────────────
+
+    /// A suite that builds its own Pulsar container, as every `e2e_*.rs` did
+    /// before the shared fixture.
+    const OUTSIDE_PULSAR_CHAIN: &str = r#"
+const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
+fn image_repo() -> String { DEFAULT_IMAGE_REPO.to_owned() }
+
+async fn start_pulsar() {
+    let container = GenericImage::new(image_repo(), "4.2.4")
+        .with_env_var("PULSAR_MEM", "-Xms256m -Xmx1g")
+        .start()
+        .await?;
+}
+"#;
+
+    #[test]
+    fn fixture_rejects_a_pulsar_chain_outside_the_shared_fixture() {
+        // Even a fully capped chain: the violation is where it lives.
+        let scan = scan_e2e_fixture(OUTSIDE_PULSAR_CHAIN, false);
+        assert_eq!(scan.violations, vec![(6, FIXTURE_CHAIN_OUTSIDE)]);
+        assert_eq!(scan.capped, 0);
+    }
+
+    #[test]
+    fn fixture_accepts_the_same_chain_inside_the_shared_fixture() {
+        let scan = scan_e2e_fixture(OUTSIDE_PULSAR_CHAIN, true);
+        assert_eq!(scan.violations, [] as [(usize, &str); 0]);
+        assert_eq!(scan.capped, 1);
+    }
+
+    #[test]
+    fn fixture_rejects_an_inline_pulsar_literal_chain_outside() {
+        let src = r#"
+async fn start_pulsar() {
+    let container = GenericImage::new("apachepulsar/pulsar", tag)
+        .with_env_var("PULSAR_MEM", "-Xms256m -Xmx1g")
+        .start()
+        .await?;
+}
+"#;
+        assert_eq!(
+            scan_e2e_fixture(src, false).violations,
+            vec![(3, FIXTURE_CHAIN_OUTSIDE)]
+        );
+    }
+
+    #[test]
+    fn fixture_rejects_an_unresolvable_chain_outside_too() {
+        // A repo the gate cannot read could be Pulsar; it never passes
+        // unverified, inside the fixture directory or out of it.
+        let src = r#"
+async fn start() {
+    let container = GenericImage::new(format!("{registry}/pulsar"), "4.2.4").start().await?;
+}
+"#;
+        assert_eq!(
+            scan_e2e_fixture(src, false).violations,
+            vec![(3, CONTAINER_MEM_UNRESOLVED)]
+        );
+    }
+
+    #[test]
+    fn fixture_allows_non_pulsar_chains_outside() {
+        // The KDC and the ZTS server stay in their own suites.
+        let src = r#"
+const KDC_REPO: &str = "gcavalcante8808/krb5-server";
+async fn start_kdc() {
+    let container = GenericImage::new(KDC_REPO, "alpine_3.19.0").start().await?;
+}
+"#;
+        let scan = scan_e2e_fixture(src, false);
+        assert_eq!(scan.violations, [] as [(usize, &str); 0]);
+        assert_eq!(scan.out_of_scope, 1);
+    }
+
+    #[test]
+    fn fixture_rejects_a_tagged_pulsar_reference_outside_even_in_a_comment() {
+        // `e2e_pulsar.rs` once said "Uses `apachepulsar/pulsar:4.2.4`" in its
+        // module docs; a copy of the tag in prose is what drifted to `latest`.
+        let src = "//! Uses `apachepulsar/pulsar:4.2.4`.\nfn main() {}\nconst IMAGE: &str = \"apachepulsar/pulsar:4.0.13\";\n";
+        let scan = scan_e2e_fixture(src, false);
+        assert_eq!(
+            scan.violations,
+            vec![(1, FIXTURE_LITERAL_OUTSIDE), (3, FIXTURE_LITERAL_OUTSIDE)]
+        );
+    }
+
+    #[test]
+    fn fixture_allows_a_tagged_pulsar_reference_inside() {
+        let src = "//! Boots `apachepulsar/pulsar:4.2.4`.\n";
+        assert_eq!(
+            scan_e2e_fixture(src, true).violations,
+            [] as [(usize, &str); 0]
+        );
+    }
+
+    #[test]
+    fn fixture_ignores_an_untagged_repository_name_in_prose() {
+        // Only a *tagged* reference carries a version that can drift.
+        let src = "//! Boots the `apachepulsar/pulsar` image via the shared fixture.\n";
+        assert_eq!(
+            scan_e2e_fixture(src, false).violations,
+            [] as [(usize, &str); 0]
+        );
+    }
+
+    #[test]
+    fn fixture_memory_rule_still_applies_inside_the_fixture() {
+        let src = r#"
+fn image_repo() -> String { IMAGE_REPO.to_owned() }
+const IMAGE_REPO: &str = "apachepulsar/pulsar";
+async fn start() {
+    let container = GenericImage::new(image_repo(), tag).start().await?;
+}
+"#;
+        assert_eq!(
+            scan_e2e_fixture(src, true).violations,
+            vec![(5, CONTAINER_MEM_NO_ENV)]
+        );
+    }
+
+    // ── check-e2e-fixture: tag agreement (ADR-0115 rule 3) ──────────
+
+    const FIXTURE_SRC: &str = r#"
+pub const IMAGE_REPO: &str = "apachepulsar/pulsar";
+pub const DEFAULT_TAG: &str = "4.2.4";
+pub const V4_LTS_TAG: &str = "4.0.13";
+pub const SCALABLE_TAG: &str = "5.0.0-M1";
+pub const DEFAULT_TAG_ENV: &str = "MAGNETAR_PULSAR_IMAGE_TAG";
+"#;
+
+    const CI_SRC: &str = "\
+      - name: Pre-pull Pulsar broker images
+        run: |
+          # docker pull apachepulsar/pulsar:latest (commented out, ignored)
+          docker pull apachepulsar/pulsar:4.2.4
+          docker pull apachepulsar/pulsar:5.0.0-M1
+          docker pull apachepulsar/pulsar:4.0.13
+          docker pull gcavalcante8808/krb5-server:alpine_3.19.0
+";
+
+    const CAMPAIGN_SRC: &str = r#"
+FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.13", "apachepulsar/pulsar:4.2.4",
+                "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest")
+SEED_REGISTRY = "x"
+image = images["apachepulsar/pulsar:4.2.4"]
+"#;
+
+    const COMPOSE_SRC: &str = "\
+services:
+  zookeeper:
+    image: zookeeper:3.9
+  broker-a:
+    image: apachepulsar/pulsar:4.2.4
+  broker-b:
+    image: apachepulsar/pulsar:4.2.4
+";
+
+    fn tag_violations(fixture: &str, ci: &str, campaign: &str, compose: &str) -> Vec<String> {
+        fixture_tag_violations(
+            &fixture_tag_constants(fixture),
+            &workflow_refs("ci.yml", ci),
+            &campaign_fixture_tags(campaign),
+            &campaign_refs("campaign.py", campaign),
+            campaign_fixture_tag_assignments(campaign),
+            &compose_refs("compose.yml", compose),
+        )
+    }
+
+    #[test]
+    fn fixture_tags_read_only_version_tag_constants() {
+        assert_eq!(
+            fixture_tag_constants(FIXTURE_SRC),
+            vec![
+                ("DEFAULT_TAG".to_owned(), "4.2.4".to_owned()),
+                ("V4_LTS_TAG".to_owned(), "4.0.13".to_owned()),
+                ("SCALABLE_TAG".to_owned(), "5.0.0-M1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fixture_tag_sources_are_parsed_without_their_neighbours() {
+        let pulled = workflow_refs("ci.yml", CI_SRC);
+        assert_eq!(pulled.tags, ["4.2.4", "5.0.0-M1", "4.0.13"]);
+        assert_eq!(pulled.unrecognised, Vec::<String>::new());
+        // A pull of another image, and a commented-out pull, are not Pulsar references.
+        assert_eq!(
+            campaign_fixture_tags(CAMPAIGN_SRC),
+            ["latest", "4.0.13", "4.2.4", "5.0.0-M1"]
+        );
+        let campaign = campaign_refs("campaign.py", CAMPAIGN_SRC);
+        assert_eq!(
+            campaign.tags,
+            ["latest", "4.0.13", "4.2.4", "5.0.0-M1", "4.2.4"]
+        );
+        assert_eq!(campaign.unrecognised, Vec::<String>::new());
+        assert_eq!(campaign_fixture_tag_assignments(CAMPAIGN_SRC), 1);
+        let compose = compose_refs("compose.yml", COMPOSE_SRC);
+        assert_eq!(compose.tags, ["4.2.4", "4.2.4"]);
+        assert_eq!(compose.unrecognised, Vec::<String>::new());
+    }
+
+    #[test]
+    fn fixture_tags_accept_a_consistent_tree() {
+        assert_eq!(
+            tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, COMPOSE_SRC),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_constant_with_no_ci_pre_pull() {
+        let ci = CI_SRC.replace("          docker pull apachepulsar/pulsar:4.0.13\n", "");
+        let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("V4_LTS_TAG = 4.0.13 has no `docker pull"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_ci_pre_pull_with_no_constant() {
+        let ci = format!("{CI_SRC}          docker pull apachepulsar/pulsar:4.0.14\n");
+        let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("pulsar:4.0.14` in .github/workflows/ matches no tag constant"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_constant_missing_from_the_campaign_fixture_tags() {
+        let campaign = CAMPAIGN_SRC.replace("\"apachepulsar/pulsar:4.0.13\", ", "");
+        let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("V4_LTS_TAG = 4.0.13 is missing from FIXTURE_TAGS"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_allow_extra_campaign_tags() {
+        // `FIXTURE_TAGS` is a superset: the campaign also pulls `latest`.
+        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert!(campaign_fixture_tags(CAMPAIGN_SRC).contains(&"latest".to_owned()));
+    }
+
+    /// Run the tag rule with one workflow line replaced and return its messages.
+    fn violations_with_ci_line(line: &str) -> Vec<String> {
+        let ci = CI_SRC.replace(
+            "          docker pull apachepulsar/pulsar:4.0.13\n",
+            &format!("{line}\n"),
+        );
+        tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC)
+    }
+
+    #[test]
+    fn fixture_tags_fail_closed_on_every_workflow_spelling_they_cannot_read() {
+        // Each of these pulls the 4.0.13 image a reader of the strict spelling would
+        // miss; the constant would then look un-pulled, or — worse — not be seen at all.
+        for line in [
+            "          docker pull docker.io/apachepulsar/pulsar:4.0.13",
+            "          docker pull \"apachepulsar/pulsar:4.0.13\"",
+            "          docker pull 'apachepulsar/pulsar:4.0.13'",
+            "          docker image pull apachepulsar/pulsar:4.0.13",
+            "          docker pull -q apachepulsar/pulsar:4.0.13",
+            "          docker pull apachepulsar/pulsar:${PULSAR_TAG:-4.0.13}",
+            "          docker pull ${PULSAR_IMAGE:-apachepulsar/pulsar}:4.0.13",
+            "          docker pull apachepulsar/pulsar@sha256:0123",
+            "          docker pull apachepulsar/pulsar",
+        ] {
+            let violations = violations_with_ci_line(line);
+            assert!(
+                violations.iter().any(
+                    |v| v.starts_with("ci.yml:") && v.contains("spelling the gate cannot read")
+                ),
+                "{line}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_accept_the_workflow_spellings_that_are_only_formatting() {
+        for line in [
+            "          docker pull apachepulsar/pulsar:4.0.13  ",
+            "        run: docker pull apachepulsar/pulsar:4.0.13",
+            "          docker pull apachepulsar/pulsar:4.0.13;",
+            "          # docker pull docker.io/apachepulsar/pulsar:9.9.9 (a comment)",
+        ] {
+            let ci = CI_SRC.replace(
+                "          docker pull apachepulsar/pulsar:4.0.13\n",
+                &format!("{line}\n"),
+            );
+            let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
+            // The commented line pulls nothing, so only that case loses the 4.0.13 pull.
+            if line.trim_start().starts_with('#') {
+                assert_eq!(violations.len(), 1, "{line}: {violations:?}");
+                assert!(violations[0].contains("V4_LTS_TAG = 4.0.13 has no `docker pull"));
+            } else {
+                assert_eq!(violations, Vec::<String>::new(), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_tags_fail_closed_on_every_compose_spelling_they_cannot_read() {
+        for line in [
+            "    image: \"apachepulsar/pulsar:4.2.4\"",
+            "    image: 'apachepulsar/pulsar:4.2.4'",
+            "    image: docker.io/apachepulsar/pulsar:4.2.4",
+            "    image: apachepulsar/pulsar:${PULSAR_TAG:-4.2.4}",
+            "    image: ${PULSAR_IMAGE:-apachepulsar/pulsar}:4.2.4",
+            "    image: apachepulsar/pulsar",
+            "    - apachepulsar/pulsar:4.2.4",
+        ] {
+            let compose = COMPOSE_SRC.replacen("    image: apachepulsar/pulsar:4.2.4", line, 1);
+            let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, &compose);
+            assert!(
+                violations.iter().any(|v| v.starts_with("compose.yml:")
+                    && v.contains("spelling the gate cannot read")),
+                "{line}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_fail_closed_on_campaign_spellings_and_a_second_tuple() {
+        // A single-quoted literal in the tuple.
+        let single = CAMPAIGN_SRC.replace(
+            "\"apachepulsar/pulsar:4.2.4\",",
+            "'apachepulsar/pulsar:4.2.4',",
+        );
+        // A registry-prefixed literal.
+        let registry = CAMPAIGN_SRC.replace(
+            "\"apachepulsar/pulsar:latest\"",
+            "\"docker.io/apachepulsar/pulsar:latest\"",
+        );
+        // An f-string with a default.
+        let formatted = format!("{CAMPAIGN_SRC}tag = f\"apachepulsar/pulsar:{{TAG}}\"\n");
+        for campaign in [single, registry, formatted] {
+            let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+            assert!(
+                violations.iter().any(|v| v.starts_with("campaign.py:")
+                    && v.contains("spelling the gate cannot read")),
+                "{violations:?}"
+            );
+        }
+        // A second assignment would add pre-pulls the first tuple does not show.
+        for second in [
+            "FIXTURE_TAGS += (\"apachepulsar/pulsar:4.0.14\",)\n",
+            "FIXTURE_TAGS = (\"apachepulsar/pulsar:4.2.4\",)\n",
+        ] {
+            let campaign = format!("{CAMPAIGN_SRC}{second}");
+            let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains("assigns FIXTURE_TAGS 2 times")),
+                "{second}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_campaign_lookup_of_an_image_fixture_tags_does_not_pull() {
+        // `images["…:9.9.9"]` is a KeyError waiting in the nightly.
+        let campaign = format!("{CAMPAIGN_SRC}image = images[\"apachepulsar/pulsar:9.9.9\"]\n");
+        let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+        assert_eq!(
+            violations,
+            [
+                "scripts/performance_campaign.py names apachepulsar/pulsar:9.9.9, which FIXTURE_TAGS does not pre-pull"
+            ]
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_compose_pin_that_drifts_from_default_tag() {
+        let compose = COMPOSE_SRC.replacen("pulsar:4.2.4", "pulsar:4.2.3", 1);
+        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, &compose);
+        assert_eq!(
+            violations,
+            ["the PIP-33 compose fixture pins 4.2.3 but DEFAULT_TAG is 4.2.4"]
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_fixture_that_declares_no_tag() {
+        let violations = tag_violations(
+            "pub const OTHER: &str = \"x\";",
+            CI_SRC,
+            CAMPAIGN_SRC,
+            COMPOSE_SRC,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("declares no"), "{violations:?}");
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_compose_file_with_no_pulsar_pin() {
+        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, "services: {}\n");
+        assert_eq!(
+            violations,
+            ["the PIP-33 compose fixture pins no `image: apachepulsar/pulsar:<tag>`"]
+        );
     }
 
     // ── check-no-internal-clock scanner (ADR-0011, ADR-0086) ────────

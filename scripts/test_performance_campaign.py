@@ -135,23 +135,27 @@ class CampaignContracts(unittest.TestCase):
             with mock.patch.object(CAMPAIGN.shutil, "which", return_value="/another/docker"), self.assertRaisesRegex(ValueError, "regular executable"):
                 CAMPAIGN.docker_cli_identity(root, executable)
 
-    def test_batch_chunk_default_image_is_preloaded_and_frozen(self):
-        source = Path(CAMPAIGN.__file__).resolve().parents[1] / "crates/magnetar/tests/e2e_batch_chunk.rs"
+    def test_pulsar_fixture_images_are_preloaded_and_frozen(self):
+        source = Path(CAMPAIGN.__file__).resolve().parents[1] / "crates/magnetar/tests/common/pulsar.rs"
         text = source.read_text()
-        repository = re.search(r'const DEFAULT_IMAGE_REPO: &str = "([^"]+)";', text).group(1)
-        tag = re.search(r'const DEFAULT_IMAGE_TAG: &str = "([^"]+)";', text).group(1)
-        self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
+        repository = re.search(r'const IMAGE_REPO: &str = "([^"]+)";', text).group(1)
+        tags = dict(re.findall(r'const (\w+_TAG): &str = "(\d[^"]*)";', text))
+        self.assertEqual(set(tags), {"DEFAULT_TAG", "V4_LTS_TAG", "SCALABLE_TAG"})
+        for name, tag in tags.items():
+            with self.subTest(constant=name):
+                self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
 
-    def test_baseline_overlay_copies_only_the_three_audited_harness_sources(self):
+    def test_baseline_overlay_copies_only_the_audited_harness_sources(self):
         fixture = "crates/magnetar/tests/e2e_reconnect_safety.rs"
         proxy = "crates/magnetar/tests/e2e_pulsar_proxy.rs"
+        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); base = root / "base"; candidate = root / "candidate"
             output = root / "output"; output.mkdir()
             revisions = {}
             for checkout, label in ((base, "base"), (candidate, "candidate")):
                 checkout.mkdir()
-                for path in (CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy, "scripts/performance.py",
+                for path in (CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy, *shared, "scripts/performance.py",
                              "scripts/performance_campaign.py", "scripts/performance/Dockerfile",
                              "scripts/performance/control.c", "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml"):
                     target = checkout / path; target.parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +169,7 @@ class CampaignContracts(unittest.TestCase):
                                                   check=True, capture_output=True, text=True).stdout.strip()
             overlay = CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
             files = json.loads(overlay.read_text())["files"]
-            self.assertEqual({row["path"] for row in files}, {CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy})
+            self.assertEqual({row["path"] for row in files}, {CAMPAIGN.EXAMPLE_SOURCE, fixture, proxy, *shared})
             for row in files:
                 self.assertEqual(row["status"], " M")
                 self.assertEqual((base / row["path"]).read_bytes(), (candidate / row["path"]).read_bytes())
@@ -178,6 +182,39 @@ class CampaignContracts(unittest.TestCase):
             (base / "unexpected-product.rs").write_text("not an audited harness input")
             with self.assertRaisesRegex(ValueError, "unaudited product change"):
                 CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
+
+    def test_baseline_overlay_adds_the_shared_fixture_a_base_checkout_lacks(self):
+        # The nightly's base is an older `main` that predates `tests/common/`: the overlaid
+        # `e2e_*` harness files `mod common;`, so the shared fixture must arrive with them.
+        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
+        harness = tuple(CAMPAIGN.BASELINE_HARNESS_SOURCES)
+        self.assertTrue(set(shared) <= set(harness))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); base = root / "base"; candidate = root / "candidate"
+            output = root / "output"; output.mkdir()
+            revisions = {}
+            for checkout, label in ((base, "base"), (candidate, "candidate")):
+                checkout.mkdir()
+                for path in (*harness, "scripts/performance.py", "scripts/performance_campaign.py",
+                             "scripts/performance/Dockerfile", "scripts/performance/control.c",
+                             "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml"):
+                    if label == "base" and path in shared:
+                        continue
+                    target = checkout / path; target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(label + " " + path)
+                subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+                subprocess.run(["git", "add", "."], cwd=checkout, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.name=Contract", "-c", "user.email=contract@example.invalid",
+                                "-c", "commit.gpgsign=false", "commit", "-qm", label],
+                               cwd=checkout, check=True, capture_output=True)
+                revisions[label] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
+                                                  check=True, capture_output=True, text=True).stdout.strip()
+            overlay = CAMPAIGN.ci_checkout(candidate, base, revisions["base"], revisions["candidate"], output)
+            rows = {row["path"]: row for row in json.loads(overlay.read_text())["files"]}
+            self.assertEqual(set(rows), set(harness))
+            for path in harness:
+                self.assertEqual(rows[path]["status"], "??" if path in shared else " M", path)
+                self.assertEqual((base / path).read_bytes(), (candidate / path).read_bytes())
 
     def test_inner_invalid_collection_keeps_its_original_machine_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:

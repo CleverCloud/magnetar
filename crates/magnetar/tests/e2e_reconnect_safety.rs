@@ -12,19 +12,16 @@ use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
 use magnetar_proto::{FrameError, decode_one, pb};
 use magnetar_runtime_tokio::ClientError;
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-const PULSAR_IMAGE: &str = "apachepulsar/pulsar";
-const PULSAR_TAG: &str = "4.0.13";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+mod common;
+
+use common::pulsar::{Broker, Pulsar};
+
 const WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
@@ -322,32 +319,18 @@ where
     }
 }
 
+/// Start the Pulsar 4.0 LTS broker (`Broker::V4Lts`) this suite is pinned to, with
+/// batch-index acknowledgement on, and return (`host:port`, `container_handle`).
 async fn start_pulsar()
 -> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
-    let container = GenericImage::new(PULSAR_IMAGE, PULSAR_TAG)
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_env_var(
-            "PULSAR_PREFIX_acknowledgmentAtBatchIndexLevelEnabled",
-            "true",
-        )
-        .with_cmd(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ conf/standalone.conf && \
-             bin/pulsar standalone"
-                .to_owned(),
-        ])
+    let broker = Pulsar::new(Broker::V4Lts)
+        .config("acknowledgmentAtBatchIndexLevelEnabled", "true")
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    Ok((format!("{host}:{port}"), container))
+    Ok((
+        format!("{}:{}", broker.host, broker.binary_port),
+        broker.container,
+    ))
 }
 
 fn supervisor() -> SupervisorConfig {

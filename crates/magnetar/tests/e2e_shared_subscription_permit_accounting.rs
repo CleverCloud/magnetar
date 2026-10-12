@@ -116,19 +116,12 @@ use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::Consumer;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container. See
-/// `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Receiver-queue size for every consumer here. Small enough that each round's
 /// partial receive crosses the half-queue flow threshold immediately, which is
@@ -157,9 +150,6 @@ const ROUNDS: usize = 3;
 /// `CONSUMERS * RECEIVER_QUEUE_SIZE` so a real backlog exists behind the
 /// in-flight window while the churn happens.
 const MESSAGES_PER_ROUND: usize = 40;
-
-/// How long to wait for the broker to finish standalone bootstrap.
-const BROKER_READY_TIMEOUT: Duration = Duration::from_mins(4);
 
 /// How long to wait for the broker's topic stats to reach an expected shape.
 const ADMIN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -215,87 +205,25 @@ const DISPATCHER_LOGGER: &str = "PersistentDispatcherMultipleConsumers";
 /// because entering the window is not itself a defect.
 const DISCARD_MARKER: &str = "Ignoring flow control from disconnected consumer";
 
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
 /// Start a `pulsar standalone` container and return (`service_url`,
 /// `admin_url`, `container_handle`).
 ///
-/// Readiness is polled from the broker itself rather than matched on a startup
-/// log line: `apachepulsar/pulsar:5.0.0-M2` logs `Created namespace
-/// {clientAppId=null, namespace=public/default}` on **stderr**, where 4.x logs
-/// `Created namespace public/default` on stdout (measured 2026-09-18). A
-/// log-string wait therefore turns a perfectly healthy 5.x broker into an
-/// opaque `StartupTimeout`, which would read as a red test rather than the
-/// infrastructure mismatch it is. Same reasoning, and the same shape, as
-/// `e2e_scalable_topic.rs`.
+/// Readiness is not matched on a startup log line: the shared fixture polls the
+/// broker's own namespace endpoint until `public/default` is served
+/// (ADR-0115). A log-string wait turns a perfectly healthy 5.x broker into an
+/// opaque `StartupTimeout`, because its structured `Created namespace
+/// {clientAppId=null, namespace=public/default}` line differs from 4.x's. The
+/// dispatcher's debug logger is patched in before the broker boots.
 async fn start_pulsar() -> Result<
     (String, String, testcontainers::ContainerAsync<GenericImage>),
     Box<dyn std::error::Error>,
 > {
     init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::Nothing)
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec![
-            "bash".to_owned(),
-            "-c".to_owned(),
-            format!("{DISPATCHER_DEBUG_LOGGER_PATCH} && exec bin/pulsar standalone"),
-        ])
+    let broker = Pulsar::new(Broker::Default)
+        .pre_start(DISPATCHER_DEBUG_LOGGER_PATCH)
         .start()
         .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
-}
-
-/// Poll the broker until `public/default` exists, which is what standalone
-/// bootstrap finishing actually means for the topics created below.
-async fn await_broker_ready(admin: &AdminClient) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + BROKER_READY_TIMEOUT;
-    loop {
-        let observation = match admin.namespaces_list("public").await {
-            Ok(namespaces) => {
-                if namespaces
-                    .iter()
-                    .any(|namespace| namespace == "public/default")
-                {
-                    return Ok(());
-                }
-                format!("{namespaces:?}")
-            }
-            Err(error) => format!("admin error: {error}"),
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "broker did not finish standalone bootstrap within {BROKER_READY_TIMEOUT:?}; \
-                 last observation: {observation}"
-            )
-            .into());
-        }
-        tokio::time::sleep(ADMIN_POLL_INTERVAL).await;
-    }
+    Ok(broker.into_parts())
 }
 
 /// The broker's own version string, so the matrix row records what actually
@@ -763,14 +691,12 @@ async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
         .service_url(admin_url.parse()?)
         .timeout(Duration::from_secs(30))
         .build()?;
-    await_broker_ready(&admin).await?;
     let version = broker_version(&admin_url)
         .await
         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
     eprintln!(
-        "[#462-permits] image={}:{} brokerVersion={version}",
-        image_repo(),
-        image_tag()
+        "[#462-permits] image={} brokerVersion={version}",
+        Broker::Default.image()
     );
 
     // Deliberately no `consumer_stall_timeout` / `consumer_stall_auto_recovery`:

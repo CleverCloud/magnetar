@@ -72,6 +72,50 @@ let unicode = '\u{7FFF}';
                                      "fixture-required" if required else "fixture-free")
                     self.assertEqual(PERF.fixture_policy(root, "fixture.rs")["source_sha256"], PERF.digest(source))
 
+    def test_fixture_policy_treats_the_shared_pulsar_fixture_as_a_constructor(self):
+        # Since ADR-0115 `GenericImage::new` lives only in `tests/common/pulsar.rs`; a target that boots its
+        # broker through the shared builder or its `start_pulsar()` helper declares fixture use all the same.
+        shared_builder = "async fn start_pulsar() { Ok(Pulsar::new(Broker::Default).start().await?.into_parts()) }"
+        stored_builder = ("async fn start_broker(broker: Broker) { let mut pulsar = Pulsar::new(broker).flag(\"x\");\n"
+                          "if cond { pulsar = pulsar.config(\"a\", \"b\"); }\nOk(pulsar.start().await?.into_parts()) }")
+        inert = ('// Pulsar::new(Broker::Default).start()\n/// start_pulsar()\n'
+                 'const A: &str = "Pulsar::new(Broker::Default).start()";\nconst B: &str = "start_pulsar()";')
+        cases = [("use common::pulsar::start_pulsar;\nasync fn t() { let (a, b, c) = start_pulsar().await?; }", True),
+                 (shared_builder, True),
+                 ("let proxy = Pulsar::new(Broker::Default).config(\"a\", \"b\").start_proxy().await?;", True),
+                 (stored_builder, True),
+                 ("let c = Pulsar::new(Broker::Default)\n    .config(\"a\", \"b\")\n    .start()\n    .await?;", True),
+                 # The Docker-free contract test builds the command and never starts a container.
+                 ("let command = Pulsar::new(Broker::Default).config(\"a\", \"b\").command();", False),
+                 ("let p = Pulsar::new(Broker::Default); let command = p.command();", False),
+                 ("async fn start_pulsar() {}", False),
+                 ("let w = MyPulsar::new(Broker::Default).start();", False),
+                 (inert, False),
+                 # The KDC and ZTS suites keep their own constructor.
+                 ("let kdc = GenericImage::new(image_repo(), image_tag()).start().await?;", True)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "fixture.rs"
+            for contents, required in cases:
+                with self.subTest(contents=contents):
+                    source.write_text(contents)
+                    self.assertEqual(PERF.fixture_policy(root, "fixture.rs")["scope"],
+                                     "fixture-required" if required else "fixture-free")
+
+    def test_fixture_policy_classifies_every_target_of_the_repository_tests(self):
+        root = Path(__file__).resolve().parents[1]
+        scopes = {path.name: PERF.fixture_policy(root, path.relative_to(root).as_posix())["scope"]
+                  for path in sorted((root / "crates/magnetar/tests").glob("*.rs"))}
+        self.assertGreater(len(scopes), 60)
+        # `e2e_replicated_subscriptions` attaches to the PIP-33 compose fixture and creates no child itself.
+        free_e2e = {name for name, scope in scopes.items() if name.startswith("e2e_") and scope == "fixture-free"}
+        self.assertEqual(free_e2e, {"e2e_replicated_subscriptions.rs"})
+        for name in ("e2e_pulsar.rs", "e2e_pulsar_proxy.rs", "e2e_reconnect_safety.rs", "e2e_batch_chunk.rs",
+                     "e2e_scalable_topic.rs", "e2e_admin_verbs.rs", "e2e_athenz_zts.rs", "e2e_sasl_kerberos.rs"):
+            self.assertEqual(scopes[name], "fixture-required", name)
+        for name, scope in scopes.items():
+            if not name.startswith("e2e_"):
+                self.assertEqual(scope, "fixture-free", name)
+
     def test_fixture_policy_refuses_unterminated_rust_regions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); source = root / "fixture.rs"

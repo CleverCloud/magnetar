@@ -50,19 +50,11 @@ use std::time::Duration;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
 
-/// JVM budget for the `pulsar standalone` container. See
-/// `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+use common::pulsar::start_pulsar;
 
 /// Receiver-queue size for every consumer here. Small enough that a modest
 /// backlog forces several flow round-trips — which is what makes the permit
@@ -87,51 +79,6 @@ const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// flush as the first, so it is already on the wire — this only removes any
 /// dependence on where the broker happened to be in processing that write.
 const ADMIN_SETTLE: Duration = Duration::from_secs(1);
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-/// Start a Pulsar 4.x standalone container and return (`service_url`,
-/// `admin_url`, `container_handle`). The container is held by the returned
-/// guard; dropping it stops the broker.
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
-    init_tracing();
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(2))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
-    Ok((service_url, admin_url, container))
-}
 
 /// The broker's own `availablePermits` for every consumer registered on
 /// `subscription`, in the order the broker lists them. Empty while the

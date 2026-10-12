@@ -157,33 +157,75 @@ The CI sharding in [ADR-0098](../specs/adr/0098-parallelize-per-pr-test-executio
 cargo test --workspace --all-features --locked
 ```
 
-The batching and chunking suite defaults to `apachepulsar/pulsar:4.2.4`, as declared and asserted in `e2e_batch_chunk.rs`. This was the latest published stable Pulsar 4.x image observed on 2026-09-29; `4.2.3` was the previous default.
-Set `MAGNETAR_PULSAR_IMAGE_TAG` to an explicit tag for compatibility runs; the issue #331 unchanged-code reproduction used `4.0.4`. This version change does not establish compatibility on untested tags.
+The batching and chunking suite ([`e2e_batch_chunk.rs`](../crates/magnetar/tests/e2e_batch_chunk.rs)) runs on the default broker of the shared fixture below.
 Its flow-control regression creates twelve direct Failover child-topic consumers with receiver queues of 2,000, sends five-chunk messages to one partition and small messages to the other eleven, and requires every partition to drain without reaching zero broker permits below the logical-message refill threshold.
 This topology is the end-to-end verification contract for [ADR-0076](../specs/adr/0076-conserve-flow-permits-across-chunk-reassembly.md).
 
+### The shared Pulsar fixture
+
+Every suite that needs a broker gets it from one place, [`crates/magnetar/tests/common/pulsar.rs`](../crates/magnetar/tests/common/pulsar.rs) ([ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)).
+It owns the image repository and tag, the JVM budget, the container command, the published ports (the embedded `ZooKeeper` port only for `.zookeeper_metadata()`), the readiness wait and a check that the broker is the version the tag names.
+A suite states only what is specific to it: `PULSAR_PREFIX_*` broker configuration (`.config`), a pre-start shell step (`.pre_start`), a standalone flag (`.flag`), a bearer token for a broker that enforces authentication on its admin REST (`.admin_token`).
+
+A suite selects a `Broker`, never a tag:
+
+| `Broker`           | Tag constant   | Override                             |
+| ------------------ | -------------- | ------------------------------------ |
+| `Broker::Default`  | `DEFAULT_TAG`  | `MAGNETAR_PULSAR_IMAGE_TAG`          |
+| `Broker::V4Lts`    | `V4_LTS_TAG`   | none — pinned                        |
+| `Broker::Scalable` | `SCALABLE_TAG` | `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG` |
+
+`MAGNETAR_PULSAR_IMAGE_REPO` replaces the repository for all three.
+`DEFAULT_TAG` is the broker baseline the whole suite runs on (`4.2.4`, [ADR-0109](../specs/adr/0109-pin-the-e2e-broker-image-tag.md)).
+`MAGNETAR_PULSAR_IMAGE_TAG` is how a compatibility run points every `Broker::Default` suite at another tag; the issue #331 unchanged-code reproduction used `4.0.4`, and a run on `5.0.0` is `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0 cargo test -p magnetar-driver --test e2e_pulsar`.
+This version change does not establish compatibility on untested tags.
+A suite that needs a 4.x or a 5.x broker whatever the default is (`e2e_consumer_drop.rs`, `e2e_reconnect_safety.rs` and the negotiated-refusal test of `e2e_scalable_topic.rs` on `Broker::V4Lts`; the PIP-460 tests of `e2e_scalable_topic.rs` on `Broker::Scalable`) pins its `Broker`, so moving the default can neither skip it nor run it on the wrong broker.
+
+Changing a broker version is a constants-only change: edit the tag constants of `common/pulsar.rs`, the matching `docker pull apachepulsar/pulsar:<tag>` lines of the e2e job in [`ci.yml`](../.github/workflows/ci.yml), `FIXTURE_TAGS` in [`scripts/performance_campaign.py`](../scripts/performance_campaign.py) and the six `image:` pins of the PIP-33 compose fixture.
+`cargo run -p xtask -- check-e2e-fixture` fails until all four agree.
+
+Readiness never matches a log line.
+`Created namespace public/default` is printed by 4.0.14, 4.2.4 and 4.2.5 but not by 5.0.0, which logs the structured `PulsarWebResource - Created namespace {clientAppId=null, namespace=public/default}`, and with the functions worker enabled the first `Created namespace` line is the one for `public/functions`.
+`/admin/v2/brokers/ready` answers 200 before `public/default` exists.
+The fixture therefore starts the container with no log wait and polls `GET /admin/v2/namespaces/public/default` from the host until it answers 200, under a four-minute deadline; if the container exits first, the failure quotes its logs.
+It then asserts that `GET /admin/v2/brokers/version` reports the `MAJOR.MINOR` series of the requested tag (retried under the same deadline; only a version that answers and disagrees fails at once), and skips that assertion, with a notice on stderr, only for a tag without a leading `MAJOR.MINOR` (`latest`).
+
+`PULSAR_PREFIX_<key>` variables reach `conf/standalone.conf` only through `bin/apply-config-from-env.py`; plain `bin/pulsar standalone` ignores them.
+The fixture exports every `.config` pair inside the container's start script and runs that helper before it `exec`s the broker, so a key a suite sets is applied rather than silently dropped.
+The helper edits the broker's `standalone.conf`, not the `client.conf` the in-container `pulsar-admin` reads, so a suite that enables authentication passes the token to `pulsar-admin` itself (`--auth-plugin`, `--auth-params`).
+
+`pulsar_fixture_contract.rs` checks the fixture's selection, version and command logic without Docker, on every run.
+
 ### e2e container memory budget
 
-Every `pulsar standalone` container the suite starts is capped with `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g`, declared as the `PULSAR_MEM_LIMIT` const next to `image_repo()` / `image_tag()` in each `e2e_*.rs` file that starts one.
+Every `pulsar standalone` container the suite starts is capped with `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g`, declared once as `PULSAR_MEM_LIMIT` in the shared fixture [`common/pulsar.rs`](../crates/magnetar/tests/common/pulsar.rs), which is the only code that starts one.
 
 The image default is `-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g` ([`conf/pulsar_env.sh`](https://github.com/apache/pulsar/blob/master/conf/pulsar_env.sh)), which measures **~2.3 GiB RSS per idle standalone container** against **~0.95 GiB** at the capped budget.
 That difference is load-bearing on CI, not cosmetic: libtest runs up to `nproc` tests of a binary in parallel — 4 on a GitHub `ubuntu-26.04` runner — and the PIP-33 two-cluster compose fixture (zookeeper + 2 bookkeepers + 2 brokers, itself capped at 256m–1g) stays up for the whole job.
 At stock sizes four concurrent standalones alone reserve ~9 GiB of the runner's 16 GiB, and the resulting memory pressure stalls brokers long enough that client operations blow their 30s `operation_timeout` — surfacing as `open_producer: timed out: producer target resolution exceeded operation_timeout` (or an outright OOM-kill, as [`e2e_cluster_failover.rs`](../crates/magnetar/tests/e2e_cluster_failover.rs) documents) in whichever e2e test happens to be running.
 
 The cap is a broker-side resource budget, never a client-side timeout adjustment: no test loosens an assertion or widens a deadline to accommodate a slow broker.
-Raise `PULSAR_MEM_LIMIT` in a specific file if that suite genuinely needs more heap (compaction and deep-partition topologies are the likely candidates), and say why in the const's doc comment.
+Raise the budget for a specific suite with `Pulsar::memory(…)` at its call site if that suite genuinely needs more heap (compaction and deep-partition topologies are the likely candidates), and say why in a comment there.
 
 That rule is about brokers **stalled** by memory pressure — it does not cover a test that deliberately drives a full container restart and then has to wait out the JVM boot it just triggered.
 There the client default is measuring the wrong thing: `send_timeout` defaults to 30 s for Java parity ([ADR-0072](../specs/adr/0072-java-parity-default-send-timeout.md)), a statement about production publish latency, while the send-timeout budget of a publish relocated across a reconnect runs from the op's original `enqueued_at` and so must also cover `docker restart` → JVM boot → namespace load → `rebuild_producers` → `CommandSendReceipt`.
 `BROKER_RESTART_SEND_TIMEOUT` in [`e2e_reconnect.rs`](../crates/magnetar/tests/e2e_reconnect.rs) sizes that window from a measurement recorded in its doc comment.
 The distinction that keeps this honest: the assertion is unchanged (every `SendFut` must still resolve `Ok`), the deadline stays finite so the test still proves replay completes in bounded time, and the number is measured rather than inflated until green.
 
-`cargo run -p xtask -- check-e2e-container-memory` enforces this, in the local validation chain and as a per-PR CI job.
-It walks every `GenericImage::new(…)` chain under `crates/magnetar/tests/`, resolves the image repository the first constructor argument denotes — a string literal, a `&str` const, or a zero-argument accessor returning one — and requires every `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)` before `.start()`.
-The gate checks that the call is present, not what budget it sets; this section governs the value.
+`cargo run -p xtask -- check-e2e-fixture` enforces this, in the local validation chain and as a per-PR CI job ([ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)).
+It walks every `GenericImage::new(…)` chain under `crates/magnetar/tests/`, resolves the image repository the first constructor argument denotes — a string literal, a `&str` const, or a zero-argument accessor returning one — and applies three rules:
+
+1. A chain whose repository is `apachepulsar/…`, and any `apachepulsar/pulsar:` reference at all — code, string or comment — is allowed only under `crates/magnetar/tests/common/`.
+   A suite that wants a broker uses `common::pulsar::Pulsar`; prose that needs a version says "the shared fixture's default image".
+2. Every Pulsar chain there carries `.with_env_var("PULSAR_MEM", …)` before `.start()` on the same expression chain.
+   The gate checks that the call is present, not what budget it sets; this section governs the value.
+3. The tag constants (`*_TAG`) of `common/pulsar.rs` equal the set of `docker pull apachepulsar/pulsar:<tag>` lines under `.github/workflows/`, are a subset of `FIXTURE_TAGS` in `scripts/performance_campaign.py`, and every `image: apachepulsar/pulsar:<tag>` of the PIP-33 compose fixture equals `DEFAULT_TAG`.
+   The gate reads `.github/` and `scripts/` explicitly, because its Rust walk skips both, and it fails closed: a line of a workflow, of the compose fixture or of `performance_campaign.py` that names `apachepulsar/pulsar` in any other spelling (a registry prefix, quotes, `docker image pull`, a `${VAR:-…}` default) is itself a violation.
+
 Containers running something other than the Pulsar JVM are out of scope by resolution rather than by exemption list: [`e2e_sasl_kerberos.rs`](../crates/magnetar/tests/e2e_sasl_kerberos.rs) starts a Kerberos KDC and [`e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs) an Athenz ZTS server.
 The KDC fixture uses `gcavalcante8808/krb5-server:alpine_3.19.0`, the newest published KDC image (the same digest as `latest`); the ZTS fixture uses the newest published `athenz/athenz-zts-server:1.12.47` image. CI pre-pulls both without suppressing pull failures before the e2e shards.
 A chain whose image cannot be resolved, or that stashes the builder instead of reaching `.start()` in the same chain, fails the gate rather than passing unverified — an unverifiable chain is the hole this check exists to close.
+That is why the fixture builds its container command before the chain and keeps `PULSAR_MEM` and `.start()` on one `GenericImage` expression: `ImageExt` consumes the builder, so a variable number of environment variables cannot be added to the chain.
 
 Suites cover:
 
