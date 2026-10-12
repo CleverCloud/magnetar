@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PIP-460 scalable-topic and PIP-145 topic-list waiter lost-wakeup regression — tokio engine.
+//! Per-client waiter lost-wakeup regression (PIP-460 scalable-topic, PIP-145 topic-list and
+//! PIP-33 marker waiters) — tokio engine.
 //!
 //! `Client::scalable_topic_lookup`, `Client::scalable_topic_subscribe`,
 //! `Client::next_scalable_event` and `Client::next_topic_list_change` used to drain their buffer
@@ -38,8 +39,15 @@
 //! a waiter that is still late finds the event in its drain, so the test can
 //! pass spuriously against a regression but can never fail against the fix.
 //!
+//! The second family is the missing *close* wake. `next_topic_list_change` and
+//! `next_replicated_subscription_marker` document `None` once the connection closes, but a parked
+//! waiter only re-checks `is_closed()` when it is woken, and a dead connection pushes no further
+//! delta. Each close test therefore makes a hand poll that must return `Pending` (so the park is
+//! proven, not timed), hangs the broker up, and requires `None` within `HANG_GUARD`: it fails if
+//! the driver's end-of-stream path does not pulse that waiter's `Notify`.
+//!
 //! ADR-0024: this is the tokio integration twin; the moonpool twin is
-//! `scalable_and_topic_list_lost_wakeup.rs` (1:1, `check-runtime-test-parity`).
+//! `waiter_lost_wakeup.rs` (1:1, `check-runtime-test-parity`).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -401,6 +409,37 @@ async fn next_topic_list_change_returns_none_when_the_connection_dies() {
         assert!(
             change.is_none(),
             "a dead connection ends the wait with None: {change:?}"
+        );
+    }
+
+    close_client(client).await;
+}
+
+/// A `next_replicated_subscription_marker` parked on an open connection must
+/// resolve to `None` when the connection dies, for the same reason as
+/// `next_topic_list_change` above: the driver has to pulse
+/// `replicated_subscription_marker_notify` itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_replicated_subscription_marker_returns_none_when_the_connection_dies() {
+    let (client, hang_up) = connect_to_hangup_broker().await;
+
+    {
+        let mut next = std::pin::pin!(client.next_replicated_subscription_marker());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            next.as_mut().poll(&mut cx).is_pending(),
+            "an open connection with an empty buffer parks the waiter"
+        );
+
+        hang_up.notify_one();
+
+        let marker = tokio::time::timeout(HANG_GUARD, next).await.expect(
+            "next_replicated_subscription_marker woke when the connection died \
+             (a missing close pulse would hang here)",
+        );
+        assert!(
+            marker.is_none(),
+            "a dead connection ends the wait with None: {marker:?}"
         );
     }
 

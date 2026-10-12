@@ -112,6 +112,25 @@ fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
     shared.scalable_notify.notify_waiters();
 }
 
+/// Wake every accessor that parks on a per-client buffer's `Notify` and promises
+/// `None` or an error once the connection closes (`next_scalable_event`,
+/// `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_topic_list_change`,
+/// `next_replicated_subscription_marker`).
+///
+/// Such a waiter only re-checks `is_closed()` when it is woken, and a dead
+/// connection pushes no further event, so every path that marks the connection
+/// disconnected must call this or the waiter parks forever. Keeping the pulses
+/// in one place is what stops a new waiter's `Notify` from being left out of
+/// one of those paths.
+fn wake_close_waiters(shared: &ConnectionShared) {
+    #[cfg(feature = "scalable-topics")]
+    shared.scalable_notify.notify_waiters();
+    shared.topic_list_notify.notify_waiters();
+    shared
+        .replicated_subscription_marker_notify
+        .notify_waiters();
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (`Connected`, `SendReceipt`,
 /// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
@@ -1618,12 +1637,10 @@ where
                     Ok(n) => n,
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
-                        // Wake anything parked on a scalable or topic-list wait loop: those only
-                        // re-check `is_closed()` when an event arrives, so a dead connection
-                        // would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
-                        shared.topic_list_notify.notify_waiters();
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         return Err(err.into());
                     }
                 };
@@ -1635,12 +1652,10 @@ where
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();
-                        // Wake anything parked on a scalable or topic-list wait loop: those only
-                        // re-check `is_closed()` when an event arrives, so a dead connection
-                        // would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
-                        shared.topic_list_notify.notify_waiters();
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         debug_assert!(
                             !conn.is_connected(),
                             "mark_disconnected() must clear is_connected() (ADR-0038)"
@@ -1687,12 +1702,10 @@ where
                 let handle_result = shared.inner.lock().handle_bytes_owned(now, chunk);
                 if let Err(err) = handle_result {
                     shared.inner.lock().mark_disconnected();
-                    // Wake anything parked on a scalable or topic-list wait loop: those only
-                    // re-check `is_closed()` when an event arrives, so a dead connection
-                    // would park them forever.
-                    #[cfg(feature = "scalable-topics")]
-                    shared.scalable_notify.notify_waiters();
-                    shared.topic_list_notify.notify_waiters();
+                    // Wake anything parked on a per-client buffer: those only re-check
+                    // `is_closed()` when an event arrives, so a dead connection would park
+                    // them forever.
+                    wake_close_waiters(&shared);
                     return Err(err.into());
                 }
                 // Supervisor Stage 3: once the new session's handshake completes, replay every
@@ -1801,12 +1814,10 @@ where
                     }
                     Err(err) => {
                         shared.inner.lock().mark_disconnected();
-                        // Wake anything parked on a scalable or topic-list wait loop: those only
-                        // re-check `is_closed()` when an event arrives, so a dead connection
-                        // would park them forever.
-                        #[cfg(feature = "scalable-topics")]
-                        shared.scalable_notify.notify_waiters();
-                        shared.topic_list_notify.notify_waiters();
+                        // Wake anything parked on a per-client buffer: those only re-check
+                        // `is_closed()` when an event arrives, so a dead connection would park
+                        // them forever.
+                        wake_close_waiters(&shared);
                         return Err(err.into());
                     }
                 }

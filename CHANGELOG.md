@@ -14,9 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Each waiter now arms its `Notified` before the drain, the enroll-before-drain idiom `next_replicated_subscription_marker` already used, on both engines.
   The `scalable_client_equivalence` differential tests also bound every `connect`, lookup and subscribe await by `HANG_GUARD`, so a regression fails in 60 seconds instead of at the job timeout.
 
-- **A parked `next_topic_list_change` now returns `None` when the connection dies, as its documentation promises, instead of waiting forever.**
-  Both drivers woke parked scalable-topic waiters on each I/O-failure path (read error, end of stream, undecodable frame, write error) but never pulsed `topic_list_notify`, and a parked waiter only re-checks `is_closed()` when it is woken.
-  Each of those paths now pulses it as well, on both engines.
+- **A parked `next_topic_list_change` or `next_replicated_subscription_marker` now returns `None` when the connection dies, as its documentation promises, instead of waiting forever.**
+  Both drivers woke parked scalable-topic waiters on each I/O-failure path (read error, end of stream, undecodable frame, write error) but never pulsed `topic_list_notify` or `replicated_subscription_marker_notify`, and a parked waiter only re-checks `is_closed()` when it is woken.
+  Each of those paths now calls one `wake_close_waiters` helper that pulses all three per-client notifies, on both engines.
 
 - **The e2e suite pins `apachepulsar/pulsar:4.2.4` instead of tracking `latest`, which moved to Pulsar 5.0.0 on 2026-10-01 and no longer prints the start-up line the harness waits for ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)).**
   Every shard had been failing with `WaitContainer(StartupTimeout)` and the PIP-33 two-cluster compose fixture, which also ran `latest`, failed to come up; `MAGNETAR_PULSAR_IMAGE_TAG` still overrides the tag for the suites.
