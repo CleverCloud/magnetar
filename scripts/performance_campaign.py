@@ -45,13 +45,27 @@ GAPS = ["doctest performance (functional compilation/execution only)", "effectiv
         "explicit feature/fault isolated scenarios", "quiescent RSS/retention after drain",
         "all Rust allocations (glibc dynamic malloc-family only)", "inlined/kernel/DMA copy bytes",
         "client-only attribution of whole-lifecycle instrumented totals"]
-FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apachepulsar/pulsar:4.0.13", "apachepulsar/pulsar:4.2.3",
-                "apachepulsar/pulsar:4.2.4", "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest",
-                "athenz/athenz-zts-server:1.12.41")
+# Images the nightly pre-pulls and freezes. Every tag constant of the shared fixture and every
+# Pulsar version CI runs the e2e suite on must be here, and `check-e2e-fixture` enforces it.
+# 4.2.4, 4.0.13 and 5.0.0-M1 are a one-cycle grace and not constants (ADR-0116 decision 7): the
+# nightly measures the head of the last successful scheduled run as its base, so the first nightly
+# after ADR-0116 uses a154636, which predates the shared fixture and boots its own per-file pins:
+# 4.2.4 (59 suites), 4.0.13 (e2e_consumer_drop, e2e_reconnect_safety, the v4 test of
+# e2e_scalable_topic) and 5.0.0-M1 (the PIP-460 tests; the shared fixture's SCALABLE_TAG moved to
+# 5.0.0 GA once the vendored protocol did). Computed with
+#   git grep -h -oE 'apachepulsar/pulsar:[^"]+|DEFAULT_IMAGE_TAG: &str = "[^"]+"|PULSAR_TAG[^=]*= "[^"]+"|_IMAGE_TAG: &str = "[^"]+"' a154636 -- crates/magnetar/tests scripts
+# The earlier entries `latest`, 4.0.4 and 4.2.3 appeared there only in this tuple and in prose,
+# so they are gone. Removal condition: after the first green nightly whose base includes
+# ADR-0116, delete the 4.2.4, 4.0.13 and 5.0.0-M1 entries (and the V4Lts rename waits for the
+# same point).
+FIXTURE_TAGS = ("apachepulsar/pulsar:4.0.13", "apachepulsar/pulsar:4.0.14", "apachepulsar/pulsar:4.2.4",
+                "apachepulsar/pulsar:4.2.5", "apachepulsar/pulsar:5.0.0", "apachepulsar/pulsar:5.0.0-M1",
+                "gcavalcante8808/krb5-server:latest", "athenz/athenz-zts-server:1.12.41")
 SEED_REGISTRY = "crates/magnetar-runtime-moonpool/seeds/known-failing.toml"
 EXAMPLE_SOURCE = "crates/magnetar/examples/performance.rs"
+FIXTURE_SOURCE = "crates/magnetar/tests/common/pulsar.rs"
 BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs", "crates/magnetar/tests/e2e_pulsar_proxy.rs",
-                            "crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
+                            "crates/magnetar/tests/common/mod.rs", FIXTURE_SOURCE)
 PROXY_GATEWAY = "MAGNETAR_E2E_DOCKER_HOST_GATEWAY"
 PIP33_BINDINGS = ("MAGNETAR_PIP33_CLUSTER_A_URL", "MAGNETAR_PIP33_CLUSTER_B_URL", "MAGNETAR_PIP33_ADMIN_B_URL")
 
@@ -1210,6 +1224,19 @@ def free_ports(count):
             handle.close()
 
 
+def default_broker_image(checkout):
+    """The image `Broker::Default` boots, read from the one place a tag is declared (ADR-0115, ADR-0116)."""
+    path = Path(checkout) / FIXTURE_SOURCE
+    text = path.read_text()
+    found = []
+    for name in ("IMAGE_REPO", "DEFAULT_TAG"):
+        match = re.search(r'const ' + name + r': &str = "([^"]+)";', text)
+        if match is None:
+            raise ValueError(f"{path} declares no `const {name}: &str = \"…\";`, so the default Pulsar broker image cannot be derived")
+        found.append(match.group(1))
+    return found[0] + ":" + found[1]
+
+
 def start_pip33(candidate, images, output, prefix):
     source = candidate / "crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml"
     original = json.loads(perf.read_command(["docker", "compose", "-f", str(source), "config", "--format", "json"], output))
@@ -1223,7 +1250,7 @@ def start_pip33(candidate, images, output, prefix):
     finally:
         for handle in handles:
             handle.close()
-    image = images["apachepulsar/pulsar:4.2.4"]
+    image = images[default_broker_image(candidate)]
     config = private_pip33_config(original, image["reference"], prefix, ports)
     compose = output / "private-pip33.json"; save(compose, config)
     perf.run(["docker", "compose", "-f", str(compose), "up", "-d", "--wait", "--wait-timeout", "180"],
@@ -1372,7 +1399,8 @@ def ci_worker(args):
                 save(output / "proxy-network.json", proxy_network)
                 bindings[PROXY_GATEWAY] = proxy_network["gateway"]
         if args.kind == "scenarios":
-            image = images["apachepulsar/pulsar:4.2.4"]
+            default_image = default_broker_image(candidate)
+            image = images[default_image]
             container_id = perf.read_command(["docker", "create", "--name", prefix, "--label", "magnetar.performance.fixture=" + prefix,
                 "--memory", "2g", "--cpus", "2", "--pids-limit", "512", "-p", "127.0.0.1::6650", "-p", "127.0.0.1::8080",
                 "-e", "JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2", "-e", "PULSAR_MEM=-Xms256m -Xmx512m -XX:MaxDirectMemorySize=512m",
@@ -1392,7 +1420,7 @@ def ci_worker(args):
                        "--build-cache", str(args.build_cache), "--repetitions", "2", "--cpu-count", str(args.cpu_count)]
             if runtime:
                 contract = payload["scenario_contract"]
-                command.extend(["--broker-container", owned[0], "--broker-image-id", images["apachepulsar/pulsar:4.2.4"]["image_id"],
+                command.extend(["--broker-container", owned[0], "--broker-image-id", images[default_image]["image_id"],
                                 "--fixture-label", "magnetar.performance.fixture=" + prefix, "--service-url", service_url,
                                 "--runtime", runtime, "--scenario", scenario, "--messages", str(contract["messages"]), "--payload-bytes", str(contract["payload_bytes"])])
             else:

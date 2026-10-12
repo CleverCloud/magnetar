@@ -319,11 +319,12 @@ where
     }
 }
 
-/// Start the Pulsar 4.0 LTS broker (`Broker::V4Lts`) this suite is pinned to, with
-/// batch-index acknowledgement on, and return (`host:port`, `container_handle`).
+/// Start the matrix broker (`Broker::Default`, so this suite runs on every Pulsar axis CI
+/// exercises, ADR-0116) with batch-index acknowledgement on, and return (`host:port`,
+/// `container_handle`).
 async fn start_pulsar()
 -> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
-    let broker = Pulsar::new(Broker::V4Lts)
+    let broker = Pulsar::new(Broker::Default)
         .config("acknowledgmentAtBatchIndexLevelEnabled", "true")
         .start()
         .await?;

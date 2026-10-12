@@ -10,8 +10,8 @@
 mod common;
 
 use common::pulsar::{
-    Broker, DEFAULT_TAG, DEFAULT_TAG_ENV, Pulsar, SCALABLE_TAG, SCALABLE_TAG_ENV, V4_LTS_TAG,
-    resolve_tag, shell_quote, version_series,
+    Broker, DEFAULT_TAG, DEFAULT_TAG_ENV, MIN_SUPPORTED_TAG, Pulsar, SCALABLE_TAG,
+    SCALABLE_TAG_ENV, V4_LTS_TAG, resolve_tag, shell_quote, version_series,
 };
 
 /// An environment with every override set to something recognisable.
@@ -38,9 +38,24 @@ fn the_default_and_scalable_overrides_apply_to_their_own_broker_only() {
 }
 
 #[test]
-fn the_lts_pin_ignores_every_override() {
+fn the_pre_5_pin_ignores_every_override() {
     assert_eq!(resolve_tag(Broker::V4Lts, overridden), V4_LTS_TAG);
     assert_eq!(Broker::V4Lts.override_var(), None);
+}
+
+#[test]
+fn the_pins_name_the_series_their_suites_need() {
+    // `Broker::V4Lts` backs the test that a pre-5.0 broker refuses scalable topics, and
+    // `Broker::Scalable` backs the PIP-460 tests: moving either to the wrong major would
+    // keep the suite green while testing nothing. It is a literal of its own so that a
+    // bump of `DEFAULT_TAG` to 5.x cannot drag the first one along (ADR-0116).
+    assert_eq!(version_series(V4_LTS_TAG).map(|(major, _)| major), Some(4));
+    assert_eq!(
+        version_series(SCALABLE_TAG).map(|(major, _)| major),
+        Some(5)
+    );
+    // The minimum supported broker is the 4.0 LTS line (ADR-0009, ADR-0116).
+    assert_eq!(version_series(MIN_SUPPORTED_TAG), Some((4, 0)));
 }
 
 #[test]
@@ -52,12 +67,12 @@ fn an_empty_override_is_treated_as_unset() {
 
 #[test]
 fn version_series_reads_major_and_minor_of_every_tag_and_broker_version() {
-    assert_eq!(version_series("4.2.4"), Some((4, 2)));
-    assert_eq!(version_series("4.0.13"), Some((4, 0)));
+    assert_eq!(version_series("4.2.5"), Some((4, 2)));
+    assert_eq!(version_series("4.0.14"), Some((4, 0)));
     assert_eq!(version_series("5.0.0"), Some((5, 0)));
     assert_eq!(version_series("5.0.0-M1"), Some((5, 0)));
     assert_eq!(version_series("5.0"), Some((5, 0)));
-    assert_eq!(version_series(" 4.2.4\n"), Some((4, 2)));
+    assert_eq!(version_series(" 4.2.5\n"), Some((4, 2)));
 }
 
 #[test]

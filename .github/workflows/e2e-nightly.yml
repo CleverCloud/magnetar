@@ -1,0 +1,52 @@
+name: e2e nightly (Pulsar 4.0 LTS)
+
+# The whole e2e suite on the Pulsar 4.0 LTS line, nightly and on demand
+# (ADR-0116). 4.0 is the minimum supported broker (ADR-0009) and an upstream LTS
+# line, but not what Clever Cloud runs and not what a pull request needs to be
+# judged against, so it gets a nightly run instead of a per-PR cell. It is the
+# same four shards as every pull-request axis: the job below calls the reusable
+# e2e-pulsar.yml of ci.yml, so there is one shard script.
+#
+# A red run here is a real regression on the minimum broker. It needs the same
+# treatment as a red pull-request cell: fix the cause, never add a
+# `continue-on-error` or a per-version #[ignore].
+#
+# `cargo run -p xtask -- check-e2e-fixture` reads the `pulsar:` value below and
+# fails when it is not pulled, not in FIXTURE_TAGS of the performance campaign,
+# or when the e2e-pulsar.yml wiring drops it.
+#
+# Security note: no `github.event.*` value is interpolated anywhere; the only
+# triggers are a static cron and a manual dispatch with no inputs.
+
+on:
+  schedule:
+    # 05:47 UTC daily, off the hour. The other scheduled workflows start at
+    # 01:17 (performance, hours long), 03:17 (moonpool seed sweep), Mondays
+    # 03:47 (PIP-33 weekly) and 04:17 (xtask gates); nothing else fires in
+    # between 04:17 and the morning, and this run is done well before the
+    # working day (four shards of about 10-16 minutes each plus the build).
+    - cron: '47 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A nightly still running when the next one fires makes it wait instead of
+# cancelling it; a manual dispatch queues behind a running nightly.
+concurrency:
+  group: e2e-nightly
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: e2e (Pulsar ${{ matrix.pulsar }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pulsar: "4.0.14"
+            pip33: false
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: ${{ matrix.pulsar }}
+      pip33: ${{ matrix.pip33 }}

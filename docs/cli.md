@@ -114,7 +114,7 @@ This is a best-effort heuristic — many deployments (incl. Clever Cloud behind 
 
 ```sh
 docker run --rm -p 6650:6650 -p 8080:8080 \
-  apachepulsar/pulsar:4.0.0 \
+  apachepulsar/pulsar:4.2.5 \
   bin/pulsar standalone
 
 magnetarctl admin tenants list

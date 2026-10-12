@@ -5,6 +5,12 @@
 - **Decider**: Florentin Dubois
 - **Tags**: testing, e2e, ci, docker, xtask
 
+> **Amendment (2026-10-12, [ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).** The tag values of decision 2 change: `DEFAULT_TAG` is `4.2.5` and `V4_LTS_TAG` is `4.2.5` (a literal of its own, the newest 4.x release; the identifiers keep their `V4Lts` spelling until a follow-up renames them), `SCALABLE_TAG` was `5.0.0-M1` and is `5.0.0` (Pulsar 5.0.0 GA) once the vendored protocol moved to the GA release.
+> `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs` now use `Broker::Default`, so `MAGNETAR_PULSAR_IMAGE_TAG` redirects them again; the behaviour change noted under decision 2 is reversed.
+> Decision 6's rule 3 is extended: the pre-pull set is the tag constants plus the `pulsar:` axis of the e2e jobs, `FIXTURE_TAGS` must contain both, and `DEFAULT_TAG` must be an axis value of `ci.yml`.
+> The closing paragraph's "running a 4.0.14 plus 5.0.0 matrix" is what ADR-0116 does.
+> The rest of this ADR is unchanged.
+
 ## Context
 
 Sixty-two `crates/magnetar/tests/e2e_*.rs` files each carried their own copy of the Pulsar fixture: the `DEFAULT_IMAGE_REPO` / `DEFAULT_IMAGE_TAG` constants, `image_repo()` / `image_tag()`, the `PULSAR_MEM_LIMIT` constant, a `start_pulsar()` builder chain and a `WaitFor::message_on_stdout("Created namespace public/default")` wait.

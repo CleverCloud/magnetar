@@ -107,35 +107,12 @@ jobs:
       - run: cargo build --workspace --all-features --locked
 
   test:
-    name: test (${{ matrix.name }})
-    # ADR-0098 replaces the aggregate job with one non-e2e cell and four e2e
-    # cells. ADR-0046 still governs semantics: no e2e feature gate or #[ignore].
+    name: test (non-e2e)
+    # ADR-0098 splits the former aggregate job into one non-e2e cell (this job)
+    # and four e2e cells per Pulsar broker version (the `e2e` job below).
+    # ADR-0046 still governs semantics: no e2e feature gate or #[ignore].
     runs-on: ubuntu-26.04
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: non-e2e
-            suite: non-e2e
-            shard: -1
-            pip33: false
-          - name: e2e 1/4
-            suite: e2e
-            shard: 0
-            pip33: false
-          - name: e2e 2/4
-            suite: e2e
-            shard: 1
-            pip33: false
-          - name: e2e 3/4
-            suite: e2e
-            shard: 2
-            pip33: false
-          - name: e2e 4/4 + PIP-33
-            suite: e2e
-            shard: 3
-            pip33: true
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
@@ -152,66 +129,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
-      - name: Pre-pull Pulsar broker images
-        if: ${{ matrix.suite == 'e2e' }}
-        run: |
-          # One line per tag constant of crates/magnetar/tests/common/pulsar.rs
-          # (DEFAULT_TAG, V4_LTS_TAG, SCALABLE_TAG); `check-e2e-fixture` keeps
-          # the two lists equal (ADR-0115). 4.2.4 is the e2e default (ADR-0109):
-          # `latest` moved to Pulsar 5.0.0 on 2026-10-01.
-          docker pull apachepulsar/pulsar:4.2.4
-          docker pull apachepulsar/pulsar:5.0.0-M1
-          docker pull apachepulsar/pulsar:4.0.13
-      - name: Pre-pull KDC image (for the SASL Kerberos e2e)
-        if: ${{ matrix.suite == 'e2e' }}
-        run: docker pull gcavalcante8808/krb5-server:alpine_3.19.0
-      - name: Pre-pull Athenz ZTS image
-        if: ${{ matrix.suite == 'e2e' }}
-        run: docker pull athenz/athenz-zts-server:1.12.47
-      - name: Bring up two-cluster Pulsar fixture (PIP-33)
-        if: ${{ matrix.pip33 }}
-        working-directory: crates/magnetar/tests/fixtures
-        run: |
-          set -euo pipefail
-          docker compose -f docker-compose.replicated-subs.yml up -d
-          for url in http://localhost:18080/admin/v2/brokers/health \
-                     http://localhost:18081/admin/v2/brokers/health; do
-            attempts=60
-            until curl -sf "$url" >/dev/null; do
-              attempts=$((attempts - 1))
-              if [ "$attempts" -le 0 ]; then
-                echo "broker @ $url did not become healthy in time"
-                docker compose -f docker-compose.replicated-subs.yml ps
-                docker compose -f docker-compose.replicated-subs.yml logs --tail=200
-                exit 1
-              fi
-              sleep 2
-            done
-          done
-      - name: Assert pulsar-init registered both clusters (regression guard, issue #389)
-        if: ${{ matrix.pip33 }}
-        run: |
-          set -euo pipefail
-          for url in http://localhost:18080 http://localhost:18081; do
-            attempts=30
-            until clusters=$(curl -sf "$url/admin/v2/clusters") \
-              && grep -q '"cluster-a"' <<<"$clusters" \
-              && grep -q '"cluster-b"' <<<"$clusters"; do
-              attempts=$((attempts - 1))
-              if [ "$attempts" -le 0 ]; then
-                echo "pulsar-init did not register both clusters at $url: ${clusters:-<no response>}"
-                exit 1
-              fi
-              sleep 2
-            done
-            echo "$url -> $clusters"
-          done
-      - name: Configure peer clusters + replicated subscription status
-        if: ${{ matrix.pip33 }}
-        working-directory: crates/magnetar/tests/fixtures
-        run: ./configure_replicated_subs.sh
       - name: Run non-e2e tests
-        if: ${{ matrix.suite == 'non-e2e' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -227,53 +145,30 @@ jobs:
             esac
             cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
           done
-      - name: Run e2e shard
-        if: ${{ matrix.suite == 'e2e' }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          shard=${{ matrix.shard }}
-          regular_index=0
-          selected=0
-          paths=(crates/magnetar/tests/e2e_*.rs)
-          if [ "${#paths[@]}" -eq 0 ]; then
-            echo "no e2e test targets found"
-            exit 1
-          fi
-          mapfile -t paths < <(printf '%s\n' "${paths[@]}" | sort)
-          for path in "${paths[@]}"; do
-            target="${path##*/}"
-            target="${target%.rs}"
-            if [ "$target" = e2e_replicated_subscriptions ]; then
-              assigned=3
-            else
-              assigned=$((regular_index % 4))
-              regular_index=$((regular_index + 1))
-            fi
-            if [ "$assigned" -ne "$shard" ]; then
-              continue
-            fi
-            selected=$((selected + 1))
-            echo "::group::$target"
-            if [ "$target" = e2e_scalable_topic ]; then
-              cargo build -p magnetarctl --all-features --locked
-            fi
-            cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
-            echo "::endgroup::"
-          done
-          if [ "$selected" -eq 0 ]; then
-            echo "e2e shard $shard selected no test targets"
-            exit 1
-          fi
-          echo "e2e shard $shard ran $selected test targets"
-      - name: Dump two-cluster broker logs on failure
-        if: ${{ failure() && matrix.pip33 }}
-        working-directory: crates/magnetar/tests/fixtures
-        run: docker compose -f docker-compose.replicated-subs.yml logs --tail=500 || true
-      - name: Tear down two-cluster fixture
-        if: ${{ always() && matrix.pip33 }}
-        working-directory: crates/magnetar/tests/fixtures
-        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
+
+  e2e:
+    name: e2e (Pulsar ${{ matrix.pulsar }})
+    # The whole e2e suite once per Pulsar version (ADR-0116): `pulsar` is the
+    # tag every Broker::Default suite boots, handed to the reusable workflow as
+    # MAGNETAR_PULSAR_IMAGE_TAG. Cells render as `e2e (Pulsar 5.0.0) / e2e 3/4`.
+    # The default broker (DEFAULT_TAG of crates/magnetar/tests/common/pulsar.rs, the
+    # release Clever Cloud runs) is the one that also brings up the PIP-33
+    # two-cluster fixture, which is pinned to that same tag. 4.0.14 runs nightly in
+    # e2e-nightly.yml. No axis is allowed to fail: no `continue-on-error`, no
+    # per-version #[ignore].
+    # `cargo run -p xtask -- check-e2e-fixture` reads these `pulsar:` values.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pulsar: "4.2.5"
+            pip33: true
+          - pulsar: "5.0.0"
+            pip33: false
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: ${{ matrix.pulsar }}
+      pip33: ${{ matrix.pip33 }}
 
   seed-replay:
     # Per ADR-0047: replay every `status = "open"` seed listed in
@@ -427,10 +322,10 @@ jobs:
     # default costs ~2.3 GiB RSS per container; four uncapped standalones stall
     # brokers past `operation_timeout` and surface as a flaky timeout in
     # whichever unrelated test is running — docs/testing.md § "e2e container
-    # memory budget"), and that the fixture's tag constants equal the
-    # `docker pull apachepulsar/pulsar:<tag>` list of the e2e job above, sit in
-    # FIXTURE_TAGS of scripts/performance_campaign.py and match the PIP-33
-    # compose pin.
+    # memory budget"), and that the fixture's tag constants plus the `pulsar:`
+    # axis of the e2e jobs (ADR-0116) equal the `docker pull
+    # apachepulsar/pulsar:<tag>` list of e2e-pulsar.yml, sit in FIXTURE_TAGS of
+    # scripts/performance_campaign.py and match the PIP-33 compose pin.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -588,7 +483,8 @@ jobs:
   # on every PR / push.
 
   # ADR-0098 splits the former aggregate test job into one non-e2e cell and
-  # four e2e cells. The local canonical command remains one
+  # four e2e cells, and ADR-0116 runs those four once per Pulsar version
+  # (e2e-pulsar.yml). The local canonical command remains one
   # `cargo test --workspace --all-features` invocation per ADR-0046.
 
   mutants-smoke:

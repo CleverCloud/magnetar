@@ -1724,7 +1724,7 @@ High-level summary:
 - **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
 - **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no feature gate and no `#[ignore]` ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)); Docker is the runtime prerequisite.
-  Spins `apachepulsar/pulsar:4.0.4` via `testcontainers`.
+  Spins `apachepulsar/pulsar:4.2.5` via `testcontainers` (CI runs the whole suite on `4.2.5` and `5.0.0` per pull request and on `4.0.14` nightly, [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover.
 
 Run them with the regular workspace test command: `cargo test --workspace --all-features --locked` (requires Docker).

@@ -1234,6 +1234,24 @@ const COMPOSE_FIXTURE: &str = "crates/magnetar/tests/fixtures/docker-compose.rep
 /// The fixture source that declares the image tag constants.
 const E2E_FIXTURE_SOURCE: &str = "crates/magnetar/tests/common/pulsar.rs";
 
+/// The workflow that runs on every pull request. Its `pulsar:` axis must
+/// contain `DEFAULT_TAG` (ADR-0116).
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+/// The one expression a workflow may use in place of a pulled tag and as the
+/// value of [`PULSAR_TAG_ENV`]: the reusable e2e workflow's input, whose values
+/// are the `pulsar:` axis its callers declare (ADR-0116).
+const PULSAR_AXIS_EXPR: &str = "${{ inputs.pulsar }}";
+
+/// The constant of the shared fixture that names the minimum supported broker
+/// (ADR-0009). It is not pulled by name: a workflow other than [`CI_WORKFLOW`]
+/// must run it as an axis value.
+const MIN_SUPPORTED_CONSTANT: &str = "MIN_SUPPORTED_TAG";
+
+/// The environment variable every `Broker::Default` suite honours, and the
+/// matrix hook CI sets from the axis.
+const PULSAR_TAG_ENV: &str = "MAGNETAR_PULSAR_IMAGE_TAG";
+
 /// The `testcontainers` constructor every e2e container is built from.
 const CONTAINER_CTOR: &str = "GenericImage::new";
 
@@ -1660,13 +1678,13 @@ struct PulsarRefs {
     /// One message per other reference. The tag rule fails closed on these: a
     /// spelling the gate cannot read would otherwise drop out of the
     /// comparison and let the lists drift unseen.
-    unrecognised: Vec<String>,
+    problems: Vec<String>,
 }
 
 impl PulsarRefs {
     fn extend(&mut self, other: Self) {
         self.tags.extend(other.tags);
-        self.unrecognised.extend(other.unrecognised);
+        self.problems.extend(other.problems);
     }
 }
 
@@ -1709,7 +1727,7 @@ fn pulsar_refs(
         if readable {
             refs.tags.extend(tags);
         } else {
-            refs.unrecognised.push(format!(
+            refs.problems.push(format!(
                 "{label}:{}: `{}` names `{PULSAR_REPO_MARK}` in a spelling the gate cannot read; \
                  write it as {expected}",
                 index + 1,
@@ -1725,22 +1743,221 @@ fn ends_shell_word(rest: &str) -> bool {
     rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')
 }
 
-/// Every `docker pull apachepulsar/pulsar:<tag>` of a workflow; any other
-/// reference — a registry prefix, quotes, `docker image pull`, a `${VAR:-…}`
-/// default — is [`PulsarRefs::unrecognised`].
-fn workflow_refs(label: &str, workflow: &str) -> PulsarRefs {
-    pulsar_refs(
+/// What one workflow says about the Pulsar versions it pulls and runs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkflowPulsar {
+    /// The literal `docker pull apachepulsar/pulsar:<tag>` tags, and one
+    /// message per spelling or wiring the gate cannot accept.
+    pulls: PulsarRefs,
+    /// How many pre-pulls name [`PULSAR_AXIS_EXPR`] instead of a tag.
+    axis_pulls: usize,
+    /// The `pulsar: "<tag>"` values: the broker versions the e2e jobs of this
+    /// workflow run the whole suite on.
+    axis: Vec<String>,
+}
+
+impl WorkflowPulsar {
+    fn extend(&mut self, other: Self) {
+        self.pulls.extend(other.pulls);
+        self.axis_pulls += other.axis_pulls;
+        self.axis.extend(other.axis);
+    }
+}
+
+/// An exact Pulsar version: `MAJOR.MINOR.PATCH` with an optional `-suffix`
+/// (`4.2.5`, `5.0.0-M1`). `latest`, `4.2` and a digest are not.
+fn is_exact_version(tag: &str) -> bool {
+    let core = tag.split_once('-').map_or(tag, |(core, _)| core);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+}
+
+/// The `pulsar: "<tag>"` axis a workflow declares, and one message per
+/// `pulsar` mention in another spelling. The one accepted shape is a
+/// block-mapping key at the start of a line (after an optional `- `) with a
+/// double-quoted exact version. The double quotes are required: an unquoted
+/// `5.1` or `4.10` is a YAML float, not a tag.
+///
+/// Accepted without becoming an axis value: the forwarding
+/// `${{ matrix.pulsar }}` of a caller's `with:`, and an empty value that opens
+/// a mapping (the reusable workflow's input declaration). Fails closed on
+/// everything else the strict reader would not consume: an empty value that
+/// opens a block list (`pulsar:` then `- "9.9.9"`), a flow mapping or flow list
+/// (`- {pulsar: "9.9.9", …}`, `[{"pulsar": …}]`, `pulsar: ["…"]`), a quoted key
+/// and a `pulsar:` that is not the line's first key. A comment is ignored, and
+/// so is an image reference such as `apachepulsar/pulsar:4.2.5`.
+fn workflow_axis(label: &str, workflow: &str) -> (Vec<String>, Vec<String>) {
+    let mut axis = Vec::new();
+    let mut problems = Vec::new();
+    let lines: Vec<&str> = workflow.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let entry = line.trim_start();
+        if entry.starts_with('#') {
+            continue;
+        }
+        let key_start = entry.strip_prefix("- ").map_or(entry, str::trim_start);
+        let mut unreadable = |why: &str| {
+            problems.push(format!(
+                "{label}:{}: `{}` {why}; declare the axis as `pulsar: \"<exact version>\"` in a \
+                 block-mapping `include:` entry",
+                index + 1,
+                line.trim()
+            ));
+        };
+        let Some(value) = key_start.strip_prefix("pulsar:") else {
+            if names_pulsar_key(entry) {
+                unreadable("mentions a `pulsar` key outside the one spelling the gate reads");
+            }
+            continue;
+        };
+        let value = value.split(" #").next().unwrap_or_default().trim();
+        if value == "${{ matrix.pulsar }}" {
+            continue;
+        }
+        if value.is_empty() {
+            // An empty value either opens a mapping (an input declaration) or, unreadably,
+            // a block list of versions.
+            let next = lines[index + 1..]
+                .iter()
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty() && !line.starts_with('#'));
+            if next.is_some_and(|next| next == "-" || next.starts_with("- ")) {
+                unreadable("opens a block list of `pulsar` versions");
+            }
+            continue;
+        }
+        match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            Some(tag) if is_exact_version(tag) => axis.push(tag.to_owned()),
+            _ => unreadable("declares a `pulsar:` axis value in a spelling the gate cannot read"),
+        }
+    }
+    (axis, problems)
+}
+
+/// Whether `entry` (a trimmed, non-comment line that does not start with the
+/// accepted `pulsar:` key) writes a `pulsar` key anyway: after `{`, `,` or `[`
+/// (flow collections), after a second key on the same line, or as a quoted
+/// key. An image reference (`apachepulsar/pulsar:4.2.5`) is not one.
+fn names_pulsar_key(entry: &str) -> bool {
+    if entry.contains("\"pulsar\":") || entry.contains("'pulsar':") {
+        return true;
+    }
+    entry.match_indices("pulsar:").any(|(at, _)| {
+        entry[..at].chars().next_back().is_some_and(|before| {
+            before.is_whitespace() || matches!(before, '{' | ',' | '[' | '"' | '\'')
+        })
+    })
+}
+
+/// How many lines set [`PULSAR_TAG_ENV`] to [`PULSAR_AXIS_EXPR`], and one
+/// message per other YAML assignment of it: a hard-coded value would run the
+/// suite on a broker the axis does not name.
+fn workflow_wiring(label: &str, workflow: &str) -> (usize, Vec<String>) {
+    let wired = format!("{PULSAR_TAG_ENV}: {PULSAR_AXIS_EXPR}");
+    let mut count = 0;
+    let mut problems = Vec::new();
+    for (index, line) in workflow.lines().enumerate() {
+        let entry = line.trim();
+        if entry.starts_with('#') || !entry.starts_with(&format!("{PULSAR_TAG_ENV}:")) {
+            continue;
+        }
+        if entry == wired {
+            count += 1;
+        } else {
+            problems.push(format!(
+                "{label}:{}: `{entry}` sets {PULSAR_TAG_ENV} in a spelling the gate cannot read; \
+                 write it as `{wired}`",
+                index + 1
+            ));
+        }
+    }
+    (count, problems)
+}
+
+/// Every `docker pull apachepulsar/pulsar:<tag>` of a workflow, plus the one
+/// expression spelling `docker pull apachepulsar/pulsar:${{ inputs.pulsar }}`
+/// that stands for the `pulsar:` axis; any other reference — a registry prefix,
+/// quotes, `docker image pull`, a `${VAR:-…}` default, another expression — is
+/// a problem. A workflow that pre-pulls the axis must also export it as
+/// [`PULSAR_TAG_ENV`], and the reverse: otherwise the cells would pre-pull one
+/// broker and test another.
+fn workflow_refs(label: &str, workflow: &str) -> WorkflowPulsar {
+    let mut pulls = pulsar_refs(
         label,
         workflow,
-        "`docker pull apachepulsar/pulsar:<tag>`",
+        "`docker pull apachepulsar/pulsar:<tag>` or `docker pull \
+         apachepulsar/pulsar:${{ inputs.pulsar }}`",
         |before, after| {
+            if !(before.ends_with(char::is_whitespace)
+                && before.trim_end().ends_with("docker pull"))
+            {
+                return None;
+            }
+            if let Some(rest) = after
+                .strip_prefix(':')
+                .and_then(|after| after.strip_prefix(PULSAR_AXIS_EXPR))
+            {
+                return ends_shell_word(rest).then(|| PULSAR_AXIS_EXPR.to_owned());
+            }
             let (tag, rest) = tag_prefix(after)?;
-            (before.ends_with(char::is_whitespace)
-                && before.trim_end().ends_with("docker pull")
-                && ends_shell_word(rest))
-            .then(|| tag.to_owned())
+            ends_shell_word(rest).then(|| tag.to_owned())
         },
-    )
+    );
+    let axis_pulls = pulls
+        .tags
+        .iter()
+        .filter(|tag| *tag == PULSAR_AXIS_EXPR)
+        .count();
+    pulls.tags.retain(|tag| tag != PULSAR_AXIS_EXPR);
+    let (axis, axis_problems) = workflow_axis(label, workflow);
+    let (wired, wiring_problems) = workflow_wiring(label, workflow);
+    pulls.problems.extend(axis_problems);
+    pulls.problems.extend(wiring_problems);
+    if axis_pulls > 0 && wired == 0 {
+        pulls.problems.push(format!(
+            "{label} pre-pulls `{PULSAR_TAG_ENV}`'s axis ({PULSAR_AXIS_EXPR}) but never sets \
+             `{PULSAR_TAG_ENV}: {PULSAR_AXIS_EXPR}`, so its cells would pull one broker and test \
+             another"
+        ));
+    }
+    if wired > 0 && axis_pulls == 0 {
+        pulls.problems.push(format!(
+            "{label} sets `{PULSAR_TAG_ENV}: {PULSAR_AXIS_EXPR}` but never pre-pulls \
+             `docker pull {PULSAR_TAGGED_IMAGE}{PULSAR_AXIS_EXPR}`, so its cells pull the broker \
+             they test only at test time"
+        ));
+    }
+    WorkflowPulsar {
+        pulls,
+        axis_pulls,
+        axis,
+    }
+}
+
+/// Fold the e2e-relevant workflows (`(label, text)` pairs) into one view, and
+/// return two axes separately: the versions [`CI_WORKFLOW`] runs the whole
+/// suite on for every pull request, and the versions every other workflow
+/// (the nightly) runs it on.
+fn collect_workflows(workflows: &[(String, String)]) -> (WorkflowPulsar, Vec<String>, Vec<String>) {
+    let mut all = WorkflowPulsar::default();
+    let mut per_pr_axis = Vec::new();
+    let mut other_axis = Vec::new();
+    for (label, text) in workflows {
+        let one = workflow_refs(label, text);
+        if label == CI_WORKFLOW {
+            per_pr_axis.clone_from(&one.axis);
+        } else {
+            other_axis.extend(one.axis.iter().cloned());
+        }
+        all.extend(one);
+    }
+    (all, per_pr_axis, other_axis)
 }
 
 /// Every `image: apachepulsar/pulsar:<tag>` of the PIP-33 compose fixture; any
@@ -1815,27 +2032,70 @@ fn campaign_fixture_tag_assignments(campaign: &str) -> usize {
         .count()
 }
 
-/// The cross-file tag rule: the fixture's tag constants equal the CI pre-pull
-/// set, are a subset of the campaign's `FIXTURE_TAGS`, and the compose
-/// fixture pins `DEFAULT_TAG`. Fails closed: a reference to the image in a
-/// spelling the readers do not accept is itself a violation. Returns one
-/// message per disagreement.
+/// What the performance campaign says about the Pulsar images it pre-pulls.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CampaignTags {
+    /// The tags of the `FIXTURE_TAGS` tuple, which the nightly pre-pulls.
+    fixture: Vec<String>,
+    /// Every Pulsar reference in the file, in the one spelling the gate reads.
+    refs: PulsarRefs,
+    /// How many lines assign `FIXTURE_TAGS`; the gate reads exactly one.
+    assignments: usize,
+}
+
+fn campaign_tags(label: &str, campaign: &str) -> CampaignTags {
+    CampaignTags {
+        fixture: campaign_fixture_tags(campaign),
+        refs: campaign_refs(label, campaign),
+        assignments: campaign_fixture_tag_assignments(campaign),
+    }
+}
+
+/// The cross-file tag rule (ADR-0115, ADR-0116). The broker versions CI runs
+/// are the fixture's tag constants and the `pulsar:` axis of the e2e jobs:
+///
+/// - every pin constant has its own `docker pull`, and the default broker is pulled by the axis
+///   cell that boots it;
+/// - every tag the workflows pull is a constant or an axis value;
+/// - every constant and axis value is pre-pulled by the performance campaign's `FIXTURE_TAGS`;
+/// - `DEFAULT_TAG` is an axis value of the workflow that runs on every pull request, so the default
+///   broker really runs the whole suite there;
+/// - `MIN_SUPPORTED_TAG`, the minimum supported broker, is an axis value of a workflow other than
+///   that one, so the nightly cannot be dropped or retargeted unnoticed (ADR-0009, ADR-0116);
+/// - the compose fixture pins `DEFAULT_TAG`.
+///
+/// Fails closed: a reference to the image in a spelling the readers do not
+/// accept is itself a violation. Returns one message per disagreement.
 fn fixture_tag_violations(
     constants: &[(String, String)],
-    pulled: &PulsarRefs,
-    campaign_fixture: &[String],
-    campaign: &PulsarRefs,
-    campaign_assignments: usize,
+    workflows: &WorkflowPulsar,
+    per_pr_axis: &[String],
+    other_axis: &[String],
+    campaign: &CampaignTags,
     compose: &PulsarRefs,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    out.extend(pulled.unrecognised.iter().cloned());
-    out.extend(campaign.unrecognised.iter().cloned());
-    out.extend(compose.unrecognised.iter().cloned());
-    if campaign_assignments != 1 {
+    out.extend(workflows.pulls.problems.iter().cloned());
+    out.extend(campaign.refs.problems.iter().cloned());
+    out.extend(compose.problems.iter().cloned());
+    if campaign.assignments != 1 {
         out.push(format!(
-            "scripts/performance_campaign.py assigns FIXTURE_TAGS {campaign_assignments} times; \
-             the gate reads exactly one tuple"
+            "scripts/performance_campaign.py assigns FIXTURE_TAGS {} times; \
+             the gate reads exactly one tuple",
+            campaign.assignments
+        ));
+    }
+    if workflows.axis_pulls > 0 && workflows.axis.is_empty() {
+        out.push(format!(
+            "a workflow pre-pulls `{PULSAR_TAGGED_IMAGE}{PULSAR_AXIS_EXPR}` but no workflow \
+             declares a `pulsar: \"<exact version>\"` axis, so nothing says which broker that is"
+        ));
+    }
+    if workflows.axis_pulls == 0 && !workflows.axis.is_empty() {
+        out.push(format!(
+            "workflows declare the `pulsar:` axis {:?} but none pre-pulls \
+             `docker pull {PULSAR_TAGGED_IMAGE}{PULSAR_AXIS_EXPR}`",
+            workflows.axis
         ));
     }
     if constants.is_empty() {
@@ -1847,28 +2107,53 @@ fn fixture_tag_violations(
         out.dedup();
         return out;
     }
+    let axis_pulled: &[String] = if workflows.axis_pulls > 0 {
+        &workflows.axis
+    } else {
+        &[]
+    };
+    out.extend(min_supported_violation(constants, other_axis));
     for (name, tag) in constants {
-        if !pulled.tags.contains(tag) {
+        // The minimum supported broker is a nightly axis value, never a pin. The
+        // default broker is booted, and so pre-pulled, as the axis cell that
+        // names it; every other constant is a pin that each cell may boot whatever
+        // its axis is, so it is pre-pulled by name.
+        if name == MIN_SUPPORTED_CONSTANT {
+            continue;
+        }
+        let pulled = workflows.pulls.tags.contains(tag)
+            || (name == "DEFAULT_TAG" && axis_pulled.contains(tag));
+        if !pulled {
             out.push(format!(
                 "{name} = {tag} has no `docker pull {PULSAR_TAGGED_IMAGE}{tag}` in .github/workflows/"
             ));
         }
-        if !campaign_fixture.contains(tag) {
+    }
+    for tag in &workflows.pulls.tags {
+        if !constants.iter().any(|(_, value)| value == tag) && !workflows.axis.contains(tag) {
+            out.push(format!(
+                "`docker pull {PULSAR_TAGGED_IMAGE}{tag}` in .github/workflows/ matches no tag \
+                 constant of {E2E_FIXTURE_SOURCE} and no `pulsar:` axis value"
+            ));
+        }
+    }
+    for (name, tag) in constants {
+        if !campaign.fixture.contains(tag) {
             out.push(format!(
                 "{name} = {tag} is missing from FIXTURE_TAGS in scripts/performance_campaign.py"
             ));
         }
     }
-    for tag in &pulled.tags {
-        if !constants.iter().any(|(_, value)| value == tag) {
+    for tag in &workflows.axis {
+        if !campaign.fixture.contains(tag) {
             out.push(format!(
-                "`docker pull {PULSAR_TAGGED_IMAGE}{tag}` in .github/workflows/ matches no tag \
-                 constant of {E2E_FIXTURE_SOURCE}"
+                "the `pulsar: \"{tag}\"` axis value is missing from FIXTURE_TAGS in \
+                 scripts/performance_campaign.py"
             ));
         }
     }
-    for tag in &campaign.tags {
-        if !campaign_fixture.contains(tag) {
+    for tag in &campaign.refs.tags {
+        if !campaign.fixture.contains(tag) {
             out.push(format!(
                 "scripts/performance_campaign.py names {PULSAR_TAGGED_IMAGE}{tag}, which \
                  FIXTURE_TAGS does not pre-pull"
@@ -1877,24 +2162,63 @@ fn fixture_tag_violations(
     }
     match constants.iter().find(|(name, _)| name == "DEFAULT_TAG") {
         None => out.push(format!("{E2E_FIXTURE_SOURCE} declares no DEFAULT_TAG")),
-        Some((_, default)) => {
-            if compose.tags.is_empty() {
-                out.push(
-                    "the PIP-33 compose fixture pins no `image: apachepulsar/pulsar:<tag>`"
-                        .to_owned(),
-                );
-            }
-            for tag in &compose.tags {
-                if tag != default {
-                    out.push(format!(
-                        "the PIP-33 compose fixture pins {tag} but DEFAULT_TAG is {default}"
-                    ));
-                }
-            }
-        }
+        Some((_, default)) => out.extend(default_tag_violations(default, per_pr_axis, compose)),
     }
     out.sort();
     out.dedup();
+    out
+}
+
+/// The minimum supported broker (ADR-0009) is declared once, as
+/// [`MIN_SUPPORTED_CONSTANT`], and a workflow other than [`CI_WORKFLOW`] must
+/// run the whole suite on exactly that version.
+fn min_supported_violation(
+    constants: &[(String, String)],
+    other_axis: &[String],
+) -> Option<String> {
+    let Some((_, min)) = constants
+        .iter()
+        .find(|(name, _)| name == MIN_SUPPORTED_CONSTANT)
+    else {
+        return Some(format!(
+            "{E2E_FIXTURE_SOURCE} declares no {MIN_SUPPORTED_CONSTANT}, so the minimum supported \
+             broker is encoded nowhere"
+        ));
+    };
+    (!other_axis.contains(min)).then(|| {
+        format!(
+            "{MIN_SUPPORTED_CONSTANT} = {min} is not a `pulsar:` axis value of any workflow other \
+             than {CI_WORKFLOW} ({other_axis:?}), so the minimum supported broker (ADR-0009) runs \
+             nowhere"
+        )
+    })
+}
+
+/// The two places `DEFAULT_TAG` must show up besides the fixture: the axis of
+/// the workflow that runs on every pull request, and every compose pin.
+fn default_tag_violations(
+    default: &str,
+    per_pr_axis: &[String],
+    compose: &PulsarRefs,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !per_pr_axis.iter().any(|tag| tag == default) {
+        out.push(format!(
+            "DEFAULT_TAG = {default} is not a `pulsar:` axis value of {CI_WORKFLOW} \
+             ({per_pr_axis:?}), so the default broker would not run the whole e2e suite \
+             on every pull request"
+        ));
+    }
+    if compose.tags.is_empty() {
+        out.push(
+            "the PIP-33 compose fixture pins no `image: apachepulsar/pulsar:<tag>`".to_owned(),
+        );
+    }
+    for tag in compose.tags.iter().filter(|tag| *tag != default) {
+        out.push(format!(
+            "the PIP-33 compose fixture pins {tag} but DEFAULT_TAG is {default}"
+        ));
+    }
     out
 }
 
@@ -1934,7 +2258,7 @@ fn check_e2e_fixture() -> Result<()> {
     let campaign = read_workspace_file(&workspace_root, "scripts/performance_campaign.py")?;
     let compose = read_workspace_file(&workspace_root, COMPOSE_FIXTURE)?;
     let workflows_dir = workspace_root.join(".github/workflows");
-    let mut pulled = PulsarRefs::default();
+    let mut workflows = Vec::new();
     for entry in fs::read_dir(&workflows_dir)
         .with_context(|| format!("reading {}", workflows_dir.display()))?
     {
@@ -1949,16 +2273,17 @@ fn check_e2e_fixture() -> Result<()> {
                     .and_then(|name| name.to_str())
                     .unwrap_or("?")
             );
-            pulled.extend(workflow_refs(&label, &fs::read_to_string(&path)?));
+            workflows.push((label, fs::read_to_string(&path)?));
         }
     }
+    let (workflow_pulsar, per_pr_axis, other_axis) = collect_workflows(&workflows);
     let constants = fixture_tag_constants(&fixture_source);
     let tag_violations = fixture_tag_violations(
         &constants,
-        &pulled,
-        &campaign_fixture_tags(&campaign),
-        &campaign_refs("scripts/performance_campaign.py", &campaign),
-        campaign_fixture_tag_assignments(&campaign),
+        &workflow_pulsar,
+        &per_pr_axis,
+        &other_axis,
+        &campaign_tags("scripts/performance_campaign.py", &campaign),
         &compose_refs(COMPOSE_FIXTURE, &compose),
     );
 
@@ -1974,9 +2299,9 @@ fn check_e2e_fixture() -> Result<()> {
             "e2e-fixture check failed: {} placement/memory offender(s), {} tag disagreement(s). \
              Pulsar containers are built only by the shared fixture under \
              crates/magnetar/tests/common/, which chains `.with_env_var(\"PULSAR_MEM\", …)` \
-             before `.start()`, and its tag constants must equal the CI pre-pull list, sit in \
-             FIXTURE_TAGS and match the PIP-33 compose pin — see ADR-0115 and docs/testing.md \
-             § \"e2e container memory budget\".",
+             before `.start()`, and its tag constants plus the e2e jobs' `pulsar:` axis must equal \
+             the CI pre-pull list, sit in FIXTURE_TAGS and match the PIP-33 compose pin — see \
+             ADR-0115, ADR-0116 and docs/testing.md § \"e2e container memory budget\".",
             offenders.len(),
             tag_violations.len()
         );
@@ -1985,9 +2310,12 @@ fn check_e2e_fixture() -> Result<()> {
     // this gate exists to make visible.
     eprintln!(
         "xtask check-e2e-fixture: {capped} Pulsar container chain(s) in the shared fixture carry \
-         PULSAR_MEM ({out_of_scope} non-Pulsar chain(s) out of scope); {} tag constant(s) agree \
-         with the CI pre-pulls, FIXTURE_TAGS and the PIP-33 compose fixture.",
-        constants.len()
+         PULSAR_MEM ({out_of_scope} non-Pulsar chain(s) out of scope); {} tag constant(s) and {} \
+         `pulsar:` axis value(s) ({} on every pull request) agree with the CI pre-pulls, \
+         FIXTURE_TAGS and the PIP-33 compose fixture.",
+        constants.len(),
+        workflow_pulsar.axis.len(),
+        per_pr_axis.len()
     );
     Ok(())
 }
@@ -4132,31 +4460,69 @@ async fn start() {
         );
     }
 
-    // ── check-e2e-fixture: tag agreement (ADR-0115 rule 3) ──────────
+    // ── check-e2e-fixture: tag agreement (ADR-0115 rule 3, ADR-0116) ─
 
     const FIXTURE_SRC: &str = r#"
 pub const IMAGE_REPO: &str = "apachepulsar/pulsar";
-pub const DEFAULT_TAG: &str = "4.2.4";
-pub const V4_LTS_TAG: &str = "4.0.13";
+pub const DEFAULT_TAG: &str = "4.2.5";
+pub const V4_LTS_TAG: &str = "4.2.5";
+pub const MIN_SUPPORTED_TAG: &str = "4.0.14";
 pub const SCALABLE_TAG: &str = "5.0.0-M1";
 pub const DEFAULT_TAG_ENV: &str = "MAGNETAR_PULSAR_IMAGE_TAG";
 "#;
 
-    const CI_SRC: &str = "\
+    /// The reusable e2e workflow: the axis placeholder, the two pins, the wiring.
+    const E2E_SRC: &str = "\
+    inputs:
+      pulsar:
+        type: string
+    steps:
       - name: Pre-pull Pulsar broker images
         run: |
           # docker pull apachepulsar/pulsar:latest (commented out, ignored)
-          docker pull apachepulsar/pulsar:4.2.4
+          docker pull apachepulsar/pulsar:${{ inputs.pulsar }}
+          docker pull apachepulsar/pulsar:4.2.5
           docker pull apachepulsar/pulsar:5.0.0-M1
-          docker pull apachepulsar/pulsar:4.0.13
           docker pull gcavalcante8808/krb5-server:alpine_3.19.0
+      - name: Run e2e shard
+        env:
+          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
+        run: echo \"on $MAGNETAR_PULSAR_IMAGE_TAG\"
+";
+
+    /// `ci.yml`: the per-pull-request axis.
+    const CI_SRC: &str = "\
+  e2e:
+    strategy:
+      matrix:
+        include:
+          - pulsar: \"4.2.5\"
+            pip33: true
+          - pulsar: \"5.0.0\"  # the new LTS
+            pip33: false
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: ${{ matrix.pulsar }}
+";
+
+    /// `e2e-nightly.yml`: the nightly axis.
+    const NIGHTLY_SRC: &str = "\
+  e2e:
+    strategy:
+      matrix:
+        include:
+          - pulsar: \"4.0.14\"
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: ${{ matrix.pulsar }}
 ";
 
     const CAMPAIGN_SRC: &str = r#"
-FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.13", "apachepulsar/pulsar:4.2.4",
-                "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest")
+FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.14", "apachepulsar/pulsar:4.2.4",
+                "apachepulsar/pulsar:4.2.5", "apachepulsar/pulsar:5.0.0", "apachepulsar/pulsar:5.0.0-M1",
+                "gcavalcante8808/krb5-server:latest")
 SEED_REGISTRY = "x"
-image = images["apachepulsar/pulsar:4.2.4"]
+image = images["apachepulsar/pulsar:4.2.5"]
 "#;
 
     const COMPOSE_SRC: &str = "\
@@ -4164,20 +4530,61 @@ services:
   zookeeper:
     image: zookeeper:3.9
   broker-a:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
   broker-b:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
 ";
 
-    fn tag_violations(fixture: &str, ci: &str, campaign: &str, compose: &str) -> Vec<String> {
+    fn tag_violations_of(
+        fixture: &str,
+        workflows: &[(&str, &str)],
+        campaign: &str,
+        compose: &str,
+    ) -> Vec<String> {
+        let workflows: Vec<(String, String)> = workflows
+            .iter()
+            .map(|(label, text)| ((*label).to_owned(), (*text).to_owned()))
+            .collect();
+        let (all, per_pr_axis, other_axis) = collect_workflows(&workflows);
         fixture_tag_violations(
             &fixture_tag_constants(fixture),
-            &workflow_refs("ci.yml", ci),
-            &campaign_fixture_tags(campaign),
-            &campaign_refs("campaign.py", campaign),
-            campaign_fixture_tag_assignments(campaign),
+            &all,
+            &per_pr_axis,
+            &other_axis,
+            &campaign_tags("campaign.py", campaign),
             &compose_refs("compose.yml", compose),
         )
+    }
+
+    fn tag_violations(
+        fixture: &str,
+        e2e: &str,
+        ci: &str,
+        nightly: &str,
+        campaign: &str,
+        compose: &str,
+    ) -> Vec<String> {
+        tag_violations_of(
+            fixture,
+            &[
+                (".github/workflows/e2e-pulsar.yml", e2e),
+                (CI_WORKFLOW, ci),
+                (".github/workflows/e2e-nightly.yml", nightly),
+            ],
+            campaign,
+            compose,
+        )
+    }
+
+    /// The consistent tree with one source replaced.
+    fn violations_with(
+        e2e: &str,
+        ci: &str,
+        nightly: &str,
+        campaign: &str,
+        compose: &str,
+    ) -> Vec<String> {
+        tag_violations(FIXTURE_SRC, e2e, ci, nightly, campaign, compose)
     }
 
     #[test]
@@ -4185,8 +4592,9 @@ services:
         assert_eq!(
             fixture_tag_constants(FIXTURE_SRC),
             vec![
-                ("DEFAULT_TAG".to_owned(), "4.2.4".to_owned()),
-                ("V4_LTS_TAG".to_owned(), "4.0.13".to_owned()),
+                ("DEFAULT_TAG".to_owned(), "4.2.5".to_owned()),
+                ("V4_LTS_TAG".to_owned(), "4.2.5".to_owned()),
+                ("MIN_SUPPORTED_TAG".to_owned(), "4.0.14".to_owned()),
                 ("SCALABLE_TAG".to_owned(), "5.0.0-M1".to_owned()),
             ]
         );
@@ -4194,104 +4602,437 @@ services:
 
     #[test]
     fn fixture_tag_sources_are_parsed_without_their_neighbours() {
-        let pulled = workflow_refs("ci.yml", CI_SRC);
-        assert_eq!(pulled.tags, ["4.2.4", "5.0.0-M1", "4.0.13"]);
-        assert_eq!(pulled.unrecognised, Vec::<String>::new());
-        // A pull of another image, and a commented-out pull, are not Pulsar references.
+        let e2e = workflow_refs("e2e-pulsar.yml", E2E_SRC);
+        // A pull of another image, and a commented-out pull, are not Pulsar references;
+        // the axis placeholder is counted apart from the literal tags.
+        assert_eq!(e2e.pulls.tags, ["4.2.5", "5.0.0-M1"]);
+        assert_eq!(e2e.axis_pulls, 1);
+        assert_eq!(e2e.axis, Vec::<String>::new());
+        assert_eq!(e2e.pulls.problems, Vec::<String>::new());
+        // The caller's forwarding `pulsar: ${{ matrix.pulsar }}` is not an axis value, and a
+        // trailing comment on a quoted value is ignored.
+        let ci = workflow_refs(CI_WORKFLOW, CI_SRC);
+        assert_eq!(ci.axis, ["4.2.5", "5.0.0"]);
+        assert_eq!(ci.pulls, PulsarRefs::default());
+        assert_eq!(workflow_refs("nightly.yml", NIGHTLY_SRC).axis, ["4.0.14"]);
         assert_eq!(
             campaign_fixture_tags(CAMPAIGN_SRC),
-            ["latest", "4.0.13", "4.2.4", "5.0.0-M1"]
+            ["latest", "4.0.14", "4.2.4", "4.2.5", "5.0.0", "5.0.0-M1"]
         );
         let campaign = campaign_refs("campaign.py", CAMPAIGN_SRC);
         assert_eq!(
             campaign.tags,
-            ["latest", "4.0.13", "4.2.4", "5.0.0-M1", "4.2.4"]
+            [
+                "latest", "4.0.14", "4.2.4", "4.2.5", "5.0.0", "5.0.0-M1", "4.2.5"
+            ]
         );
-        assert_eq!(campaign.unrecognised, Vec::<String>::new());
+        assert_eq!(campaign.problems, Vec::<String>::new());
         assert_eq!(campaign_fixture_tag_assignments(CAMPAIGN_SRC), 1);
         let compose = compose_refs("compose.yml", COMPOSE_SRC);
-        assert_eq!(compose.tags, ["4.2.4", "4.2.4"]);
-        assert_eq!(compose.unrecognised, Vec::<String>::new());
+        assert_eq!(compose.tags, ["4.2.5", "4.2.5"]);
+        assert_eq!(compose.problems, Vec::<String>::new());
     }
 
     #[test]
     fn fixture_tags_accept_a_consistent_tree() {
         assert_eq!(
-            tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, COMPOSE_SRC),
+            violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC),
             Vec::<String>::new()
         );
     }
 
     #[test]
-    fn fixture_tags_reject_a_constant_with_no_ci_pre_pull() {
-        let ci = CI_SRC.replace("          docker pull apachepulsar/pulsar:4.0.13\n", "");
-        let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
+    fn fixture_tags_reject_a_pin_constant_with_no_literal_pre_pull() {
+        // 4.2.5 is also an axis value, but the 5.0.0 cell boots the pin without having
+        // pulled it: the pin needs its own line.
+        let e2e = E2E_SRC.replace("          docker pull apachepulsar/pulsar:4.2.5\n", "");
+        let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
-            violations[0].contains("V4_LTS_TAG = 4.0.13 has no `docker pull"),
+            violations[0].contains("V4_LTS_TAG = 4.2.5 has no `docker pull"),
+            "{violations:?}"
+        );
+        let e2e = E2E_SRC.replace("          docker pull apachepulsar/pulsar:5.0.0-M1\n", "");
+        let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("SCALABLE_TAG = 5.0.0-M1 has no `docker pull"),
             "{violations:?}"
         );
     }
 
     #[test]
-    fn fixture_tags_reject_a_ci_pre_pull_with_no_constant() {
-        let ci = format!("{CI_SRC}          docker pull apachepulsar/pulsar:4.0.14\n");
-        let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
+    fn fixture_tags_reject_a_literal_pre_pull_that_is_neither_constant_nor_axis() {
+        // The retired 4.0.13 and 4.2.4 must not linger as pulls.
+        for stray in ["4.0.13", "4.2.4"] {
+            let e2e = format!("{E2E_SRC}          docker pull apachepulsar/pulsar:{stray}\n");
+            let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+            assert_eq!(violations.len(), 1, "{stray}: {violations:?}");
+            assert!(
+                violations[0].contains(&format!(
+                    "pulsar:{stray}` in .github/workflows/ matches no tag constant"
+                )),
+                "{violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_accept_a_nightly_axis_that_is_no_constant() {
+        // 4.0.14 is MIN_SUPPORTED_TAG and 4.0.15 is no constant at all: both are pulled
+        // through the placeholder, which is the whole point of the axis, and the second one
+        // must still be in FIXTURE_TAGS.
+        let two = NIGHTLY_SRC.replace(
+            "          - pulsar: \"4.0.14\"\n",
+            "          - pulsar: \"4.0.14\"\n          - pulsar: \"4.0.15\"\n",
+        );
+        let violations = violations_with(E2E_SRC, CI_SRC, &two, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(
+            violations,
+            [
+                "the `pulsar: \"4.0.15\"` axis value is missing from FIXTURE_TAGS in scripts/performance_campaign.py"
+            ]
+        );
+        let campaign = CAMPAIGN_SRC.replace(
+            "\"apachepulsar/pulsar:4.0.14\",",
+            "\"apachepulsar/pulsar:4.0.14\", \"apachepulsar/pulsar:4.0.15\",",
+        );
+        let violations = violations_with(E2E_SRC, CI_SRC, &two, &campaign, COMPOSE_SRC);
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_minimum_supported_broker_that_no_other_workflow_runs() {
+        // The nightly deleted outright: nothing runs the 4.0 LTS (ADR-0009) anywhere.
+        let violations = violations_with(E2E_SRC, CI_SRC, "jobs: {}\n", CAMPAIGN_SRC, COMPOSE_SRC);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
-            violations[0].contains("pulsar:4.0.14` in .github/workflows/ matches no tag constant"),
+            violations[0].starts_with(
+                "MIN_SUPPORTED_TAG = 4.0.14 is not a `pulsar:` axis value of any workflow other than .github/workflows/ci.yml"
+            ),
             "{violations:?}"
         );
+        // The nightly retargeted to another version.
+        let campaign = CAMPAIGN_SRC.replace(
+            "\"apachepulsar/pulsar:4.0.14\",",
+            "\"apachepulsar/pulsar:4.0.14\", \"apachepulsar/pulsar:4.0.15\",",
+        );
+        let moved = NIGHTLY_SRC.replace("4.0.14", "4.0.15");
+        let violations = violations_with(E2E_SRC, CI_SRC, &moved, &campaign, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("MIN_SUPPORTED_TAG = 4.0.14 is not a `pulsar:` axis value"),
+            "{violations:?}"
+        );
+        // The per-pull-request axis does not count: it is not the nightly.
+        let ci = CI_SRC.replace("pulsar: \"5.0.0\"", "pulsar: \"4.0.14\"");
+        let violations = violations_with(E2E_SRC, &ci, "jobs: {}\n", CAMPAIGN_SRC, COMPOSE_SRC);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("MIN_SUPPORTED_TAG = 4.0.14 is not a `pulsar:` axis value")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_fixture_without_the_minimum_supported_constant() {
+        let fixture = FIXTURE_SRC.replace("pub const MIN_SUPPORTED_TAG: &str = \"4.0.14\";\n", "");
+        let violations = tag_violations(
+            &fixture,
+            E2E_SRC,
+            CI_SRC,
+            NIGHTLY_SRC,
+            CAMPAIGN_SRC,
+            COMPOSE_SRC,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("declares no MIN_SUPPORTED_TAG"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_do_not_pull_the_minimum_supported_broker_by_name() {
+        // A per-pull-request cell must never pull 4.0.14: it is a nightly axis, not a pin.
+        let e2e = format!("{E2E_SRC}          docker pull apachepulsar/pulsar:4.0.14\n");
+        let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations, Vec::<String>::new());
     }
 
     #[test]
     fn fixture_tags_reject_a_constant_missing_from_the_campaign_fixture_tags() {
-        let campaign = CAMPAIGN_SRC.replace("\"apachepulsar/pulsar:4.0.13\", ", "");
-        let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+        let campaign = CAMPAIGN_SRC.replace("\"apachepulsar/pulsar:5.0.0-M1\",", "");
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
-            violations[0].contains("V4_LTS_TAG = 4.0.13 is missing from FIXTURE_TAGS"),
+            violations[0].contains("SCALABLE_TAG = 5.0.0-M1 is missing from FIXTURE_TAGS"),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_an_axis_value_missing_from_the_campaign_fixture_tags() {
+        let campaign = CAMPAIGN_SRC.replace("\"apachepulsar/pulsar:5.0.0\", ", "");
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
+        assert_eq!(
+            violations,
+            [
+                "the `pulsar: \"5.0.0\"` axis value is missing from FIXTURE_TAGS in scripts/performance_campaign.py"
+            ]
+        );
+        // 4.0.14 is both the minimum-supported constant and the nightly axis value.
+        let campaign = CAMPAIGN_SRC.replace("\"apachepulsar/pulsar:4.0.14\", ", "");
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
+        assert_eq!(
+            violations,
+            [
+                "MIN_SUPPORTED_TAG = 4.0.14 is missing from FIXTURE_TAGS in scripts/performance_campaign.py",
+                "the `pulsar: \"4.0.14\"` axis value is missing from FIXTURE_TAGS in scripts/performance_campaign.py",
+            ]
         );
     }
 
     #[test]
     fn fixture_tags_allow_extra_campaign_tags() {
-        // `FIXTURE_TAGS` is a superset: the campaign also pulls `latest`.
-        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        // `FIXTURE_TAGS` is a superset: the campaign also pulls `latest` and the grace-period
+        // 4.2.4, which no constant or axis names.
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
         assert!(violations.is_empty(), "{violations:?}");
-        assert!(campaign_fixture_tags(CAMPAIGN_SRC).contains(&"latest".to_owned()));
+        let tags = campaign_fixture_tags(CAMPAIGN_SRC);
+        assert!(tags.contains(&"latest".to_owned()) && tags.contains(&"4.2.4".to_owned()));
     }
 
-    /// Run the tag rule with one workflow line replaced and return its messages.
-    fn violations_with_ci_line(line: &str) -> Vec<String> {
-        let ci = CI_SRC.replace(
-            "          docker pull apachepulsar/pulsar:4.0.13\n",
-            &format!("{line}\n"),
+    #[test]
+    fn fixture_tags_reject_a_default_tag_that_the_pull_request_axis_does_not_run() {
+        // The axis moved on, DEFAULT_TAG did not: the "default" broker would no longer be
+        // tested on every pull request.
+        let ci = CI_SRC.replace("pulsar: \"4.2.5\"", "pulsar: \"4.2.6\"");
+        let campaign = CAMPAIGN_SRC.replace(
+            "\"apachepulsar/pulsar:5.0.0\", ",
+            "\"apachepulsar/pulsar:5.0.0\", \"apachepulsar/pulsar:4.2.6\", ",
         );
-        tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC)
+        let violations = violations_with(E2E_SRC, &ci, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].starts_with(
+                "DEFAULT_TAG = 4.2.5 is not a `pulsar:` axis value of .github/workflows/ci.yml"
+            ),
+            "{violations:?}"
+        );
+        // The nightly's axis does not count: it does not run on pull requests.
+        let nightly = NIGHTLY_SRC.replace(
+            "          - pulsar: \"4.0.14\"\n",
+            "          - pulsar: \"4.0.14\"\n          - pulsar: \"4.2.5\"\n",
+        );
+        let ci = CI_SRC.replace("pulsar: \"4.2.5\"", "pulsar: \"5.0.0\"");
+        let violations = violations_with(E2E_SRC, &ci, &nightly, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].starts_with("DEFAULT_TAG = 4.2.5 is not a `pulsar:` axis value"));
+    }
+
+    #[test]
+    fn fixture_tags_reject_an_axis_that_is_never_pre_pulled() {
+        // No placeholder pull: the axis brokers would only be pulled at test time.
+        let e2e = E2E_SRC.replace("docker pull apachepulsar/pulsar:${{ inputs.pulsar }}\n", "");
+        let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("declare the `pulsar:` axis") && v.contains("none pre-pulls")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains(
+                "sets `MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}` but never pre-pulls"
+            )),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_placeholder_pull_with_no_axis_declared() {
+        let violations = violations_with(
+            E2E_SRC,
+            "jobs: {}\n",
+            "jobs: {}\n",
+            CAMPAIGN_SRC,
+            COMPOSE_SRC,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("but no workflow declares a `pulsar:")),
+            "{violations:?}"
+        );
+        // And DEFAULT_TAG has no per-pull-request axis to sit in.
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("DEFAULT_TAG = 4.2.5 is not a `pulsar:` axis value")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_an_axis_that_is_not_exported_to_the_suite() {
+        // The cell would pull 5.0.0 and silently test the default.
+        let e2e = E2E_SRC.replace(
+            "          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}\n",
+            "          RUST_LOG: info\n",
+        );
+        let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("never sets `MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}`"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_tags_reject_a_hard_coded_suite_tag() {
+        for line in [
+            "          MAGNETAR_PULSAR_IMAGE_TAG: 5.0.0",
+            "          MAGNETAR_PULSAR_IMAGE_TAG: ${{ matrix.pulsar }}",
+            "          MAGNETAR_PULSAR_IMAGE_TAG: \"${{ inputs.pulsar }}\"",
+        ] {
+            let e2e = E2E_SRC.replace(
+                "          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}",
+                line,
+            );
+            let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.starts_with(".github/workflows/e2e-pulsar.yml:")
+                        && v.contains(
+                            "sets MAGNETAR_PULSAR_IMAGE_TAG in a spelling the gate cannot read"
+                        )),
+                "{line}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_fail_closed_on_every_axis_spelling_they_cannot_read() {
+        for value in [
+            // unquoted: `4.10` would be a YAML float
+            "4.2.5",
+            "'4.2.5'",
+            "\"latest\"",
+            "\"4.2\"",
+            "\"4.2.5\" \"5.0.0\"",
+            "[\"4.2.5\", \"5.0.0\"]",
+            "\"${{ matrix.other }}\"",
+            "${{ inputs.pulsar }}",
+        ] {
+            let ci = CI_SRC.replace("pulsar: \"4.2.5\"", &format!("pulsar: {value}"));
+            let violations = violations_with(E2E_SRC, &ci, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.starts_with(".github/workflows/ci.yml:")
+                        && v.contains("`pulsar:` axis value in a spelling the gate cannot read")),
+                "{value}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_tags_fail_closed_on_a_block_list_or_a_flow_mapping_axis() {
+        // `pulsar:` with an empty value followed by a list, in a cross-product matrix.
+        let block_list = CI_SRC.replace(
+            "        include:\n          - pulsar: \"4.2.5\"\n            pip33: true\n          - pulsar: \"5.0.0\"  # the new LTS\n            pip33: false\n",
+            "        pulsar:\n          - \"4.2.5\"\n          - \"9.9.9\"\n",
+        );
+        assert_ne!(block_list, CI_SRC);
+        // A flow mapping in `include:`, with the key in the middle and first.
+        let flow_mapping = CI_SRC.replace(
+            "          - pulsar: \"5.0.0\"  # the new LTS\n            pip33: false\n",
+            "          - {pulsar: \"9.9.9\", pip33: false}\n",
+        );
+        let flow_second = CI_SRC.replace(
+            "          - pulsar: \"5.0.0\"  # the new LTS\n            pip33: false\n",
+            "          - {pip33: false, pulsar: \"9.9.9\"}\n",
+        );
+        let flow_list = CI_SRC.replace(
+            "          - pulsar: \"5.0.0\"  # the new LTS\n            pip33: false\n",
+            "          - [{pulsar: \"9.9.9\"}]\n",
+        );
+        let quoted_key = CI_SRC.replace(
+            "          - pulsar: \"5.0.0\"  # the new LTS\n            pip33: false\n",
+            "          - {\"pulsar\": \"9.9.9\"}\n",
+        );
+        for (name, ci) in [
+            ("block list", block_list),
+            ("flow mapping, key first", flow_mapping),
+            ("flow mapping, key second", flow_second),
+            ("flow list of mappings", flow_list),
+            ("quoted key", quoted_key),
+        ] {
+            let violations = violations_with(E2E_SRC, &ci, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.starts_with(".github/workflows/ci.yml:")),
+                "{name}: {violations:?}"
+            );
+        }
+        // The block list is named as such, and a list under an input declaration is too.
+        let (_, problems) =
+            workflow_axis("w.yml", "matrix:\n  pulsar:\n    # why\n    - \"9.9.9\"\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("opens a block list of `pulsar` versions"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_axis_does_not_mistake_image_references_or_input_declarations_for_an_axis() {
+        let text = "\
+    inputs:
+      pulsar:
+        description: the tag
+        type: string
+    steps:
+      - run: docker pull apachepulsar/pulsar:4.2.5
+      - run: echo \"on Pulsar $TAG, not pulsar\"
+    with:
+      pulsar: ${{ matrix.pulsar }}
+      # pulsar: [\"9.9.9\"]
+";
+        assert_eq!(workflow_axis("w.yml", text), (Vec::new(), Vec::new()));
     }
 
     #[test]
     fn fixture_tags_fail_closed_on_every_workflow_spelling_they_cannot_read() {
-        // Each of these pulls the 4.0.13 image a reader of the strict spelling would
-        // miss; the constant would then look un-pulled, or — worse — not be seen at all.
+        // Each of these pulls an image a reader of the strict spellings would miss; the
+        // constant would then look un-pulled, or — worse — not be seen at all.
         for line in [
-            "          docker pull docker.io/apachepulsar/pulsar:4.0.13",
-            "          docker pull \"apachepulsar/pulsar:4.0.13\"",
-            "          docker pull 'apachepulsar/pulsar:4.0.13'",
-            "          docker image pull apachepulsar/pulsar:4.0.13",
-            "          docker pull -q apachepulsar/pulsar:4.0.13",
-            "          docker pull apachepulsar/pulsar:${PULSAR_TAG:-4.0.13}",
-            "          docker pull ${PULSAR_IMAGE:-apachepulsar/pulsar}:4.0.13",
+            "          docker pull docker.io/apachepulsar/pulsar:5.0.0-M1",
+            "          docker pull \"apachepulsar/pulsar:5.0.0-M1\"",
+            "          docker pull 'apachepulsar/pulsar:5.0.0-M1'",
+            "          docker image pull apachepulsar/pulsar:5.0.0-M1",
+            "          docker pull -q apachepulsar/pulsar:5.0.0-M1",
+            "          docker pull apachepulsar/pulsar:${PULSAR_TAG:-5.0.0-M1}",
+            "          docker pull ${PULSAR_IMAGE:-apachepulsar/pulsar}:5.0.0-M1",
             "          docker pull apachepulsar/pulsar@sha256:0123",
             "          docker pull apachepulsar/pulsar",
+            // the placeholder in any spelling but the one
+            "          docker pull apachepulsar/pulsar:${{ matrix.pulsar }}",
+            "          docker pull apachepulsar/pulsar:${{inputs.pulsar}}",
+            "          docker pull apachepulsar/pulsar:${{ inputs.other }}",
+            "          docker pull apachepulsar/pulsar:${{ inputs.pulsar }}-alpine",
         ] {
-            let violations = violations_with_ci_line(line);
+            let e2e = E2E_SRC.replace("          docker pull apachepulsar/pulsar:5.0.0-M1", line);
+            let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
             assert!(
-                violations.iter().any(
-                    |v| v.starts_with("ci.yml:") && v.contains("spelling the gate cannot read")
-                ),
+                violations
+                    .iter()
+                    .any(|v| v.starts_with(".github/workflows/e2e-pulsar.yml:")
+                        && v.contains("spelling the gate cannot read")),
                 "{line}: {violations:?}"
             );
         }
@@ -4300,20 +5041,17 @@ services:
     #[test]
     fn fixture_tags_accept_the_workflow_spellings_that_are_only_formatting() {
         for line in [
-            "          docker pull apachepulsar/pulsar:4.0.13  ",
-            "        run: docker pull apachepulsar/pulsar:4.0.13",
-            "          docker pull apachepulsar/pulsar:4.0.13;",
+            "          docker pull apachepulsar/pulsar:5.0.0-M1  ",
+            "        run: docker pull apachepulsar/pulsar:5.0.0-M1",
+            "          docker pull apachepulsar/pulsar:5.0.0-M1;",
             "          # docker pull docker.io/apachepulsar/pulsar:9.9.9 (a comment)",
         ] {
-            let ci = CI_SRC.replace(
-                "          docker pull apachepulsar/pulsar:4.0.13\n",
-                &format!("{line}\n"),
-            );
-            let violations = tag_violations(FIXTURE_SRC, &ci, CAMPAIGN_SRC, COMPOSE_SRC);
-            // The commented line pulls nothing, so only that case loses the 4.0.13 pull.
+            let e2e = E2E_SRC.replace("          docker pull apachepulsar/pulsar:5.0.0-M1", line);
+            let violations = violations_with(&e2e, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, COMPOSE_SRC);
+            // The commented line pulls nothing, so only that case loses the 5.0.0-M1 pull.
             if line.trim_start().starts_with('#') {
                 assert_eq!(violations.len(), 1, "{line}: {violations:?}");
-                assert!(violations[0].contains("V4_LTS_TAG = 4.0.13 has no `docker pull"));
+                assert!(violations[0].contains("SCALABLE_TAG = 5.0.0-M1 has no `docker pull"));
             } else {
                 assert_eq!(violations, Vec::<String>::new(), "{line}");
             }
@@ -4323,16 +5061,16 @@ services:
     #[test]
     fn fixture_tags_fail_closed_on_every_compose_spelling_they_cannot_read() {
         for line in [
-            "    image: \"apachepulsar/pulsar:4.2.4\"",
-            "    image: 'apachepulsar/pulsar:4.2.4'",
-            "    image: docker.io/apachepulsar/pulsar:4.2.4",
-            "    image: apachepulsar/pulsar:${PULSAR_TAG:-4.2.4}",
-            "    image: ${PULSAR_IMAGE:-apachepulsar/pulsar}:4.2.4",
+            "    image: \"apachepulsar/pulsar:4.2.5\"",
+            "    image: 'apachepulsar/pulsar:4.2.5'",
+            "    image: docker.io/apachepulsar/pulsar:4.2.5",
+            "    image: apachepulsar/pulsar:${PULSAR_TAG:-4.2.5}",
+            "    image: ${PULSAR_IMAGE:-apachepulsar/pulsar}:4.2.5",
             "    image: apachepulsar/pulsar",
-            "    - apachepulsar/pulsar:4.2.4",
+            "    - apachepulsar/pulsar:4.2.5",
         ] {
-            let compose = COMPOSE_SRC.replacen("    image: apachepulsar/pulsar:4.2.4", line, 1);
-            let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, &compose);
+            let compose = COMPOSE_SRC.replacen("    image: apachepulsar/pulsar:4.2.5", line, 1);
+            let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, &compose);
             assert!(
                 violations.iter().any(|v| v.starts_with("compose.yml:")
                     && v.contains("spelling the gate cannot read")),
@@ -4355,8 +5093,10 @@ services:
         );
         // An f-string with a default.
         let formatted = format!("{CAMPAIGN_SRC}tag = f\"apachepulsar/pulsar:{{TAG}}\"\n");
-        for campaign in [single, registry, formatted] {
-            let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+        // The default read from the fixture by concatenation, which the gate cannot follow.
+        let concatenated = format!("{CAMPAIGN_SRC}tag = \"apachepulsar/pulsar:\" + default_tag\n");
+        for campaign in [single, registry, formatted, concatenated] {
+            let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
             assert!(
                 violations.iter().any(|v| v.starts_with("campaign.py:")
                     && v.contains("spelling the gate cannot read")),
@@ -4365,11 +5105,11 @@ services:
         }
         // A second assignment would add pre-pulls the first tuple does not show.
         for second in [
-            "FIXTURE_TAGS += (\"apachepulsar/pulsar:4.0.14\",)\n",
+            "FIXTURE_TAGS += (\"apachepulsar/pulsar:4.0.15\",)\n",
             "FIXTURE_TAGS = (\"apachepulsar/pulsar:4.2.4\",)\n",
         ] {
             let campaign = format!("{CAMPAIGN_SRC}{second}");
-            let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+            let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
             assert!(
                 violations
                     .iter()
@@ -4383,7 +5123,7 @@ services:
     fn fixture_tags_reject_a_campaign_lookup_of_an_image_fixture_tags_does_not_pull() {
         // `images["…:9.9.9"]` is a KeyError waiting in the nightly.
         let campaign = format!("{CAMPAIGN_SRC}image = images[\"apachepulsar/pulsar:9.9.9\"]\n");
-        let violations = tag_violations(FIXTURE_SRC, CI_SRC, &campaign, COMPOSE_SRC);
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, &campaign, COMPOSE_SRC);
         assert_eq!(
             violations,
             [
@@ -4394,11 +5134,11 @@ services:
 
     #[test]
     fn fixture_tags_reject_a_compose_pin_that_drifts_from_default_tag() {
-        let compose = COMPOSE_SRC.replacen("pulsar:4.2.4", "pulsar:4.2.3", 1);
-        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, &compose);
+        let compose = COMPOSE_SRC.replacen("pulsar:4.2.5", "pulsar:4.2.3", 1);
+        let violations = violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, &compose);
         assert_eq!(
             violations,
-            ["the PIP-33 compose fixture pins 4.2.3 but DEFAULT_TAG is 4.2.4"]
+            ["the PIP-33 compose fixture pins 4.2.3 but DEFAULT_TAG is 4.2.5"]
         );
     }
 
@@ -4406,7 +5146,9 @@ services:
     fn fixture_tags_reject_a_fixture_that_declares_no_tag() {
         let violations = tag_violations(
             "pub const OTHER: &str = \"x\";",
+            E2E_SRC,
             CI_SRC,
+            NIGHTLY_SRC,
             CAMPAIGN_SRC,
             COMPOSE_SRC,
         );
@@ -4416,11 +5158,24 @@ services:
 
     #[test]
     fn fixture_tags_reject_a_compose_file_with_no_pulsar_pin() {
-        let violations = tag_violations(FIXTURE_SRC, CI_SRC, CAMPAIGN_SRC, "services: {}\n");
+        let violations =
+            violations_with(E2E_SRC, CI_SRC, NIGHTLY_SRC, CAMPAIGN_SRC, "services: {}\n");
         assert_eq!(
             violations,
             ["the PIP-33 compose fixture pins no `image: apachepulsar/pulsar:<tag>`"]
         );
+    }
+
+    #[test]
+    fn exact_versions_are_three_numbers_and_an_optional_suffix() {
+        for tag in ["4.2.5", "5.0.0", "5.0.0-M1", "4.0.14", "10.11.12-rc.1"] {
+            assert!(is_exact_version(tag), "{tag}");
+        }
+        for tag in [
+            "latest", "4.2", "4", "4.2.x", "4..5", "v4.2.5", "4.2.5.1", "", "4.2.5 ",
+        ] {
+            assert!(!is_exact_version(tag), "{tag}");
+        }
     }
 
     // ── check-no-internal-clock scanner (ADR-0011, ADR-0086) ────────

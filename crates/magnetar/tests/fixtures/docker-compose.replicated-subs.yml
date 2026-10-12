@@ -2,7 +2,9 @@
 #
 # Every `image: apachepulsar/pulsar:<tag>` below must equal `DEFAULT_TAG` in
 # crates/magnetar/tests/common/pulsar.rs; `cargo run -p xtask --
-# check-e2e-fixture` fails on a drift (ADR-0115).
+# check-e2e-fixture` fails on a drift (ADR-0115). The fixture never follows the
+# `pulsar:` axis of CI's e2e jobs: only the default-broker run brings it up and
+# selects e2e_replicated_subscriptions (ADR-0116).
 #
 # Two-cluster Apache Pulsar 4.0 fixture used by
 # crates/magnetar/tests/e2e_replicated_subscriptions.rs to exercise PIP-33
@@ -55,12 +57,13 @@
 #   cargo test -p magnetar --test e2e_replicated_subscriptions
 #   docker compose -f docker-compose.replicated-subs.yml down -v
 #
-# Per ADR-0046 this fixture runs on every PR — the `test` job in
-# .github/workflows/ci.yml brings it up automatically before `cargo test`.
+# Per ADR-0046 this fixture runs on every PR — the default-broker run of the `e2e`
+# job in .github/workflows/ci.yml (e2e-pulsar.yml, shard 4) brings it up
+# automatically before `cargo test`.
 
 services:
   zookeeper:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-zookeeper
     restart: unless-stopped
     network_mode: host
@@ -81,7 +84,7 @@ services:
       retries: 30
 
   pulsar-init:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-init
     network_mode: host
     depends_on:
@@ -134,7 +137,7 @@ services:
           --broker-service-url pulsar://localhost:16651
 
   bookkeeper-a:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-bk-a
     restart: unless-stopped
     network_mode: host
@@ -168,7 +171,7 @@ services:
         exec bin/pulsar bookie
 
   bookkeeper-b:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-bk-b
     restart: unless-stopped
     network_mode: host
@@ -199,7 +202,7 @@ services:
         exec bin/pulsar bookie
 
   broker-a:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-broker-a
     restart: unless-stopped
     network_mode: host
@@ -236,7 +239,7 @@ services:
       retries: 30
 
   broker-b:
-    image: apachepulsar/pulsar:4.2.4
+    image: apachepulsar/pulsar:4.2.5
     container_name: magnetar-pip33-broker-b
     restart: unless-stopped
     network_mode: host
