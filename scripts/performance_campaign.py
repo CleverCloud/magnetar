@@ -45,11 +45,13 @@ GAPS = ["doctest performance (functional compilation/execution only)", "effectiv
         "explicit feature/fault isolated scenarios", "quiescent RSS/retention after drain",
         "all Rust allocations (glibc dynamic malloc-family only)", "inlined/kernel/DMA copy bytes",
         "client-only attribution of whole-lifecycle instrumented totals"]
-FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apachepulsar/pulsar:4.2.3", "apachepulsar/pulsar:4.2.4",
-                "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest", "athenz/athenz-zts-server:1.12.41")
+FIXTURE_TAGS = ("apachepulsar/pulsar:latest", "apachepulsar/pulsar:4.0.4", "apachepulsar/pulsar:4.0.13", "apachepulsar/pulsar:4.2.3",
+                "apachepulsar/pulsar:4.2.4", "apachepulsar/pulsar:5.0.0-M1", "gcavalcante8808/krb5-server:latest",
+                "athenz/athenz-zts-server:1.12.41")
 SEED_REGISTRY = "crates/magnetar-runtime-moonpool/seeds/known-failing.toml"
 EXAMPLE_SOURCE = "crates/magnetar/examples/performance.rs"
-BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs", "crates/magnetar/tests/e2e_pulsar_proxy.rs")
+BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs", "crates/magnetar/tests/e2e_pulsar_proxy.rs",
+                            "crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
 PROXY_GATEWAY = "MAGNETAR_E2E_DOCKER_HOST_GATEWAY"
 PIP33_BINDINGS = ("MAGNETAR_PIP33_CLUSTER_A_URL", "MAGNETAR_PIP33_CLUSTER_B_URL", "MAGNETAR_PIP33_ADMIN_B_URL")
 

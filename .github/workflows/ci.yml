@@ -155,9 +155,10 @@ jobs:
       - name: Pre-pull Pulsar broker images
         if: ${{ matrix.suite == 'e2e' }}
         run: |
-          # 4.2.4 is the e2e default (ADR-0109): `latest` moved to Pulsar 5.0.0 on
-          # 2026-10-01 and its structured startup log no longer prints the line
-          # the harness waits for, so every shard timed out at container start.
+          # One line per tag constant of crates/magnetar/tests/common/pulsar.rs
+          # (DEFAULT_TAG, V4_LTS_TAG, SCALABLE_TAG); `check-e2e-fixture` keeps
+          # the two lists equal (ADR-0115). 4.2.4 is the e2e default (ADR-0109):
+          # `latest` moved to Pulsar 5.0.0 on 2026-10-01.
           docker pull apachepulsar/pulsar:4.2.4
           docker pull apachepulsar/pulsar:5.0.0-M1
           docker pull apachepulsar/pulsar:4.0.13
@@ -418,21 +419,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-log-fields
 
-  e2e-container-memory:
-    name: e2e-container-memory (JVM budget)
-    # Asserts every `pulsar standalone` container the e2e suite starts caps
-    # its JVM with `.with_env_var("PULSAR_MEM", …)` before `.start()`. The
-    # image default costs ~2.3 GiB RSS per container; four uncapped
-    # standalones stall brokers past `operation_timeout` and surface as a
-    # flaky timeout in whichever unrelated test is running. Mirrors
-    # docs/testing.md § "e2e container memory budget".
+  e2e-fixture:
+    name: e2e-fixture (shared Pulsar fixture)
+    # Asserts the e2e suite boots Pulsar only through the shared fixture under
+    # crates/magnetar/tests/common/ (ADR-0115), that the fixture caps the JVM
+    # with `.with_env_var("PULSAR_MEM", …)` before `.start()` (the image
+    # default costs ~2.3 GiB RSS per container; four uncapped standalones stall
+    # brokers past `operation_timeout` and surface as a flaky timeout in
+    # whichever unrelated test is running — docs/testing.md § "e2e container
+    # memory budget"), and that the fixture's tag constants equal the
+    # `docker pull apachepulsar/pulsar:<tag>` list of the e2e job above, sit in
+    # FIXTURE_TAGS of scripts/performance_campaign.py and match the PIP-33
+    # compose pin.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo run --manifest-path xtask/Cargo.toml -- check-e2e-container-memory
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-e2e-fixture
 
   msrv:
     name: msrv (1.91)

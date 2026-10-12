@@ -68,8 +68,9 @@ experimental-v5-client = ["tokio"]
 # flag is on. Propagates to the proto wire surface and to whichever engine(s)
 # are enabled. The e2e tests in `tests/e2e_scalable_topic.rs` are gated on
 # `scalable-topics` alone (no `e2e` flag — see ADR-0046) and run against a
-# real `apachepulsar/pulsar:5.0.0-M1` broker, plus a `:4.0.4` broker for the
-# negotiated-refusal case, on every push. Does NOT block release.
+# real PIP-460 broker (`Broker::Scalable` in `tests/common/pulsar.rs`), plus a
+# Pulsar 4.0 LTS broker (`Broker::V4Lts`) for the negotiated-refusal case, on
+# every push. Does NOT block release.
 scalable-topics = [
     "magnetar-proto/scalable-topics",
     "magnetar-runtime-tokio?/scalable-topics",

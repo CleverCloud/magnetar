@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
+# Every `image: apachepulsar/pulsar:<tag>` below must equal `DEFAULT_TAG` in
+# crates/magnetar/tests/common/pulsar.rs; `cargo run -p xtask --
+# check-e2e-fixture` fails on a drift (ADR-0115).
+#
 # Two-cluster Apache Pulsar 4.0 fixture used by
 # crates/magnetar/tests/e2e_replicated_subscriptions.rs to exercise PIP-33
 # (replicated subscriptions). Each cluster runs a single broker + bookie with

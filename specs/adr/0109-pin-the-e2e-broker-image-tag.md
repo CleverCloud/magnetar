@@ -1,9 +1,15 @@
 # ADR-0109 — Pin the e2e broker image tag instead of tracking `latest`
 
-- **Status**: Accepted
+- **Status**: Accepted (**amended by [ADR-0115](0115-share-one-version-agnostic-pulsar-e2e-fixture.md)** — the HTTP readiness wait it rejected is now in force)
 - **Date**: 2026-10-08
 - **Decider**: Rémi Collignon-Ducret
 - **Tags**: testing, e2e, ci, docker
+
+> **Amendment (2026-10-12, [ADR-0115](0115-share-one-version-agnostic-pulsar-e2e-fixture.md)).** The "HTTP readiness wait" alternative rejected below is taken: the 59 per-suite copies of the fixture are replaced by one shared fixture, `crates/magnetar/tests/common/pulsar.rs`, which no longer waits for a log line and instead polls `GET /admin/v2/namespaces/public/default` until it answers 200.
+> The `DEFAULT_IMAGE_TAG` constants of §1 are one `DEFAULT_TAG` there, still `4.2.4`, and `MAGNETAR_PULSAR_IMAGE_TAG` / `MAGNETAR_PULSAR_IMAGE_REPO` still override it.
+> §3's condition that a 5.x default "needs the wait marker changed in every suite" no longer holds, since there is no wait marker; its review of the suite against the new major, and its requirement that the move land on its own, stand.
+> Pulsar 5.0.0 starts under the fixture (`MAGNETAR_PULSAR_IMAGE_TAG=5.0.0`, `e2e_pulsar` green), which is evidence of readiness and not a compatibility result.
+> The rest of this ADR is unchanged.
 
 ## Context
 

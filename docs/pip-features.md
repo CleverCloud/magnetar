@@ -371,15 +371,15 @@ By convention, magnetar treats `ConnectionEvent` as `#[non_exhaustive]`, so the 
 
 ### Shadow replicator-role e2e setup
 
-The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference). The test now defaults to `apachepulsar/pulsar:latest`, which resolved to 4.2.4 at the 2026-09-29 audit; `MAGNETAR_PULSAR_IMAGE_TAG` can select an explicit compatibility image. The earlier 4.0.4 description is historical, not the image selected by the current default or CI.
+The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference). The test runs on the default broker of the shared e2e fixture (`crates/magnetar/tests/common/pulsar.rs`, [ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); `MAGNETAR_PULSAR_IMAGE_TAG` can select an explicit compatibility image. The earlier 4.0.4 description is historical, not the image selected by the current default or CI.
 The fixture is **self-hosting** — one standalone container via `testcontainers-rs`, no external broker dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster geo-replication is PIP-33, covered by [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)).
 
 #### Shadow fixture (`start_pulsar_with_token_auth_and_replicator_role`)
 
-1. Boot one standalone container from `apachepulsar/pulsar:latest` by default, or use `MAGNETAR_PULSAR_IMAGE_TAG` when set, with token auth turned on via `PULSAR_PREFIX_*` env overrides (`authenticationEnabled=true`, `authenticationProviders=…AuthenticationProviderToken`, `authorizationEnabled=true`, `superUserRoles=admin`). CI does not set the image-tag override; this documents the selected image, not a compatibility result for 4.0.4.
+1. Boot one standalone container of the shared fixture's default image, or the `MAGNETAR_PULSAR_IMAGE_TAG` image when set, with token auth turned on through the fixture's `.config(…)` calls (`authenticationEnabled=true`, `authenticationProviders=…AuthenticationProviderToken`, `authorizationEnabled=true`, `superUserRoles=admin`), which the fixture applies to `conf/standalone.conf` with `bin/apply-config-from-env.py` before the broker starts and whose admin token authenticates its readiness probe. Before ADR-0115 these were exported as `PULSAR_PREFIX_*` variables to a plain `bin/pulsar standalone`, which ignores them, so this suite ran against a broker with authentication off. CI does not set the image-tag override; this documents the selected image, not a compatibility result for 4.0.4.
    The HS256 signing secret is seeded inline as `tokenSecretKey=data:;base64,<b64>` — no bind-mount.
 2. Mint three HS256 JWTs in-process (`sub` claim = role), hand-encoded with `aws-lc-rs::hmac`: `admin` (super-user), `replicator`, `magnetar-test-user`.
-3. Pre-seed the namespace by exec'ing `pulsar-admin namespaces grant-permission public/default --role replicator --actions produce,consume` inside the container (waits for exit).
+3. Pre-seed the namespace by exec'ing `pulsar-admin --auth-plugin … --auth-params token:<admin> namespaces grant-permission public/default --role replicator --actions produce,consume` inside the container (waits for exit and requires exit zero). The CLI reads `client.conf`, which the broker configuration does not touch, so it authenticates as the admin role explicitly.
    The non-replicator role is deliberately left **un-granted**.
 
 #### Shadow broker contract pinned

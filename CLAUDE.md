@@ -169,7 +169,7 @@ cargo run -p xtask -- check-no-channels         # banned-channel grep
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps
 cargo run -p xtask -- check-no-internal-clock   # no Instant::now() / SystemTime::now() / .elapsed() in proto
 cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
-cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container caps PULSAR_MEM (docs/testing.md)
+cargo run -p xtask -- check-e2e-fixture         # Pulsar e2e containers only via the shared fixture, which caps PULSAR_MEM; its tags match CI, FIXTURE_TAGS and the PIP-33 compose pin (ADR-0115, docs/testing.md)
 cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # patch coverage on diff over the 6 crates the sim run compiles; ENFORCING — an uncovered added line fails (ADR-0024, ADR-0088, ADR-0090, ADR-0092)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
@@ -178,7 +178,11 @@ cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR
 ```
 
 Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).
-The local run still needs Docker + the published Pulsar images used by the e2e tests reachable: `apachepulsar/pulsar:4.2.4` (the pinned e2e default, [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md); `MAGNETAR_PULSAR_IMAGE_TAG` overrides it) and the per-test pins such as `apachepulsar/pulsar:4.0.13`.
+The local run still needs Docker + the published Pulsar images the e2e tests use reachable.
+Every e2e suite boots its broker through the one shared fixture, [`crates/magnetar/tests/common/pulsar.rs`](crates/magnetar/tests/common/pulsar.rs) ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); its `DEFAULT_TAG` / `V4_LTS_TAG` / `SCALABLE_TAG` constants are the only place an image tag appears in the Rust tests, and `cargo run -p xtask -- check-e2e-fixture` fails any other `apachepulsar/` image reference there.
+A suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`), never a tag: `Default` is the pinned e2e baseline ([ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md)) that `MAGNETAR_PULSAR_IMAGE_TAG` overrides, `Scalable` takes `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG`, and `V4Lts` is pinned with no override.
+Changing a broker version means changing those constants together with the `docker pull` lines of `ci.yml`, `FIXTURE_TAGS` in `scripts/performance_campaign.py` and the PIP-33 compose pins; the gate fails until all agree.
+A new e2e test never writes an image, a tag, `PULSAR_MEM` or a startup log wait: it calls `Pulsar::new(Broker::…)` and adds only its own `.config(…)` / `.flag(…)` / `.pre_start(…)`.
 The PIP-33 two-cluster tests additionally require the `crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml` fixture to be up before `cargo test` — CI brings it up automatically.
 Locally that is **two** steps, not one: `docker compose -f docker-compose.replicated-subs.yml up -d` **and then** `./configure_replicated_subs.sh`.
 `up -d` alone leaves both brokers healthy but not registered as each other's peers, and the replicated-subscription tests then have nothing to replicate between.

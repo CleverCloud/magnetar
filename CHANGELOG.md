@@ -90,6 +90,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Expect more, smaller entries from such a producer.
   (issue #860 review; [ADR-0112](specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md))
 
+- **The replicator and scalable-topic e2e suites now run against the broker configuration they ask for.**
+  Both exported `PULSAR_PREFIX_*` variables to a plain `bin/pulsar standalone`, which ignores them: `e2e_shadow_topic_replicator.rs` ran against a broker with authentication and authorization off, and `e2e_scalable_topic.rs` left PIP-483 auto split/merge on despite `scalableTopicAutoScaleEnabled=false`.
+  The shared fixture applies the configuration with `bin/apply-config-from-env.py` before the broker starts, and the replicator suite's in-container `pulsar-admin` calls now authenticate as the admin role and must exit zero.
+  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md))
+
 ### Changed
 
 - **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
@@ -112,6 +117,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `.github/dependabot.yml` is deleted: its Cargo PRs bumped `Cargo.lock` alone, which the workspace does not take, and stayed open after the manifest floors moved.
   Dependency and action bumps land by hand, raising manifest floors and refreshing the lockfiles in the same changeset; Dependabot alerts and security updates are repository settings and unchanged.
   ([ADR-0114](specs/adr/0114-bump-dependencies-through-manifest-floors-without-dependabot.md))
+
+- **The e2e suite boots Pulsar through one shared fixture and waits for the broker to serve `public/default` instead of for a log line.**
+  The sixty-two per-file copies of the image constants, the `PULSAR_MEM` budget and the start-up chain are replaced by `crates/magnetar/tests/common/pulsar.rs`, where a suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`) rather than a tag.
+  Readiness is `GET /admin/v2/namespaces/public/default` answering 200 — the one signal that holds on 4.0.14, 4.2.4, 4.2.5 and 5.0.0, whose structured log never prints `Created namespace public/default` — followed by a check that `GET /admin/v2/brokers/version` reports the requested tag's `MAJOR.MINOR`.
+  No tag changes: the default stays `4.2.4`, the three 4.0 LTS suites stay on `4.0.13`, the PIP-460 tests on `5.0.0-M1`; `MAGNETAR_PULSAR_IMAGE_TAG` no longer overrides `e2e_consumer_drop.rs`, whose `4.0.13` is now a pin, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` starts under the fixture (`e2e_pulsar` green).
+  `cargo run -p xtask -- check-e2e-container-memory` becomes `check-e2e-fixture` (CI job `e2e-fixture`): a Pulsar container or an `apachepulsar/pulsar:` reference outside `crates/magnetar/tests/common/` fails, and the fixture's tag constants must equal the `docker pull` list of `ci.yml`, sit in `FIXTURE_TAGS` and match the PIP-33 compose pin.
+  `e2e_batch_chunk.rs` drops its self-referential `default_image_tag_tracks_latest_pulsar_four`, and `scripts/performance_campaign.py` overlays `tests/common/` onto the nightly's base checkout.
+  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md), amending [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
 
 ## [1.7.2] - 2026-09-21
 

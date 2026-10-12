@@ -608,11 +608,43 @@ def rust_code(contents):
     return "".join(code)
 
 
+SHARED_BUILDER = re.compile(r"(?<!\w)Pulsar\s*::\s*new\s*\(")
+SHARED_START = re.compile(r"\.\s*start(?:_proxy)?\s*\(")
+SHARED_HELPER_CALL = re.compile(r"(?<!\w)start_pulsar\s*\(")
+BUILDER_BINDING = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*(?::[^=;{}]*)?=\s*$")
+
+
+def starts_shared_pulsar_fixture(code):
+    """True when Rust code (comments and literals already masked) boots a container through the
+    shared `tests/common/pulsar.rs` fixture, which is where `GenericImage::new` lives since ADR-0115.
+
+    Two forms count: the builder, `Pulsar::new(..)` whose chain reaches `.start()` / `.start_proxy()`
+    (directly, or through the `let` binding it was stored in), and a call of the shared
+    `start_pulsar()` helper. A target that only builds `Pulsar::new(..).command()` never starts a
+    container and stays fixture-free."""
+    for call in SHARED_HELPER_CALL.finditer(code):
+        if not re.search(r"\bfn\s+$", code[:call.start()]):
+            return True
+    for builder in SHARED_BUILDER.finditer(code):
+        end = code.find(";", builder.end())
+        statement = code[builder.start(): len(code) if end < 0 else end]
+        if SHARED_START.search(statement):
+            return True
+        statement_start = max(code.rfind(";", 0, builder.start()), code.rfind("{", 0, builder.start()),
+                              code.rfind("}", 0, builder.start())) + 1
+        binding = BUILDER_BINDING.search(code[statement_start:builder.start()])
+        if binding and re.search(r"(?<!\w)" + re.escape(binding.group(1)) + r"\s*\.\s*start(?:_proxy)?\s*\(",
+                                 code[builder.end():]):
+            return True
+    return False
+
+
 def fixture_policy(checkout, source):
-    required = re.search(r"(?<!\w)(?:r#)?GenericImage\s*::\s*(?:r#)?new\s*\(",
-                         rust_code((checkout / source).read_text())) is not None
+    code = rust_code((checkout / source).read_text())
+    constructor = re.search(r"(?<!\w)(?:r#)?GenericImage\s*::\s*(?:r#)?new\s*\(", code) is not None
+    required = constructor or starts_shared_pulsar_fixture(code)
     return {"scope": "fixture-required" if required else "fixture-free", "source": source, "source_sha256": digest(checkout / source),
-            "basis": "assigned target declares a GenericImage::new call outside Rust comments/literals" if required else "assigned target has no GenericImage::new call outside Rust comments/literals; any observed child creation contradicts this scope"}
+            "basis": "assigned target declares a GenericImage::new call or starts the shared Pulsar fixture (Pulsar::new(..).start(), start_pulsar()) outside Rust comments/literals" if required else "assigned target has no GenericImage::new call and does not start the shared Pulsar fixture outside Rust comments/literals; any observed child creation contradicts this scope"}
 
 
 def metadata_families(checkout, metadata, packages):

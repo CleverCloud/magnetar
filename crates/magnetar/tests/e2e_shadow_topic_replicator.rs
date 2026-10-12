@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PIP-180 / ADR-0033 — replicator-role end-to-end coverage against a real
-//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:4.2.4`).
+//! Apache Pulsar 4.x standalone broker (the shared fixture's default image).
 //!
 //! Sibling of [`e2e_shadow_topic.rs`](e2e_shadow_topic.rs), which exercises
 //! the **admin REST + produce/consume happy path** against an
@@ -84,14 +84,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use magnetar::proto::TokenAuth;
 use magnetar::{AuthProvider, PulsarClient};
 use magnetar_proto::MessageId;
-use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::GenericImage;
+use testcontainers::core::{CmdWaitFor, ExecCommand};
 
-const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.2.4";
-const BROKER_BINARY_PORT: u16 = 6650;
-const BROKER_HTTP_PORT: u16 = 8080;
+mod common;
+
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Fixed 32-byte HS256 signing secret. Test-only. The broker is
 /// configured with the same bytes via `tokenSecretKey=data:base64,...`.
@@ -106,31 +104,6 @@ const ADMIN_ROLE: &str = "admin";
 const REPLICATOR_ROLE: &str = "replicator";
 /// A regular non-replicator role used by the negative test.
 const NON_REPLICATOR_ROLE: &str = "magnetar-test-user";
-
-/// JVM budget for the `pulsar standalone` container.
-/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
-/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
-/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
-/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
-const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
-
-fn image_repo() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
-}
-
-fn image_tag() -> String {
-    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
 
 /// Mint a token-auth JWT (HS256, `sub`-claim = role) signed with the
 /// fixture's [`TOKEN_SECRET`]. The broker's `AuthenticationProviderToken`
@@ -155,6 +128,40 @@ fn mint_jwt(role: &str) -> String {
     format!("{signing_input}.{sig_b64}")
 }
 
+/// The token authentication plugin both the broker (for its internal client)
+/// and the in-container `pulsar-admin` use.
+const TOKEN_AUTH_PLUGIN: &str = "org.apache.pulsar.client.impl.auth.AuthenticationToken";
+
+/// Run `bin/pulsar-admin` inside the container, authenticated with
+/// `admin_token`, and require it to exit zero.
+async fn pulsar_admin(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    admin_token: &str,
+    args: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = vec![
+        "bin/pulsar-admin".to_owned(),
+        "--auth-plugin".to_owned(),
+        TOKEN_AUTH_PLUGIN.to_owned(),
+        "--auth-params".to_owned(),
+        format!("token:{admin_token}"),
+    ];
+    command.extend(args.iter().map(|arg| (*arg).to_owned()));
+    let mut result = container
+        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
+        .await?;
+    let stdout = String::from_utf8_lossy(&result.stdout_to_vec().await?).into_owned();
+    let stderr = String::from_utf8_lossy(&result.stderr_to_vec().await?).into_owned();
+    match result.exit_code().await? {
+        Some(0) => Ok(()),
+        code => Err(format!(
+            "pulsar-admin {} exited {code:?}:\n{stdout}{stderr}",
+            args.join(" ")
+        )
+        .into()),
+    }
+}
+
 /// Bring up a single Pulsar 4.x standalone container with token-auth +
 /// admin REST pre-seed for the `replicator` role.
 ///
@@ -167,10 +174,11 @@ fn mint_jwt(role: &str) -> String {
 /// - `non_replicator_token` — HS256 JWT with `sub: "magnetar-test-user"`;
 /// - `container` — the kept-alive `ContainerAsync<GenericImage>` (drop to tear down).
 ///
-/// The broker's `standard.conf` is overlaid via environment variables
-/// (the upstream `apachepulsar/pulsar` image's `entrypoint.sh` honours
-/// `PULSAR_PREFIX_<key>` for any conf key per
-/// [`docker/conf/apply-config-from-env.py`](https://github.com/apache/pulsar/blob/v4.0.4/docker/pulsar/scripts/apply-config-from-env.py)).
+/// The broker's `standalone.conf` is overlaid by the shared fixture, which
+/// exports each `.config(…)` pair as `PULSAR_PREFIX_<key>` and runs
+/// [`bin/apply-config-from-env.py`](https://github.com/apache/pulsar/blob/v4.0.4/docker/pulsar/scripts/apply-config-from-env.py)
+/// before the broker starts. The image has no entrypoint that would do so, so a
+/// plain `bin/pulsar standalone` would ignore the variables.
 /// We seed the HS256 secret via `tokenSecretKey=data:base64,...` so no
 /// bind-mount is needed.
 async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
@@ -201,52 +209,39 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
     let replicator_token = mint_jwt(REPLICATOR_ROLE);
     let non_replicator_token = mint_jwt(NON_REPLICATOR_ROLE);
 
-    // `bin/pulsar standalone --no-functions-worker --no-stream-storage`
-    // skips two background components the test doesn't need; shaves
-    // ~30 s off startup on cold-cache CI hosts.
-    let container = GenericImage::new(image_repo(), image_tag())
-        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
-        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Created namespace public/default",
-        ))
-        .with_startup_timeout(Duration::from_mins(3))
-        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
-        // Token-auth provider + secret-key + admin super-user role.
-        // `brokerClientAuthenticationPlugin` + `brokerClientAuthenticationParameters`
-        // are required so the broker's internal admin client (used by
-        // `pulsar standalone`'s bootstrap path that creates
-        // `public/default`) can authenticate against itself.
-        .with_env_var("PULSAR_PREFIX_authenticationEnabled", "true")
-        .with_env_var(
-            "PULSAR_PREFIX_authenticationProviders",
+    // `--no-functions-worker --no-stream-storage` skips two background
+    // components the test doesn't need; shaves ~30 s off startup on cold-cache
+    // CI hosts.
+    //
+    // Token-auth provider + secret-key + admin super-user role.
+    // `brokerClientAuthenticationPlugin` + `brokerClientAuthenticationParameters`
+    // are required so the broker's internal admin client (used by
+    // `pulsar standalone`'s bootstrap path that creates
+    // `public/default`) can authenticate against itself. The shared fixture
+    // applies them to `conf/standalone.conf` before the broker boots, and
+    // authenticates its own readiness probe with the admin token.
+    let broker = Pulsar::new(Broker::Default)
+        .config("authenticationEnabled", "true")
+        .config(
+            "authenticationProviders",
             "org.apache.pulsar.broker.authentication.AuthenticationProviderToken",
         )
-        .with_env_var("PULSAR_PREFIX_tokenSecretKey", token_secret_key)
-        .with_env_var("PULSAR_PREFIX_authorizationEnabled", "true")
-        .with_env_var("PULSAR_PREFIX_superUserRoles", ADMIN_ROLE)
-        .with_env_var(
-            "PULSAR_PREFIX_brokerClientAuthenticationPlugin",
-            "org.apache.pulsar.client.impl.auth.AuthenticationToken",
-        )
-        .with_env_var(
-            "PULSAR_PREFIX_brokerClientAuthenticationParameters",
+        .config("tokenSecretKey", token_secret_key)
+        .config("authorizationEnabled", "true")
+        .config("superUserRoles", ADMIN_ROLE)
+        .config("brokerClientAuthenticationPlugin", TOKEN_AUTH_PLUGIN)
+        .config(
+            "brokerClientAuthenticationParameters",
             format!("token:{admin_token}"),
         )
-        .with_cmd(vec![
-            "bin/pulsar".to_owned(),
-            "standalone".to_owned(),
-            "--no-functions-worker".to_owned(),
-            "--no-stream-storage".to_owned(),
-        ])
+        .flag("--no-functions-worker")
+        .flag("--no-stream-storage")
+        .admin_token(admin_token.clone())
         .start()
         .await?;
-
-    let host = container.get_host().await?;
-    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
-    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
-    let service_url = format!("pulsar://{host}:{binary_port}");
-    let admin_url = format!("http://{host}:{http_port}");
+    let service_url = broker.service_url;
+    let admin_url = broker.admin_url;
+    let container = broker.container;
 
     // Pre-seed: grant `produce` + `consume` permission on
     // `public/default` to the `replicator` role. The broker's
@@ -255,10 +250,11 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
     // grant, even a valid JWT-bearing producer is rejected with
     // `AuthorizationException`.
     //
-    // Done via `pulsar-admin` exec'd inside the container — it picks up
-    // `brokerClientAuthenticationParameters` from `client.conf` and
-    // authenticates as the broker's super-user role. Functionally
-    // equivalent to a
+    // Done via `pulsar-admin` exec'd inside the container, authenticated
+    // explicitly as the broker's super-user role: `PULSAR_PREFIX_*` configures
+    // the broker's `standalone.conf`, not the `client.conf` the CLI reads, so
+    // without the token the CLI is anonymous and the now-enforced
+    // authentication rejects it. Functionally equivalent to a
     // `POST /admin/v2/namespaces/public/default/permissions/replicator`
     // REST call but avoids dragging a reqwest request-construction dance
     // into the test file.
@@ -266,27 +262,27 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
     // We wait for the exec to exit (`CmdWaitFor::exit`) so the grant is
     // visible before the test opens its first producer — without the
     // wait the exec runs lazily and the producer attach could race the
-    // permission write.
+    // permission write — and require it to exit zero, so a refused grant
+    // fails here instead of as an unrelated authorisation error later.
     //
     // The negative test's `NON_REPLICATOR_ROLE` is **deliberately not**
     // granted any permission on `public/default`, so its producer attach
     // is rejected with an authorisation error — that is the contract pin
     // the negative test asserts.
-    let _grant_replicator = container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "namespaces",
-                "grant-permission",
-                "public/default",
-                "--role",
-                REPLICATOR_ROLE,
-                "--actions",
-                "produce,consume",
-            ])
-            .with_cmd_ready_condition(testcontainers::core::CmdWaitFor::exit()),
-        )
-        .await?;
+    pulsar_admin(
+        &container,
+        &admin_token,
+        &[
+            "namespaces",
+            "grant-permission",
+            "public/default",
+            "--role",
+            REPLICATOR_ROLE,
+            "--actions",
+            "produce,consume",
+        ],
+    )
+    .await?;
 
     Ok((
         service_url,
@@ -344,7 +340,7 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v4_replicator_role_can_assert_source_message_id()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (service_url, _admin_url, _admin_token, replicator_token, _non_replicator_token, container) =
+    let (service_url, _admin_url, admin_token, replicator_token, _non_replicator_token, container) =
         start_pulsar_with_token_auth_and_replicator_role().await?;
 
     let regular = "persistent://public/default/magnetar-e2e-replicator-regular";
@@ -414,20 +410,12 @@ async fn e2e_v4_replicator_role_can_assert_source_message_id()
     // mirrors the Java admin client by creating the shadow topic with the
     // `PULSAR.SHADOW_SOURCE` property; this test uses the CLI route so it
     // exercises only the broker-side replicator gate below.
-    let create_shadow = container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "topics",
-                "create-shadow-topic",
-                "--source",
-                source,
-                shadow,
-            ])
-            .with_cmd_ready_condition(testcontainers::core::CmdWaitFor::exit()),
-        )
-        .await?;
-    drop(create_shadow);
+    pulsar_admin(
+        &container,
+        &admin_token,
+        &["topics", "create-shadow-topic", "--source", source, shadow],
+    )
+    .await?;
 
     // Open a producer on the SHADOW topic and assert the synthetic source
     // id. On a shadow, the broker passes the topic-type gate: the send is
