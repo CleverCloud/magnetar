@@ -751,6 +751,7 @@ pub struct OperationDeadline {
     last_broker_error: Option<(i32, String)>,
 }
 
+#[cfg(feature = "tokio")]
 type OperationDeadlineParts<'a> = (
     Pin<&'a mut (dyn Future<Output = ()> + Send)>,
     &'a mut Option<(i32, String)>,
@@ -1019,7 +1020,7 @@ pub type OpenProducerFut<'a, P> = Pin<
 /// `Option<E::Encryptor>` (engine-typed) instead of an
 /// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` (tokio-locked).
 ///
-/// Implemented on the engine marker ([`TokioEngine`] / [`MoonpoolEngine<P>`]).
+/// Implemented on the engine marker ([`TokioEngine`] / `MoonpoolEngine<P>`, feature `moonpool`).
 /// Tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`;
 /// moonpool plugs in `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>`.
 /// The choice of `Encryptor: Clone` lets the façade fan out the encryptor
@@ -1244,7 +1245,7 @@ pub enum ScalableEvent {
 
 /// Zero-sized stub for any future engine that genuinely cannot wire real
 /// encryption. Both shipped engines ([`TokioEngine`] and
-/// [`MoonpoolEngine`]) now resolve their `MessageEncryptorApi::Encryptor`
+/// `MoonpoolEngine`, feature `moonpool`) now resolve their `MessageEncryptorApi::Encryptor`
 /// / `MessageDecryptorApi::Decryptor` to their own runtime's
 /// `Arc<dyn …MessageEncryptor>` / `…MessageDecryptor`, so `NoEncryption`
 /// is no longer used by either. It is retained as the documented opt-out
@@ -1270,6 +1271,7 @@ mod tests {
     // `moonpool` submodules whose names would shadow the external
     // `tokio` crate inside this test scope and break the
     // `#[::tokio::test]` macro expansions below.
+    #[cfg(feature = "tokio")]
     use super::Engine;
     #[cfg(feature = "moonpool")]
     use super::MoonpoolEngine;

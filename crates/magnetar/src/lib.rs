@@ -35,7 +35,7 @@
 //!
 //! - `tokio` (default): pull in the tokio engine.
 //! - `moonpool`: pull in the moonpool engine.
-//! - `admin`: re-export [`magnetar_admin`] under [`admin`] for the REST admin client.
+//! - `admin`: re-export `magnetar_admin` under `admin` for the REST admin client.
 //! - `auth-oauth2`, `auth-sasl`, `auth-athenz`: pluggable auth providers.
 //! - `encryption`: PIP-4 end-to-end encryption.
 //! - `opentelemetry` (default off): inject/extract W3C `traceparent`/`tracestate` into message
@@ -224,6 +224,7 @@ mod tests {
     /// regresses the generic `impl<E: Engine> PulsarClient<E> where
     /// E::ClientState: TransactionApi` will fail to compile.
     /// Runs at compile time only — no broker round-trip, no I/O.
+    #[cfg(feature = "tokio")]
     fn assert_transaction_api_bound<T: crate::TransactionApi>() {}
 
     #[cfg(feature = "tokio")]

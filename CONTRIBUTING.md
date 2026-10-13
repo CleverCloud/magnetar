@@ -32,6 +32,13 @@ cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --
 cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
 cargo clippy -p magnetar-driver --lib --locked -- -D warnings
 cargo doc -p magnetar-proto --no-deps --locked
+# Also catches a link to an `admin`/`moonpool` item, which resolves only when that feature is on.
+cargo doc -p magnetar-driver --no-deps --locked
+# The façade library with no engine, then its unit-test target: "$FEATURES"
+# above keeps `tokio` on, so it never sees an ungated helper that only
+# `tokio`-gated code uses.
+cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check

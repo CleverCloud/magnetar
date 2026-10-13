@@ -15,6 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Ordinary `cargo test` is unaffected.
   ([ADR-0094](specs/adr/0094-measure-sim-coverage-unoptimized.md) amendment of 2026-10-13)
 
+- **`magnetar-driver` builds warning-free with `default-features = false`, and its default-feature docs build under `-D warnings`.**
+  The `OperationDeadlineParts` type alias, the engine-test `Engine` import and the `assert_transaction_api_bound` unit-test helper served only `tokio`-gated code but were themselves ungated, so a `--no-default-features` build reported them as dead code, which `-D warnings` turns into an error.
+  Each now carries the same `#[cfg(feature = "tokio")]` as its users.
+  Five intra-doc links to `magnetar_admin`, `admin` and `MoonpoolEngine` resolved only when the `admin` or `moonpool` feature was on, so `cargo doc -p magnetar-driver` failed with its default features; they are now code spans that name the feature.
+  CI only compiled `--all-features`, which hid both; the `clippy` and `doc` jobs now also build the façade library with no features, its unit-test target, and its default-feature docs.
+
 - **The scalable-topic and topic-list waiters no longer lose a wakeup, so `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_scalable_event` and `next_topic_list_change` stop parking forever on an event that is already buffered.**
   All four drained their buffer (`scalable_events`, `topic_list_changes`) and re-checked `is_closed()` before creating the `Notified` they park on, while the driver pushes the event and then calls `notify_waiters()`, which stores no permit.
   An event pushed between the drain and the park was buffered and never woke the caller; the scripted broker sends each of these events exactly once, so nothing woke it afterwards either, which is the likely cause of the `scalable_assignment_rebalance_parity` differential test sometimes hanging until the CI job timeout; the new regression tests show that the window exists, not that it caused that CI run.
