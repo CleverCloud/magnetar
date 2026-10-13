@@ -76,6 +76,11 @@ CI compounds it: `Swatinem/rust-cache@v2` in the `check-sim-coverage` job runs u
 The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
 So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
 
+**Demonstrated since, outside this tree (2026-10-13).** In a two-crate workspace, a coverage run over crate `a`'s own tests followed by an edit to `a` and a gate-shaped pass (execute `-p b`, re-export `-p a -p b`) reported `a`'s **old** line mapping onto the new source: the stale `a` test binary was walked first and `llvm-cov` keeps the first record per function, so the current one was discarded.
+That is a wrong report, not just a stale one; on `magnetar` the same shape needs an earlier coverage run of `magnetar-proto` or `magnetar-runtime-tokio`'s own tests in the same target directory.
+
+**A second, separate cause of record-less gated files is closed.** In a default incremental build at `rustc 1.99.0`, a new `magnetar-runtime-tokio` module the sim binaries never call into lost all its records because the linker dropped its codegen unit, and the gate printed it as advisory `not gated` where a `CARGO_INCREMENTAL=0` build failed it; [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md)'s 2026-10-13 amendment pins one codegen unit per crate, so a record-less file in a crate that did report now has no instrumented function at all.
+
 **Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
 Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
 
