@@ -23,7 +23,7 @@
 > A minimal two-crate workspace isolates the unit count from incremental compilation: `CARGO_INCREMENTAL=0` with 256 units drops the same records and incremental with one unit keeps them.
 > CI's 16 is no guarantee either, since which unit is designated and which units get linked follow the crate's partitioning; one unit is, because a crate linked at all brings its whole mapping and a crate linked not at all already hard-fails the gate.
 > Toolchain skew and the workstation's `mbx` build cache were both tested and are not the cause: the first row reproduces with plain Cargo on CI's toolchain.
-> **Harder**: every crate the run compiles, dependencies included, codegens as one unit at `opt-level = 0`, and the first run after this lands rebuilds them all. At `d5834ee` on a 20-core host the one-unit run, rebuilding after the profile change, took 206 s end to end, and the default incremental run 259 s, so the job's `timeout-minutes: 180` is not at risk.
+> **Harder**: every crate the run compiles, dependencies included, codegens as one unit at `opt-level = 0`, and the first run after this lands rebuilds them all. At `d5834ee` on a 20-core host the one-unit cell took 206 s end to end, in a target directory the preceding cells had partly warmed; a cold run on CI's runner is unmeasured, against the job's `timeout-minutes: 180`.
 > **Stricter, not weaker, on CI**: lines CI's 16 units happened to drop now fail there too.
 
 ## Context
