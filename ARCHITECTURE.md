@@ -1630,7 +1630,7 @@ pub trait Schema: Send + Sync + std::fmt::Debug {
 | `BytesSchema`                                                                           | `Bytes`                    | passthrough                                                                                      |
 | `StringSchema`                                                                          | `String`                   | UTF-8                                                                                            |
 | `JsonSchema<T: Serialize + DeserializeOwned>`                                           | `T`                        | JSON via `serde_json`; broker stores canonicalised form                                          |
-| `AvroSchema`                                                                            | `apache_avro::Value`       | Avro single-object encoding; canonical parsing form for version dedup                            |
+| `AvroSchema` (feature `schema-avro`)                                                    | `apache_avro::Value`       | Avro single-object encoding; canonical parsing form for version dedup                            |
 | `ProtobufSchema`                                                                        | `prost::Message`           | Protobuf wire encoding; descriptor-based version dedup                                           |
 | `ProtobufNativeSchema`                                                                  | `prost::Message`           | Protobuf wire encoding; byte-identical Java `FileDescriptorSet` for version dedup                |
 | `KeyValueSchema`                                                                        | `KeyValuePair<K, V>`       | Concatenated `(key_len, key, value_len, value)` with `KeyValueEncodingType::{Inline, Separated}` |
@@ -1657,6 +1657,7 @@ Source: [`crates/magnetar-proto/src/schema/mod.rs:19-34`](crates/magnetar-proto/
 ### Typed producer / consumer
 
 `magnetar::TypedProducer<S: Schema>` and `magnetar::TypedConsumer<S>` serialise / deserialise per call.
+`AvroSchema` is the one schema that needs a Cargo feature, `schema-avro` on `magnetar-proto` or `magnetar-driver`, off by default ([ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md)); the example below assumes it is enabled.
 Construction:
 
 ```rust,no_run

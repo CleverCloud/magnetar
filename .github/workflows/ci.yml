@@ -81,6 +81,15 @@ jobs:
       # combination, which doubles as an incidental rustc-warning gate
       # for that axis since the seed cells carry no `-D warnings`.
       - run: cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+      # `--all-features` above also turns `schema-avro` on (ADR-0117), so it
+      # can never see a missing `#[cfg(feature = "schema-avro")]` gate or a
+      # test that links `apache-avro` without declaring it. Lint the build a
+      # user gets with no feature selected, one package per invocation so that
+      # a dev-dependency of one cannot switch the feature back on for the
+      # other: `magnetar-proto` with every test target, and the façade
+      # library (its test targets link `schema-avro` on purpose).
+      - run: cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+      - run: cargo clippy -p magnetar-driver --lib --locked -- -D warnings
 
   build:
     name: build (${{ matrix.toolchain }})
@@ -255,6 +264,10 @@ jobs:
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo doc --workspace --all-features --no-deps --locked
+      # `AvroSchema` exists only under `schema-avro` (ADR-0117), so a plain
+      # intra-doc link to it from always-compiled docs resolves under
+      # `--all-features` and breaks the default build. Document that build too.
+      - run: cargo doc -p magnetar-proto --no-deps --locked
 
   deny:
     name: cargo-deny

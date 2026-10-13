@@ -153,6 +153,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `e2e_batch_chunk.rs` drops its self-referential `default_image_tag_tracks_latest_pulsar_four`, and `scripts/performance_campaign.py` overlays `tests/common/` onto the nightly's base checkout.
   ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md), amending [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
 
+- **BREAKING: `AvroSchema` is opt-in behind a `schema-avro` Cargo feature, so a default build no longer compiles `apache-avro`.**
+  `magnetar-proto` gains `schema-avro = ["dep:apache-avro"]` and the `magnetar-driver` façade forwards it as `schema-avro = ["magnetar-proto/schema-avro"]`; both leave it off by default, and `magnetarctl` does not enable it.
+  Only `AvroSchema` moves behind the feature: Bytes, String, the primitive and temporal schemas, `JsonSchema`, Protobuf, ProtobufNative, KeyValue, AutoConsume and AutoProduceBytes stay always available, and the wire behaviour of `AvroSchema` is unchanged.
+  Turning the feature on adds 33 crates to a default `magnetar-proto` or `magnetar-driver` build (60 → 93 and 107 → 140 unique crate versions in `cargo tree -e normal`, measured 2026-10-13).
+  **BREAKING CHANGE** (the `magnetar-driver` façade as well as `magnetar-proto`, re-exported as `magnetar::proto`): code that names `magnetar_proto::schema::AvroSchema`, or `magnetar::proto::schema::AvroSchema`, no longer compiles until the feature is enabled, with `magnetar-driver = { version = "…", features = ["schema-avro"] }` or the same feature on a direct `magnetar-proto` dependency.
+  rustc reports the missing import and names the feature that gates it.
+  The `JsonSchema` unit test that parses `schema_data` as Avro and the Avro e2e test link `apache-avro` themselves and run in every build, and `ci.yml` now lints `magnetar-proto` and the façade library and documents `magnetar-proto` with default features, because `--all-features` always turns the feature on.
+  `magnetar-proto` builds its docs.rs documentation with the feature.
+  ([ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md), amending [ADR-0066](specs/adr/0066-release-1-0-0-first-stable.md))
+
+- **Dependencies:** removed the manifest entries and Cargo features nothing used, and `Cargo.lock` drops 17 packages (the `proptest` and `rstest` closures).
+  Workspace entries `pin-project-lite`, `http`, `proptest` and `rstest` are gone; `tracing` leaves `magnetar-admin`, `magnetar-auth-sasl`, `magnetar-fakes` and `magnetar-messagecrypto`, `http` leaves `magnetar-admin`, `pin-project-lite` and `tokio-util` leave `magnetar-runtime-tokio`, `anstream` leaves `magnetarctl`, and `proptest`, `rstest` and `tempfile` leave the `magnetar-proto` dev-dependencies.
+  `url` becomes a dev-dependency of the façade, `tracing` one of `magnetar-differential`, and `serde_json`, `thiserror` and `tracing` in `magnetar-auth-athenz` are compiled only with its `zts` feature.
+  The `tokio` features are narrowed to what each crate uses: `["sync"]` for `magnetar-runtime-moonpool`, `rt-multi-thread` alone for `magnetarctl`, and no `rt-multi-thread` for the `magnetar-differential` library.
+  `rustls` is no longer asked for its `logging` feature, so the `rustls` instance magnetar builds stops emitting `log` records unless another crate in the build enables the feature; nothing in this workspace consumes them, because no `log` to `tracing` bridge is active in any build.
+  Floors are unchanged.
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed

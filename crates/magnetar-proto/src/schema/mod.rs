@@ -4,8 +4,12 @@
 //!
 //! This module exposes the [`Schema`] trait and the nine concrete implementations advertised by
 //! the Apache Pulsar Java client (`org.apache.pulsar.client.api.Schema`): [`BytesSchema`],
-//! [`StringSchema`], [`JsonSchema`], [`AvroSchema`], [`ProtobufSchema`], [`ProtobufNativeSchema`],
+//! [`StringSchema`], [`JsonSchema`], `AvroSchema`, [`ProtobufSchema`], [`ProtobufNativeSchema`],
 //! [`KeyValueSchema`], [`AutoConsumeSchema`], and [`AutoProduceBytesSchema`].
+//!
+//! `AvroSchema` is the only one that needs an optional dependency (`apache-avro`): it is compiled
+//! only when the `schema-avro` feature is enabled, which is off by default. Every other schema is
+//! always available.
 //!
 //! # Wire shape
 //!
@@ -50,7 +54,8 @@
 //! # Implementation status
 //!
 //! - Fully implemented (inline schema data): [`BytesSchema`], [`StringSchema`], [`JsonSchema`],
-//!   [`AvroSchema`], [`ProtobufSchema`], [`ProtobufNativeSchema`], [`KeyValueSchema`].
+//!   `AvroSchema` (feature `schema-avro`), [`ProtobufSchema`], [`ProtobufNativeSchema`],
+//!   [`KeyValueSchema`].
 //! - Broker-driven schema lookup (PIP-87 — schema cached in an `Arc<Mutex<Option<pb::Schema>>>`
 //!   populated by [`Connection::get_schema`](crate::conn::Connection::get_schema)):
 //!   [`AutoConsumeSchema`], [`AutoProduceBytesSchema`].

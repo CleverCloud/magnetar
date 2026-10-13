@@ -171,6 +171,10 @@ aws-lc-rs          = { workspace = true }
 base64             = { workspace = true }
 magnetar-admin      = { workspace = true }
 magnetar-fakes     = { workspace = true }
+# `tests/e2e_schemas_extended.rs` round-trips an `AvroSchema` against a real
+# broker. The façade's own `schema-avro` feature stays off by default, so the
+# test target enables the sans-io feature itself and runs on every build.
+magnetar-proto     = { workspace = true, features = ["schema-avro"] }
 opentelemetry      = { workspace = true }
 opentelemetry_sdk  = { workspace = true }
 reqwest            = { workspace = true }
