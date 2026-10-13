@@ -805,7 +805,7 @@ impl PulsarClient<crate::TokioEngine> {
     /// [`crate::ClientBuilder`] — the default `E = TokioEngine` on
     /// [`PulsarClient<E>`]. Users targeting the moonpool engine open
     /// the engine directly via
-    /// [`magnetar_runtime_moonpool::MoonpoolEngine`] (see
+    /// `magnetar_runtime_moonpool::MoonpoolEngine` (feature `moonpool`; see
     /// [`PulsarClient::<MoonpoolEngine<P>>::from_moonpool`](crate::PulsarClient)
     /// for the equivalent constructor).
     #[must_use]

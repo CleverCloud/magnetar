@@ -157,6 +157,11 @@ cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --
 cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
 cargo clippy -p magnetar-driver --lib --locked -- -D warnings
 cargo doc -p magnetar-proto --no-deps --locked
+cargo doc -p magnetar-driver --no-deps --locked  # also catches links to admin/moonpool items, which resolve only under --all-features
+# the façade library with no engine, then its unit-test target — --all-features
+# never cfg-strips the tokio-only items, so it cannot see what they leave dead
+cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. performance.yml also replays fixed

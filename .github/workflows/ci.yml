@@ -90,6 +90,15 @@ jobs:
       # library (its test targets link `schema-avro` on purpose).
       - run: cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
       - run: cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+      # `--all-features` above also turns on every façade engine, so it
+      # never sees the `magnetar-driver` library a `default-features = false`
+      # consumer builds, where every `tokio`-only item is cfg-stripped and an
+      # ungated helper they alone use becomes dead code. Lint that library,
+      # then its unit-test target. The test target links every
+      # dev-dependency, so `--no-deps` keeps that pass on the façade. Its
+      # integration tests and examples need an engine and are not built here.
+      - run: cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
+      - run: cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 
   build:
     name: build (${{ matrix.toolchain }})
@@ -268,6 +277,10 @@ jobs:
       # intra-doc link to it from always-compiled docs resolves under
       # `--all-features` and breaks the default build. Document that build too.
       - run: cargo doc -p magnetar-proto --no-deps --locked
+      # An intra-doc link to an `admin`- or `moonpool`-gated item resolves
+      # under `--all-features` and breaks the default build. Document the
+      # façade with its default features too.
+      - run: cargo doc -p magnetar-driver --no-deps --locked
 
   deny:
     name: cargo-deny
