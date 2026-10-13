@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`check-sim-coverage` no longer passes locally on lines CI fails: a never-called function's body and a module no sim test calls now count as uncovered on every machine.**
+  `llvm-cov export` reads coverage mappings out of the executed test binaries, and the linker keeps only the codegen units something references, so with several units per crate the records of an unreferenced module, and of every function rustc never codegenned — the body of an `async fn` nobody polls, an uninstantiated generic — could vanish and their lines read as non-executable.
+  Which units survived followed partitioning: on PR #877, at CI's `rustc 1.99.0`, the default local incremental build (205 objects in `magnetar-runtime-tokio`) passed while CI's `CARGO_INCREMENTAL=0` build (16) failed on four lines of the never-called `Client::next_topic_list_change`.
+  The measurement now compiles each crate into one codegen unit via `CARGO_PROFILE_TEST_CODEGEN_UNITS=1` on both the execution and re-export commands, so any linked crate brings its whole mapping; that reproduces CI's verdict locally and makes CI's own independent of partitioning.
+  Ordinary `cargo test` is unaffected.
+  ([ADR-0094](specs/adr/0094-measure-sim-coverage-unoptimized.md) amendment of 2026-10-13)
+
 - **The scalable-topic and topic-list waiters no longer lose a wakeup, so `scalable_topic_lookup`, `scalable_topic_subscribe`, `next_scalable_event` and `next_topic_list_change` stop parking forever on an event that is already buffered.**
   All four drained their buffer (`scalable_events`, `topic_list_changes`) and re-checked `is_closed()` before creating the `Notified` they park on, while the driver pushes the event and then calls `notify_waiters()`, which stores no permit.
   An event pushed between the drain and the park was buffered and never woke the caller; the scripted broker sends each of these events exactly once, so nothing woke it afterwards either, which is the likely cause of the `scalable_assignment_rebalance_parity` differential test sometimes hanging until the CI job timeout; the new regression tests show that the window exists, not that it caused that CI run.

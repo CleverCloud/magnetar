@@ -2703,6 +2703,65 @@ const SIM_COVERAGE_REPORT_PACKAGES: &[&str] = &[
 /// there — and a second writer would clobber it.
 const SIM_COVERAGE_OPT_LEVEL: &str = "0";
 
+/// Codegen units per crate the coverage build compiles into, overriding
+/// Cargo's default for the duration of the measurement.
+///
+/// `llvm-cov export` reads coverage mappings out of the executed test
+/// binaries, and a mapping exists only in the object file of the codegen unit
+/// that emitted it. A library is linked as an archive of one object per
+/// codegen unit, and the linker extracts only the members that resolve a
+/// referenced symbol, so every record in an unreferenced codegen unit is gone
+/// before the report is written. Two kinds of record live in such units:
+///
+/// - functions of a module nothing in the executed binaries calls into;
+/// - every *unused* function of the crate — anything never codegenned, such as the coroutine body
+///   of an `async fn` nobody polls. rustc emits all of them into one designated codegen unit
+///   (rust-lang/rust#92165 tracks the linker discarding it).
+///
+/// A missing record is not a zero: [`intersect_diff_with_coverage`] treats a
+/// line with no `DA:` entry as non-executable, so those lines pass.
+///
+/// Measured 2026-10-13 on PR #877's head `d5834ee` against its base `50b6702`,
+/// `rustc 1.99.0 (b940084d7 2026-09-28)` and cargo-llvm-cov 0.9.1 — CI's exact
+/// toolchain — with only the unit count varying. `next_topic_list_change` is a
+/// `magnetar-runtime-tokio` `async fn` no sim test calls:
+///
+/// | build | tokio rlib objects | verdict | `DA:` in `client.rs:1456-1470` |
+/// | --- | --- | --- | --- |
+/// | incremental, Cargo's local default | 205 | **passes** | `1456,0` only |
+/// | `CARGO_INCREMENTAL=0`, as CI runs | 16 | fails: 1458, 1459, 1460, 1468 | whole body, zero hits |
+/// | incremental, one unit (this constant) | 1 | fails: 1458, 1459, 1460, 1468 | whole body, zero hits |
+///
+/// The second row is CI job 114793099056 line for line; the first reproduces
+/// the PR's local runs, which reported every added line covered. A minimal
+/// two-crate workspace separates the knob from incremental compilation:
+/// `CARGO_INCREMENTAL=0` with 256 units drops the same records, incremental
+/// with one unit keeps them, and an unused generic function and a module
+/// nothing calls lose their records exactly like the `async fn` body.
+///
+/// CI's 16 is not a guarantee either — which unit is designated and which units
+/// get linked follow the crate's partitioning. One unit per crate is: any crate
+/// linked at all brings its whole mapping, unused functions included, and a
+/// crate linked not at all is already a hard failure ([`report_missing_gated`]).
+///
+/// Like [`SIM_COVERAGE_OPT_LEVEL`], this is a `[profile.test]` override, so the
+/// environment variable outranks any `codegen-units` a profile or config file
+/// sets.
+const SIM_COVERAGE_CODEGEN_UNITS: &str = "1";
+
+/// The `[profile.test]` overrides both coverage commands run under:
+/// [`SIM_COVERAGE_OPT_LEVEL`] and [`SIM_COVERAGE_CODEGEN_UNITS`].
+///
+/// One list applied to both commands, so the re-export resolves the artifacts
+/// the execution just built rather than a differently-profiled set beside them.
+const SIM_COVERAGE_PROFILE_ENV: [(&str, &str); 2] = [
+    ("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL),
+    (
+        "CARGO_PROFILE_TEST_CODEGEN_UNITS",
+        SIM_COVERAGE_CODEGEN_UNITS,
+    ),
+];
+
 /// Greppable tag stamped on every line `check-sim-coverage` emits when it was
 /// handed `--reuse-lcov`.
 ///
@@ -2730,6 +2789,13 @@ const SIM_COVERAGE_REUSE_MARKER: &str = "[REUSED LCOV — NOT A FRESH MEASUREMEN
 /// silences an inlined callee's counter, and the gate reports lines a passing
 /// test provably executed — non-deterministically, since inlining follows
 /// codegen-unit partitioning. See that constant for the measurement.
+///
+/// Both steps also compile each crate into [`SIM_COVERAGE_CODEGEN_UNITS`] — one
+/// — codegen unit. With more, the linker drops every unit the executed test
+/// binaries never reference, taking along the coverage records of unreferenced
+/// modules and of every function the crate never codegenned, such as the body
+/// of an `async fn` nobody polls; those lines then read as non-executable and
+/// pass. See that constant for the measurement.
 ///
 /// The second step is what closes ADR-0088's scope gap, and it is nearly free
 /// because instrumentation was never the limit. `cargo-llvm-cov`'s `RUSTC_WRAPPER`
@@ -2804,7 +2870,35 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let (mut exec, mut report) =
+        sim_lcov_commands(&cargo, workspace_root, &exec_lcov_path, &lcov_path);
 
+    let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
+    if !status.success() {
+        bail!("`cargo llvm-cov` exited with status {status}");
+    }
+    let status = report
+        .status()
+        .context("failed to invoke `cargo llvm-cov report`")?;
+    if !status.success() {
+        bail!("`cargo llvm-cov report` exited with status {status}");
+    }
+
+    fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
+}
+
+/// The two commands [`run_sim_lcov`] runs, built but not started: step 1
+/// executes, step 2 re-exports.
+///
+/// Both carry [`SIM_COVERAGE_PROFILE_ENV`]. They are built here, apart from
+/// the code that runs them, so a unit test inspects exactly what runs —
+/// `sim_coverage_pins_the_measurement_profile_on_both_commands`.
+fn sim_lcov_commands(
+    cargo: &std::ffi::OsStr,
+    workspace_root: &Path,
+    exec_lcov_path: &Path,
+    lcov_path: &Path,
+) -> (StdCommand, StdCommand) {
     // Step 1 — execution. `-p` is a cargo flag, not a test-runner flag. Putting
     // it after `--` routes it to libtest, which rejects it ("Unrecognized
     // option: 'p'") and aborts the whole coverage run. Here it picks the test
@@ -2812,10 +2906,10 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     // in the façade's Docker-bound e2e suite). It does NOT restrict
     // instrumentation: cargo-llvm-cov instruments every workspace member
     // regardless, which is exactly why step 2 can widen the report for free.
-    let mut exec = StdCommand::new(&cargo);
+    let mut exec = StdCommand::new(cargo);
     exec.current_dir(workspace_root)
         .args(["llvm-cov", "--lcov", "--output-path"])
-        .arg(&exec_lcov_path)
+        .arg(exec_lcov_path)
         .args([
             "-p",
             "magnetar-runtime-moonpool",
@@ -2831,21 +2925,19 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     // a bare Linux checkout, which is how it shipped until 2026-07-31.
     force_clang_toolchain(&mut exec);
     // Measure at `opt-level = 0`, overriding the workspace's
-    // `[profile.test] opt-level = 1`. See [`SIM_COVERAGE_OPT_LEVEL`].
-    exec.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
-    let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
-    if !status.success() {
-        bail!("`cargo llvm-cov` exited with status {status}");
-    }
+    // `[profile.test] opt-level = 1`, and in one codegen unit per crate, so
+    // the linker cannot drop the unit holding a record. See
+    // [`SIM_COVERAGE_OPT_LEVEL`] and [`SIM_COVERAGE_CODEGEN_UNITS`].
+    exec.envs(SIM_COVERAGE_PROFILE_ENV);
 
     // Step 2 — re-export the same profdata + object files over the wider
     // package set. `cargo llvm-cov report` accepts `-p` only; `--workspace`,
     // `--exclude-from-report` and `--exclude-from-test` are all rejected on it.
-    let mut report = StdCommand::new(&cargo);
+    let mut report = StdCommand::new(cargo);
     report
         .current_dir(workspace_root)
         .args(["llvm-cov", "report", "--lcov", "--output-path"])
-        .arg(&lcov_path);
+        .arg(lcov_path);
     for package in SIM_COVERAGE_REPORT_PACKAGES {
         report.args(["-p", package]);
     }
@@ -2853,17 +2945,11 @@ fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<String> {
     // (`SIM_COVERAGE_EXCLUDE_PREFIXES`); dropping it here too keeps the report
     // from carrying tens of thousands of prost-generated lines.
     report.args(["--ignore-filename-regex", "crates/magnetar-proto/src/pb/"]);
-    // Same override as step 1 so this re-export resolves the artifacts step 1
+    // Same overrides as step 1 so this re-export resolves the artifacts step 1
     // just built rather than a differently-profiled set beside them.
-    report.env("CARGO_PROFILE_TEST_OPT_LEVEL", SIM_COVERAGE_OPT_LEVEL);
-    let status = report
-        .status()
-        .context("failed to invoke `cargo llvm-cov report`")?;
-    if !status.success() {
-        bail!("`cargo llvm-cov report` exited with status {status}");
-    }
+    report.envs(SIM_COVERAGE_PROFILE_ENV);
 
-    fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
+    (exec, report)
 }
 
 /// Intersect the per-file added-line sets from the diff with the executable
@@ -5752,6 +5838,40 @@ mod tests {
             "the advisory arm must still exit 0 — it is what the constant \
              selects, and keeping it working is what makes a revert one line"
         );
+    }
+
+    /// Both coverage commands run unoptimized and in one codegen unit per
+    /// crate, and agree on it.
+    ///
+    /// Losing either pin on either command reopens a fail-open: `opt-level >= 1`
+    /// lets the MIR inliner silence a callee's counter (ADR-0094), and more
+    /// than one codegen unit lets the linker drop the unit holding a record, so
+    /// the lines of a never-called `async fn` body or of an unreferenced module
+    /// read as non-executable and pass (see `SIM_COVERAGE_CODEGEN_UNITS`).
+    /// Neither shows up in the report itself — the missing records look exactly
+    /// like comments — so this pins what actually runs.
+    #[test]
+    fn sim_coverage_pins_the_measurement_profile_on_both_commands() {
+        let root = Path::new("/ws");
+        let (exec, report) = sim_lcov_commands(
+            std::ffi::OsStr::new("cargo"),
+            root,
+            &root.join("target/sim-coverage-exec.lcov"),
+            &root.join("target/sim-coverage.lcov"),
+        );
+        for (step, command) in [("execution", &exec), ("re-export", &report)] {
+            let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+            for (name, value) in [
+                ("CARGO_PROFILE_TEST_OPT_LEVEL", "0"),
+                ("CARGO_PROFILE_TEST_CODEGEN_UNITS", "1"),
+            ] {
+                assert_eq!(
+                    env.get(std::ffi::OsStr::new(name)),
+                    Some(&Some(std::ffi::OsStr::new(value))),
+                    "the {step} command must run with {name}={value}"
+                );
+            }
+        }
     }
 
     /// The façade is deliberately outside `SIM_COVERAGE_REPORT_PACKAGES` —
