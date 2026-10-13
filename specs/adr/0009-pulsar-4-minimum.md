@@ -5,6 +5,12 @@
 - **Decider**: Florentin Dubois
 - **Tags**: compatibility, broker-version
 
+> **Amendment (2026-10-12, [ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).** The minimum broker is unchanged: Apache Pulsar 4.0.
+> The decision's bullet that the end-to-end suite runs against `apachepulsar/pulsar:4.0.4` and that the CI matrix pins that tag no longer describes CI (it was already stale after [ADR-0109](0109-pin-the-e2e-broker-image-tag.md)).
+> CI now runs the whole suite on `4.2.5` (the default, what Clever Cloud runs) and `5.0.0` on every pull request, and on `4.0.14` nightly, so the minimum is tested as the 4.0 LTS line's last release.
+> The consequence "when Pulsar 5.0 ships, we extend the supported list rather than replacing it" is taken: 5.0 is a tested axis, and 4.x stays supported.
+> The rest of this ADR is unchanged.
+
 ## Context
 
 The audit asked: do we target Pulsar 3.0 LTS, 3.x, or 4.0+? Each has trade-offs:

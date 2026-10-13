@@ -4,10 +4,9 @@
 //! Apache Pulsar broker.
 //!
 //! Runs against the shared fixture's `Broker::Scalable` image (`common/pulsar.rs`,
-//! ADR-0115), the first published release carrying PIP-460. Its `ServiceConfiguration` defaults
-//! `scalableTopicsEnabled` to `true`; the fixture sets it explicitly anyway so
-//! the test does not silently depend on an upstream default that may move
-//! before Pulsar 5.0 final.
+//! ADR-0115), Pulsar 5.0.0 GA, the release that carries PIP-460. Its `standalone.conf` sets
+//! `scalableTopicsEnabled=true`; the test sets it explicitly anyway so it does not silently depend
+//! on an upstream default that may move.
 //!
 //! Per [ADR-0046] these are ordinary tests — no `#[ignore]`, no `feature =
 //! "e2e"` — gated only on `feature = "scalable-topics"` like the rest of the
@@ -28,6 +27,10 @@
 //!    rather than emitting a command the peer cannot parse. That is the guarantee that lets this
 //!    surface ship without breaking existing deployments, and it is only provable against a real v4
 //!    broker.
+//! 5. [`e2e_scalable_topic_read_only_lookup_does_not_create_the_topic`] — `lookup_scalable_topic`
+//!    is read-only: on a never-created topic it reports "not found", and the broker's admin REST
+//!    still answers 404 for that topic afterwards. Pulsar 5.0.0 auto-creates the topic for a lookup
+//!    that leaves `create_if_missing` unset, so this is what the explicit `false` is for.
 //!
 //! [ADR-0046]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md
 
@@ -92,9 +95,8 @@ async fn start_broker(
         .flag("--no-stream-storage");
     if broker == Broker::Scalable {
         pulsar = pulsar
-            // Defaults to `true` in 5.0.0-M1's ServiceConfiguration; set
-            // explicitly so the test does not depend on an upstream default
-            // holding through to Pulsar 5.0 final.
+            // `standalone.conf` of Pulsar 5.0.0 sets this to `true`; set it
+            // explicitly so the test does not depend on an upstream default.
             .config("scalableTopicsEnabled", "true")
             // PIP-483 auto split/merge also defaults on. Disable it so the only
             // layout change in these tests is the one the admin API triggers —
@@ -366,6 +368,76 @@ async fn e2e_scalable_topic_info_cli_round_trip() {
             seg.segment_id.0
         );
     }
+}
+
+/// HTTP status of the broker's admin REST for the scalable topic `name` of [`TENANT_NS`]:
+/// `GET /admin/v2/scalable/{tenant}/{namespace}/{name}` answers 200 with the topic's metadata
+/// when it exists and 404 with `Scalable topic not found` when it does not (Pulsar 5.0.0).
+async fn scalable_topic_admin_status(admin_url: &str, name: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{admin_url}/admin/v2/scalable/{TENANT_NS}/{name}"))
+        .send()
+        .await
+        .expect("admin REST answers")
+        .status()
+}
+
+/// (5) A read-only lookup never creates the topic it looks up.
+///
+/// A Pulsar 5.0.0 broker auto-creates a scalable topic for a lookup that leaves
+/// `create_if_missing` unset (it defaults to `true`), where 5.0.0-M1 failed with "Scalable topic
+/// not found". `PulsarClient::lookup_scalable_topic` sends `false` explicitly, so on a
+/// never-created topic it must report "not found" and the topic must still not exist afterwards;
+/// `magnetarctl topic-info` relies on exactly that. The broker's admin REST is the oracle, with a
+/// positive control proving the endpoint really distinguishes the two states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_scalable_topic_read_only_lookup_does_not_create_the_topic() {
+    let (service_url, admin_url, container) = start_broker(Broker::Scalable)
+        .await
+        .expect("pulsar 5.0 broker starts");
+
+    // Positive control: the admin endpoint answers 200 for a topic that exists.
+    create_scalable_topic(
+        &container,
+        &format!("topic://{TENANT_NS}/e2e-scaled-control"),
+        1,
+    )
+    .await
+    .expect("control topic created");
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, "e2e-scaled-control").await,
+        reqwest::StatusCode::OK,
+        "the admin endpoint reports an existing scalable topic"
+    );
+
+    let name = "e2e-scaled-never-created";
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, name).await,
+        reqwest::StatusCode::NOT_FOUND,
+        "the topic does not exist before the lookup"
+    );
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await
+        .expect("client connects");
+    let err = client
+        .lookup_scalable_topic(&format!("topic://{TENANT_NS}/{name}"))
+        .await
+        .expect_err("a read-only lookup of a never-created topic fails");
+    let rendered = err.to_string();
+    assert!(
+        rendered.to_lowercase().contains("not found"),
+        "the lookup reports the topic as not found, got `{rendered}`"
+    );
+
+    assert_eq!(
+        scalable_topic_admin_status(&admin_url, name).await,
+        reqwest::StatusCode::NOT_FOUND,
+        "a read-only lookup must not auto-create the topic (create_if_missing = false); the lookup \
+         failed with `{rendered}`"
+    );
 }
 
 /// (3) Drop-on-DAG-change observed against a broker-driven segment split.

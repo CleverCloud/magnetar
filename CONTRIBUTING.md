@@ -63,7 +63,7 @@ MOONPOOL_SEED=0xdeadbeef cargo test -p magnetar-runtime-moonpool \
 
 (Using a single-provider feature flag here avoids pulling `crypto-fips` for the per-package run, which would otherwise need a native FIPS build toolchain locally.)
 
-E2e tests (require Docker; auto-pulls `apachepulsar/pulsar:4.0.4`):
+E2e tests (require Docker; auto-pull `apachepulsar/pulsar:4.2.5`, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` or `4.0.14` runs them on another broker):
 
 ```
 cargo test --workspace --all-features

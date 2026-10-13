@@ -764,9 +764,10 @@ The [parity matrix above](#java-client-parity-matrix) is the per-feature, per-en
 
 ## Supported broker versions
 
-- **Pulsar 4.0+** (LTS).
+- **Pulsar 4.0+**: the minimum is the 4.0 LTS line ([ADR-0009](specs/adr/0009-pulsar-4-minimum.md)), and 5.0 (the new upstream LTS) is tested alongside 4.x.
   The CONNECT frame advertises `ProtocolVersion::V21` and the connection falls back to whichever lower version the broker reports on `CONNECTED`.
-- The end-to-end suite runs against `apachepulsar/pulsar:4.0.4`.
+- The end-to-end suite runs against `apachepulsar/pulsar:4.2.5` (the default, and what Clever Cloud runs) and `5.0.0` on every pull request, and against `4.0.14` every night ([ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
+  The PIP-460 scalable-topic tests run against Pulsar `5.0.0` GA on every run, the nightly included, and the feature stays experimental.
 
 ---
 
@@ -813,8 +814,8 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`); per-PR CI parallelizes that surface into one non-e2e cell and four e2e cells (ADR-0098).
-Docker is the only prerequisite; the suite spins `pulsar:4.0.4` via `testcontainers-rs`.
+End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`); per-PR CI parallelizes that surface into one non-e2e cell and four e2e cells per Pulsar version ([ADR-0098](specs/adr/0098-parallelize-per-pr-test-execution.md), [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
+Docker is the only prerequisite; the suite spins `apachepulsar/pulsar:4.2.5` via `testcontainers-rs`, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` (or `4.0.14`) runs the same suite on another broker.
 
 Additional `xtask` checks specific to the sans-io invariants:
 

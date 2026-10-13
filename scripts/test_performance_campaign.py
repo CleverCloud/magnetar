@@ -136,14 +136,54 @@ class CampaignContracts(unittest.TestCase):
                 CAMPAIGN.docker_cli_identity(root, executable)
 
     def test_pulsar_fixture_images_are_preloaded_and_frozen(self):
-        source = Path(CAMPAIGN.__file__).resolve().parents[1] / "crates/magnetar/tests/common/pulsar.rs"
-        text = source.read_text()
+        root = Path(CAMPAIGN.__file__).resolve().parents[1]
+        text = (root / CAMPAIGN.FIXTURE_SOURCE).read_text()
         repository = re.search(r'const IMAGE_REPO: &str = "([^"]+)";', text).group(1)
         tags = dict(re.findall(r'const (\w+_TAG): &str = "(\d[^"]*)";', text))
-        self.assertEqual(set(tags), {"DEFAULT_TAG", "V4_LTS_TAG", "SCALABLE_TAG"})
+        self.assertEqual(set(tags), {"DEFAULT_TAG", "V4_LTS_TAG", "MIN_SUPPORTED_TAG", "SCALABLE_TAG"})
         for name, tag in tags.items():
             with self.subTest(constant=name):
                 self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
+        # The Pulsar versions CI runs the whole suite on (the `pulsar:` axis of the e2e jobs,
+        # ADR-0116) are pre-pulled too; `check-e2e-fixture` enforces the same.
+        axis = set()
+        for workflow in ("ci.yml", "e2e-nightly.yml"):
+            axis |= set(re.findall(r'^\s*(?:- )?pulsar: "([^"]+)"', (root / ".github/workflows" / workflow).read_text(), re.M))
+        self.assertTrue(axis, "the e2e workflows declare no pulsar axis")
+        for tag in sorted(axis):
+            with self.subTest(axis=tag):
+                self.assertIn(repository + ":" + tag, CAMPAIGN.FIXTURE_TAGS)
+        # Grace entries: the nightly's base is the head of the last successful scheduled run,
+        # a154636 for the first nightly after ADR-0116, which boots its own per-file pins. The
+        # set was computed from that tree (4.2.4, 4.0.13 and 5.0.0-M1, the last no longer a constant); `latest`, 4.0.4 and
+        # 4.2.3 were used by nothing there and are not pre-pulled.
+        for grace in ("4.2.4", "4.0.13", "5.0.0-M1"):
+            self.assertIn(repository + ":" + grace, CAMPAIGN.FIXTURE_TAGS)
+        for retired in ("latest", "4.0.4", "4.2.3"):
+            self.assertNotIn(repository + ":" + retired, CAMPAIGN.FIXTURE_TAGS)
+
+    def test_default_broker_image_follows_the_fixture_and_is_never_hard_coded(self):
+        root = Path(CAMPAIGN.__file__).resolve().parents[1]
+        default = CAMPAIGN.default_broker_image(root)
+        self.assertEqual(default, re.search(r'const IMAGE_REPO: &str = "([^"]+)";', (root / CAMPAIGN.FIXTURE_SOURCE).read_text()).group(1)
+                         + ":" + re.search(r'const DEFAULT_TAG: &str = "([^"]+)";', (root / CAMPAIGN.FIXTURE_SOURCE).read_text()).group(1))
+        self.assertIn(default, CAMPAIGN.FIXTURE_TAGS)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / CAMPAIGN.FIXTURE_SOURCE
+            source.parent.mkdir(parents=True)
+            source.write_text('pub const IMAGE_REPO: &str = "mirror/pulsar";\npub const DEFAULT_TAG: &str = "9.9.9";\n'
+                              'pub const V4_LTS_TAG: &str = "4.2.5";\n')
+            self.assertEqual(CAMPAIGN.default_broker_image(temporary), "mirror/pulsar:9.9.9")
+            # A fixture without the constant fails loudly, naming the file and the constant.
+            source.write_text('pub const IMAGE_REPO: &str = "mirror/pulsar";\n')
+            with self.assertRaisesRegex(ValueError, r"pulsar\.rs declares no `const DEFAULT_TAG"):
+                CAMPAIGN.default_broker_image(temporary)
+            source.write_text('pub const DEFAULT_TAG: &str = "9.9.9";\n')
+            with self.assertRaisesRegex(ValueError, r"declares no `const IMAGE_REPO"):
+                CAMPAIGN.default_broker_image(temporary)
+        # The lookups of the frozen image inventory name the default through the fixture: a
+        # literal tag here is what broke the campaign when 4.2.4 was retired.
+        self.assertNotRegex(Path(CAMPAIGN.__file__).read_text(), r'images\["apachepulsar/pulsar:')
 
     def test_baseline_overlay_copies_only_the_audited_harness_sources(self):
         fixture = "crates/magnetar/tests/e2e_reconnect_safety.rs"

@@ -36,12 +36,12 @@ const EXPLICIT_CONSUMER_NAME: &str = "consumer-explicit-close-name";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// The Pulsar 4.0 LTS broker this suite is pinned to (`Broker::V4Lts`), whatever
-/// `MAGNETAR_PULSAR_IMAGE_TAG` selects for the rest of the e2e suite.
+/// The matrix broker (`Broker::Default`): `MAGNETAR_PULSAR_IMAGE_TAG` selects it, so
+/// this suite runs on every Pulsar axis CI exercises (ADR-0116).
 async fn start_pulsar() -> TestResult<(String, String, testcontainers::ContainerAsync<GenericImage>)>
 {
     init_tracing();
-    Ok(Pulsar::new(Broker::V4Lts).start().await?.into_parts())
+    Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
 
 fn unique_topic(prefix: &str) -> String {

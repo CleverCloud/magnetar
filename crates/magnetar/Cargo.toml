@@ -69,7 +69,7 @@ experimental-v5-client = ["tokio"]
 # are enabled. The e2e tests in `tests/e2e_scalable_topic.rs` are gated on
 # `scalable-topics` alone (no `e2e` flag — see ADR-0046) and run against a
 # real PIP-460 broker (`Broker::Scalable` in `tests/common/pulsar.rs`), plus a
-# Pulsar 4.0 LTS broker (`Broker::V4Lts`) for the negotiated-refusal case, on
+# pre-5.0 broker (`Broker::V4Lts`, 4.2.5) for the negotiated-refusal case, on
 # every push. Does NOT block release.
 scalable-topics = [
     "magnetar-proto/scalable-topics",

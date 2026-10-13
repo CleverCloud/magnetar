@@ -1,6 +1,6 @@
 # ADR-0109 — Pin the e2e broker image tag instead of tracking `latest`
 
-- **Status**: Accepted (**amended by [ADR-0115](0115-share-one-version-agnostic-pulsar-e2e-fixture.md)** — the HTTP readiness wait it rejected is now in force)
+- **Status**: Superseded by [ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md) (**amended by [ADR-0115](0115-share-one-version-agnostic-pulsar-e2e-fixture.md)** — the HTTP readiness wait it rejected is now in force)
 - **Date**: 2026-10-08
 - **Decider**: Rémi Collignon-Ducret
 - **Tags**: testing, e2e, ci, docker
@@ -10,6 +10,11 @@
 > §3's condition that a 5.x default "needs the wait marker changed in every suite" no longer holds, since there is no wait marker; its review of the suite against the new major, and its requirement that the move land on its own, stand.
 > Pulsar 5.0.0 starts under the fixture (`MAGNETAR_PULSAR_IMAGE_TAG=5.0.0`, `e2e_pulsar` green), which is evidence of readiness and not a compatibility result.
 > The rest of this ADR is unchanged.
+
+> **Superseded by [ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md) (2026-10-12).** The single pinned default `4.2.4` is replaced by a version matrix: `4.2.5` is the default (and what Clever Cloud runs), `5.0.0` is a second axis on every pull request and `4.0.14` runs nightly.
+> The decision's other half stands: the tag is exact and never `latest`, and `MAGNETAR_PULSAR_IMAGE_TAG` is the override, which CI now sets from the matrix.
+> §3's condition for moving to 5.x (a review of the suite against the new major, landing on its own) is met by running the whole suite on `5.0.0` as an axis that lands green ([ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md) decision 5).
+> The ADR-0115 amendment below is unchanged.
 
 ## Context
 

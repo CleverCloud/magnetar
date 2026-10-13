@@ -372,6 +372,7 @@ By convention, magnetar treats `ConnectionEvent` as `#[non_exhaustive]`, so the 
 ### Shadow replicator-role e2e setup
 
 The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference). The test runs on the default broker of the shared e2e fixture (`crates/magnetar/tests/common/pulsar.rs`, [ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); `MAGNETAR_PULSAR_IMAGE_TAG` can select an explicit compatibility image. The earlier 4.0.4 description is historical, not the image selected by the current default or CI.
+Shadow topics are opt-in on Pulsar 4.0.14, 4.2.5 and 5.0.0 (`enableShadowTopics=false` in `standalone.conf`, the admin REST answers `405 Shadow topics are disabled`), so both shadow-topic e2e suites enable them with `.config("enableShadowTopics", "true")` ([ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)); a broker you run yourself needs `enableShadowTopics=true` before `create-shadow-topic` works.
 The fixture is **self-hosting** — one standalone container via `testcontainers-rs`, no external broker dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster geo-replication is PIP-33, covered by [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)).
 
 #### Shadow fixture (`start_pulsar_with_token_auth_and_replicator_role`)
@@ -546,7 +547,7 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
 - **Differential**: 2 equivalence tests at `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs` assert tokio ↔ moonpool produce the same `EventStream` + byte-identical `CommandSubscribe`.
 - **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture: cursor-resume across a cluster failover, and remote materialization of the replicated subscription once the acked position crosses a snapshot window.
   The client-side marker observation channel is exercised by the scripted sim suites only — real Pulsar dispatchers filter `REPLICATED_SUBSCRIPTION_*` marker entries off consumer delivery, so an e2e can never observe one.
-  Runs as a regular `cargo test` per ADR-0046: the two-cluster fixture comes up in the per-PR `test` job of [`ci.yml`](../.github/workflows/ci.yml) (every PR and push), and additionally on a weekly schedule in [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) as a dedicated standalone gate retained per ADR-0075.
+  Runs as a regular `cargo test` per ADR-0046: the two-cluster fixture comes up in the default-broker run of the per-PR `e2e` job of [`ci.yml`](../.github/workflows/ci.yml) (every PR and push; [ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)), and additionally on a weekly schedule in [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) as a dedicated standalone gate retained per ADR-0075.
 
 ### Replicated subscriptions references
 

@@ -5,6 +5,10 @@
 - **Decider**: Florentin Dubois
 - **Tags**: testing, ci, e2e, github-actions
 
+> **Amendment (2026-10-12, [ADR-0116](0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).** Decision 2's four e2e cells now run once per Pulsar version: they are the reusable workflow `.github/workflows/e2e-pulsar.yml`, called from `ci.yml` for `4.2.5` and `5.0.0` and from `e2e-nightly.yml` for `4.0.14`, and the `test` job keeps only the non-e2e cell.
+> Decision 3 narrows to the default-broker run: `e2e_replicated_subscriptions` is still assigned to shard 3, but only the `4.2.5` run brings up the PIP-33 fixture and selects the target; the other runs skip it with a notice.
+> The sorted `e2e_*.rs` glob, the index-modulo-four assignment, the fail-closed empty-shard check and the 180-minute ceiling are unchanged.
+
 ## Context
 
 ADR-0046 folded every test into one per-PR `test` job to avoid a duplicate Cargo build.

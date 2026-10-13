@@ -223,6 +223,26 @@ fn portless_lookup_stub_answers_partition_metadata() {
     assert_eq!(metadata.error, None);
 }
 
+/// Topic of the second scenario, whose lookups the stub bootstrap answers itself.
+const PORTLESS_TOPIC: &str = "persistent://public/default/magnetar-e2e-moonpool-portless-direct";
+
+/// Open and close a producer on `topic` through `client`, which looks it up through the real
+/// broker, so that the broker owns the topic's namespace bundle.
+///
+/// The stub bootstrap of the second scenario answers lookups itself, so the broker never sees one
+/// for that topic. Pulsar 5.0.0 does not acquire the bundle when a producer attaches directly: it
+/// logs `Namespace bundle (…) … not served by this instance … Please redo the lookup.`
+/// (`FAILED_CHECK_OWNERSHIP`) and answers `ServiceUnitNotReady` (code 6). Pulsar 4.0.14 and 4.2.5
+/// log `Trying to acquire ownership of …` on that attach and succeed (ADR-0116). The assertions of
+/// the scenario are unchanged.
+async fn open_and_close_producer_through_a_lookup(
+    client: &PulsarClient<magnetar::MoonpoolEngine<TokioProviders>>,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    client.producer(topic).create().await?.close().await?;
+    Ok(())
+}
+
 /// Pulsar 4 standalone advertises its own well-formed `pulsar://host:port`
 /// URL on every lookup response's `broker_service_url`. The moonpool
 /// engine's `Client::resolve_direct_broker` feeds that value through
@@ -288,6 +308,7 @@ async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
         consumer.ack(msg.message_id).await?;
     }
     consumer.close().await?;
+    open_and_close_producer_through_a_lookup(&client, PORTLESS_TOPIC).await?;
     client.close().await;
 
     assert_eq!(
@@ -332,10 +353,7 @@ async fn e2e_moonpool_open_producer_against_standalone_after_direct_lookup()
     )
     .await?;
     let client = PulsarClient::from_runtime_client(runtime_client);
-    let producer = client
-        .producer("persistent://public/default/magnetar-e2e-moonpool-portless-direct")
-        .create()
-        .await?;
+    let producer = client.producer(PORTLESS_TOPIC).create().await?;
     producer
         .send(OutgoingMessage::with_payload(b"portless-direct".to_vec()).into())
         .await?;

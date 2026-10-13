@@ -14,8 +14,8 @@
 //! Runs as a regular test under `cargo test` (ADR-0046 — the former
 //! `e2e` / `e2e-multi-cluster` Cargo features are gone). The two-cluster
 //! docker-compose fixture must be healthy before `cargo test` starts;
-//! per-PR CI brings it up automatically in the `test` job
-//! (`.github/workflows/ci.yml`).
+//! per-PR CI brings it up automatically in the default-broker run of the `e2e`
+//! job (`.github/workflows/ci.yml`, `e2e-pulsar.yml` shard 4; ADR-0116).
 //!
 //! ## Running locally
 //!

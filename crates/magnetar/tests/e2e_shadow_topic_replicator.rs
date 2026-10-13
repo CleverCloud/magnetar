@@ -220,7 +220,13 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
     // `public/default`) can authenticate against itself. The shared fixture
     // applies them to `conf/standalone.conf` before the broker boots, and
     // authenticates its own readiness probe with the admin token.
+    // `enableShadowTopics` is `false` in the `standalone.conf` of Pulsar 4.0.14, 4.2.5 and 5.0.0,
+    // so `pulsar-admin topics create-shadow-topic` fails with `HTTP 405 Shadow topics are
+    // disabled`. The key is absent from 4.0.13 and 4.2.4 (and earlier), where shadow topics
+    // worked without it; enabling it explicitly makes the suite hold on every version of the CI
+    // matrix (ADR-0116).
     let broker = Pulsar::new(Broker::Default)
+        .config("enableShadowTopics", "true")
         .config("authenticationEnabled", "true")
         .config(
             "authenticationProviders",

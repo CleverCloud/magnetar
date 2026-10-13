@@ -18,16 +18,24 @@
 //! compose fixture.
 //! A suite selects a [`Broker`], never a tag:
 //!
-//! | [`Broker`]            | Tag            | Override                             |
-//! | --------------------- | -------------- | ------------------------------------ |
+//! | [`Broker`]            | Tag              | Override                             |
+//! | --------------------- | ---------------- | ------------------------------------ |
 //! | [`Broker::Default`]   | [`DEFAULT_TAG`]  | `MAGNETAR_PULSAR_IMAGE_TAG`          |
 //! | [`Broker::V4Lts`]     | [`V4_LTS_TAG`]   | none — pinned                        |
 //! | [`Broker::Scalable`]  | [`SCALABLE_TAG`] | `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG` |
 //!
-//! `MAGNETAR_PULSAR_IMAGE_REPO` replaces the repository for all three. A
-//! suite that needs a 4.x-only or a 5.x-only broker pins it with the matching
-//! [`Broker`], so changing the default can neither skip it nor run it on the
-//! wrong broker.
+//! `MAGNETAR_PULSAR_IMAGE_REPO` replaces the repository for all three.
+//!
+//! [`Broker::Default`] is the broker the whole suite runs on, and
+//! `MAGNETAR_PULSAR_IMAGE_TAG` is the matrix hook (ADR-0116): CI exports it
+//! from the `pulsar:` axis of its e2e cells — [`DEFAULT_TAG`] and 5.0.0 on
+//! every pull request, 4.0.14 nightly — so every suite on [`Broker::Default`]
+//! runs on each axis. A suite that needs a 4.x-only or a 5.x-only broker
+//! whatever the axis pins it with the matching [`Broker`], so changing the
+//! default can neither skip it nor run it on the wrong broker. Only two kinds
+//! of suite pin: the PIP-460 tests (a 5.x milestone) and the one test that
+//! asserts a pre-5.0 broker refuses scalable topics. A suite with no such
+//! reason uses [`Broker::Default`], so it gets every axis.
 //!
 //! # Readiness
 //!
@@ -74,16 +82,40 @@ type BoxError = Box<dyn std::error::Error>;
 /// Docker Hub repository of the broker image.
 pub const IMAGE_REPO: &str = "apachepulsar/pulsar";
 
-/// Tag [`Broker::Default`] boots: the broker baseline the whole suite runs on.
-pub const DEFAULT_TAG: &str = "4.2.4";
+/// Tag [`Broker::Default`] boots: the broker baseline the whole suite runs on,
+/// and the release Clever Cloud runs in production (ADR-0116).
+pub const DEFAULT_TAG: &str = "4.2.5";
 
-/// Tag [`Broker::V4Lts`] boots: the Pulsar 4.0 LTS line, for the suites that
-/// need a 4.x broker whatever the default is.
-pub const V4_LTS_TAG: &str = "4.0.13";
+/// Tag [`Broker::V4Lts`] boots: the newest pre-5.0 broker (4.2.5), for the suite that
+/// must see a broker without PIP-460 whatever the axis is.
+///
+/// The name is historical and no longer means the 4.0 LTS: this pinned 4.0.13 until
+/// ADR-0116, which runs the 4.0 LTS as the nightly axis instead. It is a literal of its
+/// own and not an alias of [`DEFAULT_TAG`], so moving the default to a 5.x tag cannot drag
+/// the v4-refusal test onto a broker that supports scalable topics.
+///
+/// The rename (to `V4` / `V4_TAG`) waits for the grace cycle of ADR-0116 decision 7. The
+/// performance nightly overlays this file onto its base checkout, and the base only
+/// advances to a head that includes ADR-0116 after the first green nightly that follows
+/// it: until then a base that already has the shared fixture but not this change still
+/// names `Broker::V4Lts` / `V4_LTS_TAG` in its suites, and a rename would stop that base
+/// from compiling. Rename it together with the removals the performance campaign's
+/// `FIXTURE_TAGS` comment lists.
+pub const V4_LTS_TAG: &str = "4.2.5";
 
-/// Tag [`Broker::Scalable`] boots: the first published release carrying
-/// PIP-460 scalable topics (ADR-0093).
-pub const SCALABLE_TAG: &str = "5.0.0-M1";
+/// The minimum supported broker (ADR-0009): the last release of the 4.0 LTS line, which CI
+/// runs the whole suite on nightly (ADR-0116).
+///
+/// Not a [`Broker`]: no suite boots it by name, the nightly selects it as the axis through
+/// `MAGNETAR_PULSAR_IMAGE_TAG`. It is declared here so the minimum broker is encoded once, and
+/// `cargo run -p xtask -- check-e2e-fixture` fails unless a workflow other than `ci.yml` runs
+/// exactly this version, so deleting or retargeting the nightly cannot go unnoticed.
+pub const MIN_SUPPORTED_TAG: &str = "4.0.14";
+
+/// Tag [`Broker::Scalable`] boots: Pulsar 5.0.0 GA, the release that carries PIP-460 scalable
+/// topics (ADR-0093). It was the 5.0.0-M1 milestone, the first release carrying PIP-460, until
+/// the vendored protocol moved to the GA release.
+pub const SCALABLE_TAG: &str = "5.0.0";
 
 /// Environment variable replacing [`IMAGE_REPO`] for every [`Broker`].
 pub const REPO_ENV: &str = "MAGNETAR_PULSAR_IMAGE_REPO";
@@ -131,10 +163,11 @@ const LOG_TAIL_LINES: usize = 40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Broker {
     /// The workspace baseline ([`DEFAULT_TAG`]); `MAGNETAR_PULSAR_IMAGE_TAG`
-    /// selects another one for a compatibility run.
+    /// selects another one — CI's matrix axis, or a local compatibility run.
     Default,
-    /// The Pulsar 4.0 LTS pin ([`V4_LTS_TAG`]); no override, so a suite that
-    /// needs a 4.x broker never runs on another major.
+    /// The newest pre-5.0 broker ([`V4_LTS_TAG`], 4.2.5), not the 4.0 LTS despite the
+    /// name (see the constant); no override, so a suite that needs a 4.x broker never
+    /// runs on another major.
     V4Lts,
     /// The PIP-460 broker ([`SCALABLE_TAG`]); `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG`
     /// selects a later milestone.
@@ -375,10 +408,13 @@ impl Pulsar {
     pub async fn start(self) -> Result<Running, BoxError> {
         let tag = self.broker.tag();
         let command = self.command_for(Role::Standalone);
-        // The `ZooKeeper` port is published only in `ZooKeeper` mode. A port cannot
-        // be added to a `GenericImage` chain conditionally, and `PULSAR_MEM` is
-        // verified only when `.start()` sits on the same chain, so each variant
-        // spells out its whole chain.
+        // The `ZooKeeper` port is published only in `ZooKeeper` mode, so each
+        // variant spells out its whole chain. Not because a port cannot be added
+        // conditionally (`with_exposed_port` is a `GenericImage` method, so it
+        // could be added to a stashed builder), but because `check-e2e-fixture`
+        // resolves the image and the `PULSAR_MEM` cap only on a chain that runs
+        // from `GenericImage::new(…)` to `.start()` in one expression, and
+        // treats a stashed builder as a violation.
         let container = if self.zookeeper {
             GenericImage::new(image_repo(), tag.as_str().to_owned())
                 .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))

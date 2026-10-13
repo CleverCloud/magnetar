@@ -5,8 +5,9 @@
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires
 //! Docker on the host. PIP-180 is available against the baseline broker
-//! (Pulsar 4.0+, ADR-0009). No new container, no docker-compose helper
-//! — uses the same single-broker fixture as `e2e_pulsar.rs`.
+//! (Pulsar 4.0+, ADR-0009), but is opt-in on the releases the CI matrix runs
+//! (ADR-0116): the suite enables it explicitly, see below. No new container, no
+//! docker-compose helper — uses the same single-broker fixture as `e2e_pulsar.rs`.
 
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use magnetar_admin::AdminClient;
 
 mod common;
 
-use common::pulsar::start_pulsar;
+use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// PIP-180 e2e — admin REST + produce / consume cycle:
 /// 1. Bootstrap the source topic by producing once.
@@ -28,7 +29,16 @@ use common::pulsar::start_pulsar;
 /// 6. Delete the shadow topic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_shadow_topic_full_cycle() -> Result<(), Box<dyn std::error::Error>> {
-    let (service_url, admin_url, _container) = start_pulsar().await?;
+    init_tracing();
+    // `enableShadowTopics` is `false` in the `standalone.conf` of Pulsar 4.0.14, 4.2.5 and 5.0.0,
+    // and the admin REST then answers `405 {"reason":"Shadow topics are disabled"}`. The key is
+    // absent from 4.0.13 and 4.2.4 (and earlier), where the suite passed without it. Enabling it
+    // keeps the suite meaningful on every version of the CI matrix (ADR-0116).
+    let (service_url, admin_url, _container) = Pulsar::new(Broker::Default)
+        .config("enableShadowTopics", "true")
+        .start()
+        .await?
+        .into_parts();
 
     let admin = AdminClient::builder()
         .service_url(admin_url.parse()?)
