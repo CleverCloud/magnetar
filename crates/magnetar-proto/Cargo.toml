@@ -39,6 +39,11 @@ scalable-topics  = []
 # `Buggify::with_rng_and_filter` under ADR-0097 swarm configurations).
 # Tests opt in via the moonpool integration suite.
 buggify          = []
+# Apache Avro schema support (ADR-0117). Default OFF. Compiles
+# `schema::AvroSchema` and pulls in `apache-avro` with its dependency
+# closure; every other schema (Bytes, String, JSON, Protobuf, KeyValue, ...)
+# is always available. The façade forwards it as `magnetar-driver/schema-avro`.
+schema-avro = ["dep:apache-avro"]
 
 [dependencies]
 bytes        = { workspace = true }
@@ -55,7 +60,7 @@ slab         = { workspace = true }
 uuid         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-apache-avro  = { workspace = true }
+apache-avro  = { workspace = true , optional = true }
 schemars     = { workspace = true }
 hdrhistogram = { workspace = true }
 # Sync primitive only — no I/O, no async, no networking.
@@ -80,10 +85,18 @@ zstd         = { workspace = true }
 snap         = { workspace = true }
 
 [dev-dependencies]
-proptest  = { workspace = true }
-rstest    = { workspace = true }
-tempfile  = { workspace = true }
+schemars  = { workspace = true, features = ["derive"] }
+# `JsonSchema::schema_data` must parse as an Avro schema, because the broker
+# validates JSON schemas with its Avro parser (`schema/json.rs` unit test).
+# That invariant belongs to `JsonSchema`, not to `AvroSchema`, so the test
+# links `apache-avro` itself and keeps running when the opt-in `schema-avro`
+# feature is off.
+apache-avro = { workspace = true }
 # Capturing subscriber for the ADR-0054 log-emission unit tests
 # (`tests/log_capture.rs`). Dev-only — the production dependency graph
 # stays I/O-free (`cargo run -p xtask -- check-no-io-deps`).
 tracing-subscriber = { workspace = true }
+
+[package.metadata.docs.rs]
+# `AvroSchema` is opt-in (ADR-0117); keep it in the published API docs.
+features = ["schema-avro"]

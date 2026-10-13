@@ -125,6 +125,15 @@ crypto-fips = [
     "magnetar-auth-oauth2?/crypto-fips",
 ]
 
+# --- Pulsar schemas (`magnetar_proto::schema`). Always available, no
+# extra dependency: Bytes, String, the primitive / temporal schemas, JSON,
+# PROTOBUF, PROTOBUF_NATIVE, KeyValue, AutoConsume and AutoProduceBytes. ---
+#
+# AVRO (`AvroSchema`): advertises the Avro parsing canonical form as
+# `schema_data` so the broker registry dedups logically-identical schemas.
+# Pulls in `apache-avro`. Default OFF.
+schema-avro = ["magnetar-proto/schema-avro"]
+
 [dependencies]
 magnetar-proto             = { workspace = true }
 magnetar-runtime-tokio     = { workspace = true, optional = true }
@@ -148,7 +157,6 @@ parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, optional = true, features = ["rt", "sync", "test-util"] }
 tracing                    = { workspace = true }
-url                        = { workspace = true }
 uuid                       = { workspace = true }
 
 [dev-dependencies]
@@ -163,6 +171,10 @@ aws-lc-rs          = { workspace = true }
 base64             = { workspace = true }
 magnetar-admin      = { workspace = true }
 magnetar-fakes     = { workspace = true }
+# `tests/e2e_schemas_extended.rs` round-trips an `AvroSchema` against a real
+# broker. The façade's own `schema-avro` feature stays off by default, so the
+# test target enables the sans-io feature itself and runs on every build.
+magnetar-proto     = { workspace = true, features = ["schema-avro"] }
 opentelemetry      = { workspace = true }
 opentelemetry_sdk  = { workspace = true }
 reqwest            = { workspace = true }
@@ -172,6 +184,7 @@ serde_json         = { workspace = true }
 testcontainers     = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
+url                = { workspace = true }
 # `wiremock` powers the `e2e_oauth2` IDP stub. Pure dev-dep — not pulled
 # in for non-test builds.
 wiremock           = { workspace = true }

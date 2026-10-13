@@ -17,7 +17,7 @@ Before opening a PR:
 Pick a routine feature subset that pulls in every magnetar facet EXCEPT `crypto-fips` and `auth-sasl-kerberos` (those need native FIPS / Kerberos toolchains that not every contributor has installed):
 
 ```
-FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,crypto-aws-lc-rs"
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,schema-avro,crypto-aws-lc-rs"
 
 cargo +nightly fmt --check
 cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
@@ -26,6 +26,12 @@ cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targ
 # above never lints because it enables `buggify` and cfg-strips the
 # no-`buggify` stubs (issue #438).
 cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+# The build a user gets with no feature selected has `schema-avro` off (ADR-0117), and
+# `--features "$FEATURES"` / `--all-features` turn it on, so lint and document it
+# once per package: a dev-dependency of one must not switch it back on for another.
+cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+cargo doc -p magnetar-proto --no-deps --locked
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check

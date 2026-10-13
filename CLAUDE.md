@@ -152,6 +152,11 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 # no-buggify axis of the moonpool engine — the seed-replay/sweep cell;
 # --all-features cfg-strips its stubs, so this is the only lint pass over it
 cargo clippy -p magnetar-runtime-moonpool --all-targets --no-default-features --features crypto-aws-lc-rs --locked -- -D warnings
+# default-feature axis — `--all-features` always turns the opt-in `schema-avro` on (ADR-0117),
+# so these are the only lint and doc passes over a build without it; one package per command
+cargo clippy -p magnetar-proto --all-targets --locked -- -D warnings
+cargo clippy -p magnetar-driver --lib --locked -- -D warnings
+cargo doc -p magnetar-proto --no-deps --locked
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. performance.yml also replays fixed

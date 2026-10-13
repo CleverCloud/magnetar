@@ -61,7 +61,7 @@ moonpool-core  = { workspace = true }
 parking_lot    = { workspace = true }
 rustls         = { workspace = true }
 rustls-openssl = { workspace = true, optional = true }
-tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util"] }
+tokio          = { workspace = true, features = ["sync"] }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 
@@ -78,10 +78,6 @@ tokio-util     = { workspace = true }
 # minimum Pulsar wire subset. See ADR-0026 §D2.
 moonpool-sim   = { workspace = true }
 async-trait    = { workspace = true }
-# Moonpool 0.8 captures named, flat `tracing` events inside actor spans and
-# exposes them through `TraceQuery`; no unstable tracing cfg or Valuable/Serde
-# payload bridge is required.
-tracing        = { workspace = true }
 # SASL Kerberos integration test driver. `magnetar-auth-sasl` ships
 # `ScriptedGssapiClient` without enabling the `kerberos` feature so this
 # dev-dep does NOT pull libgssapi into the build (ADR-0029 + ADR-0024 §3).

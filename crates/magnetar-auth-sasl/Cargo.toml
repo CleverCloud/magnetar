@@ -21,7 +21,6 @@ libgssapi      = { workspace = true, optional = true }
 magnetar-proto = { workspace = true }
 parking_lot    = { workspace = true }
 thiserror      = { workspace = true }
-tracing        = { workspace = true }
 
 [features]
 # Real GSSAPI/Kerberos support. Pulls in the `libgssapi` crate, which links
