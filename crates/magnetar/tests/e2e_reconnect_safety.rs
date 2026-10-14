@@ -132,6 +132,25 @@ impl ReconnectGate {
         })
     }
 
+    fn report_timeout(
+        &self,
+        phase: &str,
+        durable: bool,
+        (lower, higher): (Option<magnetar::MessageId>, Option<magnetar::MessageId>),
+        error: tokio::time::error::Elapsed,
+    ) -> tokio::time::error::Elapsed {
+        let observed = self.observations.lock().expect("observation lock");
+        eprintln!(
+            "high-ACK reconnect timeout: phase={phase} durable={durable} lower={lower:?} higher={higher:?} proxy_sessions={} proxy_closed_sessions={} decoded_subscribes={} decoded_ack_entries={} decoded_redeliveries={}: {error}",
+            self.sessions.load(Ordering::SeqCst),
+            self.closed_sessions.load(Ordering::SeqCst),
+            observed.subscribe_start_ids.len(),
+            observed.ack_sets.len(),
+            observed.redeliveries,
+        );
+        error
+    }
+
     fn cut_current(&self) {
         self.cut.notify_waiters();
     }
@@ -627,8 +646,15 @@ async fn exercise_unconfirmed_high_ack_reconnect(
     producer
         .send(OutgoingMessage::with_payload(b"higher".to_vec()).into())
         .await?;
-    let lower = tokio::time::timeout(WAIT, consumer.receive()).await??;
-    let higher = tokio::time::timeout(WAIT, consumer.receive()).await??;
+    let lower = tokio::time::timeout(WAIT, consumer.receive())
+        .await
+        .map_err(|error| gate.report_timeout("receive-lower", durable, (None, None), error))??;
+    let lower_id = lower.message_id;
+    let higher = tokio::time::timeout(WAIT, consumer.receive())
+        .await
+        .map_err(|error| {
+            gate.report_timeout("receive-higher", durable, (Some(lower_id), None), error)
+        })??;
     assert!(
         higher.message_id > lower.message_id,
         "the regression requires the acknowledged message to be above the nacked message"
@@ -656,7 +682,10 @@ async fn exercise_unconfirmed_high_ack_reconnect(
     gate.cut_current_and_wait().await;
     gate.release_broker_frames();
     gate.wait_for_sessions(2).await;
-    let ack_result = tokio::time::timeout(WAIT, ack_task).await??;
+    let ids = (Some(lower_id), Some(higher.message_id));
+    let ack_result = tokio::time::timeout(WAIT, ack_task)
+        .await
+        .map_err(|error| gate.report_timeout("held-ack", durable, ids, error))??;
     assert!(
         ack_result.is_err(),
         "the held CommandAckResponse must leave the local ack unconfirmed"
@@ -674,7 +703,6 @@ async fn exercise_unconfirmed_high_ack_reconnect(
         assert_eq!((start.ledger_id, start.entry_id), (u64::MAX, u64::MAX));
     }
 
-    let lower_id = lower.message_id;
     tokio::time::timeout(WAIT, async {
         loop {
             let message = consumer.receive().await?;
@@ -683,7 +711,8 @@ async fn exercise_unconfirmed_high_ack_reconnect(
             }
         }
     })
-    .await??;
+    .await
+    .map_err(|error| gate.report_timeout("replay-lower", durable, ids, error))??;
 
     consumer.close().await?;
     producer.close().await?;

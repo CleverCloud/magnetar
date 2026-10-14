@@ -5405,6 +5405,116 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn close_during_reconnect_backoff_prevents_control_plane_retry() {
+        use std::task::Poll;
+
+        use magnetar_proto::{AggregatePhase, ControllerIncarnation};
+
+        let inner = empty_aggregate_inner();
+        let consumer = StreamConsumer {
+            inner: Arc::clone(&inner),
+        };
+        let shared = Arc::clone(&inner.subscriber.bootstrap);
+        connect_shared(&shared);
+        let previous = settled_controller_session(&shared, ControllerIncarnation(0));
+        let dag = DagSession {
+            shared: Arc::clone(&shared),
+            route: claim_dag(&shared, 41),
+            session_id: 41,
+            requested_topic: ToOwned::to_owned(&inner.topic),
+            resolved_topic_name: Some(ToOwned::to_owned(&inner.topic)),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        let mut reconnect = Box::pin(inner.reconnect_control_plane(dag, previous));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement lookup")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup body");
+        assert!(bytes.is_empty());
+        shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicUpdate as i32,
+                    scalable_topic_update: Some(magnetar_proto::pb::CommandScalableTopicUpdate {
+                        session_id: lookup.session_id,
+                        error: Some(magnetar_proto::pb::ServerError::ServiceNotReady as i32),
+                        message: Some("replacement lookup temporarily unavailable".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("correlated recoverable lookup rejection");
+        crate::driver::drain_scalable_events_for_test(&shared);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(matches!(consumer.next_event().await,
+            Ok(Some(StreamConsumerEvent::ResyncRequired { reason }))
+            if reason.contains("replacement lookup temporarily unavailable")));
+        let leave_request = {
+            let mut conn = shared.inner.lock();
+            assert!(conn.poll_transmit().is_empty());
+            assert!(conn.scalable_consumer_assignment(42).is_some());
+            conn.peek_next_request_id_for_test()
+        };
+        let mut close = Box::pin(consumer.close());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(close.as_mut(), cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(matches!(
+            consumer.status().phase(),
+            AggregatePhase::Closing | AggregatePhase::Closed
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        std::future::poll_fn(|cx| {
+            assert!(matches!(
+                std::future::Future::poll(reconnect.as_mut(), cx),
+                Poll::Ready(None)
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        close.await.expect("aggregate close");
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let leave = magnetar_proto::decode_one(&mut bytes)
+            .expect("terminal controller leave")
+            .command
+            .scalable_topic_unsubscribe
+            .expect("leave body");
+        assert_eq!((leave.consumer_id, leave.request_id), (42, leave_request));
+        assert!(
+            bytes.is_empty(),
+            "close must not issue a retry Lookup or Subscribe"
+        );
+        {
+            let conn = shared.inner.lock();
+            assert!(conn.scalable_consumer_assignment(42).is_none());
+        }
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+        let status = consumer.status();
+        assert_eq!(status.phase(), AggregatePhase::Closed);
+        assert_eq!(status.receiver_budget_used(), 0);
+    }
+
     #[tokio::test]
     async fn aggregate_reconnect_retains_membership_while_reopening_control_plane() {
         let inner = empty_aggregate_inner();
