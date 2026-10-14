@@ -648,7 +648,10 @@ where
     cluster
         .wait_for("receive matrix cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0 && counts.permits == 0
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
+                && counts.layout_sessions == 0
         })
         .await;
     ReceiveTrace {
@@ -766,7 +769,7 @@ where
     cluster
         .wait_for("budget cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.permits == 0
+            counts.child_consumers == 0 && counts.permits == 0 && counts.layout_sessions == 0
         })
         .await;
     BudgetTrace {
@@ -1199,10 +1202,13 @@ where
     assert_eq!(status.attached_segments, 2);
 
     consumer.close().await.expect("close reconnect aggregate");
+    // DAG close has no broker ACK; wait for the socket bridge to observe it.
     cluster
         .wait_for("reconnect cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.layout_sessions == 0
         })
         .await;
     ReconnectTrace {
@@ -1548,7 +1554,10 @@ where
     cluster
         .wait_for("over-delivery cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.permits == 0 && counts.unacked_messages == 0
+            counts.child_consumers == 0
+                && counts.permits == 0
+                && counts.unacked_messages == 0
+                && counts.layout_sessions == 0
         })
         .await;
     OverDeliveryTrace {
@@ -1811,7 +1820,9 @@ where
     cluster
         .wait_for("acknowledgement-failure cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.layout_sessions == 0
         })
         .await;
     AcknowledgementTrace {
@@ -1930,7 +1941,9 @@ where
     cluster
         .wait_for("negative-acknowledgement cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.layout_sessions == 0
         })
         .await;
     NegativeAcknowledgementTrace {
