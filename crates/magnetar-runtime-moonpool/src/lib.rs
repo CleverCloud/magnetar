@@ -1555,11 +1555,14 @@ mod tests {
     #[test]
     fn scalable_id_allocation_is_unique_and_never_wraps() {
         let shared = ConnectionShared::new(ConnectionConfig::default());
+        let start = std::sync::Barrier::new(4);
         let allocated = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..4)
                 .map(|_| {
                     let shared = shared.clone();
+                    let start = &start;
                     scope.spawn(move || {
+                        start.wait();
                         (0..128)
                             .map(|_| {
                                 (

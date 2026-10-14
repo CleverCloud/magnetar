@@ -496,6 +496,103 @@ fn scalable_subscribe_replays_prebaseline_pushes_and_rejects_identity_drift() {
     ));
 }
 
+#[test]
+fn invalidated_registration_rejects_pushes_until_a_fresh_incarnation() {
+    let mut connection = handshaked_scalable_connection();
+    for epoch in [1, 2] {
+        let incarnation = ControllerIncarnation(epoch);
+        let request = connection
+            .scalable_topic_subscribe(
+                TOPIC,
+                "sub",
+                "member",
+                7,
+                magnetar_proto::ScalableConsumerType::Stream,
+                incarnation,
+            )
+            .expect("register current incarnation");
+        let commands = drain_commands(&mut connection);
+        assert_eq!(commands.len(), 1);
+        let subscribe = commands[0]
+            .scalable_topic_subscribe
+            .as_ref()
+            .expect("Subscribe body");
+        assert_eq!(
+            (subscribe.request_id, subscribe.consumer_id),
+            (request.0, 7)
+        );
+        connection
+            .handle_bytes(
+                Instant::now(),
+                &encode(&pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(
+                        pb::CommandScalableTopicSubscribeResponse {
+                            request_id: request.0,
+                            error: None,
+                            message: None,
+                            assignment: Some(assignment(epoch, vec![assigned(epoch, 0, 65_535)])),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("current Subscribe response");
+        assert!(
+            matches!(connection.poll_event(), Some(ConnectionEvent::ScalableConsumerAssigned {
+            consumer_id: 7, incarnation: current, ..
+        }) if current == incarnation)
+        );
+        assert!(connection.poll_event().is_none());
+        let baseline = connection
+            .scalable_consumer_assignment(7)
+            .expect("current assignment");
+        let baseline = ToOwned::to_owned(baseline);
+        assert_eq!(baseline.layout_epoch(), epoch);
+        let next_request = connection.peek_next_request_id_for_test();
+        assert!(!connection.invalidate_scalable_consumer_registration(8, incarnation));
+        assert!(
+            !connection
+                .invalidate_scalable_consumer_registration(7, ControllerIncarnation(epoch - 1))
+        );
+        assert_eq!(connection.scalable_consumer_assignment(7), Some(&baseline));
+        assert!(connection.invalidate_scalable_consumer_registration(7, incarnation));
+        assert!(connection.scalable_consumer_assignment(7).is_none());
+        connection
+            .handle_bytes(
+                Instant::now(),
+                &encode(&pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+                    scalable_topic_assignment_update: Some(
+                        pb::CommandScalableTopicAssignmentUpdate {
+                            consumer_id: 7,
+                            assignment: assignment(epoch + 1, vec![assigned(epoch + 1, 0, 65_535)]),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("late assignment push");
+        assert!(connection.scalable_consumer_assignment(7).is_none());
+        assert!(connection.poll_event().is_none());
+        assert_eq!(drain_commands(&mut connection), [] as [pb::BaseCommand; 0]);
+        assert_eq!(connection.peek_next_request_id_for_test(), next_request);
+    }
+    let next_request = connection.peek_next_request_id_for_test();
+    assert!(connection.remove_scalable_consumer_registration(7, ControllerIncarnation(2)));
+    let commands = drain_commands(&mut connection);
+    assert_eq!(commands.len(), 1);
+    let leave = commands[0]
+        .scalable_topic_unsubscribe
+        .as_ref()
+        .expect("Unsubscribe body");
+    assert_eq!((leave.consumer_id, leave.request_id), (7, next_request));
+    assert_eq!(connection.peek_next_request_id_for_test(), next_request + 1);
+    assert!(!connection.remove_scalable_consumer_registration(7, ControllerIncarnation(2)));
+    assert_eq!(drain_commands(&mut connection), [] as [pb::BaseCommand; 0]);
+    assert!(connection.poll_event().is_none());
+}
+
 // Keep error exports instantiated in the same public-contract target so future
 // representation changes cannot silently remove their trait bounds.
 #[test]

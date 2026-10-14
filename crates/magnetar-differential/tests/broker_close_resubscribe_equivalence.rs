@@ -621,6 +621,25 @@ fn terminal_connection_rejects_new_raw_consumer_close_and_unsubscribe_without_al
     for unsubscribe in [false, true] {
         let (mut conn, original, now) = attached_terminal_consumer();
         conn.fail_all_pending("connection permanently closed");
+        let next_request = conn.peek_next_request_id_for_test();
+        for handle in [original, ConsumerHandle(u64::MAX)] {
+            let result = if unsubscribe {
+                conn.unsubscribe(handle, false)
+                    .map(|admission| admission.request_id)
+            } else {
+                conn.close_consumer(handle, now)
+            };
+            assert_eq!(result, Err(ConsumerTerminalAdmissionError::Terminal));
+            assert_eq!(conn.peek_next_request_id_for_test(), next_request);
+            assert!(conn.poll_transmit().is_empty());
+        }
+        assert!(
+            conn.consumer(original)
+                .expect("original terminal slot")
+                .state
+                .lock()
+                .closed
+        );
         let raw = conn.subscribe(SubscribeRequest {
             topic: "persistent://public/default/raw-after-terminal".to_owned(),
             subscription: "raw-after-terminal".to_owned(),
@@ -662,4 +681,159 @@ fn terminal_connection_rejects_new_raw_consumer_close_and_unsubscribe_without_al
         assert!(conn.poll_transmit().is_empty());
         assert!(conn.force_close_consumer_forget(raw, now).is_none());
     }
+}
+
+#[test]
+fn unsubscribe_completion_after_cancelled_pending_subscribe_does_not_restore_its_slot() {
+    for rejected in [false, true] {
+        let (mut conn, original, now) = attached_terminal_consumer();
+        let original_slot = ToOwned::to_owned(conn.consumer(original).expect("witness slot"));
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/cancelled-unsubscribe".to_owned(),
+            subscription: "cancelled-unsubscribe".to_owned(),
+            ..Default::default()
+        });
+        let mut wire = conn.poll_transmit();
+        let subscribe = decode_one(&mut wire)
+            .expect("pending Subscribe")
+            .command
+            .subscribe
+            .expect("Subscribe body");
+        assert_eq!(subscribe.consumer_id, handle.0);
+        assert_eq!(
+            subscribe.topic,
+            "persistent://public/default/cancelled-unsubscribe"
+        );
+        assert_ne!(handle, original);
+        assert!(wire.is_empty());
+        let admission = conn
+            .unsubscribe(handle, false)
+            .expect("unsubscribe admitted");
+        let request = admission.request_id;
+        let mut wire = conn.poll_transmit();
+        let unsubscribe = decode_one(&mut wire)
+            .expect("Unsubscribe")
+            .command
+            .unsubscribe
+            .expect("Unsubscribe body");
+        assert_eq!(
+            (unsubscribe.consumer_id, unsubscribe.request_id),
+            (handle.0, request.0)
+        );
+        assert!(wire.is_empty());
+        drop(admission);
+        let close_request = conn.peek_next_request_id_for_test();
+        conn.cancel_consumer_subscribe(handle);
+        let mut wire = conn.poll_transmit();
+        let close = decode_one(&mut wire)
+            .expect("cancelled Subscribe Close")
+            .command
+            .close_consumer
+            .expect("Close body");
+        assert_eq!(
+            (close.consumer_id, close.request_id),
+            (handle.0, close_request)
+        );
+        assert!(wire.is_empty());
+        assert!(conn.consumer(handle).is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            conn.consumer(original).expect("same witness slot"),
+            &original_slot,
+        ));
+        assert!(
+            !conn.has_pending_request_for_test(magnetar_proto::RequestId(subscribe.request_id))
+        );
+        assert!(conn.has_pending_request_for_test(request));
+        let next_request = conn.peek_next_request_id_for_test();
+        assert_eq!(next_request, close_request + 1);
+        feed_success(&mut conn, close_request, now);
+        feed_success(&mut conn, subscribe.request_id, now);
+        if rejected {
+            let mut bytes = BytesMut::new();
+            encode_command(
+                &mut bytes,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::Error as i32,
+                    error: Some(pb::CommandError {
+                        request_id: request.0,
+                        error: pb::ServerError::ServiceNotReady as i32,
+                        message: "subscription was not removed".to_owned(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("encode unsubscribe rejection");
+            conn.handle_bytes(now, &bytes)
+                .expect("late unsubscribe rejection");
+        } else {
+            feed_success(&mut conn, request.0, now);
+        }
+        for id in [subscribe.request_id, request.0, close_request] {
+            let id = magnetar_proto::RequestId(id);
+            assert!(!conn.has_pending_request_for_test(id));
+            assert!(conn.take_outcome(PendingOpKey::Request(id)).is_none());
+        }
+        assert!(conn.consumer(handle).is_none());
+        let witness = conn.consumer(original).expect("unrelated live slot");
+        assert!(!witness.state.lock().closed);
+        assert_eq!(
+            conn.consumer_topic(original),
+            Some("persistent://public/default/terminal-lifecycle")
+        );
+        assert_eq!(conn.peek_next_request_id_for_test(), next_request);
+        assert_eq!(conn.pending_waker_count(), 0);
+        assert!(conn.poll_event().is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+}
+
+#[test]
+fn terminal_connection_wakes_a_close_observer_before_close_admission() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use magnetar_proto::consumer::ConsumerCloseCompletion;
+
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (mut conn, handle, _) = attached_terminal_consumer();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let slot = ToOwned::to_owned(conn.consumer(handle).expect("live slot"));
+    slot.state
+        .lock()
+        .register_close_waker(Waker::from(ToOwned::to_owned(&wakes)));
+    let next_request = conn.peek_next_request_id_for_test();
+    conn.fail_all_pending("terminal close observer");
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(slot.state.lock().closed);
+    assert!(slot.state.lock().close_waiters.is_empty());
+    assert_eq!(
+        slot.state.lock().close_completion(),
+        Some(ConsumerCloseCompletion::Terminal {
+            reason: "terminal close observer".to_owned(),
+        })
+    );
+    conn.fail_all_pending("repeated terminal observation");
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        slot.state.lock().close_completion(),
+        Some(ConsumerCloseCompletion::Terminal {
+            reason: "terminal close observer".to_owned(),
+        })
+    );
+    assert_eq!(conn.peek_next_request_id_for_test(), next_request);
+    assert_eq!(conn.pending_waker_count(), 0);
+    for expected in ["terminal close observer", "repeated terminal observation"] {
+        assert!(
+            matches!(conn.poll_event(), Some(ConnectionEvent::Closed { reason })
+            if reason.as_deref() == Some(expected))
+        );
+    }
+    assert!(conn.poll_event().is_none());
+    assert!(conn.poll_transmit().is_empty());
 }
