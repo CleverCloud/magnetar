@@ -7,6 +7,23 @@
 
 ## Context
 
+### Ordinary consumer subscription cancellation
+
+An ordinary consumer subscribe can also finish at the broker after its caller
+cancels. Dropping only the local slot leaves an Exclusive consumer registered,
+so subsequent consumer IDs are rejected as busy. Cancellation therefore reuses
+the existing forgotten `CloseConsumer` operation before removing the slot when
+the current session has a pending subscribe or an unobserved successful reply.
+The operation is idempotent and its response creates no unowned outcome.
+
+Pulsar 5.0.0 `ServerCnx.handleCloseConsumer` closes the completed ordinary
+consumer or fails its pending creation future, preventing a late creation from
+retaining the abandoned registration. This path needs no abandoned-producer
+recovery ring. Already closed consumers and completed unsubscribes produce no
+additional close. Reset invalidates the subscribe completion bit while retaining
+the stable waiter token; cancellation before replay on a new session sends no
+close there, and a replayed subscribe owns its current-session cleanup.
+
 Issue #406: an `open_producer` lost client-side while completing broker-side leaks a zombie broker-side producer session.
 Every later open under the same producer name is rejected with `ProducerBusy` (code 16, the broker's `NamingException` "Producer with name 'X' is already connected to topic 'T'") for as long as the connection lives.
 Only `pulsar-admin topics unload` recovered the name.

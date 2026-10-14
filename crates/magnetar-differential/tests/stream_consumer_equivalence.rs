@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use magnetar::proto::schema::{AutoConsumeSchema, BytesSchema, Schema, SchemaError};
 use magnetar::scalable::{
     BatchReceivePolicy, SegmentSubscriberApi, StreamConsumer, StreamConsumerEvent, StreamMessage,
@@ -23,6 +23,7 @@ use magnetar_fakes::m1::{
     BrokerFailure, Endpoint, FullAssignment, M1FakeCluster, M1Segment, OperationKind,
     PendingCompletion, ResourceCounts, ScriptedBehavior,
 };
+use prost::Message as _;
 use stream_consumer_support::client::{
     connect_moonpool, connect_moonpool_with_keepalive,
     connect_moonpool_with_terminal_reconnect_budget, connect_tokio, connect_tokio_with_keepalive,
@@ -504,8 +505,8 @@ where
     assert_eq!(status.assigned_segments, 2);
     assert_eq!(status.attached_segments, 2);
     assert_eq!(status.draining_segments, 0);
-    assert!(status.pending_ownership.is_empty());
-    assert!(status.ordering_unprovable.is_empty());
+    assert_eq!(status.pending_ownership, [] as [u64; 0]);
+    assert_eq!(status.ordering_unprovable, [] as [u64; 0]);
     assert!(status.budget_used <= status.budget_limit);
     let final_position = position_trace(&consumer.delivered_position());
 
@@ -759,7 +760,9 @@ where
     assert_eq!(status.budget_limit, minimum_budget);
     assert!(status.budget_used <= status.budget_limit);
 
-    consumer.close().await.expect("close budget aggregate");
+    let close = consumer.close().await;
+    cluster.assert_healthy();
+    close.expect("close budget aggregate");
     cluster
         .wait_for("budget cleanup", |fake| {
             let counts = fake.resource_counts();
@@ -836,7 +839,7 @@ where
         .await
         .expect("subscribe second assignment aggregate");
     let (initial_b, initial_b_resyncs) = wait_for_assignment(&consumer_b, 1, &[]).await;
-    assert!(initial_b_resyncs.is_empty());
+    assert_eq!(initial_b_resyncs, [] as [std::string::String; 0]);
 
     cluster
         .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"old-owner")))
@@ -846,6 +849,9 @@ where
             fake.resource_counts().unacked_messages == 1
         })
         .await;
+    let old_child_identity = cluster
+        .inspect(|fake| fake.active_child_consumer("assignment-sub", 2, "assignment-a-seg-2"))
+        .expect("ordinary physical child before descriptor replacement");
     let old_owner_message = receive(&consumer_a).await;
     assert_eq!(old_owner_message.source().segment_id().0, 2);
     cluster
@@ -876,8 +882,8 @@ where
         wait_for_assignment(&consumer_a, 2, &[1, 2]).await;
     let (first_descriptor_assignment_b, first_descriptor_resync_b) =
         wait_for_assignment(&consumer_b, 2, &[]).await;
-    assert!(first_descriptor_resync_a.is_empty());
-    assert!(first_descriptor_resync_b.is_empty());
+    assert_eq!(first_descriptor_resync_a, [] as [std::string::String; 0]);
+    assert_eq!(first_descriptor_resync_b, [] as [std::string::String; 0]);
     assert_eq!(consumer_a.status().draining_segments(), 1);
 
     cluster
@@ -897,8 +903,8 @@ where
         wait_for_assignment(&consumer_a, 3, &[1, 2]).await;
     let (second_descriptor_assignment_b, second_descriptor_resync_b) =
         wait_for_assignment(&consumer_b, 3, &[]).await;
-    assert!(second_descriptor_resync_a.is_empty());
-    assert!(second_descriptor_resync_b.is_empty());
+    assert_eq!(second_descriptor_resync_a, [] as [std::string::String; 0]);
+    assert_eq!(second_descriptor_resync_b, [] as [std::string::String; 0]);
     assert!(
         !cluster.inspect(|fake| {
             fake.routes().iter().any(|route| {
@@ -921,8 +927,12 @@ where
         })
         .await;
     assert_eq!(
-        cluster.inspect(|fake| fake.active_child_owner("assignment-sub", 2)),
-        Some(member_a),
+        cluster.inspect(|fake| fake.active_child_consumer(
+            "assignment-sub",
+            2,
+            "assignment-a-seg-2"
+        )),
+        Some(old_child_identity),
         "descriptor replacement retains the old child until obsolete FLOW is terminal"
     );
     cluster
@@ -948,7 +958,9 @@ where
     cluster
         .wait_for("replacement FLOW reaches the relocated broker", |fake| {
             fake.assigned_owner("assignment-sub", 2) == Some(member_a)
-                && fake.active_child_owner("assignment-sub", 2) == Some(member_a)
+                && fake
+                    .active_child_consumer("assignment-sub", 2, "assignment-a-seg-2")
+                    .is_some_and(|physical| physical != old_child_identity)
                 && fake.segment_permits("assignment-sub", 2) > 0
         })
         .await;
@@ -970,7 +982,7 @@ where
     assert_eq!(new_owner_status.assigned_segments, 0);
     assert_eq!(new_owner_status.attached_segments, 0);
     assert_eq!(new_owner_status.draining_segments, 0);
-    assert!(new_owner_status.pending_ownership.is_empty());
+    assert_eq!(new_owner_status.pending_ownership, [] as [u64; 0]);
 
     cluster
         .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"new-owner")))
@@ -1002,7 +1014,7 @@ where
     assert_eq!(final_status.assigned_segments, 2);
     assert_eq!(final_status.attached_segments, 2);
     assert_eq!(final_status.draining_segments, 0);
-    assert!(final_status.pending_ownership.is_empty());
+    assert_eq!(final_status.pending_ownership, [] as [u64; 0]);
 
     consumer_a
         .close()
@@ -1336,7 +1348,7 @@ where
         })
         .expect("replace descriptor behind obsolete FLOW");
     let (_, resyncs) = wait_for_assignment(&consumer, 2, &[1, 2]).await;
-    assert!(resyncs.is_empty());
+    assert_eq!(resyncs, [] as [std::string::String; 0]);
     assert_eq!(consumer.status().draining_segments(), 1);
     cluster
         .update(|fake| {
@@ -1603,7 +1615,7 @@ where
         .await
         .expect("subscribe assignment-close-failure takeover");
     let (_, takeover_resyncs) = wait_for_assignment(&takeover, 1, &[]).await;
-    assert!(takeover_resyncs.is_empty());
+    assert_eq!(takeover_resyncs, [] as [std::string::String; 0]);
     let owner_member = cluster
         .inspect(|fake| {
             fake.member(
@@ -1640,9 +1652,9 @@ where
         })
         .expect("apply assignment with a rejected child close");
     let (_, owner_resyncs) = wait_for_assignment(&owner, 1, &[2]).await;
-    assert!(owner_resyncs.is_empty());
+    assert_eq!(owner_resyncs, [] as [std::string::String; 0]);
     let (_, takeover_resyncs) = wait_for_assignment(&takeover, 1, &[1]).await;
-    assert!(takeover_resyncs.is_empty());
+    assert_eq!(takeover_resyncs, [] as [std::string::String; 0]);
     let reason = loop {
         match tokio::time::timeout(magnetar_differential::HANG_GUARD, owner.next_event())
             .await
@@ -1973,11 +1985,66 @@ where
         })
         .await;
     wait_for_initial_flow(&consumer).await;
+    cluster
+        .wait_for("both initial child FLOW commands before close", |fake| {
+            [Endpoint::Segment(1), Endpoint::Segment(2)]
+                .iter()
+                .all(|endpoint| {
+                    fake.routes().iter().any(|route| {
+                        route.endpoint == *endpoint
+                            && route.command == magnetar::proto::pb::base_command::Type::Flow
+                    })
+                })
+        })
+        .await;
 
-    let closer = consumer.clone();
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold the first child close confirmation");
+    let mut receive = Box::pin(consumer.receive());
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(receive.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let mut first_close = Box::pin(consumer.clone().close());
+    tokio::select! {
+        biased;
+        result = &mut first_close => panic!("aggregate close completed before held child confirmation: {result:?}"),
+        () = cluster.wait_for("first child close before caller cancellation", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::Close
+            })
+        }) => {}
+    }
+    let pending_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::Close)
+                .map(|pending| pending.id)
+        })
+        .expect("pending first child close confirmation");
+    drop(first_close);
+    let mut replacement_close = Box::pin(consumer.clone().close());
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(replacement_close.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    cluster
+        .update(|fake| fake.complete_pending(pending_close, PendingCompletion::Succeed))
+        .expect("release the cancelled caller's original child close confirmation");
     let (receive_result, close_result) =
         tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
-            tokio::join!(consumer.receive(), closer.close())
+            tokio::join!(receive, replacement_close)
         })
         .await
         .expect("global close did not wake the parked aggregate receive");
@@ -1990,7 +2057,7 @@ where
     assert_eq!(status.assigned_segments, 0);
     assert_eq!(status.attached_segments, 0);
     assert_eq!(status.draining_segments, 0);
-    assert!(status.pending_ownership.is_empty());
+    assert_eq!(status.pending_ownership, [] as [u64; 0]);
     consumer
         .close()
         .await
@@ -2460,9 +2527,32 @@ where
                         "scripted schema preparation failure",
                     )),
                 )?;
-                fake.enqueue_message(1, Bytes::from_static(b"schema-prepare-failure-one"))?;
                 if batch {
-                    fake.enqueue_message(1, Bytes::from_static(b"schema-prepare-failure-two"))?;
+                    let mut payload = BytesMut::new();
+                    for value in [b"schema-prepare-failure-one", b"schema-prepare-failure-two"] {
+                        let metadata = magnetar::proto::pb::SingleMessageMetadata {
+                            payload_size: i32::try_from(value.len())
+                                .expect("batch payload fits i32"),
+                            ..Default::default()
+                        }
+                        .encode_to_vec();
+                        payload.put_u32(
+                            u32::try_from(metadata.len()).expect("batch metadata fits u32"),
+                        );
+                        payload.extend_from_slice(&metadata);
+                        payload.extend_from_slice(value);
+                    }
+                    fake.enqueue_message_with_metadata(
+                        1,
+                        magnetar::proto::pb::MessageMetadata {
+                            num_messages_in_batch: Some(2),
+                            ..Default::default()
+                        },
+                        payload.freeze(),
+                        vec![0b11],
+                    )?;
+                } else {
+                    fake.enqueue_message(1, Bytes::from_static(b"schema-prepare-failure-one"))?;
                 }
                 Ok(())
             })
@@ -2487,12 +2577,12 @@ where
                 .to_string()
                 .contains("scripted schema preparation failure")
         );
+        let expected_nacks = if batch { 2 } else { 1 };
         cluster
             .wait_for("schema-prepare failure negative acknowledgement", |fake| {
-                fake.routes().iter().any(|route| {
-                    route.command
-                        == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
-                })
+                fake.routes().iter().filter(|route| {
+                    route.command == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
+                }).count() == expected_nacks
             })
             .await;
         schema_prepare_failures_nacked[index] = cluster.inspect(|fake| {
@@ -2502,10 +2592,15 @@ where
                     route.command
                         == magnetar::proto::pb::base_command::Type::RedeliverUnacknowledgedMessages
                 })
-                .count()
-                == 1
+                .map(|route| route.endpoint)
+                .collect::<Vec<_>>()
+                == vec![Endpoint::Segment(1); expected_nacks]
         });
-        assert!(schema_prepare_failures_nacked[index]);
+        assert!(
+            schema_prepare_failures_nacked[index],
+            "schema preparation NACK observation: batch={batch}, routes={:?}",
+            cluster.inspect(|fake| fake.routes().to_vec())
+        );
         prepare_failure_consumer
             .close()
             .await
@@ -2964,10 +3059,9 @@ where
             counts.child_consumers == 2 && counts.pending_operations == 0
         })
         .await;
-    fencing_consumer
-        .close()
-        .await
-        .expect("close schema-fencing aggregate after replacement");
+    let close = fencing_consumer.close().await;
+    cluster.assert_healthy();
+    close.expect("close schema-fencing aggregate after replacement");
     cluster
         .wait_for("schema-fencing cleanup", |fake| {
             let counts = fake.resource_counts();

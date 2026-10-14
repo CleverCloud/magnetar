@@ -68,6 +68,8 @@ struct CancelledRawEventTrace {
     lookup: (u64, Option<String>, bool, bool, u64, usize),
     assigned: (u64, u64, u64, Vec<u64>),
     rejected: (u64, u64, String),
+    reused_assignment: (u64, Vec<u64>),
+    rejected_cleanup_ids: Vec<String>,
 }
 
 async fn observe_cancelled_raw_events<E>(
@@ -217,12 +219,57 @@ where
         } => (consumer_id, incarnation.0, reason),
         event => panic!("unexpected cancelled raw rejection event: {event:?}"),
     };
+    let reused = tokio::time::timeout(
+        HANG_GUARD,
+        client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "cancelled-raw-reused-sub",
+            "cancelled-raw-reused-member",
+            99,
+            ScalableConsumerType::Stream,
+        ),
+    )
+    .await
+    .expect("reusing the cancelled rejected registration did not hang")
+    .expect("the rejected local registration was retired before reuse with a different identity");
+    let reused_assignment = (
+        reused.layout_epoch(),
+        reused
+            .segments()
+            .iter()
+            .map(|segment| segment.segment_id().0)
+            .collect(),
+    );
+    cluster
+        .wait_for("cancelled rejected raw registration cleanup", |fake| {
+            fake.routes().iter().any(|route| {
+                route.command == magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe
+            })
+        })
+        .await;
+    let rejected_cleanup_ids = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.command == magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe
+            })
+            .map(|route| {
+                route
+                    .resource
+                    .clone()
+                    .expect("unsubscribe carries its generated consumer id")
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(rejected_cleanup_ids, ["99"]);
     client.close_scalable_topic_session(lookup.0);
 
     CancelledRawEventTrace {
         lookup,
         assigned,
         rejected,
+        reused_assignment,
+        rejected_cleanup_ids,
     }
 }
 
@@ -545,6 +592,8 @@ async fn cancelled_raw_requests_leave_identical_facade_events() {
     assert_eq!(tokio_trace.assigned.2, 1);
     assert_eq!(tokio_trace.assigned.3, vec![1, 2]);
     assert_eq!(tokio_trace.rejected.0, 99);
+    assert_eq!(tokio_trace.reused_assignment, (1, vec![1, 2]));
+    assert_eq!(tokio_trace.rejected_cleanup_ids, ["99"]);
     assert!(
         tokio_trace
             .rejected
@@ -744,8 +793,8 @@ async fn facade_transaction_api_fences_concurrent_end_requests() {
     );
     moonpool_client.close().await;
 
-    assert!(!tokio_error.is_empty());
-    assert!(!moonpool_error.is_empty());
+    assert_ne!(tokio_error, "");
+    assert_ne!(moonpool_error, "");
     assert_eq!(
         tokio_cluster.inspect(|fake| {
             fake.routes()

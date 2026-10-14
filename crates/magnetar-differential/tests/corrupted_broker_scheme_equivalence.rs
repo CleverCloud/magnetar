@@ -51,7 +51,7 @@
 //! in-process fake broker (moonpool via `TokioProviders`), so this asserts
 //! equivalence of the actual `Client` surface, not of a proto snapshot.
 //!
-//! ADR-0103 assigns this execution to the isolated Tokio evidence domain.
+//! ADR-0121 assigns this execution to the isolated Tokio evidence domain.
 //! That domain runs Tokio's unit/integration tests plus the differential suite
 //! but reports only `magnetar-runtime-tokio` adapter source; its profiles can
 //! never satisfy the separate Moonpool/shared report.

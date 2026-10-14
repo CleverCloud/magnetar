@@ -76,7 +76,7 @@ fn handshaked_scalable_connection() -> Connection {
 fn assigned(id: u64, start: u32, end: u32) -> pb::ScalableAssignedSegment {
     let range = KeyRange::new(start, end).expect("valid range");
     pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+        bucket_ranges: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -206,14 +206,14 @@ fn complete_ids_drive_partial_ack_nack_seek_and_manual_flow() {
         Instant::now(),
     );
     let commands = drain_commands(&mut connection);
-    assert!(
+    assert_eq!(
         commands[0]
             .ack
             .as_ref()
             .expect("cumulative ack command")
             .message_id[0]
-            .ack_set
-            .is_empty()
+            .ack_set,
+        [] as [i64; 0]
     );
 
     let ordinary = complete_id(9, 13, None, None, Vec::new());

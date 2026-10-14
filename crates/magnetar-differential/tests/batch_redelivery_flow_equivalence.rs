@@ -455,8 +455,6 @@ async fn unbatched_shared_delivery_is_unchanged() {
                     partition: -1,
                     batch_index: -1,
                     batch_size: 0,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 },
             },
             "an unbatched entry must still arrive with batch_index -1 and batch_size 0, \

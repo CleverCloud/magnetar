@@ -3,7 +3,7 @@
 //! **Experimental** PIP-460 assignment-driven scalable stream consumption.
 //!
 //! A [`crate::scalable::StreamConsumer`] keeps the controller assignment and validated segment
-//! DAG as its control plane while ordinary Exclusive consumers provide the data
+//! DAG as its control plane while ordinary segment consumers provide the data
 //! plane. The runtime owns keyed controller and child routes for each aggregate;
 //! high-level consumers never compete for the low-level client-global scalable
 //! event queue.
@@ -466,7 +466,7 @@ impl<S: Schema> StreamMessage<S> {
 
     /// Serializable source-qualified message position.
     #[must_use]
-    pub const fn message_id(&self) -> &StreamMessageId {
+    pub fn message_id(&self) -> &StreamMessageId {
         self.token.stream_message_id()
     }
 
@@ -628,7 +628,7 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
         &self.shared.topic
     }
 
-    /// Subscription shared by every ordinary Exclusive child.
+    /// Subscription shared by whole-segment Exclusive and bucket Key_Shared children.
     #[must_use]
     pub fn subscription(&self) -> &str {
         &self.shared.subscription
@@ -678,6 +678,8 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
     }
 
     /// Cumulatively acknowledge the delivery's complete position vector.
+    /// Retrying after partial confirmation resumes its unconfirmed sources,
+    /// including when this message's own source was already confirmed.
     pub async fn acknowledge_cumulative(
         &self,
         message: &StreamMessage<S>,
@@ -788,7 +790,7 @@ impl<S: Schema, E: Engine> StreamConsumer<S, E> {
         result
     }
 
-    /// Highest position delivered to the application for every represented
+    /// Latest position delivered to the application for every represented
     /// segment. This is not an acknowledged cursor or durable checkpoint.
     #[must_use]
     pub fn delivered_position(&self) -> PositionVector {
@@ -938,7 +940,7 @@ where
         }
     }
 
-    /// Set the subscription shared by every ordinary Exclusive child.
+    /// Set the subscription shared by whole-segment and bucket-assigned children.
     #[must_use]
     pub fn subscription(mut self, subscription: impl Into<String>) -> Self {
         self.subscription = Some(subscription.into());
@@ -1067,6 +1069,10 @@ where
     /// assignment. This low-level hook is intended for protocol tooling; normal
     /// applications use [`Self::scalable_stream_consumer`], whose ids and typed
     /// routes are runtime-owned.
+    ///
+    /// Unclaimed registration rejection releases the exact local registration
+    /// and preserves its diagnostic event. Cancelling this future does not
+    /// discard a later successful assignment from [`Self::next_scalable_event`].
     #[doc(hidden)]
     pub async fn scalable_topic_subscribe(
         &self,
@@ -1090,6 +1096,8 @@ where
 
     /// Await the next unclaimed low-level event. Events owned by a high-level
     /// aggregate route are never duplicated here.
+    /// A rejection remains observable after its registration has been removed;
+    /// aggregate retry routes retain their own terminal cleanup authority.
     pub async fn next_scalable_event(&self) -> Option<ScalableEvent> {
         self.inner.next_scalable_event().await
     }
@@ -1716,7 +1724,7 @@ mod tests {
         let dag = magnetar_proto::pb::ScalableTopicDag {
             epoch: 1,
             segments: vec![magnetar_proto::pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+                entry_bucket_splits: Vec::new(),
                 segment_id: 1,
                 hash_start: 0,
                 hash_end: 65_535,
@@ -1755,7 +1763,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: 1,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,

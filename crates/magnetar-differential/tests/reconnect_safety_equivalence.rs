@@ -194,8 +194,6 @@ fn stale_batch_ack_projection(conn: &mut Connection, at: Instant) -> Vec<i64> {
                 partition: -1,
                 batch_index: 1,
                 batch_size: 4,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             }],
             ack_type: pb::command_ack::AckType::Individual,
             properties: Vec::new(),
@@ -226,8 +224,6 @@ fn resume_projection(
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     let request_id = conn.peek_next_request_id_for_test();
     let consumer = conn.subscribe(SubscribeRequest {
@@ -249,8 +245,6 @@ fn resume_projection(
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             }],
             ack_type: pb::command_ack::AckType::Individual,
             properties: Vec::new(),

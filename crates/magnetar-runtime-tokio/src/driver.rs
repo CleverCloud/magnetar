@@ -84,9 +84,26 @@ enum RetryRequest {
 #[cfg(feature = "scalable-topics")]
 fn emit_scalable(shared: &ConnectionShared, event: crate::ScalableEvent) {
     if let Some(unclaimed) = shared.scalable_routes.publish(event) {
+        if let crate::ScalableEvent::ConsumerRejected {
+            consumer_id,
+            incarnation,
+            ..
+        } = &unclaimed
+        {
+            shared
+                .inner
+                .lock()
+                .remove_scalable_consumer_registration(*consumer_id, *incarnation);
+            shared.driver_waker.notify_one();
+        }
         shared.scalable_events.lock().push_back(unclaimed);
         shared.scalable_notify.notify_waiters();
     }
+}
+
+#[cfg(all(test, feature = "scalable-topics"))]
+pub(crate) fn drain_scalable_events_for_test(shared: &Arc<ConnectionShared>) {
+    handle_pending_events(shared).expect("drain driver events");
 }
 
 #[cfg(feature = "scalable-topics")]

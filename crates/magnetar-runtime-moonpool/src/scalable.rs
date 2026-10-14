@@ -388,11 +388,22 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
     /// Replace a fenced controller connection while retaining the logical wire
     /// consumer id and registration identity. The local incarnation always
     /// advances from the originating client capability, even if the controller
-    /// moved to another pooled broker connection.
+    /// moved to another pooled broker connection. Successful handoff retires
+    /// only the old local authority; logical unsubscribe is reserved for
+    /// terminal close or a failed/cancelled owned replacement. Aggregate retries
+    /// retain cleanup ownership without unregistering between attempts.
     pub async fn reopen_controller_session(
         &self,
         dag: &DagSession,
-        previous: ControllerSession,
+        mut previous: ControllerSession,
+    ) -> Result<ControllerSession, ClientError> {
+        self.handoff_controller_session(dag, &mut previous).await
+    }
+
+    async fn handoff_controller_session(
+        &self,
+        dag: &DagSession,
+        previous: &mut ControllerSession,
     ) -> Result<ControllerSession, ClientError> {
         let registration_topic = dag
             .resolved_topic_name
@@ -406,9 +417,23 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         let consumer_id = previous.consumer_id;
         let subscription = previous.subscription.clone();
         let consumer_name = previous.consumer_name.clone();
-        previous.close();
-        self.open_controller_session_with_id(dag, &subscription, &consumer_name, consumer_id)
-            .await
+        previous.route.close();
+        let mut replacement = self
+            .open_controller_attempt(
+                dag,
+                &subscription,
+                &consumer_name,
+                consumer_id,
+                Some(previous),
+            )
+            .await?;
+        previous.detach();
+        for candidate in core::mem::take(&mut previous.cleanup_candidates) {
+            if !Arc::ptr_eq(&candidate.shared, &replacement.shared) {
+                replacement.remember_candidate(candidate);
+            }
+        }
+        Ok(replacement)
     }
 
     async fn open_controller_session_with_id(
@@ -417,6 +442,18 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         subscription: &str,
         consumer_name: &str,
         consumer_id: u64,
+    ) -> Result<ControllerSession, ClientError> {
+        self.open_controller_attempt(dag, subscription, consumer_name, consumer_id, None)
+            .await
+    }
+
+    async fn open_controller_attempt(
+        &self,
+        dag: &DagSession,
+        subscription: &str,
+        consumer_name: &str,
+        consumer_id: u64,
+        mut owner: Option<&mut ControllerSession>,
     ) -> Result<ControllerSession, ClientError> {
         if self.pool.bootstrap_uses_proxy_target() {
             return Err(ClientError::ControllerRoutingUnsupported {
@@ -461,14 +498,32 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
             }
             route
         };
+        if let Some(owner) = owner.as_deref_mut() {
+            owner.remember_candidate(ControllerRegistration {
+                shared: shared.clone(),
+                consumer_id,
+                incarnation,
+            });
+        }
         shared.driver_waker.notify_one();
-        let pending =
+        let mut pending =
             PendingControllerSession::new(shared.clone(), route, consumer_id, incarnation);
 
         let baseline = self
             .controller_baseline_with_timeout(pending.route(), incarnation)
-            .await?;
+            .await;
+        let baseline = match baseline {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                if owner.is_some() {
+                    pending.retain_cleanup();
+                }
+                return Err(error);
+            }
+        };
         Ok(ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared,
             route: pending.into_route(),
             consumer_id,
@@ -480,13 +535,15 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         })
     }
 
-    /// Open one paused, zero-queue Exclusive child against its validated DAG
-    /// placement. Only explicit aggregate FLOW can grant a message permit.
+    /// Open a paused, zero-queue child against its validated DAG placement.
+    /// Whole segments use Exclusive; bucket assignments use sticky Key_Shared
+    /// with GA entry-bucket dispatch. Only aggregate FLOW grants permits.
     pub async fn open_segment_consumer(
         &self,
         source: &magnetar_proto::SegmentSource,
         descriptor: &magnetar_proto::SegmentDescriptor,
         options: &SegmentConsumerOptions,
+        bucket_ranges: &[magnetar_proto::KeyRange],
     ) -> Result<crate::Consumer<P>, ClientError> {
         if descriptor.segment_id != source.segment_id()
             || descriptor.key_range != source.key_range()
@@ -505,7 +562,20 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         let request = magnetar_proto::SubscribeRequest {
             topic: source.topic().to_owned(),
             subscription: options.subscription.clone(),
-            sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
+            sub_type: if bucket_ranges.is_empty() {
+                magnetar_proto::pb::command_subscribe::SubType::Exclusive
+            } else {
+                magnetar_proto::pb::command_subscribe::SubType::KeyShared
+            },
+            key_shared: (!bucket_ranges.is_empty()).then(|| magnetar_proto::KeySharedConfig {
+                mode: magnetar_proto::pb::KeySharedMode::Sticky,
+                sticky_hash_ranges: bucket_ranges
+                    .iter()
+                    .map(|range| (range.start() as i32, range.end() as i32))
+                    .collect(),
+                allow_out_of_order_delivery: false,
+            }),
+            entry_bucket_dispatch: !bucket_ranges.is_empty(),
             receiver_queue_size: 0,
             defer_payload_processing: true,
             consumer_name: Some(format!(
@@ -685,6 +755,15 @@ impl PendingControllerSession {
             .expect("pending controller route must exist until committed")
     }
 
+    fn retain_cleanup(&mut self) {
+        self.route().close();
+        self.shared
+            .inner
+            .lock()
+            .invalidate_scalable_consumer_registration(self.consumer_id, self.incarnation);
+        self.active = false;
+    }
+
     fn into_route(mut self) -> ScalableRoute {
         self.active = false;
         self.route
@@ -829,6 +908,8 @@ impl TransactionOutcomeCompletion {
         }
     }
 }
+
+type CloseResult = Arc<Mutex<Option<Result<(), StreamConsumerError>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregateCloseState {
@@ -1084,8 +1165,6 @@ struct StreamConsumerInner<P: Providers> {
     child_options: SegmentConsumerOptions,
     topic: String,
     subscription: String,
-    consumer_name: String,
-    consumer_id: u64,
     state: Mutex<AggregateState<P>>,
     notify: Notify,
     #[cfg(test)]
@@ -1100,7 +1179,7 @@ impl<P: Providers> std::fmt::Debug for StreamConsumerInner<P> {
             .debug_struct("StreamConsumerInner")
             .field("topic", &self.topic)
             .field("subscription", &self.subscription)
-            .field("consumer_name", &self.consumer_name)
+            .field("consumer_name", &self.child_options.consumer_name)
             .finish_non_exhaustive()
     }
 }
@@ -1153,8 +1232,6 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
             },
             topic,
             subscription: options.subscription,
-            consumer_name: options.consumer_name,
-            consumer_id,
             state: Mutex::new(AggregateState::new(
                 model,
                 ControllerRegistration::from_session(&controller),
@@ -1418,7 +1495,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumer<P> {
         self.inner.next_event().await
     }
 
-    /// Globally close and join every owned task.
+    /// Globally close and join every owned task. Cleanup survives cancellation
+    /// of this caller and remains shared with concurrent close calls.
     pub async fn close(&self) -> Result<(), StreamConsumerError> {
         self.inner.close().await
     }
@@ -1695,6 +1773,18 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             .segment(source.segment_id())
             .expect("model-generated child source exists in its DAG")
             .clone();
+        let bucket_ranges = self
+            .state
+            .lock()
+            .model
+            .assignment()
+            .and_then(|assignment| {
+                assignment
+                    .segments()
+                    .iter()
+                    .find(|segment| segment.source() == source)
+            })
+            .map_or_else(Vec::new, |segment| segment.bucket_ranges().to_vec());
         loop {
             if !self.child_open_is_current(&source, controller_incarnation, child_generation) {
                 return self
@@ -1703,7 +1793,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             }
             match self
                 .subscriber
-                .open_segment_consumer(&source, &descriptor, &self.child_options)
+                .open_segment_consumer(&source, &descriptor, &self.child_options, &bucket_ranges)
                 .await
             {
                 Ok(consumer) => {
@@ -1962,20 +2052,22 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         Err(error) => Err(error),
                     };
                     match result {
-                        Ok(()) => match self
-                            .state
-                            .lock()
-                            .model
-                            .seek_completed(source.segment_id(), child_generation)
-                        {
-                            Ok(next) => actions.extend(next),
-                            Err(error) => {
-                                let next = self.seek_failed_actions()?;
-                                self.spawn_actions(next);
-                                actions.clear();
-                                execution_error = Some(error.into());
+                        Ok(()) => {
+                            let completed = self
+                                .state
+                                .lock()
+                                .model
+                                .seek_completed(source.segment_id(), child_generation);
+                            match completed {
+                                Ok(next) => actions.extend(next),
+                                Err(error) => {
+                                    let next = self.seek_failed_actions()?;
+                                    self.spawn_actions(next);
+                                    actions.clear();
+                                    execution_error = Some(error.into());
+                                }
                             }
-                        },
+                        }
                         Err(error) => {
                             let next = self.seek_failed_actions()?;
                             self.spawn_actions(next);
@@ -2616,6 +2708,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 consumer.settle_transactional_acks(txn_id, committed);
             }
             *completion.work.lock() = Some(work);
+            if outcome == magnetar_proto::TransactionAcknowledgementOutcome::Unknown {
+                self.push_event(StreamConsumerEvent::ResyncRequired {
+                    reason: "transaction acknowledgement outcome is unknown".to_owned(),
+                });
+            }
         }
         #[cfg(test)]
         if let Some(hook) = self.transaction_outcome_park_hook.clone() {
@@ -2902,9 +2999,9 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
     async fn reconnect_control_plane(
         self: &Arc<Self>,
         dag: DagSession,
-        controller: ControllerSession,
+        mut previous: ControllerSession,
     ) -> Option<(DagSession, ControllerSession)> {
-        controller.close();
+        previous.route.close();
         dag.close();
         loop {
             if self.state.lock().close_state.is_closing() {
@@ -2921,12 +3018,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             };
             match self
                 .subscriber
-                .open_controller_session_with_id(
-                    &opened_dag,
-                    &self.subscription,
-                    &self.consumer_name,
-                    self.consumer_id,
-                )
+                .handoff_controller_session(&opened_dag, &mut previous)
                 .await
             {
                 Ok(mut controller) => {
@@ -2945,7 +3037,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         }
                     };
                     if let Err(error) = aligned {
-                        controller.close();
+                        previous = controller;
+                        previous.route.close();
                         opened_dag.close();
                         if !self.retry_control_plane_error(error).await {
                             return None;
@@ -2979,6 +3072,8 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     };
                     self.push_assignment_event(&assignment);
                     if let Err(error) = self.execute_actions(actions).await {
+                        previous = controller;
+                        previous.route.close();
                         self.request_resync(error.to_string());
                         continue;
                     }
@@ -3020,21 +3115,26 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
     }
 
     async fn close(self: &Arc<Self>) -> Result<(), StreamConsumerError> {
-        let (children, registration, tasks, cancelled_opens) = loop {
+        let mut owned_result: Option<CloseResult> = None;
+        loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let cleanup = {
+            {
                 let mut state = self.state.lock();
                 if state.close_state == AggregateCloseState::Closed {
+                    if let Some(result) = owned_result
+                        .as_ref()
+                        .and_then(|result| result.lock().take())
+                    {
+                        return result;
+                    }
                     return match &state.close_error {
                         Some(error) => Err(StreamConsumerError::Failed(error.clone())),
                         None => Ok(()),
                     };
                 }
-                if state.close_state == AggregateCloseState::Closing {
-                    None
-                } else {
+                if state.close_state != AggregateCloseState::Closing {
                     let actions = if state.close_state == AggregateCloseState::Fenced {
                         Vec::new()
                     } else {
@@ -3059,19 +3159,47 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             _ => None,
                         })
                         .collect();
-                    Some((
-                        core::mem::take(&mut state.children),
-                        state.controller_registration.take(),
-                        core::mem::take(&mut state.tasks),
-                        cancelled_opens,
-                    ))
+                    let children = core::mem::take(&mut state.children);
+                    let registration = state.controller_registration.take();
+                    let tasks = core::mem::take(&mut state.tasks);
+                    let result = Arc::new(Mutex::new(None));
+                    owned_result = Some(result.clone());
+                    let inner = self.clone();
+                    let completion_inner = Arc::downgrade(self);
+                    let handle = self.subscriber.spawn_task_with_completion(
+                        "scalable-close",
+                        async move {
+                            inner
+                                .finish_close(
+                                    children,
+                                    registration,
+                                    tasks,
+                                    cancelled_opens,
+                                    result,
+                                )
+                                .await;
+                        },
+                        move || {
+                            if let Some(inner) = completion_inner.upgrade() {
+                                inner.notify.notify_waiters();
+                            }
+                        },
+                    );
+                    Self::track_task(&mut state, handle);
                 }
-            };
-            if let Some(cleanup) = cleanup {
-                break cleanup;
             }
             notified.await;
-        };
+        }
+    }
+
+    async fn finish_close(
+        self: &Arc<Self>,
+        children: BTreeMap<magnetar_proto::SegmentId, ChildRuntime<P>>,
+        registration: Option<ControllerRegistration>,
+        tasks: Vec<ScalableTaskHandle<P>>,
+        cancelled_opens: Vec<(magnetar_proto::SegmentId, magnetar_proto::ChildGeneration)>,
+        result: CloseResult,
+    ) {
         if let Some(registration) = registration {
             registration.close();
         }
@@ -3106,13 +3234,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             if let Some(error) = &first_error {
                 state.close_error = Some(error.to_string());
             }
+            *result.lock() = Some(match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            });
             state.close_state = AggregateCloseState::Closed;
             state.events.push_back(StreamConsumerEvent::Closed);
-        }
-        self.notify.notify_waiters();
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
         }
     }
 
@@ -3300,9 +3427,32 @@ pub struct ControllerSession {
     registration_topic: String,
     subscription: String,
     consumer_name: String,
+    leave_on_drop: bool,
+    cleanup_candidates: Vec<ControllerRegistration>,
 }
 
 impl ControllerSession {
+    fn remember_candidate(&mut self, candidate: ControllerRegistration) {
+        if let Some(existing) = self
+            .cleanup_candidates
+            .iter_mut()
+            .find(|existing| Arc::ptr_eq(&existing.shared, &candidate.shared))
+        {
+            *existing = candidate;
+        } else {
+            self.cleanup_candidates.push(candidate);
+        }
+    }
+
+    fn detach(&mut self) {
+        self.route.close();
+        self.shared
+            .inner
+            .lock()
+            .detach_scalable_consumer_registration(self.consumer_id, self.incarnation);
+        self.leave_on_drop = false;
+    }
+
     /// Runtime-owned wire consumer id.
     #[must_use]
     pub const fn consumer_id(&self) -> u64 {
@@ -3366,8 +3516,7 @@ impl ControllerSession {
         }
     }
 
-    /// Remove the local route. M1 has no wire unregister command, so this does
-    /// not claim broker-side membership removal while the pooled connection lives.
+    /// Fence the local route and queue the broker registration unsubscribe.
     pub fn close(&self) {
         self.route.close();
         self.shared
@@ -3375,12 +3524,17 @@ impl ControllerSession {
             .lock()
             .remove_scalable_consumer_registration(self.consumer_id, self.incarnation);
         self.shared.driver_waker.notify_one();
+        for candidate in &self.cleanup_candidates {
+            candidate.close();
+        }
     }
 }
 
 impl Drop for ControllerSession {
     fn drop(&mut self) {
-        self.close();
+        if self.leave_on_drop {
+            self.close();
+        }
     }
 }
 
@@ -3724,7 +3878,6 @@ fn event_route(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
 
     use bytes::BufMut as _;
     use prost::Message as _;
@@ -3784,10 +3937,8 @@ mod tests {
     }
 
     fn zlib(payload: &[u8]) -> bytes::Bytes {
-        magnetar_proto::compress::compress(
-            magnetar_proto::CompressionKind::Zlib,
-            payload,
-        ).expect("compress test payload")
+        magnetar_proto::compress::compress(magnetar_proto::types::CompressionKind::Zlib, payload)
+            .expect("compress test payload")
     }
 
     fn connect_shared(shared: &Arc<ConnectionShared>) {
@@ -3835,7 +3986,7 @@ mod tests {
         let dag = magnetar_proto::pb::ScalableTopicDag {
             epoch,
             segments: vec![magnetar_proto::pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+                entry_bucket_splits: Vec::new(),
                 segment_id: 1,
                 hash_start: 0,
                 hash_end: 65_535,
@@ -3861,7 +4012,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: epoch,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,
@@ -3888,7 +4039,7 @@ mod tests {
         let parent = "topic://public/default/scaled";
         let segment = |segment_id, hash_start, hash_end, state, parents, children, sealed| {
             magnetar_proto::pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+                entry_bucket_splits: Vec::new(),
                 segment_id,
                 hash_start,
                 hash_end,
@@ -3948,7 +4099,7 @@ mod tests {
             &magnetar_proto::pb::ScalableConsumerAssignment {
                 layout_epoch: 2,
                 segments: vec![magnetar_proto::pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                    bucket_ranges: Vec::new(),
                     segment_id: 1,
                     hash_start: 0,
                     hash_end: 65_535,
@@ -4091,8 +4242,6 @@ mod tests {
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
-            consumer_name: "worker-a".to_owned(),
-            consumer_id: 42,
             state: Mutex::new(AggregateState {
                 model,
                 receive: magnetar_proto::StreamReceiveState::default(),
@@ -4142,8 +4291,6 @@ mod tests {
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
-            consumer_name: "worker-a".to_owned(),
-            consumer_id: 42,
             state: Mutex::new(AggregateState {
                 model,
                 receive: magnetar_proto::StreamReceiveState::default(),
@@ -4267,8 +4414,6 @@ mod tests {
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
-            consumer_name: "worker-a".to_owned(),
-            consumer_id: 42,
             state: Mutex::new(AggregateState {
                 model,
                 receive: magnetar_proto::StreamReceiveState::default(),
@@ -4653,6 +4798,591 @@ mod tests {
         );
     }
 
+    fn settled_controller_session(
+        shared: &Arc<ConnectionShared>,
+        incarnation: magnetar_proto::ControllerIncarnation,
+    ) -> ControllerSession {
+        let assignment = control_plane_fixture().1;
+        {
+            let mut conn = shared.inner.lock();
+            let request = conn
+                .scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "workers",
+                    "worker-a",
+                    42,
+                    magnetar_proto::ScalableConsumerType::Stream,
+                    incarnation,
+                )
+                .expect("admit controller registration");
+            let _ = conn.poll_transmit();
+            conn.handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                        as i32,
+                    scalable_topic_subscribe_response: Some(
+                        magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                            request_id: request.0,
+                            assignment: Some(assignment.to_pb()),
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("settle controller registration");
+            while conn.poll_event().is_some() {}
+        }
+        let epoch = shared.inner.lock().session_epoch();
+        ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
+            shared: shared.clone(),
+            route: shared.scalable_routes.claim_at_epoch(
+                shared.clone(),
+                ScalableRouteKey::consumer(42, incarnation),
+                epoch,
+            ),
+            consumer_id: 42,
+            incarnation,
+            assignment,
+            registration_topic: "topic://public/default/scaled".to_owned(),
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_retry_preserves_member_until_terminal_close() {
+        let subscriber = subscriber_with_allow_list();
+        let shared = subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let mut previous =
+            settled_controller_session(&shared, magnetar_proto::ControllerIncarnation(0));
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 41),
+            session_id: 41,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        for incarnation in 1..=2 {
+            let mut retry = Box::pin(subscriber.handoff_controller_session(&dag, &mut previous));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(retry.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut bytes = shared.inner.lock().poll_transmit();
+            let subscribe = magnetar_proto::decode_one(&mut bytes)
+                .expect("retry subscribe")
+                .command
+                .scalable_topic_subscribe
+                .expect("subscribe body");
+            assert!(bytes.is_empty());
+            {
+                let mut conn = shared.inner.lock();
+                conn.handle_bytes(
+                    std::time::Instant::now(),
+                    &encode(&magnetar_proto::pb::BaseCommand {
+                        r#type:
+                            magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                                as i32,
+                        scalable_topic_subscribe_response: Some(
+                            magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                                request_id: subscribe.request_id,
+                                assignment: None,
+                                error: Some(
+                                    magnetar_proto::pb::ServerError::AuthorizationError as i32,
+                                ),
+                                message: Some("reconnect authorization failed".to_owned()),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                )
+                .expect("failed retry response");
+                while conn.poll_event().is_some() {}
+            }
+            assert!(
+                shared
+                    .scalable_routes
+                    .publish(ScalableEvent::ConsumerRejected {
+                        consumer_id: 42,
+                        incarnation: magnetar_proto::ControllerIncarnation(incarnation),
+                        reason: "reconnect authorization failed".to_owned(),
+                    })
+                    .is_none()
+            );
+            assert!(matches!(
+                retry.await,
+                Err(ClientError::ScalableAssignmentRejected { .. })
+            ));
+            assert!(
+                shared.inner.lock().poll_transmit().is_empty(),
+                "a failed owned retry must not unregister the logical member"
+            );
+            assert!(
+                shared
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_none()
+            );
+            assert_eq!(previous.cleanup_candidates.len(), 1);
+            assert_eq!(
+                previous.cleanup_candidates[0].incarnation,
+                magnetar_proto::ControllerIncarnation(incarnation)
+            );
+        }
+        previous.close();
+        drop(previous);
+        let mut bytes = shared.inner.lock().poll_transmit();
+        assert_eq!(
+            magnetar_proto::decode_one(&mut bytes)
+                .expect("terminal leave after failed retries")
+                .command
+                .r#type,
+            magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe as i32
+        );
+        assert!(
+            bytes.is_empty(),
+            "terminal leave remains singleflight after retry failures"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_handoff_retains_other_connection_cleanup_after_failure_or_timeout() {
+        for timeout in [false, true] {
+            let subscriber = subscriber_with_allow_list();
+            let original = subscriber.bootstrap.clone();
+            connect_shared(&original);
+            let mut previous =
+                settled_controller_session(&original, magnetar_proto::ControllerIncarnation(0));
+            let mut other_subscriber = subscriber_with_allow_list();
+            other_subscriber.operation_timeout = std::time::Duration::from_secs(1);
+            let other = other_subscriber.bootstrap.clone();
+            connect_shared(&other);
+            let dag = DagSession {
+                shared: original.clone(),
+                route: claim_dag(&original, 41),
+                session_id: 41,
+                requested_topic: "topic://public/default/scaled".to_owned(),
+                resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+                controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                controller_broker_url_tls: None,
+                snapshot: control_plane_fixture().0,
+                closed: true,
+            };
+            let mut attempt =
+                Box::pin(other_subscriber.handoff_controller_session(&dag, &mut previous));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(attempt.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let request = magnetar_proto::decode_one(&mut other.inner.lock().poll_transmit())
+                .expect("other connection admission")
+                .command
+                .scalable_topic_subscribe
+                .expect("subscribe");
+            if timeout {
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                assert!(attempt.await.is_err());
+            } else {
+                other.inner.lock().handle_bytes(std::time::Instant::now(), &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request.request_id, assignment: None,
+                        error: Some(magnetar_proto::pb::ServerError::AuthorizationError as i32), message: Some("authorization rejected before registration".to_owned()),
+                    }), ..Default::default()
+                })).expect("other connection rejection");
+                while other.inner.lock().poll_event().is_some() {}
+                assert!(
+                    other
+                        .scalable_routes
+                        .publish(ScalableEvent::ConsumerRejected {
+                            consumer_id: 42,
+                            incarnation: magnetar_proto::ControllerIncarnation(1),
+                            reason: "authorization rejected before registration".to_owned(),
+                        })
+                        .is_none()
+                );
+                assert!(matches!(
+                    attempt.await,
+                    Err(ClientError::ScalableAssignmentRejected { .. })
+                ));
+            }
+            assert!(
+                original
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_some(),
+                "an unsuccessful new connection must retain the original cleanup owner"
+            );
+            assert!(original.inner.lock().poll_transmit().is_empty());
+            assert!(
+                other.inner.lock().poll_transmit().is_empty(),
+                "retry must not leave the logical member"
+            );
+            assert_eq!(previous.cleanup_candidates.len(), 1);
+            let mut resumed = Box::pin(subscriber.handoff_controller_session(&dag, &mut previous));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(resumed.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let resumed_request =
+                magnetar_proto::decode_one(&mut original.inner.lock().poll_transmit())
+                    .expect("resumed admission")
+                    .command
+                    .scalable_topic_subscribe
+                    .expect("subscribe");
+            original
+                .inner
+                .lock()
+                .handle_bytes(
+                    std::time::Instant::now(),
+                    &encode(&magnetar_proto::pb::BaseCommand {
+                        r#type:
+                            magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                                as i32,
+                        scalable_topic_subscribe_response: Some(
+                            magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                                request_id: resumed_request.request_id,
+                                assignment: Some(control_plane_fixture().1.to_pb()),
+                                error: None,
+                                message: None,
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                )
+                .expect("resumed response");
+            while original.inner.lock().poll_event().is_some() {}
+            assert!(
+                original
+                    .scalable_routes
+                    .publish(ScalableEvent::ConsumerAssigned {
+                        consumer_id: 42,
+                        incarnation: magnetar_proto::ControllerIncarnation(1),
+                        assignment: control_plane_fixture().1,
+                    })
+                    .is_none()
+            );
+            let replacement = resumed
+                .await
+                .expect("confirmed handoff after unsuccessful other connection");
+            drop(previous);
+            assert_eq!(replacement.cleanup_candidates.len(), 1);
+            assert!(Arc::ptr_eq(
+                &replacement.cleanup_candidates[0].shared,
+                &other
+            ));
+            assert!(original.inner.lock().poll_transmit().is_empty());
+            assert!(other.inner.lock().poll_transmit().is_empty());
+            replacement.close();
+            drop(replacement);
+            let mut original_leave = original.inner.lock().poll_transmit();
+            assert_eq!(
+                magnetar_proto::decode_one(&mut original_leave)
+                    .expect("terminal current leave")
+                    .command
+                    .scalable_topic_unsubscribe
+                    .expect("leave")
+                    .consumer_id,
+                42
+            );
+            assert!(original_leave.is_empty());
+            if timeout {
+                assert!(
+                    other.inner.lock().poll_transmit().is_empty(),
+                    "terminal leave must follow the unresolved other subscribe"
+                );
+                other.inner.lock().handle_bytes(std::time::Instant::now(), &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request.request_id, assignment: Some(control_plane_fixture().1.to_pb()), error: None, message: None,
+                    }), ..Default::default()
+                })).expect("late success after resumed member closes");
+                assert!(
+                    other.inner.lock().poll_event().is_none(),
+                    "late authority must not resurrect after terminal close"
+                );
+            }
+            let mut other_leave = other.inner.lock().poll_transmit();
+            assert_eq!(
+                magnetar_proto::decode_one(&mut other_leave)
+                    .expect("terminal retained other connection leave")
+                    .command
+                    .scalable_topic_unsubscribe
+                    .expect("leave")
+                    .consumer_id,
+                42
+            );
+            assert!(other_leave.is_empty());
+            assert!(
+                original
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_none()
+            );
+            assert!(
+                other
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_reconnect_retains_membership_while_reopening_control_plane() {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let previous =
+            settled_controller_session(&shared, magnetar_proto::ControllerIncarnation(0));
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 41),
+            session_id: 41,
+            requested_topic: inner.topic.clone(),
+            resolved_topic_name: Some(inner.topic.clone()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        let mut reconnect = Box::pin(inner.reconnect_control_plane(dag, previous));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement lookup")
+            .command;
+        assert_eq!(
+            lookup.r#type,
+            magnetar_proto::pb::base_command::Type::ScalableTopicLookup as i32,
+            "aggregate resynchronization must not unregister its logical member"
+        );
+        assert!(bytes.is_empty());
+        let lookup = lookup.scalable_topic_lookup.expect("lookup body");
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup.session_id,
+                    resolved_topic_name: Some(inner.topic.clone()),
+                    controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                    controller_broker_url_tls: None,
+                    snapshot: control_plane_fixture().0,
+                    segments: control_plane_fixture().0.segments(),
+                    epoch: 1,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let subscribe = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement subscribe")
+            .command;
+        assert_eq!(
+            subscribe.r#type,
+            magnetar_proto::pb::base_command::Type::ScalableTopicSubscribe as i32
+        );
+        assert_eq!(
+            subscribe
+                .scalable_topic_subscribe
+                .expect("subscribe body")
+                .consumer_id,
+            42
+        );
+        assert!(
+            bytes.is_empty(),
+            "no terminal leave between lookup and replacement subscribe"
+        );
+        drop(reconnect);
+    }
+
+    #[tokio::test]
+    async fn controller_handoff_fences_old_owners_on_same_and_different_connections() {
+        for same_connection in [true, false] {
+            let old_shared = subscriber_with_allow_list().bootstrap;
+            connect_shared(&old_shared);
+            let mut previous =
+                settled_controller_session(&old_shared, magnetar_proto::ControllerIncarnation(0));
+            let stale_owner = ControllerRegistration::from_session(&previous);
+            previous.route.close();
+            let new_shared = if same_connection {
+                old_shared.clone()
+            } else {
+                let shared = subscriber_with_allow_list().bootstrap;
+                connect_shared(&shared);
+                shared
+            };
+            let replacement =
+                settled_controller_session(&new_shared, magnetar_proto::ControllerIncarnation(1));
+            previous.detach();
+            drop(previous);
+            stale_owner.close();
+            assert!(
+                old_shared.inner.lock().poll_transmit().is_empty(),
+                "retired owners cannot unregister the resumed member"
+            );
+            assert!(
+                new_shared
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_some()
+            );
+            if !same_connection {
+                assert!(
+                    old_shared
+                        .inner
+                        .lock()
+                        .scalable_consumer_assignment(42)
+                        .is_none()
+                );
+            }
+            replacement.close();
+            drop(replacement);
+            let mut bytes = new_shared.inner.lock().poll_transmit();
+            let frame = magnetar_proto::decode_one(&mut bytes).expect("terminal leave");
+            assert_eq!(
+                frame.command.r#type,
+                magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe as i32
+            );
+            assert_eq!(
+                frame
+                    .command
+                    .scalable_topic_unsubscribe
+                    .expect("terminal leave body")
+                    .consumer_id,
+                42
+            );
+            assert!(bytes.is_empty(), "terminal cleanup is idempotent");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_controller_reopen_preserves_terminal_cleanup() {
+        let subscriber = subscriber_with_allow_list();
+        connect_shared(&subscriber.bootstrap);
+        let previous = settled_controller_session(
+            &subscriber.bootstrap,
+            magnetar_proto::ControllerIncarnation(0),
+        );
+        let dag = DagSession {
+            shared: subscriber.bootstrap.clone(),
+            route: claim_dag(&subscriber.bootstrap, 41),
+            session_id: 41,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        let mut reopen = Box::pin(subscriber.reopen_controller_session(&dag, previous));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reopen.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = subscriber.bootstrap.inner.lock().poll_transmit();
+        let subscribe = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement subscribe")
+            .command
+            .scalable_topic_subscribe
+            .expect("replacement body");
+        assert!(bytes.is_empty());
+        drop(reopen);
+        assert!(
+            subscriber.bootstrap.inner.lock().poll_transmit().is_empty(),
+            "leave must wait for the cancelled subscribe response"
+        );
+        {
+            let mut conn = subscriber.bootstrap.inner.lock();
+            conn.handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                        as i32,
+                    scalable_topic_subscribe_response: Some(
+                        magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                            request_id: subscribe.request_id,
+                            assignment: Some(control_plane_fixture().1.to_pb()),
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("settle cancelled replacement");
+            let mut bytes = conn.poll_transmit();
+            assert_eq!(
+                magnetar_proto::decode_one(&mut bytes)
+                    .expect("deferred terminal leave")
+                    .command
+                    .r#type,
+                magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe as i32
+            );
+            assert!(bytes.is_empty());
+            assert!(conn.scalable_consumer_assignment(42).is_none());
+        }
+        let previous = settled_controller_session(
+            &subscriber.bootstrap,
+            magnetar_proto::ControllerIncarnation(2),
+        );
+        let mut wrong_topic = dag;
+        wrong_topic.resolved_topic_name = Some("topic://public/default/other".to_owned());
+        assert!(matches!(
+            subscriber
+                .reopen_controller_session(&wrong_topic, previous)
+                .await,
+            Err(ClientError::ControllerRoutingUnsupported { .. })
+        ));
+        let mut bytes = subscriber.bootstrap.inner.lock().poll_transmit();
+        assert_eq!(
+            magnetar_proto::decode_one(&mut bytes)
+                .expect("failed replacement terminal leave")
+                .command
+                .r#type,
+            magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe as i32
+        );
+        assert!(
+            bytes.is_empty(),
+            "failed replacement creates no new subscription"
+        );
+        assert!(
+            subscriber
+                .bootstrap
+                .inner
+                .lock()
+                .scalable_consumer_assignment(42)
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn controller_reopen_keeps_identity_and_advances_incarnation() {
         let subscriber = subscriber_with_allow_list();
@@ -4670,21 +5400,11 @@ mod tests {
             snapshot,
             closed: true,
         };
-        let epoch = subscriber.bootstrap.inner.lock().session_epoch();
-        let previous = ControllerSession {
-            shared: subscriber.bootstrap.clone(),
-            route: subscriber.bootstrap.scalable_routes.claim_at_epoch(
-                subscriber.bootstrap.clone(),
-                ScalableRouteKey::consumer(42, magnetar_proto::ControllerIncarnation(0)),
-                epoch,
-            ),
-            consumer_id: 42,
-            incarnation: magnetar_proto::ControllerIncarnation(0),
-            assignment: assignment.clone(),
-            registration_topic: "topic://public/default/scaled".to_owned(),
-            subscription: "workers".to_owned(),
-            consumer_name: "worker-a".to_owned(),
-        };
+        let previous = settled_controller_session(
+            &subscriber.bootstrap,
+            magnetar_proto::ControllerIncarnation(0),
+        );
+        let stale_owner = ControllerRegistration::from_session(&previous);
         let task_subscriber = subscriber.clone();
         let task = tokio::spawn(async move {
             task_subscriber
@@ -4695,15 +5415,42 @@ mod tests {
 
         let subscribe = {
             let mut transmit = subscriber.bootstrap.inner.lock().poll_transmit();
-            magnetar_proto::decode_one(&mut transmit)
+            let command = magnetar_proto::decode_one(&mut transmit)
                 .expect("controller subscribe frame")
-                .command
+                .command;
+            assert_eq!(
+                command.r#type,
+                magnetar_proto::pb::base_command::Type::ScalableTopicSubscribe as i32,
+                "reconnect must not stage terminal unsubscribe before subscribe"
+            );
+            command
                 .scalable_topic_subscribe
                 .expect("controller subscribe payload")
         };
         assert_eq!(subscribe.consumer_id, 42);
         assert_eq!(subscribe.subscription, "workers");
         assert_eq!(subscribe.consumer_name, "worker-a");
+        {
+            let mut conn = subscriber.bootstrap.inner.lock();
+            conn.handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                        as i32,
+                    scalable_topic_subscribe_response: Some(
+                        magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                            request_id: subscribe.request_id,
+                            assignment: Some(assignment.to_pb()),
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("settle replacement protocol registration");
+            while conn.poll_event().is_some() {}
+        }
         assert!(
             subscriber
                 .bootstrap
@@ -4732,6 +5479,19 @@ mod tests {
                 .is_none()
         );
         let mut reopened = task.await.expect("task").expect("reopened controller");
+        stale_owner.close();
+        assert!(
+            subscriber.bootstrap.inner.lock().poll_transmit().is_empty(),
+            "old incarnation cannot leave the new registration"
+        );
+        assert!(
+            subscriber
+                .bootstrap
+                .inner
+                .lock()
+                .scalable_consumer_assignment(42)
+                .is_some()
+        );
         assert_eq!(reopened.consumer_id(), 42);
         assert_eq!(
             reopened.incarnation(),
@@ -4796,6 +5556,8 @@ mod tests {
         };
         let epoch = shared.inner.lock().session_epoch();
         let mut controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared: shared.clone(),
             route: shared.scalable_routes.claim_at_epoch(
                 shared.clone(),
@@ -4875,6 +5637,8 @@ mod tests {
         };
         let session_epoch = first_shared.inner.lock().session_epoch();
         let mut controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared: first_shared.clone(),
             route: first_shared.scalable_routes.claim_at_epoch(
                 first_shared.clone(),
@@ -4926,6 +5690,8 @@ mod tests {
         };
         let session_epoch = second_shared.inner.lock().session_epoch();
         let mut controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared: second_shared.clone(),
             route: second_shared.scalable_routes.claim_at_epoch(
                 second_shared.clone(),
@@ -4976,6 +5742,8 @@ mod tests {
         };
         let session_epoch = closed_shared.inner.lock().session_epoch();
         let mut controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared: closed_shared.clone(),
             route: closed_shared.scalable_routes.claim_at_epoch(
                 closed_shared.clone(),
@@ -5074,6 +5842,8 @@ mod tests {
             closed: true,
         };
         let controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
             shared: shared.clone(),
             route: shared.scalable_routes.claim_at_epoch(
                 shared.clone(),
@@ -5254,24 +6024,24 @@ mod tests {
             .apply_assignment(empty)
             .expect("sealed parent loses ownership while delivery is live");
         inner.execute_actions(stop).await.expect("stop parent flow");
-        assert!(
+        assert_eq!(
             inner
                 .state
                 .lock()
                 .model
                 .apply_assignment(assignment)
-                .expect("sealed parent regains ownership while draining")
-                .is_empty()
+                .expect("sealed parent regains ownership while draining"),
+            [] as [magnetar_proto::StreamConsumerAction; 0]
         );
         {
             let mut state = inner.state.lock();
             assert_eq!(state.model.pending_ownership(), vec![child.source.clone()]);
-            assert!(
+            assert_eq!(
                 state
                     .model
                     .observe_terminal(child.source.segment_id(), child.generation)
-                    .expect("sealed parent terminal with live acknowledgement")
-                    .is_empty()
+                    .expect("sealed parent terminal with live acknowledgement"),
+                [] as [magnetar_proto::StreamConsumerAction; 0]
             );
         }
         let _ = child_shared.inner.lock().poll_transmit();
@@ -5339,7 +6109,10 @@ mod tests {
 
         let state = inner.state.lock();
         assert!(state.children.is_empty());
-        assert!(state.model.pending_ownership().is_empty());
+        assert_eq!(
+            state.model.pending_ownership(),
+            [] as [magnetar_proto::SegmentSource; 0]
+        );
         assert!(
             state
                 .model
@@ -5854,7 +6627,7 @@ mod tests {
             state.model.phase(),
             magnetar_proto::AggregatePhase::ResyncRequired
         );
-        assert!(state.model.status().pending_ownership().is_empty());
+        assert_eq!(state.model.status().pending_ownership(), []);
         assert!(state.children.is_empty());
         assert!(state.flow_reservations.is_empty());
         assert!(state.reconnect_requested);
@@ -5986,7 +6759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_outcome_controls_child_reconnect_ack_state() {
+    async fn transaction_outcome_controls_child_timeout_tracking() {
         let (inner, child_shared) = aggregate_inner_with_child();
         let child = inner
             .state
@@ -6004,6 +6777,21 @@ mod tests {
             batch_index: -1,
             batch_size: 0,
         };
+        {
+            let mut tracker = magnetar_proto::trackers::UnackedMessageTracker::new(
+                child.handle(),
+                std::time::Duration::from_secs(30),
+            );
+            tracker.add(message_id, std::time::Instant::now());
+            child_shared
+                .inner
+                .lock()
+                .consumer(child.handle())
+                .expect("attached child")
+                .state
+                .lock()
+                .unacked_tracker = Some(tracker);
+        }
         let aborted = magnetar_proto::TxnId::new(19, 29);
         let ack_child = child.clone();
         let ack = tokio::spawn(async move {
@@ -6040,7 +6828,10 @@ mod tests {
             .handle_bytes(child_shared.now_instant(), &encode(&response))
             .expect("accept transactional acknowledgement");
         ack.await.expect("ack task").expect("ack accepted");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
+        assert!(
+            child.unacked_deadline_for_test().is_some(),
+            "uncommitted delivery remains tracked"
+        );
 
         inner
             .transaction_outcome(
@@ -6049,7 +6840,31 @@ mod tests {
             )
             .await
             .expect("abort propagation");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
+        assert!(
+            child.unacked_deadline_for_test().is_some(),
+            "uncommitted delivery remains tracked"
+        );
+
+        let abort_deadline = child.unacked_deadline_for_test().expect("abort timeout");
+        {
+            let slot = child_shared
+                .inner
+                .lock()
+                .consumer(child.handle())
+                .expect("child slot")
+                .to_owned();
+            let mut state = slot.state.lock();
+            let tracker = state.unacked_tracker.as_mut().expect("timeout tracker");
+            assert_eq!(
+                tracker.poll(abort_deadline),
+                vec![magnetar_proto::trackers::UnackedAction::RedeliverExpired {
+                    handle: child.handle(),
+                    message_ids: vec![message_id],
+                }],
+                "abort preserves exact message redelivery"
+            );
+            tracker.add(message_id, abort_deadline);
+        }
 
         let committed = magnetar_proto::TxnId::new(20, 30);
         let ack_child = child.clone();
@@ -6087,7 +6902,10 @@ mod tests {
             .handle_bytes(child_shared.now_instant(), &encode(&response))
             .expect("accept committed acknowledgement");
         ack.await.expect("ack task").expect("ack accepted");
-        assert_eq!(child.last_acked_message_id_for_test(), None);
+        assert!(
+            child.unacked_deadline_for_test().is_some(),
+            "uncommitted delivery remains tracked"
+        );
 
         inner
             .transaction_outcome(
@@ -6096,7 +6914,25 @@ mod tests {
             )
             .await
             .expect("commit propagation");
-        assert_eq!(child.last_acked_message_id_for_test(), Some(message_id));
+        let commit_deadline = child
+            .unacked_deadline_for_test()
+            .expect("retained timer bucket");
+        let slot = child_shared
+            .inner
+            .lock()
+            .consumer(child.handle())
+            .expect("child slot")
+            .to_owned();
+        assert!(
+            slot.state
+                .lock()
+                .unacked_tracker
+                .as_mut()
+                .expect("timeout tracker")
+                .poll(commit_deadline)
+                .is_empty(),
+            "commit prevents message redelivery"
+        );
     }
 
     #[tokio::test]
@@ -6152,17 +6988,20 @@ mod tests {
         assert_eq!(inner.state.lock().children.len(), 1);
         let mut first_staged = child_shared.inner.lock().poll_transmit();
         let mut first_flows = 0;
+        let mut original_close = None;
         while !first_staged.is_empty() {
-            if magnetar_proto::decode_one(&mut first_staged)
+            let command = magnetar_proto::decode_one(&mut first_staged)
                 .expect("decode first outcome work")
-                .command
-                .flow
-                .is_some()
-            {
+                .command;
+            if command.flow.is_some() {
                 first_flows += 1;
+            }
+            if let Some(close) = command.close_consumer {
+                assert!(original_close.replace(close.request_id).is_none());
             }
         }
         assert_eq!(first_flows, 0, "closing children reject stale FLOW work");
+        let close_request_id = original_close.expect("original confirmation-bearing close");
 
         let mut retry = Box::pin(inner.propagate_transaction_outcome(
             txn_id,
@@ -6177,23 +7016,27 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        let close_request_id = {
+        {
             let mut staged = child_shared.inner.lock().poll_transmit();
-            let mut request_id = None;
+            let mut retried_closes = 0;
             let mut retried_flows = 0;
             while !staged.is_empty() {
                 let command = magnetar_proto::decode_one(&mut staged)
                     .expect("decode child close")
                     .command;
                 if let Some(close) = command.close_consumer {
-                    request_id = Some(close.request_id);
+                    assert_eq!(close.request_id, close_request_id);
+                    retried_closes += 1;
                 }
                 if command.flow.is_some() {
                     retried_flows += 1;
                 }
             }
             assert_eq!(retried_flows, 0, "completed FLOW prefix is not replayed");
-            request_id.expect("retry owns a confirmation-bearing close")
+            assert_eq!(
+                retried_closes, 0,
+                "retry resumes the original close request"
+            );
         };
         let success = magnetar_proto::pb::BaseCommand {
             r#type: magnetar_proto::pb::base_command::Type::Success as i32,
@@ -6396,6 +7239,7 @@ mod tests {
                         consumer_name: "worker-a".to_owned(),
                         schema: magnetar_proto::pb::Schema::default(),
                     },
+                    &[],
                 )
                 .await,
             Err(ClientError::ControllerUnavailable)
@@ -6424,6 +7268,93 @@ mod tests {
             ),
             "unexpected driverless TLS controller error: {controller_error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn assigned_bucket_ranges_select_sticky_segment_dispatch() {
+        for bucket_ranges in [
+            Vec::new(),
+            vec![
+                magnetar_proto::KeyRange::new(0, 32767).expect("range"),
+                magnetar_proto::KeyRange::new(32768, 65535).expect("range"),
+            ],
+        ] {
+            let subscriber = subscriber_with_allow_list();
+            connect_shared(&subscriber.bootstrap);
+            let (snapshot, assignment) = control_plane_fixture();
+            let source = assignment.segments()[0].source();
+            let descriptor = snapshot.segment(source.segment_id()).expect("descriptor");
+            let options = SegmentConsumerOptions {
+                subscription: "workers".to_owned(),
+                consumer_name: "member".to_owned(),
+                schema: magnetar_proto::pb::Schema::default(),
+            };
+            let mut opening = Box::pin(subscriber.open_segment_consumer(
+                &source,
+                descriptor,
+                &options,
+                &bucket_ranges,
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(opening.as_mut(), &mut context).is_pending());
+            let command =
+                magnetar_proto::decode_one(&mut subscriber.bootstrap.inner.lock().poll_transmit())
+                    .expect("subscribe")
+                    .command
+                    .subscribe
+                    .expect("subscribe body");
+            if bucket_ranges.is_empty() {
+                assert_eq!(
+                    command.sub_type,
+                    magnetar_proto::pb::command_subscribe::SubType::Exclusive as i32
+                );
+                assert!(command.key_shared_meta.is_none());
+            } else {
+                assert_eq!(
+                    command.sub_type,
+                    magnetar_proto::pb::command_subscribe::SubType::KeyShared as i32
+                );
+                let meta = command.key_shared_meta.expect("bucket routing metadata");
+                assert_eq!(meta.entry_bucket_dispatch, Some(true));
+                assert_eq!(
+                    meta.key_shared_mode,
+                    magnetar_proto::pb::KeySharedMode::Sticky as i32
+                );
+                assert_eq!(
+                    meta.hash_ranges,
+                    vec![
+                        magnetar_proto::pb::IntRange {
+                            start: 0,
+                            end: 32767
+                        },
+                        magnetar_proto::pb::IntRange {
+                            start: 32768,
+                            end: 65535
+                        }
+                    ]
+                );
+            }
+            subscriber
+                .bootstrap
+                .inner
+                .lock()
+                .handle_bytes(
+                    std::time::Instant::now(),
+                    &encode(&magnetar_proto::pb::BaseCommand {
+                        r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+                        success: Some(magnetar_proto::pb::CommandSuccess {
+                            request_id: command.request_id,
+                            schema: None,
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .expect("subscribe success");
+            subscriber.bootstrap.event_waker.notify_waiters();
+            let consumer = opening.await.expect("child");
+            assert!(consumer.is_paused());
+            assert_eq!(consumer.available_permits(), 0);
+        }
     }
 
     #[tokio::test]
@@ -6589,6 +7520,76 @@ mod tests {
                 .lock()
                 .transaction_registrations
                 .contains_key(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_keeps_owned_cleanup_running() {
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let mut first = Box::pin(inner.close());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(first.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let close_request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut staged = child_shared.inner.lock().poll_transmit();
+                while !staged.is_empty() {
+                    let command = magnetar_proto::decode_one(&mut staged)
+                        .expect("decode child close")
+                        .command;
+                    if let Some(close) = command.close_consumer {
+                        assert!(staged.is_empty(), "one confirmation-bearing child close");
+                        return close.request_id;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child close starts before caller cancellation");
+        drop(first);
+        let mut second = Box::pin(inner.close());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(second.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let success = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close_request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&success))
+            .expect("confirm original child close");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("cleanup outlives initiating close future")
+            .expect("second close completes");
+        inner.reap_completed_tasks();
+        let state = inner.state.lock();
+        assert_eq!(state.close_state, AggregateCloseState::Closed);
+        assert!(state.children.is_empty());
+        assert!(state.tasks.is_empty());
+        assert!(state.controller_registration.is_none());
+        assert!(state.flow_reservations.is_empty());
+        assert!(
+            state
+                .model
+                .segment_phase(magnetar_proto::SegmentId(1))
+                .is_none()
+        );
+        assert_eq!(state.model.status().receiver_budget_used(), 0);
+        assert!(
+            child_shared.inner.lock().poll_transmit().is_empty(),
+            "no duplicate close"
         );
     }
 

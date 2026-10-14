@@ -5,7 +5,7 @@
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, stream-consumer, assignment, ordering, flow-control, transactions, coverage
 - **Supersedes**: The drop-on-DAG-change and unimplemented-data-plane scope decisions that survived [ADR-0031](0031-pip-460-scalable-subscription-scope.md) and were repeated in [ADR-0093](0093-pip-460-upstream-wire-surface.md), plus ADR-0093 § D5's blanket rejection of non-advancing consumer assignments and [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s preserved assignment-side contrast
-- **Preserves**: ADR-0093's vendored Pulsar 5.0.0-M1 wire surface and per-connection capability negotiation, plus [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
+- **Preserves**: ADR-0093's vendored Pulsar 5.0.0 GA wire surface and per-connection capability negotiation, plus [ADR-0095](0095-ignore-a-re-sent-scalable-layout-epoch.md)'s duplicate-layout handling
 - **Amends**: The compiled coverage closure and record-less-file treatment recorded by [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md) and retained by [ADR-0118](0118-isolate-sim-coverage-current-pass-artifacts.md)
 
 ## Context
@@ -45,10 +45,12 @@ High-level routes are keyed by event family, session or consumer id, and a local
 The route is installed before registration is written; pushes received before the subscribe response are buffered; the validated response becomes the incarnation baseline; and buffered then later pushes apply in wire order.
 Exact duplicates are discarded, lower epochs fail closed, and callbacks, opens, closes, acknowledgements, and reconnect results from an old incarnation cannot mutate current state.
 The low-level global scalable event API only receives events that no owned route claimed, so two aggregate consumers cannot steal or duplicate each other's events.
+An unclaimed `ConsumerRejected` retires its exact local registration and schedules logical unsubscribe while preserving the rejection diagnostic in the raw event queue. A cancelled raw registration that succeeds still exposes `ConsumerAssigned`; claimed aggregate retry routes retain their terminal cleanup ownership.
 Route retirement removes live ownership immediately and retains at most 256 logical tombstones, compacted to the newest consumer incarnation, so recent late events remain fenced without allowing abandoned route identities to grow memory without bound.
 Connection replacement and route overflow request resynchronization, while physical connection closure, explicit route closure, and peer closure fail the aggregate terminally instead of entering the reconnect loop again.
 Resynchronization marks reconnect intent before child teardown, suppresses expected close errors from obsolete child loops, and waits for confirmed children plus in-flight child opens to finish before registering a replacement controller baseline.
-Because M1 cannot unregister a scalable member logically, a broker rejection encountered during that replacement registration is retried on provider time until physical connection replacement releases the old member or the aggregate closes.
+Resynchronization reattaches the same scalable member identity without a logical unsubscribe, then retires the obsolete local registration and route after replacement succeeds. Logical unsubscribe belongs to terminal close or drop; it cannot race an asynchronous deletion against the replacement registration.
+A broker rejection during replacement registration is retried on provider time until registration succeeds or the aggregate closes; the physical-connection grace fallback describes historical M1 behavior.
 
 Controller and segment authorities are taken from broker-authored direct URLs matching the bootstrap transport: plaintext uses plaintext authority and TLS uses TLS authority.
 Every published authority passes the existing redirect allow-list before credentials are reused.
@@ -88,9 +90,12 @@ MAX_FRAME_SIZE
 + 5 * MAX_STREAM_POSITION_SIZE
 + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
++ DELIVERY_ACK_GENERATION_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 13,697,152 bytes
+= 13,697,160 bytes
 ```
+
+`DELIVERY_ACK_GENERATION_OVERHEAD` is one `u64` charged once with each live delivery lease; the canonical delivered-position map retains its existing charge.
 
 The default and documentation examples use 16 MiB.
 The bound covers allocations whose size Magnetar controls or derives from the wire; arbitrary additional memory allocated inside user-defined `S::Owned` during decoding is outside it.
@@ -109,11 +114,13 @@ Foreign, stale seek/rebalance-generation, and retired-source authority is reject
 
 `StreamMessageId` and `PositionVector` use Magnetar's strict version-1 `MSTR` binary envelope.
 `DeliveryToken` is not serializable, and a deserialized position restores a value rather than acknowledgement authority.
+`DeliveryToken::stream_message_id()` still returns `&StreamMessageId`; it is non-const because tokens share the canonical ID through `Arc`.
 An ordinary `MessageId` has no scalable segment field; scalable identity exists in the canonical source plus `StreamMessageId` or `PositionVector`.
 The canonical ordinary `MessageIdData` component is capped at 65,536 bytes during both in-memory construction and byte decoding, so an oversized `ack_set` or chunk pointer cannot enter an otherwise bounded envelope.
 
 The aggregate supports individual ack, batch ack, cumulative vector ack, restored-vector ack, negative ack, and individual or vector acknowledgement inside a Pulsar transaction.
 A vector fans out with ordinary per-segment semantics; partial success reports confirmed and failed components, and retries are idempotent for confirmed components.
+The same cumulative token retries all unconfirmed sources in its saved vector even after its own source is confirmed, without regaining receive or individual-acknowledgement authority.
 When an ordinary child receives a partial batch, expansion exposes only `ack_set`-selected members and retains the same effective mask in every source-qualified canonical id.
 Individual and cumulative acknowledgements seed from that mask; a cumulative acknowledgement inside the entry clears only selected positions through its index and preserves later selected positions as the residual `ack_set`.
 
@@ -147,17 +154,22 @@ Each open attempt is bounded by the ordinary operation deadline, while `Consumer
 Assignment removal, incarnation replacement, aggregate close, or permanent failure fences that loop.
 
 Explicit close through any clone is globally definitive locally and awaits route, task, and child cleanup.
+Cleanup runs in an owned task using the existing aggregate task registry, so cancelling the initiating close future cannot abandon child confirmations or strand concurrent close callers. Each caller waits for the same completion notification; the initiating caller retains its original structured error result.
 A transactional acknowledgement or registration that races aggregate close resolves as closed after close-owned model cleanup, rather than exposing an internal invalid-phase failure.
 Final drop is synchronous best-effort fencing and does not block or spawn.
-M1 has no scalable-consumer unregister command, so logical close on a pooled controller connection cannot promise broker membership removal; membership may remain until the physical pooled connection closes or the broker expires it.
-No existing close, unsubscribe, or layout-close command is repurposed as an unregister command.
+GA close requests logical scalable unsubscribe after any in-flight registration responses settle; it does not await the unsubscribe's `CommandSuccess`.
+The broker's physical-connection grace period remains a fallback when explicit unregister fails.
 
 ### Fake, differential, e2e, and coverage evidence
 
-`magnetar-fakes` supplies a stateful generated-M1 multi-endpoint cluster with controller and segment routes, assignments and equal-epoch rebalances, reconnect baselines, ordinary subscribe/FLOW/message/ack/seek/close behavior, delayed and failed operations, transaction state, drain eligibility, and resource counters.
-It validates commands and independent invariants rather than repeating the client state machine.
+GA same-name registration reattaches a settled membership without rebalance, including transfer to a new consumer id. A delayed unsubscribe retains the captured topic, subscription, consumer name and consumer id. Completion compares that identity against the current membership independently of its physical connection: same-id reattachment is deleted, while a different consumer id preserves the transferred membership. This fake models unsubscribe received before reattachment; it does not retain the old connection's registration reference for a new unsubscribe sent after transfer. The held-delete regression exercises the former ordering, while native protocol tests verify terminal cleanup separately.
 
-The public aggregate has 23 differential scenarios across the baseline and advanced suites: nine baseline and fourteen advanced.
+`magnetar-fakes` supplies a stateful generated-wire multi-endpoint cluster with controller and segment routes, assignments and equal-epoch rebalances, reconnect baselines, ordinary subscribe/FLOW/message/ack/seek/close behavior, delayed and failed operations, transaction state, drain eligibility, and resource counters.
+It validates commands and independent invariants rather than repeating the client state machine.
+Ordinary `CloseConsumer` cancels a matching pending Subscribe and releases only its physical reservation; an unknown connection-local consumer id returns correlated Success without changing another connection’s consumer, and late cancelled completion cannot retire a replacement. The fake cancels pending creation atomically; its fresh-id replacement regression does not model GA’s failed-future tombstone that blocks reuse of the same id until asynchronous creation finishes.
+Delayed ordinary `CloseConsumer` confirmations, admitted ACK completion, and staged transaction ACK commit or abort are fenced by the child connection, identity, incarnation, and generation independently of controller membership. Ordinary FLOW credit targets the live child on its physical connection independently of controller membership or assignment withdrawal; closed and disconnected children still reject it. Ordinary Subscribe admission and delayed completion use the physical topic placement, connection and consumer id, exclusive subscription owner, pending reservation and generation independently of logical assignment or consumer name. The fake retains the actual optional ordinary consumer name for observing roles; it does not infer child ownership from the controller. Admitted Seek completion uses the same physical child fence, resets the persistent cursor and disconnects that ordinary child before a fresh Subscribe restores delivery. GA `ServerCnx.handleAck` retains the ordinary consumer, and transaction settlement addresses its persistent subscription; leaving the scalable controller does not invalidate that already admitted work.
+
+The public aggregate has 29 runtime parity scenarios across the baseline and advanced suites: fourteen baseline and fifteen advanced. The baseline suite also has one public type and value contract test.
 They cover typed delivery, concurrent receive and atomic batch, aggregate budget, same-epoch rebalance and drain, child reconnect, ack failure/retry, nack redelivery, close wakeup, strict split/merge barriers, exact-M1 sealed-assignment drain without reopen, Strict versus BrokerManaged cross-member ancestry, vector seek/resync, transaction commit/abort/poison, and controller push/baseline/incarnation ordering.
 The pure aggregate model additionally proves that a completed sealed parent may disappear and reappear beside an active descendant without another parent open or suppression of the descendant open.
 
@@ -167,10 +179,10 @@ That provider-native test covers two-source typed delivery, aggregate status and
 Focused code, fake, proto, runtime, façade, and differential suites passed for this implementation.
 A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 
-The real `e2e_hardened_scalable_stream_consumer_contract` target compiles and is discovered when the default-off `scalable-topics` product feature is enabled; it has no `#[ignore]` or separate e2e feature.
-When Docker is available it must run against `apachepulsar/pulsar:5.0.0-M1` and prove the public `Arc<BytesSchema>` builder, multi-segment typed delivery, live and restored vector acknowledgement, broker-effective inclusive vector-seek replay, transaction commit and abort, single-member split progression in Strict mode, explicit BrokerManaged cross-member behavior, direct-bootstrap controller fallback when M1 omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and logical-close membership residue.
-The accepting host had no Docker, so this branch did not execute that real-broker target locally; existing CI policy runs e2e when Docker is available.
+The real `e2e_scalable_topic` target compiles and is discovered when the default-off `scalable-topics` product feature is enabled; it has no `#[ignore]` or separate e2e feature.
+The current GA 5.0.0 broker contract covers the public builder, multi-segment typed delivery, vector acknowledgement and seek, transaction commit/abort, two-owner PIP-486 bucket sharing with individual acknowledgements, and eventual unsubscribe membership removal on both runtimes. The original M1-era test plan and its acceptance-time Docker limitation are historical; the maintained current inventory is in [docs/testing.md](../../docs/testing.md).
 Because the standalone fixture uses one reachable endpoint for bootstrap and controller registration, it cannot prove same-cluster multi-broker controller routing.
+The scalable transaction checks exercise coordinator id 0 through lookup and `TcClientConnect` on the bootstrap connection, matching the existing Tokio transaction path; they do not establish Java-equivalent coordinator handshakes after multi-broker relocation or reconnect.
 Because the M1 broker controls when child segments enter the assignment, the real-broker Strict phase also does not isolate Magnetar's client-side ancestry gate; the fake-backed differential suites provide that evidence.
 
 The sim-coverage report and hard-gated prefix sets now contain exactly these eight packages:
@@ -197,12 +209,12 @@ The local hardening above does not solve or close these issues:
 
 | Issue                                                                | Missing upstream contract                                          | Magnetar's bounded interim behavior                                                             |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | Logical unregister on a pooled controller connection               | Close is locally definitive only; broker membership residue is documented and observable.       |
+| [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | M1 has no logical unregister on a pooled controller connection      | M1 uses the connection-close fallback; GA stages unsubscribe after registration settles without making its response a local close gate. |
 | [apache/pulsar#26273](https://github.com/apache/pulsar/issues/26273) | Assignment ordering and fencing across controller connections      | Local connection incarnations fence stale work; no distributed controller term is claimed.      |
 | [apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274) | Complete parent-before-child ordering across members and deep DAGs | Strict mode requires local proof; BrokerManaged explicitly weakens only the cross-member claim. |
 | [apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275) | Leader-only controller registration through a proxy                | Direct validated routing works; proxy-any-broker registration fails closed.                     |
 
-`QueueConsumer`, `CheckpointConsumer`, PIP-486 bucket sharing and sticky children, cross-layout vector seek, a distributed assignment generation, explicit unregister, and GA wire compatibility remain out of scope.
+`QueueConsumer` and `CheckpointConsumer` remain out of scope. M1 has no bucket ranges or unsubscribe command; the GA implementation uses PIP-486 bucket ranges and sticky children when assigned, and sends the GA unsubscribe command on close. Cross-layout vector seek and a distributed assignment generation remain out of scope.
 
 ## Consequences
 
@@ -212,9 +224,10 @@ One budget and manual FLOW prevent segment count from multiplying controlled rec
 
 The surface is intentionally breaking inside the default-off experimental feature.
 The old topic-only async constructor and layout-observer events are replaced by a required-subscription builder, owned typed deliveries, source-qualified authority, vector positions, and explicit async close.
+The hidden engine extension contract exports `RawStreamMessage`, `StreamConsumerBackend`, and `StreamConsumerOptions` with `SegmentSubscriberApi`, so downstream adapters can name its required return types.
 Low-level proto users also see the new aggregate, route, position, DAG-validation, transaction, and lifecycle types.
 
-Strict mode can block forever on cross-member ancestry, ownership drain can wait forever on an unresolved delivery, and logical close can leave broker membership behind.
+Strict mode can block forever on cross-member ancestry, ownership drain can wait forever on an unresolved delivery, and logical close on M1 can leave broker membership behind.
 Those availability costs are accepted because timing out would invent completion or release that M1 cannot prove.
 BrokerManaged mode and explicit aggregate close are the caller-selected escape hatches, with their weaker ordering or at-least-once consequences documented.
 
@@ -227,6 +240,6 @@ BrokerManaged mode and explicit aggregate close are the caller-selected escape h
 - [`crates/magnetar-proto/src/dag_watch.rs`](../../crates/magnetar-proto/src/dag_watch.rs) — complete DAG validation and ordering eligibility.
 - [`crates/magnetar-runtime-tokio/src/scalable.rs`](../../crates/magnetar-runtime-tokio/src/scalable.rs) and [`crates/magnetar-runtime-moonpool/src/scalable.rs`](../../crates/magnetar-runtime-moonpool/src/scalable.rs) — typed routes, direct controller routing, children, and provider-native operation.
 - [`crates/magnetar-fakes/src/m1.rs`](../../crates/magnetar-fakes/src/m1.rs) — stateful M1 fake cluster.
-- [`crates/magnetar-differential/tests/stream_consumer_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_equivalence.rs) and [`stream_consumer_advanced_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs) — 23 public aggregate parity scenarios: nine baseline and fourteen advanced.
-- [`crates/magnetar/tests/e2e_scalable_topic.rs`](../../crates/magnetar/tests/e2e_scalable_topic.rs) — real M1 compile/runtime contract.
+- [`crates/magnetar-differential/tests/stream_consumer_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_equivalence.rs) and [`stream_consumer_advanced_equivalence.rs`](../../crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs) — 29 public aggregate runtime parity scenarios and one public type and value contract test.
+- [`crates/magnetar/tests/e2e_scalable_topic.rs`](../../crates/magnetar/tests/e2e_scalable_topic.rs) — real GA broker contract on Tokio and Moonpool.
 - [`xtask/src/main.rs`](../../xtask/src/main.rs) — exact eight-package sim-coverage closure and unchanged two-root execution.

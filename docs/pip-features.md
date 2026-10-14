@@ -636,7 +636,7 @@ This keeps the production tokio engine and the deterministic moonpool simulation
 
 > **⚠️ EXPERIMENTAL.** This surface lives behind the default-off `scalable-topics` feature.
 > It speaks the wire protocol vendored from Apache Pulsar **5.0.0** (GA), the release that carries [PIP-460](https://github.com/apache/pulsar/blob/master/pip/pip-460.md); the surface was first vendored from the 5.0.0 milestone and moved to GA by an [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment on 2026-10-12.
-> It stays experimental because QueueConsumer and CheckpointConsumer, type-82 unsubscribe, and PIP-486 bucket dispatch remain incomplete (see [Scalable topics out of scope](#scalable-topics-out-of-scope)).
+> It stays experimental because QueueConsumer and CheckpointConsumer remain incomplete and upstream has not defined a distributed assignment generation (see [Scalable topics out of scope](#scalable-topics-out-of-scope)).
 > Against a **Pulsar 4.x** broker the client negotiates the capability away and refuses to emit a scalable-topic command — see [Broker compatibility](#scalable-topics-broker-compatibility) below.
 > See [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which supersedes [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
 
@@ -751,9 +751,12 @@ MAX_FRAME_SIZE
 + 5 * MAX_STREAM_POSITION_SIZE
 + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
++ DELIVERY_ACK_GENERATION_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 13,697,152 bytes
+= 13,697,160 bytes
 ```
+
+`DELIVERY_ACK_GENERATION_OVERHEAD` is one `u64` per live delivery lease. It is charged once with the lease; the canonical delivered-position map keeps its existing charge.
 
 The default and examples use 16 MiB.
 An 8 MiB budget is invalid.
@@ -786,12 +789,13 @@ The canonical ordinary-id component is capped at 64 KiB on construction and deco
 The aggregate supports individual acknowledgement, batch acknowledgement, cumulative acknowledgement of a live delivery's vector, acknowledgement of a restored `PositionVector`, negative acknowledgement, and individual or cumulative/vector acknowledgement inside a Pulsar transaction.
 Vector ack fans out through segment-local semantics.
 Partial failure reports confirmed and failed components; confirmed components cannot be rolled back and retry is idempotent.
+Retrying the same cumulative token reconciles every source in its saved vector and omits only independently confirmed components; it does not restore receive or individual-acknowledgement authority.
 When a broker dispatch carries `ack_set`, only selected batch members are exposed and their canonical ids retain that mask; individual and cumulative acknowledgement preserve the residual mask for later selected members in the same broker entry.
 
 Transactional acknowledgement registers every represented `(segment topic, subscription)` and admits every component before commit closes admission.
 Commit waits for all admitted operations.
 Any failed admitted registration or ack permanently poisons commit: `commit_transaction` returns `TransactionPoisoned` and sends no `EndTxn(Commit)`; abort remains available.
-Commit advances participating positions only after confirmation, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails every participant closed and requires resynchronization.
+Commit advances participating positions only after confirmation, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails every participant closed and requires resynchronization. The first installation of an unknown outcome emits `ResyncRequired` as well as the transaction outcome; retries of retained cleanup do not repeat that resynchronization event.
 Once the coordinator confirms commit or abort, an owned completion task records that terminal state and checkpoints each completed local participant action, so cancellation causes neither a second `EndTxn` nor replay of an already-issued FLOW prefix.
 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.
@@ -820,7 +824,7 @@ GA may omit the controller URL before leader election publishes one; only then d
 Missing segment authority, a transport mismatch, a rejected published target, or proxy-any-broker controller registration still fails closed; the client neither guesses another target nor downgrades TLS.
 
 Explicit close through any clone is globally definitive locally and awaits typed-route, task, and child cleanup; final drop fences synchronously on a best-effort basis and never blocks or spawns.
-GA defines `CommandScalableTopicUnsubscribe` (type 82), and Java sends it when the scalable consumer closes. The current client still needs to send this command after in-flight registration settles; until then, logical close may leave broker membership while another pool user keeps the physical controller connection open.
+On GA, close marks in-flight registrations to leave after their subscribe responses arrive, then sends `CommandScalableTopicUnsubscribe` (type 82) and completes local teardown without waiting for its broker response. M1 has no unsubscribe command and retains its connection-close cleanup behavior. A cancelled registration retains its fixed-size request record until the response or physical connection reset; these control-plane records sit outside the aggregate receive budget, and the low-level connection API has no admission cap.
 
 ### Scalable topics consumer registration
 
@@ -854,7 +858,9 @@ The `scalable` routing bit PIP-473 adds to the PIP-31 transaction commands is se
 
 The assignment-driven aggregate does not drop on a split, merge, add, or removal. It validates the replacement DAG atomically, reconciles the authoritative assignment, opens gained children, drains lost children, and applies the selected ancestry barrier before granting FLOW.
 Controller loss starts an incarnation-fenced replacement lookup/registration flow; an invalid regression or unrouteable replacement moves the aggregate to observable resynchronization-required state rather than accepting stale authority.
-Resynchronization marks reconnect intent before old-child teardown, waits for confirmed children and in-flight opens to finish, and retries a rejected replacement registration while the broker retains the previous member on its physical controller connection.
+Resynchronization marks reconnect intent before old-child teardown and waits for confirmed children and in-flight opens to finish. It registers the same logical consumer id with a newer local incarnation without logical unsubscribe, then synchronously retires the old local authority after success. Aggregate retries retain terminal cleanup capabilities for admitted attempts, deduplicated by physical connection and latest local incarnation; a rejected or timed-out attempt loses its assignment authority without logical unsubscribe. Successful handoff carries outstanding cleanup capabilities forward. Terminal close and failed or cancelled publicly owned replacements perform logical-leave cleanup after tracked subscribe responses settle. These control-plane capabilities and pending request records are outside the receiver byte budget; their cardinality follows the physical connections encountered, without a fixed connection cap. A late server registration can still reattach an older connection because the GA protocol has no broker-side incarnation term; local late responses and pushes cannot restore rejected authority. Direct `Connection` callers retain responsibility for explicit terminal registration removal after a rejection.
+
+A successful ordinary SEEK response from a retired child generation is rejected before it can restore aggregate FLOW. The adapter releases the aggregate state lock after checking the generation and before invoking resynchronization recovery; that recovery acquires the same lock independently.
 
 The low-level raw layout-session API still emits `DagUpdated` and `DagChangedDuringConsume` classifications for diagnostics and `magnetarctl topic-info`-style tooling.
 Those raw events are not the high-level `StreamConsumer` lifecycle contract and are never duplicated into an owned aggregate route.
@@ -862,18 +868,18 @@ Those raw events are not the high-level `StreamConsumer` lifecycle contract and 
 ### Scalable topics lookup auto-creation
 
 Pulsar 5.0.0 added `create_if_missing` (field 3, default `true`) to `CommandScalableTopicLookup`.
-On the 5.0.0 milestone a lookup of a missing `topic://` topic failed with "Scalable topic not found" (`DagWatchSession.java:127-137` at `v5.0.0`); on 5.0.0 a lookup that leaves the field unset creates the topic, gated by the broker's and namespace's topic auto-creation policy (`DagWatchSession.java:138-157` at `v5.0.0`).
+On the 5.0.0-M1 milestone a lookup of a missing `topic://` topic failed with "Scalable topic not found" (`DagWatchSession.java:127-137` at `v5.0.0-M1`); on 5.0.0 a lookup that leaves the field unset creates the topic, gated by the broker's and namespace's topic auto-creation policy (`DagWatchSession.java:138-157` at `v5.0.0`).
 An existing topic ignores the flag.
-Measured on 2026-10-12 against standalone brokers, `magnetarctl topic-info topic://public/default/never-created` resolves a one-segment layout on `apachepulsar/pulsar:5.0.0` and an admin `GET /admin/v2/scalable/public/default/never-created`, 404 before the lookup, then returns the persisted topic; on `apachepulsar/pulsar:5.0.0` the command fails with "Scalable topic not found".
+Measured on 2026-10-12 against standalone brokers, `magnetarctl topic-info topic://public/default/never-created` resolves a one-segment layout on `apachepulsar/pulsar:5.0.0` and an admin `GET /admin/v2/scalable/public/default/never-created`, 404 before the lookup, then returns the persisted topic; on `apachepulsar/pulsar:5.0.0-M1` the command fails with "Scalable topic not found".
 
 The caller chooses, and magnetar writes the choice **explicitly** on every lookup, `true` and `false` alike, so a lookup means the same thing to a 5.0.0 broker whether or not the field's default moves again.
-A 5.0.0 broker skips the unknown field.
+A 5.0.0-M1 broker skips the unknown field.
 
 - **`PulsarClient::scalable_stream_consumer` sends `true`.**
   It opens a consumer on an explicit single topic, which is what the Java v5 client does on every such path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799`, at `v5.0.0`).
 - **`PulsarClient::lookup_scalable_topic` sends `false`.**
   It is the read-only path behind `magnetarctl topic-info`, and a diagnostic lookup of a mistyped name must not create a topic.
-  A missing topic is reported as not found on M1 and GA alike.
+  A missing topic is reported as not found because the lookup explicitly sends `false`.
   The upstream schema comment limits the `true` default to explicit single-topic producers and consumers.
 - **`scalable_topic_subscribe` is unchanged.**
   It sends `CommandScalableTopicSubscribe`, which has no such field.
@@ -885,25 +891,19 @@ The flag is a `create_if_missing: bool` parameter of `Connection::open_scalable_
 
 ### Scalable topics out of scope
 
-`QueueConsumer`, `CheckpointConsumer`, PIP-486 bucket ranges and sticky children, read fan-out beyond segment count, multi-topic scalable aggregates, cross-layout vector seek, a distributed assignment generation/controller term, multi-topic scalable aggregates and cross-layout vector seek remain out of scope.
+`StreamConsumer` supports PIP-486 bucket ranges and sticky `Key_Shared` child subscriptions, including more keyed owners than assigned segments, and sends `CommandScalableTopicUnsubscribe` when closing a scalable subscription. The send is ordered after any pending subscribe response; local close does not wait for the unsubscribe response. `QueueConsumer` and `CheckpointConsumer`, multi-topic scalable aggregates, and a distributed assignment generation/controller term remain out of scope.
 Proxy-any-broker controller registration also remains unsupported until upstream defines leader routing and a real proxy StreamConsumer e2e passes.
 
 The implementation does not claim these upstream contracts are solved:
 
 | Issue                                                                | Gap                                                             | Current bounded behavior                                                            |
 | -------------------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | No logical unregister on a pooled controller connection         | Close is locally definitive; broker membership residue is documented.               |
+| [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | Upstream M1 lacks logical unregister on a pooled controller connection | GA `StreamConsumer` stages unsubscribe after registration settles without making its response a local close gate; M1 keeps the documented connection-close fallback. |
 | [apache/pulsar#26273](https://github.com/apache/pulsar/issues/26273) | No assignment generation/controller term across connections     | Local incarnations fence stale work without claiming a distributed term.            |
 | [apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274) | No complete cross-member/deep-DAG completion contract           | Strict requires local proof; BrokerManaged names its weaker cross-member guarantee. |
 | [apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275) | Proxy-any-broker registration does not establish leader routing | Direct validated routing is supported; proxy registration fails closed.             |
 
-Two pieces of the 5.0.0 wire are vendored but not used, both tracked in [`follow-ups.md` §12](follow-ups.md#12-pip-460-remaining-ga-wire-and-api-gaps):
-
-- **`CommandScalableTopicUnsubscribe`** (type 82, acknowledged by `CommandSuccess`) is the clean leave of a scalable consumer.
-  It is decoded and never sent, so a registration is released by the broker only when the connection goes away.
-  An inbound frame of that type is skipped without an error.
-- **PIP-486 entry bucketing** (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`) is decoded and ignored.
-  A segment assigned with a non-empty `bucket_ranges` is shared by entry bucket, so a consumer attaching to it must subscribe `Key_Shared` sticky with `entryBucketDispatch = true` instead of `Exclusive`.
+For a GA assignment with non-empty PIP-486 `bucket_ranges`, each assigned range is attached through a sticky `Key_Shared` child with `entryBucketDispatch = true`; cumulative acknowledgements are translated into individual tracked message IDs. Empty ranges use the ordinary exclusive-child path. The M1 wire surface has neither bucket metadata nor the unsubscribe command, so the M1 implementation retains its connection-close cleanup behavior.
 
 ### Scalable topics broker compatibility
 
@@ -941,12 +941,10 @@ The CLI picks it up via `--features magnetarctl/scalable-topics`.
 | Proto            | Complete DAG, aggregate lifecycle/budget, authority, `MSTR`, transaction, and seek suites under `magnetar-proto`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Tokio + Moonpool | Matched runtime integration suites for typed routes, children, receive/ack, ownership, close, and plaintext/TLS controller routing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Stateful fake    | `magnetar-fakes::m1` models controller plus segment endpoints, assignments, ordinary data-plane commands, failures, transactions, drain, and resource counts using generated Pulsar 5.0.0 frames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Differential     | 23 public aggregate scenarios, nine baseline and fourteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Real GA e2e       | With `--features scalable-topics`, `e2e_hardened_scalable_stream_consumer_contract` compiles and is discovered; when Docker is available it runs the public builder, typed multi-segment delivery, vector ack, broker-effective inclusive vector-seek replay, transaction commit/abort, single-member split progression in Strict mode, BrokerManaged cross-member behavior, direct-bootstrap controller fallback when GA omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and close residue against `apachepulsar/pulsar:5.0.0`. Broker-controlled assignment timing means this does not isolate client-side Strict gating or prove same-cluster multi-broker routing. |
+| Differential     | 29 paired public aggregate scenarios, fourteen baseline and fifteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`, plus one public type/value test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Real GA e2e       | With `--features scalable-topics`, `e2e_hardened_scalable_stream_consumer_contract` compiles and is discovered; when Docker is available it runs the public builder, typed multi-segment delivery, vector ack, broker-effective inclusive vector-seek replay, transaction commit/abort, single-member split progression in Strict mode, BrokerManaged cross-member behavior, direct-bootstrap controller fallback when GA omits its controller URL, reachable broker-authored segment authorities matching the bootstrap transport, and close residue against `apachepulsar/pulsar:5.0.0`. First transaction creation looks up coordinator partition 0 and handshakes on the bootstrap connection, matching the existing Tokio path; this does not establish Java-equivalent per-connection TC handshakes after multi-broker redirects or reconnects. Broker-controlled assignment timing also means this does not isolate client-side Strict gating or prove same-cluster multi-broker routing. |
 
-Focused code, fake, proto, runtime, façade, and differential suites passed for the implementation.
-A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
-Docker was unavailable on the integration host, so this branch did not execute the real GA e2e locally; existing CI policy runs the ordinary e2e target when Docker is available.
+The real GA contract suite is ordinary, unignored E2E coverage. The inventory in [testing.md](testing.md) includes the multi-owner bucket-sharing contract as well as the single-consumer contract. Runtime-specific execution results belong to the pull-request validation record.
 
 Patch coverage uses seven-plus-one isolated domains: Moonpool+differential owns the seven shared/sim packages, while Tokio unit/integration+differential owns only the Tokio adapter package (ADR-0121).
 Façade Docker e2e targets do not execute in either domain; `magnetar-admin`, `magnetarctl`, and other unowned packages remain advisory `not gated`.

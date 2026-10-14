@@ -17,7 +17,7 @@ const TOPIC: &str = "topic://public/default/scaled";
 fn assigned(id: u64, start: u32, end: u32) -> pb::ScalableAssignedSegment {
     let range = KeyRange::new(start, end).expect("valid range");
     pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+        bucket_ranges: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -135,7 +135,7 @@ fn segment_identity_and_descriptor_validation_fail_closed() {
     );
 
     let info = pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+        entry_bucket_splits: Vec::new(),
         segment_id: 1,
         hash_start: 0,
         hash_end: 65_535,

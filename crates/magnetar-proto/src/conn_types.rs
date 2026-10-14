@@ -1131,6 +1131,9 @@ pub struct SubscribeRequest {
     /// single receive budget can reserve every controlled allocation first.
     #[doc(hidden)]
     pub defer_payload_processing: bool,
+    /// Enable PIP-486 bucket dispatch for an assignment-owned Key_Shared child.
+    #[doc(hidden)]
+    pub entry_bucket_dispatch: bool,
 }
 
 /// PIP-4 decryption failure handling. Mirrors Java
@@ -1208,6 +1211,7 @@ impl Default for SubscribeRequest {
                 crate::consumer::DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE,
             ),
             defer_payload_processing: false,
+            entry_bucket_dispatch: false,
         }
     }
 }

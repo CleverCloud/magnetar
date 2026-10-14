@@ -988,3 +988,47 @@ fn scalable_lookup_states_create_if_missing_explicitly() {
         assert_eq!(lookup.create_if_missing, Some(create_if_missing));
     }
 }
+
+/// GA bucket assignments use sticky entry dispatch rather than key hashing.
+#[test]
+fn bucket_shared_segment_subscription_preserves_ga_dispatch_metadata() {
+    let mut conn = connected_conn();
+    conn.subscribe(magnetar_proto::SubscribeRequest {
+        topic: "segment://public/default/scaled/0000-ffff-1".to_owned(),
+        subscription: "workers".to_owned(),
+        sub_type: pb::command_subscribe::SubType::KeyShared,
+        key_shared: Some(magnetar_proto::KeySharedConfig {
+            mode: pb::KeySharedMode::Sticky,
+            sticky_hash_ranges: vec![(0, 32767), (32768, 65535)],
+            allow_out_of_order_delivery: false,
+        }),
+        entry_bucket_dispatch: true,
+        ..Default::default()
+    });
+    let subscribe = magnetar_proto::decode_one(&mut conn.poll_transmit())
+        .expect("decode bucket subscription")
+        .command
+        .subscribe
+        .expect("subscription body");
+    assert_eq!(
+        subscribe.sub_type,
+        pb::command_subscribe::SubType::KeyShared as i32
+    );
+    let meta = subscribe.key_shared_meta.expect("sticky bucket metadata");
+    assert_eq!(meta.key_shared_mode, pb::KeySharedMode::Sticky as i32);
+    assert_eq!(meta.entry_bucket_dispatch, Some(true));
+    assert_eq!(meta.allow_out_of_order_delivery, Some(false));
+    assert_eq!(
+        meta.hash_ranges,
+        vec![
+            pb::IntRange {
+                start: 0,
+                end: 32767
+            },
+            pb::IntRange {
+                start: 32768,
+                end: 65535
+            },
+        ]
+    );
+}

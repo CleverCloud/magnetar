@@ -39,7 +39,7 @@
 
 use std::time::Duration;
 
-use magnetar_differential::broker::ScriptedBroker;
+use magnetar_differential::broker::{ConsumerCloseObservation, ScriptedBroker};
 use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
 use magnetar_proto::MessageId;
 
@@ -56,8 +56,6 @@ fn message_id(entry_id: u64) -> MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     }
 }
 
@@ -573,10 +571,46 @@ fn close_consumer_frame_count(broker: &ScriptedBroker) -> usize {
 
 /// `CommandCloseConsumer` frames [`wedge_trace`] produces with recovery DISARMED, which
 /// every recovery close is counted on top of: the trace's own `CloseSharedConsumer` op,
-/// plus the two consumers' last-clone drop closes when the runner tears the client down
-/// (issue #241 / #342). Engine teardown bookkeeping rather than anything the trace
-/// states, so this is a measured baseline, not a derived one.
-const WEDGE_BASELINE_CLOSES: usize = 3;
+/// plus the survivor's final close when the runner tears the client down.
+/// The already-closed leaver reuses its completed close operation at teardown.
+const WEDGE_BASELINE_CLOSES: usize = 2;
+
+fn assert_wedge_close_identities(
+    observations: &[ConsumerCloseObservation],
+    trace: &Trace,
+    recovery_attempts: u32,
+) {
+    // The trace opens the survivor first (id 0), then the leaver (id 1).
+    // The leaver closes once; the survivor closes for each recovery and teardown.
+    let mut expected_consumers = vec![0; WEDGE_BASELINE_CLOSES + recovery_attempts as usize];
+    expected_consumers[0] = 1;
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.consumer_id)
+            .collect::<Vec<_>>(),
+        expected_consumers,
+        "the leaver closes once and only the survivor consumes the recovery budget",
+    );
+    let mut request_ids = observations
+        .iter()
+        .map(|observation| observation.request_id)
+        .collect::<Vec<_>>();
+    request_ids.sort_unstable();
+    request_ids.dedup();
+    assert_eq!(
+        request_ids.len(),
+        observations.len(),
+        "each emitted close has a distinct broker request correlation",
+    );
+    for observation in observations {
+        assert_eq!(observation.topic.as_deref(), Some(trace.topic.as_str()));
+        assert_eq!(
+            observation.subscription.as_deref(),
+            Some(trace.subscription.as_str()),
+        );
+    }
+}
 
 fn frame_count(broker: &ScriptedBroker, kind: i32) -> usize {
     broker
@@ -629,8 +663,10 @@ async fn a_leaked_shared_dispatcher_is_not_recovered_by_a_generous_budget() {
         subscribe_frame_count(&broker),
         close_consumer_frame_count(&broker),
     );
+    let tokio_close_observations = broker.consumer_close_log_snapshot();
 
     broker.clear_frame_log();
+    broker.clear_consumer_close_log();
     let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
         &host_port,
         &trace,
@@ -643,6 +679,10 @@ async fn a_leaked_shared_dispatcher_is_not_recovered_by_a_generous_budget() {
         subscribe_frame_count(&broker),
         close_consumer_frame_count(&broker),
     );
+    let moonpool_close_observations = broker.consumer_close_log_snapshot();
+    assert_wedge_close_identities(&tokio_close_observations, &trace, MAX_ATTEMPTS);
+    assert_wedge_close_identities(&moonpool_close_observations, &trace, MAX_ATTEMPTS);
+    assert_eq!(tokio_close_observations, moonpool_close_observations);
 
     assert_eq!(
         tokio_stream, moonpool_stream,
@@ -695,7 +735,7 @@ async fn a_leaked_shared_dispatcher_is_not_recovered_by_a_generous_budget() {
         (tokio_closes, moonpool_closes),
         (expected_closes, expected_closes),
         "each engine must send exactly {MAX_ATTEMPTS} recovery closes on top of the \
-         trace's own churn close and the two teardown closes — ADR-0108's phase 1, \
+         trace's own churn close and the survivor's teardown close — ADR-0108's phase 1, \
          without which the re-subscribes above would be broker-side no-ops",
     );
 }
@@ -735,8 +775,10 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     .expect("tokio runner");
     let tokio_subscribes = subscribe_frame_count(&broker);
     let tokio_closes = close_consumer_frame_count(&broker);
+    let tokio_close_observations = broker.consumer_close_log_snapshot();
 
     broker.clear_frame_log();
+    broker.clear_consumer_close_log();
     let moonpool_stream = runner_moonpool::run_with_stall_auto_recovery(
         &host_port,
         &trace,
@@ -747,6 +789,10 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
     .expect("moonpool runner");
     let moonpool_subscribes = subscribe_frame_count(&broker);
     let moonpool_closes_for_assertion = close_consumer_frame_count(&broker);
+    let moonpool_close_observations = broker.consumer_close_log_snapshot();
+    assert_wedge_close_identities(&tokio_close_observations, &trace, MAX_ATTEMPTS);
+    assert_wedge_close_identities(&moonpool_close_observations, &trace, MAX_ATTEMPTS);
+    assert_eq!(tokio_close_observations, moonpool_close_observations);
 
     assert_eq!(
         tokio_stream, moonpool_stream,
@@ -772,6 +818,6 @@ async fn wedged_shared_dispatcher_exhausts_an_insufficient_auto_recovery_budget(
         (tokio_closes, moonpool_closes_for_assertion),
         (expected_closes, expected_closes),
         "and the cap covers ADR-0108's phase 1 too: exactly {MAX_ATTEMPTS} recovery close \
-         on top of the trace's own churn close and the two teardown closes",
+         on top of the trace's own churn close and the survivor's teardown close",
     );
 }

@@ -299,13 +299,17 @@ async fn withdraw_failed_child_open<E>(
     cluster
         .wait_for("stale child-open failure cleanup", |fake| {
             fake.resource_counts().pending_operations == 0
-                && fake.active_child_owner(&subscription, 1) == Some(takeover_member)
-                && fake.active_child_owner(&subscription, 2) == Some(member)
+                && fake
+                    .active_child_consumer(&subscription, 1, &format!("{takeover_name}-seg-1"))
+                    .is_some()
+                && fake
+                    .active_child_consumer(&subscription, 2, &format!("{member_name}-seg-2"))
+                    .is_some()
         })
         .await;
     let status = consumer.status();
     assert_eq!(status.attached_segments(), 1);
-    assert!(status.pending_ownership().is_empty());
+    assert_eq!(status.pending_ownership(), []);
     consumer
         .close()
         .await
@@ -358,6 +362,7 @@ struct DagWatchRecoveryTrace {
 struct AcknowledgementFailureTrace {
     partial_confirmed: usize,
     partial_failed: usize,
+    cumulative_retry_endpoints: Vec<Endpoint>,
     registration_disconnect_error: String,
     registration_disconnect_recovered: bool,
     close_during_ack_fenced: bool,
@@ -449,6 +454,16 @@ fn same_topology_at_epoch_two() -> Vec<M1Segment> {
         M1Segment::active(1, 0, 32_767, Endpoint::Segment(1), 0),
         M1Segment::active(2, 32_768, 65_535, Endpoint::Segment(2), 0),
     ]
+}
+
+async fn wait_for_wire_flow(cluster: &M1SocketCluster, subscription: &str, segments: &[u64]) {
+    cluster
+        .wait_for("initial FLOW reaches every subscribed child", |fake| {
+            segments
+                .iter()
+                .all(|segment| fake.segment_permits(subscription, *segment) > 0)
+        })
+        .await;
 }
 
 async fn receive<E>(consumer: &StreamConsumer<BytesSchema, E>) -> StreamMessage<BytesSchema>
@@ -1283,7 +1298,7 @@ where
         assert_eq!(ordering_unprovable, vec![3]);
         assert_eq!(descendant_flow_commands, 0);
     } else {
-        assert!(ordering_unprovable.is_empty());
+        assert_eq!(ordering_unprovable, [] as [u64; 0]);
         assert!(descendant_flow_commands > 0);
     }
 
@@ -2076,7 +2091,10 @@ where
     let registration_observation = cluster
         .inspect(|fake| fake.transaction_observation(registration_failure_txn.id()))
         .expect("registration-failure transaction observation");
-    assert!(registration_observation.registered_subscriptions.is_empty());
+    assert_eq!(
+        registration_observation.registered_subscriptions,
+        [] as [(String, String); 0]
+    );
     assert_eq!(registration_observation.staged_acknowledgements, 0);
     assert_eq!(
         poisoned_commit_kind(
@@ -2313,7 +2331,8 @@ where
     );
     cluster
         .wait_for("transaction-outcome takeover", |fake| {
-            fake.active_child_owner("outcome-retry-sub", 1) == Some(takeover_member)
+            fake.active_child_consumer("outcome-retry-sub", 1, "outcome-retry-takeover-seg-1")
+                .is_some()
                 && fake.resource_counts().pending_operations == 0
         })
         .await;
@@ -2583,7 +2602,10 @@ where
     while !(unknown_outcome_event && unknown_resync_event) {
         match tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.next_event())
             .await
-            .expect("unknown transaction event timed out")
+            .unwrap_or_else(|error| panic!(
+                "unknown transaction event timed out: {error:?}; outcome_seen={unknown_outcome_event}; resync_seen={unknown_resync_event}; status={:?}",
+                consumer.status()
+            ))
             .expect("read unknown transaction event")
         {
             Some(StreamConsumerEvent::TransactionOutcome {
@@ -3218,7 +3240,10 @@ where
         cluster.release_command(endpoint, magnetar::proto::pb::base_command::Type::Success);
     }
     assert!(
-        stale_seek.await.is_err(),
+        tokio::time::timeout(magnetar_differential::HANG_GUARD, stale_seek)
+            .await
+            .expect("stale seek completion must resolve after controller fencing")
+            .is_err(),
         "successful old-generation SEEK completion must fail after controller fencing"
     );
     let stale_seek_completion_fenced = cluster.inspect(|fake| {
@@ -3388,18 +3413,18 @@ where
     let consumer_b = subscribe_b.await.expect("second control member subscribes");
     let mut assignments = vec![wait_for_assignment(&consumer_b, 1, &[2]).await];
     let _ = wait_for_assignment(&consumer_a, 1, &[1]).await;
-    consumer_a
-        .close()
-        .await
-        .expect("close first control member after observing pushed assignment");
     wait_for_flowing_sources(&consumer_b, &[2]).await;
     cluster
         .wait_for("initial reassigned child FLOW reaches the broker", |fake| {
-            fake.active_child_owner("control-sub", 2) == Some(member_b)
+            fake.active_child_consumer("control-sub", 2, "control-b-seg-2")
+                .is_some()
                 && fake.segment_permits("control-sub", 2) > 0
                 && fake.resource_counts().pending_operations == 0
         })
         .await;
+    let old_control_child = cluster
+        .inspect(|fake| fake.active_child_consumer("control-sub", 2, "control-b-seg-2"))
+        .expect("ordinary physical child before equal-epoch migration");
     cluster
         .update(|fake| {
             fake.advance_layout(2, same_topology_at_epoch_two())?;
@@ -3414,7 +3439,7 @@ where
         .expect("DAG push precedes matching epoch assignment");
     assignments.push(wait_for_assignment(&consumer_b, 2, &[2]).await);
     let sessions = cluster.inspect(M1FakeCluster::layout_session_ids);
-    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.len(), 2);
     cluster
         .update(|fake| {
             for (connection, session_id) in &sessions {
@@ -3470,14 +3495,22 @@ where
     let equal_epoch_ack_retained = true;
     cluster
         .wait_for("equal-epoch ownership migration", |fake| {
-            fake.active_child_owner("control-sub", 2) != Some(member_b)
-                && fake.active_child_owner("control-sub", 1) == Some(member_b)
+            fake.active_child_consumer("control-sub", 2, "control-b-seg-2")
+                .is_none()
+                && fake
+                    .active_child_consumer("control-sub", 1, "control-b-seg-1")
+                    .is_some()
                 && fake.resource_counts().pending_operations == 0
         })
         .await;
+    let migrated_control_child = cluster
+        .inspect(|fake| fake.active_child_consumer("control-sub", 1, "control-b-seg-1"))
+        .expect("ordinary physical child after equal-epoch migration");
+    assert_ne!(old_control_child, migrated_control_child);
     wait_for_flowing_sources(&consumer_b, &[1]).await;
+    wait_for_flowing_sources(&consumer_a, &[2]).await;
     assert_eq!(consumer_b.status().attached_segments(), 1);
-    assert!(consumer_b.status().pending_ownership().is_empty());
+    assert_eq!(consumer_b.status().pending_ownership(), []);
     assert_eq!(
         assignments,
         vec![(1, vec![2]), (2, vec![2]), (2, vec![1])],
@@ -3508,7 +3541,8 @@ where
     assert!(lower_epoch_reason.contains("regressed"));
     cluster
         .wait_for("lower-epoch fail-closed child fence", |fake| {
-            fake.active_child_owner("control-sub", 1) != Some(member_b)
+            fake.active_child_consumer("control-sub", 1, "control-b-seg-1")
+                .is_none()
                 && fake.resource_counts().pending_operations == 0
         })
         .await;
@@ -3532,6 +3566,10 @@ where
         .close()
         .await
         .expect("close epoch-ordering member");
+    consumer_a
+        .close()
+        .await
+        .expect("close live peer after epoch-ordering member is fenced");
     cluster
         .wait_for("epoch-ordering child cleanup", |fake| {
             let counts = fake.resource_counts();
@@ -3554,6 +3592,7 @@ where
         })
         .await;
     wait_for_initial_flow(&replacement_consumer, &[1, 2]).await;
+    wait_for_wire_flow(cluster, "control-replacement-sub", &[1, 2]).await;
     let replacement_components = [1, 2].into_iter().map(|segment_id| {
         let source = magnetar::proto::SegmentSource::new(
             magnetar::proto::SegmentId(segment_id),
@@ -3631,14 +3670,27 @@ where
                         member.connection != old_controller
                             && fake.assigned_owner("control-replacement-sub", 1) == Some(member)
                             && fake.assigned_owner("control-replacement-sub", 2) == Some(member)
-                            && fake.active_child_owner("control-replacement-sub", 1) == Some(member)
-                            && fake.active_child_owner("control-replacement-sub", 2) == Some(member)
+                            && fake
+                                .active_child_consumer(
+                                    "control-replacement-sub",
+                                    1,
+                                    "control-replacement-member-seg-1",
+                                )
+                                .is_some()
+                            && fake
+                                .active_child_consumer(
+                                    "control-replacement-sub",
+                                    2,
+                                    "control-replacement-member-seg-2",
+                                )
+                                .is_some()
                     })
                     && fake.resource_counts().child_consumers == 2
             },
         )
         .await;
     wait_for_flowing_sources(&replacement_consumer, &[1, 2]).await;
+    wait_for_wire_flow(cluster, "control-replacement-sub", &[1, 2]).await;
     let replacement_controller = cluster
         .inspect(|fake| fake.member("control-replacement-sub", "control-replacement-member"))
         .expect("replacement controller member")
@@ -3783,6 +3835,8 @@ where
     };
     assert!(alignment_retry_reported);
     assert_eq!(alignment_retry_baseline, (3, vec![1, 2]));
+    wait_for_flowing_sources(&replacement_consumer, &[1, 2]).await;
+    wait_for_wire_flow(cluster, "control-replacement-sub", &[1, 2]).await;
 
     cluster
         .update(|fake| {
@@ -3921,6 +3975,7 @@ where
         })
         .await;
     wait_for_initial_flow(&consumer, &[1, 2]).await;
+    wait_for_wire_flow(cluster, "terminal-controller-sub", &[1, 2]).await;
     let seek = magnetar::proto::PositionVector::new(
         1,
         [1, 2].into_iter().map(|segment_id| {
@@ -4144,14 +4199,17 @@ where
                 .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
                 .expect("complete final terminal-DAG-reconnect child close");
             cluster
-                .wait_for("replacement terminal-DAG-reconnect controller lookup", |fake| {
-                    fake.routes().iter().any(|route| {
-                        route.endpoint == Endpoint::Controller
-                            && route.command
-                                == magnetar::proto::pb::base_command::Type::ScalableTopicLookup
-                            && route.resource.as_deref() == Some(TOPIC)
-                    })
-                })
+                .wait_for(
+                    "replacement terminal-DAG-reconnect controller lookup",
+                    |fake| {
+                        fake.routes().iter().any(|route| {
+                            route.endpoint == Endpoint::Controller
+                                && route.command
+                                    == magnetar::proto::pb::base_command::Type::ScalableTopicLookup
+                                && route.resource.as_deref() == Some(TOPIC)
+                        })
+                    },
+                )
                 .await;
             assert_eq!(
                 cluster
@@ -4184,7 +4242,7 @@ where
         .await
         .expect("terminal DAG recovery must resolve aggregate receive")
         .expect_err("terminal DAG recovery must fence the queued delivery");
-    assert!(!receive_error.to_string().is_empty());
+    assert_ne!(receive_error.to_string(), "");
     let queued_delivery_fenced = true;
     let after_close = close_and_count(consumer, cluster).await;
     cluster.release_command(
@@ -4546,10 +4604,7 @@ where
             fake.script_next(
                 Endpoint::Segment(1),
                 OperationKind::SegmentOpen,
-                ScriptedBehavior::Fail(BrokerFailure::new(
-                    magnetar::proto::pb::ServerError::PersistenceError,
-                    "permanent current child-open failure",
-                )),
+                ScriptedBehavior::Delay,
             )
         })
         .expect("script permanent current child-open failure");
@@ -4562,6 +4617,62 @@ where
         .subscribe()
         .await
         .expect("subscribe current child-open failure aggregate");
+    cluster
+        .wait_for("hold the current-generation child-open failure", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.endpoint == Endpoint::Segment(1)
+                    && pending.kind == OperationKind::SegmentOpen
+            })
+        })
+        .await;
+    let failed_open = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::SegmentOpen)
+                .map(|pending| pending.id)
+        })
+        .expect("held original-generation child open");
+    let controller_subscribes_before_retry = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.command == magnetar::proto::pb::base_command::Type::ScalableTopicSubscribe
+            })
+            .count()
+    });
+    let leaves_before_retry = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.command == magnetar::proto::pb::base_command::Type::ScalableTopicUnsubscribe
+            })
+            .count()
+    });
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::ConsumerBusy,
+                    "scripted controller retry is busy",
+                )),
+            )?;
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Delay,
+            )?;
+            fake.complete_pending(
+                failed_open,
+                PendingCompletion::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "permanent current child-open failure",
+                )),
+            )
+        })
+        .expect("fail the original child and explicitly refuse the next controller retry");
     let permanent_failure_resynced = loop {
         match next_event(&failed).await {
             StreamConsumerEvent::ResyncRequired { reason } => {
@@ -4581,7 +4692,7 @@ where
     let permanent_failure_retried = loop {
         match next_event(&failed).await {
             StreamConsumerEvent::ResyncRequired { reason }
-                if reason.contains("scalable member is busy") =>
+                if reason.contains("scripted controller retry is busy") =>
             {
                 break true;
             }
@@ -4608,6 +4719,73 @@ where
             - opens_before_permanent_failure
     });
     assert_eq!(permanent_failure_attempts, 1);
+    cluster
+        .wait_for(
+            "hold the controller baseline after its busy refusal",
+            |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::ScalableOpen)
+            },
+        )
+        .await;
+    assert_eq!(
+        cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.command == magnetar::proto::pb::base_command::Type::ScalableTopicSubscribe
+                })
+                .count()
+        }),
+        controller_subscribes_before_retry + 2
+    );
+    assert_eq!(
+        cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.command
+                        == magnetar::proto::pb::base_command::Type::ScalableTopicUnsubscribe
+                })
+                .count()
+        }),
+        leaves_before_retry,
+        "owned controller retries never leave the logical membership"
+    );
+    let retry_open = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::ScalableOpen)
+                .map(|pending| pending.id)
+        })
+        .expect("held replacement controller baseline");
+    cluster
+        .update(|fake| fake.complete_pending(retry_open, PendingCompletion::Succeed))
+        .expect("allow the replacement controller and child generation to recover");
+    let _ = wait_for_assignment(&failed, 1, &[1, 2]).await;
+    wait_for_flowing_sources(&failed, &[1, 2]).await;
+    cluster
+        .wait_for("recovered current-generation child FLOW", |fake| {
+            fake.segment_permits("current-open-failure-sub", 1) > 0
+                && fake.segment_permits("current-open-failure-sub", 2) > 0
+        })
+        .await;
+    assert_eq!(
+        cluster.inspect(|fake| {
+            fake.routes()
+                .iter()
+                .filter(|route| {
+                    route.endpoint == Endpoint::Segment(1)
+                        && route.command == magnetar::proto::pb::base_command::Type::Subscribe
+                })
+                .count()
+                - opens_before_permanent_failure
+        }),
+        2,
+        "one original-generation failure and one recovered child generation"
+    );
     close_and_count(failed, cluster).await;
 
     withdraw_failed_child_open(
@@ -4646,7 +4824,9 @@ where
     cluster
         .wait_for("held child-open response", |fake| {
             fake.resource_counts().child_consumers == 2
-                && fake.active_child_owner("cancel-open-sub", 1).is_some()
+                && fake
+                    .active_child_consumer("cancel-open-sub", 1, "cancel-open-member-seg-1")
+                    .is_some()
         })
         .await;
     let member = cluster
@@ -4696,8 +4876,12 @@ where
         .wait_for("withdrawn child is closed without attachment", |fake| {
             fake.resource_counts().pending_operations == 0
                 && fake.resource_counts().child_consumers == 2
-                && fake.active_child_owner("cancel-open-sub", 1) == Some(takeover_member)
-                && fake.active_child_owner("cancel-open-sub", 2) == Some(member)
+                && fake
+                    .active_child_consumer("cancel-open-sub", 1, "cancel-open-takeover-seg-1")
+                    .is_some()
+                && fake
+                    .active_child_consumer("cancel-open-sub", 2, "cancel-open-member-seg-2")
+                    .is_some()
         })
         .await;
     let cancelled_open_removed = true;
@@ -4723,7 +4907,11 @@ where
         .wait_for("held failed-cancellation child-open response", |fake| {
             fake.resource_counts().child_consumers == 2
                 && fake
-                    .active_child_owner("failed-cancel-open-sub", 1)
+                    .active_child_consumer(
+                        "failed-cancel-open-sub",
+                        1,
+                        "failed-cancel-open-member-seg-1",
+                    )
                     .is_some()
         })
         .await;
@@ -4832,7 +5020,11 @@ where
         .wait_for("held provisional child-open response", |fake| {
             fake.resource_counts().child_consumers == 2
                 && fake
-                    .active_child_owner("provisional-close-sub", 1)
+                    .active_child_consumer(
+                        "provisional-close-sub",
+                        1,
+                        "provisional-close-member-seg-1",
+                    )
                     .is_some()
         })
         .await;
@@ -5367,7 +5559,8 @@ where
                     magnetar::proto::pb::ServerError::ServiceNotReady,
                     "terminal replacement DAG watch",
                 ),
-            )
+            )?;
+            fake.advance_layout(2, same_topology_at_epoch_two())
         })
         .expect("fail replacement DAG watch");
     let terminal_watch_failure_reported = loop {
@@ -5385,6 +5578,27 @@ where
             unexpected => panic!("unexpected replacement DAG-watch event: {unexpected:?}"),
         }
     };
+    cluster
+        .wait_for(
+            "terminal DAG-watch replacement awaiting assignment alignment",
+            |fake| {
+                fake.layout_session_ids()
+                    .iter()
+                    .any(|(_, session)| *session != session_id && *session != replacement_session)
+                    && fake
+                        .routes()
+                        .iter()
+                        .filter(|route| {
+                            route.command
+                                == magnetar::proto::pb::base_command::Type::ScalableTopicLookup
+                        })
+                        .count()
+                        == 3
+            },
+        )
+        .await;
+    assert_eq!(cluster.inspect(M1FakeCluster::layout_epoch), 2);
+    assert_eq!(consumer.status().layout_epoch(), Some(1));
     cluster
         .update(|fake| fake.disconnect_connection(replacement_connection))
         .expect("disconnect replacement DAG-watch controller");
@@ -6003,6 +6217,118 @@ where
     )
 }
 
+async fn cumulative_retry_after_partial_confirmation<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> Vec<Endpoint>
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("cumulative-retry-sub")
+        .consumer_name("cumulative-retry-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe cumulative retry aggregate");
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"cumulative-A")))
+        .expect("enqueue first cumulative component");
+    let first = receive(&consumer).await;
+    assert_eq!(first.source().segment_id().0, 1);
+    cluster
+        .update(|fake| fake.enqueue_message(2, Bytes::from_static(b"cumulative-B")))
+        .expect("enqueue second component after dequeuing the first");
+    let second = receive(&consumer).await;
+    assert_eq!(second.source().segment_id().0, 2);
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Ack,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar::proto::pb::ServerError::PersistenceError,
+                    "fail first cumulative acknowledgement component",
+                )),
+            )
+        })
+        .expect("fail A while B confirms");
+    match consumer
+        .acknowledge_cumulative(&second)
+        .await
+        .expect_err("cumulative A fails while B succeeds")
+    {
+        magnetar::scalable::StreamConsumerError::PartialAcknowledgement { confirmed, failed } => {
+            assert_eq!(confirmed.len(), 1);
+            assert_eq!(confirmed[0].source().segment_id().0, 2);
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].position().source().segment_id().0, 1);
+        }
+        unexpected => panic!("unexpected cumulative acknowledgement error: {unexpected:?}"),
+    }
+    assert_eq!(
+        cluster
+            .inspect(M1FakeCluster::resource_counts)
+            .unacked_messages,
+        1
+    );
+    let before_retry = cluster.inspect(|fake| fake.routes().len());
+    consumer
+        .acknowledge_cumulative(&second)
+        .await
+        .expect("retry saved A+B vector through the already-confirmed B delivery");
+    let retry_endpoints = cluster.inspect(|fake| {
+        fake.routes()[before_retry..]
+            .iter()
+            .filter(|route| route.command == magnetar::proto::pb::base_command::Type::Ack)
+            .map(|route| route.endpoint)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(retry_endpoints, vec![Endpoint::Segment(1)]);
+    assert_eq!(
+        cluster
+            .inspect(M1FakeCluster::resource_counts)
+            .unacked_messages,
+        0
+    );
+    assert_eq!(
+        stale_token_kind(
+            consumer
+                .acknowledge(&first)
+                .await
+                .expect_err("successful retry resolves A's remaining delivery lease")
+        ),
+        "stale-token"
+    );
+    let before_repeat = cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| route.command == magnetar::proto::pb::base_command::Type::Ack)
+            .count()
+    });
+    consumer
+        .acknowledge_cumulative(&second)
+        .await
+        .expect("fully-confirmed cumulative repeat is idempotent");
+    assert_eq!(
+        cluster.inspect(|fake| fake
+            .routes()
+            .iter()
+            .filter(|route| route.command == magnetar::proto::pb::base_command::Type::Ack)
+            .count()),
+        before_repeat
+    );
+    let closed = close_and_count(consumer.clone(), cluster).await;
+    assert_eq!(closed.scalable_members, 0);
+    assert_eq!(closed.unacked_messages, 0);
+    assert_eq!(consumer.status().receiver_budget_used(), 0);
+    retry_endpoints
+}
+
 async fn observe_acknowledgement_failures<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -6074,6 +6400,8 @@ where
         })
         .await;
     close_and_count(consumer, cluster).await;
+    let cumulative_retry_endpoints =
+        cumulative_retry_after_partial_confirmation(client, cluster).await;
 
     let close_after_ack_success =
         close_during_transactional_ack(client, cluster, "success", PendingCompletion::Succeed)
@@ -6093,6 +6421,7 @@ where
     AcknowledgementFailureTrace {
         partial_confirmed,
         partial_failed,
+        cumulative_retry_endpoints,
         registration_disconnect_error,
         registration_disconnect_recovered,
         close_during_ack_fenced,

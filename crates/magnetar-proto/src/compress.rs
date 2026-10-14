@@ -319,9 +319,8 @@ fn verify_size(buf: &[u8], expected: usize) -> Result<(), CompressionError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pb;
-
     use super::{CompressionKind, compress, decompress};
+    use crate::pb;
 
     #[test]
     fn every_codec_round_trips_and_maps_from_wire() {
@@ -345,11 +344,7 @@ mod tests {
     #[test]
     fn malformed_sizes_and_payloads_are_bounded() {
         assert!(matches!(
-            decompress(
-                CompressionKind::None,
-                b"ignored",
-                crate::MAX_FRAME_SIZE + 1,
-            ),
+            decompress(CompressionKind::None, b"ignored", crate::MAX_FRAME_SIZE + 1,),
             Err(super::CompressionError::UncompressedSizeTooLarge { .. })
         ));
         for kind in [
@@ -366,11 +361,7 @@ mod tests {
         let oversized = vec![0_u8; crate::MAX_FRAME_SIZE + 1];
         let encoded = compress(CompressionKind::Snappy, &oversized).expect("encode oversized");
         assert!(matches!(
-            decompress(
-                CompressionKind::Snappy,
-                &encoded,
-                crate::MAX_FRAME_SIZE,
-            ),
+            decompress(CompressionKind::Snappy, &encoded, crate::MAX_FRAME_SIZE,),
             Err(super::CompressionError::UncompressedSizeTooLarge { .. })
         ));
     }

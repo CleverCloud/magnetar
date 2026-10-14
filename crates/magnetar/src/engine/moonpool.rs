@@ -765,26 +765,7 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
         &self,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnId, Self::Error>> + Send + '_>> {
-        let shared = self.shared().clone();
-        Box::pin(async move {
-            let request_id = {
-                let mut conn = shared.inner.lock();
-                conn.new_txn(timeout)
-            };
-            shared.driver_waker.notify_one();
-            let outcome = moonpool_request_fut(shared.clone(), request_id).await;
-            match outcome {
-                magnetar_proto::OpOutcome::NewTxn { result, .. } => result.map_err(|err| {
-                    magnetar_runtime_moonpool::ClientError::Other(format!("new_txn: {err}"))
-                }),
-                magnetar_proto::OpOutcome::Error { code, message, .. } => {
-                    Err(magnetar_runtime_moonpool::ClientError::Broker { code, message })
-                }
-                other => Err(magnetar_runtime_moonpool::ClientError::Other(format!(
-                    "unexpected new_txn outcome: {other:?}"
-                ))),
-            }
-        })
+        Box::pin(magnetar_runtime_moonpool::Client::new_txn(self, timeout))
     }
 
     fn add_partition_to_txn(

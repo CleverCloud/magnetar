@@ -45,7 +45,7 @@ fn segment_info(
     sealed: Option<u64>,
 ) -> pb::SegmentInfoProto {
     pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+        entry_bucket_splits: Vec::new(),
         segment_id: id,
         hash_start: start,
         hash_end: end,
@@ -118,7 +118,7 @@ fn assignment_at(epoch: u64, ids: &[u64]) -> ConsumerAssignment {
             };
             let range = KeyRange::new(start, end).expect("segment range");
             pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                bucket_ranges: Vec::new(),
                 segment_id: *id,
                 hash_start: start,
                 hash_end: end,
@@ -151,7 +151,7 @@ fn foreign_assignment() -> ConsumerAssignment {
         &pb::ScalableConsumerAssignment {
             layout_epoch: 1,
             segments: vec![pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                bucket_ranges: Vec::new(),
                 segment_id: 1,
                 hash_start: range.start(),
                 hash_end: range.end(),
@@ -537,15 +537,18 @@ fn aggregate_model_acknowledgement_seek_resync_and_close_are_one_shot() {
     assert_eq!(model.child_generation(&source(1)), Some(generation_one));
     assert!(model.accepts_child_result(&source(2), generation_two));
     assert!(!model.accepts_child_result(&source(2), ChildGeneration(u64::MAX)));
-    assert!(model.pending_ownership().is_empty());
+    assert_eq!(
+        model.pending_ownership(),
+        [] as [magnetar_proto::SegmentSource; 0]
+    );
     let opening = model.status();
     assert_eq!(opening.phase(), AggregatePhase::Open);
     assert_eq!(opening.layout_epoch(), 1);
     assert_eq!(opening.assigned_segments(), 2);
     assert_eq!(opening.attached_segments(), 0);
     assert_eq!(opening.draining_segments(), 0);
-    assert!(opening.pending_ownership().is_empty());
-    assert!(opening.ordering_unprovable().is_empty());
+    assert_eq!(opening.pending_ownership(), []);
+    assert_eq!(opening.ordering_unprovable(), []);
     assert_eq!(opening.receiver_budget_limit(), model.budget().limit());
     assert_eq!(opening.receiver_budget_used(), 0);
 
@@ -636,11 +639,11 @@ fn aggregate_model_acknowledgement_seek_resync_and_close_are_one_shot() {
     ));
     let seek = model.begin_seek(&vector).expect("begin aggregate seek");
     assert_eq!(seek.len(), 4);
-    assert!(
+    assert_eq!(
         model
             .seek_completed(SegmentId(1), generation_one)
-            .expect("first seek component")
-            .is_empty()
+            .expect("first seek component"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert_eq!(
         model
@@ -657,11 +660,9 @@ fn aggregate_model_acknowledgement_seek_resync_and_close_are_one_shot() {
     let resync = model.require_resync().expect("enter resynchronization");
     assert_eq!(model.phase(), AggregatePhase::ResyncRequired);
     assert_eq!(resync.len(), 2);
-    assert!(
-        model
-            .require_resync()
-            .expect("idempotent resync")
-            .is_empty()
+    assert_eq!(
+        model.require_resync().expect("idempotent resync"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     model
         .child_closed(SegmentId(1), generation_one)
@@ -682,7 +683,10 @@ fn aggregate_model_acknowledgement_seek_resync_and_close_are_one_shot() {
     let replacement_one = opened_generation(&replacements[0]);
     let replacement_two = opened_generation(&replacements[1]);
     assert_eq!(model.close().expect("close aggregate").len(), 2);
-    assert!(model.close().expect("idempotent close").is_empty());
+    assert_eq!(
+        model.close().expect("idempotent close"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
+    );
     model
         .child_closed(SegmentId(1), replacement_one)
         .expect("first replacement closes");
@@ -858,11 +862,11 @@ fn aggregate_model_failure_dispositions_and_reservation_owners_are_explicit() {
     permanent
         .child_closed(SegmentId(1), generation)
         .expect("permanently failed child closes");
-    assert!(
+    assert_eq!(
         permanent
             .apply_assignment(assignment(&[1]))
-            .expect("same permanent assignment remains fenced")
-            .is_empty()
+            .expect("same permanent assignment remains fenced"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
 
     let mut retryable = model_with_data_capacity(MAX_FRAME_SIZE * 2);
@@ -914,11 +918,11 @@ fn aggregate_model_orders_busy_children_and_fences_controller_replacement() {
         .apply_assignment(assignment(&[1]))
         .expect("strict child assignment");
     let generation = opened_generation(&open[0]);
-    assert!(
+    assert_eq!(
         strict
             .child_opened(SegmentId(1), generation)
-            .expect("strict child attaches")
-            .is_empty()
+            .expect("strict child attaches"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert!(matches!(
         strict.segment_phase(SegmentId(1)),
@@ -978,14 +982,14 @@ fn aggregate_model_orders_busy_children_and_fences_controller_replacement() {
             .map(ConsumerAssignment::layout_epoch),
         Some(2)
     );
-    assert!(
+    assert_eq!(
         replacement
             .apply_control_plane(
                 split_dag_at(3, "pulsar://replacement-again:6650"),
                 assignment_at(3, &[1]),
             )
-            .expect("replace an already-draining placement")
-            .is_empty()
+            .expect("replace an already-draining placement"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert_eq!(replacement.dag().epoch(), 3);
     assert!(matches!(
@@ -1029,14 +1033,14 @@ fn aggregate_model_orders_busy_children_and_fences_controller_replacement() {
     unassigned_replacement
         .apply_assignment(assignment(&[]))
         .expect("start an ordinary unassigned drain");
-    assert!(
+    assert_eq!(
         unassigned_replacement
             .apply_control_plane(
                 split_dag_at(2, "pulsar://unassigned-replacement:6650"),
                 assignment_at(2, &[]),
             )
-            .expect("upgrade the unassigned retained child replacement")
-            .is_empty()
+            .expect("upgrade the unassigned retained child replacement"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert_eq!(
         unassigned_replacement.segment_phase(SegmentId(1)),
@@ -1109,11 +1113,11 @@ fn completed_sealed_segment_is_not_reopened_after_assignment_rebalance() {
     sealed
         .child_opened(SegmentId(0), generation)
         .expect("sealed parent opens");
-    assert!(
+    assert_eq!(
         sealed
             .observe_terminal(SegmentId(0), generation)
-            .expect("sealed parent terminal")
-            .is_empty()
+            .expect("sealed parent terminal"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     sealed
         .complete_segment(SegmentId(0), generation)
@@ -1162,13 +1166,16 @@ fn completed_sealed_segment_is_not_reopened_after_assignment_rebalance() {
     deferred
         .complete_segment(SegmentId(0), deferred_generation)
         .expect("deferred sealed parent completes");
-    assert!(
+    assert_eq!(
         deferred
             .child_closed(SegmentId(0), deferred_generation)
-            .expect("deferred sealed parent closes")
-            .is_empty()
+            .expect("deferred sealed parent closes"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
-    assert!(deferred.pending_ownership().is_empty());
+    assert_eq!(
+        deferred.pending_ownership(),
+        [] as [magnetar_proto::SegmentSource; 0]
+    );
 
     let (mut active, active_generation, _flow) = opened_one_child();
     active
@@ -1200,7 +1207,10 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
         empty.apply_assignment(foreign_assignment()),
         Err(StreamConsumerModelError::AssignmentParentMismatch { .. })
     ));
-    assert!(empty.close().expect("close empty aggregate").is_empty());
+    assert_eq!(
+        empty.close().expect("close empty aggregate"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
+    );
     assert_eq!(empty.phase(), AggregatePhase::Closed);
     assert!(matches!(
         empty.require_resync(),
@@ -1216,11 +1226,11 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
         .apply_assignment(assignment(&[1]))
         .expect("opening assignment");
     let generation = opened_generation(&open[0]);
-    assert!(
+    assert_eq!(
         opening
             .apply_assignment(assignment(&[1]))
-            .expect("identical assignment")
-            .is_empty()
+            .expect("identical assignment"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert!(matches!(
         opening.child_opened(SegmentId(99), generation),
@@ -1253,11 +1263,11 @@ fn aggregate_model_rejects_stale_lifecycle_position_and_acknowledgement_work() {
             .as_slice(),
         [StreamConsumerAction::CancelOpen { .. }]
     ));
-    assert!(
+    assert_eq!(
         closing_open
             .child_closed(SegmentId(1), generation)
-            .expect("cancelled opening child confirms aggregate close")
-            .is_empty()
+            .expect("cancelled opening child confirms aggregate close"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert_eq!(closing_open.phase(), AggregatePhase::Closed);
 
@@ -1572,11 +1582,11 @@ fn aggregate_model_seek_and_position_edges_validate_current_sources() {
         .apply_assignment(assignment(&[1]))
         .expect("strict seek assignment");
     let generation = opened_generation(&open[0]);
-    assert!(
+    assert_eq!(
         strict
             .child_opened(SegmentId(1), generation)
-            .expect("strict seek child")
-            .is_empty()
+            .expect("strict seek child"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     let strict_position =
         PositionVector::new(1, [(source(1), message_id(2))]).expect("strict position");
@@ -1598,11 +1608,11 @@ fn aggregate_model_seek_and_position_edges_validate_current_sources() {
     closing_resync
         .apply_assignment(assignment(&[]))
         .expect("cancel opening child before resync");
-    assert!(
+    assert_eq!(
         closing_resync
             .require_resync()
-            .expect("resync ignores an already-closing child")
-            .is_empty()
+            .expect("resync ignores an already-closing child"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
 
     let (mut positions, generation, flow) = opened_one_child();
@@ -1657,11 +1667,11 @@ fn aggregate_model_seek_and_position_edges_validate_current_sources() {
     closing_child
         .apply_assignment(assignment(&[]))
         .expect("close unopened child");
-    assert!(
+    assert_eq!(
         closing_child
             .begin_controller_incarnation(ControllerIncarnation(4))
-            .expect("replace controller around closing child")
-            .is_empty()
+            .expect("replace controller around closing child"),
+        [] as [magnetar_proto::StreamConsumerAction; 0]
     );
     assert!(matches!(
         closing_child.child_open_busy(SegmentId(99), generation),
@@ -1683,26 +1693,26 @@ fn aggregate_model_seek_and_position_edges_validate_current_sources() {
     let next = source_fence
         .message_arrived(SegmentId(1), generation, next_flow, 128)
         .expect("second source-fence arrival");
-    source_fence
+    let advancing = source_fence
         .issue_delivery(SegmentId(1), generation, stream_id(1, 11), next.retained)
         .expect("second delivery updates retained position metadata");
+    let earlier_snapshot = advancing.position_vector().to_owned();
+    assert_eq!(
+        earlier_snapshot,
+        PositionVector::new(1, [(source(1), message_id(11))]).expect("earlier snapshot")
+    );
     let third_flow = flow_reservation(&next.actions);
     let third = source_fence
         .message_arrived(SegmentId(1), generation, third_flow, 128)
         .expect("third source-fence arrival");
-    let non_advancing = source_fence
+    let redelivery = source_fence
         .issue_delivery(SegmentId(1), generation, stream_id(1, 10), third.retained)
-        .expect("older delivery does not replace the retained position");
-    assert_eq!(
-        non_advancing
-            .position_vector()
-            .iter()
-            .next()
-            .expect("one delivered position")
-            .1
-            .entry_id,
-        11
-    );
+        .expect("redelivery records the latest observed position");
+    let latest =
+        PositionVector::new(1, [(source(1), message_id(10))]).expect("latest observed snapshot");
+    assert_eq!(redelivery.position_vector(), &latest);
+    assert_eq!(source_fence.delivered_position(), &latest);
+    assert_eq!(advancing.position_vector(), &earlier_snapshot);
 }
 
 #[test]

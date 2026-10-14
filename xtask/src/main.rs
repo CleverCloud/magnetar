@@ -118,19 +118,24 @@ enum Cmd {
     /// Walks each `GenericImage::new(…)` builder chain under
     /// `crates/magnetar/tests/`, resolves the image repository the first
     /// constructor argument denotes (string literal, `&str` const, or a
-    /// zero-argument accessor returning one), and requires every
-    /// `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)`
-    /// before `.start()`. Non-Pulsar containers — the Kerberos KDC and the
-    /// Athenz ZTS server — are out of scope; a chain whose image cannot be
-    /// resolved, or that never reaches `.start()`, is a violation rather
-    /// than a silent skip. Only the call's presence is checked: the budget
-    /// value lives in `docs/testing.md` § "e2e container memory budget".
-    CheckE2eContainerMemory,
-    /// Enforce added executable-line coverage in separate Moonpool/shared and
-    /// Tokio-adapter evidence domains. Each owns an invocation-local report;
-    /// packages owned by neither remain advisory `not gated` scope.
-    /// Require all broker tests to use the shared Pulsar fixture.
+    /// zero-argument accessor returning one), and enforces three rules:
+    ///
+    /// 1. A chain whose repository is `apachepulsar/…`, and any `apachepulsar/pulsar:` reference at
+    ///    all, is allowed only under `crates/magnetar/tests/common/`.
+    /// 2. Every such chain there carries `.with_env_var("PULSAR_MEM", …)` before `.start()` on the
+    ///    same expression chain.
+    /// 3. The tag constants of `common/pulsar.rs` equal the `docker pull apachepulsar/pulsar:<tag>`
+    ///    set of the workflows under `.github/`, are a subset of `FIXTURE_TAGS` in
+    ///    `scripts/performance_campaign.py`, and the PIP-33 compose fixture pins `DEFAULT_TAG`.
+    ///
+    /// Non-Pulsar containers — the Kerberos KDC and the Athenz ZTS server —
+    /// are out of scope; a chain whose image cannot be resolved, or that never
+    /// reaches `.start()`, is a violation rather than a silent skip. Only the
+    /// `PULSAR_MEM` call's presence is checked: the budget value lives in
+    /// `docs/testing.md` § "e2e container memory budget".
+    #[command(alias = "check-e2e-container-memory")]
     CheckE2eFixture,
+    /// Require complete patch coverage from isolated runtime domains.
     CheckSimCoverage {
         /// Base ref to diff against. Defaults to `origin/main`.
         #[arg(long, default_value = "origin/main")]
@@ -3677,7 +3682,8 @@ fn sim_lcov_commands(
     // instrumentation: cargo-llvm-cov instruments every workspace member
     // regardless, which is exactly why step 2 can widen the report for free.
     let mut exec = StdCommand::new(cargo);
-    exec.current_dir(workspace_root).args(["llvm-cov", "--no-report"]);
+    exec.current_dir(workspace_root)
+        .args(["llvm-cov", "--no-report"]);
     for package in domain.execution_packages {
         exec.args(["-p", package]);
     }
@@ -4017,7 +4023,7 @@ type UninstrumentedSplit = (Vec<(String, usize)>, Vec<(String, usize)>);
 /// Split [`uninstrumented_files`] into hard failures and advisory files.
 ///
 /// A record-less gated file hard-fails when its crate produced no records at
-/// all ([`silent_gated_prefixes`]) or when the file contains a non-test function
+/// all ([`silent_gated_prefixes_for`]) or when the file contains a non-test function
 /// body ([`has_non_test_function_body`]). Inside a crate that did emit records,
 /// a genuinely non-executable file remains advisory because LLVM derives its
 /// coverage mapping from functions and nothing a test could cover can create an
@@ -4102,7 +4108,7 @@ fn report_missing_gated(domain: &SimCoverageDomain, missing: &[(String, usize)])
     );
 }
 
-/// Report both record-less buckets produced by [`classify_uninstrumented`],
+/// Report both record-less buckets produced by [`classify_uninstrumented_for`],
 /// then propagate the hard failure if there was one.
 ///
 /// The ordering is load-bearing and belongs here rather than inlined at the
@@ -6815,7 +6821,7 @@ esac
             assert_eq!(invocation.llvm_build, invocation.llvm_target);
             assert_eq!(invocation.cargo_target, invocation.llvm_target);
             assert_eq!(invocation.cargo_build, None);
-            assert!(invocation.artifact_flags.is_empty());
+            assert_eq!(invocation.artifact_flags, "");
         }
         assert!(
             !isolated_root.exists(),
@@ -7565,7 +7571,7 @@ esac
             vec![("crates/magnetar-proto/src/omitted.rs".to_owned(), 1)],
             "a production function without an SF: record is unmeasured, even when its crate reported"
         );
-        assert!(advisory.is_empty());
+        assert_eq!(advisory, Vec::<(String, usize)>::new());
         assert!(report_missing_gated(domain, &missing_gated).is_err());
     }
 
@@ -7600,7 +7606,7 @@ esac
             missing_gated,
             vec![("crates/magnetar-proto/src/callback.rs".to_owned(), 1)]
         );
-        assert!(advisory.is_empty());
+        assert_eq!(advisory, Vec::<(String, usize)>::new());
     }
 
     /// LLVM derives its coverage mapping from per-function records, so a file

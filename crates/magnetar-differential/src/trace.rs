@@ -741,24 +741,26 @@ mod tests {
 
     #[test]
     fn trace_round_trip() {
+        let operations = vec![
+            Op::Send {
+                payload: b"hi".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(1),
+            },
+            Op::Ack {
+                message_id: mid(1, 0),
+            },
+            Op::Close,
+            Op::ConcurrentClose,
+        ];
         let t = Trace::new(
             "persistent://public/default/t",
             "s",
-            vec![
-                Op::Send {
-                    payload: b"hi".to_vec(),
-                },
-                Op::Recv {
-                    timeout: Duration::from_secs(1),
-                },
-                Op::Ack {
-                    message_id: mid(1, 0),
-                },
-                Op::Close,
-                Op::ConcurrentClose,
-            ],
+            ToOwned::to_owned(&operations),
         );
-        assert_eq!(t.ops.len(), 4);
+        assert_eq!(t.ops.len(), 5);
+        assert_eq!(t.ops, operations);
         assert_eq!(t.topic, "persistent://public/default/t");
         assert_eq!(t.subscription, "s");
     }

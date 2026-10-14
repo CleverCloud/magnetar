@@ -1189,8 +1189,13 @@ impl<P: Providers> Consumer<P> {
     }
 
     #[cfg(all(test, feature = "scalable-topics"))]
-    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
-        self.slot.state.lock().last_acked_message_id
+    pub(crate) fn unacked_deadline_for_test(&self) -> Option<std::time::Instant> {
+        self.slot
+            .state
+            .lock()
+            .unacked_tracker
+            .as_ref()
+            .and_then(magnetar_proto::trackers::UnackedMessageTracker::next_deadline)
     }
 
     fn ack_inner_with_message_id_data(
@@ -5650,10 +5655,13 @@ mod tests {
         )
         .await
         .expect("overlapping unsubscribe must fail immediately");
-        assert!(matches!(
-            second,
-            Err(ClientError::Other(message)) if message == "unsubscribe already in progress"
-        ));
+        assert!(
+            matches!(
+                &second,
+                Err(ClientError::Other(message)) if message == "unsubscribe in progress"
+            ),
+            "overlapping unsubscribe result: {second:?}"
+        );
         assert_eq!(
             shared.inner.lock().peek_next_request_id_for_test(),
             first_request_id + 1,

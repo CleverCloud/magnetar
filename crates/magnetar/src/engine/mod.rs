@@ -1204,7 +1204,7 @@ pub trait StreamConsumerBackend: 'static + Send + Sync {
         txn_id: magnetar_proto::TxnId,
     ) -> Pin<Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + 'a>>;
 
-    /// Current highest position delivered to the application per segment.
+    /// Current latest position delivered to the application per segment.
     fn delivered_position(&self) -> magnetar_proto::PositionVector;
 
     /// Current aggregate lifecycle/resource snapshot.

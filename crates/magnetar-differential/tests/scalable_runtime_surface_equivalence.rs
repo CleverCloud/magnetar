@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use magnetar_differential::broker::ScriptedBroker;
 use magnetar_fakes::m1::{
-    BrokerFailure, Endpoint, M1FakeCluster, M1Segment, OperationKind, PendingCompletion,
-    ScriptedBehavior,
+    BrokerFailure, Endpoint, FullAssignment, M1FakeCluster, M1Segment, OperationKind,
+    PendingCompletion, ScriptedBehavior,
 };
 use magnetar_proto::{ConnectionConfig, ControllerIncarnation, RedirectUrlAllowList};
 use moonpool_core::TokioProviders;
@@ -324,7 +324,7 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         .key_range;
     let mismatched_source_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &mismatched, &options)
+            .open_segment_consumer(&source, &mismatched, &options, &[])
             .await,
         Err(magnetar_runtime_tokio::ClientError::Other(_))
     );
@@ -332,7 +332,7 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
     missing.broker_url = None;
     let missing_authority_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &missing, &options)
+            .open_segment_consumer(&source, &missing, &options, &[])
             .await,
         Err(magnetar_runtime_tokio::ClientError::ControllerUnavailable)
     );
@@ -340,7 +340,7 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
     wrong_scheme.broker_url = descriptor.broker_url_tls.clone();
     let wrong_scheme_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &wrong_scheme, &options)
+            .open_segment_consumer(&source, &wrong_scheme, &options, &[])
             .await,
         Err(magnetar_runtime_tokio::ClientError::ControllerRoutingUnsupported { .. })
     );
@@ -348,13 +348,13 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
     disallowed.broker_url = Some("pulsar://outside.example:6650".to_owned());
     let disallowed_authority_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &disallowed, &options)
+            .open_segment_consumer(&source, &disallowed, &options, &[])
             .await,
         Err(magnetar_runtime_tokio::ClientError::ScalableAuthorityRejected)
     );
 
     let child = subscriber
-        .open_segment_consumer(&source, &descriptor, &options)
+        .open_segment_consumer(&source, &descriptor, &options, &[])
         .await
         .expect("open valid Tokio segment consumer");
     let child_topic = child.topic();
@@ -392,10 +392,37 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         })
         .await;
     foreign_cluster.assert_healthy();
+    let controller = subscriber
+        .reopen_controller_session(&dag, controller)
+        .await
+        .expect("replace the unregistered Tokio controller");
+    assert_eq!(controller.consumer_id(), consumer_id);
+    assert!(controller.incarnation().0 > controller_incarnation);
+    assert_eq!(controller.registration_topic(), registration_topic);
+    assert_eq!(controller.subscription(), subscription);
+    assert_eq!(controller.consumer_name(), consumer_name);
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar_proto::pb::ServerError::NotAllowedError,
+                    "scripted replacement rejection",
+                )),
+            )
+        })
+        .expect("reject the next Tokio controller replacement");
     let replacement_rejected = matches!(
         subscriber.reopen_controller_session(&dag, controller).await,
         Err(magnetar_runtime_tokio::ClientError::ScalableAssignmentRejected { .. })
     );
+    cluster
+        .wait_for(
+            "Tokio rejected replacement leaves no controller member",
+            |fake| fake.member(&subscription, &consumer_name).is_none(),
+        )
+        .await;
     dag.close();
     for _ in 0..=256 {
         subscriber
@@ -649,7 +676,7 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         .key_range;
     let mismatched_source_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &mismatched, &options)
+            .open_segment_consumer(&source, &mismatched, &options, &[])
             .await,
         Err(magnetar_runtime_moonpool::ClientError::Other(_))
     );
@@ -657,7 +684,7 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
     missing.broker_url = None;
     let missing_authority_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &missing, &options)
+            .open_segment_consumer(&source, &missing, &options, &[])
             .await,
         Err(magnetar_runtime_moonpool::ClientError::ControllerUnavailable)
     );
@@ -665,7 +692,7 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
     wrong_scheme.broker_url = descriptor.broker_url_tls.clone();
     let wrong_scheme_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &wrong_scheme, &options)
+            .open_segment_consumer(&source, &wrong_scheme, &options, &[])
             .await,
         Err(magnetar_runtime_moonpool::ClientError::ControllerRoutingUnsupported { .. })
     );
@@ -673,13 +700,13 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
     disallowed.broker_url = Some("pulsar://outside.example:6650".to_owned());
     let disallowed_authority_rejected = matches!(
         subscriber
-            .open_segment_consumer(&source, &disallowed, &options)
+            .open_segment_consumer(&source, &disallowed, &options, &[])
             .await,
         Err(magnetar_runtime_moonpool::ClientError::ScalableAuthorityRejected)
     );
 
     let child = subscriber
-        .open_segment_consumer(&source, &descriptor, &options)
+        .open_segment_consumer(&source, &descriptor, &options, &[])
         .await
         .expect("open valid Moonpool segment consumer");
     let child_topic = child.topic();
@@ -728,10 +755,37 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         })
         .await;
     foreign_cluster.assert_healthy();
+    let controller = subscriber
+        .reopen_controller_session(&dag, controller)
+        .await
+        .expect("replace the unregistered Moonpool controller");
+    assert_eq!(controller.consumer_id(), consumer_id);
+    assert!(controller.incarnation().0 > controller_incarnation);
+    assert_eq!(controller.registration_topic(), registration_topic);
+    assert_eq!(controller.subscription(), subscription);
+    assert_eq!(controller.consumer_name(), consumer_name);
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                ScriptedBehavior::Fail(BrokerFailure::new(
+                    magnetar_proto::pb::ServerError::NotAllowedError,
+                    "scripted replacement rejection",
+                )),
+            )
+        })
+        .expect("reject the next Moonpool controller replacement");
     let replacement_rejected = matches!(
         subscriber.reopen_controller_session(&dag, controller).await,
         Err(magnetar_runtime_moonpool::ClientError::ScalableAssignmentRejected { .. })
     );
+    cluster
+        .wait_for(
+            "Moonpool rejected replacement leaves no controller member",
+            |fake| fake.member(&subscription, &consumer_name).is_none(),
+        )
+        .await;
     dag.close();
     for _ in 0..=256 {
         subscriber
@@ -889,16 +943,14 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
         })
         .expect("timed-out Tokio controller operation remains observable");
     controller_cluster
-        .update(|fake| {
-            fake.complete_pending(
-                pending_controller,
-                PendingCompletion::Fail(BrokerFailure::new(
-                    magnetar_proto::pb::ServerError::ServiceNotReady,
-                    "timed-out controller registration",
-                )),
-            )
-        })
-        .expect("settle timed-out Tokio controller operation");
+        .update(|fake| fake.complete_pending(pending_controller, PendingCompletion::Succeed))
+        .expect("settle timed-out Tokio controller operation successfully");
+    controller_cluster
+        .wait_for(
+            "late Tokio controller registration leaves the live pooled connection",
+            |fake| fake.resource_counts().scalable_members == 0,
+        )
+        .await;
     let controller = controller_subscriber
         .open_controller_session(&dag, "failure-sub", "segment-timeout-member")
         .await
@@ -928,6 +980,7 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
                     consumer_name: "segment-timeout-member".to_owned(),
                     schema: magnetar_proto::pb::Schema::default(),
                 },
+                &[],
             )
             .await,
         Err(magnetar_runtime_tokio::ClientError::Timeout(_))
@@ -1271,16 +1324,14 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
         })
         .expect("timed-out Moonpool controller operation remains observable");
     controller_cluster
-        .update(|fake| {
-            fake.complete_pending(
-                pending_controller,
-                PendingCompletion::Fail(BrokerFailure::new(
-                    magnetar_proto::pb::ServerError::ServiceNotReady,
-                    "timed-out controller registration",
-                )),
-            )
-        })
-        .expect("settle timed-out Moonpool controller operation");
+        .update(|fake| fake.complete_pending(pending_controller, PendingCompletion::Succeed))
+        .expect("settle timed-out Moonpool controller operation successfully");
+    controller_cluster
+        .wait_for(
+            "late Moonpool controller registration leaves the live pooled connection",
+            |fake| fake.resource_counts().scalable_members == 0,
+        )
+        .await;
     let controller = controller_subscriber
         .open_controller_session(&dag, "failure-sub", "segment-timeout-member")
         .await
@@ -1310,6 +1361,7 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
                     consumer_name: "segment-timeout-member".to_owned(),
                     schema: magnetar_proto::pb::Schema::default(),
                 },
+                &[],
             )
             .await,
         Err(magnetar_runtime_moonpool::ClientError::Other(_))
@@ -2145,4 +2197,263 @@ async fn owned_scalable_runtime_transaction_failures_are_equivalent() {
     assert!(tokio_trace.close_during_registration_fenced);
     assert!(tokio_trace.closed_outcome_rejected);
     assert!(tokio_trace.cleaned_up);
+}
+
+fn scalable_leave_count(cluster: &M1SocketCluster) -> usize {
+    cluster.inspect(|fake| {
+        fake.routes()
+            .iter()
+            .filter(|route| {
+                route.command == magnetar_proto::pb::base_command::Type::ScalableTopicUnsubscribe
+            })
+            .count()
+    })
+}
+
+async fn observe_tokio_controller_handoff_with_held_leave() {
+    let cluster = M1SocketCluster::bind().await;
+    let client =
+        magnetar_runtime_tokio::Client::connect(cluster.controller_url(), supervised_config())
+            .await
+            .expect("connect Tokio handoff client");
+    let subscriber = client.segment_subscriber().expect("controller subscriber");
+    let dag = subscriber
+        .open_dag_session(TOPIC)
+        .await
+        .expect("controller DAG");
+    let previous = subscriber
+        .open_controller_session(&dag, "held-leave-sub", "held-leave-member")
+        .await
+        .expect("initial controller registration");
+    let consumer_id = previous.consumer_id();
+    let incarnation = previous.incarnation();
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableLeave,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold any terminal leave crossing replacement registration");
+    let mut replacement = subscriber
+        .reopen_controller_session(&dag, previous)
+        .await
+        .expect("reattach controller registration");
+    let pending_leaves = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .filter(|pending| pending.kind == OperationKind::ScalableLeave)
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>()
+    });
+    for pending in pending_leaves {
+        cluster
+            .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+            .expect("settle an actually received old leave after replacement registration");
+    }
+    let member = cluster
+        .inspect(|fake| fake.member("held-leave-sub", "held-leave-member"))
+        .expect("replacement membership survives earlier asynchronous deletion");
+    assert_eq!(member.consumer_id, consumer_id);
+    assert_eq!(replacement.consumer_id(), consumer_id);
+    assert!(replacement.incarnation().0 > incarnation.0);
+    assert_eq!(scalable_leave_count(&cluster), 0);
+    assert_eq!(
+        cluster.inspect(|fake| fake.resource_counts().scalable_members),
+        1
+    );
+    cluster
+        .update(|fake| fake.advance_layout(2, unchanged_layout()))
+        .expect("new layout epoch");
+    cluster
+        .update(|fake| fake.publish_assignment_plan(2, vec![FullAssignment::new(member, [1, 2])]))
+        .expect("push assignment through replacement route");
+    let assignment = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        replacement.next_assignment(),
+    )
+    .await
+    .expect("live replacement assignment route")
+    .expect("replacement assignment");
+    assert_eq!(assignment.layout_epoch(), 2);
+    assert_eq!(
+        assignment
+            .segments()
+            .iter()
+            .map(|segment| segment.segment_id().0)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    replacement.close();
+    dag.close();
+    cluster
+        .wait_for("terminal logical leave", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::ScalableLeave)
+        })
+        .await;
+    assert_eq!(scalable_leave_count(&cluster), 1);
+    assert_eq!(
+        cluster.inspect(|fake| fake.resource_counts().scalable_members),
+        1
+    );
+    let pending = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .find(|pending| pending.kind == OperationKind::ScalableLeave)
+            .expect("terminal pending leave")
+            .id
+    });
+    cluster
+        .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+        .expect("terminal unregister");
+    cluster
+        .wait_for("terminal membership cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.scalable_members == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+        })
+        .await;
+    client.close().await;
+    cluster
+        .wait_for("controller connection cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    cluster.assert_healthy();
+}
+
+async fn observe_moonpool_controller_handoff_with_held_leave() {
+    let cluster = M1SocketCluster::bind().await;
+    let engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let address = cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("controller address");
+    let client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &engine,
+        address,
+        supervised_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect Moonpool handoff client");
+    let subscriber = client.segment_subscriber().expect("controller subscriber");
+    let dag = subscriber
+        .open_dag_session(TOPIC)
+        .await
+        .expect("controller DAG");
+    let previous = subscriber
+        .open_controller_session(&dag, "held-leave-sub", "held-leave-member")
+        .await
+        .expect("initial controller registration");
+    let consumer_id = previous.consumer_id();
+    let incarnation = previous.incarnation();
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableLeave,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold any terminal leave crossing replacement registration");
+    let mut replacement = subscriber
+        .reopen_controller_session(&dag, previous)
+        .await
+        .expect("reattach controller registration");
+    let pending_leaves = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .filter(|pending| pending.kind == OperationKind::ScalableLeave)
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>()
+    });
+    for pending in pending_leaves {
+        cluster
+            .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+            .expect("settle an actually received old leave after replacement registration");
+    }
+    let member = cluster
+        .inspect(|fake| fake.member("held-leave-sub", "held-leave-member"))
+        .expect("replacement membership survives earlier asynchronous deletion");
+    assert_eq!(member.consumer_id, consumer_id);
+    assert_eq!(replacement.consumer_id(), consumer_id);
+    assert!(replacement.incarnation().0 > incarnation.0);
+    assert_eq!(scalable_leave_count(&cluster), 0);
+    assert_eq!(
+        cluster.inspect(|fake| fake.resource_counts().scalable_members),
+        1
+    );
+    cluster
+        .update(|fake| fake.advance_layout(2, unchanged_layout()))
+        .expect("new layout epoch");
+    cluster
+        .update(|fake| fake.publish_assignment_plan(2, vec![FullAssignment::new(member, [1, 2])]))
+        .expect("push assignment through replacement route");
+    let assignment = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        replacement.next_assignment(),
+    )
+    .await
+    .expect("live replacement assignment route")
+    .expect("replacement assignment");
+    assert_eq!(assignment.layout_epoch(), 2);
+    assert_eq!(
+        assignment
+            .segments()
+            .iter()
+            .map(|segment| segment.segment_id().0)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    replacement.close();
+    dag.close();
+    cluster
+        .wait_for("terminal logical leave", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::ScalableLeave)
+        })
+        .await;
+    assert_eq!(scalable_leave_count(&cluster), 1);
+    assert_eq!(
+        cluster.inspect(|fake| fake.resource_counts().scalable_members),
+        1
+    );
+    let pending = cluster.inspect(|fake| {
+        fake.pending_operations()
+            .into_iter()
+            .find(|pending| pending.kind == OperationKind::ScalableLeave)
+            .expect("terminal pending leave")
+            .id
+    });
+    cluster
+        .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+        .expect("terminal unregister");
+    cluster
+        .wait_for("terminal membership cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.scalable_members == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+        })
+        .await;
+    client.close().await;
+    cluster
+        .wait_for("controller connection cleanup", |fake| {
+            fake.resource_counts().connections == 0
+        })
+        .await;
+    cluster.assert_healthy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_handoff_avoids_delayed_delete_and_keeps_terminal_leave_equivalently() {
+    observe_tokio_controller_handoff_with_held_leave().await;
+    observe_moonpool_controller_handoff_with_held_leave().await;
 }

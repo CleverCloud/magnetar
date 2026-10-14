@@ -4,7 +4,7 @@
 - **Date**: 2026-08-12
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, tokio, moonpool, artifact-provenance, ci
-- **Amends**: [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md), [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md), [ADR-0118](0118-isolate-sim-coverage-current-pass-artifacts.md), and [ADR-0120](0102-assignment-driven-m1-hardened-stream-consumer.md)
+- **Amends**: [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md), [ADR-0090](0090-widen-sim-coverage-report-to-compiled-closure.md), [ADR-0092](0092-enforce-sim-coverage-and-gate-every-pull-request.md), [ADR-0118](0118-isolate-sim-coverage-current-pass-artifacts.md), and [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md)
 
 This decision historically amends ADR-0120 lines 176-190 and 232 only: its single eight-package report topology becomes seven Moonpool/shared packages plus one isolated Tokio package, and its “unchanged two-root execution” reference no longer governs.
 ADR-0120's record-less-file rule remains binding.

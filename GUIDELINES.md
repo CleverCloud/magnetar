@@ -139,7 +139,7 @@ Execution scope and report scope are two different sets, and the distinction is 
 
 The `magnetar` façade library and `magnetar-fakes` are in the reported and hard-gated set because `magnetar-differential` now compiles and exercises both.
 The façade's Docker-bound `crates/magnetar/tests/e2e_*.rs` targets do not run under either coverage domain.
-Additions in `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and any other uncompiled package still print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) as amended by [ADR-0120](specs/adr/0102-assignment-driven-m1-hardened-stream-consumer.md).
+Additions in `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and any other uncompiled package still print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) as amended by [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md).
 That holds under `--enforce` too: the ungated report is a scope limit, not a verdict, so no flag turns it fatal. See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the policy the gate serves.
 
 **Enforcing landing** — `SIM_COVERAGE_ENFORCES_UNCOVERED = true` in `xtask/src/main.rs`, so an uncovered added line inside the reported scope is printed in full, with a count, and **fails** the check ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)).

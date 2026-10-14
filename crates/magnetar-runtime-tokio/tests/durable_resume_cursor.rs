@@ -62,8 +62,6 @@ fn reattach_start_message_id(durable: bool) -> Option<magnetar_proto::pb::Messag
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     let _ = conn.ack(
         handle,
@@ -96,7 +94,5 @@ fn original_start() -> MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     }
 }

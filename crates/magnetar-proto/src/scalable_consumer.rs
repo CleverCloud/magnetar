@@ -280,17 +280,19 @@ impl ScalableConsumerType {
 /// One segment assigned to this consumer, with the `segment://` topic to attach
 /// to.
 ///
-/// The wire message also carries `bucket_ranges` (PIP-486): non-empty means the
-/// segment is shared by entry bucket, and the consumer must then subscribe
-/// `Key_Shared` sticky with `entryBucketDispatch` instead of `Exclusive`. It is
-/// dropped here and re-encoded empty — a known gap until the per-segment fan-out
-/// attaches to assigned segments (ADR-0093 amendment 2026-10-12).
+/// A non-empty `bucket_ranges` value (PIP-486) means this segment is shared by
+/// entry bucket, so its child subscribes `Key_Shared` sticky with
+/// `entryBucketDispatch` instead of `Exclusive`. `entry_bucket_splits` is
+/// producer metadata and is not part of this consumer assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedSegment {
     /// Segment id within the topic's DAG.
     segment_id: SegmentId,
     /// Hash key range this segment serves.
     key_range: KeyRange,
+    /// Entry-bucket ranges owned within this segment; empty means the whole
+    /// segment is assigned to this consumer.
+    bucket_ranges: Vec<KeyRange>,
     /// Fully-qualified `segment://...` topic the consumer attaches to.
     segment_topic: String,
 }
@@ -309,6 +311,36 @@ impl AssignedSegment {
         let segment_id = SegmentId(pb.segment_id);
         let key_range = KeyRange::new(pb.hash_start, pb.hash_end)
             .map_err(|source| AssignmentError::InvalidRange { segment_id, source })?;
+        let bucket_ranges = pb
+            .bucket_ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| {
+                let (Ok(start), Ok(end)) = (u32::try_from(range.start), u32::try_from(range.end))
+                else {
+                    return Err(AssignmentError::InvalidBucketRange {
+                        segment_id,
+                        index,
+                        start: range.start,
+                        end: range.end,
+                    });
+                };
+                KeyRange::new(start, end).map_err(|_| AssignmentError::InvalidBucketRange {
+                    segment_id,
+                    index,
+                    start: range.start,
+                    end: range.end,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sorted_bucket_ranges = bucket_ranges.clone();
+        sorted_bucket_ranges.sort_unstable();
+        if sorted_bucket_ranges
+            .windows(2)
+            .any(|pair| pair[0].end() >= pair[1].start())
+        {
+            return Err(AssignmentError::OverlappingBucketRanges { segment_id });
+        }
         let expected = canonical_segment_topic(parent_topic, key_range, segment_id)?;
         if pb.segment_topic != expected {
             return Err(AssignmentError::AttachmentMismatch {
@@ -320,6 +352,7 @@ impl AssignedSegment {
         Ok(Self {
             segment_id,
             key_range,
+            bucket_ranges,
             segment_topic: pb.segment_topic.clone(),
         })
     }
@@ -334,6 +367,13 @@ impl AssignedSegment {
     #[must_use]
     pub const fn key_range(&self) -> KeyRange {
         self.key_range
+    }
+
+    /// Inclusive entry-bucket ranges owned within this segment. Empty means
+    /// this consumer owns the whole segment.
+    #[must_use]
+    pub fn bucket_ranges(&self) -> &[KeyRange] {
+        &self.bucket_ranges
     }
 
     /// Canonical attachment topic.
@@ -360,7 +400,14 @@ impl AssignedSegment {
             hash_start: self.key_range.start(),
             hash_end: self.key_range.end(),
             segment_topic: self.segment_topic.clone(),
-            bucket_ranges: Vec::new(),
+            bucket_ranges: self
+                .bucket_ranges
+                .iter()
+                .map(|range| pb::IntRange {
+                    start: range.start() as i32,
+                    end: range.end() as i32,
+                })
+                .collect(),
         }
     }
 }
@@ -537,6 +584,27 @@ pub enum AssignmentError {
         source: KeyRangeError,
     },
 
+    /// An assigned entry-bucket range is outside the inclusive 16-bit key
+    /// space or has reversed endpoints.
+    #[error("assignment segment {segment_id} has invalid bucket range {index}: [{start}, {end}]")]
+    InvalidBucketRange {
+        /// Segment whose bucket range was invalid.
+        segment_id: SegmentId,
+        /// Position of the invalid range in the wire assignment.
+        index: usize,
+        /// Inclusive range start from the wire.
+        start: i32,
+        /// Inclusive range end from the wire.
+        end: i32,
+    },
+
+    /// Bucket ranges assigned to one segment overlap.
+    #[error("assignment segment {segment_id} has overlapping bucket ranges")]
+    OverlappingBucketRanges {
+        /// Segment whose ranges overlap.
+        segment_id: SegmentId,
+    },
+
     /// The broker-authored attachment does not match the parent, range, and id.
     #[error("assignment segment {segment_id} names {got:?}; expected {expected:?}")]
     AttachmentMismatch {
@@ -602,6 +670,7 @@ pub struct ScalableConsumerSession {
     buffered_updates: VecDeque<ConsumerAssignment>,
     /// Changed pushes applied immediately after the latest response baseline.
     replayed_updates: Vec<AssignmentReplay>,
+    invalidated: bool,
 }
 
 impl ScalableConsumerSession {
@@ -626,6 +695,7 @@ impl ScalableConsumerSession {
             epoch_floor: None,
             buffered_updates: VecDeque::new(),
             replayed_updates: Vec::new(),
+            invalidated: false,
         }
     }
 
@@ -711,10 +781,22 @@ impl ScalableConsumerSession {
             });
         }
         self.incarnation = incarnation;
+        self.invalidated = false;
         self.assignment = None;
         self.buffered_updates.clear();
         self.replayed_updates.clear();
         Ok(())
+    }
+
+    pub(crate) fn invalidate_authority(&mut self) {
+        self.assignment = None;
+        self.buffered_updates.clear();
+        self.replayed_updates.clear();
+        self.invalidated = true;
+    }
+
+    pub(crate) const fn is_invalidated(&self) -> bool {
+        self.invalidated
     }
 
     /// `true` once the broker has answered the subscribe.
@@ -1172,6 +1254,63 @@ mod tests {
     }
 
     #[test]
+    fn assigned_segment_round_trips_bucket_ranges() {
+        let mut segment = assigned(1, 0, 65_535);
+        segment.bucket_ranges = vec![
+            pb::IntRange {
+                start: 0,
+                end: 16_383,
+            },
+            pb::IntRange {
+                start: 32_768,
+                end: 49_151,
+            },
+        ];
+        let assignment = assignment(1, vec![segment.clone()]);
+        let decoded = ConsumerAssignment::try_from_pb(&assignment, "topic://public/default/scaled")
+            .expect("valid assignment");
+
+        assert_eq!(decoded.to_pb(), assignment);
+        assert_eq!(
+            decoded.segments()[0].bucket_ranges(),
+            &[
+                KeyRange::new(0, 16_383).unwrap(),
+                KeyRange::new(32_768, 49_151).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn assigned_segment_rejects_invalid_or_overlapping_bucket_ranges() {
+        for (start, end) in [(-1, 0), (0, 65_536), (4, 3)] {
+            let mut segment = assigned(1, 0, 65_535);
+            segment.bucket_ranges = vec![pb::IntRange { start, end }];
+            assert!(matches!(
+                AssignedSegment::try_from_pb(&segment, "topic://public/default/scaled"),
+                Err(AssignmentError::InvalidBucketRange {
+                    segment_id: SegmentId(1),
+                    ..
+                })
+            ));
+        }
+
+        let mut segment = assigned(1, 0, 65_535);
+        segment.bucket_ranges = vec![
+            pb::IntRange { start: 0, end: 100 },
+            pb::IntRange {
+                start: 100,
+                end: 200,
+            },
+        ];
+        assert!(matches!(
+            AssignedSegment::try_from_pb(&segment, "topic://public/default/scaled"),
+            Err(AssignmentError::OverlappingBucketRanges {
+                segment_id: SegmentId(1)
+            })
+        ));
+    }
+
+    #[test]
     fn changed_equal_epoch_assignment_applies_and_exact_duplicate_is_ignored() {
         let mut session = registered_session();
         let changed = pb::CommandScalableTopicAssignmentUpdate {
@@ -1205,6 +1344,32 @@ mod tests {
             .expect("descriptor changed");
         assert_eq!(delta.lost, vec![SegmentId(1)]);
         assert_eq!(delta.gained[0].segment_id(), SegmentId(1));
+    }
+
+    #[test]
+    fn same_epoch_bucket_range_change_replaces_segment_assignment() {
+        let mut session = registered_session();
+        let mut segment = assigned(1, 0, 32_767);
+        segment.bucket_ranges = vec![pb::IntRange {
+            start: 0,
+            end: 16_383,
+        }];
+        let update = pb::CommandScalableTopicAssignmentUpdate {
+            consumer_id: 7,
+            assignment: assignment(1, vec![segment]),
+        };
+
+        let delta = session
+            .handle_assignment_update(&update)
+            .expect("same layout epoch is valid")
+            .expect("bucket ownership changed");
+        assert_eq!(delta.lost, vec![SegmentId(1)]);
+        assert_eq!(delta.gained.len(), 1);
+        assert_eq!(
+            delta.gained[0].bucket_ranges(),
+            &[KeyRange::new(0, 16_383).unwrap()]
+        );
+        assert_eq!(session.handle_assignment_update(&update), Ok(None));
     }
 
     #[test]
@@ -1268,7 +1433,10 @@ mod tests {
         assert_eq!(replayed[1].delta.gained[0].segment_id(), SegmentId(1));
         assert_eq!(replayed[1].assignment.layout_epoch(), 2);
         assert_eq!(session.assignment(), Some(&replayed[1].assignment));
-        assert!(session.take_replayed_updates().is_empty());
+        assert_eq!(
+            session.take_replayed_updates(),
+            [] as [crate::scalable_consumer::AssignmentReplay; 0]
+        );
     }
 
     #[test]
@@ -1327,7 +1495,10 @@ mod tests {
         assert!(session.assignment().is_none());
         assert_eq!(session.epoch_floor(), None);
         assert_eq!(session.buffered_updates.len(), 2);
-        assert!(session.take_replayed_updates().is_empty());
+        assert_eq!(
+            session.take_replayed_updates(),
+            [] as [crate::scalable_consumer::AssignmentReplay; 0]
+        );
     }
 
     #[test]

@@ -1353,7 +1353,7 @@ It combines two independent control inputs with an ordinary Pulsar data plane:
                  ┌────────────┬────────────┐
                  ▼            ▼            ▼
           segment child 1  child 2  ... child N
-          ordinary Exclusive consumers on `segment://` topics
+          ordinary child consumers on `segment://` topics
                  │            │            │
                  └────────────┴────────────┘
                               │
@@ -1368,7 +1368,7 @@ It combines two independent control inputs with an ordinary Pulsar data plane:
 The public Tokio and Moonpool clients remain non-`Clone`; each runtime yields an internal owned `SegmentSubscriber` that retains the narrow pool, identifier, task, clock, and ordinary-child capabilities the aggregate needs.
 The resulting `StreamConsumer<S, E>` is cheap to clone over its own shared state, and `StreamMessage<S>` owns `S::Owned` without adding a `Clone` bound to the schema, decoded value, or runtime client.
 
-The builder requires a subscription, freezes one stable consumer identity and child template, accepts one `ReceiverBudget`, defaults to `OrderingMode::Strict`, and opens assigned whole-segment children using the broker assignment and currently requires whole-segment ownership.
+The builder requires a subscription, freezes one stable consumer identity and child template, accepts one `ReceiverBudget`, defaults to `OrderingMode::Strict`, and opens assigned whole-segment children as `Exclusive` or non-empty GA bucket ranges as sticky `Key_Shared` with entry-bucket dispatch.
 Controller and child identifiers remain runtime-owned.
 
 ### Typed control-plane routing and fencing
@@ -1387,7 +1387,7 @@ Replacement registration rejection retries on provider time because the broker m
 ### DAG validation and ordering
 
 `DagSnapshot` application is atomic and validates the whole graph: unique segment and placement identities, matching placement sets, lifecycle states/epochs, dangling/conflicting/reciprocal edges, acyclicity, bounded segments/edges/depth/serialized size, canonical assignment attachments, split containment and exact coverage, merge union coverage, and non-overlapping active leaves covering the key space.
-Hash ranges are inclusive `[start,end]` within `0..=65535`; PIP-486 bucket-range assignments are not yet consumed.
+Hash ranges are inclusive `[start,end]` within `0..=65535`; GA PIP-486 bucket ranges are preserved by the protocol model and attached through sticky entry-bucket children. Bucket cumulative acknowledgements become individual tracked message IDs.
 
 Strict mode grants descendant FLOW only when retained local ownership history proves every transitive ancestor complete.
 A local ancestor is complete only after terminal/end-of-topic and after all delivered messages, pre-terminal reservations, required acks, and participating transaction commits settle.
@@ -1414,9 +1414,12 @@ MAX_FRAME_SIZE
 + 5 * MAX_STREAM_POSITION_SIZE
 + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
 + 2 * DELIVERY_AUTHORITY_OVERHEAD
++ DELIVERY_ACK_GENERATION_OVERHEAD
 + 64 KiB control-plane cleanup reserve
-= 13,697,152 bytes
+= 13,697,160 bytes
 ```
+
+`DELIVERY_ACK_GENERATION_OVERHEAD` is one `u64` charged once per live delivery lease; the canonical delivered-position map retains its existing charge.
 
 The default is 16 MiB.
 The bound includes allocations Magnetar controls or derives from the wire; arbitrary extra memory allocated by user-defined `S::Owned` during schema decoding is outside it.
@@ -1455,12 +1458,11 @@ Controller and segment authority comes from broker-authored direct URLs matching
 Plaintext and TLS stay distinct, and every published target passes the redirect allow-list.
 Before the broker publishes a controller URL, registration reuses only the already-authenticated direct bootstrap connection; missing segment authority, a mismatched or rejected published target, and proxy-any-broker registration still fail closed instead of guessing or downgrading.
 
-Explicit close through any clone is globally definitive for local routes, tasks, and ordinary children; final drop performs synchronous best-effort fencing without blocking or spawning.
-GA provides type-82 unsubscribe; the current client must send it after in-flight registration settles so close removes broker membership while the pooled controller connection remains open.
+Explicit close through any clone is globally definitive for local routes, tasks, and children; final drop performs synchronous best-effort fencing without blocking or spawning. On GA, close marks in-flight registrations to leave after their subscribe responses arrive, then sends type-82 unsubscribe without waiting for its broker response; M1 retains connection-close cleanup behavior. A cancelled registration retains its fixed-size request record until its response or physical connection reset. These control-plane records are outside the aggregate receive budget, and the low-level connection API has no admission cap.
 
 The old drop-on-change event remains only on the raw diagnostic layout-session surface.
 The high-level aggregate reconciles DAG and assignment changes in place under the contracts above.
-See [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md); apache/pulsar#26272-#26275 remain unresolved rather than being papered over by local fencing.
+See [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md); upstream ancestry, assignment-generation, and proxy-routing gaps remain explicit rather than being papered over by local fencing.
 
 ---
 
@@ -1865,7 +1867,7 @@ High-level summary:
   Trackers ship 13 ported behavioral cases from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer ships 6 ported cases from `BatchMessageContainerImplTest`.
 - **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, the complete scalable aggregate over simulated controller and segment sockets, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
-  The stateful PIP-460 fake drives the public aggregate scenarios, nine baseline and fourteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`.
+  The stateful PIP-460 fake drives 29 paired public aggregate scenarios, fourteen baseline and fifteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`; the baseline file also contains one public type/value test.
 - **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no dedicated `e2e` feature and no `#[ignore]`; owning product features still gate feature-specific targets ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)), and Docker is the runtime prerequisite.
   Spins suite-specific Pulsar 4.x images for stable and compatibility coverage and `apachepulsar/pulsar:5.0.0` for PIP-460 via `testcontainers`.
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover, and the hardened scalable aggregate contract.

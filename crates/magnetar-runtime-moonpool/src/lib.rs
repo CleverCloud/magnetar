@@ -292,6 +292,10 @@ pub struct ConnectionShared {
     /// (ADR-0024). `AtomicBool` (not a channel) is the right primitive for
     /// this one-way latch ([ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub no_driver: AtomicBool,
+    /// Set after coordinator-partition lookup and `TcClientConnect` both succeed.
+    /// Mirrors Tokio's lazy bootstrap for the client's coordinator id `0`.
+    /// A rejected handshake leaves this false so the next transaction can retry.
+    pub txn_bootstrapped: AtomicBool,
     /// The client-wide publish memory budget (Java `ClientBuilder#memoryLimit`,
     /// issue #867, [ADR-0111](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0111-share-one-memory-limit-controller-per-client.md)).
     /// 1:1 mirror of the tokio engine's field of the same name.
@@ -382,6 +386,18 @@ pub enum LookupReissueReadiness {
     /// no driver will recover it. Short-circuit to `PeerClosed` (composes with
     /// the terminal fast-fail).
     Terminal,
+}
+
+#[cfg(feature = "scalable-topics")]
+fn checked_fetch_increment(counter: &AtomicU64) -> Result<u64, u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl ConnectionShared {
@@ -600,6 +616,7 @@ impl ConnectionShared {
             replicated_subscription_marker_notify: Notify::new(),
             pending_rebuild: AtomicBool::new(false),
             no_driver: AtomicBool::new(false),
+            txn_bootstrapped: AtomicBool::new(false),
             memory_limit,
             wall_clock_base_ms,
             wall_clock_ms,
@@ -621,10 +638,7 @@ impl ConnectionShared {
     pub(crate) fn allocate_controller_incarnation(
         &self,
     ) -> Result<magnetar_proto::ControllerIncarnation, crate::client::ClientError> {
-        self.next_controller_incarnation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
+        checked_fetch_increment(&self.next_controller_incarnation)
             .map(magnetar_proto::ControllerIncarnation)
             .map_err(|_| {
                 crate::client::ClientError::Other("controller incarnation exhausted".to_owned())
@@ -633,13 +647,9 @@ impl ConnectionShared {
 
     #[cfg(feature = "scalable-topics")]
     pub(crate) fn allocate_scalable_consumer_id(&self) -> Result<u64, crate::client::ClientError> {
-        self.next_scalable_consumer_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| {
-                crate::client::ClientError::Other("scalable consumer id exhausted".to_owned())
-            })
+        checked_fetch_increment(&self.next_scalable_consumer_id).map_err(|_| {
+            crate::client::ClientError::Other("scalable consumer id exhausted".to_owned())
+        })
     }
 
     /// Snapshot the configured monotonic clock — defaults to host
@@ -1539,6 +1549,88 @@ mod tests {
         let engine = MoonpoolEngine::new(providers);
         // Calling providers() smoke-tests the trait wiring.
         let _ = engine.providers();
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn scalable_id_allocation_is_unique_and_never_wraps() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let allocated = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let shared = shared.clone();
+                    scope.spawn(move || {
+                        (0..128)
+                            .map(|_| {
+                                (
+                                    shared
+                                        .allocate_controller_incarnation()
+                                        .expect("incarnation")
+                                        .0,
+                                    shared.allocate_scalable_consumer_id().expect("consumer id"),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().expect("allocation thread"))
+                .collect::<Vec<_>>()
+        });
+        let incarnations: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.0).collect();
+        let consumer_ids: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.1).collect();
+        assert_eq!(incarnations, (1..=512).collect());
+        assert_eq!(consumer_ids, ((1_u64 << 63)..(1_u64 << 63) + 512).collect());
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("next incarnation")
+                .0,
+            513
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("next consumer id"),
+            (1_u64 << 63) + 512
+        );
+        shared
+            .next_controller_incarnation
+            .store(u64::MAX - 1, super::Ordering::Release);
+        shared
+            .next_scalable_consumer_id
+            .store(u64::MAX - 1, super::Ordering::Release);
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("last incarnation")
+                .0,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("last consumer id"),
+            u64::MAX - 1
+        );
+        assert!(shared.allocate_controller_incarnation().is_err());
+        assert!(shared.allocate_scalable_consumer_id().is_err());
+        assert_eq!(
+            shared
+                .next_controller_incarnation
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+        assert_eq!(
+            shared
+                .next_scalable_consumer_id
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
     }
 
     #[test]

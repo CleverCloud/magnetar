@@ -226,8 +226,6 @@ fn ack_batch_position(conn: &mut Connection, handle: ConsumerHandle, position: i
                 partition: -1,
                 batch_index: position,
                 batch_size: BATCH_SIZE,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             }],
             ack_type: pb::command_ack::AckType::Individual,
             properties: Vec::new(),

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Stateful Pulsar 5.0.0-M1 scalable-topic fake cluster.
+//! GA clean leave is also supported; bucket dispatch is proven against the real GA broker.
 //!
 //! The cluster is sans-I/O: callers open named endpoint connections, feed
 //! encoded client frames with [`M1FakeCluster::handle_bytes`], and drain encoded
@@ -192,6 +193,8 @@ pub struct PendingOperationId(pub u64);
 pub enum OperationKind {
     /// `CommandScalableTopicSubscribe` on the controller.
     ScalableOpen,
+    /// `CommandScalableTopicUnsubscribe` on the controller.
+    ScalableLeave,
     /// Ordinary `CommandSubscribe` on a segment endpoint.
     SegmentOpen,
     /// Ordinary `CommandAck` on a segment endpoint.
@@ -318,7 +321,7 @@ impl M1Segment {
 
     fn to_pb(&self) -> pb::SegmentInfoProto {
         pb::SegmentInfoProto {
-    entry_bucket_splits: Vec::new(),
+            entry_bucket_splits: Vec::new(),
             segment_id: self.id,
             hash_start: self.hash_start,
             hash_end: self.hash_end,
@@ -711,10 +714,10 @@ struct ChildSubscriptionState {
 
 #[derive(Debug)]
 struct ChildConsumer {
+    consumer_name: Option<String>,
     segment_id: u64,
     group: GroupKey,
     key: ChildSubscriptionKey,
-    controller_member: MemberId,
     serving_endpoint: Endpoint,
     generation: u64,
     delivery_cursor: usize,
@@ -730,7 +733,6 @@ struct ChildConsumer {
 struct ChildFence {
     segment_id: u64,
     key: ChildSubscriptionKey,
-    controller_member: MemberId,
     serving_endpoint: Endpoint,
     generation: u64,
     child_incarnation: ConnectionId,
@@ -741,17 +743,16 @@ struct ValidatedChildOpen {
     member: MemberId,
     segment_id: u64,
     group: GroupKey,
-    controller_member: MemberId,
     serving_endpoint: Endpoint,
     key: ChildSubscriptionKey,
 }
 
 #[derive(Debug, Clone)]
 struct ChildActivation {
+    consumer_name: Option<String>,
     member: MemberId,
     segment_id: u64,
     group: GroupKey,
-    controller_member: MemberId,
     serving_endpoint: Endpoint,
     generation: u64,
     key: ChildSubscriptionKey,
@@ -785,6 +786,12 @@ enum PendingOperation {
     ScalableOpen {
         info: PendingOperationInfo,
         member: MemberId,
+        created_membership: bool,
+    },
+    ScalableLeave {
+        info: PendingOperationInfo,
+        consumer_id: u64,
+        registration: Option<(GroupKey, String)>,
     },
     SegmentOpen {
         info: PendingOperationInfo,
@@ -837,6 +844,7 @@ impl PendingOperation {
     fn info(&self) -> &PendingOperationInfo {
         match self {
             Self::ScalableOpen { info, .. }
+            | Self::ScalableLeave { info, .. }
             | Self::SegmentOpen { info, .. }
             | Self::Ack { info, .. }
             | Self::Seek { info, .. }
@@ -867,7 +875,6 @@ pub struct M1FakeCluster {
     completed_segments: BTreeSet<(GroupKey, u64)>,
     child_subscriptions: BTreeMap<ChildSubscriptionKey, ChildSubscriptionState>,
     child_consumers: BTreeMap<MemberId, ChildConsumer>,
-    closed_consumers: BTreeSet<MemberId>,
     ledgers: BTreeMap<u64, Vec<StoredMessage>>,
     terminal_segments: BTreeSet<u64>,
     transactions: BTreeMap<magnetar_proto::TxnId, FakeTransaction>,
@@ -974,7 +981,6 @@ impl M1FakeCluster {
             completed_segments: BTreeSet::new(),
             child_subscriptions: BTreeMap::new(),
             child_consumers: BTreeMap::new(),
-            closed_consumers: BTreeSet::new(),
             ledgers: BTreeMap::new(),
             terminal_segments: BTreeSet::new(),
             transactions: BTreeMap::new(),
@@ -1221,7 +1227,11 @@ impl M1FakeCluster {
             .remove(&id)
             .ok_or(M1FakeError::UnknownPending(id))?;
         match operation {
-            PendingOperation::ScalableOpen { info, member } => match completion {
+            PendingOperation::ScalableOpen {
+                info,
+                member,
+                created_membership,
+            } => match completion {
                 PendingCompletion::Succeed => self.register_membership(member).and_then(|()| {
                     self.queue_scalable_subscribe_response(
                         member,
@@ -1230,12 +1240,37 @@ impl M1FakeCluster {
                     )
                 }),
                 PendingCompletion::Fail(failure) => {
-                    self.remove_membership(member, false);
+                    if created_membership {
+                        self.remove_membership(member, false);
+                    }
                     self.queue_scalable_subscribe_failure(
                         info.connection,
                         info.request_id.unwrap_or(0),
                         &failure,
                     )
+                }
+            },
+            PendingOperation::ScalableLeave {
+                info,
+                consumer_id,
+                registration,
+            } => match completion {
+                PendingCompletion::Succeed => {
+                    let member = registration.and_then(|(group, name)| {
+                        self.memberships.iter().find_map(|(member, membership)| {
+                            (member.consumer_id == consumer_id
+                                && membership.group == group
+                                && membership.consumer_name == name)
+                                .then_some(*member)
+                        })
+                    });
+                    if let Some(member) = member {
+                        self.remove_membership(member, false);
+                    }
+                    self.queue_success(info.connection, info.request_id.unwrap_or(0))
+                }
+                PendingCompletion::Fail(failure) => {
+                    self.queue_error(info.connection, info.request_id.unwrap_or(0), &failure)
                 }
             },
             PendingOperation::SegmentOpen {
@@ -1279,11 +1314,11 @@ impl M1FakeCluster {
                 fence,
             } => match completion {
                 PendingCompletion::Succeed => self
-                    .require_child_fence(id, member, &fence)
+                    .require_ordinary_child_fence(id, member, &fence)
                     .and_then(|()| self.apply_seek(member, target))
                     .and_then(|()| self.queue_success(info.connection, request_id)),
                 PendingCompletion::Fail(failure) => self
-                    .require_child_fence(id, member, &fence)
+                    .require_ordinary_child_fence(id, member, &fence)
                     .and_then(|()| self.queue_error(info.connection, request_id, &failure)),
             },
             PendingOperation::Close {
@@ -1292,20 +1327,20 @@ impl M1FakeCluster {
                 request_id,
                 fence,
             } => match completion {
-                PendingCompletion::Succeed => {
-                    self.require_close_fence(id, member, &fence).and_then(|()| {
+                PendingCompletion::Succeed => self
+                    .require_ordinary_child_fence(id, member, &fence)
+                    .and_then(|()| {
                         self.remove_child_consumer(member);
                         self.queue_success(info.connection, request_id)
-                    })
-                }
-                PendingCompletion::Fail(failure) => {
-                    self.require_close_fence(id, member, &fence).and_then(|()| {
+                    }),
+                PendingCompletion::Fail(failure) => self
+                    .require_ordinary_child_fence(id, member, &fence)
+                    .and_then(|()| {
                         if let Some(consumer) = self.child_consumers.get_mut(&member) {
                             consumer.closing = false;
                         }
                         self.queue_error(info.connection, request_id, &failure)
-                    })
-                }
+                    }),
             },
             PendingOperation::GetSchema {
                 info,
@@ -1362,7 +1397,8 @@ impl M1FakeCluster {
         txn_id: Option<magnetar_proto::TxnId>,
         completion: PendingCompletion,
     ) -> Result<(), M1FakeError> {
-        self.require_child_fence(id, member, fence)?;
+        // GA ACK completion retains its ordinary Consumer/Subscription after admission.
+        self.require_ordinary_child_fence(id, member, fence)?;
         let result = match completion {
             PendingCompletion::Succeed => self
                 .apply_or_stage_ack(member, ack_type, indices, fence, txn_id)
@@ -1936,12 +1972,19 @@ impl M1FakeCluster {
             .sum()
     }
 
-    /// Controller member owning the active ordinary child for one segment.
+    /// Physical member of a live ordinary child with the exact wire consumer name.
     #[must_use]
-    pub fn active_child_owner(&self, subscription: &str, segment_id: u64) -> Option<MemberId> {
-        self.child_consumers.values().find_map(|consumer| {
-            (consumer.segment_id == segment_id && consumer.group.subscription == subscription)
-                .then_some(consumer.controller_member)
+    pub fn active_child_consumer(
+        &self,
+        subscription: &str,
+        segment_id: u64,
+        consumer_name: &str,
+    ) -> Option<MemberId> {
+        self.child_consumers.iter().find_map(|(member, consumer)| {
+            (consumer.segment_id == segment_id
+                && consumer.group.subscription == subscription
+                && consumer.consumer_name.as_deref() == Some(consumer_name))
+            .then_some(*member)
         })
     }
 
@@ -2197,6 +2240,9 @@ impl M1FakeCluster {
             pb::base_command::Type::ScalableTopicSubscribe => {
                 self.handle_scalable_subscribe(connection, frame)
             }
+            pb::base_command::Type::ScalableTopicUnsubscribe => {
+                self.handle_scalable_unsubscribe(connection, frame)
+            }
             pb::base_command::Type::Lookup => self.handle_lookup(connection, frame),
             pb::base_command::Type::TcClientConnectRequest => {
                 self.handle_tc_client_connect(connection, frame)
@@ -2216,6 +2262,58 @@ impl M1FakeCluster {
             pb::base_command::Type::Seek => self.handle_seek(connection, frame),
             pb::base_command::Type::CloseConsumer => self.handle_close(connection, frame),
             other => Err(M1FakeError::UnsupportedCommand(other)),
+        }
+    }
+
+    fn handle_scalable_unsubscribe(
+        &mut self,
+        connection: ConnectionId,
+        frame: &Frame,
+    ) -> Result<(), M1FakeError> {
+        let kind = pb::base_command::Type::ScalableTopicUnsubscribe;
+        self.require_endpoint(connection, Endpoint::Controller, kind)?;
+        let leave = frame
+            .command
+            .scalable_topic_unsubscribe
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    kind,
+                    "missing generated CommandScalableTopicUnsubscribe body",
+                )
+            })?;
+        let member = MemberId::new(connection, leave.consumer_id);
+        match self.take_behavior(Endpoint::Controller, OperationKind::ScalableLeave) {
+            Some(ScriptedBehavior::Fail(failure)) => {
+                self.queue_error(connection, leave.request_id, &failure)
+            }
+            Some(ScriptedBehavior::Delay) => {
+                let id = self.allocate_pending_id();
+                let info = PendingOperationInfo {
+                    id,
+                    connection,
+                    endpoint: Endpoint::Controller,
+                    kind: OperationKind::ScalableLeave,
+                    request_id: Some(leave.request_id),
+                };
+                let registration = self
+                    .memberships
+                    .get(&member)
+                    .map(|membership| (membership.group.clone(), membership.consumer_name.clone()));
+                self.pending.insert(
+                    id,
+                    PendingOperation::ScalableLeave {
+                        info,
+                        consumer_id: leave.consumer_id,
+                        registration,
+                    },
+                );
+                Ok(())
+            }
+            None => {
+                self.remove_membership(member, false);
+                self.queue_success(connection, leave.request_id)
+            }
         }
     }
 
@@ -2384,21 +2482,13 @@ impl M1FakeCluster {
         connection: ConnectionId,
         frame: &Frame,
     ) -> Result<(), M1FakeError> {
-        let endpoint = self.require_endpoint(
-            connection,
-            Endpoint::Controller,
-            pb::base_command::Type::ScalableTopicSubscribe,
-        )?;
+        let kind = pb::base_command::Type::ScalableTopicSubscribe;
+        let endpoint = self.require_endpoint(connection, Endpoint::Controller, kind)?;
         let subscribe = frame
             .command
             .scalable_topic_subscribe
             .as_ref()
-            .ok_or_else(|| {
-                invalid(
-                    pb::base_command::Type::ScalableTopicSubscribe,
-                    "missing generated CommandScalableTopicSubscribe body",
-                )
-            })?;
+            .ok_or_else(|| invalid(kind, "missing generated CommandScalableTopicSubscribe body"))?;
         if subscribe.topic != self.topic {
             return self.queue_scalable_subscribe_failure(
                 connection,
@@ -2406,16 +2496,11 @@ impl M1FakeCluster {
                 &BrokerFailure::new(pb::ServerError::TopicNotFound, "unknown scalable topic"),
             );
         }
-        let consumer_type =
-            pb::ScalableConsumerType::try_from(subscribe.consumer_type).map_err(|_| {
-                invalid(
-                    pb::base_command::Type::ScalableTopicSubscribe,
-                    "unknown scalable consumer type",
-                )
-            })?;
+        let consumer_type = pb::ScalableConsumerType::try_from(subscribe.consumer_type)
+            .map_err(|_| invalid(kind, "unknown scalable consumer type"))?;
         if consumer_type != pb::ScalableConsumerType::Stream {
             return Err(invalid(
-                pb::base_command::Type::ScalableTopicSubscribe,
+                kind,
                 "the first-wave fake accepts Stream consumers only",
             ));
         }
@@ -2424,13 +2509,14 @@ impl M1FakeCluster {
             topic: subscribe.topic.clone(),
             subscription: subscribe.subscription.clone(),
         };
-        let duplicate = self.memberships.contains_key(&member)
-            || self.memberships.iter().any(|(candidate, membership)| {
-                *candidate != member
-                    && membership.group == group
-                    && membership.consumer_name == subscribe.consumer_name
-            });
-        if duplicate {
+        let conflicting_identity = self.memberships.get(&member).is_some_and(|membership| {
+            membership.group != group || membership.consumer_name != subscribe.consumer_name
+        });
+        let previous = self.memberships.iter().find_map(|(candidate, membership)| {
+            (membership.group == group && membership.consumer_name == subscribe.consumer_name)
+                .then_some((*candidate, membership.registered))
+        });
+        if conflicting_identity || previous.is_some_and(|(_, registered)| !registered) {
             return self.queue_scalable_subscribe_failure(
                 connection,
                 subscribe.request_id,
@@ -2443,7 +2529,27 @@ impl M1FakeCluster {
                 self.queue_scalable_subscribe_failure(connection, subscribe.request_id, &failure)
             }
             behavior => {
-                self.create_membership(member, group, subscribe.consumer_name.clone());
+                let created_membership = previous.is_none();
+                if let Some((previous, _)) = previous {
+                    if previous != member {
+                        let membership = self
+                            .memberships
+                            .remove(&previous)
+                            .ok_or(M1FakeError::UnknownMember(previous))?;
+                        self.memberships.insert(member, membership);
+                        for owner in self
+                            .segment_owners
+                            .values_mut()
+                            .chain(self.ownership_history.values_mut())
+                        {
+                            if *owner == previous {
+                                *owner = member;
+                            }
+                        }
+                    }
+                } else {
+                    self.create_membership(member, group, subscribe.consumer_name.clone());
+                }
                 if matches!(behavior, Some(ScriptedBehavior::Delay)) {
                     let id = self.allocate_pending_id();
                     let info = PendingOperationInfo {
@@ -2453,8 +2559,14 @@ impl M1FakeCluster {
                         kind: OperationKind::ScalableOpen,
                         request_id: Some(subscribe.request_id),
                     };
-                    self.pending
-                        .insert(id, PendingOperation::ScalableOpen { info, member });
+                    self.pending.insert(
+                        id,
+                        PendingOperation::ScalableOpen {
+                            info,
+                            member,
+                            created_membership,
+                        },
+                    );
                     Ok(())
                 } else {
                     self.register_membership(member)?;
@@ -2842,7 +2954,7 @@ impl M1FakeCluster {
             .map(|transaction| transaction.staged_acknowledgements.clone())
             .ok_or_else(|| invalid(command_type, "unknown transaction"))?;
         for acknowledgement in &staged {
-            if !self.child_fence_matches(acknowledgement.member, &acknowledgement.fence) {
+            if !self.ordinary_child_fence_matches(acknowledgement.member, &acknowledgement.fence) {
                 return Err(invalid(
                     command_type,
                     "staged acknowledgement belongs to a stale child incarnation",
@@ -2908,16 +3020,6 @@ impl M1FakeCluster {
                 "missing generated CommandSubscribe body",
             )
         })?;
-        if self.child_open_needs_ownership_retry(connection, subscribe)? {
-            return self.queue_error(
-                connection,
-                subscribe.request_id,
-                &BrokerFailure::new(
-                    pb::ServerError::ConsumerBusy,
-                    "segment ownership moved to another scalable member",
-                ),
-            );
-        }
         let validated = self.validate_child_open(connection, subscribe)?;
         if self
             .child_subscriptions
@@ -2945,7 +3047,7 @@ impl M1FakeCluster {
             member: validated.member,
             segment_id: validated.segment_id,
             group: validated.group,
-            controller_member: validated.controller_member,
+            consumer_name: subscribe.consumer_name.as_ref().map(ToOwned::to_owned),
             serving_endpoint: validated.serving_endpoint,
             generation,
             key: validated.key,
@@ -2988,48 +3090,6 @@ impl M1FakeCluster {
         }
     }
 
-    fn child_open_needs_ownership_retry(
-        &self,
-        connection: ConnectionId,
-        subscribe: &pb::CommandSubscribe,
-    ) -> Result<bool, M1FakeError> {
-        let Some(segment_id) = self.segment_id_for_topic(&subscribe.topic) else {
-            return Ok(false);
-        };
-        let Some(expected_endpoint) = self.segment_endpoint(segment_id) else {
-            return Ok(false);
-        };
-        self.require_endpoint(
-            connection,
-            expected_endpoint,
-            pb::base_command::Type::Subscribe,
-        )?;
-        let suffix = format!("-seg-{segment_id}");
-        let Some(consumer_name) = subscribe
-            .consumer_name
-            .as_deref()
-            .and_then(|name| name.strip_suffix(&suffix))
-        else {
-            return Ok(false);
-        };
-        let group = GroupKey {
-            topic: self.topic.clone(),
-            subscription: subscribe.subscription.clone(),
-        };
-        let member = self.memberships.iter().find_map(|(member, membership)| {
-            (membership.registered
-                && membership.group == group
-                && membership.consumer_name == consumer_name)
-                .then_some(*member)
-        });
-        if let Some(member) = member {
-            return Ok(self.segment_owners.get(&(group, segment_id)) != Some(&member));
-        }
-        Ok(self
-            .baselines
-            .contains_key(&(group, consumer_name.to_owned())))
-    }
-
     fn validate_child_open(
         &self,
         connection: ConnectionId,
@@ -3061,39 +3121,6 @@ impl M1FakeCluster {
             topic: self.topic.clone(),
             subscription: subscribe.subscription.clone(),
         };
-        let controller_member = self
-            .segment_owners
-            .get(&(group.clone(), segment_id))
-            .copied()
-            .ok_or_else(|| {
-                invalid(
-                    pb::base_command::Type::Subscribe,
-                    format!(
-                        "segment {segment_id} is not assigned for subscription {}",
-                        subscribe.subscription
-                    ),
-                )
-            })?;
-        let controller_membership = self
-            .memberships
-            .get(&controller_member)
-            .ok_or(M1FakeError::UnknownMember(controller_member))?;
-        if !controller_membership.registered
-            || controller_membership.group != group
-            || !controller_membership.assigned.contains(&segment_id)
-        {
-            return Err(invalid(
-                pb::base_command::Type::Subscribe,
-                "ordinary child does not match registered controller ownership",
-            ));
-        }
-        let expected_name = format!("{}-seg-{segment_id}", controller_membership.consumer_name);
-        if subscribe.consumer_name.as_deref() != Some(expected_name.as_str()) {
-            return Err(invalid(
-                pb::base_command::Type::Subscribe,
-                format!("ordinary child name must be `{expected_name}`"),
-            ));
-        }
         let member = MemberId::new(connection, subscribe.consumer_id);
         if self.child_consumers.contains_key(&member)
             || self.pending.values().any(|operation| {
@@ -3110,7 +3137,6 @@ impl M1FakeCluster {
             member,
             segment_id,
             group,
-            controller_member,
             serving_endpoint,
             key: ChildSubscriptionKey {
                 topic: subscribe.topic.clone(),
@@ -3133,16 +3159,6 @@ impl M1FakeCluster {
                 format!("unknown child consumer {}", flow.consumer_id),
             )
         })?;
-        let owns_segment = self
-            .segment_owners
-            .get(&(consumer.group.clone(), consumer.segment_id))
-            == Some(&consumer.controller_member);
-        if !owns_segment {
-            return Err(invalid(
-                pb::base_command::Type::Flow,
-                "child controller no longer owns this segment",
-            ));
-        }
         if consumer.closing {
             return Err(invalid(
                 pb::base_command::Type::Flow,
@@ -3341,7 +3357,7 @@ impl M1FakeCluster {
                     "message id is beyond the fake ledger",
                 ));
             }
-            // Pulsar 5.0.0-M1's ServerCnx projects seek positions from ledger,
+            // Pulsar 5.0.0's ServerCnx projects seek positions from ledger,
             // entry, and ack_set; partition and batch metadata are ignored.
             seek_id.entry_id as usize
         } else {
@@ -3388,15 +3404,17 @@ impl M1FakeCluster {
             )
         })?;
         let member = MemberId::new(connection, close.consumer_id);
+        let pending_open = self.pending.iter().find_map(|(id, operation)| {
+            matches!(operation, PendingOperation::SegmentOpen { activation, .. }
+                if activation.member == member)
+            .then_some(*id)
+        });
+        if let Some(id) = pending_open {
+            self.cancel_pending(id);
+            return self.queue_success(connection, close.request_id);
+        }
         let Some(consumer) = self.child_consumers.get(&member) else {
-            let endpoint = self.connection_endpoint(connection)?;
-            if matches!(endpoint, Endpoint::Segment(_)) && self.closed_consumers.contains(&member) {
-                return self.queue_success(connection, close.request_id);
-            }
-            return Err(invalid(
-                pb::base_command::Type::CloseConsumer,
-                format!("unknown child consumer {}", close.consumer_id),
-            ));
+            return self.queue_success(connection, close.request_id);
         };
         let endpoint = consumer.serving_endpoint;
         let fence = child_fence(member, consumer);
@@ -3550,7 +3568,6 @@ impl M1FakeCluster {
     }
 
     fn activate_child_consumer(&mut self, activation: ChildActivation) {
-        self.closed_consumers.remove(&activation.member);
         let subscription = self
             .child_subscriptions
             .entry(activation.key.clone())
@@ -3567,7 +3584,7 @@ impl M1FakeCluster {
                 segment_id: activation.segment_id,
                 group: activation.group,
                 key: activation.key,
-                controller_member: activation.controller_member,
+                consumer_name: activation.consumer_name,
                 serving_endpoint: activation.serving_endpoint,
                 generation: activation.generation,
                 delivery_cursor: activation.cursor,
@@ -3586,7 +3603,6 @@ impl M1FakeCluster {
             .child_consumers
             .remove(&member)
             .expect("child-removal callers retain an active consumer");
-        self.closed_consumers.insert(member);
         let subscription = self
             .child_subscriptions
             .get_mut(&consumer.key)
@@ -3611,7 +3627,12 @@ impl M1FakeCluster {
 
     fn cancel_pending(&mut self, id: PendingOperationId) {
         self.pending.remove(&id).into_iter().for_each(|operation| {
-            if let PendingOperation::ScalableOpen { member, .. } = &operation {
+            if let PendingOperation::ScalableOpen {
+                member,
+                created_membership: true,
+                ..
+            } = &operation
+            {
                 self.remove_membership(*member, false);
             }
             if let PendingOperation::SegmentOpen { activation, .. } = &operation {
@@ -4098,7 +4119,7 @@ impl M1FakeCluster {
                 ))
             })?;
             assigned.push(pb::ScalableAssignedSegment {
-    bucket_ranges: Vec::new(),
+                bucket_ranges: Vec::new(),
                 segment_id: *segment_id,
                 hash_start: segment.hash_start,
                 hash_end: segment.hash_end,
@@ -4694,43 +4715,25 @@ impl M1FakeCluster {
             .ok_or_else(|| invalid(pb::base_command::Type::Ack, "unknown child consumer"))
     }
 
-    fn child_fence_matches(&self, member: MemberId, expected: &ChildFence) -> bool {
+    fn ordinary_child_fence_matches(&self, member: MemberId, expected: &ChildFence) -> bool {
         self.child_consumers
             .get(&member)
             .is_some_and(|consumer| child_fence(member, consumer) == *expected)
-            && self.memberships.contains_key(&expected.controller_member)
     }
 
-    fn require_child_fence(
+    fn require_ordinary_child_fence(
         &self,
         id: PendingOperationId,
         member: MemberId,
         expected: &ChildFence,
     ) -> Result<(), M1FakeError> {
-        if self.child_fence_matches(member, expected) {
+        // GA ordinary operations retain the physical consumer independently
+        // of controller registration lifetime.
+        if self.ordinary_child_fence_matches(member, expected) {
             Ok(())
         } else {
             Err(M1FakeError::StalePending(id))
         }
-    }
-
-    fn require_close_fence(
-        &mut self,
-        id: PendingOperationId,
-        member: MemberId,
-        expected: &ChildFence,
-    ) -> Result<(), M1FakeError> {
-        if self.child_fence_matches(member, expected) {
-            return Ok(());
-        }
-        let same_child = self
-            .child_consumers
-            .get(&member)
-            .is_some_and(|consumer| child_fence(member, consumer) == *expected);
-        if same_child && let Some(consumer) = self.child_consumers.get_mut(&member) {
-            consumer.closing = false;
-        }
-        Err(M1FakeError::StalePending(id))
     }
 
     fn pending_open_is_current(
@@ -4743,18 +4746,6 @@ impl M1FakeCluster {
             .is_some_and(|subscription| {
                 matches!(subscription.owner, Some(ChildOwner::Pending(id)) if id == pending_id)
             })
-            && self
-                .segment_owners
-                .get(&(activation.group.clone(), activation.segment_id))
-                == Some(&activation.controller_member)
-            && self
-                .memberships
-                .get(&activation.controller_member)
-                .is_some_and(|membership| {
-                    membership.registered
-                        && membership.group == activation.group
-                        && membership.assigned.contains(&activation.segment_id)
-                })
             && self.segment_endpoint(activation.segment_id) == Some(activation.serving_endpoint)
     }
 }
@@ -5060,7 +5051,6 @@ fn child_fence(member: MemberId, consumer: &ChildConsumer) -> ChildFence {
     ChildFence {
         segment_id: consumer.segment_id,
         key: consumer.key.clone(),
-        controller_member: consumer.controller_member,
         serving_endpoint: consumer.serving_endpoint,
         generation: consumer.generation,
         child_incarnation: member.connection,
@@ -5112,6 +5102,11 @@ impl M1FakeCluster {
                 .scalable_topic_subscribe
                 .as_ref()
                 .map(|command| format!("{}:{}", command.topic, command.consumer_id)),
+            pb::base_command::Type::ScalableTopicUnsubscribe => frame
+                .command
+                .scalable_topic_unsubscribe
+                .as_ref()
+                .map(|command| command.consumer_id.to_string()),
             pb::base_command::Type::Lookup => frame
                 .command
                 .lookup_topic
@@ -5453,7 +5448,7 @@ mod tests {
         pb::BaseCommand {
             r#type: pb::base_command::Type::ScalableTopicLookup as i32,
             scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
-    create_if_missing: Some(true),
+                create_if_missing: Some(true),
                 session_id,
                 topic: topic.to_owned(),
             }),
@@ -5491,6 +5486,1144 @@ mod tests {
             M1Segment::active(4, 16_384, 32_767, Endpoint::Segment(1), epoch).with_parents([1]),
             M1Segment::active(2, 32_768, HASH_RANGE_END, Endpoint::Segment(2), 0),
         ]
+    }
+
+    fn ordinary_child_cluster() -> (M1FakeCluster, ConnectionId, ConnectionId) {
+        let mut cluster = M1FakeCluster::two_segment();
+        let controller = connect(&mut cluster, Endpoint::Controller);
+        register_member(&mut cluster, controller, "sub", "member", 100, 1);
+        let child = connect(&mut cluster, Endpoint::Segment(1));
+        let topic = cluster.segment_topic(1).expect("segment topic");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "member",
+                1,
+                11,
+                2,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("ordinary child subscribed");
+        let _ = take_frames(&mut cluster, child);
+        (cluster, controller, child)
+    }
+
+    fn delayed_child_close_cluster() -> (
+        M1FakeCluster,
+        ConnectionId,
+        ConnectionId,
+        PendingOperationId,
+    ) {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold ordinary child close");
+        send(&mut cluster, child, &close_command(11, 3)).expect("ordinary close held");
+        let pending = cluster.pending_operations()[0].id;
+        (cluster, controller, child, pending)
+    }
+
+    #[test]
+    fn ga_close_pending_subscribe_releases_only_its_reservation() {
+        for previously_closed in [false, true] {
+            let mut cluster = M1FakeCluster::two_segment();
+            let child = connect(&mut cluster, Endpoint::Segment(1));
+            let topic = cluster.segment_topic(1).expect("physical segment topic");
+            let open = segment_subscribe_command(
+                &topic,
+                "sub",
+                "worker",
+                1,
+                7,
+                1,
+                pb::command_subscribe::SubType::Exclusive,
+            );
+            if previously_closed {
+                let mut initial = ToOwned::to_owned(&open);
+                initial
+                    .subscribe
+                    .as_mut()
+                    .expect("initial Subscribe")
+                    .request_id = 100;
+                send(&mut cluster, child, &initial).expect("initial open");
+                assert_ordinary_open_and_close(&mut cluster, child, 7, 100);
+            }
+            cluster
+                .script_next(
+                    Endpoint::Segment(1),
+                    OperationKind::SegmentOpen,
+                    ScriptedBehavior::Delay,
+                )
+                .expect("hold abandoned Subscribe");
+            send(&mut cluster, child, &open).expect("pending Subscribe");
+            let retired = cluster.pending_operations()[0].id;
+            assert_eq!(cluster.resource_counts().pending_child_opens, 1);
+            send(&mut cluster, child, &close_command(7, 3))
+                .expect("GA closes a pending consumer before creation completes");
+            let responses = take_frames(&mut cluster, child);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("pending Close success")
+                    .request_id,
+                3
+            );
+            assert_eq!(cluster.resource_counts().pending_child_opens, 0);
+            assert_eq!(cluster.resource_counts().child_consumers, 0);
+            cluster
+                .script_next(
+                    Endpoint::Segment(1),
+                    OperationKind::SegmentOpen,
+                    ScriptedBehavior::Delay,
+                )
+                .expect("hold replacement Subscribe");
+            send(
+                &mut cluster,
+                child,
+                &segment_subscribe_command(
+                    &topic,
+                    "sub",
+                    "replacement",
+                    1,
+                    8,
+                    4,
+                    pb::command_subscribe::SubType::Exclusive,
+                ),
+            )
+            .expect("fresh ID reuses the released Exclusive reservation");
+            let replacement = cluster.pending_operations()[0].id;
+            assert_ne!(replacement, retired);
+            let resources = cluster.resource_counts();
+            assert!(matches!(
+                cluster.complete_pending(retired, PendingCompletion::Succeed),
+                Err(M1FakeError::UnknownPending(id)) if id == retired
+            ));
+            assert_eq!(cluster.resource_counts(), resources);
+            assert_eq!(cluster.pending_operations()[0].id, replacement);
+            assert_eq!(take_frames(&mut cluster, child).len(), 0);
+            cluster
+                .complete_pending(replacement, PendingCompletion::Succeed)
+                .expect("late retired completion cannot release replacement reservation");
+            assert_eq!(
+                cluster.active_child_consumer("sub", 1, "replacement-seg-1"),
+                Some(MemberId::new(child, 8))
+            );
+            assert_ordinary_open_and_close(&mut cluster, child, 8, 4);
+        }
+    }
+
+    #[test]
+    fn ga_close_unknown_consumer_is_connection_local_and_idempotent() {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        let unrelated = connect(&mut cluster, Endpoint::Segment(1));
+        let member = MemberId::new(child, 11);
+        let fence = child_fence(member, &cluster.child_consumers[&member]);
+        let resources = cluster.resource_counts();
+        for (connection, consumer_id, request_id) in [
+            (unrelated, 11, 10),
+            (child, 999, 11),
+            (controller, 999, 12),
+            (unrelated, 11, 13),
+        ] {
+            send(
+                &mut cluster,
+                connection,
+                &close_command(consumer_id, request_id),
+            )
+            .expect("unknown connection-local consumer closes successfully");
+            let responses = take_frames(&mut cluster, connection);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("unknown Close success")
+                    .request_id,
+                request_id
+            );
+            assert_eq!(cluster.resource_counts(), resources);
+            assert!(cluster.ordinary_child_fence_matches(member, &fence));
+            assert_eq!(take_frames(&mut cluster, child).len(), 0);
+        }
+        send(&mut cluster, child, &close_command(11, 14)).expect("real consumer still closes");
+        let responses = take_frames(&mut cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("real Close success")
+                .request_id,
+            14
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+    }
+
+    #[test]
+    fn ga_delayed_child_close_survives_controller_departure() {
+        // GA ServerCnx.handleCloseConsumer checks its ordinary connection map;
+        // controller registration lifetime is independent of ordinary child close.
+        for disconnect in [false, true] {
+            let (mut cluster, controller, child, pending) = delayed_child_close_cluster();
+            if disconnect {
+                cluster
+                    .disconnect_connection(controller)
+                    .expect("separate controller connection disconnected");
+            } else {
+                send(
+                    &mut cluster,
+                    controller,
+                    &pb::BaseCommand {
+                        r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                        scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                            request_id: 4,
+                            consumer_id: 100,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .expect("controller registration left");
+                assert_eq!(
+                    take_frames(&mut cluster, controller)[0]
+                        .command
+                        .success
+                        .as_ref()
+                        .expect("controller leave success")
+                        .request_id,
+                    4
+                );
+            }
+            assert_eq!(cluster.resource_counts().scalable_members, 0);
+            assert_eq!(cluster.resource_counts().child_consumers, 1);
+            cluster
+                .complete_pending(pending, PendingCompletion::Succeed)
+                .expect("same ordinary child close remains valid after controller departure");
+            let frames = take_frames(&mut cluster, child);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("child close success")
+                    .request_id,
+                3
+            );
+            let counts = cluster.resource_counts();
+            assert_eq!(counts.child_consumers, 0);
+            assert_eq!(counts.pending_operations, 0);
+            assert_eq!(counts.permits, 0);
+        }
+    }
+
+    fn leave_test_controller(cluster: &mut M1FakeCluster, controller: ConnectionId) {
+        send(
+            cluster,
+            controller,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                    request_id: 4,
+                    consumer_id: 100,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("controller leaves independently");
+    }
+
+    fn assert_ordinary_open_and_close(
+        cluster: &mut M1FakeCluster,
+        child: ConnectionId,
+        consumer_id: u64,
+        request_id: u64,
+    ) {
+        let responses = take_frames(cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("ordinary Subscribe success")
+                .request_id,
+            request_id
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        send(cluster, child, &close_command(consumer_id, request_id + 1))
+            .expect("ordinary child closes independently of controller membership");
+        let responses = take_frames(cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("ordinary Close success")
+                .request_id,
+            request_id + 1
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+    }
+
+    #[test]
+    fn ga_ordinary_child_subscribe_after_controller_leave() {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        send(&mut cluster, child, &close_command(11, 5)).expect("close initial ordinary child");
+        let _ = take_frames(&mut cluster, child);
+        leave_test_controller(&mut cluster, controller);
+        let _ = take_frames(&mut cluster, controller);
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        let topic = cluster.segment_topic(1).expect("physical segment topic");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "member",
+                1,
+                12,
+                6,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("GA admits an ordinary Subscribe after scalable controller leave");
+        assert_ordinary_open_and_close(&mut cluster, child, 12, 6);
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+    }
+
+    #[test]
+    fn ga_ordinary_child_subscribe_arbitrary_name_without_controller() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let child = connect(&mut cluster, Endpoint::Segment(1));
+        let topic = cluster.segment_topic(1).expect("physical segment topic");
+        let mut command = segment_subscribe_command(
+            &topic,
+            "ordinary-sub",
+            "irrelevant",
+            1,
+            12,
+            6,
+            pb::command_subscribe::SubType::Exclusive,
+        );
+        command.subscribe.as_mut().expect("Subscribe").consumer_name =
+            Some("independent-ordinary-consumer".to_owned());
+        send(&mut cluster, child, &command)
+            .expect("GA ordinary Subscribe does not require a controller or generated name");
+        assert_ordinary_open_and_close(&mut cluster, child, 12, 6);
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        let subscribe = command.subscribe.as_mut().expect("Subscribe");
+        subscribe.consumer_name = None;
+        subscribe.request_id = 8;
+        send(&mut cluster, child, &command)
+            .expect("ordinary Subscribe also accepts an absent consumer name");
+        assert_ordinary_open_and_close(&mut cluster, child, 12, 8);
+    }
+
+    #[test]
+    fn ga_ordinary_child_pending_open_survives_assignment_withdrawal() {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        send(&mut cluster, child, &close_command(11, 5)).expect("close initial ordinary child");
+        let _ = take_frames(&mut cluster, child);
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold ordinary Subscribe");
+        let topic = cluster.segment_topic(1).expect("physical segment topic");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "member",
+                1,
+                12,
+                6,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("reserve ordinary child id");
+        let pending = cluster.pending_operations()[0].id;
+        let replacement = connect(&mut cluster, Endpoint::Controller);
+        let replacement_member =
+            register_member(&mut cluster, replacement, "sub", "replacement", 101, 8);
+        cluster
+            .publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(MemberId::new(controller, 100), []),
+                    FullAssignment::new(replacement_member, [1, 2]),
+                ],
+            )
+            .expect("withdraw controller assignment using a complete plan");
+        cluster
+            .complete_pending(pending, PendingCompletion::Succeed)
+            .expect("admitted ordinary Subscribe survives assignment withdrawal");
+        assert_ordinary_open_and_close(&mut cluster, child, 12, 6);
+    }
+
+    #[test]
+    fn ga_ordinary_child_delayed_seek_survives_controller_leave() {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        cluster
+            .enqueue_message(1, Bytes::from_static(b"ordinary-seek"))
+            .expect("enqueue ordinary message");
+        send(&mut cluster, child, &flow_command(11, 1)).expect("ordinary child receives");
+        let delivered = take_frames(&mut cluster, child);
+        let position = message_frame(&delivered)
+            .command
+            .message
+            .as_ref()
+            .expect("message")
+            .message_id
+            .clone();
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::Seek,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold admitted Seek");
+        send(&mut cluster, child, &seek_command(11, 5, position)).expect("ordinary Seek admitted");
+        let pending = cluster.pending_operations()[0].id;
+        leave_test_controller(&mut cluster, controller);
+        let _ = take_frames(&mut cluster, controller);
+        cluster
+            .complete_pending(pending, PendingCompletion::Succeed)
+            .expect("GA admitted ordinary Seek settles after controller leave");
+        let responses = take_frames(&mut cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("Seek success")
+                .request_id,
+            5
+        );
+        assert_eq!(cluster.durable_cursor("sub", 1), Some(0));
+        assert_eq!(cluster.resource_counts().unacked_messages, 0);
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+        let topic = cluster.segment_topic(1).expect("physical segment topic");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "member",
+                1,
+                11,
+                7,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("reopen the same ordinary wire id after GA seek disconnect");
+        let reopened = take_frames(&mut cluster, child);
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            reopened[0]
+                .command
+                .success
+                .as_ref()
+                .expect("Subscribe success")
+                .request_id,
+            7
+        );
+        send(&mut cluster, child, &flow_command(11, 1)).expect("replay credit");
+        let replay = take_frames(&mut cluster, child);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            message_frame(&replay)
+                .payload
+                .as_ref()
+                .expect("payload")
+                .body,
+            Bytes::from_static(b"ordinary-seek")
+        );
+        send(&mut cluster, child, &close_command(11, 6)).expect("close replaying child");
+        let responses = take_frames(&mut cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("Close success")
+                .request_id,
+            6
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+    }
+
+    fn exercise_live_child_flow_after_controller_change(leave: bool) {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        if leave {
+            leave_test_controller(&mut cluster, controller);
+        } else {
+            let replacement = connect(&mut cluster, Endpoint::Controller);
+            let replacement_member =
+                register_member(&mut cluster, replacement, "sub", "replacement", 101, 6);
+            let _ = take_frames(&mut cluster, controller);
+            cluster
+                .publish_assignment_plan(
+                    1,
+                    vec![
+                        FullAssignment::new(MemberId::new(controller, 100), []),
+                        FullAssignment::new(replacement_member, [1, 2]),
+                    ],
+                )
+                .expect("withdraw the controller assignment");
+        }
+        let _ = take_frames(&mut cluster, controller);
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        send(&mut cluster, child, &flow_command(11, 2))
+            .expect("GA FLOW targets the live ordinary child independently of its controller");
+        assert_eq!(cluster.resource_counts().permits, 2);
+        cluster
+            .enqueue_message(1, Bytes::from_static(b"live-child-credit"))
+            .expect("enqueue on the existing ordinary subscription");
+        let frames = take_frames(&mut cluster, child);
+        assert_eq!(frames.len(), 1);
+        let delivery = message_frame(&frames);
+        assert_eq!(
+            delivery
+                .command
+                .message
+                .as_ref()
+                .expect("message")
+                .consumer_id,
+            11
+        );
+        assert_eq!(
+            delivery.payload.as_ref().expect("payload").body,
+            Bytes::from_static(b"live-child-credit")
+        );
+        assert_eq!(cluster.resource_counts().permits, 1);
+        assert_eq!(cluster.resource_counts().unacked_messages, 1);
+        send(&mut cluster, child, &close_command(11, 5)).expect("close the ordinary child");
+        let responses = take_frames(&mut cluster, child);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]
+                .command
+                .success
+                .as_ref()
+                .expect("close success")
+                .request_id,
+            5
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+        assert!(matches!(
+            send(&mut cluster, child, &flow_command(11, 1)),
+            Err(M1FakeError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn ga_live_child_flow_after_controller_leave() {
+        exercise_live_child_flow_after_controller_change(true);
+    }
+
+    #[test]
+    fn ga_live_child_flow_after_controller_assignment_withdrawal() {
+        exercise_live_child_flow_after_controller_change(false);
+    }
+
+    #[test]
+    fn ga_pending_ack_settles_after_controller_leave_while_child_close_is_held() {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        cluster
+            .enqueue_message(1, Bytes::from_static(b"ack-before-controller-leave"))
+            .expect("message enqueued");
+        send(&mut cluster, child, &flow_command(11, 1)).expect("ordinary child receives");
+        let delivered = take_frames(&mut cluster, child);
+        let message_id = message_frame(&delivered)
+            .command
+            .message
+            .as_ref()
+            .expect("delivered message")
+            .message_id
+            .clone();
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::Ack,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold admitted ACK");
+        send(&mut cluster, child, &ack_command(11, 5, message_id)).expect("ACK admitted");
+        let ack_id = cluster
+            .pending_operations()
+            .into_iter()
+            .find(|operation| operation.kind == OperationKind::Ack)
+            .expect("held acknowledgement")
+            .id;
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold ordinary child close");
+        send(&mut cluster, child, &close_command(11, 3)).expect("ordinary close held");
+        let close_id = cluster
+            .pending_operations()
+            .into_iter()
+            .find(|operation| operation.kind == OperationKind::Close)
+            .expect("held close")
+            .id;
+        leave_test_controller(&mut cluster, controller);
+        let _ = take_frames(&mut cluster, controller);
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        assert_eq!(cluster.resource_counts().unacked_messages, 1);
+        assert_eq!(cluster.resource_counts().pending_operations, 2);
+        cluster
+            .complete_pending(ack_id, PendingCompletion::Succeed)
+            .expect("admitted ordinary ACK survives controller leave");
+        let frames = take_frames(&mut cluster, child);
+        assert_eq!(frames.len(), 1);
+        let response = frames[0]
+            .command
+            .ack_response
+            .as_ref()
+            .expect("ACK response");
+        assert_eq!(response.request_id, Some(5));
+        assert_eq!(response.consumer_id, 11);
+        assert_eq!(response.error, None);
+        assert_eq!(cluster.resource_counts().unacked_messages, 0);
+        assert_eq!(cluster.durable_cursor("sub", 1), Some(1));
+        assert_eq!(cluster.resource_counts().pending_operations, 1);
+        cluster
+            .complete_pending(close_id, PendingCompletion::Succeed)
+            .expect("original ordinary close completes");
+        assert_eq!(
+            take_frames(&mut cluster, child)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("original close response")
+                .request_id,
+            3
+        );
+        let counts = cluster.resource_counts();
+        assert_eq!(counts.child_consumers, 0);
+        assert_eq!(counts.pending_operations, 0);
+        assert_eq!(counts.unacked_messages, 0);
+        assert_eq!(counts.permits, 0);
+    }
+
+    #[test]
+    fn ga_staged_transaction_ack_settles_after_controller_leave_commit() {
+        staged_transaction_ack_after_controller_leave(pb::TxnAction::Commit);
+    }
+
+    #[test]
+    fn ga_staged_transaction_ack_settles_after_controller_leave_abort() {
+        staged_transaction_ack_after_controller_leave(pb::TxnAction::Abort);
+    }
+
+    fn register_child_transaction(
+        cluster: &mut M1FakeCluster,
+        controller: ConnectionId,
+    ) -> magnetar_proto::TxnId {
+        let topic = cluster.segment_topic(1).expect("segment topic");
+        send(cluster, controller, &tc_connect_command(6)).expect("coordinator connected");
+        let _ = take_frames(cluster, controller);
+        send(cluster, controller, &new_transaction_command(7)).expect("transaction opened");
+        let opened = take_frames(cluster, controller)[0]
+            .command
+            .new_txn_response
+            .clone()
+            .expect("transaction response");
+        let txn_id = magnetar_proto::TxnId::new(
+            opened.txnid_most_bits.expect("most bits"),
+            opened.txnid_least_bits.expect("least bits"),
+        );
+        send(
+            cluster,
+            controller,
+            &add_subscription_to_transaction_command(8, txn_id, &topic, "sub"),
+        )
+        .expect("subscription registered with transaction");
+        let _ = take_frames(cluster, controller);
+        txn_id
+    }
+
+    fn staged_transaction_ack_after_controller_leave(action: pb::TxnAction) {
+        let (mut cluster, controller, child) = ordinary_child_cluster();
+        let txn_id = register_child_transaction(&mut cluster, controller);
+        cluster
+            .enqueue_message(1, Bytes::from_static(b"txn-before-controller-leave"))
+            .expect("message enqueued");
+        send(&mut cluster, child, &flow_command(11, 1)).expect("ordinary child receives");
+        let delivered = take_frames(&mut cluster, child);
+        let message_id = message_frame(&delivered)
+            .command
+            .message
+            .as_ref()
+            .expect("delivered message")
+            .message_id
+            .clone();
+        send(
+            &mut cluster,
+            child,
+            &transactional_ack_command(11, 9, txn_id, message_id),
+        )
+        .expect("transactional ACK admitted and staged");
+        let response = take_frames(&mut cluster, child)[0]
+            .command
+            .ack_response
+            .clone()
+            .expect("transactional ACK response");
+        assert_eq!(response.error, None);
+        assert_eq!(
+            cluster
+                .transaction_observation(txn_id)
+                .expect("transaction")
+                .staged_acknowledgements,
+            1
+        );
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold ordinary child close");
+        send(&mut cluster, child, &close_command(11, 3)).expect("ordinary close held");
+        let close_id = cluster.pending_operations()[0].id;
+        leave_test_controller(&mut cluster, controller);
+        let _ = take_frames(&mut cluster, controller);
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        send(
+            &mut cluster,
+            controller,
+            &end_transaction_command(10, txn_id, action),
+        )
+        .expect("staged ordinary subscription ACK settles after controller leave");
+        let ended = take_frames(&mut cluster, controller)[0]
+            .command
+            .end_txn_response
+            .clone()
+            .expect("transaction settlement response");
+        assert_eq!(ended.request_id, 10);
+        assert_eq!(ended.error, None);
+        let observation = cluster
+            .transaction_observation(txn_id)
+            .expect("settled transaction");
+        assert_eq!(observation.staged_acknowledgements, 0);
+        match action {
+            pb::TxnAction::Commit => {
+                assert_eq!(observation.state, FakeTransactionState::Committed);
+                assert_eq!(cluster.resource_counts().unacked_messages, 0);
+                assert_eq!(cluster.durable_cursor("sub", 1), Some(1));
+            }
+            pb::TxnAction::Abort => {
+                assert_eq!(observation.state, FakeTransactionState::Aborted);
+                assert_eq!(cluster.resource_counts().unacked_messages, 1);
+                assert_eq!(cluster.durable_cursor("sub", 1), Some(0));
+            }
+        }
+        cluster
+            .complete_pending(close_id, PendingCompletion::Succeed)
+            .expect("original ordinary close completes");
+        assert_eq!(
+            take_frames(&mut cluster, child)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("original close response")
+                .request_id,
+            3
+        );
+        let counts = cluster.resource_counts();
+        assert_eq!(counts.child_consumers, 0);
+        assert_eq!(counts.pending_operations, 0);
+        assert_eq!(counts.unacked_messages, 0);
+        assert_eq!(counts.permits, 0);
+    }
+
+    #[test]
+    fn ga_delayed_child_close_preserves_owner_after_unknown_closes() {
+        let (mut cluster, _controller, child, pending) = delayed_child_close_cluster();
+        let other = connect(&mut cluster, Endpoint::Segment(1));
+        let resources = cluster.resource_counts();
+        let member = MemberId::new(child, 11);
+        let fence = child_fence(member, &cluster.child_consumers[&member]);
+        for (connection, consumer_id) in [(other, 11), (child, 999)] {
+            send(&mut cluster, connection, &close_command(consumer_id, 5))
+                .expect("unknown Close succeeds without touching foreign child");
+            let responses = take_frames(&mut cluster, connection);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("unknown Close success")
+                    .request_id,
+                5
+            );
+            assert_eq!(cluster.resource_counts(), resources);
+            assert_eq!(cluster.pending_operations()[0].id, pending);
+            assert!(cluster.ordinary_child_fence_matches(member, &fence));
+        }
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        assert_eq!(cluster.resource_counts().pending_operations, 1);
+        cluster
+            .complete_pending(pending, PendingCompletion::Succeed)
+            .expect("unrelated Close preserves original confirmation");
+        assert_eq!(
+            take_frames(&mut cluster, child)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("original close success")
+                .request_id,
+            3
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+    }
+
+    #[test]
+    fn ga_same_member_reregister_reuses_assignment_without_new_member() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let controller = connect(&mut cluster, Endpoint::Controller);
+        let member = register_member(&mut cluster, controller, "sub", "member", 7, 1);
+        let topic = cluster.topic().to_owned();
+        let original_owners = cluster.segment_owners.clone();
+        let original_epoch = cluster.memberships[&member].assignment_epoch;
+        send(
+            &mut cluster,
+            controller,
+            &scalable_subscribe_command(&topic, "sub", "member", 7, 2),
+        )
+        .expect("same member reattaches");
+        let frames = take_frames(&mut cluster, controller);
+        assert_eq!(frames.len(), 1);
+        let response = frames[0]
+            .command
+            .scalable_topic_subscribe_response
+            .as_ref()
+            .expect("same member receives scalable response");
+        assert_eq!(response.request_id, 2);
+        assert_eq!(response.error, None);
+        assert!(response.assignment.is_some());
+        assert_eq!(cluster.resource_counts().scalable_members, 1);
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+        assert_eq!(cluster.segment_owners, original_owners);
+        assert_eq!(
+            cluster.memberships[&member].assignment_epoch,
+            original_epoch
+        );
+        assert!(cluster.memberships[&member].registered);
+    }
+
+    #[test]
+    fn ga_same_member_reregister_rejects_conflicting_identity() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let controller = connect(&mut cluster, Endpoint::Controller);
+        let member = register_member(&mut cluster, controller, "sub", "member", 7, 1);
+        let topic = cluster.topic().to_owned();
+        let original_owners = cluster.segment_owners.clone();
+        for (subscription, consumer_name) in [("other-sub", "member"), ("sub", "other-member")] {
+            send(
+                &mut cluster,
+                controller,
+                &scalable_subscribe_command(&topic, subscription, consumer_name, 7, 2),
+            )
+            .expect("conflicting identity receives a broker response");
+            let frames = take_frames(&mut cluster, controller);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0]
+                    .command
+                    .scalable_topic_subscribe_response
+                    .as_ref()
+                    .expect("conflicting identity response")
+                    .error,
+                Some(pb::ServerError::ConsumerBusy as i32),
+            );
+            assert_eq!(cluster.resource_counts().scalable_members, 1);
+            assert_eq!(cluster.segment_owners, original_owners);
+            assert_eq!(cluster.memberships[&member].consumer_name, "member");
+            assert_eq!(cluster.memberships[&member].group.subscription, "sub");
+        }
+    }
+
+    #[test]
+    fn ga_new_id_same_name_reregister_preserves_assignment_and_fences_old_leave() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let controller = connect(&mut cluster, Endpoint::Controller);
+        let old_member = register_member(&mut cluster, controller, "sub", "member", 7, 1);
+        let topic = cluster.topic().to_owned();
+        let original_epoch = cluster.memberships[&old_member].assignment_epoch;
+        let original_assignment = cluster.memberships[&old_member].assigned.clone();
+        send(
+            &mut cluster,
+            controller,
+            &scalable_subscribe_command(&topic, "sub", "member", 8, 2),
+        )
+        .expect("same name reattaches with a new consumer id");
+        let frames = take_frames(&mut cluster, controller);
+        assert_eq!(frames.len(), 1);
+        let response = frames[0]
+            .command
+            .scalable_topic_subscribe_response
+            .as_ref()
+            .expect("new id receives scalable response");
+        assert_eq!(response.request_id, 2);
+        assert_eq!(response.error, None);
+        let new_member = MemberId::new(controller, 8);
+        assert!(!cluster.memberships.contains_key(&old_member));
+        assert_eq!(cluster.resource_counts().scalable_members, 1);
+        assert_eq!(
+            cluster.memberships[&new_member].assigned,
+            original_assignment
+        );
+        assert_eq!(
+            cluster.memberships[&new_member].assignment_epoch,
+            original_epoch
+        );
+        assert!(
+            cluster
+                .segment_owners
+                .values()
+                .all(|owner| *owner == new_member)
+        );
+        assert!(
+            cluster
+                .ownership_history
+                .values()
+                .all(|owner| *owner == new_member)
+        );
+        for (consumer_id, request_id, expected_members) in [(7, 3, 1), (8, 4, 0)] {
+            send(
+                &mut cluster,
+                controller,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                    scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                        request_id,
+                        consumer_id,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("leave is correlated to its consumer id");
+            assert_eq!(
+                take_frames(&mut cluster, controller)[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("leave success")
+                    .request_id,
+                request_id,
+            );
+            assert_eq!(cluster.resource_counts().scalable_members, expected_members);
+        }
+    }
+
+    #[test]
+    fn ga_delayed_scalable_leave_is_applied_after_same_id_resume() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let controller = connect(&mut cluster, Endpoint::Controller);
+        let member = register_member(&mut cluster, controller, "sub", "member", 7, 1);
+        let topic = cluster.topic().to_owned();
+        cluster
+            .script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableLeave,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold the broker's unregister deletion");
+        send(
+            &mut cluster,
+            controller,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                    request_id: 2,
+                    consumer_id: 7,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("unregister begins before its deletion completes");
+        assert_eq!(cluster.resource_counts().scalable_members, 1);
+        assert!(take_frames(&mut cluster, controller).is_empty());
+        let pending = cluster.pending_operations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, OperationKind::ScalableLeave);
+        send(
+            &mut cluster,
+            controller,
+            &scalable_subscribe_command(&topic, "sub", "member", 7, 3),
+        )
+        .expect("same id resumes while deletion is held");
+        assert_eq!(
+            take_frames(&mut cluster, controller)[0]
+                .command
+                .scalable_topic_subscribe_response
+                .as_ref()
+                .expect("resume response")
+                .error,
+            None,
+        );
+        assert!(cluster.memberships.contains_key(&member));
+        cluster
+            .complete_pending(pending[0].id, PendingCompletion::Succeed)
+            .expect("the old same-id deletion completes");
+        assert_eq!(
+            take_frames(&mut cluster, controller)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("old leave success")
+                .request_id,
+            2,
+        );
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+    }
+
+    #[test]
+    fn ga_delayed_leave_guards_consumer_id_across_controller_connections() {
+        for (replacement_id, expected_members) in [(7, 0), (8, 1)] {
+            let mut cluster = M1FakeCluster::two_segment();
+            let old_connection = connect(&mut cluster, Endpoint::Controller);
+            let new_connection = connect(&mut cluster, Endpoint::Controller);
+            register_member(&mut cluster, old_connection, "sub", "member", 7, 1);
+            let topic = cluster.topic().to_owned();
+            cluster
+                .script_next(
+                    Endpoint::Controller,
+                    OperationKind::ScalableLeave,
+                    ScriptedBehavior::Delay,
+                )
+                .expect("hold old connection's unregister deletion");
+            send(
+                &mut cluster,
+                old_connection,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                    scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                        request_id: 2,
+                        consumer_id: 7,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("start identity-fenced deletion");
+            let pending = cluster.pending_operations()[0].id;
+            send(
+                &mut cluster,
+                new_connection,
+                &scalable_subscribe_command(&topic, "sub", "member", replacement_id, 3),
+            )
+            .expect("reattach on another pooled controller connection");
+            assert_eq!(
+                take_frames(&mut cluster, new_connection)[0]
+                    .command
+                    .scalable_topic_subscribe_response
+                    .as_ref()
+                    .expect("replacement response")
+                    .error,
+                None
+            );
+            assert_eq!(cluster.resource_counts().scalable_members, 1);
+            assert_eq!(
+                cluster.member("sub", "member"),
+                Some(MemberId::new(new_connection, replacement_id))
+            );
+            cluster
+                .complete_pending(pending, PendingCompletion::Succeed)
+                .expect("complete old connection deletion");
+            assert_eq!(
+                take_frames(&mut cluster, old_connection)[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("old deletion response")
+                    .request_id,
+                2
+            );
+            assert_eq!(cluster.resource_counts().scalable_members, expected_members);
+            assert_eq!(cluster.resource_counts().pending_operations, 0);
+            if replacement_id != 7 {
+                assert_eq!(
+                    cluster.assigned_owner("sub", 1),
+                    Some(MemberId::new(new_connection, replacement_id))
+                );
+                assert_eq!(
+                    cluster.assigned_owner("sub", 2),
+                    Some(MemberId::new(new_connection, replacement_id))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ga_unsubscribe_removes_only_its_connection_registration_and_is_idempotent() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let first = connect(&mut cluster, Endpoint::Controller);
+        let second = connect(&mut cluster, Endpoint::Controller);
+        let first_member = register_member(&mut cluster, first, "workers", "first", 7, 1);
+        let second_member = register_member(&mut cluster, second, "workers", "second", 7, 1);
+        for request_id in [2, 3] {
+            send(
+                &mut cluster,
+                first,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                    scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                        request_id,
+                        consumer_id: 7,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("GA unregister accepts unknown IDs as success");
+            let frames = take_frames(&mut cluster, first);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0]
+                    .command
+                    .success
+                    .as_ref()
+                    .expect("GA success")
+                    .request_id,
+                request_id
+            );
+            assert!(!cluster.memberships.contains_key(&first_member));
+            assert!(cluster.memberships.contains_key(&second_member));
+            assert_eq!(cluster.resource_counts().scalable_members, 1);
+            assert_eq!(cluster.resource_counts().connections, 2);
+        }
     }
 
     fn register_member(
@@ -5927,7 +7060,7 @@ mod tests {
     }
 
     #[test]
-    fn child_open_requires_controller_ownership_and_canonical_identity() {
+    fn ordinary_child_open_uses_physical_topic_and_identity_without_controller_policy() {
         let mut cluster = M1FakeCluster::two_segment();
         let controller = connect(&mut cluster, Endpoint::Controller);
         let child = connect(&mut cluster, Endpoint::Segment(1));
@@ -5941,35 +7074,30 @@ mod tests {
             1,
             pb::command_subscribe::SubType::Exclusive,
         );
-        assert!(matches!(
-            send(&mut cluster, child, &command),
-            Err(M1FakeError::InvalidCommand { .. })
-        ));
+        send(&mut cluster, child, &command).expect("ordinary child opens without a controller");
+        assert_ordinary_open_and_close(&mut cluster, child, 7, 1);
 
         register_member(&mut cluster, controller, "sub", "member", 100, 2);
-        let mut wrong_name = command.clone();
-        wrong_name
+        let mut arbitrary_name = command.clone();
+        let subscribe = arbitrary_name.subscribe.as_mut().expect("CommandSubscribe");
+        subscribe.consumer_name = Some("independent-child".to_owned());
+        subscribe.request_id = 3;
+        send(&mut cluster, child, &arbitrary_name)
+            .expect("ordinary name is independent of the controller");
+        assert_ordinary_open_and_close(&mut cluster, child, 7, 3);
+
+        let mut other_subscription = command.clone();
+        let subscribe = other_subscription
             .subscribe
             .as_mut()
-            .expect("CommandSubscribe")
-            .consumer_name = Some("forged-child".to_owned());
-        assert!(matches!(
-            send(&mut cluster, child, &wrong_name),
-            Err(M1FakeError::InvalidCommand { .. })
-        ));
+            .expect("CommandSubscribe");
+        subscribe.subscription = "other-sub".to_owned();
+        subscribe.request_id = 5;
+        send(&mut cluster, child, &other_subscription)
+            .expect("ordinary subscription is independent of the controller");
+        assert_ordinary_open_and_close(&mut cluster, child, 7, 5);
 
-        let mut wrong_group = command.clone();
-        wrong_group
-            .subscribe
-            .as_mut()
-            .expect("CommandSubscribe")
-            .subscription = "other-sub".to_owned();
-        assert!(matches!(
-            send(&mut cluster, child, &wrong_group),
-            Err(M1FakeError::InvalidCommand { .. })
-        ));
-
-        let mut noncanonical = command.clone();
+        let mut noncanonical = command;
         noncanonical
             .subscribe
             .as_mut()
@@ -5979,14 +7107,7 @@ mod tests {
             send(&mut cluster, child, &noncanonical),
             Err(M1FakeError::InvalidCommand { .. })
         ));
-
-        send(&mut cluster, child, &command).expect("owned canonical child opens");
-        assert!(
-            take_frames(&mut cluster, child)[0]
-                .command
-                .success
-                .is_some()
-        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
     }
 
     #[test]
@@ -6619,7 +7740,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_rejects_a_child_after_controller_ownership_moves() {
+    fn flow_retains_live_child_credit_after_controller_ownership_moves() {
         let mut cluster = M1FakeCluster::two_segment();
         let controller_a = connect(&mut cluster, Endpoint::Controller);
         let member_a = register_member(&mut cluster, controller_a, "sub", "member-a", 100, 1);
@@ -6652,14 +7773,30 @@ mod tests {
                 ],
             )
             .expect("ownership moves");
-        assert!(matches!(
-            send(&mut cluster, child, &flow_command(7, 1)),
-            Err(M1FakeError::InvalidCommand {
-                command: pb::base_command::Type::Flow,
-                ..
-            })
-        ));
+        send(&mut cluster, child, &flow_command(7, 1))
+            .expect("live ordinary child accepts credit after controller ownership moves");
+        assert_eq!(cluster.resource_counts().permits, 1);
+        cluster
+            .enqueue_message(1, Bytes::from_static(b"credit-after-ownership-move"))
+            .expect("enqueue on the retained ordinary child");
+        let frames = take_frames(&mut cluster, child);
+        assert_eq!(frames.len(), 1);
+        let delivery = message_frame(&frames);
+        assert_eq!(
+            delivery
+                .command
+                .message
+                .as_ref()
+                .expect("message")
+                .consumer_id,
+            7
+        );
+        assert_eq!(
+            delivery.payload.as_ref().expect("payload").body,
+            Bytes::from_static(b"credit-after-ownership-move")
+        );
         assert_eq!(cluster.resource_counts().permits, 0);
+        assert_eq!(cluster.resource_counts().unacked_messages, 1);
     }
 
     #[test]
@@ -7104,6 +8241,81 @@ mod tests {
     }
 
     #[test]
+    fn stale_open_preserves_a_new_physical_reservation_for_the_same_subscription() {
+        let mut cluster = M1FakeCluster::two_segment();
+        let child = connect(&mut cluster, Endpoint::Segment(1));
+        let topic = cluster.segment_topic(1).expect("physical segment topic");
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold old physical open");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "old",
+                1,
+                7,
+                1,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("admit old ordinary open");
+        let old_id = cluster.pending_operations()[0].id;
+        // Retain the old asynchronous response after its physical reservation is retired.
+        let retired = cluster
+            .pending
+            .remove(&old_id)
+            .expect("old pending response");
+        let PendingOperation::SegmentOpen { activation, .. } = &retired else {
+            panic!("ordinary open expected")
+        };
+        let key = activation.key.clone();
+        cluster.release_pending_child_owner(&key, old_id);
+        cluster
+            .script_next(
+                Endpoint::Segment(1),
+                OperationKind::SegmentOpen,
+                ScriptedBehavior::Delay,
+            )
+            .expect("hold replacement physical open");
+        send(
+            &mut cluster,
+            child,
+            &segment_subscribe_command(
+                &topic,
+                "sub",
+                "replacement",
+                1,
+                8,
+                2,
+                pb::command_subscribe::SubType::Exclusive,
+            ),
+        )
+        .expect("admit replacement ordinary open");
+        let replacement_id = cluster.pending_operations()[0].id;
+        assert_ne!(old_id, replacement_id);
+        cluster.pending.insert(old_id, retired);
+        assert!(
+            matches!(cluster.complete_pending(old_id, PendingCompletion::Fail(BrokerFailure::new(pb::ServerError::ServiceNotReady, "retired response"))), Err(M1FakeError::StalePending(id)) if id == old_id)
+        );
+        assert!(
+            matches!(cluster.child_subscriptions[&key].owner, Some(ChildOwner::Pending(id)) if id == replacement_id)
+        );
+        assert_eq!(cluster.pending_operations().len(), 1);
+        assert_eq!(take_frames(&mut cluster, child).len(), 0);
+        cluster
+            .complete_pending(replacement_id, PendingCompletion::Succeed)
+            .expect("replacement reservation remains current");
+        assert_ordinary_open_and_close(&mut cluster, child, 8, 2);
+    }
+
+    #[test]
     fn stale_open_and_close_completions_release_only_their_own_generation() {
         let mut cluster = M1FakeCluster::two_segment();
         let controller = connect(&mut cluster, Endpoint::Controller);
@@ -7143,17 +8355,27 @@ mod tests {
             )
             .expect("ownership moves to member B");
         let _ = take_frames(&mut cluster, controller);
-        assert!(matches!(
-            cluster.complete_pending(
+        cluster
+            .complete_pending(
                 stale_open,
                 PendingCompletion::Fail(BrokerFailure::new(
                     pb::ServerError::ServiceNotReady,
                     "stale open failure",
                 )),
-            ),
-            Err(M1FakeError::StalePending(id)) if id == stale_open
-        ));
-        assert!(take_frames(&mut cluster, child).is_empty());
+            )
+            .expect("admitted ordinary Subscribe preserves its failure after assignment moves");
+        let failed = take_frames(&mut cluster, child);
+        assert_eq!(failed.len(), 1);
+        let error = failed[0]
+            .command
+            .error
+            .as_ref()
+            .expect("correlated Subscribe failure");
+        assert_eq!(error.request_id, 3);
+        assert_eq!(error.error, pb::ServerError::ServiceNotReady as i32);
+        assert_eq!(error.message, "stale open failure");
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
 
         send(
             &mut cluster,
@@ -7179,16 +8401,22 @@ mod tests {
             .expect("close delay scripted");
         send(&mut cluster, child, &close_command(8, 5)).expect("close is held");
         let stale_close = cluster.pending_operations()[0].id;
-        cluster
-            .disconnect_connection(controller)
-            .expect("controller incarnation ends");
+        let replacement = cluster
+            .child_consumers
+            .get_mut(&MemberId::new(child, 8))
+            .expect("replacement ordinary child identity");
+        replacement.generation = replacement
+            .generation
+            .checked_add(1)
+            .expect("replacement child generation");
+        replacement.closing = false;
         assert!(matches!(
             cluster.complete_pending(stale_close, PendingCompletion::Succeed),
             Err(M1FakeError::StalePending(id)) if id == stale_close
         ));
         assert_eq!(cluster.resource_counts().child_consumers, 1);
         send(&mut cluster, child, &close_command(8, 6))
-            .expect("stale close completion releases its closing marker");
+            .expect("stale close completion preserves the replacement closing marker");
         assert!(
             take_frames(&mut cluster, child)[0]
                 .command
@@ -8484,13 +9712,23 @@ mod tests {
             ),
         )
         .expect("child racing replacement controller receives a broker response");
-        let busy = take_frames(&mut cluster, early_child)[0]
-            .command
-            .error
-            .as_ref()
-            .expect("generated ConsumerBusy during reconnect gap")
-            .error;
-        assert_eq!(busy, pb::ServerError::ConsumerBusy as i32);
+        let opened = take_frames(&mut cluster, early_child);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            opened[0]
+                .command
+                .success
+                .as_ref()
+                .expect("ordinary Subscribe during reconnect gap")
+                .request_id,
+            5
+        );
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+        assert_eq!(cluster.resource_counts().child_consumers, 1);
+        assert_eq!(
+            cluster.active_child_consumer("sub", 2, "member-b-seg-2"),
+            Some(MemberId::new(early_child, 5))
+        );
 
         let replacement = connect(&mut cluster, Endpoint::Controller);
         send(
@@ -8528,6 +9766,22 @@ mod tests {
             .map(|segment| segment.segment_id)
             .collect::<Vec<_>>();
         assert_eq!(assignment_b, vec![2]);
+        assert_eq!(cluster.resource_counts().scalable_members, 2);
+        send(&mut cluster, early_child, &close_command(5, 6))
+            .expect("ordinary reconnect-gap child closes");
+        let closed = take_frames(&mut cluster, early_child);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(
+            closed[0]
+                .command
+                .success
+                .as_ref()
+                .expect("ordinary Close success")
+                .request_id,
+            6
+        );
+        assert_eq!(cluster.resource_counts().child_consumers, 0);
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
     }
 
     #[test]

@@ -96,9 +96,9 @@ mod transport;
 mod url_parse;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "scalable-topics")]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -312,6 +312,18 @@ pub enum LookupReissueReadiness {
     Terminal,
 }
 
+#[cfg(feature = "scalable-topics")]
+fn checked_fetch_increment(counter: &AtomicU64) -> Result<u64, u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl ConnectionShared {
     /// Construct shared state from the given protocol-layer config.
     pub fn new(config: magnetar_proto::ConnectionConfig) -> Arc<Self> {
@@ -483,20 +495,14 @@ impl ConnectionShared {
     pub(crate) fn allocate_controller_incarnation(
         &self,
     ) -> Result<magnetar_proto::ControllerIncarnation, crate::ClientError> {
-        self.next_controller_incarnation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
+        checked_fetch_increment(&self.next_controller_incarnation)
             .map(magnetar_proto::ControllerIncarnation)
             .map_err(|_| crate::ClientError::Other("controller incarnation exhausted".to_owned()))
     }
 
     #[cfg(feature = "scalable-topics")]
     pub(crate) fn allocate_scalable_consumer_id(&self) -> Result<u64, crate::ClientError> {
-        self.next_scalable_consumer_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
+        checked_fetch_increment(&self.next_scalable_consumer_id)
             .map_err(|_| crate::ClientError::Other("scalable consumer id exhausted".to_owned()))
     }
 }
@@ -637,6 +643,88 @@ mod tests {
     use magnetar_proto::ConnectionConfig;
 
     use super::{ConnectionShared, TopicListChange};
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn scalable_id_allocation_is_unique_and_never_wraps() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let allocated = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let shared = shared.clone();
+                    scope.spawn(move || {
+                        (0..128)
+                            .map(|_| {
+                                (
+                                    shared
+                                        .allocate_controller_incarnation()
+                                        .expect("incarnation")
+                                        .0,
+                                    shared.allocate_scalable_consumer_id().expect("consumer id"),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().expect("allocation thread"))
+                .collect::<Vec<_>>()
+        });
+        let incarnations: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.0).collect();
+        let consumer_ids: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.1).collect();
+        assert_eq!(incarnations, (1..=512).collect());
+        assert_eq!(consumer_ids, ((1_u64 << 63)..(1_u64 << 63) + 512).collect());
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("next incarnation")
+                .0,
+            513
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("next consumer id"),
+            (1_u64 << 63) + 512
+        );
+        shared
+            .next_controller_incarnation
+            .store(u64::MAX - 1, super::Ordering::Release);
+        shared
+            .next_scalable_consumer_id
+            .store(u64::MAX - 1, super::Ordering::Release);
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("last incarnation")
+                .0,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("last consumer id"),
+            u64::MAX - 1
+        );
+        assert!(shared.allocate_controller_incarnation().is_err());
+        assert!(shared.allocate_scalable_consumer_id().is_err());
+        assert_eq!(
+            shared
+                .next_controller_incarnation
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+        assert_eq!(
+            shared
+                .next_scalable_consumer_id
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn shared_state_can_be_constructed() {

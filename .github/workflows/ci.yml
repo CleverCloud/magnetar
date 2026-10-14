@@ -459,7 +459,7 @@ jobs:
       # check-sim-coverage runs two fresh all-feature domains: Moonpool +
       # differential for shared/sim source, then Tokio unit/integration tests
       # for private Tokio adapter source. Their targets, profiles, objects and
-      # reports are disjoint under one invocation-owned scratch root (ADR-0103).
+      # reports are disjoint under one invocation-owned scratch root (ADR-0121).
       - name: Free disk space
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:

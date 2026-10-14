@@ -513,8 +513,8 @@ pub struct ConsumerState {
     /// same-handle replies cannot satisfy the stable waiter.
     pub(crate) subscribe_waiter_request: Option<RequestId>,
     /// The active wire request succeeded, but the runtime has not yet consumed
-    /// the stable waiter completion. Preserved across reset so rebuild can
-    /// transfer the same waiter onto the replacement session.
+    /// the stable waiter completion. Reset invalidates this success bit;
+    /// the stable waiter token is retained for the rebuilt session's reply.
     pub(crate) subscribe_waiter_completed: bool,
     /// Re-attach flow gate: set while a driver-owned subscribe waits for its
     /// acknowledgement. Kept public as a boolean for source compatibility;
@@ -4909,7 +4909,7 @@ mod tests {
         consumer
             .deliver(
                 &message_cmd(0),
-                metadata(1),
+                single_metadata(),
                 None,
                 Bytes::from_static(b"buffered"),
                 std::time::Instant::now(),

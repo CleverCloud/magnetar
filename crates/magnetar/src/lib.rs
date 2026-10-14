@@ -197,6 +197,9 @@ pub mod v5;
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 pub mod scalable;
 #[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[doc(hidden)]
+pub use engine::{RawStreamMessage, StreamConsumerBackend, StreamConsumerOptions};
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
 pub use engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi, SegmentSubscriberApi};
 
 #[cfg(test)]

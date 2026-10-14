@@ -14,14 +14,13 @@
 //!
 //! # Test inventory
 //!
-//! 1. [`e2e_hardened_scalable_stream_consumer_contract`] — one transaction-enabled M1 broker proves
+//! 1. [`e2e_hardened_scalable_stream_consumer_contract`] — one transaction-enabled GA broker proves
 //!    typed multi-segment delivery, live and restored-vector acknowledgement, broker-effective
 //!    vector seek replay, transaction commit/abort, single-member split progression in Strict mode,
-//!    explicit broker-managed cross-member behavior, direct-bootstrap controller fallback when M1
-//!    has not published a controller URL, reachable broker-authored segment authorities matching
-//!    the bootstrap transport, and the accepted logical-close membership residue. Because the
-//!    standalone broker controls child assignment, this does not isolate client-side Strict gating
-//!    or prove same-cluster multi-broker routing.
+//!    explicit broker-managed cross-member behavior, reachable broker-authored controller and
+//!    segment authorities matching the bootstrap transport, and clean controller membership leave.
+//!    Because the standalone broker controls child assignment, this does not isolate client-side
+//!    Strict gating or prove same-cluster multi-broker routing.
 //! 2. [`e2e_scalable_topic_info_cli_round_trip`] — the `magnetarctl topic-info` view of the topic
 //!    matches the layout the client library resolves, so the CLI and the driver cannot drift.
 //! 3. [`e2e_scalable_topic_drops_on_broker_split`] — an admin-triggered segment split bumps the
@@ -37,13 +36,21 @@
 //!    still answers 404 for that topic afterwards. Pulsar 5.0.0 auto-creates the topic for a lookup
 //!    that leaves `create_if_missing` unset, so this is what the explicit `false` is for.
 //!
+//! 6. [`e2e_scalable_stream_close_unregisters_with_a_live_pooled_connection`] — repeated same-name
+//!    subscribe/close removes controller membership before the pooled client transport closes.
+//! 7. [`e2e_scalable_bucket_owners_preserve_keys_and_transactional_acknowledgements`] — two members
+//!    share one segment by entry bucket, preserving key ownership and order, repeated cumulative
+//!    acknowledgement idempotence, and transactional commit/abort durability. Both this and clean
+//!    leave reuse the same assertions through Tokio and Moonpool clients when `moonpool` is
+//!    enabled.
+//!
 //! [ADR-0046]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md
 
 #![cfg(feature = "scalable-topics")]
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -74,7 +81,7 @@ const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 type PulsarContainer = testcontainers::ContainerAsync<GenericImage>;
-type ByteStreamConsumer = StreamConsumer<BytesSchema>;
+type ByteStreamConsumer<E = magnetar::TokioEngine> = StreamConsumer<BytesSchema, E>;
 type ByteStreamMessage = StreamMessage<BytesSchema>;
 type ReceiveFuture<'a> = Pin<
     Box<dyn Future<Output = (usize, Result<ByteStreamMessage, StreamConsumerError>)> + Send + 'a>,
@@ -324,7 +331,7 @@ async fn create_scalable_topic(
     Ok(())
 }
 
-/// Publish distinct opaque payloads through M1's bundled V5 client. This is the
+/// Publish distinct opaque payloads through Pulsar's bundled V5 client. This is the
 /// real scalable producer path, not one producer opened directly per segment.
 async fn publish_scalable_messages(
     container: &testcontainers::ContainerAsync<GenericImage>,
@@ -332,11 +339,21 @@ async fn publish_scalable_messages(
     topic: &str,
     payloads: &[String],
 ) -> TestResult {
+    publish_scalable_messages_with_key(container, service_url, topic, payloads, None).await
+}
+
+async fn publish_scalable_messages_with_key(
+    container: &PulsarContainer,
+    service_url: &str,
+    topic: &str,
+    payloads: &[String],
+    key: Option<&str>,
+) -> TestResult {
     if payloads.is_empty() || payloads.iter().any(|payload| payload.contains(',')) {
         return Err("scalable publisher requires non-empty comma-free payloads".into());
     }
     let messages = payloads.join(",");
-    let command = vec![
+    let mut command = vec![
         "bin/pulsar-client".to_owned(),
         "--url".to_owned(),
         service_url.to_owned(),
@@ -346,6 +363,9 @@ async fn publish_scalable_messages(
         messages,
         topic.to_owned(),
     ];
+    if let Some(key) = key {
+        command.extend(["--key".to_owned(), key.to_owned()]);
+    }
     let mut output = container
         .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
         .await?;
@@ -374,13 +394,16 @@ fn payloads(prefix: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-async fn subscribe_byte_stream(
-    client: &PulsarClient,
+async fn subscribe_byte_stream<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
     topic: &str,
     subscription: &str,
     consumer_name: &str,
     ordering_mode: OrderingMode,
-) -> TestResult<ByteStreamConsumer> {
+) -> TestResult<ByteStreamConsumer<E>>
+where
+    E::ClientState: magnetar::SegmentSubscriberApi,
+{
     let budget = ReceiverBudget::bytes(STREAM_BUDGET_BYTES)?;
     Ok(client
         .scalable_stream_consumer(topic, Arc::new(BytesSchema::new()))
@@ -414,8 +437,8 @@ async fn wait_for_status(
     }
 }
 
-async fn wait_for_status_with_events(
-    consumer: &ByteStreamConsumer,
+async fn wait_for_status_with_events<E: magnetar::Engine>(
+    consumer: &ByteStreamConsumer<E>,
     description: &str,
     mut predicate: impl FnMut(&magnetar::scalable::StreamConsumerStatus) -> bool,
 ) -> TestResult<magnetar::scalable::StreamConsumerStatus> {
@@ -498,8 +521,8 @@ async fn wait_for_settled_delivery_leases(
     Ok(())
 }
 
-async fn receive_expected_messages(
-    consumer: &ByteStreamConsumer,
+async fn receive_expected_messages<E: magnetar::Engine>(
+    consumer: &ByteStreamConsumer<E>,
     payloads: &[String],
     context: &str,
 ) -> TestResult<Vec<ByteStreamMessage>> {
@@ -550,8 +573,8 @@ fn assert_stream_payloads(
     }
 }
 
-async fn receive_from_any(
-    consumers: &[ByteStreamConsumer],
+async fn receive_from_any<E: magnetar::Engine>(
+    consumers: &[ByteStreamConsumer<E>],
     indexes: &[usize],
     context: &str,
 ) -> TestResult<(usize, ByteStreamMessage)> {
@@ -572,8 +595,8 @@ async fn receive_from_any(
     Ok((index, result?))
 }
 
-async fn wait_for_transaction_outcome(
-    consumer: &ByteStreamConsumer,
+async fn wait_for_transaction_outcome<E: magnetar::Engine>(
+    consumer: &ByteStreamConsumer<E>,
     transaction: magnetar::Transaction,
     expected: TransactionOutcome,
 ) -> TestResult {
@@ -639,16 +662,16 @@ async fn scalable_consumer_count(
     let Some(subscription_stats) = subscriptions.get(subscription) else {
         return Ok(0);
     };
-    let count = subscription_stats
-        .get("consumerCount")
-        .and_then(serde_json::Value::as_u64)
+    let consumers = subscription_stats
+        .get("consumers")
+        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             format!(
-                "scalable stats for subscription `{subscription}` lack `consumerCount`: \
+                "scalable stats for subscription `{subscription}` lack `consumers`: \
                  {subscription_stats}"
             )
         })?;
-    Ok(usize::try_from(count)?)
+    Ok(consumers.len())
 }
 
 async fn wait_for_consumer_count(
@@ -697,7 +720,7 @@ async fn force_delete_scalable_topics(
     }
 }
 
-async fn verify_m1_topology(
+async fn verify_scalable_topology(
     client: &PulsarClient,
     topic: &str,
     service_url: &str,
@@ -706,9 +729,11 @@ async fn verify_m1_topology(
     let lookup = client.lookup_scalable_topic(topic).await?;
     let result = (|| {
         if lookup.resolved_topic_name.as_deref() != Some(topic) {
-            return Err(
-                format!("M1 resolved `{topic}` as {:?}", lookup.resolved_topic_name).into(),
-            );
+            return Err(format!(
+                "GA broker resolved `{topic}` as {:?}",
+                lookup.resolved_topic_name
+            )
+            .into());
         }
         if lookup
             .controller_broker_url
@@ -745,7 +770,7 @@ async fn verify_m1_topology(
     result
 }
 
-async fn exercise_delivery_and_close_residue(
+async fn exercise_delivery_and_close_cleanup(
     client: &PulsarClient,
     container: &PulsarContainer,
     service_url: &str,
@@ -756,7 +781,7 @@ async fn exercise_delivery_and_close_residue(
     let subscription = format!("e2e-delivery-{suffix}");
     create_scalable_topic(container, &topic, 4).await?;
     created_topics.push(topic.clone());
-    verify_m1_topology(client, &topic, service_url, 4).await?;
+    verify_scalable_topology(client, &topic, service_url, 4).await?;
 
     let consumer = subscribe_byte_stream(
         client,
@@ -827,9 +852,9 @@ async fn exercise_delivery_and_close_residue(
     }
     consumer.close().await?;
 
-    // M1 has no unregister command. Logical close is definitive locally but
-    // leaves this durable member while the pooled connection remains alive.
-    wait_for_consumer_count(container, &topic, &subscription, 1).await
+    // Pulsar 5 GA clean leave removes the controller member while the pooled
+    // transport stays alive, matching the Java V5 consumer.
+    wait_for_consumer_count(container, &topic, &subscription, 0).await
 }
 
 async fn exercise_vector_seek(
@@ -1209,28 +1234,100 @@ async fn exercise_strict_split(
     }
     consumer.acknowledge(&parent).await?;
     drop(parent);
-    wait_for_status_with_events(
-        &consumer,
-        "sealed parent plus two strict children",
-        |status| {
-            status
-                .layout_epoch()
-                .is_some_and(|epoch| epoch > initial_epoch)
-                && status.assigned_segments() == 3
-        },
-    )
-    .await?;
+    let child_ids =
+        wait_for_drained_parent_assignment(client, &consumer, &topic, parent_id, initial_epoch)
+            .await?;
     let children =
         receive_expected_messages(&consumer, &child_payloads, "strict descendant phase").await?;
     if children
         .iter()
-        .any(|message| message.source().segment_id().0 == parent_id)
+        .any(|message| !child_ids.contains(&message.source().segment_id().0))
     {
-        return Err("strict child payload was delivered from the sealed parent".into());
+        return Err(
+            "strict child payload was delivered outside the exact successor assignment".into(),
+        );
     }
     consumer.acknowledge_batch(&children).await?;
     consumer.close().await?;
     Ok(())
+}
+
+async fn wait_for_drained_parent_assignment(
+    client: &PulsarClient,
+    consumer: &ByteStreamConsumer,
+    topic: &str,
+    parent_id: u64,
+    initial_epoch: u64,
+) -> TestResult<BTreeSet<u64>> {
+    let deadline = Instant::now() + STATUS_TIMEOUT;
+    let layout = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        client.lookup_scalable_topic(topic),
+    )
+    .await??;
+    client.close_scalable_topic_session(layout.session_id);
+    let child_ids: BTreeSet<u64> = layout
+        .segments
+        .iter()
+        .filter(|segment| segment.parent_ids.iter().any(|id| id.0 == parent_id))
+        .map(|segment| segment.segment_id.0)
+        .collect();
+    if child_ids.len() != 2 {
+        return Err(format!(
+            "split parent {parent_id} must have exactly two successors: {child_ids:?}"
+        )
+        .into());
+    }
+    // GA retires a sealed parent once drained, then assigns its exact successors.
+    let mut assigned_successors = false;
+    loop {
+        let status = consumer.status();
+        if assigned_successors
+            && status.phase() == magnetar::proto::AggregatePhase::Open
+            && status
+                .layout_epoch()
+                .is_some_and(|epoch| epoch > initial_epoch)
+            && status.assigned_segments() == 2
+            && status.attached_segments() == 2
+            && status.draining_segments() == 0
+            && status.pending_ownership().is_empty()
+            && status.ordering_unprovable().is_empty()
+        {
+            return Ok(child_ids);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "did not reach exact attached successor assignment {child_ids:?} within \
+                 {STATUS_TIMEOUT:?}: observed assignment={assigned_successors}, status={status:?}"
+            )
+            .into());
+        }
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(100)),
+            consumer.next_event(),
+        )
+        .await
+        {
+            Ok(Ok(Some(StreamConsumerEvent::AssignmentApplied {
+                layout_epoch,
+                sources,
+            }))) if layout_epoch > initial_epoch
+                && sources
+                    .iter()
+                    .map(|source| source.segment_id().0)
+                    .collect::<BTreeSet<_>>()
+                    == child_ids =>
+            {
+                assigned_successors = true;
+            }
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None)) => {
+                return Err("strict consumer closed before attached successor assignment".into());
+            }
+            Ok(Err(error)) => return Err(error.into()),
+        }
+    }
 }
 
 async fn acknowledge_broker_managed_children(
@@ -1297,45 +1394,39 @@ async fn exercise_broker_managed_split(
             .await?,
         );
     }
-    wait_for_status(&consumers[0], "broker-managed parent owner", |status| {
-        status.assigned_segments() == 1 && status.attached_segments() == 1
-    })
-    .await?;
-    for consumer in &consumers[1..] {
-        wait_for_status(consumer, "broker-managed non-parent member", |status| {
-            status.assigned_segments() == 0
+    // PIP-486 fans this one segment out by entry bucket before any split.
+    for consumer in &consumers {
+        wait_for_status_with_events(consumer, "broker-managed shared parent owner", |status| {
+            status.assigned_segments() == 1 && status.attached_segments() == 1
         })
         .await?;
     }
 
     let parent_payloads = payloads(&format!("broker-parent-{suffix}"), 1);
     publish_scalable_messages(container, service_url, &topic, &parent_payloads).await?;
-    let mut parents = receive_expected_messages(
-        &consumers[0],
-        &parent_payloads,
-        "broker-managed parent phase",
-    )
-    .await?;
-    let parent = parents
-        .pop()
-        .ok_or("broker-managed parent message missing")?;
+    let (parent_owner, parent) =
+        receive_from_any(&consumers, &[0, 1, 2], "broker-managed parent phase").await?;
+    if parent.payload() != parent_payloads[0].as_bytes() {
+        return Err("broker-managed parent payload differs from the published message".into());
+    }
     if parent.source().segment_id().0 != parent_id {
         return Err("broker-managed parent delivery came from the wrong segment".into());
     }
     split_scalable_segment(container, &topic, parent_id).await?;
     let child_payloads = payloads(&format!("broker-child-{suffix}"), 6);
     publish_scalable_messages(container, service_url, &topic, &child_payloads).await?;
-    for (index, consumer) in consumers.iter().enumerate() {
-        let expected_segments = usize::from(index == 0);
+    for consumer in &consumers {
         wait_for_status(consumer, "split visible before broker drain", |status| {
             status
                 .layout_epoch()
                 .is_some_and(|epoch| epoch > initial_epoch)
-                && status.assigned_segments() == expected_segments
+                && status.assigned_segments() == 1
         })
         .await?;
     }
-    consumers[0].acknowledge(&parent).await?;
+    consumers[parent_owner]
+        .acknowledge_cumulative(&parent)
+        .await?;
     drop(parent);
     for consumer in &consumers {
         wait_for_status_with_events(consumer, "balanced post-drain split assignment", |status| {
@@ -1347,10 +1438,13 @@ async fn exercise_broker_managed_split(
         .await?;
     }
 
+    let remote_owners: Vec<usize> = (0..consumers.len())
+        .filter(|owner| *owner != parent_owner)
+        .collect();
     let (remote_owner, remote_child) = receive_from_any(
         &consumers,
-        &[1, 2],
-        "broker-managed member without parent history",
+        &remote_owners,
+        "broker-managed member without parent delivery history",
     )
     .await?;
     if remote_child.source().segment_id().0 == parent_id {
@@ -1380,13 +1474,12 @@ async fn exercise_broker_managed_split(
     Ok(())
 }
 
-/// (1) Public M1-hardened aggregate contract against one real broker.
+/// (1) Public hardened aggregate contract against one real GA broker.
 ///
 /// The phases are sequential and UUID-isolated so this adds no concurrent broker
 /// beyond the lightweight lookup test it replaces. Standalone cannot prove a
-/// same-cluster multi-broker route. M1 may omit its controller URL before
-/// leader election, in which case successful subscription proves reuse of the
-/// already-authenticated direct bootstrap connection.
+/// same-cluster multi-broker route. Controller and segment authorities must
+/// remain reachable through the broker-advertised standalone transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
     let (service_url, container, _proxy) = start_hardened_broker().await?;
@@ -1397,14 +1490,15 @@ async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
     if !client.broker_supports_scalable_topics() {
         client.close().await;
         return Err(
-            "M1 with scalableTopicsEnabled=true did not advertise scalable-topic support".into(),
+            "GA broker with scalableTopicsEnabled=true did not advertise scalable-topic support"
+                .into(),
         );
     }
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let mut created_topics = Vec::new();
     let exercise: TestResult = async {
-        exercise_delivery_and_close_residue(
+        exercise_delivery_and_close_cleanup(
             &client,
             &container,
             &service_url,
@@ -1462,10 +1556,8 @@ async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
     }
     .await;
 
-    // Physical close releases every pooled socket. M1 deliberately retains the
-    // persisted controller registrations for its 60-second reconnect grace, so
-    // cleanup uses the exact force-delete operation rather than waiting or
-    // pretending disconnect is an immediate unregister.
+    // Release every pooled socket, then remove only the UUID-isolated topics
+    // this test created, including when an earlier assertion failed.
     client.close().await;
     let cleanup = force_delete_scalable_topics(&container, &created_topics).await;
     match (exercise, cleanup) {
@@ -1473,6 +1565,338 @@ async fn e2e_hardened_scalable_stream_consumer_contract() -> TestResult {
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(error), Err(cleanup_error)) => Err(format!(
             "hardened scalable contract failed: {error}; cleanup also failed: {cleanup_error}"
+        )
+        .into()),
+    }
+}
+
+#[cfg(feature = "moonpool")]
+async fn connect_moonpool(
+    service_url: &str,
+) -> TestResult<PulsarClient<magnetar::MoonpoolEngine<moonpool_core::TokioProviders>>> {
+    use magnetar::runtime_moonpool::{Client, MoonpoolEngine};
+    use moonpool_core::TokioProviders;
+
+    let host_port = service_url
+        .strip_prefix("pulsar://")
+        .ok_or("broker URL lacks scheme")?;
+    let runtime_client = Client::connect_plain_supervised(
+        &MoonpoolEngine::new(TokioProviders::new()),
+        host_port,
+        magnetar::proto::ConnectionConfig {
+            operation_timeout: STATUS_TIMEOUT,
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .await?;
+    Ok(PulsarClient::from_runtime_client(runtime_client))
+}
+
+/// Clean leave and same-name rejoin match Java V5EntryBucketDispatchTest's
+/// controller cleanup contract without closing the pooled client transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_scalable_stream_close_unregisters_with_a_live_pooled_connection() -> TestResult {
+    let (service_url, container, _proxy) = start_hardened_broker().await?;
+    let client = PulsarClient::builder()
+        .service_url(service_url.clone())
+        .build()
+        .await?;
+    let result = exercise_close_contract(&client, &container).await;
+    client.close().await;
+    result
+}
+
+#[cfg(feature = "moonpool")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_moonpool_transaction_bootstraps_a_fresh_coordinator() -> TestResult {
+    let (service_url, _container, _proxy) = start_hardened_broker().await?;
+    let client = connect_moonpool(&service_url).await?;
+    let result = async {
+        for _ in 0..2 {
+            let transaction = client.new_transaction(TXN_TIMEOUT).await?;
+            let state = client.abort_transaction(transaction).await?;
+            if state != magnetar::TxnState::Aborted {
+                return Err(format!("fresh coordinator returned {state:?} on abort").into());
+            }
+        }
+        Ok(())
+    }
+    .await;
+    client.close().await;
+    result
+}
+
+#[cfg(feature = "moonpool")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_scalable_stream_close_unregisters_with_a_live_pooled_connection_moonpool() -> TestResult
+{
+    let (service_url, container, _proxy) = start_hardened_broker().await?;
+    let client = connect_moonpool(&service_url).await?;
+    let result = exercise_close_contract(&client, &container).await;
+    client.close().await;
+    result
+}
+
+async fn exercise_close_contract<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
+    container: &PulsarContainer,
+) -> TestResult
+where
+    E::ClientState: magnetar::SegmentSubscriberApi,
+{
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let topic = unique_scalable_topic("clean-leave", &suffix);
+    let subscription = format!("clean-leave-{suffix}");
+    create_scalable_topic(container, &topic, 1).await?;
+    let exercise: TestResult = async {
+        for _ in 0..3 {
+            let consumer = subscribe_byte_stream(
+                client,
+                &topic,
+                &subscription,
+                &format!("same-name-{suffix}"),
+                OrderingMode::BrokerManaged,
+            )
+            .await?;
+            wait_for_consumer_count(container, &topic, &subscription, 1).await?;
+            consumer.close().await?;
+            wait_for_consumer_count(container, &topic, &subscription, 0).await?;
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = force_delete_scalable_topics(container, &[topic]).await;
+    match (exercise, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(format!("clean leave failed: {error}; cleanup also failed: {cleanup_error}").into())
+        }
+    }
+}
+
+/// Java GA V5EntryBucketDispatchTest's one-segment/two-consumer contract:
+/// whole keys retain one owner and FIFO order; cumulative acknowledgements
+/// translate to individual Key_Shared acknowledgements, including transactions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_scalable_bucket_owners_preserve_keys_and_transactional_acknowledgements() -> TestResult
+{
+    let (service_url, container, _proxy) = start_hardened_broker().await?;
+    let client = PulsarClient::builder()
+        .service_url(service_url.clone())
+        .build()
+        .await?;
+    let result = exercise_bucket_contract(&client, &container, &service_url).await;
+    client.close().await;
+    result
+}
+
+#[cfg(feature = "moonpool")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_scalable_bucket_owners_preserve_keys_and_transactional_acknowledgements_moonpool()
+-> TestResult {
+    let (service_url, container, _proxy) = start_hardened_broker().await?;
+    let client = connect_moonpool(&service_url).await?;
+    let result = exercise_bucket_contract(&client, &container, &service_url).await;
+    client.close().await;
+    result
+}
+
+async fn exercise_bucket_transaction<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
+    consumers: &[ByteStreamConsumer<E>],
+    last_messages: &BTreeMap<usize, ByteStreamMessage>,
+    phase: &str,
+) -> TestResult
+where
+    E::ClientState: magnetar::SegmentSubscriberApi + magnetar::TransactionApi,
+{
+    let transaction = client.new_transaction(TXN_TIMEOUT).await?;
+    for (owner, message) in last_messages {
+        consumers[*owner]
+            .acknowledge_cumulative_in_transaction(message, transaction)
+            .await?;
+    }
+    let expected_outcome = if phase == "commit" {
+        if client.commit_transaction(transaction).await? != magnetar::TxnState::Committed {
+            return Err("bucket transaction did not commit".into());
+        }
+        TransactionOutcome::Committed
+    } else {
+        if client.abort_transaction(transaction).await? != magnetar::TxnState::Aborted {
+            return Err("bucket transaction did not abort".into());
+        }
+        TransactionOutcome::Aborted
+    };
+    for consumer in consumers {
+        wait_for_transaction_outcome(consumer, transaction, expected_outcome).await?;
+    }
+    Ok(())
+}
+
+async fn exercise_bucket_phase<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
+    container: &PulsarContainer,
+    service_url: &str,
+    topic: &str,
+    consumers: &[ByteStreamConsumer<E>],
+    key_owners: &mut BTreeMap<String, usize>,
+    phase: &str,
+) -> TestResult<Vec<String>>
+where
+    E::ClientState: magnetar::SegmentSubscriberApi + magnetar::TransactionApi,
+{
+    let mut abort_payloads = Vec::new();
+    // The Java reference uses sixteen keys and twenty messages per key.
+    // Each CLI call fixes its key and publishes in send order.
+    let per_key = if phase == "plain" { 20 } else { 1 };
+    let mut expected = BTreeMap::new();
+    for key_index in 0..16 {
+        let key = format!("key-{key_index}");
+        let values: Vec<String> = (0..per_key)
+            .map(|sequence| format!("{phase}-{key}:{sequence}"))
+            .collect();
+        publish_scalable_messages_with_key(container, service_url, topic, &values, Some(&key))
+            .await?;
+        if phase == "abort" {
+            abort_payloads.extend(values.iter().cloned());
+        }
+        expected.insert(key, values);
+    }
+    let mut actual: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut last_messages: BTreeMap<usize, ByteStreamMessage> = BTreeMap::new();
+    let mut owner_counts = [0usize; 2];
+    for _ in 0..16 * per_key {
+        let (owner, message) = receive_from_any(consumers, &[0, 1], phase).await?;
+        let value = std::str::from_utf8(message.value().as_ref())?.to_owned();
+        let (key_with_phase, _) = value
+            .rsplit_once(':')
+            .ok_or("keyed payload lacks sequence")?;
+        let key = key_with_phase
+            .strip_prefix(&format!("{phase}-"))
+            .ok_or("keyed payload belongs to another phase")?
+            .to_owned();
+        if !expected.contains_key(&key) {
+            return Err(format!("unexpected key `{key}`").into());
+        }
+        if let Some(previous) = key_owners.insert(key.clone(), owner) {
+            if previous != owner {
+                return Err(format!("key `{key}` changed bucket owner").into());
+            }
+        }
+        owner_counts[owner] += 1;
+        actual.entry(key).or_default().push(value);
+        if phase == "plain" {
+            consumers[owner].acknowledge_cumulative(&message).await?;
+            // A successful repeated cumulative ack is idempotent in Java.
+            consumers[owner].acknowledge_cumulative(&message).await?;
+        } else {
+            last_messages.insert(owner, message);
+        }
+    }
+    if owner_counts.contains(&0) {
+        return Err(format!("both bucket owners must receive traffic: {owner_counts:?}").into());
+    }
+    if actual != expected {
+        return Err(format!("per-key order/content mismatch in {phase}: {actual:?}").into());
+    }
+    if phase != "plain" {
+        exercise_bucket_transaction(client, consumers, &last_messages, phase).await?;
+    }
+    Ok(abort_payloads)
+}
+
+async fn exercise_bucket_contract<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
+    container: &PulsarContainer,
+    service_url: &str,
+) -> TestResult
+where
+    E::ClientState: magnetar::SegmentSubscriberApi + magnetar::TransactionApi,
+{
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let topic = unique_scalable_topic("bucket-share", &suffix);
+    let subscription = format!("bucket-share-{suffix}");
+    create_scalable_topic(container, &topic, 1).await?;
+    let exercise: TestResult = async {
+        let mut consumers = Vec::with_capacity(2);
+        for owner in ['a', 'b'] {
+            consumers.push(
+                subscribe_byte_stream(
+                    client,
+                    &topic,
+                    &subscription,
+                    &format!("bucket-{owner}-{suffix}"),
+                    OrderingMode::BrokerManaged,
+                )
+                .await?,
+            );
+        }
+        for consumer in &consumers {
+            wait_for_status_with_events(consumer, "shared entry-bucket owner attached", |status| {
+                status.assigned_segments() == 1 && status.attached_segments() == 1
+            })
+            .await?;
+        }
+        wait_for_consumer_count(container, &topic, &subscription, 2).await?;
+        let mut key_owners = BTreeMap::new();
+        let mut abort_payloads = Vec::new();
+        for phase in ["plain", "commit", "abort"] {
+            abort_payloads.extend(
+                exercise_bucket_phase(
+                    client,
+                    container,
+                    service_url,
+                    &topic,
+                    &consumers,
+                    &mut key_owners,
+                    phase,
+                )
+                .await?,
+            );
+        }
+        for consumer in consumers {
+            consumer.close().await?;
+        }
+        wait_for_consumer_count(container, &topic, &subscription, 0).await?;
+        let replay = subscribe_byte_stream(
+            client,
+            &topic,
+            &subscription,
+            &format!("bucket-replay-{suffix}"),
+            OrderingMode::BrokerManaged,
+        )
+        .await?;
+        let replayed = receive_expected_messages(
+            &replay,
+            &abort_payloads,
+            "aborted bucket transaction replay",
+        )
+        .await?;
+        for message in &replayed {
+            replay.acknowledge_cumulative(message).await?;
+        }
+        match tokio::time::timeout(NO_DELIVERY_WINDOW, replay.receive()).await {
+            Err(_) => {}
+            Ok(Ok(message)) => {
+                return Err(
+                    format!("acked bucket payload redelivered: {:?}", message.payload()).into(),
+                );
+            }
+            Ok(Err(error)) => return Err(error.into()),
+        }
+        replay.close().await?;
+        wait_for_consumer_count(container, &topic, &subscription, 0).await
+    }
+    .await;
+    let cleanup = force_delete_scalable_topics(container, &[topic]).await;
+    match (exercise, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "bucket contract failed: {error}; cleanup also failed: {cleanup_error}"
         )
         .into()),
     }

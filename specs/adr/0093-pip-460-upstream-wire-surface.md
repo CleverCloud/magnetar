@@ -29,20 +29,17 @@
 >   This client has no namespace consumer; when one lands it passes `false`.
 >   `scalable_stream_consumer` is bound `where E::ClientState: Clone` and neither engine's client is `Clone` (`docs/follow-ups.md` §11), so its `true` path is covered at the runtime and differential layers rather than through the façade.
 >   The scripted broker in `magnetar-differential` honours the flag for a topic whose name ends `-absent`.
-> - **`CommandScalableTopicUnsubscribe` (`BaseCommand` type 82), acknowledged by `CommandSuccess` — decoded, never sent: a known gap.**
->   It is the clean leave of a scalable consumer: the controller deletes the registration and rebalances at once instead of after the disconnect grace period, which remains the fallback.
->   The assignment-driven `StreamConsumer` now has a local lifetime. GA defines type-82 unsubscribe and Java sends it on close; Magnetar currently does not send the command, so a registration is released only when the physical connection goes away.
->   An inbound type-82 frame is skipped by the catch-all arm of `Connection::handle_frame` without an error, an event or a reply (pinned by `conn_skips_scalable_topic_unsubscribe_frame`).
-> - **PIP-486 entry bucketing — `MessageMetadata.entry_hash_min` / `entry_hash_max` (33, 34), `KeySharedMeta.entryBucketDispatch` (5), `SegmentInfoProto.entry_bucket_splits` (12), `ScalableAssignedSegment.bucket_ranges` (5) — decoded by `prost`, ignored by the client: a known gap.**
->   Producers stamp the hash range and the broker dispatches whole entries by it.
->   The current aggregate has no scalable-topic producer and does not yet consume assigned `bucket_ranges`; `entry_bucket_splits` are producer metadata from the layout, while `bucket_ranges` in the assignment govern shared-segment consumer subscriptions.
->   No producer path stamps `entry_hash_min` / `entry_hash_max`; the consumer path currently drops `bucket_ranges` and leaves `entryBucketDispatch` unset. `SegmentDescriptor` also omits producer-side `entry_bucket_splits`.
+> - **`CommandScalableTopicUnsubscribe` (`BaseCommand` type 82), acknowledged by `CommandSuccess` — implemented for `StreamConsumer` close by ADR-0120.**
+>   Close fences local state and stages broker leave after pending subscribe responses; it returns after local teardown without waiting for `CommandSuccess`. This releases the controller registration without relying on physical connection loss. The real GA close test observes broker consumer count reach zero while the client remains alive.
+> - **PIP-486 consumer entry-bucket dispatch — implemented for assigned `ScalableAssignedSegment.bucket_ranges` by ADR-0120.**
+>   A non-empty range list opens a sticky `Key_Shared` child with `entryBucketDispatch = true` and the assigned ranges; empty ranges retain whole-segment `Exclusive` ownership. Cumulative acknowledgements expand to the tracked individual canonical message ids.
+>   The scalable-topic producer surface remains absent: no producer stamps `MessageMetadata.entry_hash_min` / `entry_hash_max`, and `SegmentDescriptor` omits producer-side `entry_bucket_splits`.
 >   This is the common case on GA, not an exotic one: the same probe shows a newly created 5.0.0 topic carrying `entryBucketSplits=[16384,32768,49152]`.
 >   A non-empty `bucket_ranges` means the segment is shared by entry bucket.
 >   The consumer that attaches to it must then subscribe `Key_Shared` sticky with `entryBucketDispatch = true`, declaring exactly that list, instead of `Exclusive`; the §12 work has to read it.
 >
 > §D1's sentence that M1 "is a milestone, not a GA release", and the matching caveat that the surface may still move, are superseded.
-> The surface is now the GA one. The assignment-driven `StreamConsumer` is implemented by [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md); QueueConsumer, CheckpointConsumer, client-side type-82 unsubscribe and PIP-486 bucket dispatch remain incomplete.
+> The surface is now the GA one. The assignment-driven `StreamConsumer`, client-side type-82 unsubscribe, and assigned consumer bucket dispatch are implemented by [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md). QueueConsumer, CheckpointConsumer, scalable-topic producer entry-hash/split support, controller-election awareness, and repartition handling remain incomplete.
 > The `MessageIdData` paragraph of the Consequences is unchanged: GA carries no segment field either.
 
 ## Context

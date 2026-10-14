@@ -667,8 +667,13 @@ impl Consumer {
     }
 
     #[cfg(all(test, feature = "scalable-topics"))]
-    pub(crate) fn last_acked_message_id_for_test(&self) -> Option<MessageId> {
-        self.slot.state.lock().last_acked_message_id
+    pub(crate) fn unacked_deadline_for_test(&self) -> Option<std::time::Instant> {
+        self.slot
+            .state
+            .lock()
+            .unacked_tracker
+            .as_ref()
+            .and_then(magnetar_proto::trackers::UnackedMessageTracker::next_deadline)
     }
 
     fn ack_many_with_message_id_data(
@@ -4679,10 +4684,13 @@ mod tests {
         )
         .await
         .expect("overlapping unsubscribe must fail immediately");
-        assert!(matches!(
-            second,
-            Err(ClientError::Other(message)) if message == "unsubscribe already in progress"
-        ));
+        assert!(
+            matches!(
+                &second,
+                Err(ClientError::Other(message)) if message == "unsubscribe in progress"
+            ),
+            "overlapping unsubscribe result: {second:?}"
+        );
         assert_eq!(
             shared.inner.lock().peek_next_request_id_for_test(),
             first_request_id + 1,
@@ -4986,8 +4994,8 @@ mod tests {
 
     /// Issue #860 / ADR-0112: a NON-batched compressed message is still decompressed after the
     /// pop, exactly as before — only batched entries moved into `ConsumerState::deliver`.
-    /// Tokio-only: the moonpool consumer has no post-pop decompression (its producer refuses
-    /// every codec), so there is no branch to mirror.
+    /// Both runtimes use the shared bounded decompression kernel after popping an unbatched
+    /// entry; batched entries are expanded by `ConsumerState::deliver`.
     #[tokio::test(flavor = "current_thread")]
     async fn receive_decompresses_an_unbatched_compressed_message() {
         use magnetar_proto::types::CompressionKind;
@@ -5008,11 +5016,57 @@ mod tests {
         assert_eq!(msg.payload.as_ref(), plaintext.as_slice());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchecked_uncompressed_size_is_rejected_before_allocation() {
+        let consumer = consumer_fed_with(
+            "persistent://public/default/uncompressed-size-bound",
+            &pb::MessageMetadata {
+                compression: Some(pb::CompressionType::Zlib as i32),
+                uncompressed_size: Some(u32::MAX),
+                ..Default::default()
+            },
+            &[],
+        );
+        let error = consumer
+            .receive()
+            .await
+            .expect_err("oversized broker hint rejected");
+        let expected = crate::compress::CompressionError::UncompressedSizeTooLarge {
+            got: u32::MAX as usize,
+            ceiling: magnetar_proto::MAX_FRAME_SIZE,
+        };
+        assert_eq!(error.to_string(), format!("other: decompress: {expected}"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zstd_decompression_bomb_is_bounded() {
+        let payload = vec![0_u8; magnetar_proto::MAX_FRAME_SIZE + 1024];
+        let encoded =
+            crate::compress::compress(magnetar_proto::types::CompressionKind::Zstd, &payload)
+                .expect("encode highly compressible entry");
+        let consumer = consumer_fed_with(
+            "persistent://public/default/zstd-size-bound",
+            &pb::MessageMetadata {
+                compression: Some(pb::CompressionType::Zstd as i32),
+                uncompressed_size: Some(1),
+                ..Default::default()
+            },
+            &encoded,
+        );
+        let error = consumer
+            .receive()
+            .await
+            .expect_err("overexpansion rejected");
+        assert!(
+            matches!(error, ClientError::Other(message) if message.starts_with("decompress: "))
+        );
+    }
+
     /// Issue #860 / ADR-0112: a Java-layout compressed batch — the WHOLE packed body compressed
     /// once — reaches `receive_batch` as plaintext members, through both post-pop paths
     /// (`ReceiveFut` for the first, `post_process_message` for the rest), neither of which may
     /// decompress a member a second time. Before ADR-0112 nothing surfaced at all.
-    /// Tokio-only: the skipped branch is the tokio post-pop decompression moonpool lacks.
+    /// The shared expansion path supplies already-decoded members to both runtimes.
     #[tokio::test(flavor = "current_thread")]
     async fn receive_batch_hands_back_java_layout_members_decoded_once() {
         use magnetar_proto::types::CompressionKind;

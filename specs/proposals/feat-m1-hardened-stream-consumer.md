@@ -5,7 +5,7 @@
 - **Date**: 2026-08-04
 - **Owner**: Florentin Dubois
 - **Scope**: One pull request closing `docs/follow-ups.md` sections 11, 12, 14, and 15
-- **Broker baseline**: `apachepulsar/pulsar:5.0.0-M1` (`8dae0236c0a0d405ed7f8303081080520fe91551`)
+- **Original broker baseline**: `apachepulsar/pulsar:5.0.0-M1` (`8dae0236c0a0d405ed7f8303081080520fe91551`)
 
 ## 0. Purpose
 
@@ -16,8 +16,12 @@ The pull request remains one review unit, but its three lanes stay independently
 2. Tokio write-deadline clock coherence (follow-up 15);
 3. M1-hardened scalable consumption (follow-ups 11 and 12).
 
-The scalable lane deliberately targets the wire Apache Pulsar 5.0.0-M1 ships while adopting client-side correctness improvements that need no newer wire fields.
-It does not claim Pulsar `master` parity, PIP-486 bucket sharing, or GA wire stability.
+The scalable lane began on the M1 wire and adopted client-side correctness improvements that needed no newer fields.
+The implementation has since moved to the 5.0.0 GA wire; the current GA `StreamConsumer` supports PIP-486 bucket sharing and unsubscribe, while M1 retains its connection-close cleanup path. This proposal remains In-flight until all PR verification gates pass; no statement here implies merge or release.
+
+### Current GA implementation addendum (2026-10-13)
+
+Non-empty `bucket_ranges` are preserved in `AssignedSegment` and opened as sticky `Key_Shared` children with `entryBucketDispatch`; bucket cumulative acknowledgements are expanded to individually tracked canonical message IDs. Empty ranges keep the ordinary exclusive child path. Close stages type-82 unsubscribe after in-flight registration settles, then completes local cleanup without waiting for its response. The real-broker contract covers two owners, keyed ordering, repeated cumulative acknowledgement, commit/abort, exact abort replay, and eventual clean leave on both runtimes.
 
 ## 1. Evidence and upstream boundary
 
@@ -49,7 +53,7 @@ Four contracts remain unresolved in M1 and in the inspected Pulsar `master` snap
 | Contract                                                  | Upstream question                                                    | Interim Magnetar behavior                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Assignment ordering/fencing across controller connections | [apache/pulsar#26273](https://github.com/apache/pulsar/issues/26273) | Fence every callback and asynchronous result with a local controller-connection incarnation; accept changed equal-epoch assignments only in one incarnation's receive order; treat the replacement connection's validated response as its baseline                 |
-| Logical unregister on a pooled controller connection      | [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | `close()` is locally definitive but cannot promise broker membership removal; the durable member may remain until the pooled connection closes                                                                                                                     |
+| Logical unregister on a pooled controller connection      | [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) | M1 has no unregister command and may retain membership until the pooled connection closes; GA sends type-82 unsubscribe after in-flight registration settles, without awaiting its response during local close.                                                                                                                     |
 | Full DAG parent-before-child ordering                     | [apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274) | Keep the DAG watch; strict mode enforces the complete transitive barrier only where local ownership history proves every ancestor complete and blocks cross-member ancestry as unprovable, while explicit broker-managed mode makes no stronger cross-member claim |
 | Controller subscribe through a proxy                      | [apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275) | Published direct controller routing is validated; an absent M1 controller URL reuses only the already-authenticated direct bootstrap, while unrouteable published authority and proxy-any-broker registration fail closed                                          |
 
@@ -226,7 +230,7 @@ Adding segments redistributes available capacity; it never multiplies the config
 Every child runs in manual-FLOW mode: initial, automatic, reconnect, and refill FLOW are disabled, and only the aggregate arbiter grants permits.
 Before granting one message permit, the arbiter reserves `MAX_FRAME_SIZE` (5 MiB); arrival transfers that reservation to exact retained bytes and releases any surplus.
 Announced chunk totals and decompression output plus validation slack/workspace are reserved before retention or allocation, selected batch members use right-sized payload buffers, and a message that cannot fit produces `MessageTooLargeForBudget` without exposing partial data.
-The configured budget must fit one maximum-size frame, five maximum-size stream-position values, three worst-case position-component node sets, two delivery-authority overheads, and a fixed 64 KiB control-plane cleanup reserve: `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + 64 KiB = 13,697,152 bytes`.
+The configured budget must fit one maximum-size frame, five maximum-size stream-position values, three worst-case position-component node sets, two delivery-authority overheads, one per-delivery generation field, and a fixed 64 KiB control-plane cleanup reserve: `MAX_FRAME_SIZE + 5 * MAX_STREAM_POSITION_SIZE + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD + 2 * DELIVERY_AUTHORITY_OVERHEAD + DELIVERY_ACK_GENERATION_OVERHEAD + 64 KiB = 13,697,160 bytes`.
 Examples use 16 MiB; 8 MiB is below the valid minimum.
 
 Moving a message between child, barrier, aggregate, and delivery state transfers one reservation rather than double-counting it.
@@ -252,7 +256,7 @@ pub struct PositionVector { /* private, versioned */ }
 A delivery token binds the consumer instance, controller and child incarnations, segment identity, ordinary message ID, delivery epoch, and dequeue sequence.
 Tokens from another consumer, an old seek/rebalance generation, or a retired source are rejected before wire I/O unless the source is deliberately retained for an unbounded drain.
 
-The position vector records the highest position already delivered to the application for each segment at the delivery linearization point.
+The position vector records the most recently delivered message ID for each segment at the delivery linearization point. Redelivery can move a component backward, matching Java's latest-observed delivery semantics; this vector is not a durable acknowledgement cursor.
 It is not an acknowledged cursor or a durable checkpoint by itself.
 `DeliveryToken` is live authority and is never serializable; it can project a source-qualified `StreamMessageId` and `PositionVector` value.
 
@@ -353,11 +357,10 @@ Dropping an intermediate clone does nothing.
 Final-drop cleanup is synchronous and best-effort per ADR-0077: it marks the aggregate closed, advances generations, removes local routes and scalable registration state, wakes pending receivers and drivers, releases child guards so they stage ordinary closes, and never blocks or spawns.
 Runtime tasks may not retain the final user close guard.
 
-M1 has no scalable-consumer unregister command.
-Closing the logical consumer therefore does not promise immediate or eventual broker membership removal while another pool user keeps the physical connection alive.
-The API and documentation name this limitation explicitly, and [apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272) remains open.
+M1 has no scalable-consumer unregister command, so its logical close cannot remove broker membership while another pool user keeps the physical connection alive.
+The GA implementation sends type-82 unsubscribe after in-flight registration settles, but local teardown does not wait for the unsubscribe response; it does not claim this capability for M1.
 
-The implementation never repurposes `CommandScalableTopicClose`, ordinary `CommandCloseConsumer`, or `CommandUnsubscribe` as a controller unregister command.
+The implementation never repurposes `CommandScalableTopicClose`, ordinary `CommandCloseConsumer`, or ordinary `CommandUnsubscribe` as a controller unregister command.
 
 ### D17 - Fail closed on unsupported controller routing
 
@@ -371,16 +374,16 @@ The implementation does not send credentials or a subscribe command to an author
 
 ### D18 - Defer wire-dependent surfaces
 
-The following remain out of scope:
+The following remain out of scope for the supported `StreamConsumer` surface:
 
-- PIP-486 `bucket_ranges` and `Key_Shared` STICKY children;
-- read fan-out beyond segment count;
+- PIP-486 bucket sharing on M1 (GA `StreamConsumer` supports bucket ranges and sticky `Key_Shared` children);
+- bucket-shared keyed fan-out beyond segment count on GA is supported; M1 has no PIP-486 bucket assignment surface;
 - `QueueConsumer` and `CheckpointConsumer`;
 - multi-topic scalable consumers;
 - vector seek across a layout transition or into sealed/remote ancestry;
 - a distributed assignment generation/controller term absent from M1;
-- explicit scalable-consumer unregister absent from M1;
-- GA wire compatibility and future proto bumps.
+- explicit scalable-consumer unregister on M1 (GA `StreamConsumer` sends type-82 unsubscribe);
+- future proto bumps.
 
 ## 3. Public API sketch
 
@@ -493,7 +496,7 @@ The fake environment becomes a stateful multi-endpoint cluster rather than a tra
 
 - one controller endpoint;
 - at least two segment endpoints;
-- generated M1 frames only;
+- generated M1 frames for fallback coverage plus GA unsubscribe and PIP-486 bucket-range assignment frames;
 - full assignments, equal-epoch rebalances, duplicates, stale updates, and reconnect baselines;
 - locally provable and cross-member-unprovable ancestry in both ordering modes;
 - ordinary segment lookup, `Exclusive` subscribe, FLOW, message, ack, seek, termination, and close;
@@ -511,10 +514,10 @@ Runtime IDs, socket addresses, task scheduling order, and timestamps are normali
 | Layer                | Crate                       | Required evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Proto unit           | `magnetar-proto`            | Assignment normalization; inclusive hash ranges; equal/stale epochs; connection incarnations; malformed DAGs; strict and broker-managed ancestry; deep split and merge barriers; atomic receive/batch reservation; token and seek epochs; partial transaction failure poisoning and outcomes; budget conservation; serialization rejection; no-panic properties                                                                                                                                           |
-| Tokio integration    | `magnetar-runtime-tokio`    | Real sockets; two consumers cannot steal events; push-before-response; segment fan-out; concurrent receive; batch atomicity; ack/nack/transaction/seek; unbounded drain and pending ownership; pooled-close limitation; plaintext/TLS direct controller routing                                                                                                                                                                                                                                           |
+| Tokio integration    | `magnetar-runtime-tokio`    | Real sockets; two consumers cannot steal events; push-before-response; segment fan-out; concurrent receive; batch atomicity; ack/nack/transaction/seek; unbounded drain and pending ownership; GA unsubscribe cleanup; plaintext/TLS direct controller routing                                                                                                                                                                                                                                           |
 | Moonpool integration | `magnetar-runtime-moonpool` | Exact Tokio scenarios under provider-native execution plus deterministic race schedules and seed replay                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Differential         | `magnetar-differential`     | Equivalent normalized behavior for assignment, delivery, ordering barriers, acknowledgements, reconnect, close, and failures                                                                                                                                                                                                                                                                                                                                                                              |
-| E2E                  | `magnetar-driver`           | Real M1 topic, official V5 CLI multi-segment publisher, public Magnetar builder, typed delivery, position-vector ack, transaction commit/abort, single-member split progression in Strict mode, explicit broker-managed multi-member behavior, close limitation, direct-bootstrap controller fallback when M1 omits its controller URL, and reachable broker-authored segment authority matching the standalone transport; broker-controlled assignment timing does not isolate client-side Strict gating |
+| E2E                  | `magnetar-driver`           | Real GA 5.0.0 topic, official V5 CLI publisher, public builder, typed delivery, vector ack/seek, transaction commit/abort, two-owner PIP-486 bucket sharing and repeated cumulative ack, exact abort replay, and eventual broker membership removal after close on both runtimes; standalone topology does not prove multi-broker coordinator relocation/reconnect parity |
 
 Real e2e publishes distinct unkeyed messages with M1's bundled V5 client:
 
@@ -565,7 +568,7 @@ flowchart TD
     RUNTIME[Paired Tokio and Moonpool runtime ports]
     API[Generic StreamConsumer API]
     DIFF[Differential and SimProviders]
-    E2E[Real M1 e2e]
+    E2E[Real GA e2e on both runtimes]
     DOC[ADRs and documentation integration]
     FULL[Full serial validation]
 
@@ -594,11 +597,11 @@ flowchart TD
 | Coverage     | `xtask/` and coverage-job cache configuration              | Poisoned target cannot influence fresh verdict |
 | Deadline     | Tokio driver write deadline and existing deadline tests    | Deterministic red-before/green-after test      |
 | Proto        | Scalable assignment/DAG/lifecycle state and proto tests    | Pure deterministic transition suite            |
-| Fakes        | `magnetar-fakes` and differential broker model             | Self-tests against generated M1 frames         |
+| Fakes        | `magnetar-fakes` and differential broker model             | Generated M1 fallback and GA command contracts |
 | Runtime pair | Both runtime clients/libs/drivers and paired runtime tests | Tokio/Moonpool semantic and count parity       |
 | Facade       | `magnetar/src/scalable.rs` and engine adapters             | Generic API and concurrent-operation tests     |
 | Differential | Differential tests and golden traces                       | User-visible trace parity                      |
-| E2E          | Scalable M1 e2e only                                       | Public API proves real multi-segment delivery  |
+| E2E          | Scalable real-broker contract                              | Public API proves multi-segment and bucket-shared delivery |
 | Integration  | ADRs, indexes, README, changelog, follow-ups               | Cross-document consistency and full validation |
 
 Implementation agents work in isolated Worktrunk worktrees.
@@ -630,11 +633,11 @@ Push and pull-request creation remain separately approval-gated.
 Each focused lane ran its targeted red/green checks before integration.
 The code, fake, proto, runtime, façade, and differential focused suites passed.
 The Moonpool runtime also passes a complete aggregate over simulated controller and segment sockets for four schedules derived from `MOONPOOL_SEED`, covering typed delivery from both sources, status, position, acknowledgement, and close under `SimProviders`.
-The real M1 e2e target compiles and is discovered with `--features scalable-topics`, but Docker was unavailable on the integration host, so this branch did not execute it locally; the existing all-feature CI policy runs the ordinary e2e target when Docker is available.
+At the original M1 integration pass on 2026-08-04, Docker was unavailable, so that M1 target was not executed locally. The current GA real-broker inventory, including the two-owner bucket contract on both runtimes, is maintained in [docs/testing.md](../../docs/testing.md); current execution results belong to the PR validation record.
 A local worktree invocation of `check-runtime-test-parity` reported Tokio 407 / Moonpool 407 before the final committed-diff validation pass.
 `check-sim-coverage` diffs `<merge-base>..HEAD`, not the uncommitted worktree.
 The complete implementation diff must first be represented by `HEAD`, then the enforcing gate rerun before its result can satisfy this proposal's acceptance criteria.
-The proposal therefore remains in flight until the real M1 target executes successfully, the committed complete diff passes the enforcing sim-coverage gate, and the required full validation chain is green.
+The proposal remains in flight until the committed complete diff passes the enforcing sim-coverage gate and the required full validation chain is green.
 
 The proposal is implemented only when:
 
@@ -649,8 +652,8 @@ The proposal is implemented only when:
 - ack, nack, seek, transaction, and serialization reject stale/foreign authority;
 - a committed transactional vector advances all represented segment cursors and abort permits redelivery;
 - Tokio and Moonpool produce equivalent public traces;
-- real M1 e2e receives and acknowledges messages from multiple segments;
-- `close()`'s possible broker-membership residue is tested and documented;
+- real GA e2e receives and acknowledges ordinary and bucket-shared messages, verifies transaction commit/abort behavior, and observes unsubscribe cleanup;
+- M1's lack of logical unregister remains documented as a version-specific limitation;
 - sim coverage uses current-pass artifacts;
 - the write deadline expires deterministically on Tokio virtual time.
 
@@ -661,6 +664,6 @@ No broker wire migration is introduced; the canonical stream-position envelope i
 Versioned position serialization must remain decodable once released; that format receives dedicated golden tests before the feature is declared implemented.
 
 The largest accepted availability cost is the safety-first drain: an application that never resolves a delivered parent message can block descendant delivery and assignment handoff indefinitely while resources remain bounded.
-The largest accepted upstream limitation is pooled logical close: local shutdown can leave durable broker membership until the physical controller connection closes.
+On M1, local shutdown can leave durable broker membership until the physical controller connection closes; GA sends type-82 unsubscribe after in-flight registration settles without waiting for its response.
 
 Pulsar answers that require new wire fields become later vendor-proto work and never enter this PR as hand-maintained protocol projections.

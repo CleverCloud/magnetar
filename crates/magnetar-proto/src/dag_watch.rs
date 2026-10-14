@@ -1518,7 +1518,7 @@ mod tests {
 
         assert!(delta.is_consume_affecting());
         assert_eq!(delta.change_reason(), DagChangeReason::Split);
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [crate::types::SegmentId; 0]);
         assert_eq!(delta.split_events.len(), 1, "1 -> {{2,3}} is one split");
         assert_eq!(delta.split_events[0].parent_segment_id, SegmentId(1));
         assert_eq!(
@@ -1565,7 +1565,7 @@ mod tests {
             vec![SegmentId(5), SegmentId(6)]
         );
         assert_eq!(delta.merge_events[0].child_segment_id, SegmentId(7));
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [crate::types::SegmentId; 0]);
         assert_eq!(s.snapshot().len(), 3);
     }
 

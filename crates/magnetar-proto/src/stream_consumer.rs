@@ -9,6 +9,7 @@
 //! receive budget.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::{Buf as _, Bytes, BytesMut};
 use prost::Message as _;
@@ -36,6 +37,8 @@ pub const CONTROL_PLANE_CLEANUP_RESERVE: usize = 64 * 1024;
 pub const MIN_RETAINED_MESSAGE_RESERVATION: usize = 64;
 /// Fixed per-allocation authority bookkeeping charged beside encoded position data.
 pub const DELIVERY_AUTHORITY_OVERHEAD: usize = 64;
+/// One per-live-token generation field retained beside the canonical id.
+const DELIVERY_ACK_GENERATION_OVERHEAD: usize = std::mem::size_of::<u64>();
 /// Conservative allocation charge for one `BTreeMap` position component node.
 pub const POSITION_COMPONENT_NODE_OVERHEAD: usize = 256;
 /// Conservative fixed workspace for zlib inflate state and its 32 KiB window.
@@ -45,7 +48,8 @@ pub const ZSTD_DECOMPRESSION_CONTEXT_WORKSPACE: usize = 256 * 1024;
 /// Worst-case live and retained authority metadata kept beside one maximum frame.
 pub const RECEIVER_BUDGET_AUTHORITY_HEADROOM: usize = 5 * MAX_STREAM_POSITION_SIZE
     + 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
-    + 2 * DELIVERY_AUTHORITY_OVERHEAD;
+    + 2 * DELIVERY_AUTHORITY_OVERHEAD
+    + DELIVERY_ACK_GENERATION_OVERHEAD;
 
 /// Process-local aggregate consumer identity supplied by the owning runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -988,6 +992,9 @@ struct ChildState {
     flow_purpose: Option<FlowPurpose>,
     completion: CompletionBarrier,
     wait_for_flow_drain: bool,
+    bucket_shared: bool,
+    acknowledgement_generation: u64,
+    confirmed_cumulative: Option<crate::MessageId>,
 }
 
 impl ChildState {
@@ -1012,11 +1019,11 @@ impl ChildState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveDelivery {
     owner: BudgetReservationOwner,
     reservation: BudgetReservationId,
-    message_id: crate::MessageId,
+    stream_message_id: Arc<StreamMessageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1034,7 +1041,8 @@ pub struct DeliveryToken {
     consumer_instance: ConsumerInstanceId,
     controller_incarnation: ControllerIncarnation,
     child_generation: ChildGeneration,
-    stream_message_id: StreamMessageId,
+    acknowledgement_generation: u64,
+    stream_message_id: Arc<StreamMessageId>,
     position_vector: PositionVector,
     delivery_epoch: DeliveryEpoch,
     dequeue_sequence: DequeueSequence,
@@ -1044,7 +1052,7 @@ pub struct DeliveryToken {
 impl DeliveryToken {
     /// Source-qualified position value projected from this live token.
     #[must_use]
-    pub const fn stream_message_id(&self) -> &StreamMessageId {
+    pub fn stream_message_id(&self) -> &StreamMessageId {
         &self.stream_message_id
     }
 
@@ -1069,6 +1077,8 @@ pub struct AcknowledgementComponent {
     message_ids: Vec<crate::MessageId>,
     message_id_bytes: Vec<Vec<u8>>,
     cumulative: bool,
+    cumulative_position: Option<crate::MessageId>,
+    acknowledgement_generation: u64,
 }
 
 impl AcknowledgementComponent {
@@ -2256,7 +2266,7 @@ impl StreamConsumerModel {
         self.assignment.as_ref()
     }
 
-    /// Highest positions delivered to the application at the latest dequeue
+    /// Latest positions delivered to the application at the latest dequeue
     /// linearization point.
     #[must_use]
     pub const fn delivered_position(&self) -> &PositionVector {
@@ -2782,20 +2792,40 @@ impl StreamConsumerModel {
             .0
             .checked_add(1)
             .ok_or(StreamConsumerModelError::GenerationExhausted)?;
-        let before: BTreeMap<SegmentId, SegmentSource> =
-            self.assignment
-                .as_ref()
-                .map_or_else(BTreeMap::new, |current| {
-                    current
-                        .segments()
-                        .iter()
-                        .map(|segment| (segment.segment_id(), segment.source()))
-                        .collect()
-                });
-        let after: BTreeMap<SegmentId, SegmentSource> = assignment
+        let before: BTreeMap<SegmentId, (SegmentSource, Vec<KeyRange>)> = self
+            .assignment
+            .as_ref()
+            .map_or_else(BTreeMap::new, |current| {
+                current
+                    .segments()
+                    .iter()
+                    .map(|segment| {
+                        (
+                            segment.segment_id(),
+                            (segment.source(), segment.bucket_ranges().to_vec()),
+                        )
+                    })
+                    .collect()
+            });
+        let after: BTreeMap<SegmentId, (SegmentSource, Vec<KeyRange>)> = assignment
             .segments()
             .iter()
-            .map(|segment| (segment.segment_id(), segment.source()))
+            .map(|segment| {
+                (
+                    segment.segment_id(),
+                    (segment.source(), segment.bucket_ranges().to_vec()),
+                )
+            })
+            .collect();
+        let bucket_only_changes: BTreeSet<SegmentId> = before
+            .iter()
+            .filter_map(|(segment_id, (source, ranges))| {
+                after
+                    .get(segment_id)
+                    .and_then(|(next_source, next_ranges)| {
+                        (source == next_source && ranges != next_ranges).then_some(*segment_id)
+                    })
+            })
             .collect();
         let completed_sealed: BTreeSet<SegmentId> = self
             .completed
@@ -2831,8 +2861,10 @@ impl StreamConsumerModel {
         let mut actions = Vec::new();
         let mut retiring: BTreeMap<SegmentId, SegmentSource> = before
             .iter()
-            .filter(|(id, source)| replacements.contains(id) || after.get(id) != Some(*source))
-            .map(|(id, source)| (*id, source.clone()))
+            .filter(|(id, ownership)| {
+                replacements.contains(id) || after.get(id) != Some(*ownership)
+            })
+            .map(|(id, (source, _))| (*id, source.clone()))
             .collect();
         for segment_id in replacements {
             let child = &children[segment_id];
@@ -2848,7 +2880,8 @@ impl StreamConsumerModel {
                 .into_iter()
                 .for_each(|child| {
                     let mut stop_flow = false;
-                    let wait_for_flow_drain = replacements.contains(lost);
+                    let wait_for_flow_drain =
+                        replacements.contains(lost) && !bucket_only_changes.contains(lost);
                     if child.phase == SegmentPhase::Opening {
                         actions.push(StreamConsumerAction::CancelOpen {
                             source: child.source.clone(),
@@ -2888,11 +2921,13 @@ impl StreamConsumerModel {
                 });
         }
 
-        for (segment_id, source) in &after {
+        for (segment_id, (source, bucket_ranges)) in &after {
             if completed_sealed.contains(segment_id) {
                 continue;
             }
-            if !replacements.contains(segment_id) && before.get(segment_id) == Some(source) {
+            if !replacements.contains(segment_id)
+                && before.get(segment_id) == Some(&(source.clone(), bucket_ranges.clone()))
+            {
                 continue;
             }
             if children.contains_key(segment_id) {
@@ -2916,6 +2951,9 @@ impl StreamConsumerModel {
                     flow_purpose: None,
                     completion: CompletionBarrier::default(),
                     wait_for_flow_drain: false,
+                    bucket_shared: !bucket_ranges.is_empty(),
+                    acknowledgement_generation: 0,
+                    confirmed_cumulative: None,
                 },
             );
             actions.push(StreamConsumerAction::OpenChild {
@@ -3025,7 +3063,24 @@ impl StreamConsumerModel {
             .map(|source| {
                 self.next_child_generation
                     .checked_add(1)
-                    .map(|next| (source, ChildGeneration(self.next_child_generation), next))
+                    .map(|next| {
+                        let bucket_shared = self
+                            .assignment
+                            .as_ref()
+                            .and_then(|assignment| {
+                                assignment
+                                    .segments()
+                                    .iter()
+                                    .find(|segment| segment.segment_id() == segment_id)
+                            })
+                            .is_some_and(|segment| !segment.bucket_ranges().is_empty());
+                        (
+                            source,
+                            ChildGeneration(self.next_child_generation),
+                            next,
+                            bucket_shared,
+                        )
+                    })
                     .ok_or(StreamConsumerModelError::GenerationExhausted)
             })
             .transpose()?;
@@ -3036,7 +3091,8 @@ impl StreamConsumerModel {
         self.children.remove(&segment_id);
         self.pending_ownership.remove(&segment_id);
         let mut actions = Vec::new();
-        if let Some((source, child_generation, next_child_generation)) = replacement {
+        if let Some((source, child_generation, next_child_generation, bucket_shared)) = replacement
+        {
             self.next_child_generation = next_child_generation;
             self.completed.remove(&segment_id);
             self.ownership_history.insert(segment_id);
@@ -3051,6 +3107,9 @@ impl StreamConsumerModel {
                     flow_purpose: None,
                     completion: CompletionBarrier::default(),
                     wait_for_flow_drain: false,
+                    bucket_shared,
+                    acknowledgement_generation: 0,
+                    confirmed_cumulative: None,
                 },
             );
             actions.push(StreamConsumerAction::OpenChild {
@@ -3674,6 +3733,17 @@ impl StreamConsumerModel {
             });
         }
         let message_id = stream_message_id.ordinary_message_id();
+        let previous_position = self.delivered_positions.get(&source);
+        let observed_redelivery =
+            previous_position.is_some_and(|current| current.ordinary_message_id() >= message_id);
+        let acknowledgement_generation = if observed_redelivery {
+            child
+                .acknowledgement_generation
+                .checked_add(1)
+                .ok_or(StreamConsumerModelError::GenerationExhausted)?
+        } else {
+            child.acknowledgement_generation
+        };
         let exhausted = StreamConsumerModelError::CompletionCounterExhausted {
             segment_id,
             kind: "delivery",
@@ -3695,10 +3765,7 @@ impl StreamConsumerModel {
         let reservation_state =
             self.budget
                 .owned(reservation, owner, BudgetUse::RetainedMessage)?;
-        let replace = self
-            .delivered_positions
-            .get(&source)
-            .is_none_or(|current| current.ordinary_message_id() < message_id);
+        let replace = true;
         let (position_vector_heap, delivered_positions_heap) = prospective_position_heap_bytes(
             &self.delivered_positions,
             &source,
@@ -3716,6 +3783,7 @@ impl StreamConsumerModel {
             .and_then(|bytes| bytes.checked_add(MAX_STREAM_POSITION_SIZE))
             .and_then(|bytes| bytes.checked_add(position_vector_heap))
             .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
+            .and_then(|bytes| bytes.checked_add(DELIVERY_ACK_GENERATION_OVERHEAD))
             .ok_or(StreamPositionError::LengthOverflow)?;
         let provisional_lease_bytes = reservation_state
             .bytes
@@ -3759,9 +3827,7 @@ impl StreamConsumerModel {
             .map_err(StreamConsumerModelError::from)?;
 
         let mut delivered_positions = self.delivered_positions.clone();
-        if replace {
-            delivered_positions.insert(source.clone(), stream_message_id.clone());
-        }
+        delivered_positions.insert(source.clone(), stream_message_id.clone());
         let position_vector =
             PositionVector::from_canonical(self.dag.epoch(), &delivered_positions)?;
         let position_vector_bytes = position_vector.encoded_len()?;
@@ -3770,6 +3836,7 @@ impl StreamConsumerModel {
             .and_then(|bytes| bytes.checked_add(position_vector_bytes))
             .and_then(|bytes| bytes.checked_add(position_vector_heap))
             .and_then(|bytes| bytes.checked_add(DELIVERY_AUTHORITY_OVERHEAD))
+            .and_then(|bytes| bytes.checked_add(DELIVERY_ACK_GENERATION_OVERHEAD))
             .ok_or(StreamPositionError::LengthOverflow)?;
         let lease_bytes = reservation_state
             .bytes
@@ -3802,23 +3869,29 @@ impl StreamConsumerModel {
                 let child = self.child_mut(segment_id, generation)?;
                 child.completion.deliveries = delivery_count;
                 child.completion.pre_terminal_reservations = pre_terminal_reservations;
+                child.acknowledgement_generation = acknowledgement_generation;
+                if observed_redelivery {
+                    child.confirmed_cumulative = None;
+                }
                 self.budget = budget;
                 self.delivered_positions = delivered_positions;
                 self.delivered_position = position_vector.clone();
                 self.delivered_positions_reservation = Some(delivered_positions_reservation);
                 self.next_dequeue_sequence = next_dequeue_sequence;
+                let stream_message_id = Arc::new(stream_message_id);
                 self.live_deliveries.insert(
                     dequeue_sequence,
                     LiveDelivery {
                         owner,
                         reservation,
-                        message_id,
+                        stream_message_id: Arc::clone(&stream_message_id),
                     },
                 );
                 Ok(DeliveryToken {
                     consumer_instance: self.consumer_instance,
                     controller_incarnation,
                     child_generation: generation,
+                    acknowledgement_generation,
                     stream_message_id,
                     position_vector,
                     delivery_epoch: self.delivery_epoch,
@@ -3870,6 +3943,13 @@ impl StreamConsumerModel {
             message_ids: vec![validated.message_id],
             message_id_bytes: vec![validated.message_id_bytes],
             cumulative: false,
+            cumulative_position: None,
+            acknowledgement_generation: self
+                .child(
+                    token.stream_message_id.source().segment_id(),
+                    validated.child_generation,
+                )?
+                .acknowledgement_generation,
         };
         self.admit_acknowledgement(
             vec![component],
@@ -3886,13 +3966,35 @@ impl StreamConsumerModel {
         })
     }
 
-    /// Atomically admit cumulative acknowledgement of a live delivery's
-    /// complete delivered-position vector.
+    /// Atomically admit cumulative acknowledgement of a delivery's complete
+    /// saved position vector. A partially confirmed retry retains only its
+    /// unconfirmed components without restoring the token's delivery authority.
     pub fn admit_cumulative_acknowledgement(
         &mut self,
         token: &DeliveryToken,
     ) -> Result<AcknowledgementTransition, StreamConsumerModelError> {
-        self.validate_delivery_token(token)?;
+        if self.validate_delivery_token(token).is_err() {
+            let source = token.stream_message_id.source();
+            let confirmed_repeat = token.consumer_instance == self.consumer_instance
+                && token.controller_incarnation == self.controller_incarnation
+                && token.delivery_epoch == self.delivery_epoch
+                && token.dequeue_sequence.0 < self.next_dequeue_sequence
+                && self
+                    .children
+                    .get(&source.segment_id())
+                    .is_some_and(|child| {
+                        child.generation == token.child_generation
+                            && child.controller_incarnation == token.controller_incarnation
+                            && child.source == *source
+                            && child.acknowledgement_generation == token.acknowledgement_generation
+                            && child.confirmed_cumulative.is_some_and(|confirmed| {
+                                token.stream_message_id.ordinary_message_id() <= confirmed
+                            })
+                    });
+            if !confirmed_repeat {
+                return Err(StreamConsumerModelError::StaleDeliveryToken);
+            }
+        }
         let components = self.position_components(token.position_vector(), false)?;
         let deliveries = self.deliveries_covered_by(&components);
         self.admit_acknowledgement(components, deliveries, false)
@@ -3930,17 +4032,24 @@ impl StreamConsumerModel {
         }
         let components = grouped
             .into_iter()
-            .map(|((source, child_generation), message_ids)| {
-                let (message_ids, message_id_bytes) = message_ids.into_iter().unzip();
-                AcknowledgementComponent {
-                    source,
-                    child_generation,
-                    message_ids,
-                    message_id_bytes,
-                    cumulative: false,
-                }
-            })
-            .collect();
+            .map(
+                |((source, child_generation), message_ids)| -> Result<_, StreamConsumerModelError> {
+                    let acknowledgement_generation = self
+                        .child(source.segment_id(), child_generation)?
+                        .acknowledgement_generation;
+                    let (message_ids, message_id_bytes) = message_ids.into_iter().unzip();
+                    Ok(AcknowledgementComponent {
+                        source,
+                        child_generation,
+                        message_ids,
+                        message_id_bytes,
+                        cumulative: false,
+                        cumulative_position: None,
+                        acknowledgement_generation,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
         self.admit_acknowledgement(components, deliveries, false)
             .map(|(authority, components)| AcknowledgementTransition {
                 authority: AcknowledgementAuthority {
@@ -3990,6 +4099,22 @@ impl StreamConsumerModel {
             .pending_acknowledgements
             .remove(&authority.operation_id);
         let mut actions = staged.settle_acknowledgement_counters(&pending.components, false)?;
+        for component in &pending.components {
+            if confirmed_sources.contains(&component.source) {
+                if let Some(position) = component.cumulative_position {
+                    if let Some(child) = staged.children.get_mut(&component.source.segment_id())
+                        && child.generation == component.child_generation
+                        && child.acknowledgement_generation == component.acknowledgement_generation
+                    {
+                        child.confirmed_cumulative = Some(
+                            child
+                                .confirmed_cumulative
+                                .map_or(position, |confirmed| confirmed.max(position)),
+                        );
+                    }
+                }
+            }
+        }
         for (sequence, source) in pending.deliveries {
             if confirmed_sources.contains(&source) {
                 actions.extend(staged.resolve_delivery_sequence(sequence)?);
@@ -4020,6 +4145,13 @@ impl StreamConsumerModel {
             message_ids: vec![validated.message_id],
             message_id_bytes: vec![validated.message_id_bytes],
             cumulative: false,
+            cumulative_position: None,
+            acknowledgement_generation: self
+                .child(
+                    token.stream_message_id.source().segment_id(),
+                    validated.child_generation,
+                )?
+                .acknowledgement_generation,
         };
         self.admit_acknowledgement(
             vec![component],
@@ -4404,11 +4536,13 @@ impl StreamConsumerModel {
                     && child.source == *source
                     && !matches!(child.phase, SegmentPhase::Closing | SegmentPhase::Failed)
             })
-            && self.live_deliveries.get(&token.dequeue_sequence)
-                == Some(&LiveDelivery {
-                    owner,
-                    reservation: token.reservation,
-                    message_id: token.stream_message_id.ordinary_message_id(),
+            && self
+                .live_deliveries
+                .get(&token.dequeue_sequence)
+                .is_some_and(|delivery| {
+                    delivery.owner == owner
+                        && delivery.reservation == token.reservation
+                        && delivery.stream_message_id.as_ref() == token.stream_message_id.as_ref()
                 });
         if !valid {
             return Err(StreamConsumerModelError::StaleDeliveryToken);
@@ -4450,13 +4584,12 @@ impl StreamConsumerModel {
                 components
                     .iter()
                     .any(|component| {
-                        component.cumulative
+                        component.cumulative_position.is_some()
                             && component.source == child.source
                             && component.child_generation == child.generation
-                            && component
-                                .message_ids
-                                .first()
-                                .is_some_and(|target| delivery.message_id <= *target)
+                            && component.cumulative_position.is_some_and(|target| {
+                                delivery.stream_message_id.ordinary_message_id() <= target
+                            })
                     })
                     .then(|| (*sequence, child.source.clone()))
             })
@@ -4510,15 +4643,52 @@ impl StreamConsumerModel {
                         segment_source: source,
                     });
                 }
-                Ok(AcknowledgementComponent {
+                let target = stream_message_id.ordinary_message_id();
+                if child
+                    .confirmed_cumulative
+                    .is_some_and(|confirmed| target <= confirmed)
+                {
+                    return Ok(None);
+                }
+                let (message_ids, message_id_bytes, cumulative) = if child.bucket_shared {
+                    let mut tracked = BTreeMap::new();
+                    for delivery in self.live_deliveries.values().filter(|delivery| {
+                        delivery.owner.segment_id() == source.segment_id()
+                            && delivery.owner.child_generation() == child.generation
+                            && delivery.stream_message_id.ordinary_message_id() <= target
+                    }) {
+                        tracked.insert(
+                            delivery.stream_message_id.ordinary_message_id(),
+                            delivery
+                                .stream_message_id
+                                .ordinary_message_id_bytes()
+                                .to_vec(),
+                        );
+                    }
+                    if tracked.is_empty() {
+                        return Ok(None);
+                    }
+                    let (message_ids, message_id_bytes) = tracked.into_iter().unzip();
+                    (message_ids, message_id_bytes, false)
+                } else {
+                    (
+                        vec![target],
+                        vec![stream_message_id.ordinary_message_id_bytes().to_vec()],
+                        true,
+                    )
+                };
+                Ok(Some(AcknowledgementComponent {
                     source,
                     child_generation: child.generation,
-                    message_ids: vec![stream_message_id.ordinary_message_id()],
-                    message_id_bytes: vec![stream_message_id.ordinary_message_id_bytes().to_vec()],
-                    cumulative: true,
-                })
+                    message_ids,
+                    message_id_bytes,
+                    cumulative,
+                    cumulative_position: Some(target),
+                    acknowledgement_generation: child.acknowledgement_generation,
+                }))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|components| components.into_iter().flatten().collect())
     }
 
     fn admit_acknowledgement(
@@ -4637,7 +4807,7 @@ impl StreamConsumerModel {
         let delivery = self
             .live_deliveries
             .get(&sequence)
-            .copied()
+            .cloned()
             .ok_or(StreamConsumerModelError::StaleDeliveryToken)?;
         let segment_id = delivery.owner.segment_id();
         let generation = delivery.owner.child_generation();
@@ -5109,6 +5279,29 @@ mod tests {
         .expect("assignment")
     }
 
+    fn assignment_with_bucket_ranges(
+        epoch: u64,
+        ids: &[u64],
+        bucket_ranges: &[KeyRange],
+    ) -> ConsumerAssignment {
+        let mut assignment = assignment(epoch, ids).to_pb();
+        for segment in &mut assignment.segments {
+            segment.bucket_ranges = if segment.segment_id == 1 {
+                bucket_ranges
+                    .iter()
+                    .map(|range| pb::IntRange {
+                        start: range.start() as i32,
+                        end: range.end() as i32,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        }
+        ConsumerAssignment::try_from_pb(&assignment, "topic://t/n/x")
+            .expect("valid bucket assignment")
+    }
+
     fn model(mode: OrderingMode) -> StreamConsumerModel {
         model_with_data_capacity(mode, MAX_FRAME_SIZE * 3)
     }
@@ -5317,11 +5510,11 @@ mod tests {
             .admit_individual_acknowledgement(&parent)
             .expect("parent acknowledgement");
         let confirmed = BTreeSet::from([parent.stream_message_id().source().clone()]);
-        assert!(
+        assert_eq!(
             model
                 .settle_acknowledgement(&acknowledgement.authority, &confirmed)
-                .expect("parent acknowledgement settles")
-                .is_empty()
+                .expect("parent acknowledgement settles"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         let mut deferred = model.clone();
         let flow = model
@@ -5355,7 +5548,10 @@ mod tests {
             StreamConsumerAction::OpenChild { source, .. }
                 if source.segment_id() == SegmentId(0)
         )));
-        assert!(deferred.pending_ownership().is_empty());
+        assert_eq!(
+            deferred.pending_ownership(),
+            [] as [crate::scalable_consumer::SegmentSource; 0]
+        );
     }
 
     #[test]
@@ -5365,11 +5561,9 @@ mod tests {
             .apply_assignment(assignment(1, &[1]))
             .expect("assignment");
         let generation = opened_generation(&open[0]);
-        assert!(
-            strict
-                .child_opened(SegmentId(1), generation)
-                .expect("open")
-                .is_empty()
+        assert_eq!(
+            strict.child_opened(SegmentId(1), generation).expect("open"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         assert_eq!(
             strict.segment_phase(SegmentId(1)),
@@ -5397,7 +5591,7 @@ mod tests {
             .expect("assignment");
         let generation = opened_generation(&open[0]);
         let source = model.children[&SegmentId(1)].source.clone();
-        assert!(model.status().pending_ownership().is_empty());
+        assert_eq!(model.status().pending_ownership(), []);
 
         model
             .child_open_busy(SegmentId(1), generation)
@@ -5415,7 +5609,7 @@ mod tests {
             model.child_opened(SegmentId(1), generation),
             Ok(actions) if matches!(actions.as_slice(), [StreamConsumerAction::GrantFlow { .. }])
         ));
-        assert!(model.status().pending_ownership().is_empty());
+        assert_eq!(model.status().pending_ownership(), []);
     }
 
     #[test]
@@ -5581,6 +5775,473 @@ mod tests {
             0
         );
         assert_eq!(model.children[&SegmentId(2)].completion.acknowledgements, 0);
+    }
+
+    #[test]
+    fn redelivery_position_follows_latest_observed_entry() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (_first, refill) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            10,
+        );
+        let (redelivery, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&refill),
+            5,
+        );
+        let source = redelivery.stream_message_id().source();
+        assert_eq!(
+            redelivery.position_vector().get(source),
+            Some(message_id(5))
+        );
+        let transition = model
+            .admit_cumulative_acknowledgement(&redelivery)
+            .expect("admit");
+        assert_eq!(transition.components[0].message_ids(), &[message_id(5)]);
+    }
+
+    #[test]
+    fn successful_cumulative_acknowledgement_is_idempotent() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let transition = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("admit");
+        model
+            .settle_acknowledgement(
+                &transition.authority,
+                &BTreeSet::from([token.stream_message_id().source().clone()]),
+            )
+            .expect("settle");
+        let repeat = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("idempotent repeat");
+        assert!(
+            repeat.components.is_empty(),
+            "confirmed cumulative position has no wire work"
+        );
+        model
+            .settle_acknowledgement(&repeat.authority, &BTreeSet::new())
+            .expect("settle no-op");
+        let future_token = DeliveryToken {
+            consumer_instance: token.consumer_instance,
+            controller_incarnation: token.controller_incarnation,
+            child_generation: token.child_generation,
+            acknowledgement_generation: token.acknowledgement_generation,
+            stream_message_id: Arc::clone(&token.stream_message_id),
+            position_vector: token.position_vector.clone(),
+            delivery_epoch: token.delivery_epoch,
+            dequeue_sequence: DequeueSequence(model.next_dequeue_sequence),
+            reservation: token.reservation,
+        };
+        assert!(
+            matches!(
+                model.admit_cumulative_acknowledgement(&future_token),
+                Err(StreamConsumerModelError::StaleDeliveryToken)
+            ),
+            "confirmed-watermark no-op still rejects a future sequence"
+        );
+        assert_eq!(
+            model.resolve_delivery(&token),
+            Err(StreamConsumerModelError::StaleDeliveryToken),
+            "idempotent cumulative ack does not revive delivery authority"
+        );
+    }
+
+    #[test]
+    fn cumulative_retry_preserves_unconfirmed_vector_sources() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let opens = model
+            .apply_assignment(assignment(1, &[1, 2]))
+            .expect("assignment");
+        let generation_one = opened_generation(&opens[0]);
+        let generation_two = opened_generation(&opens[1]);
+        let flow_one = model
+            .child_opened(SegmentId(1), generation_one)
+            .expect("first open");
+        let flow_two = model
+            .child_opened(SegmentId(2), generation_two)
+            .expect("second open");
+        let (first, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation_one,
+            flow_reservation(&flow_one),
+            5,
+        );
+        let (last, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(2),
+            generation_two,
+            flow_reservation(&flow_two),
+            7,
+        );
+        assert_eq!(last.position_vector().len(), 2);
+        let first_source = first.stream_message_id().source().clone();
+        let last_source = last.stream_message_id().source().clone();
+        let initial = model
+            .admit_cumulative_acknowledgement(&last)
+            .expect("complete vector admitted");
+        assert_eq!(initial.components.len(), 2);
+        model
+            .settle_acknowledgement(&initial.authority, &BTreeSet::from([last_source.clone()]))
+            .expect("only final token source confirmed");
+        assert_eq!(
+            model.validate_delivery_restoration(&last),
+            Err(StreamConsumerModelError::StaleDeliveryToken)
+        );
+        assert_eq!(
+            model
+                .admit_individual_acknowledgement(&last)
+                .expect_err("confirmed token has no individual delivery authority"),
+            StreamConsumerModelError::StaleDeliveryToken
+        );
+        let retry = model
+            .admit_cumulative_acknowledgement(&last)
+            .expect("saved vector retry");
+        assert_eq!(
+            retry.components.len(),
+            1,
+            "an unconfirmed earlier source still requires a wire acknowledgement"
+        );
+        assert_eq!(retry.components[0].source(), &first_source);
+        assert_eq!(retry.components[0].message_ids(), &[message_id(5)]);
+        model
+            .settle_acknowledgement(&retry.authority, &BTreeSet::from([first_source]))
+            .expect("retry confirms remaining source");
+        assert_eq!(
+            model.resolve_delivery(&first),
+            Err(StreamConsumerModelError::StaleDeliveryToken)
+        );
+        let repeated = model
+            .admit_cumulative_acknowledgement(&last)
+            .expect("complete successful vector repeat");
+        assert_eq!(repeated.components, [] as [AcknowledgementComponent; 0]);
+        model
+            .settle_acknowledgement(&repeated.authority, &BTreeSet::new())
+            .expect("settle complete no-op");
+        assert_eq!(
+            model.children[&last_source.segment_id()]
+                .completion
+                .acknowledgements,
+            0
+        );
+        assert_eq!(model.children[&SegmentId(1)].completion.acknowledgements, 0);
+    }
+
+    #[test]
+    fn failed_cumulative_acknowledgement_remains_retryable() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let first = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("first cumulative ack");
+        model
+            .settle_acknowledgement(&first.authority, &BTreeSet::new())
+            .expect("failed component settles without resolving delivery");
+
+        let retry = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("failed ack can retry");
+        assert_eq!(retry.components.len(), 1);
+        assert!(retry.components[0].cumulative());
+    }
+
+    #[test]
+    fn transaction_abort_does_not_confirm_plain_cumulative_acknowledgement() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let transactional = model
+            .admit_cumulative_transactional_acknowledgement(&token)
+            .expect("transactional cumulative ack");
+        model
+            .settle_transactional_acknowledgement(
+                &transactional.authority,
+                TransactionAcknowledgementOutcome::Aborted,
+            )
+            .expect("transaction abort");
+
+        let plain = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("plain ack remains necessary");
+        assert_eq!(plain.components.len(), 1);
+        assert!(plain.components[0].cumulative());
+    }
+
+    #[test]
+    fn late_cumulative_ack_completion_after_redelivery_cannot_confirm_new_generation() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (older, refill) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            10,
+        );
+        let pending = model
+            .admit_cumulative_acknowledgement(&older)
+            .expect("admit old cumulative ack");
+        let (redelivery, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&refill),
+            5,
+        );
+        let source = older.stream_message_id().source().clone();
+        model
+            .settle_acknowledgement(&pending.authority, &BTreeSet::from([source]))
+            .expect("late completion settles old operation");
+
+        let retry = model
+            .admit_cumulative_acknowledgement(&redelivery)
+            .expect("redelivery position remains unconfirmed");
+        assert_eq!(retry.components.len(), 1);
+        assert_eq!(retry.components[0].message_ids(), &[message_id(5)]);
+    }
+
+    #[test]
+    fn bucket_shared_cumulative_ack_preserves_tracked_batch_and_chunk_ids() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let assignment =
+            assignment_with_bucket_ranges(1, &[1], &[KeyRange::new(0, 31_999).expect("range")]);
+        let open = model.apply_assignment(assignment).expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let retained = model
+            .message_arrived(SegmentId(1), generation, flow_reservation(&flow), 128)
+            .expect("arrival")
+            .retained;
+        let source = model.children[&SegmentId(1)].source.clone();
+        let ordinary = canonical_ordinary_bytes();
+        let stream_message_id =
+            StreamMessageId::from_ordinary_bytes(source, &ordinary).expect("complete ordinary id");
+        let token = model
+            .issue_delivery(SegmentId(1), generation, stream_message_id, retained)
+            .expect("delivery");
+
+        let acknowledgement = model
+            .admit_cumulative_acknowledgement(&token)
+            .expect("shared cumulative ack");
+        let component = &acknowledgement.components[0];
+        assert!(!component.cumulative(), "shared wire ACK is individual");
+        assert_eq!(
+            component.message_ids(),
+            &[token.stream_message_id().ordinary_message_id()]
+        );
+        assert_eq!(component.message_id_bytes(), &[ordinary]);
+        let decoded = component.message_id_data().expect("wire message id");
+        assert_eq!(decoded[0].ack_set, vec![3, 5]);
+        assert_eq!(
+            decoded[0]
+                .first_chunk_message_id
+                .as_deref()
+                .map(|first| first.entry_id),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn bucket_range_reassignment_replaces_child_without_waiting_for_flow_drain() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let first = model
+            .apply_assignment(assignment_with_bucket_ranges(
+                1,
+                &[1],
+                &[KeyRange::new(0, 31_999).expect("range")],
+            ))
+            .expect("first assignment");
+        let old_generation = opened_generation(&first[0]);
+        let flow = model
+            .child_opened(SegmentId(1), old_generation)
+            .expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            old_generation,
+            flow_reservation(&flow),
+            5,
+        );
+
+        let transition = model
+            .apply_assignment(assignment_with_bucket_ranges(
+                1,
+                &[1],
+                &[KeyRange::new(32_000, 65_535).expect("range")],
+            ))
+            .expect("bucket ownership change");
+        assert!(matches!(
+            transition.as_slice(),
+            [StreamConsumerAction::StopFlow { child_generation, .. }]
+                if *child_generation == old_generation
+        ));
+        assert!(!model.children[&SegmentId(1)].wait_for_flow_drain);
+
+        let ack = model
+            .admit_individual_acknowledgement(&token)
+            .expect("old child delivery remains acknowledgeable");
+        let close = model
+            .settle_acknowledgement(
+                &ack.authority,
+                &BTreeSet::from([token.stream_message_id().source().clone()]),
+            )
+            .expect("handoff does not wait for flow drain");
+        assert!(matches!(
+            close.as_slice(),
+            [StreamConsumerAction::CloseChild { .. }]
+        ));
+
+        let replacement = model
+            .child_closed(SegmentId(1), old_generation)
+            .expect("old child closes");
+        assert_eq!(replacement.len(), 1);
+        let new_generation = opened_generation(&replacement[0]);
+        assert_ne!(new_generation, old_generation);
+        assert!(model.children[&SegmentId(1)].bucket_shared);
+    }
+
+    #[test]
+    fn out_of_order_cumulative_ack_completions_keep_highest_confirmed_position() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let source = model.children[&SegmentId(1)].source.clone();
+        let high_position =
+            PositionVector::new(1, [(source.clone(), message_id(10))]).expect("position");
+        let high_ack = model
+            .admit_position_acknowledgement(&high_position)
+            .expect("high ack without retained deliveries");
+        let (low, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let low_ack = model
+            .admit_cumulative_acknowledgement(&low)
+            .expect("low cumulative ack");
+        model
+            .settle_acknowledgement(&high_ack.authority, &BTreeSet::from([source.clone()]))
+            .expect("high ack completes first");
+        model
+            .settle_acknowledgement(&low_ack.authority, &BTreeSet::from([source]))
+            .expect("low ack completes later");
+
+        assert_eq!(
+            model.children[&SegmentId(1)].confirmed_cumulative,
+            Some(message_id(10))
+        );
+    }
+
+    #[test]
+    fn confirmed_watermark_reset_tracks_every_non_increasing_observation() {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (confirmed, refill) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let ack = model
+            .admit_cumulative_acknowledgement(&confirmed)
+            .expect("ack");
+        let source = confirmed.stream_message_id().source().clone();
+        let _settled = model
+            .settle_acknowledgement(&ack.authority, &BTreeSet::from([source]))
+            .expect("confirm first watermark");
+        let (later, refill) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&refill),
+            10,
+        );
+        assert_eq!(
+            model.children[&SegmentId(1)].confirmed_cumulative,
+            Some(message_id(5))
+        );
+        let pending = model
+            .admit_cumulative_acknowledgement(&later)
+            .expect("later ack");
+        let (redelivery, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&refill),
+            8,
+        );
+        assert_eq!(
+            redelivery.stream_message_id().ordinary_message_id(),
+            message_id(8)
+        );
+        assert_eq!(model.children[&SegmentId(1)].confirmed_cumulative, None);
+        assert_ne!(
+            model.children[&SegmentId(1)].acknowledgement_generation,
+            later.acknowledgement_generation
+        );
+        let source = redelivery.stream_message_id().source().clone();
+        model
+            .settle_acknowledgement(&pending.authority, &BTreeSet::from([source.clone()]))
+            .expect("old completion cannot restore watermark");
+        assert_eq!(model.children[&SegmentId(1)].confirmed_cumulative, None);
     }
 
     #[test]
@@ -5834,11 +6495,11 @@ mod tests {
             "permanent failure must not queue a replacement open"
         );
         assert!(model.segment_phase(SegmentId(1)).is_none());
-        assert!(
+        assert_eq!(
             model
                 .apply_assignment(assignment(1, &[1]))
-                .expect("same authoritative assignment remains fenced")
-                .is_empty()
+                .expect("same authoritative assignment remains fenced"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
     }
 
@@ -6169,7 +6830,8 @@ mod tests {
             + stream_message_id_heap
             + vector_bytes
             + vector_heap
-            + DELIVERY_AUTHORITY_OVERHEAD;
+            + DELIVERY_AUTHORITY_OVERHEAD
+            + DELIVERY_ACK_GENERATION_OVERHEAD;
         let delivered_positions_bytes =
             vector_bytes + vector_heap + canonical_heap + DELIVERY_AUTHORITY_OVERHEAD;
         let delivered_positions_reservation = model
@@ -6236,11 +6898,11 @@ mod tests {
         let first = model
             .child_opened(SegmentId(1), generation_one)
             .expect("first child");
-        assert!(
+        assert_eq!(
             model
                 .child_opened(SegmentId(2), generation_two)
-                .expect("second child")
-                .is_empty()
+                .expect("second child"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
 
         let to_two = model
@@ -6277,11 +6939,11 @@ mod tests {
         let reservation = flow_reservation(&flow);
         assert_eq!(model.budget.data_used(), MAX_FRAME_SIZE);
 
-        assert!(
+        assert_eq!(
             model
                 .observe_terminal(SegmentId(1), generation)
-                .expect("terminal")
-                .is_empty()
+                .expect("terminal"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         assert_eq!(model.budget.data_used(), 0);
         assert_eq!(model.budget.use_of(reservation), None);
@@ -6289,11 +6951,11 @@ mod tests {
             model.segment_phase(SegmentId(1)),
             Some(&SegmentPhase::Terminal)
         );
-        assert!(
+        assert_eq!(
             model
                 .complete_segment(SegmentId(1), generation)
-                .expect("complete")
-                .is_empty()
+                .expect("complete"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         assert_eq!(model.budget.data_used(), 0);
     }
@@ -6535,14 +7197,17 @@ mod tests {
                 assignment(2, &[]),
             )
             .expect("descriptor replacement upgrades the retained drain");
-        assert!(actions.is_empty());
+        assert_eq!(
+            actions,
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
+        );
         assert!(model.children[&SegmentId(1)].wait_for_flow_drain);
         assert_eq!(model.budget().use_of(flow), Some(BudgetUse::FlowPermit));
-        assert!(
+        assert_eq!(
             model
                 .resolve_delivery(&token)
-                .expect("delivery resolution waits for old descriptor flow")
-                .is_empty()
+                .expect("delivery resolution waits for old descriptor flow"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         assert_eq!(
             model.segment_phase(SegmentId(1)),
@@ -6734,11 +7399,11 @@ mod tests {
             model.segment_phase(SegmentId(2)),
             Some(&SegmentPhase::Seeking)
         );
-        assert!(
+        assert_eq!(
             model
                 .seek_completed(SegmentId(1), generation_one)
-                .expect("first confirmation")
-                .is_empty()
+                .expect("first confirmation"),
+            [] as [crate::stream_consumer::StreamConsumerAction; 0]
         );
         let flow = model
             .seek_completed(SegmentId(2), generation_two)
@@ -7253,7 +7918,7 @@ mod tests {
     fn budget_transfers_conserve_bytes_and_cleanup_is_independent() {
         let minimum =
             MAX_FRAME_SIZE + RECEIVER_BUDGET_AUTHORITY_HEADROOM + CONTROL_PLANE_CLEANUP_RESERVE;
-        assert_eq!(minimum, 13_697_152);
+        assert_eq!(minimum, 13_697_160);
         assert!(ReceiverBudget::bytes(16 * 1024 * 1024).is_ok());
         assert_eq!(
             ReceiverBudget::bytes(minimum - 1),

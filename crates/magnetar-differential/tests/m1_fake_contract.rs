@@ -73,6 +73,74 @@ fn take_frames(cluster: &mut M1FakeCluster, connection: ConnectionId) -> Vec<Fra
         .collect()
 }
 
+fn assert_ordinary_subscribe_and_close(
+    cluster: &mut M1FakeCluster,
+    connection: ConnectionId,
+    command: &pb::BaseCommand,
+    segment_id: u64,
+    close_request_id: u64,
+) {
+    let subscribe = command.subscribe.as_ref().expect("ordinary Subscribe body");
+    let before = cluster.resource_counts();
+    send(cluster, connection, command).expect("admit the physical ordinary subscription");
+    let opened = take_frames(cluster, connection);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0]
+            .command
+            .success
+            .as_ref()
+            .expect("ordinary Subscribe success")
+            .request_id,
+        subscribe.request_id
+    );
+    assert_eq!(
+        cluster.active_child_consumer(
+            &subscribe.subscription,
+            segment_id,
+            subscribe
+                .consumer_name
+                .as_deref()
+                .expect("wire consumer name"),
+        ),
+        Some(MemberId::new(connection, subscribe.consumer_id))
+    );
+    let active = cluster.resource_counts();
+    assert_eq!(active.child_consumers, before.child_consumers + 1);
+    assert_eq!(active.pending_child_opens, before.pending_child_opens);
+    assert_eq!(active.pending_operations, before.pending_operations);
+    assert_eq!(active.scalable_members, before.scalable_members);
+    send(
+        cluster,
+        connection,
+        &close_command(subscribe.consumer_id, close_request_id),
+    )
+    .expect("close the exact ordinary consumer");
+    let closed = take_frames(cluster, connection);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("ordinary Close success")
+            .request_id,
+        close_request_id
+    );
+    assert_eq!(cluster.resource_counts(), before);
+    assert_eq!(
+        cluster.active_child_consumer(
+            &subscribe.subscription,
+            segment_id,
+            subscribe
+                .consumer_name
+                .as_deref()
+                .expect("wire consumer name"),
+        ),
+        None
+    );
+}
+
 fn connect(cluster: &mut M1FakeCluster, endpoint: Endpoint) -> ConnectionId {
     let connection = cluster
         .open_connection(endpoint)
@@ -201,7 +269,7 @@ fn scalable_lookup_command(session_id: u64, topic: &str) -> pb::BaseCommand {
     pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicLookup as i32,
         scalable_topic_lookup: Some(pb::CommandScalableTopicLookup {
-    create_if_missing: Some(true),
+            create_if_missing: Some(true),
             session_id,
             topic: topic.to_owned(),
         }),
@@ -581,11 +649,9 @@ fn fake_projects_layout_and_assignment_and_fences_physical_connections() {
     let tls = cluster
         .open_connection_with_transport(Endpoint::Segment(1), TransportSecurity::Tls)
         .expect("open TLS segment connection");
-    assert!(
-        cluster
-            .take_output(plaintext)
-            .expect("empty output")
-            .is_empty()
+    assert_eq!(
+        cluster.take_output(plaintext).expect("empty output"),
+        [] as [bytes::Bytes; 0]
     );
     assert_eq!(cluster.resource_counts().connections, 2);
 
@@ -679,12 +745,12 @@ fn production_connection_adapter_round_trips_real_framing() {
         .expect("idle adapter exchange");
     assert_eq!(idle.client_bytes, 0);
     assert_eq!(idle.broker_frames, 0);
-    assert!(!cluster.routes().is_empty());
-    assert!(!cluster.broker_frames().is_empty());
+    assert_ne!(cluster.routes(), []);
+    assert_ne!(cluster.broker_frames(), []);
     cluster.clear_routes();
     cluster.clear_broker_frames();
-    assert!(cluster.routes().is_empty());
-    assert!(cluster.broker_frames().is_empty());
+    assert_eq!(cluster.routes(), []);
+    assert_eq!(cluster.broker_frames(), []);
 
     let unknown_adapter = M1ConnectionAdapter::new(ConnectionId(99));
     let mut unknown_client =
@@ -1053,22 +1119,21 @@ fn assignment_plans_are_complete_historical_and_ancestry_aware() {
     );
     let pending_child = connect(&mut unknown, Endpoint::Segment(1));
     let pending_topic = unknown.segment_topic(3).expect("pending parent topic");
-    assert!(matches!(
-        send(
-            &mut unknown,
-            pending_child,
-            &segment_subscribe_command(
-                &pending_topic,
-                "unknown",
-                "pending",
-                3,
-                20,
-                20,
-                pb::command_subscribe::SubType::Exclusive,
-            ),
+    assert_ordinary_subscribe_and_close(
+        &mut unknown,
+        pending_child,
+        &segment_subscribe_command(
+            &pending_topic,
+            "unknown",
+            "pending",
+            3,
+            20,
+            20,
+            pb::command_subscribe::SubType::Exclusive,
         ),
-        Err(M1FakeError::InvalidCommand { .. })
-    ));
+        3,
+        21,
+    );
 }
 
 #[test]
@@ -1631,7 +1696,10 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
     send(&mut cluster, controller, &scalable_close_command(41)).expect("close layout session");
     send(&mut cluster, controller, &scalable_close_command(41))
         .expect("layout close is idempotent");
-    assert!(cluster.layout_session_ids().is_empty());
+    assert_eq!(
+        cluster.layout_session_ids(),
+        [] as [(magnetar_fakes::m1::ConnectionId, u64); 0]
+    );
     assert!(cluster.resend_layout(controller, 41).is_err());
 
     send(
@@ -1677,7 +1745,9 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    let _member = register_member(&mut cluster, controller, "sub", "member", 103, 103);
+    let old_member = register_member(&mut cluster, controller, "sub", "member", 103, 103);
+    assert_eq!(cluster.assigned_owner("sub", 1), Some(old_member));
+    assert_eq!(cluster.assigned_owner("sub", 2), Some(old_member));
     send(
         &mut cluster,
         controller,
@@ -1690,14 +1760,45 @@ fn hostile_wire_commands_never_reroute_or_leak_controller_state() {
             pb::ScalableConsumerType::Stream as i32,
         ),
     )
-    .expect("duplicate member name returns ConsumerBusy");
-    assert!(
-        take_frames(&mut cluster, controller)[0]
-            .command
-            .scalable_topic_subscribe_response
-            .as_ref()
-            .is_some_and(|response| response.error == Some(pb::ServerError::ConsumerBusy as i32))
-    );
+    .expect("same-name registration reattaches the existing GA session");
+    let response = take_frames(&mut cluster, controller)[0]
+        .command
+        .scalable_topic_subscribe_response
+        .clone()
+        .expect("reattachment response");
+    assert_eq!(response.error, None);
+    let new_member = MemberId::new(controller, 104);
+    assert_eq!(cluster.assigned_owner("sub", 1), Some(new_member));
+    assert_eq!(cluster.assigned_owner("sub", 2), Some(new_member));
+    assert_eq!(cluster.resource_counts().scalable_members, 1);
+    for (consumer_id, request_id, remaining_members) in [(103, 105, 1), (104, 106, 0)] {
+        send(
+            &mut cluster,
+            controller,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+                scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                    consumer_id,
+                    request_id,
+                }),
+                ..pb::BaseCommand::default()
+            },
+        )
+        .expect("identity-fenced GA unsubscribe");
+        assert_eq!(
+            take_frames(&mut cluster, controller)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("unsubscribe success")
+                .request_id,
+            request_id
+        );
+        assert_eq!(
+            cluster.resource_counts().scalable_members,
+            remaining_members
+        );
+    }
 }
 
 #[test]
@@ -1918,38 +2019,36 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    assert!(matches!(
-        send(
-            &mut cluster,
-            child,
-            &segment_subscribe_command(
-                &topic,
-                "unassigned-sub",
-                "wire-member",
-                1,
-                11,
-                12,
-                pb::command_subscribe::SubType::Exclusive,
-            ),
+    assert_ordinary_subscribe_and_close(
+        &mut cluster,
+        child,
+        &segment_subscribe_command(
+            &topic,
+            "unassigned-sub",
+            "wire-member",
+            1,
+            11,
+            12,
+            pb::command_subscribe::SubType::Exclusive,
         ),
-        Err(M1FakeError::InvalidCommand { .. })
-    ));
-    assert!(matches!(
-        send(
-            &mut cluster,
-            child,
-            &segment_subscribe_command(
-                &topic,
-                "wire-sub",
-                "wrong-name",
-                1,
-                11,
-                13,
-                pb::command_subscribe::SubType::Exclusive,
-            ),
+        1,
+        112,
+    );
+    assert_ordinary_subscribe_and_close(
+        &mut cluster,
+        child,
+        &segment_subscribe_command(
+            &topic,
+            "wire-sub",
+            "wrong-name",
+            1,
+            11,
+            13,
+            pb::command_subscribe::SubType::Exclusive,
         ),
-        Err(M1FakeError::InvalidCommand { .. })
-    ));
+        1,
+        213,
+    );
     send(
         &mut cluster,
         child,
@@ -2074,7 +2173,6 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
         ack_command(999, 114, pb::MessageIdData::default()),
         redeliver_command(999, pb::MessageIdData::default()),
         seek_command(999, 115, pb::MessageIdData::default()),
-        close_command(999, 116),
     ]
     .into_boxed_slice()
     {
@@ -2083,6 +2181,28 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
             Err(M1FakeError::InvalidCommand { .. })
         ));
     }
+
+    let resources = cluster.resource_counts();
+    let owner = cluster.active_child_consumer("wire-sub", 1, "wire-member-seg-1");
+    assert_eq!(owner, Some(MemberId::new(child, 11)));
+    send(&mut cluster, child, &close_command(999, 116))
+        .expect("unknown ordinary Close is idempotently successful");
+    let responses = take_frames(&mut cluster, child);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(
+        responses[0]
+            .command
+            .success
+            .as_ref()
+            .expect("unknown Close success")
+            .request_id,
+        116
+    );
+    assert_eq!(cluster.resource_counts(), resources);
+    assert_eq!(
+        cluster.active_child_consumer("wire-sub", 1, "wire-member-seg-1"),
+        owner
+    );
 
     let competing = connect(&mut cluster, Endpoint::Segment(1));
     send(
@@ -2296,7 +2416,10 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     cluster
         .disconnect_connection(child)
         .expect("disconnect cancels delayed close");
-    assert!(cluster.pending_operations().is_empty());
+    assert_eq!(
+        cluster.pending_operations(),
+        [] as [magnetar_fakes::m1::PendingOperationInfo; 0]
+    );
     assert!(matches!(
         send(&mut cluster, child, &flow_command(11, 1)),
         Err(M1FakeError::Disconnected(_))
@@ -2331,7 +2454,10 @@ fn malformed_transaction_and_child_commands_fail_before_mutating_fake_state() {
     cluster
         .disconnect_connection(pending_controller)
         .expect("disconnect cancels scalable open");
-    assert!(cluster.pending_operations().is_empty());
+    assert_eq!(
+        cluster.pending_operations(),
+        [] as [magnetar_fakes::m1::PendingOperationInfo; 0]
+    );
     assert!(
         cluster
             .member("disconnect-sub", "disconnect-member")
@@ -2716,7 +2842,7 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
         .expect("disconnect assigned retry member");
     let retry_child = connect(&mut retry_cluster, Endpoint::Segment(1));
     let retry_topic = retry_cluster.segment_topic(1).expect("retry segment topic");
-    send(
+    assert_ordinary_subscribe_and_close(
         &mut retry_cluster,
         retry_child,
         &segment_subscribe_command(
@@ -2728,15 +2854,10 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
             2,
             pb::command_subscribe::SubType::Exclusive,
         ),
-    )
-    .expect("reconnecting former owner receives ConsumerBusy");
-    assert!(
-        take_frames(&mut retry_cluster, retry_child)[0]
-            .command
-            .error
-            .as_ref()
-            .is_some_and(|error| error.error == pb::ServerError::ConsumerBusy as i32)
+        1,
+        3,
     );
+    assert_eq!(retry_cluster.resource_counts().scalable_members, 0);
 
     let mut cluster = M1FakeCluster::default();
     let controller_a = connect(&mut cluster, Endpoint::Controller);
@@ -2793,10 +2914,36 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
             ],
         )
         .expect("move segment while child open is pending");
-    assert!(matches!(
-        cluster.complete_pending(stale_open, PendingCompletion::Succeed),
-        Err(M1FakeError::StalePending(id)) if id == stale_open
-    ));
+    cluster
+        .complete_pending(stale_open, PendingCompletion::Succeed)
+        .expect("admitted ordinary Subscribe survives controller assignment withdrawal");
+    let opened = take_frames(&mut cluster, child);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0]
+            .command
+            .success
+            .as_ref()
+            .expect("original Subscribe success")
+            .request_id,
+        3
+    );
+    assert_eq!(cluster.resource_counts().child_consumers, 1);
+    send(&mut cluster, child, &close_command(11, 10))
+        .expect("close the late ordinary child before the next exclusive open");
+    let closed = take_frames(&mut cluster, child);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("ordinary Close success")
+            .request_id,
+        10
+    );
+    assert_eq!(cluster.resource_counts().child_consumers, 0);
+    assert_eq!(cluster.resource_counts().pending_operations, 0);
 
     cluster
         .script_next(
@@ -2853,10 +3000,10 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
             ],
         )
         .expect("move segment away from active child");
-    assert!(matches!(
-        send(&mut cluster, child, &flow_command(12, 1)),
-        Err(M1FakeError::InvalidCommand { .. })
-    ));
+    send(&mut cluster, child, &flow_command(12, 1))
+        .expect("live ordinary child FLOW survives controller assignment withdrawal");
+    assert_eq!(cluster.resource_counts().permits, 1);
+    assert_eq!(take_frames(&mut cluster, child).len(), 0);
 
     cluster
         .script_next(
@@ -2894,20 +3041,54 @@ fn stale_child_operations_are_fenced_across_assignment_and_controller_changes() 
     cluster
         .disconnect_connection(controller_b)
         .expect("disconnect stale child controller");
-    assert!(matches!(
-        cluster.complete_pending(pending_ack, PendingCompletion::Succeed),
-        Err(M1FakeError::StalePending(id)) if id == pending_ack
-    ));
-    assert!(matches!(
-        cluster.complete_pending(pending_close, PendingCompletion::Succeed),
-        Err(M1FakeError::StalePending(id)) if id == pending_close
-    ));
+    cluster
+        .complete_pending(pending_ack, PendingCompletion::Succeed)
+        .expect("admitted ordinary ACK survives separate controller departure");
+    let acknowledgement_responses = take_frames(&mut cluster, child);
+    assert_eq!(acknowledgement_responses.len(), 1);
+    let acknowledgement = acknowledgement_responses[0]
+        .command
+        .ack_response
+        .as_ref()
+        .expect("original admitted ACK response");
+    assert_eq!(acknowledgement.request_id, Some(6));
+    assert_eq!(acknowledgement.consumer_id, 12);
+    assert_eq!(acknowledgement.error, None);
+    assert_eq!(cluster.resource_counts().unacked_messages, 0);
+    assert_eq!(cluster.resource_counts().child_consumers, 1);
+    assert_eq!(cluster.durable_cursor("fence-sub", 1), Some(1));
+    cluster
+        .complete_pending(pending_close, PendingCompletion::Succeed)
+        .expect("ordinary child close survives separate controller departure");
+    let close_responses = take_frames(&mut cluster, child);
+    assert_eq!(close_responses.len(), 1);
+    assert_eq!(
+        close_responses[0]
+            .command
+            .success
+            .as_ref()
+            .expect("ordinary child close success")
+            .request_id,
+        7
+    );
+    assert_eq!(cluster.resource_counts().child_consumers, 0);
     assert!(matches!(
         send(&mut cluster, child, &flow_command(12, 1)),
         Err(M1FakeError::InvalidCommand { .. })
     ));
-    send(&mut cluster, child, &close_command(12, 9)).expect("close stale child after fencing");
-    let _ = take_frames(&mut cluster, child);
+    send(&mut cluster, child, &close_command(12, 9)).expect("closed child close is idempotent");
+    let retry_responses = take_frames(&mut cluster, child);
+    assert_eq!(retry_responses.len(), 1);
+    assert_eq!(
+        retry_responses[0]
+            .command
+            .success
+            .as_ref()
+            .expect("idempotent ordinary close success")
+            .request_id,
+        9
+    );
+    assert_eq!(cluster.resource_counts().child_consumers, 0);
 
     send(
         &mut cluster,
@@ -3052,10 +3233,21 @@ fn message_delivery_redelivery_seek_terminal_and_close_conserve_resources() {
             .is_some()
     );
     let unrelated_connection = connect(&mut cluster, Endpoint::Segment(1));
-    assert!(matches!(
-        send(&mut cluster, unrelated_connection, &close_command(7, 7)),
-        Err(M1FakeError::InvalidCommand { .. })
-    ));
+    let resources = cluster.resource_counts();
+    send(&mut cluster, unrelated_connection, &close_command(7, 7))
+        .expect("unknown ordinary Close on another connection is successful");
+    let responses = take_frames(&mut cluster, unrelated_connection);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(
+        responses[0]
+            .command
+            .success
+            .as_ref()
+            .expect("unknown Close success")
+            .request_id,
+        7
+    );
+    assert_eq!(cluster.resource_counts(), resources);
     let counts = cluster.resource_counts();
     assert_eq!(counts.child_consumers, 0);
     assert_eq!(counts.permits, 0);
@@ -3563,4 +3755,229 @@ fn transaction_coordinator_stages_commit_abort_and_fences_pending_work() {
         ),
         Err(M1FakeError::InvalidCommand { .. })
     ));
+}
+
+#[test]
+fn scalable_leave_failures_preserve_confirmed_membership_until_success() {
+    for delayed in [false, true] {
+        let mut cluster = M1FakeCluster::default();
+        let connection = connect(&mut cluster, Endpoint::Controller);
+        let member = register_member(
+            &mut cluster,
+            connection,
+            "leave-failure-sub",
+            "member",
+            7,
+            1,
+        );
+        let failure = BrokerFailure::new(
+            pb::ServerError::UnknownError,
+            "registration deletion failed",
+        );
+        cluster
+            .script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableLeave,
+                if delayed {
+                    ScriptedBehavior::Delay
+                } else {
+                    ScriptedBehavior::Fail(failure.clone())
+                },
+            )
+            .expect("script failed logical leave");
+        let leave = pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+            scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                consumer_id: 7,
+                request_id: 2,
+            }),
+            ..pb::BaseCommand::default()
+        };
+        send(&mut cluster, connection, &leave).expect("attempt logical leave");
+        if delayed {
+            assert_eq!(take_frames(&mut cluster, connection).len(), 0);
+            assert_eq!(cluster.member("leave-failure-sub", "member"), Some(member));
+            let pending = cluster.pending_operations()[0].id;
+            cluster
+                .complete_pending(pending, PendingCompletion::Fail(failure))
+                .expect("reject deferred deletion");
+        }
+        let frames = take_frames(&mut cluster, connection);
+        let error = frames[0]
+            .command
+            .error
+            .as_ref()
+            .expect("correlated leave failure");
+        assert_eq!(error.request_id, 2);
+        assert_eq!(error.error, pb::ServerError::UnknownError as i32);
+        assert_eq!(cluster.member("leave-failure-sub", "member"), Some(member));
+        assert_eq!(cluster.assigned_owner("leave-failure-sub", 1), Some(member));
+        assert_eq!(cluster.assigned_owner("leave-failure-sub", 2), Some(member));
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+        assert_eq!(cluster.resource_counts().scalable_members, 1);
+        send(
+            &mut cluster,
+            connection,
+            &pb::BaseCommand {
+                scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                    consumer_id: 7,
+                    request_id: 3,
+                }),
+                ..leave
+            },
+        )
+        .expect("retry logical leave after failed deletion");
+        assert_eq!(
+            take_frames(&mut cluster, connection)[0]
+                .command
+                .success
+                .as_ref()
+                .expect("retried leave success")
+                .request_id,
+            3
+        );
+        assert_eq!(cluster.resource_counts().scalable_members, 0);
+    }
+}
+
+#[test]
+fn failed_scalable_resume_preserves_the_confirmed_assignment() {
+    for delayed in [false, true] {
+        let mut cluster = M1FakeCluster::default();
+        let connection = connect(&mut cluster, Endpoint::Controller);
+        let member = register_member(
+            &mut cluster,
+            connection,
+            "resume-failure-sub",
+            "member",
+            7,
+            1,
+        );
+        let failure = BrokerFailure::new(
+            pb::ServerError::ServiceNotReady,
+            "registration retry rejected",
+        );
+        cluster
+            .script_next(
+                Endpoint::Controller,
+                OperationKind::ScalableOpen,
+                if delayed {
+                    ScriptedBehavior::Delay
+                } else {
+                    ScriptedBehavior::Fail(failure.clone())
+                },
+            )
+            .expect("script failed reattachment");
+        send(
+            &mut cluster,
+            connection,
+            &scalable_subscribe_command(
+                TOPIC,
+                "resume-failure-sub",
+                "member",
+                7,
+                2,
+                pb::ScalableConsumerType::Stream as i32,
+            ),
+        )
+        .expect("attempt reattachment");
+        if delayed {
+            assert_eq!(take_frames(&mut cluster, connection).len(), 0);
+            let pending = cluster.pending_operations()[0].id;
+            cluster
+                .complete_pending(pending, PendingCompletion::Fail(failure))
+                .expect("fail delayed reattachment");
+        }
+        let frames = take_frames(&mut cluster, connection);
+        let response = frames[0]
+            .command
+            .scalable_topic_subscribe_response
+            .as_ref()
+            .expect("correlated reattachment failure");
+        assert_eq!(response.request_id, 2);
+        assert_eq!(
+            response.error,
+            Some(pb::ServerError::ServiceNotReady as i32)
+        );
+        assert_eq!(cluster.member("resume-failure-sub", "member"), Some(member));
+        assert_eq!(
+            cluster.assigned_owner("resume-failure-sub", 1),
+            Some(member)
+        );
+        assert_eq!(
+            cluster.assigned_owner("resume-failure-sub", 2),
+            Some(member)
+        );
+        assert_eq!(cluster.resource_counts().pending_operations, 0);
+        assert_eq!(cluster.resource_counts().scalable_members, 1);
+    }
+}
+
+#[test]
+fn cancelled_scalable_resume_retains_the_confirmed_reconnect_assignment() {
+    let mut cluster = M1FakeCluster::default();
+    let old_connection = connect(&mut cluster, Endpoint::Controller);
+    register_member(
+        &mut cluster,
+        old_connection,
+        "cancelled-resume-sub",
+        "member",
+        7,
+        1,
+    );
+    cluster
+        .script_next(
+            Endpoint::Controller,
+            OperationKind::ScalableOpen,
+            ScriptedBehavior::Delay,
+        )
+        .expect("hold reattachment response");
+    send(
+        &mut cluster,
+        old_connection,
+        &scalable_subscribe_command(
+            TOPIC,
+            "cancelled-resume-sub",
+            "member",
+            7,
+            2,
+            pb::ScalableConsumerType::Stream as i32,
+        ),
+    )
+    .expect("begin held reattachment");
+    assert_eq!(cluster.resource_counts().pending_operations, 1);
+    cluster
+        .disconnect_connection(old_connection)
+        .expect("cancel in-flight reattachment by dropping its transport");
+    assert_eq!(cluster.resource_counts().pending_operations, 0);
+    assert_eq!(cluster.resource_counts().scalable_members, 0);
+    let new_connection = connect(&mut cluster, Endpoint::Controller);
+    register_member(
+        &mut cluster,
+        new_connection,
+        "cancelled-resume-sub",
+        "other-member",
+        8,
+        3,
+    );
+    assert_eq!(cluster.assigned_owner("cancelled-resume-sub", 1), None);
+    assert_eq!(cluster.assigned_owner("cancelled-resume-sub", 2), None);
+    let replacement = register_member(
+        &mut cluster,
+        new_connection,
+        "cancelled-resume-sub",
+        "member",
+        9,
+        4,
+    );
+    assert_eq!(
+        cluster.assigned_owner("cancelled-resume-sub", 1),
+        Some(replacement)
+    );
+    assert_eq!(
+        cluster.assigned_owner("cancelled-resume-sub", 2),
+        Some(replacement)
+    );
+    assert_eq!(cluster.resource_counts().scalable_members, 2);
+    assert_eq!(cluster.resource_counts().pending_operations, 0);
 }

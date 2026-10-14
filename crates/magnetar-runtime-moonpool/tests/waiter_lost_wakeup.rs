@@ -292,6 +292,26 @@ async fn scalable_lookup_catches_resolution_pushed_between_drain_and_park() {
             session_id: 1,
             resolved_topic_name: Some("topic://public/default/lost-wakeup".to_owned()),
             controller_broker_url: None,
+            controller_broker_url_tls: None,
+            snapshot: magnetar_proto::DagSnapshot::try_from_pb(
+                &magnetar_proto::pb::ScalableTopicDag {
+                    epoch: 3,
+                    segments: vec![magnetar_proto::pb::SegmentInfoProto {
+                        segment_id: 0,
+                        hash_start: 0,
+                        hash_end: 65_535,
+                        state: magnetar_proto::pb::SegmentState::Active as i32,
+                        ..Default::default()
+                    }],
+                    segment_brokers: vec![magnetar_proto::pb::SegmentBrokerAddress {
+                        segment_id: 0,
+                        broker_url: "pulsar://localhost:6650".to_owned(),
+                        broker_url_tls: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .expect("valid lookup layout"),
             segments: Vec::new(),
             epoch: 3,
         },
@@ -335,6 +355,7 @@ async fn scalable_subscribe_catches_rejection_pushed_between_drain_and_park() {
         },
         ScalableEvent::ConsumerRejected {
             consumer_id: 77,
+            incarnation: magnetar_proto::ControllerIncarnation(1),
             reason: "scripted rejection".to_owned(),
         },
     );
