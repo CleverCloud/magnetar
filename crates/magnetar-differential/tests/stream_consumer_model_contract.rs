@@ -2556,3 +2556,78 @@ fn receive_state_rejects_malformed_chunks_and_batches_without_partial_accounting
         ));
     }
 }
+
+#[test]
+fn bucket_cumulative_positions_ack_only_live_deliveries_and_preserve_resolved_tokens() {
+    let mut aggregate = model();
+    let mut wire = assignment(&[1]).to_pb();
+    wire.segments[0].bucket_ranges = vec![pb::IntRange { start: 0, end: 10 }];
+    let buckets = ConsumerAssignment::try_from_pb(&wire, "topic://public/default/model")
+        .expect("bucket-shared assignment");
+    let open = aggregate
+        .apply_assignment(buckets)
+        .expect("apply bucket assignment");
+    let generation = opened_generation(&open[0]);
+    let flow = aggregate
+        .child_opened(SegmentId(1), generation)
+        .expect("open child");
+    let (first, flow) = issue_delivery(&mut aggregate, 1, generation, flow_reservation(&flow), 3);
+    let (last, _) = issue_delivery(&mut aggregate, 1, generation, flow_reservation(&flow), 7);
+    let position = last.position_vector().clone();
+    let pending = aggregate
+        .admit_position_acknowledgement(&position)
+        .expect("position ACK");
+    assert_eq!(pending.components.len(), 1);
+    assert_eq!(
+        pending.components[0].message_ids(),
+        &[message_id(3), message_id(7)]
+    );
+    assert!(
+        !pending.components[0].cumulative(),
+        "other bucket owners may hold gaps"
+    );
+    aggregate
+        .cancel_acknowledgement(&pending.authority)
+        .expect("retry remains possible");
+
+    let last_ack = aggregate
+        .admit_individual_acknowledgement(&last)
+        .expect("ACK last delivery");
+    aggregate
+        .settle_acknowledgement(&last_ack.authority, &BTreeSet::from([source(1)]))
+        .expect("confirm last delivery");
+    assert!(matches!(
+        aggregate.admit_cumulative_acknowledgement(&last),
+        Err(StreamConsumerModelError::StaleDeliveryToken)
+    ));
+    let remaining = aggregate
+        .admit_position_acknowledgement(&position)
+        .expect("retry position");
+    assert_eq!(remaining.components[0].message_ids(), &[message_id(3)]);
+    aggregate
+        .settle_acknowledgement(&remaining.authority, &BTreeSet::from([source(1)]))
+        .expect("confirm first delivery");
+    assert!(matches!(
+        aggregate.validate_delivery_restoration(&first),
+        Err(StreamConsumerModelError::StaleDeliveryToken)
+    ));
+    let repeated = aggregate
+        .admit_position_acknowledgement(&position)
+        .expect("empty position retry");
+    assert!(
+        repeated.components.is_empty(),
+        "no invented ACK for another owner's message"
+    );
+    aggregate
+        .cancel_acknowledgement(&repeated.authority)
+        .expect("settle empty retry");
+    assert!(matches!(
+        aggregate.cancel_acknowledgement(&repeated.authority),
+        Err(StreamConsumerModelError::StaleAcknowledgementAuthority)
+    ));
+    aggregate.close().expect("close model");
+    aggregate
+        .child_closed(SegmentId(1), generation)
+        .expect("confirm child cleanup");
+    assert_eq!(aggregate.budget().data_used(), 0);
+}

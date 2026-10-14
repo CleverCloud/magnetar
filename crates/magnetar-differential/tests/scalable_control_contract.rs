@@ -317,3 +317,42 @@ fn prebaseline_assignment_buffer_is_bounded_and_consumer_scoped() {
     assert_eq!(replayed[0].assignment.layout_epoch(), 2);
     assert_eq!(replayed[0].delta.lost, vec![SegmentId(1)]);
 }
+
+#[test]
+fn bucket_assignments_round_trip_disjoint_ranges_and_reject_hostile_bounds() {
+    let mut segment = assigned(1, 0, 65_535);
+    segment.bucket_ranges = vec![
+        pb::IntRange { start: 0, end: 10 },
+        pb::IntRange { start: 20, end: 30 },
+    ];
+    let wire = assignment(3, vec![segment.clone()]);
+    let decoded = ConsumerAssignment::try_from_pb(&wire, TOPIC).expect("disjoint buckets");
+    assert_eq!(
+        decoded.to_pb(),
+        wire,
+        "bucket ownership survives the wire round trip"
+    );
+    for (start, end) in [(-1, 10), (0, -1), (12, 11), (0, 65_536)] {
+        segment.bucket_ranges = vec![pb::IntRange { start, end }];
+        assert_eq!(
+            ConsumerAssignment::try_from_pb(&assignment(3, vec![segment.clone()]), TOPIC),
+            Err(AssignmentError::InvalidBucketRange {
+                segment_id: SegmentId(1),
+                index: 0,
+                start,
+                end,
+            }),
+        );
+    }
+    segment.bucket_ranges = vec![
+        pb::IntRange { start: 0, end: 10 },
+        pb::IntRange { start: 10, end: 20 },
+    ];
+    assert_eq!(
+        ConsumerAssignment::try_from_pb(&assignment(3, vec![segment]), TOPIC),
+        Err(AssignmentError::OverlappingBucketRanges {
+            segment_id: SegmentId(1)
+        }),
+        "inclusive endpoints cannot be owned twice",
+    );
+}

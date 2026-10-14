@@ -468,3 +468,198 @@ fn same_broker_close_during_a_pending_reattach_is_refused_identically() {
          `CommandSubscribe` here would leave one of the two unmatched and the flow gate stuck",
     );
 }
+
+fn attached_terminal_consumer() -> (Connection, ConsumerHandle, Instant) {
+    let now = Instant::now();
+    let mut conn = Connection::new(
+        ConnectionConfig::default(),
+        std::sync::Arc::new(std::time::SystemTime::now),
+    );
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(now, &handshake_response_bytes())
+        .expect("Connected");
+    let _ = conn.poll_transmit();
+    let handle = conn.subscribe(SubscribeRequest {
+        topic: "persistent://public/default/terminal-lifecycle".to_owned(),
+        subscription: "terminal-lifecycle".to_owned(),
+        ..Default::default()
+    });
+    let mut wire = conn.poll_transmit();
+    let subscribe = decode_one(&mut wire)
+        .expect("Subscribe frame")
+        .command
+        .subscribe
+        .expect("Subscribe");
+    assert_eq!(subscribe.consumer_id, handle.0);
+    assert!(wire.is_empty());
+    feed_success(&mut conn, subscribe.request_id, now);
+    assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+    while conn.poll_event().is_some() {}
+    (conn, handle, now)
+}
+
+#[test]
+fn terminal_close_reset_preserves_completion_without_replaying_the_consumer() {
+    use magnetar_proto::consumer::ConsumerCloseCompletion;
+
+    for forgotten in [false, true] {
+        let (mut conn, handle, now) = attached_terminal_consumer();
+        let request = if forgotten {
+            conn.close_consumer_forget(handle, now)
+        } else {
+            conn.close_consumer(handle, now)
+        }
+        .expect("close admitted");
+        let mut wire = conn.poll_transmit();
+        let close = decode_one(&mut wire)
+            .expect("Close frame")
+            .command
+            .close_consumer
+            .expect("CloseConsumer");
+        assert_eq!((close.consumer_id, close.request_id), (handle.0, request.0));
+        assert!(wire.is_empty());
+        conn.reset();
+        let slot = conn.consumer(handle).expect("reusable closed slot");
+        assert!(slot.state.lock().closed);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(ConsumerCloseCompletion::SessionLost)
+        );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request));
+        assert!(!conn.has_pending_request_for_test(request));
+        assert!(conn.take_outcome(PendingOpKey::Request(request)).is_none());
+        assert!(conn.poll_transmit().is_empty());
+        conn.begin_handshake().expect("new handshake");
+        conn.handle_bytes(now, &handshake_response_bytes())
+            .expect("new Connected");
+        let _ = conn.poll_transmit();
+        while conn.poll_event().is_some() {}
+        assert_eq!(
+            conn.rebuild_consumers(),
+            [] as [magnetar_proto::RequestId; 0]
+        );
+        feed_success(&mut conn, request.0, now);
+        assert_eq!(
+            conn.consumer(handle)
+                .expect("closed slot")
+                .state
+                .lock()
+                .close_completion(),
+            Some(ConsumerCloseCompletion::SessionLost)
+        );
+        assert!(conn.poll_event().is_none());
+        assert!(conn.take_outcome(PendingOpKey::Request(request)).is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+}
+
+#[test]
+fn terminal_close_rejection_keeps_completion_and_bounds_forgotten_retry() {
+    use magnetar_proto::consumer::ConsumerCloseCompletion;
+
+    for forgotten in [false, true] {
+        let (mut conn, handle, now) = attached_terminal_consumer();
+        let request = if forgotten {
+            conn.close_consumer_forget(handle, now)
+        } else {
+            conn.close_consumer(handle, now)
+        }
+        .expect("close admitted");
+        let _ = conn.poll_transmit();
+        let rejection = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request.0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "broker could not close the consumer".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut wire = BytesMut::new();
+        encode_command(&mut wire, &rejection).expect("encode rejection");
+        conn.handle_bytes(now, &wire).expect("broker rejection");
+        assert_eq!(
+            conn.consumer(handle)
+                .expect("closed slot")
+                .state
+                .lock()
+                .close_completion(),
+            Some(ConsumerCloseCompletion::BrokerError {
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "broker could not close the consumer".to_owned(),
+            })
+        );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request));
+        assert!(conn.take_outcome(PendingOpKey::Request(request)).is_none());
+        assert!(conn.poll_transmit().is_empty());
+        let retry = conn.force_close_consumer_forget(handle, now);
+        if forgotten {
+            assert!(retry.is_none());
+        } else {
+            let retry = retry.expect("one forgotten retry of a reliable failure");
+            let mut wire = conn.poll_transmit();
+            let close = decode_one(&mut wire)
+                .expect("retry frame")
+                .command
+                .close_consumer
+                .expect("CloseConsumer retry");
+            assert_eq!((close.consumer_id, close.request_id), (handle.0, retry.0));
+            assert!(wire.is_empty());
+            feed_success(&mut conn, retry.0, now);
+            assert!(conn.take_outcome(PendingOpKey::Request(retry)).is_none());
+        }
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_event().is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+}
+
+#[test]
+fn terminal_connection_rejects_new_raw_consumer_close_and_unsubscribe_without_allocation() {
+    use magnetar_proto::consumer::{ConsumerCloseCompletion, ConsumerTerminalAdmissionError};
+
+    for unsubscribe in [false, true] {
+        let (mut conn, original, now) = attached_terminal_consumer();
+        conn.fail_all_pending("connection permanently closed");
+        let raw = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/raw-after-terminal".to_owned(),
+            subscription: "raw-after-terminal".to_owned(),
+            ..Default::default()
+        });
+        assert_ne!(raw, original);
+        let slot = ToOwned::to_owned(conn.consumer(raw).expect("raw admission retained its slot"));
+        assert!(!slot.state.lock().closed);
+        let next_request = conn.peek_next_request_id_for_test();
+        let mut wire = conn.poll_transmit();
+        let subscribe = decode_one(&mut wire)
+            .expect("raw Subscribe frame")
+            .command
+            .subscribe
+            .expect("raw Subscribe");
+        assert_eq!(subscribe.consumer_id, raw.0);
+        assert_eq!(subscribe.request_id + 1, next_request);
+        assert!(wire.is_empty());
+        let result = if unsubscribe {
+            conn.unsubscribe(raw, false)
+                .map(|admission| admission.request_id)
+        } else {
+            conn.close_consumer(raw, now)
+        };
+        assert_eq!(result, Err(ConsumerTerminalAdmissionError::Terminal));
+        assert!(slot.state.lock().closed);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(ConsumerCloseCompletion::Terminal {
+                reason: "connection permanently closed".to_owned(),
+            })
+        );
+        assert_eq!(conn.peek_next_request_id_for_test(), next_request);
+        assert!(!conn.has_pending_request_for_test(magnetar_proto::RequestId(next_request)));
+        assert_eq!(
+            conn.rebuild_consumers(),
+            [] as [magnetar_proto::RequestId; 0]
+        );
+        assert!(conn.poll_transmit().is_empty());
+        assert!(conn.force_close_consumer_forget(raw, now).is_none());
+    }
+}

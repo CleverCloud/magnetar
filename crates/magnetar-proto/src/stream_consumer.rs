@@ -1030,6 +1030,7 @@ struct LiveDelivery {
 struct ValidatedDelivery {
     source: SegmentSource,
     child_generation: ChildGeneration,
+    acknowledgement_generation: u64,
     message_id: crate::MessageId,
     message_id_bytes: Vec<u8>,
 }
@@ -3944,12 +3945,7 @@ impl StreamConsumerModel {
             message_id_bytes: vec![validated.message_id_bytes],
             cumulative: false,
             cumulative_position: None,
-            acknowledgement_generation: self
-                .child(
-                    token.stream_message_id.source().segment_id(),
-                    validated.child_generation,
-                )?
-                .acknowledgement_generation,
+            acknowledgement_generation: validated.acknowledgement_generation,
         };
         self.admit_acknowledgement(
             vec![component],
@@ -4146,12 +4142,7 @@ impl StreamConsumerModel {
             message_id_bytes: vec![validated.message_id_bytes],
             cumulative: false,
             cumulative_position: None,
-            acknowledgement_generation: self
-                .child(
-                    token.stream_message_id.source().segment_id(),
-                    validated.child_generation,
-                )?
-                .acknowledgement_generation,
+            acknowledgement_generation: validated.acknowledgement_generation,
         };
         self.admit_acknowledgement(
             vec![component],
@@ -4526,16 +4517,19 @@ impl StreamConsumerModel {
         let source = token.stream_message_id.source();
         let segment_id = source.segment_id();
         let owner = BudgetReservationOwner::new(segment_id, token.child_generation);
-        let current = self.children.get(&segment_id);
-        let valid = token.consumer_instance == self.consumer_instance
-            && token.controller_incarnation == self.controller_incarnation
-            && token.delivery_epoch == self.delivery_epoch
-            && current.is_some_and(|child| {
+        let child = self
+            .children
+            .get(&segment_id)
+            .filter(|child| {
                 child.generation == token.child_generation
                     && child.controller_incarnation == token.controller_incarnation
                     && child.source == *source
                     && !matches!(child.phase, SegmentPhase::Closing | SegmentPhase::Failed)
             })
+            .ok_or(StreamConsumerModelError::StaleDeliveryToken)?;
+        let valid = token.consumer_instance == self.consumer_instance
+            && token.controller_incarnation == self.controller_incarnation
+            && token.delivery_epoch == self.delivery_epoch
             && self
                 .live_deliveries
                 .get(&token.dequeue_sequence)
@@ -4553,6 +4547,7 @@ impl StreamConsumerModel {
         Ok(ValidatedDelivery {
             source: source.clone(),
             child_generation: token.child_generation,
+            acknowledgement_generation: child.acknowledgement_generation,
             message_id: token.stream_message_id.ordinary_message_id(),
             message_id_bytes: token.stream_message_id.ordinary_message_id_bytes().to_vec(),
         })
@@ -5785,7 +5780,7 @@ mod tests {
             .expect("assignment");
         let generation = opened_generation(&open[0]);
         let flow = model.child_opened(SegmentId(1), generation).expect("open");
-        let (_first, refill) = issue_test_delivery(
+        let (first, refill) = issue_test_delivery(
             &mut model,
             SegmentId(1),
             generation,
@@ -5808,6 +5803,34 @@ mod tests {
             .admit_cumulative_acknowledgement(&redelivery)
             .expect("admit");
         assert_eq!(transition.components[0].message_ids(), &[message_id(5)]);
+        model
+            .cancel_acknowledgement(&transition.authority)
+            .expect("cancel cumulative operation");
+        let current_generation = model.children[&SegmentId(1)].acknowledgement_generation;
+        assert_ne!(current_generation, first.acknowledgement_generation);
+        let individual = model
+            .admit_individual_acknowledgement(&first)
+            .expect("older live delivery still permits individual ACK");
+        assert_eq!(
+            individual.components[0].acknowledgement_generation,
+            current_generation
+        );
+        model
+            .cancel_acknowledgement(&individual.authority)
+            .expect("cancel individual operation");
+        let transactional = model
+            .admit_individual_transactional_acknowledgement(&first)
+            .expect("older live delivery permits transactional ACK");
+        assert_eq!(
+            transactional.components[0].acknowledgement_generation,
+            current_generation
+        );
+        model
+            .cancel_transactional_acknowledgement(&transactional.authority)
+            .expect("cancel transactional operation");
+        model
+            .validate_delivery_restoration(&first)
+            .expect("cancelled operations preserve the older delivery lease");
     }
 
     #[test]

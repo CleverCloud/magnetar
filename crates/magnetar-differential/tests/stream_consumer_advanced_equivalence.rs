@@ -6587,3 +6587,236 @@ async fn partial_and_closing_acknowledgement_failures_are_equivalent() {
     let moonpool_trace = run_moonpool_acknowledgement_failures().await;
     assert_eq!(tokio_trace, moonpool_trace);
 }
+
+async fn observe_withdrawn_open_finishing_during_close<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> Option<String>
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    use std::future::Future as _;
+    let success = magnetar::proto::pb::base_command::Type::Success;
+    cluster.hold_command(Endpoint::Segment(1), success);
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("withdraw-close-sub")
+        .consumer_name("withdraw-close-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("initial consumer");
+    cluster
+        .wait_for(
+            "old ordinary Subscribe admitted with response held",
+            |fake| {
+                fake.active_child_consumer("withdraw-close-sub", 1, "withdraw-close-member-seg-1")
+                    .is_some()
+                    && fake.resource_counts().child_consumers == 2
+            },
+        )
+        .await;
+    let member = cluster
+        .inspect(|fake| fake.member("withdraw-close-sub", "withdraw-close-member"))
+        .expect("initial controller member");
+    let takeover = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("withdraw-close-sub")
+        .consumer_name("withdraw-close-takeover")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("takeover consumer");
+    let other = cluster
+        .inspect(|fake| fake.member("withdraw-close-sub", "withdraw-close-takeover"))
+        .expect("takeover controller member");
+    cluster
+        .update(|fake| {
+            fake.publish_assignment_plan(
+                1,
+                vec![
+                    FullAssignment::new(member, []),
+                    FullAssignment::new(other, [1, 2]),
+                ],
+            )
+        })
+        .expect("withdraw every original child");
+    loop {
+        if matches!(next_event(&consumer).await,
+            StreamConsumerEvent::AssignmentApplied { sources, .. } if sources.is_empty())
+        {
+            break;
+        }
+    }
+    tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        while consumer.status().attached_segments() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CancelOpen and child close retire the model children");
+    let observed = ToOwned::to_owned(&consumer);
+    let mut close = std::pin::pin!(consumer.close());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        close.as_mut().poll(&mut context).is_pending(),
+        "close waits for the held ordinary open"
+    );
+    assert_eq!(
+        observed.status().phase(),
+        magnetar::proto::AggregatePhase::Closed,
+        "the withdrawn model has no child authority before late SubscribeSuccess"
+    );
+    cluster.release_command(Endpoint::Segment(1), success);
+    let result = tokio::time::timeout(magnetar_differential::HANG_GUARD, close)
+        .await
+        .expect("late open cleanup does not hang");
+    takeover.close().await.expect("close takeover");
+    cluster
+        .wait_for("all withdrawn-open resources cleaned", |fake| {
+            let c = fake.resource_counts();
+            c.child_consumers == 0
+                && c.layout_sessions == 0
+                && c.pending_operations == 0
+                && c.scalable_members == 0
+        })
+        .await;
+    result.err().map(|error| error.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_open_finishing_during_close_preserves_success_equivalently() {
+    let _serial = advanced_socket_test_guard();
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let tokio = observe_withdrawn_open_finishing_during_close(&client, &cluster).await;
+    client.close().await;
+    drop(cluster);
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let moonpool = observe_withdrawn_open_finishing_during_close(&client, &cluster).await;
+    client.close().await;
+    assert_eq!(
+        (tokio, moonpool),
+        (None, None),
+        "successful physical cleanup must keep close successful"
+    );
+}
+
+async fn terminal_client_during_transaction_registration<E, Close, CloseFuture>(
+    client: PulsarClient<E>,
+    close_client: Close,
+    cluster: &M1SocketCluster,
+) -> String
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi,
+    Close: FnOnce(PulsarClient<E>) -> CloseFuture,
+    CloseFuture: std::future::Future<Output = ()>,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("terminal-registration-sub")
+        .consumer_name("terminal-registration-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe terminal-registration aggregate");
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"terminal-registration")))
+        .expect("enqueue delivery");
+    let message = receive(&consumer).await;
+    let transaction = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("new transaction");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::TransactionRegistration,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold registration");
+    let mut acknowledgement = Box::pin(consumer.acknowledge_in_transaction(&message, transaction));
+    tokio::select! {
+        biased;
+        result = &mut acknowledgement => panic!("registration completed before terminal close: {result:?}"),
+        () = cluster.wait_for("pending registration before terminal close", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.kind == OperationKind::TransactionRegistration
+            })
+        }) => {}
+    }
+    assert_eq!(
+        cluster.inspect(|fake| fake
+            .routes()
+            .iter()
+            .filter(|route| { route.command == magnetar::proto::pb::base_command::Type::Ack })
+            .count()),
+        0
+    );
+    let error = tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        close_client(client).await;
+        while !matches!(
+            consumer.status().phase(),
+            magnetar::proto::AggregatePhase::Closing | magnetar::proto::AggregatePhase::Closed
+        ) {
+            tokio::task::yield_now().await;
+        }
+        acknowledgement.await
+    })
+    .await
+    .expect("terminal client close fences the aggregate and wakes registration")
+    .expect_err("registration cannot succeed after terminal client close");
+    let message = match error {
+        magnetar::scalable::StreamConsumerError::Engine { message, .. } => message,
+        unexpected => panic!("unexpected terminal registration error: {unexpected:?}"),
+    };
+    assert_eq!(message, "stream consumer is closed");
+    assert_eq!(
+        cluster.inspect(|fake| fake
+            .routes()
+            .iter()
+            .filter(|route| { route.command == magnetar::proto::pb::base_command::Type::Ack })
+            .count()),
+        0
+    );
+    drop(consumer);
+    cluster
+        .wait_for("terminal registration resources released", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 0
+                && counts.layout_sessions == 0
+                && counts.pending_operations == 0
+                && counts.scalable_members == 0
+        })
+        .await;
+    message
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_client_during_registration_is_equivalent() {
+    let _guard = advanced_socket_test_guard();
+    let tokio_cluster = M1SocketCluster::bind().await;
+    let tokio_client = connect_tokio(&tokio_cluster).await;
+    let tokio = terminal_client_during_transaction_registration(
+        tokio_client,
+        PulsarClient::<magnetar::TokioEngine>::close,
+        &tokio_cluster,
+    )
+    .await;
+    let moonpool_cluster = M1SocketCluster::bind().await;
+    let moonpool_client = connect_moonpool(&moonpool_cluster).await;
+    let moonpool = terminal_client_during_transaction_registration(
+        moonpool_client,
+        PulsarClient::<magnetar::MoonpoolEngine<moonpool_core::TokioProviders>>::close,
+        &moonpool_cluster,
+    )
+    .await;
+    assert_eq!(tokio, moonpool);
+}

@@ -1887,16 +1887,16 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         }
         let closed = {
             let mut state = self.state.lock();
-            state
-                .model
-                .child_closed(source.segment_id(), child_generation)
+            if state.model.accepts_child_result(&source, child_generation) {
+                state
+                    .model
+                    .child_closed(source.segment_id(), child_generation)
+            } else {
+                Ok(Vec::new())
+            }
         };
         let result = match closed {
             Ok(actions) => self.execute_actions(actions).await,
-            Err(
-                magnetar_proto::StreamConsumerModelError::UnknownChild { .. }
-                | magnetar_proto::StreamConsumerModelError::StaleChildGeneration { .. },
-            ) => Ok(()),
             Err(error) => Err(error.into()),
         };
         match close_error {

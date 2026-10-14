@@ -3381,6 +3381,154 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn public_unsubscribe_repoll_replaces_waiter_before_session_loss() {
+        for terminal in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/public-unsubscribe-loss-{terminal}"),
+                subscription: "public-unsubscribe-loss".to_owned(),
+                ..Default::default()
+            });
+            let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+            let _ = shared.inner.lock().poll_transmit();
+            let request_id = shared.inner.lock().peek_next_request_id_for_test();
+            let first_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let second_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let first_waker = std::task::Waker::from(first_wake.clone());
+            let second_waker = std::task::Waker::from(second_wake.clone());
+            let mut unsubscribe = Box::pin(consumer.unsubscribe(false));
+            assert!(
+                unsubscribe
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&first_waker))
+                    .is_pending()
+            );
+            assert!(
+                unsubscribe
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&second_waker))
+                    .is_pending()
+            );
+            let mut bytes = shared.inner.lock().poll_transmit();
+            let command = decode_one(&mut bytes)
+                .expect("one unsubscribe frame")
+                .command;
+            assert_eq!(command.r#type, pb::base_command::Type::Unsubscribe as i32);
+            let wire = command.unsubscribe.expect("unsubscribe payload");
+            assert_eq!(wire.consumer_id, handle.0);
+            assert_eq!(wire.request_id, request_id);
+            assert_eq!(wire.force, Some(false));
+            assert_eq!(bytes.as_ref(), [] as [u8; 0]);
+            assert!(
+                shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id))
+            );
+            if terminal {
+                shared.inner.lock().fail_all_pending("peer closed");
+            } else {
+                shared.inner.lock().reset();
+            }
+            assert_eq!(first_wake.0.load(Ordering::SeqCst), 0);
+            assert_eq!(second_wake.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                unsubscribe
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&second_waker)),
+                Poll::Ready(Err(ClientError::PeerClosed))
+            ));
+            drop(unsubscribe);
+            let conn = &mut *shared.inner.lock();
+            assert!(!conn.has_pending_request_for_test(magnetar_proto::RequestId(request_id)));
+            assert!(
+                conn.take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id)
+                ))
+                .is_none()
+            );
+            assert_eq!(conn.pending_waker_count(), 0);
+            assert_eq!(conn.peek_next_request_id_for_test(), request_id + 1);
+            assert_eq!(conn.poll_transmit().as_ref(), [] as [u8; 0]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_unsubscribe_during_and_after_close_stages_no_request() {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: "persistent://public/default/unsubscribe-close-admission".to_owned(),
+            subscription: "unsubscribe-close-admission".to_owned(),
+            ..Default::default()
+        });
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let survivor = consumer.clone();
+        let _ = shared.inner.lock().poll_transmit();
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let mut close = Box::pin(consumer.close());
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(close.as_mut().poll(&mut context).is_pending());
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let command = decode_one(&mut bytes).expect("one close frame").command;
+        assert_eq!(command.r#type, pb::base_command::Type::CloseConsumer as i32);
+        let wire = command.close_consumer.expect("close payload");
+        assert_eq!(wire.consumer_id, handle.0);
+        assert_eq!(wire.request_id, request_id);
+        assert_eq!(bytes.as_ref(), [] as [u8; 0]);
+        {
+            let mut unsubscribe = Box::pin(survivor.unsubscribe(false));
+            assert!(matches!(
+                unsubscribe.as_mut().poll(&mut context),
+                Poll::Ready(Err(ClientError::Other(message))) if message == "close in progress"
+            ));
+        }
+        {
+            let conn = &mut *shared.inner.lock();
+            assert_eq!(conn.peek_next_request_id_for_test(), request_id + 1);
+            assert!(conn.has_pending_request_for_test(magnetar_proto::RequestId(request_id)));
+            assert_eq!(conn.poll_transmit().as_ref(), [] as [u8; 0]);
+        }
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode close success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("apply close success");
+        assert!(matches!(
+            close.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        drop(close);
+        {
+            let mut unsubscribe = Box::pin(survivor.unsubscribe(false));
+            assert!(matches!(
+                unsubscribe.as_mut().poll(&mut context),
+                Poll::Ready(Err(ClientError::Other(message))) if message == "consumer closed"
+            ));
+        }
+        assert!(survivor.slot.state.lock().closed);
+        assert_eq!(
+            survivor.slot.state.lock().close_completion(),
+            Some(ConsumerCloseCompletion::Success)
+        );
+        assert_eq!(survivor.slot.state.lock().close_waiters.len(), 0);
+        let conn = &mut *shared.inner.lock();
+        assert!(!conn.has_pending_request_for_test(magnetar_proto::RequestId(request_id)));
+        assert_eq!(conn.peek_next_request_id_for_test(), request_id + 1);
+        assert_eq!(conn.pending_waker_count(), 0);
+        assert_eq!(conn.poll_transmit().as_ref(), [] as [u8; 0]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unsubscribe_resolves_when_connection_fails_before_first_poll() {
         const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(1);
         for terminal in [false, true] {

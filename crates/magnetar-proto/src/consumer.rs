@@ -2595,14 +2595,12 @@ impl ConsumerState {
         request_id: RequestId,
         completion: ConsumerCloseCompletion,
     ) -> Vec<Waker> {
-        if matches!(
-            self.terminal_operation,
-            ConsumerTerminalOperation::Pending { request_id: pending, .. } if pending == request_id
-        ) {
-            let origin = match self.terminal_operation {
-                ConsumerTerminalOperation::Pending { origin, .. } => origin,
-                _ => return Vec::new(),
-            };
+        if let ConsumerTerminalOperation::Pending {
+            request_id: pending,
+            origin,
+        } = self.terminal_operation
+            && pending == request_id
+        {
             self.terminal_operation = ConsumerTerminalOperation::Complete {
                 request_id: Some(request_id),
                 origin,
