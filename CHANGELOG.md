@@ -159,6 +159,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Dependency floors are updated for `aws-lc-rs ^1.18.2`, `opentelemetry ^0.33.1`, `opentelemetry_sdk ^0.33.1`, `proptest ^1.12.0`, `rustls ^0.23.46`, `rustls-native-certs ^0.8.5`, `schemars ^1.2.3`, `serde_json ^1.0.154`, `tokio ^1.53.3`, `tokio-util ^0.7.20`, `uuid ^1.28.0`, and `zstd ^0.14.2`.** Cargo regenerated the root and standalone fuzz workspace lockfiles for the updated manifests.
+  (ADR-0114)
+
 - **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention`, `namespace_get_persistence`, `namespace_get_dispatch_rate`, `namespace_get_subscription_dispatch_rate`, `namespace_get_replicator_dispatch_rate` and `namespace_get_publish_rate` now return `Option<_>`, `None` when the policy is unset at that level.**
   Retention, persistence, dispatch rate and publish rate used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0` while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`, and `DispatchRate::default()` is `-1` (unlimited) whatever the broker's `dispatchThrottlingRatePer*`.
   The client therefore reported values the cluster never returned.
