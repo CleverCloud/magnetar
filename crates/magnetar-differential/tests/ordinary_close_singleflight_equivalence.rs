@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::{Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_ordinary_close_is_equivalent() {
@@ -13,6 +13,7 @@ async fn concurrent_ordinary_close_is_equivalent() {
                 timeout: std::time::Duration::from_millis(1),
             },
             Op::ConcurrentClose,
+            Op::ConcurrentClose,
         ],
     );
     let broker = ScriptedBroker::bind().await.expect("scripted broker");
@@ -21,6 +22,8 @@ async fn concurrent_ordinary_close_is_equivalent() {
             .await
             .expect("Tokio close trace must not hang")
             .expect("Tokio close trace");
+    assert_eq!(tokio_trace.events.len(), trace.ops.len());
+    assert_eq!(&tokio_trace.events[1..], &[Event::Closed, Event::Closed]);
     let tokio_closes = broker.consumer_close_log_snapshot();
     assert_eq!(tokio_closes.len(), 1, "Tokio must emit one close command");
     assert_ne!(tokio_closes[0].request_id, 0);

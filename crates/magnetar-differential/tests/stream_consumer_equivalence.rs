@@ -2205,6 +2205,20 @@ where
         .await;
     let first = receive(&consumer).await;
     let second = receive(&consumer).await;
+    let second_id = ToOwned::to_owned(second.message_id());
+    let second_position = ToOwned::to_owned(second.position());
+    let second_payload = second.payload().to_vec();
+    let (owned, raw, token) = second.into_parts();
+    assert_eq!(owned.as_ref(), second_payload.as_slice());
+    assert_eq!(raw.payload.as_ref(), second_payload.as_slice());
+    assert_eq!(token.stream_message_id(), &second_id);
+    assert_eq!(token.position_vector(), &second_position);
+    assert_eq!(
+        cluster
+            .inspect(M1FakeCluster::resource_counts)
+            .unacked_messages,
+        2
+    );
     let message_debug = format!("{first:?}").contains("StreamMessage");
     let position = consumer.delivered_position();
     let restored = magnetar::proto::PositionVector::from_bytes(
@@ -2235,7 +2249,7 @@ where
             magnetar::proto::StreamConsumerModelError::StaleDeliveryToken
         )
     );
-    drop(second);
+    drop((owned, raw, token));
     cluster
         .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"batch-one")))
         .expect("enqueue first batch-ack message");
@@ -3348,4 +3362,76 @@ fn public_batch_and_acknowledgement_failure_values_are_typed() {
         magnetar::scalable::StreamConsumerError::engine("test", "aggregate failed").to_string(),
         "test stream-consumer error: aggregate failed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moonpool_pair_constructors_preserve_lookup_and_transaction_lifecycle() {
+    for explicit_providers in [false, true] {
+        let cluster = M1SocketCluster::bind().await;
+        let providers = moonpool_core::TokioProviders::new();
+        let engine = magnetar::runtime_moonpool::MoonpoolEngine::new(ToOwned::to_owned(&providers));
+        let (shared, driver) = engine
+            .connect_plain(
+                cluster
+                    .controller_url()
+                    .strip_prefix("pulsar://")
+                    .expect("plain controller"),
+                magnetar::ConnectionConfig {
+                    operation_timeout: Duration::from_secs(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connect existing shared/driver pair");
+        let client = if explicit_providers {
+            PulsarClient::<magnetar::MoonpoolEngine<moonpool_core::TokioProviders>>::from_moonpool_with_providers(
+                shared, driver, &providers,
+            )
+        } else {
+            PulsarClient::<magnetar::MoonpoolEngine<moonpool_core::TokioProviders>>::from_moonpool(
+                shared, driver,
+            )
+        };
+        let lookup = client
+            .lookup_scalable_topic("topic://public/default/scaled")
+            .await
+            .expect("lookup through pair constructor");
+        assert_eq!(
+            lookup.resolved_topic_name.as_deref(),
+            Some("topic://public/default/scaled")
+        );
+        assert_eq!(lookup.epoch, 1);
+        assert_eq!(
+            lookup
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id)
+                .collect::<Vec<_>>(),
+            [magnetar::proto::SegmentId(1), magnetar::proto::SegmentId(2)]
+        );
+        client.close_scalable_topic_session(lookup.session_id);
+        cluster
+            .wait_for("pair constructor DAG cleanup", |fake| {
+                fake.resource_counts().layout_sessions == 0
+            })
+            .await;
+        let transaction = client
+            .new_transaction(Duration::from_secs(30))
+            .await
+            .expect("lazy coordinator from constructor");
+        assert_eq!(
+            client
+                .abort_transaction(transaction)
+                .await
+                .expect("abort constructor transaction"),
+            magnetar::TxnState::Aborted
+        );
+        let counts = cluster.inspect(M1FakeCluster::resource_counts);
+        assert_eq!(counts.pending_operations, 0);
+        assert_eq!(counts.child_consumers, 0);
+        assert_eq!(counts.unacked_messages, 0);
+        let observer = Arc::clone(client.shared());
+        client.close().await;
+        assert!(observer.inner.lock().is_closed());
+    }
 }

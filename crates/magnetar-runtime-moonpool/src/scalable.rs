@@ -5145,6 +5145,266 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn control_plane_open_uses_one_deadline_across_lookup_and_registration() {
+        let subscriber = subscriber_with_allow_list();
+        let shared = subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let started = tokio::time::Instant::now();
+        let mut open = Box::pin(subscriber.open_control_plane(
+            "topic://public/default/scaled",
+            "workers",
+            "worker-a",
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = magnetar_proto::decode_one(&mut bytes)
+            .expect("initial lookup")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup body");
+        assert!(bytes.is_empty());
+        tokio::time::advance(std::time::Duration::from_millis(600)).await;
+        let snapshot = control_plane_fixture().0;
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup.session_id,
+                    resolved_topic_name: Some(lookup.topic),
+                    controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                    controller_broker_url_tls: None,
+                    segments: snapshot.segments(),
+                    epoch: 1,
+                    snapshot,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let subscribe = magnetar_proto::decode_one(&mut bytes)
+            .expect("registration after lookup")
+            .command
+            .scalable_topic_subscribe
+            .expect("registration body");
+        assert!(bytes.is_empty());
+        tokio::time::advance(std::time::Duration::from_millis(400)).await;
+        assert!(matches!(
+            open.await,
+            Err(ClientError::ControllerUnavailable)
+        ));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
+        assert!(
+            shared
+                .inner
+                .lock()
+                .dag_snapshot(lookup.session_id)
+                .is_none()
+        );
+        assert!(
+            shared
+                .inner
+                .lock()
+                .scalable_consumer_assignment(subscribe.consumer_id)
+                .is_none()
+        );
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let close = magnetar_proto::decode_one(&mut bytes)
+            .expect("deadline closes only DAG immediately")
+            .command
+            .scalable_topic_close
+            .expect("DAG close body");
+        assert_eq!(close.session_id, lookup.session_id);
+        assert!(
+            bytes.is_empty(),
+            "leave waits for the admitted subscribe response"
+        );
+        let late_response = encode(&magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(
+                magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                    request_id: subscribe.request_id,
+                    assignment: Some(control_plane_fixture().1.to_pb()),
+                    error: None,
+                    message: None,
+                },
+            ),
+            ..Default::default()
+        });
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &late_response)
+            .expect("late successful registration response");
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let leave = magnetar_proto::decode_one(&mut bytes)
+            .expect("leave after late response")
+            .command
+            .scalable_topic_unsubscribe
+            .expect("leave body");
+        assert_eq!(leave.consumer_id, subscribe.consumer_id);
+        assert!(bytes.is_empty());
+        assert!(
+            shared
+                .inner
+                .lock()
+                .scalable_consumer_assignment(subscribe.consumer_id)
+                .is_none()
+        );
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &late_response)
+            .expect("duplicate late response is ignored");
+        assert!(shared.inner.lock().poll_transmit().is_empty());
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_connection_during_reconnect_epoch_alignment_fails_closed() {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let previous =
+            settled_controller_session(&shared, magnetar_proto::ControllerIncarnation(0));
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 41),
+            session_id: 41,
+            requested_topic: inner.topic.clone(),
+            resolved_topic_name: Some(inner.topic.clone()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        let mut reconnect = Box::pin(inner.reconnect_control_plane(dag, previous));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement lookup")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup body");
+        assert!(bytes.is_empty());
+        let snapshot = control_plane_fixture_at(2).0;
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup.session_id,
+                    resolved_topic_name: Some(inner.topic.clone()),
+                    controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                    controller_broker_url_tls: None,
+                    segments: snapshot.segments(),
+                    epoch: 2,
+                    snapshot,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let subscribe = magnetar_proto::decode_one(&mut bytes)
+            .expect("replacement registration")
+            .command
+            .scalable_topic_subscribe
+            .expect("registration body");
+        assert!(bytes.is_empty());
+        shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ScalableTopicSubscribeResponse
+                        as i32,
+                    scalable_topic_subscribe_response: Some(
+                        magnetar_proto::pb::CommandScalableTopicSubscribeResponse {
+                            request_id: subscribe.request_id,
+                            assignment: Some(control_plane_fixture().1.to_pb()),
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("successful older-epoch assignment");
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::ConsumerAssigned {
+                    consumer_id: subscribe.consumer_id,
+                    incarnation: magnetar_proto::ControllerIncarnation(1),
+                    assignment: control_plane_fixture().1,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(inner.state.lock().model.status().layout_epoch(), 1);
+        assert!(
+            shared.inner.lock().poll_transmit().is_empty(),
+            "alignment must not issue another open"
+        );
+        shared
+            .inner
+            .lock()
+            .fail_all_pending("terminal during epoch alignment");
+        shared.mark_no_driver();
+        shared.scalable_routes.close_all();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), reconnect)
+                .await
+                .expect("terminal alignment resolves")
+                .is_none()
+        );
+        assert!(inner.state.lock().terminal_error.is_some());
+        assert!(matches!(
+            inner.state.lock().model.phase(),
+            magnetar_proto::AggregatePhase::Closing | magnetar_proto::AggregatePhase::Closed
+        ));
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let close = magnetar_proto::decode_one(&mut bytes)
+            .expect("terminal DAG cleanup")
+            .command
+            .scalable_topic_close
+            .expect("DAG close body");
+        assert_eq!(close.session_id, lookup.session_id);
+        let leave = magnetar_proto::decode_one(&mut bytes)
+            .expect("terminal registration cleanup")
+            .command
+            .scalable_topic_unsubscribe
+            .expect("leave body");
+        assert_eq!(leave.consumer_id, subscribe.consumer_id);
+        assert!(
+            bytes.is_empty(),
+            "only the two exact cleanups, no Lookup or Subscribe replay"
+        );
+    }
+
     #[tokio::test]
     async fn aggregate_reconnect_retains_membership_while_reopening_control_plane() {
         let inner = empty_aggregate_inner();

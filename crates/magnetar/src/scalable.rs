@@ -572,18 +572,6 @@ impl Drop for RawDeliveryLease {
     }
 }
 
-impl<S: Schema> std::fmt::Debug for StreamConsumerShared<S> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StreamConsumerShared")
-            .field("topic", &self.topic)
-            .field("subscription", &self.subscription)
-            .field("consumer_name", &self.consumer_name)
-            .field("status", &self.backend.status())
-            .finish_non_exhaustive()
-    }
-}
-
 impl<S: Schema> Drop for StreamConsumerShared<S> {
     fn drop(&mut self) {
         self.backend.close_best_effort();

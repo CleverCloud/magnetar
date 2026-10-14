@@ -3981,3 +3981,407 @@ fn cancelled_scalable_resume_retains_the_confirmed_reconnect_assignment() {
     assert_eq!(cluster.resource_counts().scalable_members, 2);
     assert_eq!(cluster.resource_counts().pending_operations, 0);
 }
+
+#[test]
+fn malformed_scalable_unregister_preserves_the_registered_member() {
+    let mut cluster = M1FakeCluster::default();
+    let controller = connect(&mut cluster, Endpoint::Controller);
+    let member = register_member(&mut cluster, controller, "malformed-leave", "member", 7, 1);
+    let before = cluster.resource_counts();
+    let missing_body = pb::BaseCommand {
+        r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+        ..Default::default()
+    };
+    assert!(matches!(
+        send(&mut cluster, controller, &missing_body),
+        Err(M1FakeError::InvalidCommand { command, reason })
+            if command == pb::base_command::Type::ScalableTopicUnsubscribe
+                && reason == "missing generated CommandScalableTopicUnsubscribe body"
+    ));
+    assert_eq!(cluster.resource_counts(), before);
+    assert_eq!(cluster.member("malformed-leave", "member"), Some(member));
+    assert_eq!(cluster.assigned_owner("malformed-leave", 1), Some(member));
+    assert_eq!(cluster.assigned_owner("malformed-leave", 2), Some(member));
+    assert_eq!(take_frames(&mut cluster, controller).len(), 0);
+    send(
+        &mut cluster,
+        controller,
+        &pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+            scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                consumer_id: 7,
+                request_id: 2,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("the original member can still unregister");
+    let closed = take_frames(&mut cluster, controller);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("unregister success")
+            .request_id,
+        2
+    );
+    let mut expected = before;
+    expected.scalable_members -= 1;
+    assert_eq!(cluster.resource_counts(), expected);
+    assert_eq!(cluster.member("malformed-leave", "member"), None);
+}
+
+#[test]
+fn pending_scalable_registration_collision_preserves_the_original_operation() {
+    let mut cluster = M1FakeCluster::default();
+    let controller = connect(&mut cluster, Endpoint::Controller);
+    cluster
+        .script_next(
+            Endpoint::Controller,
+            OperationKind::ScalableOpen,
+            ScriptedBehavior::Delay,
+        )
+        .expect("hold the first registration");
+    send(
+        &mut cluster,
+        controller,
+        &scalable_subscribe_command(
+            TOPIC,
+            "pending-registration",
+            "member",
+            7,
+            1,
+            pb::ScalableConsumerType::Stream as i32,
+        ),
+    )
+    .expect("admit the original registration");
+    let original = cluster.pending_operations();
+    assert_eq!(original.len(), 1);
+    assert_eq!(original[0].kind, OperationKind::ScalableOpen);
+    assert_eq!(original[0].connection, controller);
+    assert_eq!(original[0].request_id, Some(1));
+    let member = MemberId::new(controller, 7);
+    assert_eq!(
+        cluster.member("pending-registration", "member"),
+        Some(member)
+    );
+    assert_eq!(take_frames(&mut cluster, controller).len(), 0);
+    let before = cluster.resource_counts();
+    assert_eq!(before.pending_scalable_opens, 1);
+    assert_eq!(before.scalable_members, 0);
+    send(
+        &mut cluster,
+        controller,
+        &scalable_subscribe_command(
+            TOPIC,
+            "pending-registration",
+            "member",
+            8,
+            2,
+            pb::ScalableConsumerType::Stream as i32,
+        ),
+    )
+    .expect("return a correlated collision response");
+    let rejected = take_frames(&mut cluster, controller);
+    assert_eq!(rejected.len(), 1);
+    let response = rejected[0]
+        .command
+        .scalable_topic_subscribe_response
+        .as_ref()
+        .expect("collision response");
+    assert_eq!(response.request_id, 2);
+    assert_eq!(response.error, Some(pb::ServerError::ConsumerBusy as i32));
+    assert_eq!(response.message.as_deref(), Some("scalable member is busy"));
+    assert_eq!(cluster.resource_counts(), before);
+    assert_eq!(cluster.pending_operations(), original);
+    assert_eq!(
+        cluster.member("pending-registration", "member"),
+        Some(member)
+    );
+    cluster
+        .complete_pending(original[0].id, PendingCompletion::Succeed)
+        .expect("the original registration still completes");
+    let completed = take_frames(&mut cluster, controller);
+    assert_eq!(completed.len(), 1);
+    let response = completed[0]
+        .command
+        .scalable_topic_subscribe_response
+        .as_ref()
+        .expect("original success");
+    assert_eq!(response.request_id, 1);
+    assert_eq!(response.error, None);
+    assert_eq!(
+        cluster.assigned_owner("pending-registration", 1),
+        Some(member)
+    );
+    assert_eq!(
+        cluster.assigned_owner("pending-registration", 2),
+        Some(member)
+    );
+    assert_eq!(cluster.resource_counts().scalable_members, 1);
+    assert_eq!(cluster.resource_counts().pending_operations, 0);
+}
+
+#[test]
+fn pending_child_open_endpoint_change_releases_only_its_retired_reservation() {
+    let mut cluster = M1FakeCluster::default();
+    let old_connection = connect(&mut cluster, Endpoint::Segment(1));
+    let replacement_connection = connect(&mut cluster, Endpoint::Segment(2));
+    let topic = cluster.segment_topic(1).expect("canonical child topic");
+    let before = cluster.resource_counts();
+    cluster
+        .script_next(
+            Endpoint::Segment(1),
+            OperationKind::SegmentOpen,
+            ScriptedBehavior::Delay,
+        )
+        .expect("hold the old endpoint open");
+    send(
+        &mut cluster,
+        old_connection,
+        &segment_subscribe_command(
+            &topic,
+            "moved-child",
+            "old",
+            1,
+            7,
+            1,
+            pb::command_subscribe::SubType::Exclusive,
+        ),
+    )
+    .expect("reserve the original physical child");
+    let old_pending = cluster.pending_operations()[0].id;
+    assert_eq!(cluster.resource_counts().pending_child_opens, 1);
+    let mut moved = root_layout();
+    moved[0].endpoint = Some(Endpoint::Segment(2));
+    cluster
+        .advance_layout(2, moved)
+        .expect("move the existing segment endpoint");
+    assert_eq!(cluster.segment_endpoint(1), Some(Endpoint::Segment(2)));
+    assert!(
+        matches!(cluster.complete_pending(old_pending, PendingCompletion::Succeed),
+        Err(M1FakeError::StalePending(id)) if id == old_pending)
+    );
+    assert_eq!(cluster.resource_counts(), before);
+    assert_eq!(take_frames(&mut cluster, old_connection).len(), 0);
+    cluster
+        .script_next(
+            Endpoint::Segment(2),
+            OperationKind::SegmentOpen,
+            ScriptedBehavior::Delay,
+        )
+        .expect("hold the replacement endpoint open");
+    send(
+        &mut cluster,
+        replacement_connection,
+        &segment_subscribe_command(
+            &topic,
+            "moved-child",
+            "replacement",
+            1,
+            8,
+            2,
+            pb::command_subscribe::SubType::Exclusive,
+        ),
+    )
+    .expect("reserve the replacement after the retired reservation was released");
+    let replacement = cluster.pending_operations();
+    assert_eq!(replacement.len(), 1);
+    assert_ne!(replacement[0].id, old_pending);
+    assert_eq!(replacement[0].connection, replacement_connection);
+    assert_eq!(replacement[0].endpoint, Endpoint::Segment(2));
+    assert_eq!(replacement[0].request_id, Some(2));
+    let reserved = cluster.resource_counts();
+    assert_eq!(reserved.pending_child_opens, 1);
+    assert!(
+        matches!(cluster.complete_pending(old_pending, PendingCompletion::Succeed),
+        Err(M1FakeError::UnknownPending(id)) if id == old_pending)
+    );
+    assert_eq!(cluster.resource_counts(), reserved);
+    assert_eq!(cluster.pending_operations(), replacement);
+    assert_eq!(take_frames(&mut cluster, replacement_connection).len(), 0);
+    cluster
+        .complete_pending(replacement[0].id, PendingCompletion::Succeed)
+        .expect("the replacement reservation remains valid");
+    let opened = take_frames(&mut cluster, replacement_connection);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0]
+            .command
+            .success
+            .as_ref()
+            .expect("replacement success")
+            .request_id,
+        2
+    );
+    assert_eq!(
+        cluster.active_child_consumer("moved-child", 1, "replacement-seg-1"),
+        Some(MemberId::new(replacement_connection, 8))
+    );
+    assert_eq!(cluster.resource_counts().child_consumers, 1);
+    assert_eq!(cluster.resource_counts().pending_operations, 0);
+    send(&mut cluster, replacement_connection, &close_command(8, 3))
+        .expect("close the replacement child");
+    let closed = take_frames(&mut cluster, replacement_connection);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("replacement close success")
+            .request_id,
+        3
+    );
+    assert_eq!(cluster.resource_counts(), before);
+}
+
+#[test]
+fn delayed_ack_after_physical_close_preserves_the_replacement_generation() {
+    let mut cluster = M1FakeCluster::default();
+    let child = connect(&mut cluster, Endpoint::Segment(1));
+    let topic = cluster.segment_topic(1).expect("canonical child topic");
+    cluster
+        .enqueue_message(1, Bytes::from_static(b"physical-generation"))
+        .expect("retain a replayable message");
+    let before = cluster.resource_counts();
+    send(
+        &mut cluster,
+        child,
+        &segment_subscribe_command(
+            &topic,
+            "generation-sub",
+            "old",
+            1,
+            7,
+            1,
+            pb::command_subscribe::SubType::Exclusive,
+        ),
+    )
+    .expect("open the original physical child");
+    let opened = take_frames(&mut cluster, child);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0]
+            .command
+            .success
+            .as_ref()
+            .expect("original open success")
+            .request_id,
+        1
+    );
+    send(&mut cluster, child, &flow_command(7, 1)).expect("deliver to the original child");
+    let original = take_frames(&mut cluster, child);
+    assert_eq!(original.len(), 1);
+    assert_eq!(
+        original[0].payload.as_ref().expect("original payload").body,
+        Bytes::from_static(b"physical-generation")
+    );
+    let original_id = message_id(&original);
+    cluster
+        .script_next(
+            Endpoint::Segment(1),
+            OperationKind::Ack,
+            ScriptedBehavior::Delay,
+        )
+        .expect("hold the original generation acknowledgement");
+    send(&mut cluster, child, &ack_command(7, 2, original_id))
+        .expect("admit the original acknowledgement");
+    let old_ack = cluster.pending_operations()[0].id;
+    send(&mut cluster, child, &close_command(7, 3)).expect("close the original child");
+    let closed = take_frames(&mut cluster, child);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("original close success")
+            .request_id,
+        3
+    );
+    send(
+        &mut cluster,
+        child,
+        &segment_subscribe_command(
+            &topic,
+            "generation-sub",
+            "replacement",
+            1,
+            7,
+            4,
+            pb::command_subscribe::SubType::Exclusive,
+        ),
+    )
+    .expect("reuse the completed-close physical ID for a new generation");
+    let reopened = take_frames(&mut cluster, child);
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(
+        reopened[0]
+            .command
+            .success
+            .as_ref()
+            .expect("replacement open success")
+            .request_id,
+        4
+    );
+    assert_eq!(
+        cluster.active_child_consumer("generation-sub", 1, "replacement-seg-1"),
+        Some(MemberId::new(child, 7))
+    );
+    send(&mut cluster, child, &flow_command(7, 1)).expect("replay to the replacement generation");
+    let replay = take_frames(&mut cluster, child);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(
+        replay[0]
+            .payload
+            .as_ref()
+            .expect("replacement payload")
+            .body,
+        Bytes::from_static(b"physical-generation")
+    );
+    let mut expected = cluster.resource_counts();
+    assert_eq!(expected.unacked_messages, 1);
+    assert_eq!(expected.pending_operations, 1);
+    expected.pending_operations -= 1;
+    let cursor = cluster.durable_cursor("generation-sub", 1);
+    assert!(
+        matches!(cluster.complete_pending(old_ack, PendingCompletion::Succeed),
+        Err(M1FakeError::StalePending(id)) if id == old_ack)
+    );
+    assert_eq!(cluster.resource_counts(), expected);
+    assert_eq!(cluster.durable_cursor("generation-sub", 1), cursor);
+    assert_eq!(
+        cluster.active_child_consumer("generation-sub", 1, "replacement-seg-1"),
+        Some(MemberId::new(child, 7))
+    );
+    assert_eq!(take_frames(&mut cluster, child).len(), 0);
+    send(&mut cluster, child, &ack_command(7, 5, message_id(&replay)))
+        .expect("the replacement can acknowledge its replay");
+    let acknowledged = take_frames(&mut cluster, child);
+    assert_eq!(acknowledged.len(), 1);
+    let response = acknowledged[0]
+        .command
+        .ack_response
+        .as_ref()
+        .expect("replacement ACK response");
+    assert_eq!(response.request_id, Some(5));
+    assert_eq!(response.consumer_id, 7);
+    assert_eq!(response.error, None);
+    assert_eq!(cluster.durable_cursor("generation-sub", 1), Some(1));
+    send(&mut cluster, child, &close_command(7, 6)).expect("close the replacement generation");
+    let closed = take_frames(&mut cluster, child);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0]
+            .command
+            .success
+            .as_ref()
+            .expect("replacement close success")
+            .request_id,
+        6
+    );
+    assert_eq!(cluster.resource_counts(), before);
+}

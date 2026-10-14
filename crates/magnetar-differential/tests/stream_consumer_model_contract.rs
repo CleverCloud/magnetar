@@ -2631,3 +2631,87 @@ fn bucket_cumulative_positions_ack_only_live_deliveries_and_preserve_resolved_to
         .expect("confirm child cleanup");
     assert_eq!(aggregate.budget().data_used(), 0);
 }
+
+#[test]
+fn late_cumulative_confirmation_does_not_confirm_a_redelivery_generation() {
+    let (mut aggregate, generation, flow) = opened_one_child();
+    let (older, refill) = issue_delivery(&mut aggregate, 1, generation, flow, 10);
+    let old_ack = aggregate
+        .admit_cumulative_acknowledgement(&older)
+        .expect("admit original cumulative ACK");
+    let (redelivery, _) =
+        issue_delivery(&mut aggregate, 1, generation, flow_reservation(&refill), 5);
+    aggregate
+        .settle_acknowledgement(&old_ack.authority, &BTreeSet::from([source(1)]))
+        .expect("settle original generation");
+    assert!(matches!(
+        aggregate.validate_delivery_restoration(&older),
+        Err(StreamConsumerModelError::StaleDeliveryToken)
+    ));
+    aggregate
+        .validate_delivery_restoration(&redelivery)
+        .expect("redelivery lease remains live");
+    let current = aggregate
+        .admit_cumulative_acknowledgement(&redelivery)
+        .expect("new generation still requires acknowledgement");
+    assert_eq!(current.components.len(), 1);
+    assert_eq!(current.components[0].message_ids(), &[message_id(5)]);
+    aggregate
+        .settle_acknowledgement(&current.authority, &BTreeSet::from([source(1)]))
+        .expect("confirm redelivery generation");
+    aggregate.close().expect("close aggregate");
+    aggregate
+        .child_closed(SegmentId(1), generation)
+        .expect("close child");
+    assert_eq!(aggregate.budget().data_used(), 0);
+}
+
+#[test]
+fn bucket_position_before_remaining_deliveries_emits_no_acknowledgement() {
+    let mut aggregate = model();
+    let mut wire = assignment(&[1]).to_pb();
+    wire.segments[0].bucket_ranges = vec![pb::IntRange { start: 0, end: 10 }];
+    let assignment = ConsumerAssignment::try_from_pb(&wire, "topic://public/default/model")
+        .expect("bucket-shared assignment");
+    let open = aggregate.apply_assignment(assignment).expect("assignment");
+    let generation = opened_generation(&open[0]);
+    let flow = aggregate
+        .child_opened(SegmentId(1), generation)
+        .expect("open child");
+    let (earlier, refill) =
+        issue_delivery(&mut aggregate, 1, generation, flow_reservation(&flow), 3);
+    let saved = earlier.position_vector().clone();
+    let (later, _) = issue_delivery(&mut aggregate, 1, generation, flow_reservation(&refill), 7);
+    let individual = aggregate
+        .admit_individual_acknowledgement(&earlier)
+        .expect("ACK earlier");
+    aggregate
+        .settle_acknowledgement(&individual.authority, &BTreeSet::from([source(1)]))
+        .expect("confirm individual without a cumulative watermark");
+    let before = aggregate.budget().data_used();
+    let position = aggregate
+        .admit_position_acknowledgement(&saved)
+        .expect("older valid position");
+    assert!(
+        position.components.is_empty(),
+        "no tracked delivery lies before this position"
+    );
+    aggregate
+        .settle_acknowledgement(&position.authority, &BTreeSet::new())
+        .expect("empty acknowledgement settles");
+    assert_eq!(aggregate.budget().data_used(), before);
+    aggregate
+        .validate_delivery_restoration(&later)
+        .expect("later delivery remains live");
+    let later_ack = aggregate
+        .admit_individual_acknowledgement(&later)
+        .expect("ACK later");
+    aggregate
+        .settle_acknowledgement(&later_ack.authority, &BTreeSet::from([source(1)]))
+        .expect("confirm later delivery");
+    aggregate.close().expect("close aggregate");
+    aggregate
+        .child_closed(SegmentId(1), generation)
+        .expect("close child");
+    assert_eq!(aggregate.budget().data_used(), 0);
+}
