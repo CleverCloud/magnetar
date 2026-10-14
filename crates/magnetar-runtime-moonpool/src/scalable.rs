@@ -1618,22 +1618,21 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
 
     fn spawn_control_task(self: &Arc<Self>, dag: DagSession, controller: ControllerSession) {
         let mut state = self.state.lock();
-        if !state.close_state.is_closing() {
-            let inner = self.clone();
-            let completion_inner = Arc::downgrade(self);
-            let handle = self.subscriber.spawn_task_with_completion(
-                "scalable-control",
-                async move {
-                    inner.control_loop(dag, controller).await;
-                },
-                move || {
-                    if let Some(inner) = completion_inner.upgrade() {
-                        inner.notify.notify_waiters();
-                    }
-                },
-            );
-            Self::track_task(&mut state, handle);
-        }
+        // Called only while opening, before the public handle can close the aggregate.
+        let inner = self.clone();
+        let completion_inner = Arc::downgrade(self);
+        let handle = self.subscriber.spawn_task_with_completion(
+            "scalable-control",
+            async move {
+                inner.control_loop(dag, controller).await;
+            },
+            move || {
+                if let Some(inner) = completion_inner.upgrade() {
+                    inner.notify.notify_waiters();
+                }
+            },
+        );
+        Self::track_task(&mut state, handle);
     }
 
     fn spawn_open_task(
@@ -1895,10 +1894,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 Ok(Vec::new())
             }
         };
-        let result = match closed {
-            Ok(actions) => self.execute_actions(actions).await,
-            Err(error) => Err(error.into()),
-        };
+        let result = self.execute_actions(closed?).await;
         match close_error {
             Some(error) if result.is_ok() => Err(error),
             _ => result,
@@ -5513,6 +5509,234 @@ mod tests {
         let status = consumer.status();
         assert_eq!(status.phase(), AggregatePhase::Closed);
         assert_eq!(status.receiver_budget_used(), 0);
+    }
+
+    fn complete_controller_assignment(
+        shared: &Arc<ConnectionShared>,
+        request_id: u64,
+        assignment: magnetar_proto::pb::ScalableConsumerAssignment,
+    ) {
+        use magnetar_proto::pb::base_command::Type;
+        use magnetar_proto::pb::{BaseCommand, CommandScalableTopicSubscribeResponse};
+        let response = encode(&BaseCommand {
+            r#type: Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(CommandScalableTopicSubscribeResponse {
+                request_id,
+                assignment: Some(assignment),
+                error: None,
+                message: None,
+            }),
+            ..Default::default()
+        });
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &response)
+            .expect("valid correlated controller response");
+        crate::driver::drain_scalable_events_for_test(shared);
+    }
+
+    fn assert_control_plane_released(
+        shared: &Arc<ConnectionShared>,
+        consumer_id: u64,
+        session_id: u64,
+    ) {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let leave = magnetar_proto::decode_one(&mut bytes)
+            .expect("terminal registration leave")
+            .command
+            .scalable_topic_unsubscribe
+            .expect("leave body");
+        assert_eq!(leave.consumer_id, consumer_id);
+        let close = magnetar_proto::decode_one(&mut bytes)
+            .expect("terminal DAG close")
+            .command
+            .scalable_topic_close
+            .expect("close body");
+        assert_eq!(close.session_id, session_id);
+        assert!(
+            bytes.is_empty(),
+            "only exact leave and DAG close; no child or control-plane replay"
+        );
+        let conn = shared.inner.lock();
+        assert!(conn.dag_snapshot(session_id).is_none());
+        assert!(conn.scalable_consumer_assignment(consumer_id).is_none());
+        assert!(shared.scalable_routes.state.lock().routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_open_rejects_noncanonical_resolved_parent_and_releases_sessions() {
+        use magnetar_proto::{
+            self as proto, ReceiverBudget, SegmentTopicError, StreamConsumerModelError,
+        };
+        use proto::pb::ScalableConsumerAssignment;
+        let subscriber = subscriber_with_allow_list();
+        let shared = Arc::clone(&subscriber.bootstrap);
+        let routes = &shared.scalable_routes;
+        connect_shared(&shared);
+        let parent = "persistent://public/default/scaled";
+        let mut open = Box::pin(subscriber.subscribe_stream_consumer(StreamConsumerOptions {
+            topic: parent.to_owned(),
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+            schema: proto::pb::Schema::default(),
+            receiver_budget: ReceiverBudget::bytes(16 * 1024 * 1024).expect("budget"),
+            ordering_mode: proto::OrderingMode::BrokerManaged,
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = proto::decode_one(&mut bytes)
+            .expect("lookup")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup body");
+        assert_eq!(lookup.topic, parent);
+        assert!(bytes.is_empty());
+        let snapshot = control_plane_fixture().0;
+        assert!(
+            routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup.session_id,
+                    resolved_topic_name: Some(parent.to_owned()),
+                    controller_broker_url: None,
+                    controller_broker_url_tls: None,
+                    epoch: snapshot.epoch(),
+                    segments: snapshot.segments(),
+                    snapshot,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let subscribe = proto::decode_one(&mut bytes)
+            .expect("subscribe")
+            .command
+            .scalable_topic_subscribe
+            .expect("subscribe body");
+        assert_eq!(subscribe.topic, parent);
+        assert!(bytes.is_empty());
+        complete_controller_assignment(
+            &shared,
+            subscribe.request_id,
+            ScalableConsumerAssignment {
+                layout_epoch: 1,
+                segments: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(tokio::time::timeout(std::time::Duration::from_secs(1), open).await.expect("open resolves"),
+            Err(StreamConsumerError::Model(StreamConsumerModelError::SegmentTopic(SegmentTopicError::InvalidParent { topic }))) if topic == parent)
+        );
+        assert_control_plane_released(&shared, subscribe.consumer_id, lookup.session_id);
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_assignment_for_a_segment_absent_from_its_dag() {
+        use magnetar_proto::{self as proto, AttachmentError, SegmentId};
+        let inner = empty_aggregate_inner();
+        let shared = Arc::clone(&inner.subscriber.bootstrap);
+        let routes = &shared.scalable_routes;
+        connect_shared(&shared);
+        let incarnation = shared
+            .allocate_controller_incarnation()
+            .expect("initial incarnation");
+        assert_eq!(
+            incarnation,
+            inner.state.lock().model.controller_incarnation()
+        );
+        let previous = settled_controller_session(&shared, incarnation);
+        let actions = inner
+            .state
+            .lock()
+            .model
+            .require_resync()
+            .expect("fence initial baseline");
+        inner
+            .execute_actions(actions)
+            .await
+            .expect("settle cancelled initial open");
+        let dag = DagSession {
+            shared: Arc::clone(&shared),
+            route: claim_dag(&shared, 41),
+            session_id: 41,
+            requested_topic: ToOwned::to_owned(&inner.topic),
+            resolved_topic_name: Some(ToOwned::to_owned(&inner.topic)),
+            controller_broker_url: None,
+            controller_broker_url_tls: None,
+            snapshot: control_plane_fixture().0,
+            closed: true,
+        };
+        let mut reconnect = Box::pin(inner.reconnect_control_plane(dag, previous));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let lookup = proto::decode_one(&mut bytes)
+            .expect("replacement lookup")
+            .command
+            .scalable_topic_lookup
+            .expect("lookup body");
+        assert!(bytes.is_empty());
+        let snapshot = control_plane_fixture().0;
+        assert!(
+            routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup.session_id,
+                    resolved_topic_name: Some(ToOwned::to_owned(&inner.topic)),
+                    controller_broker_url: None,
+                    controller_broker_url_tls: None,
+                    epoch: snapshot.epoch(),
+                    segments: snapshot.segments(),
+                    snapshot,
+                })
+                .is_none()
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let subscribe = proto::decode_one(&mut bytes)
+            .expect("replacement subscribe")
+            .command
+            .scalable_topic_subscribe
+            .expect("subscribe body");
+        assert_eq!(subscribe.consumer_id, 42);
+        assert!(bytes.is_empty());
+        let mut assignment = control_plane_fixture().1.to_pb();
+        assignment.segments[0].segment_id = 99;
+        assignment.segments[0].segment_topic =
+            proto::canonical_segment_topic(&inner.topic, proto::KeyRange::FULL, SegmentId(99))
+                .expect("canonical attachment");
+        complete_controller_assignment(&shared, subscribe.request_id, assignment);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), reconnect)
+                .await
+                .expect("rejection resolves")
+                .is_none()
+        );
+        let expected = AttachmentError::UnknownSegment {
+            segment_id: SegmentId(99),
+        }
+        .to_string();
+        let state = inner.state.lock();
+        assert_eq!(state.terminal_error.as_deref(), Some(expected.as_str()));
+        assert_eq!(state.model.controller_incarnation(), incarnation);
+        assert_eq!(state.model.status().receiver_budget_used(), 0);
+        assert!(state.children.is_empty());
+        drop(state);
+        assert_control_plane_released(&shared, subscribe.consumer_id, lookup.session_id);
     }
 
     #[tokio::test]

@@ -1042,7 +1042,11 @@ async fn supervised_driver_loop(
         // stable". A socket that died inside `drop_grace` (or never handshaked
         // at all, behind a TCP-accepting proxy) resets neither.
         let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
-        if cfg.should_reset_backoff(socket_alive_since.elapsed()) {
+        if !shared
+            .pending_rebuild
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && cfg.should_reset_backoff(socket_alive_since.elapsed())
+        {
             backoff.reset();
             give_up_attempts = 0;
         }
@@ -1408,6 +1412,22 @@ where
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
     let mut pending_write = PendingDriverWrite::new();
     let mut close_after_write = false;
+    // A TCP redial may accept CONNECT without ever completing the protocol
+    // handshake. Anchor one budget across reads, auth challenges and wakeups.
+    let handshake_started_at = tokio::time::Instant::now().into_std();
+    let mut handshake_deadline = {
+        let conn = shared.inner.lock();
+        (shared
+            .pending_rebuild
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !conn.is_connected())
+        .then(|| {
+            magnetar_proto::time::deadline_with_clamp(
+                handshake_started_at,
+                conn.operation_timeout(),
+            )
+        })
+    };
     // ADR-0083: the write's `operation_timeout` deadline, anchored to a
     // fixed `tokio::time::Instant` set the moment a logical write FIRST has
     // work and cleared once it fully drains — NOT recomputed fresh every
@@ -1455,6 +1475,9 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
+            if conn.is_connected() || closing {
+                handshake_deadline = None;
+            }
             (out, dl, closing, conn.operation_timeout())
         } else {
             let conn = shared.inner.lock();
@@ -1465,12 +1488,31 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
+            if conn.is_connected() || closing {
+                handshake_deadline = None;
+            }
             (
                 magnetar_proto::TransmitOwned::Contiguous(bytes::Bytes::new()),
                 dl,
                 closing,
                 conn.operation_timeout(),
             )
+        };
+        // Check before select: ready reads or wakeups must not starve expiry.
+        if handshake_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline)
+        {
+            shared.inner.lock().mark_disconnected();
+            wake_close_waiters(shared);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection handshake deadline exceeded",
+            )
+            .into());
+        }
+        let deadline = match (deadline, handshake_deadline) {
+            (Some(protocol), Some(handshake)) => Some(protocol.min(handshake)),
+            (protocol, handshake) => protocol.or(handshake),
         };
         close_after_write |= should_close;
         if pending_write.is_empty() {

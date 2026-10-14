@@ -7303,16 +7303,8 @@ impl Connection {
             crate::consumer::ConsumerTerminalOperation::Pending { request_id, .. } => {
                 return Ok(request_id);
             }
-            crate::consumer::ConsumerTerminalOperation::Complete {
-                request_id: Some(request_id),
-                ..
-            } => {
-                return Ok(request_id);
-            }
-            crate::consumer::ConsumerTerminalOperation::Complete {
-                request_id: None, ..
-            } => {
-                return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+            crate::consumer::ConsumerTerminalOperation::Complete { request_id, .. } => {
+                return request_id.ok_or(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
             }
             crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
                 return Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress);

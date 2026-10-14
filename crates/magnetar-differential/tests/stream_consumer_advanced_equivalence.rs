@@ -6820,3 +6820,124 @@ async fn terminal_client_during_registration_is_equivalent() {
     .await;
     assert_eq!(tokio, moonpool);
 }
+
+async fn observe_atomic_delivery_budget_pressure<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> (usize, usize, ResourceCounts)
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    use magnetar::proto::{AggregatePhase, BudgetError, StreamConsumerModelError};
+    const MEMBERS: usize = 6_000;
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("delivery-budget-sub")
+        .consumer_name("delivery-budget-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe delivery-budget aggregate");
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    let initial_budget = consumer.status().receiver_budget_used();
+    // One ordinary broker batch is admitted atomically; each member retains
+    // its canonical 94-word mask as well as independent delivery authority.
+    let payload = encoded_batch(&vec![b"".as_slice(); MEMBERS]);
+    let entry = cluster
+        .update(|fake| {
+            fake.enqueue_message_with_metadata(
+                1,
+                magnetar::proto::pb::MessageMetadata {
+                    num_messages_in_batch: Some(i32::try_from(MEMBERS).expect("batch count fits")),
+                    ..Default::default()
+                },
+                payload,
+                Vec::new(),
+            )
+        })
+        .expect("enqueue valid packed empty members");
+    assert_eq!(entry, (1, 0));
+    cluster
+        .wait_for("single broker batch dispatched", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        while consumer.status().receiver_budget_used() <= initial_budget {
+            assert_eq!(consumer.status().phase(), AggregatePhase::Open);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("packed batch is retained before attempting delivery authority");
+    let before = consumer.status();
+    assert_eq!(before.phase(), AggregatePhase::Open);
+    let error = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        consumer.receive_batch(
+            BatchReceivePolicy::new(MEMBERS, 1, Duration::from_secs(1))
+                .expect("empty payloads all fit the positive byte cap"),
+        ),
+    )
+    .await
+    .expect("batch reservation resolves")
+    .expect_err("retained batch fits, but all delivery authorities cannot fit together");
+    let (requested, available) = match error {
+        magnetar::scalable::StreamConsumerError::Model(StreamConsumerModelError::Budget(
+            BudgetError::Exhausted {
+                requested,
+                available,
+            },
+        )) => (requested, available),
+        unexpected => panic!("unexpected delivery authority failure: {unexpected:?}"),
+    };
+    assert!(requested > available);
+    assert_eq!(
+        consumer.status(),
+        before,
+        "failed staged issuance is atomic"
+    );
+    assert_eq!(
+        cluster.inspect(|fake| fake.resource_counts().unacked_messages),
+        1
+    );
+    assert!(cluster.inspect(|fake| {
+        command_segments(fake, magnetar::proto::pb::base_command::Type::Ack).is_empty()
+    }));
+    let first = receive(&consumer).await;
+    assert_eq!(first.payload(), &[] as &[u8]);
+    assert_eq!(first.source().segment_id().0, 1);
+    let id = first
+        .message_id()
+        .ordinary_message_id_data()
+        .expect("canonical first member id");
+    assert_eq!(
+        (id.ledger_id, id.entry_id, id.batch_index, id.batch_size),
+        (1, 0, Some(0), Some(6_000))
+    );
+    assert_eq!(id.ack_set.len(), 94);
+    assert_eq!(first.delivery_token().dequeue_sequence().0, 0);
+    let observed = ToOwned::to_owned(&consumer);
+    let after_close = close_and_count(consumer, cluster).await;
+    assert_eq!(observed.status().receiver_budget_used(), 0);
+    assert_eq!(after_close.scalable_members, 0);
+    assert_eq!(after_close.unacked_messages, 0);
+    (requested, available, after_close)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_authority_budget_failure_is_atomic_and_equivalent() {
+    let _guard = advanced_socket_test_guard();
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let tokio = observe_atomic_delivery_budget_pressure(&client, &cluster).await;
+    client.close().await;
+    drop(cluster);
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let moonpool = observe_atomic_delivery_budget_pressure(&client, &cluster).await;
+    client.close().await;
+    assert_eq!(tokio, moonpool);
+}

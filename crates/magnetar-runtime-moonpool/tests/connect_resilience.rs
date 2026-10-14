@@ -48,9 +48,9 @@
 //!
 //! ## Runtime-test-parity
 //!
-//! Four `#[test]` functions live here (two dial-cap, two handshake-bound);
-//! the mirrored `magnetar-runtime-tokio/tests/connect_resilience.rs`
-//! carries four of its own so `check-runtime-test-parity` stays 1:1
+//! Four simulated initial-connect tests and two loopback redial tests live
+//! here; `magnetar-runtime-tokio/tests/connect_resilience.rs` carries six
+//! mirrors so `check-runtime-test-parity` stays 1:1
 //! (ADR-0024).
 
 #![allow(clippy::expect_used)]
@@ -599,4 +599,192 @@ fn moonpool_silent_broker_error_is_timed_out_io() {
         "silent-broker handshake must surface ErrorKind::TimedOut, message was: {:?}",
         captured.lock().take(),
     );
+}
+
+/// Require the replacement socket to have reached the binary handshake.
+async fn read_reconnect_connect(silent: &mut (impl AsyncRead + Unpin)) {
+    let mut input = BytesMut::new();
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let n = silent.read(&mut chunk).await.expect("read CONNECT");
+        assert_ne!(n, 0);
+        input.extend_from_slice(&chunk[..n]);
+        let mut frame_bytes = ToOwned::to_owned(&input).freeze();
+        match decode_one(&mut frame_bytes) {
+            Ok(frame) => {
+                assert_eq!(frame.command.r#type, pb::base_command::Type::Connect as i32);
+                break;
+            }
+            Err(FrameError::Incomplete { .. }) => {}
+            Err(error) => panic!("invalid CONNECT: {error:?}"),
+        }
+    }
+}
+
+/// A successful TCP redial is not a completed Pulsar handshake. A silent
+/// replacement must be abandoned so the supervisor can try a healthy session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_silent_reconnect_handshake_is_abandoned() {
+    let engine = MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let listener = engine
+        .providers()
+        .network()
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    let silent_connect = std::sync::Arc::new(tokio::sync::Notify::new());
+    let abandoned = std::sync::Arc::new(tokio::sync::Notify::new());
+    let broker = {
+        let disconnect = ToOwned::to_owned(&disconnect);
+        let silent_connect = ToOwned::to_owned(&silent_connect);
+        let abandoned = ToOwned::to_owned(&abandoned);
+        tokio::spawn(async move {
+            let (initial, _) = listener.accept().await.expect("initial accept");
+            let initial = tokio::spawn(handle_session(initial));
+            disconnect.notified().await;
+            initial.abort();
+            assert!(
+                initial
+                    .await
+                    .expect_err("initial socket dropped")
+                    .is_cancelled()
+            );
+
+            let (mut silent, _) = listener.accept().await.expect("silent accept");
+            read_reconnect_connect(&mut silent).await;
+            silent_connect.notify_one();
+            // Intentionally neither reply nor close: TCP establishment succeeds,
+            // but the protocol handshake makes no progress.
+            let mut unexpected = [0_u8; 1];
+            assert_eq!(
+                silent
+                    .read(&mut unexpected)
+                    .await
+                    .expect("silent socket EOF"),
+                0
+            );
+            abandoned.notify_one();
+            let (recovered, _) = listener.accept().await.expect("recovered accept");
+            handle_session(recovered).await.expect("recovered session");
+        })
+    };
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(250),
+        supervisor: Some(magnetar_proto::SupervisorConfig {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+            ..magnetar_proto::SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    };
+    let client = Client::connect_plain_supervised(&engine, &addr, config, None, None)
+        .await
+        .expect("initial handshake");
+    disconnect.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), silent_connect.notified())
+        .await
+        .expect("supervisor sent CONNECT on the replacement socket");
+    assert!(
+        !client.is_connected(),
+        "silent replacement is not connected"
+    );
+    let abandonment = tokio::time::timeout(Duration::from_secs(5), abandoned.notified()).await;
+    let recovery = if abandonment.is_ok() {
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !client.is_connected() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+    let closed = tokio::time::timeout(Duration::from_secs(5), client.close()).await;
+    broker.abort();
+    let _ = broker.await;
+    assert!(
+        abandonment.is_ok(),
+        "supervisor never abandoned the silent CONNECT handshake"
+    );
+    assert!(
+        matches!(recovery, Some(Ok(()))),
+        "supervisor did not recover on the next connection"
+    );
+    assert!(closed.is_ok(), "client close must finish");
+}
+
+/// A socket that never handshakes cannot reset the finite reconnect budget,
+/// even when it stays open longer than the supervisor's stability window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_silent_handshakes_exhaust_attempt_budget() {
+    let engine = MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let listener = engine
+        .providers()
+        .network()
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let broker = {
+        let disconnect = ToOwned::to_owned(&disconnect);
+        let attempts = ToOwned::to_owned(&attempts);
+        tokio::spawn(async move {
+            let (initial, _) = listener.accept().await.expect("initial accept");
+            let initial = tokio::spawn(handle_session(initial));
+            disconnect.notified().await;
+            initial.abort();
+            assert!(
+                initial
+                    .await
+                    .expect_err("initial socket dropped")
+                    .is_cancelled()
+            );
+            loop {
+                let (mut silent, _) = listener.accept().await.expect("redial accept");
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut input = [0_u8; 4096];
+                // Read CONNECT, but never reply. Only peer EOF ends this session.
+                while silent.read(&mut input).await.expect("read until EOF") != 0 {}
+            }
+        })
+    };
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(100),
+        keepalive_interval: Duration::from_millis(50),
+        supervisor: Some(magnetar_proto::SupervisorConfig {
+            max_attempts: Some(2),
+            drop_grace: Duration::from_millis(10),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+            ..magnetar_proto::SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    };
+    let client = Client::connect_plain_supervised(&engine, &addr, config, None, None)
+        .await
+        .expect("initial handshake");
+    disconnect.notify_one();
+    let exhausted = tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.shared().is_no_driver() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let observed = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    let closed = tokio::time::timeout(Duration::from_secs(5), client.close()).await;
+    broker.abort();
+    let _ = broker.await;
+    assert!(
+        exhausted.is_ok(),
+        "silent handshakes reset the retry budget"
+    );
+    assert_eq!(observed, 2, "only the configured redials are permitted");
+    assert!(closed.is_ok(), "client close must finish");
 }
