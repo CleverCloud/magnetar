@@ -65,7 +65,8 @@ async fn persistence_get_set_remove_cycle() {
     let pol = admin
         .namespace_get_persistence("acme/svc")
         .await
-        .expect("get persistence");
+        .expect("get persistence")
+        .expect("persistence policy is set");
     assert_eq!(pol.bookkeeper_ensemble, 3);
     assert_eq!(pol.bookkeeper_write_quorum, 2);
     assert_eq!(pol.bookkeeper_ack_quorum, 2);
@@ -129,7 +130,8 @@ async fn dispatch_rate_get_set_remove_cycle() {
     let rate = admin
         .namespace_get_dispatch_rate("acme/svc")
         .await
-        .expect("get dispatch rate");
+        .expect("get dispatch rate")
+        .expect("dispatch rate is set");
     assert_eq!(rate.dispatch_throttling_rate_in_msg, 1000);
     assert_eq!(rate.dispatch_throttling_rate_in_byte, 1_048_576);
     assert_eq!(rate.rate_period_in_second, 1);
@@ -199,7 +201,8 @@ async fn subscription_dispatch_rate_get_set_remove_cycle() {
     let rate = admin
         .namespace_get_subscription_dispatch_rate("acme/svc")
         .await
-        .expect("get subscription dispatch rate");
+        .expect("get subscription dispatch rate")
+        .expect("subscription dispatch rate is set");
     assert_eq!(rate.dispatch_throttling_rate_in_msg, 500);
     assert_eq!(rate.dispatch_throttling_rate_in_byte, 524_288);
 
@@ -261,7 +264,8 @@ async fn replicator_dispatch_rate_get_set_remove_cycle() {
     let rate = admin
         .namespace_get_replicator_dispatch_rate("acme/svc")
         .await
-        .expect("get replicator dispatch rate");
+        .expect("get replicator dispatch rate")
+        .expect("replicator dispatch rate is set");
     assert_eq!(rate.dispatch_throttling_rate_in_msg, 100);
     assert_eq!(rate.dispatch_throttling_rate_in_byte, 65_536);
 
@@ -319,7 +323,8 @@ async fn publish_rate_get_set_remove_cycle() {
     let rate = admin
         .namespace_get_publish_rate("acme/svc")
         .await
-        .expect("get publish rate");
+        .expect("get publish rate")
+        .expect("publish rate is set");
     assert_eq!(rate.publish_throttling_rate_in_msg, 5000);
     assert_eq!(rate.publish_throttling_rate_in_byte, 2_097_152);
 

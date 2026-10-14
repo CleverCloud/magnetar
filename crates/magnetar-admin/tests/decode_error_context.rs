@@ -8,7 +8,7 @@
 //! body snippet instead of the bare serde "expected value at line 1
 //! column 1" message. These tests pin that contract against real
 //! `AdminClient` methods using `json_ok` (`cluster_list`),
-//! `json_ok_or_default` (`namespace_get_retention`), and
+//! `json_ok_unset_policy` (`namespace_get_retention`), and
 //! `json_ok_optional` (`namespace_get_message_ttl`).
 
 use magnetar_admin::{AdminClient, AdminError};
@@ -177,9 +177,8 @@ async fn no_content_on_or_default_endpoint_yields_default_not_decode() {
     let policy = admin
         .namespace_get_retention("public/default")
         .await
-        .expect("204 must fold to the default, not a Decode error");
-    assert_eq!(policy.retention_time_in_minutes, 0);
-    assert_eq!(policy.retention_size_in_mb, 0);
+        .expect("204 must fold to None, not a Decode error");
+    assert!(policy.is_none(), "{policy:?}");
 }
 
 #[tokio::test]
@@ -196,9 +195,8 @@ async fn empty_body_on_or_default_endpoint_yields_default_not_decode() {
     let policy = admin
         .namespace_get_retention("public/default")
         .await
-        .expect("empty 200 body must fold to the default, not a Decode error");
-    assert_eq!(policy.retention_time_in_minutes, 0);
-    assert_eq!(policy.retention_size_in_mb, 0);
+        .expect("empty 200 body must fold to None, not a Decode error");
+    assert!(policy.is_none(), "{policy:?}");
 }
 
 #[tokio::test]
@@ -219,9 +217,8 @@ async fn null_body_on_or_default_endpoint_yields_default_not_decode() {
     let policy = admin
         .namespace_get_retention("public/default")
         .await
-        .expect("literal null must fold to the default, not a Decode error");
-    assert_eq!(policy.retention_time_in_minutes, 0);
-    assert_eq!(policy.retention_size_in_mb, 0);
+        .expect("literal null must fold to None, not a Decode error");
+    assert!(policy.is_none(), "{policy:?}");
 }
 
 #[tokio::test]

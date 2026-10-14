@@ -6,6 +6,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`magnetarctl --format` / `-F` / `MAGNETAR_FORMAT` selects the output format: `json` (unchanged default) or `human`.**
+  `human` prints command-specific labels with unit-aware values: a two-column `LABEL  VALUE` table for `admin namespaces get-retention` and `admin topics get-retention` (durations in days/hours/minutes, sizes in `MB`, `-1` shown as `∞`) and for `admin namespaces get-persistence` and `admin topics get-persistence` (`BookKeeper` quorums, mark-delete rate cap in `ops/s` or `disabled`), aligned tables for `admin topics list` (physical partitions collapsed under their parent with the declared count), `admin clusters list`, `admin tenants list`, `admin namespaces list`, `admin subscriptions list`, `admin brokers list` (in natural host order), `admin brokers leader`, `admin bookies list` (one `BOOKIE` column in natural host order), `admin bookies racks-info` (bookies grouped under their rack), `admin clusters list-failure-domains` and `admin clusters get-failure-domain` (one row per broker, the domain named once per group), and an aggregate block followed by per-producer, per-subscription and per-consumer tables for `admin topics stats` (rates and byte sizes with two decimals, decimal SI units).
+  Labels are uppercase and blue on a terminal; a pipe or a non-empty `NO_COLOR` disables color.
+  Every other command still prints JSON whatever the flag says, and `json` output is byte-for-byte unchanged.
+
+### Changed
+
+- **BREAKING: the vendored `PulsarApi.proto` moves from `v5.0.0-M1` to the GA release `v5.0.0`.**
+  The revision is `apache/pulsar` `b7b03f72cd4f81d501570588fcf3433ee035629b`, taken as the "another §D4 bump" [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) §D1 foresaw; `PulsarMarkers.proto` is byte-identical and `ProtocolVersion` stays `v21`.
+  The change over M1 is purely additive: PIP-486 entry-bucketing fields (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`), `CommandScalableTopicLookup.create_if_missing`, and `BaseCommand` type 82, `CommandScalableTopicUnsubscribe`.
+  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): the generated `pb` surface follows the 5.0.0 schema, and the `magnetar` façade is unaffected. The six new fields are required in struct literals of `MessageMetadata`, `KeySharedMeta`, `SegmentInfoProto`, `ScalableAssignedSegment` and `CommandScalableTopicLookup`, `pb::base_command::Type` gains `ScalableTopicUnsubscribe` (an exhaustive `match` stops compiling), and `pb::ScalableAssignedSegment` no longer derives `Eq` or `Hash` because it now holds a message-typed field.
+  The wire bytes this client sends are unchanged by the bump itself.
+  (ADR-0093 amendment 2026-10-12)
+
+- **BREAKING: the scalable-topic lookup takes a `create_if_missing` flag and states it explicitly; the read-only lookup behind `magnetarctl topic-info` never creates a topic.**
+  On Pulsar 5.0.0-M1 a lookup of a missing `topic://` topic failed with "Scalable topic not found"; on 5.0.0 a lookup that leaves the new `create_if_missing` field unset (default `true`) auto-creates the topic, subject to the broker's auto-creation policy.
+  `Connection::open_scalable_topic_session`, `Client::scalable_topic_lookup` on both runtimes and the `ScalableTopicsApi::scalable_topic_lookup` trait method gain a `create_if_missing: bool` parameter, passed last, and the lookup command always carries it explicitly, `true` and `false` alike; an M1 broker skips the unknown field.
+  **BREAKING CHANGE** (`magnetar-proto`, re-exported as `magnetar::proto`, plus the two runtime `Client`s and the `ScalableTopicsApi` engine hook): any direct caller of those entries must pass the flag. The `PulsarClient` signatures are unchanged.
+  `PulsarClient::scalable_stream_consumer` opens a consumer, so it passes `true` as the Java v5 client does on every explicit single-topic path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799` at `v5.0.0`).
+  `PulsarClient::lookup_scalable_topic` passes `false`: it is read-only, so `magnetarctl topic-info` reports "not found" for a missing topic on M1 and 5.0.0 alike instead of creating it on 5.0.0.
+  `scalable_topic_subscribe` is unchanged; `CommandScalableTopicSubscribe` has no such field.
+  `CommandScalableTopicUnsubscribe` is decoded and never sent, an inbound frame of that type is skipped without an error, and the PIP-486 fields are decoded and ignored; all three are recorded as known gaps in `docs/follow-ups.md` §12.
+  (ADR-0093 amendment 2026-10-12)
+
+- **The whole e2e suite runs on Pulsar 4.2.5 and 5.0.0 for every pull request, and on 4.0.14 every night.**
+  `4.2.5` (what Clever Cloud runs, and the last release before 5.0) is now the default broker in place of `4.2.4`; `5.0.0`, the new upstream LTS, is a second axis of the per-PR `e2e` job; `4.0.14`, the 4.0 LTS and minimum supported broker, runs in the new `e2e-nightly.yml` (05:47 UTC and on dispatch).
+  The four e2e shards are now the reusable workflow `e2e-pulsar.yml`, called once per version with `MAGNETAR_PULSAR_IMAGE_TAG` set from the matrix, so a pull request pays four more e2e cells (nine instead of five) and the version is in every cell name (`e2e (Pulsar 5.0.0) / e2e 3/4`); the required-check names change.
+  `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs`, pinned to `4.0.13` without a reason, now use `Broker::Default` and so honour `MAGNETAR_PULSAR_IMAGE_TAG` again; only the PIP-460 tests (Pulsar `5.0.0` GA, which replaces the `5.0.0-M1` milestone now that the vendored protocol is the GA release) and the test that a pre-5.0 broker refuses scalable topics (`4.2.5`, a literal of its own) still pin.
+  `e2e_replicated_subscriptions` runs only on the `4.2.5` axis: the PIP-33 two-cluster compose is a 4.2.5 fixture, so only that run brings it up and selects the target, and porting it to 5.0 and 4.0 is separate work.
+  `check-e2e-fixture` reads the `pulsar:` axis: it fails when the axis, the tag constants, the pre-pulls, `FIXTURE_TAGS`, the compose pin or the `MAGNETAR_PULSAR_IMAGE_TAG` wiring disagree, when the default broker is not an axis value of `ci.yml`, or when no workflow other than `ci.yml` runs `MIN_SUPPORTED_TAG` (4.0.14, the minimum supported broker), and it rejects a `pulsar` axis written as a block list or in a flow mapping.
+  `4.0.13` and `4.2.4` are no longer pulled by CI; `scripts/performance_campaign.py` keeps both, and `5.0.0-M1`, in `FIXTURE_TAGS` for one nightly cycle (the first nightly after this change measures against a base that still boots them), drops the unused `latest`, `4.0.4` and `4.2.3`, and reads the default image from the fixture instead of naming it.
+  Landing the axes also found three suite assumptions that releases changed: shadow topics are opt-in (`enableShadowTopics=false`) from 4.0.14, 4.2.5 and 5.0.0, so `e2e_shadow_topic` and `e2e_shadow_topic_replicator` enable them, and Pulsar 5.0.0 does not acquire a namespace bundle on a direct producer attach, so `e2e_moonpool_direct_broker_authority` looks the topic up through the real broker first; no assertion changed.
+  ([ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md), superseding [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
+
+- **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
+  On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.
+  `magnetar_proto` gains `MemoryLimitController`, `MemoryReservation`, `MemoryWaiterId`, `MemoryLimitExceeded`, `ProducerSlot::queue_send_reserved`, `ProducerState::queue_send_reserved` and `Connection::send_reserved`.
+  `OpSend` gains a crate-private reservation, so it can no longer be constructed outside `magnetar-proto`, and a `reserved_bytes()` accessor; `ProducerState::apply_receipt`, `apply_send_error`, `drain_timed_out_sends`, `drain_pending_sends` and `snapshot_pending_sends` now return the removed `OpSend`s so the caller releases their reservations outside the per-slot lock.
+  The `magnetar` façade surface is unchanged.
+  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
+
+- **The `performance` workflow runs nightly on `main` instead of on every pull request.**
+  It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.
+  Pull requests no longer wait on its thirteen release builds; the fixed Moonpool seeds 1–32 it replayed per PR now run nightly, while `ci.yml`'s `seed-replay` keeps the open registry seeds on every PR.
+  ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md))
+- **Dependencies:** bumped workspace manifest floors — `opentelemetry` 0.32.0→0.33.0, `opentelemetry_sdk` 0.32.1→0.33.0, `tokio` 1.53.1→1.53.2, `tokio-rustls` 0.26.5→0.26.6, `rustls-openssl` 0.4.1→0.4.2, `uuid` 1.26.1→1.27.0, `zeroize` 1.9.0→1.9.1, and `thiserror` 2.0.20→2.0.21 — and refreshed `Cargo.lock`.
+  The `opentelemetry` feature's `otel::extract_context` and `otel::attach_context` families return `opentelemetry` types, so an application enabling that feature must move its own `opentelemetry` dependency to 0.33 as well.
+  `matchit` stays at 0.8.4 because `axum` 0.8.9 requires that exact version.
+- **Fuzz workspace:** `crates/magnetar-proto/fuzz` now commits its `Cargo.lock`, moves `prost` 0.13→0.14 to match the main workspace, and raises `libfuzzer-sys`, `arbitrary` and `bytes` to explicit current floors.
+
+- **Dependabot version updates are removed.**
+  `.github/dependabot.yml` is deleted: its Cargo PRs bumped `Cargo.lock` alone, which the workspace does not take, and stayed open after the manifest floors moved.
+  Dependency and action bumps land by hand, raising manifest floors and refreshing the lockfiles in the same changeset; Dependabot alerts and security updates are repository settings and unchanged.
+  ([ADR-0114](specs/adr/0114-bump-dependencies-through-manifest-floors-without-dependabot.md))
+
+- **The e2e suite boots Pulsar through one shared fixture and waits for the broker to serve `public/default` instead of for a log line.**
+  The sixty-two per-file copies of the image constants, the `PULSAR_MEM` budget and the start-up chain are replaced by `crates/magnetar/tests/common/pulsar.rs`, where a suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`) rather than a tag.
+  Readiness is `GET /admin/v2/namespaces/public/default` answering 200 — the one signal that holds on 4.0.14, 4.2.4, 4.2.5 and 5.0.0, whose structured log never prints `Created namespace public/default` — followed by a check that `GET /admin/v2/brokers/version` reports the requested tag's `MAJOR.MINOR`.
+  No tag changes: the default stays `4.2.4`, the three 4.0 LTS suites stay on `4.0.13`, the PIP-460 tests on `5.0.0-M1`; `MAGNETAR_PULSAR_IMAGE_TAG` no longer overrides `e2e_consumer_drop.rs`, whose `4.0.13` is now a pin, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` starts under the fixture (`e2e_pulsar` green).
+  `cargo run -p xtask -- check-e2e-container-memory` becomes `check-e2e-fixture` (CI job `e2e-fixture`): a Pulsar container or an `apachepulsar/pulsar:` reference outside `crates/magnetar/tests/common/` fails, and the fixture's tag constants must equal the `docker pull` list of `ci.yml`, sit in `FIXTURE_TAGS` and match the PIP-33 compose pin.
+  `e2e_batch_chunk.rs` drops its self-referential `default_image_tag_tracks_latest_pulsar_four`, and `scripts/performance_campaign.py` overlays `tests/common/` onto the nightly's base checkout.
+  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md), amending [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
+
+- **BREAKING: `AvroSchema` is opt-in behind a `schema-avro` Cargo feature, so a default build no longer compiles `apache-avro`.**
+  `magnetar-proto` gains `schema-avro = ["dep:apache-avro"]` and the `magnetar-driver` façade forwards it as `schema-avro = ["magnetar-proto/schema-avro"]`; both leave it off by default, and `magnetarctl` does not enable it.
+  Only `AvroSchema` moves behind the feature: Bytes, String, the primitive and temporal schemas, `JsonSchema`, Protobuf, ProtobufNative, KeyValue, AutoConsume and AutoProduceBytes stay always available, and the wire behaviour of `AvroSchema` is unchanged.
+  Turning the feature on adds 33 crates to a default `magnetar-proto` or `magnetar-driver` build (60 → 93 and 107 → 140 unique crate versions in `cargo tree -e normal`, measured 2026-10-13).
+  **BREAKING CHANGE** (the `magnetar-driver` façade as well as `magnetar-proto`, re-exported as `magnetar::proto`): code that names `magnetar_proto::schema::AvroSchema`, or `magnetar::proto::schema::AvroSchema`, no longer compiles until the feature is enabled, with `magnetar-driver = { version = "…", features = ["schema-avro"] }` or the same feature on a direct `magnetar-proto` dependency.
+  rustc reports the missing import and names the feature that gates it.
+  The `JsonSchema` unit test that parses `schema_data` as Avro and the Avro e2e test link `apache-avro` themselves and run in every build, and `ci.yml` now lints `magnetar-proto` and the façade library and documents `magnetar-proto` with default features, because `--all-features` always turns the feature on.
+  `magnetar-proto` builds its docs.rs documentation with the feature.
+  ([ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md), amending [ADR-0066](specs/adr/0066-release-1-0-0-first-stable.md))
+
+- **Dependencies:** removed the manifest entries and Cargo features nothing used, and `Cargo.lock` drops 17 packages (the `proptest` and `rstest` closures).
+  Workspace entries `pin-project-lite`, `http`, `proptest` and `rstest` are gone; `tracing` leaves `magnetar-admin`, `magnetar-auth-sasl`, `magnetar-fakes` and `magnetar-messagecrypto`, `http` leaves `magnetar-admin`, `pin-project-lite` and `tokio-util` leave `magnetar-runtime-tokio`, `anstream` leaves `magnetarctl`, and `proptest`, `rstest` and `tempfile` leave the `magnetar-proto` dev-dependencies.
+  `url` becomes a dev-dependency of the façade, `tracing` one of `magnetar-differential`, and `serde_json`, `thiserror` and `tracing` in `magnetar-auth-athenz` are compiled only with its `zts` feature.
+  The `tokio` features are narrowed to what each crate uses: `["sync"]` for `magnetar-runtime-moonpool`, `rt-multi-thread` alone for `magnetarctl`, and no `rt-multi-thread` for the `magnetar-differential` library.
+  `rustls` is no longer asked for its `logging` feature, so the `rustls` instance magnetar builds stops emitting `log` records unless another crate in the build enables the feature; nothing in this workspace consumes them, because no `log` to `tracing` bridge is active in any build.
+  Floors are unchanged.
+
+- **BREAKING (`magnetar-admin`): `namespace_get_retention`, `topic_get_retention`, `namespace_get_persistence`, `namespace_get_dispatch_rate`, `namespace_get_subscription_dispatch_rate`, `namespace_get_replicator_dispatch_rate` and `namespace_get_publish_rate` now return `Option<_>`, `None` when the policy is unset at that level.**
+  Retention, persistence, dispatch rate and publish rate used to fold a `204`, empty, `null` or `{}` body into the struct's `Default`, which is a client-side constant: `PersistencePolicies::default()` is `2/2/2/0.0` while a broker's effective `managedLedgerDefault*` can be `3/3/2/1.0`, and `DispatchRate::default()` is `-1` (unlimited) whatever the broker's `dispatchThrottlingRatePer*`.
+  The client therefore reported values the cluster never returned.
+  The subscription and replicator dispatch-rate getters used the strict decoder instead and failed with a decode error on the same empty body.
+  All seven now share `json_ok_unset_policy`, which folds the four unset shapes to `None` and decodes anything else strictly, matching the `null` Java's admin client surfaces; the topic-level getters already behaved this way.
+
 ### Fixed
 
 - **`check-sim-coverage` no longer passes locally on lines CI fails: a never-called function's body and a module no sim test calls now count as uncovered on every machine.**
@@ -108,80 +196,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The shared fixture applies the configuration with `bin/apply-config-from-env.py` before the broker starts, and the replicator suite's in-container `pulsar-admin` calls now authenticate as the admin role and must exit zero.
   ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md))
 
-### Changed
-
-- **BREAKING: the vendored `PulsarApi.proto` moves from `v5.0.0-M1` to the GA release `v5.0.0`.**
-  The revision is `apache/pulsar` `b7b03f72cd4f81d501570588fcf3433ee035629b`, taken as the "another §D4 bump" [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) §D1 foresaw; `PulsarMarkers.proto` is byte-identical and `ProtocolVersion` stays `v21`.
-  The change over M1 is purely additive: PIP-486 entry-bucketing fields (`MessageMetadata.entry_hash_min` / `entry_hash_max`, `KeySharedMeta.entryBucketDispatch`, `SegmentInfoProto.entry_bucket_splits`, `ScalableAssignedSegment.bucket_ranges`), `CommandScalableTopicLookup.create_if_missing`, and `BaseCommand` type 82, `CommandScalableTopicUnsubscribe`.
-  **BREAKING CHANGE** (`magnetar-proto` only, re-exported as `magnetar::proto`): the generated `pb` surface follows the 5.0.0 schema, and the `magnetar` façade is unaffected. The six new fields are required in struct literals of `MessageMetadata`, `KeySharedMeta`, `SegmentInfoProto`, `ScalableAssignedSegment` and `CommandScalableTopicLookup`, `pb::base_command::Type` gains `ScalableTopicUnsubscribe` (an exhaustive `match` stops compiling), and `pb::ScalableAssignedSegment` no longer derives `Eq` or `Hash` because it now holds a message-typed field.
-  The wire bytes this client sends are unchanged by the bump itself.
-  (ADR-0093 amendment 2026-10-12)
-
-- **BREAKING: the scalable-topic lookup takes a `create_if_missing` flag and states it explicitly; the read-only lookup behind `magnetarctl topic-info` never creates a topic.**
-  On Pulsar 5.0.0-M1 a lookup of a missing `topic://` topic failed with "Scalable topic not found"; on 5.0.0 a lookup that leaves the new `create_if_missing` field unset (default `true`) auto-creates the topic, subject to the broker's auto-creation policy.
-  `Connection::open_scalable_topic_session`, `Client::scalable_topic_lookup` on both runtimes and the `ScalableTopicsApi::scalable_topic_lookup` trait method gain a `create_if_missing: bool` parameter, passed last, and the lookup command always carries it explicitly, `true` and `false` alike; an M1 broker skips the unknown field.
-  **BREAKING CHANGE** (`magnetar-proto`, re-exported as `magnetar::proto`, plus the two runtime `Client`s and the `ScalableTopicsApi` engine hook): any direct caller of those entries must pass the flag. The `PulsarClient` signatures are unchanged.
-  `PulsarClient::scalable_stream_consumer` opens a consumer, so it passes `true` as the Java v5 client does on every explicit single-topic path (`DagWatchClient.java:77-79`, `Commands.java:1793-1799` at `v5.0.0`).
-  `PulsarClient::lookup_scalable_topic` passes `false`: it is read-only, so `magnetarctl topic-info` reports "not found" for a missing topic on M1 and 5.0.0 alike instead of creating it on 5.0.0.
-  `scalable_topic_subscribe` is unchanged; `CommandScalableTopicSubscribe` has no such field.
-  `CommandScalableTopicUnsubscribe` is decoded and never sent, an inbound frame of that type is skipped without an error, and the PIP-486 fields are decoded and ignored; all three are recorded as known gaps in `docs/follow-ups.md` §12.
-  (ADR-0093 amendment 2026-10-12)
-
-- **The whole e2e suite runs on Pulsar 4.2.5 and 5.0.0 for every pull request, and on 4.0.14 every night.**
-  `4.2.5` (what Clever Cloud runs, and the last release before 5.0) is now the default broker in place of `4.2.4`; `5.0.0`, the new upstream LTS, is a second axis of the per-PR `e2e` job; `4.0.14`, the 4.0 LTS and minimum supported broker, runs in the new `e2e-nightly.yml` (05:47 UTC and on dispatch).
-  The four e2e shards are now the reusable workflow `e2e-pulsar.yml`, called once per version with `MAGNETAR_PULSAR_IMAGE_TAG` set from the matrix, so a pull request pays four more e2e cells (nine instead of five) and the version is in every cell name (`e2e (Pulsar 5.0.0) / e2e 3/4`); the required-check names change.
-  `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs`, pinned to `4.0.13` without a reason, now use `Broker::Default` and so honour `MAGNETAR_PULSAR_IMAGE_TAG` again; only the PIP-460 tests (Pulsar `5.0.0` GA, which replaces the `5.0.0-M1` milestone now that the vendored protocol is the GA release) and the test that a pre-5.0 broker refuses scalable topics (`4.2.5`, a literal of its own) still pin.
-  `e2e_replicated_subscriptions` runs only on the `4.2.5` axis: the PIP-33 two-cluster compose is a 4.2.5 fixture, so only that run brings it up and selects the target, and porting it to 5.0 and 4.0 is separate work.
-  `check-e2e-fixture` reads the `pulsar:` axis: it fails when the axis, the tag constants, the pre-pulls, `FIXTURE_TAGS`, the compose pin or the `MAGNETAR_PULSAR_IMAGE_TAG` wiring disagree, when the default broker is not an axis value of `ci.yml`, or when no workflow other than `ci.yml` runs `MIN_SUPPORTED_TAG` (4.0.14, the minimum supported broker), and it rejects a `pulsar` axis written as a block list or in a flow mapping.
-  `4.0.13` and `4.2.4` are no longer pulled by CI; `scripts/performance_campaign.py` keeps both, and `5.0.0-M1`, in `FIXTURE_TAGS` for one nightly cycle (the first nightly after this change measures against a base that still boots them), drops the unused `latest`, `4.0.4` and `4.2.3`, and reads the default image from the fixture instead of naming it.
-  Landing the axes also found three suite assumptions that releases changed: shadow topics are opt-in (`enableShadowTopics=false`) from 4.0.14, 4.2.5 and 5.0.0, so `e2e_shadow_topic` and `e2e_shadow_topic_replicator` enable them, and Pulsar 5.0.0 does not acquire a namespace bundle on a direct producer attach, so `e2e_moonpool_direct_broker_authority` looks the topic up through the real broker first; no assertion changed.
-  ([ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md), superseding [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
-
-- **Runtime API: the per-connection memory-limit fields of `ConnectionShared` are replaced by the shared `memory_limit` controller.**
-  On both engines `ConnectionShared` loses `memory_limit_bytes`, `memory_used`, `memory_limit_policy`, `memory_wakers`, `try_reserve_memory`, `release_memory`, `try_reserve_memory_or_register` and `cancel_memory_waker`, and gains `memory_limit: Arc<magnetar_proto::MemoryLimitController>` plus a `with_auth_and_memory_limit` constructor.
-  `magnetar_proto` gains `MemoryLimitController`, `MemoryReservation`, `MemoryWaiterId`, `MemoryLimitExceeded`, `ProducerSlot::queue_send_reserved`, `ProducerState::queue_send_reserved` and `Connection::send_reserved`.
-  `OpSend` gains a crate-private reservation, so it can no longer be constructed outside `magnetar-proto`, and a `reserved_bytes()` accessor; `ProducerState::apply_receipt`, `apply_send_error`, `drain_timed_out_sends`, `drain_pending_sends` and `snapshot_pending_sends` now return the removed `OpSend`s so the caller releases their reservations outside the per-slot lock.
-  The `magnetar` façade surface is unchanged.
-  (issue #867; [ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md))
-
-- **The `performance` workflow runs nightly on `main` instead of on every pull request.**
-  It compares `main`'s head against the head the last successful nightly measured, skips when `main` has not moved, and still runs on manual dispatch, so a branch that needs a measurement dispatches it.
-  Pull requests no longer wait on its thirteen release builds; the fixed Moonpool seeds 1–32 it replayed per PR now run nightly, while `ci.yml`'s `seed-replay` keeps the open registry seeds on every PR.
-  ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md))
-- **Dependencies:** bumped workspace manifest floors — `opentelemetry` 0.32.0→0.33.0, `opentelemetry_sdk` 0.32.1→0.33.0, `tokio` 1.53.1→1.53.2, `tokio-rustls` 0.26.5→0.26.6, `rustls-openssl` 0.4.1→0.4.2, `uuid` 1.26.1→1.27.0, `zeroize` 1.9.0→1.9.1, and `thiserror` 2.0.20→2.0.21 — and refreshed `Cargo.lock`.
-  The `opentelemetry` feature's `otel::extract_context` and `otel::attach_context` families return `opentelemetry` types, so an application enabling that feature must move its own `opentelemetry` dependency to 0.33 as well.
-  `matchit` stays at 0.8.4 because `axum` 0.8.9 requires that exact version.
-- **Fuzz workspace:** `crates/magnetar-proto/fuzz` now commits its `Cargo.lock`, moves `prost` 0.13→0.14 to match the main workspace, and raises `libfuzzer-sys`, `arbitrary` and `bytes` to explicit current floors.
-
-- **Dependabot version updates are removed.**
-  `.github/dependabot.yml` is deleted: its Cargo PRs bumped `Cargo.lock` alone, which the workspace does not take, and stayed open after the manifest floors moved.
-  Dependency and action bumps land by hand, raising manifest floors and refreshing the lockfiles in the same changeset; Dependabot alerts and security updates are repository settings and unchanged.
-  ([ADR-0114](specs/adr/0114-bump-dependencies-through-manifest-floors-without-dependabot.md))
-
-- **The e2e suite boots Pulsar through one shared fixture and waits for the broker to serve `public/default` instead of for a log line.**
-  The sixty-two per-file copies of the image constants, the `PULSAR_MEM` budget and the start-up chain are replaced by `crates/magnetar/tests/common/pulsar.rs`, where a suite selects a `Broker` (`Default`, `V4Lts`, `Scalable`) rather than a tag.
-  Readiness is `GET /admin/v2/namespaces/public/default` answering 200 — the one signal that holds on 4.0.14, 4.2.4, 4.2.5 and 5.0.0, whose structured log never prints `Created namespace public/default` — followed by a check that `GET /admin/v2/brokers/version` reports the requested tag's `MAJOR.MINOR`.
-  No tag changes: the default stays `4.2.4`, the three 4.0 LTS suites stay on `4.0.13`, the PIP-460 tests on `5.0.0-M1`; `MAGNETAR_PULSAR_IMAGE_TAG` no longer overrides `e2e_consumer_drop.rs`, whose `4.0.13` is now a pin, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` starts under the fixture (`e2e_pulsar` green).
-  `cargo run -p xtask -- check-e2e-container-memory` becomes `check-e2e-fixture` (CI job `e2e-fixture`): a Pulsar container or an `apachepulsar/pulsar:` reference outside `crates/magnetar/tests/common/` fails, and the fixture's tag constants must equal the `docker pull` list of `ci.yml`, sit in `FIXTURE_TAGS` and match the PIP-33 compose pin.
-  `e2e_batch_chunk.rs` drops its self-referential `default_image_tag_tracks_latest_pulsar_four`, and `scripts/performance_campaign.py` overlays `tests/common/` onto the nightly's base checkout.
-  ([ADR-0115](specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md), amending [ADR-0109](specs/adr/0109-pin-the-e2e-broker-image-tag.md))
-
-- **BREAKING: `AvroSchema` is opt-in behind a `schema-avro` Cargo feature, so a default build no longer compiles `apache-avro`.**
-  `magnetar-proto` gains `schema-avro = ["dep:apache-avro"]` and the `magnetar-driver` façade forwards it as `schema-avro = ["magnetar-proto/schema-avro"]`; both leave it off by default, and `magnetarctl` does not enable it.
-  Only `AvroSchema` moves behind the feature: Bytes, String, the primitive and temporal schemas, `JsonSchema`, Protobuf, ProtobufNative, KeyValue, AutoConsume and AutoProduceBytes stay always available, and the wire behaviour of `AvroSchema` is unchanged.
-  Turning the feature on adds 33 crates to a default `magnetar-proto` or `magnetar-driver` build (60 → 93 and 107 → 140 unique crate versions in `cargo tree -e normal`, measured 2026-10-13).
-  **BREAKING CHANGE** (the `magnetar-driver` façade as well as `magnetar-proto`, re-exported as `magnetar::proto`): code that names `magnetar_proto::schema::AvroSchema`, or `magnetar::proto::schema::AvroSchema`, no longer compiles until the feature is enabled, with `magnetar-driver = { version = "…", features = ["schema-avro"] }` or the same feature on a direct `magnetar-proto` dependency.
-  rustc reports the missing import and names the feature that gates it.
-  The `JsonSchema` unit test that parses `schema_data` as Avro and the Avro e2e test link `apache-avro` themselves and run in every build, and `ci.yml` now lints `magnetar-proto` and the façade library and documents `magnetar-proto` with default features, because `--all-features` always turns the feature on.
-  `magnetar-proto` builds its docs.rs documentation with the feature.
-  ([ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md), amending [ADR-0066](specs/adr/0066-release-1-0-0-first-stable.md))
-
-- **Dependencies:** removed the manifest entries and Cargo features nothing used, and `Cargo.lock` drops 17 packages (the `proptest` and `rstest` closures).
-  Workspace entries `pin-project-lite`, `http`, `proptest` and `rstest` are gone; `tracing` leaves `magnetar-admin`, `magnetar-auth-sasl`, `magnetar-fakes` and `magnetar-messagecrypto`, `http` leaves `magnetar-admin`, `pin-project-lite` and `tokio-util` leave `magnetar-runtime-tokio`, `anstream` leaves `magnetarctl`, and `proptest`, `rstest` and `tempfile` leave the `magnetar-proto` dev-dependencies.
-  `url` becomes a dev-dependency of the façade, `tracing` one of `magnetar-differential`, and `serde_json`, `thiserror` and `tracing` in `magnetar-auth-athenz` are compiled only with its `zts` feature.
-  The `tokio` features are narrowed to what each crate uses: `["sync"]` for `magnetar-runtime-moonpool`, `rt-multi-thread` alone for `magnetarctl`, and no `rt-multi-thread` for the `magnetar-differential` library.
-  `rustls` is no longer asked for its `logging` feature, so the `rustls` instance magnetar builds stops emitting `log` records unless another crate in the build enables the feature; nothing in this workspace consumes them, because no `log` to `tracing` bridge is active in any build.
-  Floors are unchanged.
+- **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
+  Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.
+  JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
+  **BREAKING (CLI JSON) for the single-valued getters**: TTL, deduplication, snapshot interval, compaction threshold and the max-* counts are now wrapped in an object under their Java field name (`{"source": "broker", "messageTTLInSeconds": 0}`) where they printed a bare value or `null`; the struct-valued getters keep their fields unchanged.
+  Human output renders the sentinels (`unlimited`, `disabled`) and units (durations, decimal SI sizes, `msg/s`) per policy.
+- **`magnetarctl … | head` no longer panics with `failed printing to stdout: Broken pipe` once the reader closes the pipe.**
+  Command output now goes through a writer that ends the process quietly with status 141 (what a shell reports for a `SIGPIPE` death) on `EPIPE`; the workspace forbids `unsafe`, so resetting the signal disposition was not an option.
 
 ## [1.7.2] - 2026-09-21
 
