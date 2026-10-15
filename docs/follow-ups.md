@@ -22,10 +22,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 
 | #   | Item                                                                                                                                                     | Status                   |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| 11  | [`scalable_stream_consumer` is uncallable on the tokio engine](#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)                           | ⚡ ready to dispatch     |
 | 12  | [PIP-460 remaining GA wire and API gaps](#12-pip-460-remaining-ga-wire-and-api-gaps)                                                                         | ⚡ ready to dispatch     |
-| 14  | [`check-sim-coverage` can report over artifacts it did not build](#14-check-sim-coverage-can-report-over-artifacts-it-did-not-build)                     | ⚡ ready to dispatch     |
-| 15  | [`stalled_write_is_bounded_by_operation_timeout` flakes under load](#15-stalled_write_is_bounded_by_operation_timeout-flakes-under-load)                 | ⚡ ready to dispatch     |
 | 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered)           | 🟡 deferred              |
 | 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                           | 🟡 deferred              |
 | 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                 | 🧠 needs design decision |
@@ -43,66 +40,12 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 
 ---
 
-## 16. PIP-460 upstream assignment, lifecycle, DAG-ordering, and proxy contracts
-
-**Scope.** The historical Pulsar 5.0.0-M1 investigation identified four upstream contracts. The GA 5.0.0 disposition is:
-
-1. Different consumer assignments may carry the same `layout_epoch`, but the wire has no assignment generation, controller term, or cross-connection fencing rule ([apache/pulsar#26273](https://github.com/apache/pulsar/issues/26273)).
-2. GA implements type-82 logical unsubscribe. Magnetar stages it after pending registration settles on terminal close; successful controller reconnect instead retires old local authority without unregistering the broker member, matching the Java driver ([apache/pulsar#26272](https://github.com/apache/pulsar/issues/26272)).
-3. The broker's assignment barrier gates active direct children but does not establish the complete PIP-460 ordering contract for sealed intermediate segments, deep DAGs, merge, or cursor rewind ([apache/pulsar#26274](https://github.com/apache/pulsar/issues/26274)).
-4. Proxy-any-broker controller registration appears to select an arbitrary broker even though scalable consumer registration is leader-only, and the upstream proxy e2e exercises `QueueConsumer`, which never sends that command ([apache/pulsar#26275](https://github.com/apache/pulsar/issues/26275)).
-
-**Implemented entry points.** `lookup_scalable_topic` + `next_scalable_event` + `close_scalable_topic_session` expose a read-only layout watch (`create_if_missing = false`). The assignment-driven `scalable_stream_consumer` opens its retained watch with `create_if_missing = true`, attaches ordinary segment children, and manages their lifecycle as specified by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md). The scalable E2E target separately verifies read-only lookup and the aggregate consumer.
-
 ## 12. PIP-460 remaining GA wire and API gaps
 
 **Status.** Assignment-driven `StreamConsumer` fan-out, ordinary segment children, aggregate flow control, delivery tracking, acknowledgements, transactions, seek, resynchronization, type-82 unsubscribe, and PIP-486 consumer bucket dispatch are implemented by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md). Scalable-topic producers, `QueueConsumer`, `CheckpointConsumer`, namespace consumers, controller-election awareness, and repartition handling remain outside this implementation; the feature stays experimental and default-off.
 
 - **Scalable-topic producer entry bucketing is not implemented.** A 5.0.0 topic may carry `entryBucketSplits=[16384,32768,49152]` (measured 2026-10-12). `MessageMetadata.entry_hash_min` / `entry_hash_max` and `SegmentInfoProto.entry_bucket_splits` define the producer-side contract; no scalable producer currently stamps and honours it. Consumer assignment ranges are carried separately in `ScalableAssignedSegment.bucket_ranges` and consumed by `StreamConsumer`.
 - **A namespace (multi-topic) consumer passes `create_if_missing = false`** to `open_scalable_topic_session` on its per-topic lookups, as the Java v5 client does (`MultiTopicQueueConsumer.java:169` at `v5.0.0`), so a reconnecting watch cannot resurrect a deleted topic. The namespace consumer surface does not exist yet.
-
-## 14. `check-sim-coverage` can report over artifacts it did not build
-
-**Gap.** [ADR-0090](../specs/adr/0090-widen-sim-coverage-report-to-compiled-closure.md) split the gate into an execution step and a re-export step with **different scopes**.
-Execution passes `-p magnetar-runtime-moonpool -p magnetar-differential`, and `cargo llvm-cov`'s `-p` also selects which packages get _cleaned_.
-The report then covers all six of `SIM_COVERAGE_REPORT_PACKAGES`, so `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-auth-athenz` and `magnetar-auth-sasl` are re-exported from object files no step in the current pass is guaranteed to have produced.
-CI compounds it: `Swatinem/rust-cache@v2` in the `check-sim-coverage` job runs unconfigured, so it archives `target/` — including `target/llvm-cov-target`, which its workspace-artifact pruning does not know about.
-
-**Why it stays open.** It was investigated as the suspected cause of the PR #391 false red and **refuted**: `cargo llvm-cov clean --workspace` followed by a cold `CARGO_INCREMENTAL=0` run reproduced the failing report exactly (81 `SF:` records, `DA:271,0`).
-The real cause was optimizer inlining, fixed by [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md).
-So this is a latent integrity gap with no demonstrated failure behind it, which is why it is filed rather than fixed alongside that ADR — but the direction it fails in is the fail-open one, and a gate that exists to prove patch coverage must not be able to certify coverage that did not happen.
-
-**Demonstrated since, outside this tree (2026-10-13).** In a two-crate workspace, a coverage run over crate `a`'s own tests followed by an edit to `a` and a gate-shaped pass (execute `-p b`, re-export `-p a -p b`) reported `a`'s **old** line mapping onto the new source: the stale `a` test binary was walked first and `llvm-cov` keeps the first record per function, so the current one was discarded.
-That is a wrong report, not just a stale one; on `magnetar` the same shape needs an earlier coverage run of `magnetar-proto` or `magnetar-runtime-tokio`'s own tests in the same target directory.
-
-**A second, separate cause of record-less gated files is closed.** In a default incremental build at `rustc 1.99.0`, a new `magnetar-runtime-tokio` module the sim binaries never call into lost all its records because the linker dropped its codegen unit, and the gate printed it as advisory `not gated` where a `CARGO_INCREMENTAL=0` build failed it; [ADR-0094](../specs/adr/0094-measure-sim-coverage-unoptimized.md)'s 2026-10-13 amendment pins one codegen unit per crate, so a record-less file in a crate that did report now has no instrumented function at all.
-
-**Candidate fixes, cheapest first.** Treat a file inside a gated crate that carries added lines but emits **no** `SF:` record as a hard failure, extending the existing record-less-_crate_ bail to per-file granularity — free, and it turns "could not measure" into a red instead of a silent pass.
-Failing that, `cargo llvm-cov clean --workspace` before the execution step, which is correct but pays a full instrumented rebuild — including `aws-lc-fips-sys` — on every run and defeats the job's cache.
-
-## 15. `stalled_write_is_bounded_by_operation_timeout` flakes under load
-
-**Observed.** `crates/magnetar-runtime-tokio/src/driver.rs`'s `driver::tests::stalled_write_is_bounded_by_operation_timeout` (issue #370 / [ADR-0083](../specs/adr/0083-bounded-cancellable-driver-write.md)) fails intermittently under CPU pressure with `Elapsed(())` on its 90-second harness margin.
-
-**Why that is surprising.** The test is `#[tokio::test(start_paused = true)]`, which implies the `current_thread` flavour, so its 90 seconds is _virtual_ — the failure lands in ~0.06 s of wall clock, not 90 s of it. A paused-clock test on a single thread should be deterministic, and this one is not: it depends on host load.
-
-**Hypothesis, not conclusion — clock-domain mismatch.** The driver computes its write deadline on the **real** clock: `use std::time::Instant` (`driver.rs:51`), `write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout)` (`driver.rs:1394`), `deadline.saturating_duration_since(Instant::now())` (`driver.rs:1682`). `tokio::time::pause()` advances tokio's timer clock; it does not advance `std::time::Instant`. So the harness measures its margin in virtual time while the code under test measures its deadline in real time, and the two can be raced against each other by host load. That is consistent with every observation above and it is what should be investigated first.
-
-It is **not proven**. This entry previously asserted "a real thread, a `spawn_blocking`, or a lock held across an await"; none of those was verified, and the mixed clock domains are a better-supported explanation. Whoever picks this up should confirm the mechanism before fixing it, not inherit this paragraph as fact.
-
-**Measured 2026-08-04**, on `feat/pip-460-upstream-wire`:
-
-| condition                                                                                                    | result         |
-| ------------------------------------------------------------------------------------------------------------ | -------------- |
-| inside `cargo test --workspace --all-features` while a full instrumented coverage rebuild saturated 16 cores | FAILED         |
-| 3 isolated runs, load average still ~13                                                                      | 1 FAILED, 2 ok |
-| 30 isolated runs of the test binary at idle                                                                  | 0/30 failed    |
-
-**Ancestry: inferred, not measured.** `git diff origin/main...HEAD` touches neither the test, nor `PendingForeverStream`, nor the 90-second margin, and the three deadline lines above are byte-identical to `origin/main`; every change `feat/pip-460-upstream-wire` makes to `driver.rs` is a `#[cfg(feature = "scalable-topics")]` addition. So both the test and the suspected mechanism predate that branch. It has **not** been reproduced on `origin/main` under equivalent load, which is what would actually establish "pre-existing" — until someone does that, this is a well-supported inference and no more. CI has not reproduced it on either branch.
-
-**Why it stays open.** Filing rather than fixing is a scope call: the defect is in the driver's write path, which the PIP-460 branch does not own, and diagnosing "what escapes the paused clock" is its own investigation. It is recorded here rather than left as folklore — a test that fails only under load is exactly the kind that gets re-run until green and then forgotten.
-
-**Do not** fix this by widening the 90-second margin. The margin is virtual; widening it makes the race less likely to be observed without changing anything real, which is the failure mode [ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) and the `lookup_error_propagation` correction both exist to avoid.
 
 ## 16. The batched `deliver` loop counts dead-lettered members as delivered
 
@@ -218,5 +161,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the upstream wire surface and added real-broker e2e coverage; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §12 was partially closed by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), §14 by [ADR-0118](../specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md), and §15 by [ADR-0119](../specs/adr/0119-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
+§11 closed with [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), which exposed the owned façade constructor on both engines. §1 closed with [ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md), which migrated PIP-460 onto the upstream wire surface and added real-broker e2e coverage; §8 closed with [ADR-0091](../specs/adr/0091-broker-authority-default-port-unification.md), §10 with [ADR-0092](../specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md), §12 was partially closed by [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), §14 closed with [ADR-0118](../specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md) and [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md), and §15 closed with [ADR-0119](../specs/adr/0119-use-tokio-time-for-driver-write-deadlines.md). §13 closed with `e93deee`, which woke the scalable waiters on disconnect in both engines.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

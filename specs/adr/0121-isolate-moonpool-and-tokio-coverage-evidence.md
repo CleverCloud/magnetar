@@ -59,6 +59,8 @@ Fresh current-HEAD timings and deficits remain pending until the implementation 
 ## Consequences
 
 Tokio adapter changes can now be discharged by honest Tokio tests, including private runtime and TLS behavior, without weakening Moonpool evidence for shared and simulation-owned source.
+Defensive-state coverage may prepare a boundary through the non-default `magnetar-proto/test-support` feature and then execute the production transition.
+These tests must describe when the prepared state violates a normal invariant; they do not reclassify a domain, substitute an error result, or relax the hard verdict.
 The command costs a second isolated all-feature instrumented execution and cannot reuse first-party objects across domains.
 That cost is accepted because provenance is part of the hard-gate claim.
 

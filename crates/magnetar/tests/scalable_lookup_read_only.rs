@@ -9,10 +9,8 @@
 //! mistyped name would create a topic. The façade therefore sends `false`.
 //!
 //! The opposite fork — `scalable_stream_consumer`, which opens a consumer and so
-//! sends `true` — cannot be exercised here: it is bound `where E::ClientState:
-//! Clone`, and neither engine's client is `Clone` (`docs/follow-ups.md` §11).
-//! The engine-level `true` path is covered by the runtime and differential
-//! suites; this test pins the façade half that is reachable.
+//! sends `true` — is exercised by the aggregate consumer suites. This test pins
+//! the read-only façade lookup and its explicit `false` request.
 //!
 //! Like `consumer_name_builder_surface.rs`, it needs a real `PulsarClient` and so
 //! speaks to a TCP fake broker. This one advertises `supports_scalable_topics`,

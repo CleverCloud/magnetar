@@ -887,7 +887,7 @@ A 5.0.0-M1 broker skips the unknown field.
   magnetar has no such consumer yet.
 
 The flag is a `create_if_missing: bool` parameter of `Connection::open_scalable_topic_session`, of `Client::scalable_topic_lookup` on both runtimes, and of the `ScalableTopicsApi::scalable_topic_lookup` trait method ([ADR-0093](../specs/adr/0093-pip-460-upstream-wire-surface.md) amendment 2026-10-12).
-`scalable_stream_consumer` is bound `where E::ClientState: Clone` and neither engine's client is `Clone` ([`follow-ups.md` §11](follow-ups.md#11-scalable_stream_consumer-is-uncallable-on-the-tokio-engine)), so only its engine-level `true` path is exercised today.
+`scalable_stream_consumer` uses the owned builder from [ADR-0120](../specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md) on both engines. The read-only lookup test exercises `false`; the aggregate consumer tests exercise `true` through the façade and runtime layers.
 
 ### Scalable topics out of scope
 

@@ -514,7 +514,10 @@ where
     cluster
         .wait_for("aggregate child cleanup", |fake| {
             let counts = fake.resource_counts();
-            counts.child_consumers == 0 && counts.pending_operations == 0 && counts.permits == 0
+            counts.child_consumers == 0
+                && counts.pending_operations == 0
+                && counts.permits == 0
+                && counts.layout_sessions == 0
         })
         .await;
     let after_close = cluster.inspect(M1FakeCluster::resource_counts);

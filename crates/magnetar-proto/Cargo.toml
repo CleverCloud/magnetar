@@ -44,6 +44,8 @@ buggify          = []
 # closure; every other schema (Bytes, String, JSON, Protobuf, KeyValue, ...)
 # is always available. The façade forwards it as `magnetar-driver/schema-avro`.
 schema-avro = ["dep:apache-avro"]
+# Boundary-state fixtures for runtime tests. Never enabled by default.
+test-support = []
 
 [dependencies]
 bytes        = { workspace = true }

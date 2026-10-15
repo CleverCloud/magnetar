@@ -172,6 +172,10 @@ The Tokio domain separately runs `magnetar-runtime-tokio` unit/integration tests
 One invocation-owned scratch root contains separate domain targets and profiles; neither domain's hits or artifacts can discharge the other.
 The façade and fake are reached through the differential aggregate tests; façade Docker e2e targets do not execute under this gate.
 An added production line in those packages must be reached transitively by one of the two execution roots, while `magnetar-admin`, `magnetarctl`, and other packages those roots do not compile remain advisory `not gated` scope.
+Runtime unit tests enable the non-default `magnetar-proto/test-support` feature through their dev-dependencies.
+Its hidden setters prepare generation and completion-counter boundaries, and its unsubscribe hook completes an already pending operation; each test then calls the unchanged production transition or handles a real correlated broker response.
+Counter corruption, mismatched unsubscribe correlation, and reconnect with a still attached child are defensive-state tests, not ordinary client workflows.
+The feature is absent from default library builds; the coverage command's `--all-features` compilation does not change normal runtime behavior.
 A record-less file in a gated package hard-fails when it contains a non-test function body, even if sibling files emitted LCOV records.
 Executable `unreachable!`, `unimplemented!`, and `todo!` lines remain gated. Missing `DA:` mappings inside an otherwise recorded file remain an unresolved follow-up rather than a lexical hard verdict.
 Module/export/constant/bodyless-declaration-only files remain advisory because they have no executable coverage mapping.

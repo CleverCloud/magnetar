@@ -2225,6 +2225,30 @@ impl StreamConsumerModel {
         self.generation
     }
 
+    /// Prepare a generation-exhaustion boundary in runtime-crate tests.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_delivery_epoch_for_test(&mut self, epoch: DeliveryEpoch) {
+        self.delivery_epoch = epoch;
+    }
+
+    /// Prepare a corrupted completion-counter boundary in runtime-crate tests.
+    /// This deliberately does not synthesize a model error: callers exercise
+    /// the production transition and its checked increment.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_pre_terminal_reservations_for_test(
+        &mut self,
+        segment_id: SegmentId,
+        generation: ChildGeneration,
+        count: usize,
+    ) -> Result<(), StreamConsumerModelError> {
+        self.child_mut(segment_id, generation)?
+            .completion
+            .pre_terminal_reservations = count;
+        Ok(())
+    }
+
     /// Current delivery-authority epoch.
     #[must_use]
     pub const fn delivery_epoch(&self) -> DeliveryEpoch {

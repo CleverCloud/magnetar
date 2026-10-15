@@ -187,6 +187,13 @@ impl ConsumerUnsubscribeOperation {
         self.completion = Some(completion);
         self.waiters.drain().collect()
     }
+
+    /// Exercise a second publication through the production idempotence guard.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn complete_for_test(&mut self, completion: ConsumerUnsubscribeCompletion) -> Vec<Waker> {
+        self.complete(completion)
+    }
 }
 
 /// Singleflight lifecycle for an ordinary consumer close.
