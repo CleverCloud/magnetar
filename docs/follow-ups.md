@@ -18,7 +18,7 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 ## Index
 
-Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
+Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🔬 needs reproduction · 🟡 deferred (not load-bearing).
 
 | #   | Item                                                                                                                                                     | Status                   |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
@@ -39,6 +39,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 26  | [`receive_batch` inner pops do not wake the driver](#26-receive_batch-inner-pops-do-not-wake-the-driver)                                                 | ⚡ ready to dispatch     |
 | 27  | [An undecodable batched entry is dropped without an ack](#27-an-undecodable-batched-entry-is-dropped-without-an-ack)                                     | 🧠 needs design decision |
 | 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                          | 🧠 needs design decision |
+| 29  | [Intermittent high ACK/NACK reconnect test](#29-intermittent-high-ack-nack-reconnect-test)                                                              | 🔬 needs reproduction    |
 
 ---
 
@@ -201,6 +202,12 @@ Java's `discardCorruptedMessage` acknowledges such an entry with a validation er
 Consumer side: a Java batched + encrypted entry has to be decrypted as one body, then decompressed, then split; `ConsumerState::deliver` cannot decrypt — the decryptor lives in the engine, after the pop — so such an entry is undecodable and is dropped and refunded with one `warn!`.
 
 **Why it stays open.** Both halves are a wire change of their own: the encryptor has to run over the batch body inside `flush_batch`, and the decryptor has to reach `deliver` (or the split has to move after the engine's decrypt step).
+
+## 29. Intermittent high ACK/NACK reconnect test
+
+**Gap.** `e2e_unconfirmed_high_ack_never_skips_nacked_lower_message` is temporarily ignored while its intermittent reconnect result is investigated; its assertions remain intact. The exception and reactivation criteria are defined in [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md).
+
+**Why it stays open.** The proposed upstream cursor-cleanup race itself has not been reproduced at runtime, and its causal link to this intermittent result is unproven.
 
 ## Notes on this file
 
