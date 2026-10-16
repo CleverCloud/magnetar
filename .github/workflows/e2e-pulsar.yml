@@ -184,10 +184,13 @@ jobs:
           MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
         run: |
           set -uo pipefail
+          # Capture the pipeline statuses before restoring the runner's inherited `-e`.
+          set +e
           cargo test -p magnetar-driver --all-features --locked --test e2e_seek_per_partition -- --ignored --exact e2e_seek_per_partition_callback --nocapture 2>&1 | tee "$RUNNER_TEMP/quarantine-e2e.log"
           statuses=("${PIPESTATUS[@]}")
           test_status=${statuses[0]}
           tee_status=${statuses[1]}
+          set -e
           printf 'test_status=%s\ntee_status=%s\n' "$test_status" "$tee_status" >> "$GITHUB_OUTPUT"
           if [ "$tee_status" -ne 0 ]; then
             exit 125
