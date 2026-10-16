@@ -12,7 +12,7 @@
 It left the question of _which_ versions to run open, and the answer had changed in the meantime:
 
 - Clever Cloud runs **4.2.5** in production.
-  It is the last release before 5.0, and it carries the broker fix for apache/pulsar#26416 (issue #462) that `4.2.4` lacked.
+  It is the last release before 5.0. At the time this ADR was accepted, the upstream patches for apache/pulsar#26416 (issue #462) were expected to cover the defect seen on `4.2.4`; the 2026-10-16 amendment below records that this expectation is not confirmed by stable-image runs.
 - **5.0.0** was published on 2026-10-01 as the new upstream LTS.
   A client that has never run its Docker-bound suite against it is making a compatibility claim it has not tested.
 - **4.0.14** is the last release of the 4.0 LTS line, which [ADR-0009](0009-pulsar-4-minimum.md) makes the minimum supported broker.
@@ -27,6 +27,12 @@ A suite pinned for no reason runs on exactly one version, which is the thing a v
 
 The per-pull-request `test` job already runs five cells (ADR-0098): one non-e2e and four e2e shards.
 The e2e cells measured about 10–16 minutes each on run 38227469856.
+
+## Amendment — 2026-10-16: issue #462 stable-image evidence
+
+The stable tags `4.0.14`, `4.2.5`, and `5.0.0` are published. The exact ignored test `e2e_shared_subscription_permit_accounting_survives_repeated_churn` was run from source commit `46792879ecde265c50ffaf10616396f14a894f7b`. On `4.0.14` (index digest `sha256:d404b4db9b809cd4e8b65fc2120a97dbc024c222fc2d53041d900c7d5a5f1f2d`), all three bounded runs passed, with 98, 102, and 99 broker observations, minimum aggregate 0, and no negative readings. On `4.2.5` (index digest `sha256:34954c978ecf26808243091495660c8feda6d40241a3ff77aa17bc49f93041a1`), the first run passed with 102 observations and no negative reading; the second failed after 101 observations at `totalAvailablePermits=-2`, with one negative reading and five discarded deferred credits. The failing log SHA-256 is `0107369d8a0b47b7b93e9254f13f994e4f67d5768989e2a51c8000720aa825a7`; raw logs for the three passing `4.0.14` runs and the passing `4.2.5` run were not archived. The test command was `MAGNETAR_PULSAR_IMAGE_TAG=4.2.5 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting --locked -- --ignored --nocapture`.
+
+The previous 2026-10-12 matrix report recorded 5/5 passing runs on `4.0.14` and 7/10 passing runs on each of `4.2.5` and `5.0.0`, with a residual minimum of −2 on the latter two tags. Those results predate PR #399 and are not combined with the current sample. The current campaign stopped after the first `4.2.5` failure; it did not run `5.0.0`. The bounded `4.0.14` sample and the passing first `4.2.5` run do not establish a reliably green image, so the `#[ignore]` remains unchanged and issue #462 remains open. These observations do not alter the version matrix or claim that a release or deployment occurred.
 
 ## Decision
 
@@ -73,7 +79,7 @@ The e2e cells measured about 10–16 minutes each on run 38227469856.
    A failure on one version is one of three things, and each has its own fix: a client bug (fix the client), a test assumption the broker legitimately changed (change the test, with the broker change named in a comment, so that it holds on every axis), or a broker defect (a tracked issue and a decision recorded here; never a silent skip).
    A red nightly is a regression on the minimum broker and is treated like a red pull-request cell.
    The `#[ignore]` on the permit-accounting suite for apache/pulsar#26416 is not part of this decision.
-   `4.2.5` and `4.0.14` carry the upstream fix, so the ignore can be revisited, but separately.
+   The published-image evidence in the 2026-10-16 amendment does not confirm a reliable fix on `4.2.5`; the existing issue #462 ignore remains a separately tracked policy deviation and is not authorized or removed by this matrix decision.
    Landing the axes found the three test assumptions listed under "5.0 / 4.2.5 behaviour changes the suites had to accommodate"; each is a change of the third kind above, made without touching an assertion.
 
 6. **The gate keeps it honest.**
@@ -123,7 +129,7 @@ None is a client defect, and none needed an assertion, a timeout or a skipped te
   The `test` job's five cells become nine (one non-e2e, eight e2e), which adds four e2e cells per pull request, roughly 40–65 runner-minutes at the measured 10–16 minutes each.
   They run in parallel, so wall-clock time stays about that of one e2e cell.
 - Compatibility with 5.0 stops being a claim and becomes a result of every pull request, and the 4.0 minimum is exercised nightly instead of by three suites.
-- `4.2.5` is the baseline, so the fix for apache/pulsar#26416 is in the default broker.
+- `4.2.5` is the baseline broker. The fix for apache/pulsar#26416 is not confirmed on that published image; the ignored diagnostic remains tracked separately by issue #462 (amendment dated 2026-10-16).
 - The required-check names change: `test (e2e 1/4)` and its siblings become `e2e (Pulsar 4.2.5) / e2e 1/4` and so on.
   A branch-protection rule that names them must be updated; `main` carried none as of the last record of ADR-0092.
 - `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs` now honour `MAGNETAR_PULSAR_IMAGE_TAG` again; ADR-0115's note that they no longer do is superseded.
