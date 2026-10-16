@@ -223,6 +223,25 @@ pub(crate) enum Transport<P: Providers> {
 }
 
 impl<P: Providers> Transport<P> {
+    pub(crate) async fn connect_selected(
+        network: &P::Network,
+        addr: &str,
+        tls: Option<(&str, Arc<rustls::ClientConfig>)>,
+        resolver: Option<&dyn DnsResolver>,
+        time: &P::Time,
+        connect_timeout: Duration,
+    ) -> Result<Self, EngineError> {
+        match tls {
+            Some((host, config)) => {
+                Self::connect_tls(network, addr, host, config, resolver, time, connect_timeout)
+                    .await
+            }
+            None => {
+                Self::connect_with_resolver(network, addr, resolver, time, connect_timeout).await
+            }
+        }
+    }
+
     /// Establish a plaintext connection to `addr` (a moonpool-format
     /// `host:port` string, NOT a `pulsar://` URL).
     ///
@@ -904,7 +923,7 @@ impl<P: Providers> TransportWriteHalf<P> {
 /// parsing that moonpool's [`NetworkProvider::connect`] does internally but
 /// surfaces a typed error so the resolver path can report a friendlier
 /// configuration mistake. Brackets around IPv6 hosts are stripped.
-fn split_host_port(addr: &str) -> Result<(&str, u16), EngineError> {
+pub(crate) fn split_host_port(addr: &str) -> Result<(&str, u16), EngineError> {
     let (host, port) = addr
         .rsplit_once(':')
         .ok_or_else(|| EngineError::Config(format!("invalid host:port literal {addr:?}")))?;

@@ -90,6 +90,30 @@ fn seg(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
     }
 }
 
+fn created_at(mut segment: pb::SegmentInfoProto, epoch: u64) -> pb::SegmentInfoProto {
+    segment.created_at_epoch = epoch;
+    segment
+}
+
+fn sealed_at(
+    mut segment: pb::SegmentInfoProto,
+    epoch: u64,
+    children: &[u64],
+) -> pb::SegmentInfoProto {
+    segment.state = pb::SegmentState::Sealed as i32;
+    segment.child_ids = children.to_vec();
+    segment.sealed_at_epoch = Some(epoch);
+    segment
+}
+
+fn split_layout(epoch: u64) -> Vec<pb::SegmentInfoProto> {
+    vec![
+        sealed_at(seg(1, 0, 65_535, &[]), epoch, &[3, 4]),
+        created_at(seg(3, 0, 32_767, &[1]), epoch),
+        created_at(seg(4, 32_768, 65_535, &[1]), epoch),
+    ]
+}
+
 /// Encode a broker→client `CommandScalableTopicUpdate` carrying a whole layout.
 fn layout_frame(session_id: u64, epoch: u64, segments: Vec<pb::SegmentInfoProto>) -> BytesMut {
     let segment_brokers = segments
@@ -134,7 +158,7 @@ fn run_lookup_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) 
     let buf = layout_frame(
         session_id,
         1,
-        vec![seg(1, 0, 32_768, &[]), seg(2, 32_768, 65_536, &[])],
+        vec![seg(1, 0, 32_767, &[]), seg(2, 32_768, 65_535, &[])],
     );
     conn.handle_bytes(Instant::now(), &buf).expect("layout");
     drain_event_tags(&mut conn)
@@ -152,18 +176,14 @@ fn run_split_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -
     // records only the split.
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_535, &[])]),
     )
     .expect("initial layout");
     while conn.poll_event().is_some() {}
     // Second layout splits segment 1 into 3 + 4.
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(
-            session_id,
-            2,
-            vec![seg(3, 0, 32_768, &[1]), seg(4, 32_768, 65_536, &[1])],
-        ),
+        &layout_frame(session_id, 2, split_layout(2)),
     )
     .expect("split layout");
     drain_event_tags(&mut conn)
@@ -176,16 +196,16 @@ fn drain_event_tags(conn: &mut Connection) -> Vec<String> {
     while let Some(ev) = conn.poll_event() {
         let tag = match ev {
             ConnectionEvent::ScalableTopicLookupResolved {
-                segments,
                 controller_broker_url,
                 resolved_topic_name,
-                epoch,
+                snapshot,
                 ..
             } => format!(
-                "LookupResolved(url={},resolved={},epoch={epoch},segs={})",
+                "LookupResolved(url={},resolved={},epoch={},segs={})",
                 controller_broker_url.unwrap_or_default(),
                 resolved_topic_name.unwrap_or_default(),
-                segments.len()
+                snapshot.epoch(),
+                snapshot.segments().len()
             ),
             ConnectionEvent::SegmentDagUpdated { delta, .. } => format!(
                 "DagUpdated(epoch={},added={},removed={},splits={},merges={})",
@@ -204,12 +224,15 @@ fn drain_event_tags(conn: &mut Connection) -> Vec<String> {
             ConnectionEvent::ScalableConsumerAssigned {
                 consumer_id,
                 assignment,
+                ..
             } => format!(
                 "ConsumerAssigned(id={consumer_id},epoch={},topics={})",
-                assignment.layout_epoch,
+                assignment.layout_epoch(),
                 assignment.segment_topics().join("|")
             ),
-            ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta } => format!(
+            ConnectionEvent::ScalableAssignmentChanged {
+                consumer_id, delta, ..
+            } => format!(
                 "AssignmentChanged(id={consumer_id},epoch={},gained={},lost={})",
                 delta.layout_epoch,
                 delta.gained.len(),
@@ -263,7 +286,7 @@ fn dag_change_event_stream_parity() {
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/scalable_topic_drop_on_split.json");
     let expected = "[\
-\n  \"DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)\",\
+\n  \"DagUpdated(epoch=2,added=2,removed=0,splits=1,merges=0)\",\
 \n  \"DagChanged(Split)\"\
 \n]\n";
     if std::env::var_os("MAGNETAR_REGENERATE_GOLDEN").is_some() {
@@ -281,7 +304,7 @@ fn dag_change_event_stream_parity() {
     assert_eq!(
         tokio_tags,
         vec![
-            "DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)".to_owned(),
+            "DagUpdated(epoch=2,added=2,removed=0,splits=1,merges=0)".to_owned(),
             "DagChanged(Split)".to_owned(),
         ]
     );
@@ -307,24 +330,20 @@ fn run_duplicate_epoch_transcript(
     let _ = conn.poll_transmit();
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_535, &[])]),
     )
     .expect("initial layout");
     while conn.poll_event().is_some() {}
     // The duplicate the real broker sends.
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+        &layout_frame(session_id, 1, vec![seg(1, 0, 65_535, &[])]),
     )
     .expect("duplicate layout");
     // The genuine advance the duplicate used to cost us.
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(
-            session_id,
-            2,
-            vec![seg(3, 0, 32_768, &[1]), seg(4, 32_768, 65_536, &[1])],
-        ),
+        &layout_frame(session_id, 2, split_layout(2)),
     )
     .expect("split layout");
     drain_event_tags(&mut conn)
@@ -343,7 +362,7 @@ fn duplicate_layout_epoch_event_stream_parity() {
     assert_eq!(
         tokio_tags,
         vec![
-            "DagUpdated(epoch=2,added=2,removed=1,splits=1,merges=0)".to_owned(),
+            "DagUpdated(epoch=2,added=2,removed=0,splits=1,merges=0)".to_owned(),
             "DagChanged(Split)".to_owned(),
         ],
         "the duplicate contributes no event and leaves the session open"
@@ -387,12 +406,20 @@ fn consumer_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignme
         layout_epoch: epoch,
         segments: segs
             .iter()
-            .map(|&id| pb::ScalableAssignedSegment {
-                segment_id: id,
-                hash_start: 0,
-                hash_end: 32_768,
-                segment_topic: format!("segment://public/default/scaled/{id}"),
-                bucket_ranges: Vec::new(),
+            .map(|&id| {
+                let (hash_start, hash_end) = match id {
+                    2 => (32_768, 65_535),
+                    _ => (0, 32_767),
+                };
+                pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
+                    segment_id: id,
+                    hash_start,
+                    hash_end,
+                    segment_topic: format!(
+                        "segment://public/default/scaled/{hash_start:04x}-{hash_end:04x}-{id}"
+                    ),
+                }
             })
             .collect(),
     }
@@ -429,6 +456,7 @@ fn run_assignment_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Syn
             "consumer-a",
             42,
             magnetar_proto::ScalableConsumerType::Stream,
+            magnetar_proto::ControllerIncarnation(1),
         )
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
@@ -487,7 +515,8 @@ fn consumer_assignment_event_stream_parity() {
     assert_eq!(
         tokio_tags,
         vec![
-            "ConsumerAssigned(id=42,epoch=1,topics=segment://public/default/scaled/1)".to_owned(),
+            "ConsumerAssigned(id=42,epoch=1,topics=segment://public/default/scaled/0000-7fff-1)"
+                .to_owned(),
             "AssignmentChanged(id=42,epoch=2,gained=1,lost=1)".to_owned(),
         ]
     );
@@ -525,14 +554,22 @@ fn run_merge_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -
         &layout_frame(
             session_id,
             1,
-            vec![seg(5, 0, 32_768, &[]), seg(6, 32_768, 65_536, &[])],
+            vec![seg(5, 0, 32_767, &[]), seg(6, 32_768, 65_535, &[])],
         ),
     )
     .expect("initial layout");
     while conn.poll_event().is_some() {}
     conn.handle_bytes(
         Instant::now(),
-        &layout_frame(session_id, 2, vec![seg(7, 0, 65_536, &[5, 6])]),
+        &layout_frame(
+            session_id,
+            2,
+            vec![
+                sealed_at(seg(5, 0, 32_767, &[]), 2, &[7]),
+                sealed_at(seg(6, 32_768, 65_535, &[]), 2, &[7]),
+                created_at(seg(7, 0, 65_535, &[5, 6]), 2),
+            ],
+        ),
     )
     .expect("merge layout");
     drain_event_tags(&mut conn)
@@ -609,7 +646,7 @@ fn run_bodyless_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>
 }
 
 /// Drive a `Connection` through the broker's **synthetic** layout for a regular,
-/// unmigrated topic: one sealed legacy segment wrapping a `persistent://` name.
+/// unmigrated topic: one active legacy segment wrapping a `persistent://` name.
 fn run_legacy_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Vec<String> {
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
@@ -617,17 +654,18 @@ fn run_legacy_transcript(wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) 
         .open_scalable_topic_session("persistent://public/default/plain", true)
         .expect("broker supports scalable topics");
     let _ = conn.poll_transmit();
-    let mut legacy = seg(0, 0, 65_536, &[]);
+    let mut legacy = seg(0, 0, 65_535, &[]);
     legacy.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
-    legacy.state = pb::SegmentState::Sealed as i32;
     conn.handle_bytes(Instant::now(), &layout_frame(session_id, 0, vec![legacy]))
         .expect("legacy layout");
     let tags = drain_event_tags(&mut conn);
-    // The legacy marker and the sealed state must survive the decode, or a
+    // The legacy marker and active state must survive the decode, or a
     // consumer would look for a `segment://` topic that does not exist.
-    let snap = conn.dag_snapshot(session_id).expect("session open");
+    let snap = conn
+        .dag_snapshot(session_id)
+        .unwrap_or_else(|| panic!("legacy session closed: {tags:?}"));
     assert!(snap[0].is_legacy(), "legacy marker survives decode");
-    assert_eq!(snap[0].state, magnetar_proto::SegmentState::Sealed);
+    assert_eq!(snap[0].state, magnetar_proto::SegmentState::Active);
     tags
 }
 
@@ -642,7 +680,7 @@ fn merge_event_stream_parity() {
     assert_eq!(
         tokio_tags,
         vec![
-            "DagUpdated(epoch=2,added=1,removed=2,splits=0,merges=1)".to_owned(),
+            "DagUpdated(epoch=2,added=1,removed=0,splits=0,merges=1)".to_owned(),
             "DagChanged(Merge)".to_owned(),
         ]
     );
@@ -707,7 +745,7 @@ fn legacy_layout_event_stream_parity() {
 /// the two legs the moment either replays a layout it decoded.
 #[test]
 fn scalable_wire_types_roundtrip() {
-    let mut info = seg(3, 16_384, 32_768, &[1, 2]);
+    let mut info = seg(3, 16_384, 32_767, &[1, 2]);
     info.legacy_topic_name = Some("persistent://public/default/plain".to_owned());
     info.sealed_at_epoch = Some(4);
     info.state = pb::SegmentState::Sealed as i32;
@@ -717,7 +755,8 @@ fn scalable_wire_types_roundtrip() {
         broker_url_tls: Some("pulsar+ssl://seg3:6651".to_owned()),
     };
 
-    let descriptor = magnetar_proto::SegmentDescriptor::from_pb(&info, Some(&address));
+    let descriptor = magnetar_proto::SegmentDescriptor::try_from_pb(&info, Some(&address))
+        .expect("valid descriptor");
     let (back_info, back_address) = descriptor.to_pb();
     assert_eq!(back_info.segment_id, info.segment_id);
     assert_eq!(back_info.hash_start, info.hash_start);
@@ -731,26 +770,35 @@ fn scalable_wire_types_roundtrip() {
 
     // A descriptor with no placement encodes no address half — a sealed segment
     // the broker no longer serves has none.
-    let placeless = magnetar_proto::SegmentDescriptor::from_pb(&info, None);
+    let placeless =
+        magnetar_proto::SegmentDescriptor::try_from_pb(&info, None).expect("valid descriptor");
     assert_eq!(placeless.to_pb().1, None);
 
     // Segment state and consumer type survive the enum round-trip.
     assert_eq!(
-        magnetar_proto::SegmentState::from_pb_i32(magnetar_proto::SegmentState::Sealed.to_pb_i32()),
-        magnetar_proto::SegmentState::Sealed
+        magnetar_proto::SegmentState::try_from_pb_i32(
+            magnetar_proto::SegmentState::Sealed.to_pb_i32()
+        ),
+        Ok(magnetar_proto::SegmentState::Sealed)
     );
     assert_eq!(
-        magnetar_proto::SegmentState::from_pb_i32(magnetar_proto::SegmentState::Active.to_pb_i32()),
-        magnetar_proto::SegmentState::Active
+        magnetar_proto::SegmentState::try_from_pb_i32(
+            magnetar_proto::SegmentState::Active.to_pb_i32()
+        ),
+        Ok(magnetar_proto::SegmentState::Active)
     );
     assert_eq!(
-        magnetar_proto::SegmentState::from_pb_i32(99),
-        magnetar_proto::SegmentState::Active,
-        "an unknown wire state saturates rather than breaking the decode"
+        magnetar_proto::SegmentState::try_from_pb_i32(99),
+        Err(99),
+        "an unknown wire state is rejected instead of silently changing lifecycle"
     );
 
-    let assignment = magnetar_proto::ConsumerAssignment::from_pb(&consumer_assignment(7, &[2, 1]));
-    assert_eq!(assignment.layout_epoch, 7);
+    let assignment = magnetar_proto::ConsumerAssignment::try_from_pb(
+        &consumer_assignment(7, &[2, 1]),
+        "topic://public/default/scaled",
+    )
+    .expect("valid canonical assignment");
+    assert_eq!(assignment.layout_epoch(), 7);
     let back = assignment.to_pb();
     assert_eq!(back.layout_epoch, 7);
     assert_eq!(back.segments.len(), 2);
@@ -790,7 +838,7 @@ fn session_guards_and_accessors_parity() {
         let _ = conn.poll_transmit();
         conn.handle_bytes(
             Instant::now(),
-            &layout_frame(session_id, 5, vec![seg(1, 0, 65_536, &[])]),
+            &layout_frame(session_id, 5, vec![seg(1, 0, 65_535, &[])]),
         )
         .expect("initial layout");
         while conn.poll_event().is_some() {}
@@ -801,7 +849,7 @@ fn session_guards_and_accessors_parity() {
         // the client to every later epoch against a real broker.
         conn.handle_bytes(
             Instant::now(),
-            &layout_frame(session_id, 5, vec![seg(9, 0, 65_536, &[])]),
+            &layout_frame(session_id, 5, vec![seg(9, 0, 65_535, &[])]),
         )
         .expect("stale layout");
         let tags = drain_event_tags(&mut conn);
@@ -880,7 +928,7 @@ fn scalable_stale_frames_are_dropped_and_accessors_read() {
         );
         conn.handle_bytes(
             Instant::now(),
-            &layout_frame(session_id, 1, vec![seg(1, 0, 65_536, &[])]),
+            &layout_frame(session_id, 1, vec![seg(1, 0, 65_535, &[])]),
         )
         .expect("initial layout");
         while conn.poll_event().is_some() {}
@@ -894,7 +942,7 @@ fn scalable_stale_frames_are_dropped_and_accessors_read() {
         // A layout for a session this connection never opened is dropped.
         conn.handle_bytes(
             Instant::now(),
-            &layout_frame(9_999, 1, vec![seg(1, 0, 65_536, &[])]),
+            &layout_frame(9_999, 1, vec![seg(1, 0, 65_535, &[])]),
         )
         .expect("stale layout tolerated");
         assert!(
@@ -960,6 +1008,7 @@ fn scalable_stale_frames_are_dropped_and_accessors_read() {
 /// The sans-io session and watch types expose read-only state the engines and
 /// the CLI surface; exercised here for the same execution-scope reason.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scalable_consumer_session_and_watch_accessors() {
     let mut session = magnetar_proto::ScalableConsumerSession::new(
         7,
@@ -967,6 +1016,7 @@ fn scalable_consumer_session_and_watch_accessors() {
         "sub".to_owned(),
         "consumer-a".to_owned(),
         magnetar_proto::ScalableConsumerType::Stream,
+        magnetar_proto::ControllerIncarnation(1),
     );
     assert_eq!(session.topic(), "topic://public/default/scaled");
     assert_eq!(session.subscription(), "sub");
@@ -987,10 +1037,15 @@ fn scalable_consumer_session_and_watch_accessors() {
         })
         .expect("subscribe resolves");
     assert!(session.is_registered());
-    assert_eq!(session.assignment().map(|a| a.layout_epoch), Some(3));
+    assert_eq!(
+        session
+            .assignment()
+            .map(magnetar_proto::ConsumerAssignment::layout_epoch),
+        Some(3)
+    );
     assert_eq!(
         assignment.segment_topics(),
-        vec!["segment://public/default/scaled/1"]
+        vec!["segment://public/default/scaled/0000-7fff-1"]
     );
 
     // A success response carrying no assignment is refused rather than read as
@@ -1001,6 +1056,7 @@ fn scalable_consumer_session_and_watch_accessors() {
         "s".to_owned(),
         "c".to_owned(),
         magnetar_proto::ScalableConsumerType::Checkpoint,
+        magnetar_proto::ControllerIncarnation(1),
     );
     assert_eq!(
         empty.consumer_type(),
@@ -1051,13 +1107,17 @@ fn scalable_consumer_session_and_watch_accessors() {
 
     // An assignment round-trips through the wire pair, and the assigned-segment
     // encode side is what the fakes hand back.
-    let seg = magnetar_proto::AssignedSegment::from_pb(&pb::ScalableAssignedSegment {
-        segment_id: 4,
-        hash_start: 0,
-        hash_end: 128,
-        segment_topic: "segment://public/default/scaled/4".to_owned(),
-        bucket_ranges: Vec::new(),
-    });
+    let seg = magnetar_proto::AssignedSegment::try_from_pb(
+        &pb::ScalableAssignedSegment {
+            bucket_ranges: Vec::new(),
+            segment_id: 4,
+            hash_start: 0,
+            hash_end: 128,
+            segment_topic: "segment://public/default/scaled/0000-0080-4".to_owned(),
+        },
+        "topic://public/default/scaled",
+    )
+    .expect("valid canonical assigned segment");
     assert_eq!(seg.to_pb().segment_id, 4);
     assert!(
         magnetar_proto::AssignmentDelta {
@@ -1221,6 +1281,7 @@ fn scalable_session_and_watch_reject_foreign_updates() {
         "sub".to_owned(),
         "consumer-a".to_owned(),
         magnetar_proto::ScalableConsumerType::Stream,
+        magnetar_proto::ControllerIncarnation(1),
     );
     let err = session
         .handle_assignment_update(&pb::CommandScalableTopicAssignmentUpdate {
@@ -1269,10 +1330,10 @@ fn scalable_session_and_watch_reject_foreign_updates() {
 /// Drive a `Connection` built the way an engine builds it through the outbound
 /// commands the 5.0.0 vendoring touches — a scalable lookup with each
 /// `create_if_missing` value, and a plain `Key_Shared` subscribe — and return the
-/// exact bytes written for each.
+/// exact bytes written for each, including GA sticky entry-bucket dispatch.
 fn run_outbound_transcript(
     wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
-) -> (bytes::Bytes, bytes::Bytes, bytes::Bytes) {
+) -> (bytes::Bytes, bytes::Bytes, bytes::Bytes, bytes::Bytes) {
     let mut conn = Connection::new(ConnectionConfig::default(), wall_clock);
     connected(&mut conn);
     let _ = conn.poll_transmit();
@@ -1295,19 +1356,37 @@ fn run_outbound_transcript(
         ..Default::default()
     });
     let subscribe = conn.poll_transmit();
-    (creating_lookup, read_only_lookup, subscribe)
+    conn.subscribe(magnetar_proto::SubscribeRequest {
+        topic: "segment://public/default/scaled/0000-ffff-1".to_owned(),
+        subscription: "workers".to_owned(),
+        sub_type: pb::command_subscribe::SubType::KeyShared,
+        key_shared: Some(magnetar_proto::KeySharedConfig {
+            mode: pb::KeySharedMode::Sticky,
+            sticky_hash_ranges: vec![(0, 32767), (32768, 65535)],
+            allow_out_of_order_delivery: false,
+        }),
+        entry_bucket_dispatch: true,
+        ..Default::default()
+    });
+    (
+        creating_lookup,
+        read_only_lookup,
+        subscribe,
+        conn.poll_transmit(),
+    )
 }
 
 /// Both engine shapes write byte-identical lookup and `Key_Shared` subscribe
 /// frames (ADR-0093 amendment 2026-10-12): a lookup states the caller's
 /// `create_if_missing` explicitly — `true` for a consumer, `false` for the
 /// read-only lookup — and a plain `Key_Shared` subscription leaves PIP-486's
-/// `entryBucketDispatch` unset so the broker keeps dispatching by key.
+/// `entryBucketDispatch` unset so the broker keeps dispatching by key. A scalable
+/// bucket subscription preserves the assigned ranges and enables entry dispatch.
 #[test]
 fn outbound_lookup_and_key_shared_subscribe_parity() {
-    let (tokio_creating, tokio_read_only, tokio_subscribe) =
+    let (tokio_creating, tokio_read_only, tokio_subscribe, tokio_bucket) =
         run_outbound_transcript(tokio_wall_clock());
-    let (moonpool_creating, moonpool_read_only, moonpool_subscribe) =
+    let (moonpool_creating, moonpool_read_only, moonpool_subscribe, moonpool_bucket) =
         run_outbound_transcript(moonpool_wall_clock());
     assert_eq!(
         tokio_creating, moonpool_creating,
@@ -1342,4 +1421,33 @@ fn outbound_lookup_and_key_shared_subscribe_parity() {
         .expect("a Key_Shared subscribe carries its meta");
     assert_eq!(meta.allow_out_of_order_delivery, Some(true));
     assert_eq!(meta.entry_bucket_dispatch, None);
+
+    assert_eq!(
+        tokio_bucket, moonpool_bucket,
+        "engine bucket subscribe bytes diverged"
+    );
+    let mut bucket_bytes = tokio_bucket;
+    let meta = magnetar_proto::decode_one(&mut bucket_bytes)
+        .expect("bucket subscription decodes")
+        .command
+        .subscribe
+        .expect("bucket subscription body")
+        .key_shared_meta
+        .expect("bucket metadata");
+    assert_eq!(meta.entry_bucket_dispatch, Some(true));
+    assert_eq!(meta.key_shared_mode, pb::KeySharedMode::Sticky as i32);
+    assert_eq!(meta.allow_out_of_order_delivery, Some(false));
+    assert_eq!(
+        meta.hash_ranges,
+        vec![
+            pb::IntRange {
+                start: 0,
+                end: 32767
+            },
+            pb::IntRange {
+                start: 32768,
+                end: 65535
+            },
+        ]
+    );
 }

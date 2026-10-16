@@ -16,18 +16,13 @@
 //! are wired: LZ4 (block format with a header), Zlib, Zstd, Snappy. The `None` variant is
 //! a pass-through.
 //!
-//! Decompression takes the broker-supplied `uncompressed_size` as a sanity bound — a payload
-//! that would inflate beyond `MAX_INFLATE_RATIO × uncompressed_size` is rejected to keep
-//! malicious peers from triggering OOMs.
+//! Decompression takes the broker-supplied `uncompressed_size` as an output
+//! bound. The aggregate separately reserves bounded codec context/window work.
 
 use bytes::Bytes;
 
 use crate::pb;
 use crate::types::CompressionKind;
-
-/// Bound on inflation during `decompress()` — caps each codec's working buffer at
-/// `MAX_INFLATE_RATIO × uncompressed_size` to defuse decompression bombs.
-const MAX_INFLATE_RATIO: usize = 4;
 
 /// Errors that can occur during compress/decompress.
 #[derive(Debug, thiserror::Error)]
@@ -117,11 +112,9 @@ pub fn compress(kind: CompressionKind, plaintext: &[u8]) -> Result<Bytes, Compre
 /// Decompress `ciphertext` according to `kind`, using `uncompressed_size` from the broker as
 /// the expected output size (and as the safety bound).
 ///
-/// Every codec path is **bounded**: the decompressor cannot allocate more than
-/// [`crate::MAX_FRAME_SIZE`] regardless of what the codec's internal
-/// length header claims. This blocks the "tiny ciphertext expands to GB"
-/// decompression-bomb pattern (CWE-409) that bypasses the
-/// `uncompressed_size`-based pre-cap.
+/// Every codec output path is bounded by the broker-advertised size plus one
+/// validation byte. Zlib uses a borrowed input buffer; zstd decodes into a
+/// fixed destination with a window capped from the same advertised size.
 ///
 /// # Errors
 /// Codec-specific decode failures, plus [`CompressionError::SizeMismatch`] if the decompressed
@@ -148,73 +141,39 @@ pub fn decompress(
         });
     }
     let ceiling = crate::MAX_FRAME_SIZE;
-    let bound = uncompressed_size.saturating_mul(MAX_INFLATE_RATIO).max(64);
+    let validation_len = uncompressed_size
+        .checked_add(crate::DECOMPRESSION_VALIDATION_SLACK)
+        .ok_or(CompressionError::UncompressedSizeTooLarge {
+            got: usize::MAX,
+            ceiling,
+        })?;
     match kind {
         CompressionKind::None => Ok(Bytes::copy_from_slice(ciphertext)),
         CompressionKind::Lz4 => {
-            // `lz4_flex::decompress` allocates `Vec::with_capacity(uncompressed_size)`
-            // and decodes into it. The broker-supplied `uncompressed_size` is already
-            // pre-capped at `MAX_FRAME_SIZE` above, so the pre-allocation is bounded.
-            // The codec itself stops when the block ends; if a tampered block
-            // over-runs, `verify_size` catches it on the post-check. As an extra
-            // belt the post-decode length is re-checked against the ceiling so a
-            // future codec-side bug that grew the buffer past the announced size
-            // still cannot bypass the wire ceiling.
-            let decompressed = lz4_flex::decompress(ciphertext, uncompressed_size)
+            let mut decompressed = vec![0_u8; validation_len];
+            let len = lz4_flex::block::decompress_into(ciphertext, &mut decompressed)
                 .map_err(|e| CompressionError::Lz4(e.to_string()))?;
-            if decompressed.len() > ceiling {
-                return Err(CompressionError::UncompressedSizeTooLarge {
-                    got: decompressed.len(),
-                    ceiling,
-                });
-            }
+            decompressed.truncate(len);
             verify_size(&decompressed, uncompressed_size)?;
             Ok(Bytes::from(decompressed))
         }
         CompressionKind::Zlib => {
-            use std::io::Read;
-            let mut decoder = flate2::read::ZlibDecoder::new(ciphertext);
-            let mut out = Vec::with_capacity(uncompressed_size);
-            // `.take(bound + 1)` so a payload that *actually* exceeds `bound`
-            // can be detected via the over-read marker rather than silently
-            // truncating.
-            decoder
-                .by_ref()
-                .take(bound.saturating_add(1) as u64)
-                .read_to_end(&mut out)?;
-            if out.len() > ceiling {
-                return Err(CompressionError::UncompressedSizeTooLarge {
-                    got: out.len(),
-                    ceiling,
-                });
-            }
+            let mut decoder = flate2::bufread::ZlibDecoder::new(ciphertext);
+            let out = read_bounded(&mut decoder, validation_len)?;
             verify_size(&out, uncompressed_size)?;
             Ok(Bytes::from(out))
         }
         CompressionKind::Zstd => {
-            // Streaming Zstd decoder bounded by `take(ceiling + 1)`: a tampered
-            // small ciphertext that would otherwise expand to GBs of zeroes
-            // can never grow `out` past the wire ceiling. The `+ 1` lets us
-            // distinguish "decoded exactly up to the ceiling" from "would have
-            // continued past it"; the over-cap branch returns `UncompressedSizeTooLarge`
-            // instead of silently returning a truncated frame. `decode_all`
-            // previously had no such bound — a decompression bomb (CWE-409).
-            use std::io::Read;
-            let mut decoder = zstd::stream::Decoder::new(ciphertext)
+            let mut decoder = zstd::bulk::Decompressor::new()
                 .map_err(|e| CompressionError::Zstd(e.to_string()))?;
-            let cap = ceiling.saturating_add(1) as u64;
-            let mut out = Vec::with_capacity(uncompressed_size);
             decoder
-                .by_ref()
-                .take(cap)
-                .read_to_end(&mut out)
+                .window_log_max(zstd_window_log(uncompressed_size))
                 .map_err(|e| CompressionError::Zstd(e.to_string()))?;
-            if out.len() > ceiling {
-                return Err(CompressionError::UncompressedSizeTooLarge {
-                    got: out.len(),
-                    ceiling,
-                });
-            }
+            let mut out = vec![0_u8; validation_len];
+            let written = decoder
+                .decompress_to_buffer(ciphertext, out.as_mut_slice())
+                .map_err(|e| CompressionError::Zstd(e.to_string()))?;
+            out.truncate(written);
             verify_size(&out, uncompressed_size)?;
             Ok(Bytes::from(out))
         }
@@ -233,21 +192,45 @@ pub fn decompress(
                     ceiling,
                 });
             }
-            let mut buf = vec![0u8; announced];
+            if announced != uncompressed_size {
+                return Err(CompressionError::SizeMismatch {
+                    got: announced,
+                    expected: uncompressed_size,
+                });
+            }
+            let mut buf = vec![0u8; uncompressed_size];
             let n = Decoder::new()
                 .decompress(ciphertext, &mut buf)
                 .map_err(|e| CompressionError::Snappy(e.to_string()))?;
             buf.truncate(n);
-            if buf.len() > ceiling {
-                return Err(CompressionError::UncompressedSizeTooLarge {
-                    got: buf.len(),
-                    ceiling,
-                });
-            }
             verify_size(&buf, uncompressed_size)?;
             Ok(Bytes::from(buf))
         }
     }
+}
+
+fn zstd_window_log(uncompressed_size: usize) -> u32 {
+    let window = uncompressed_size
+        .max(crate::ZSTD_MIN_WINDOW_SIZE)
+        .next_power_of_two();
+    usize::BITS - window.leading_zeros() - 1
+}
+
+fn read_bounded(
+    reader: &mut impl std::io::Read,
+    validation_len: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut output = vec![0_u8; validation_len];
+    let mut written = 0;
+    while written < validation_len {
+        let read = reader.read(&mut output[written..])?;
+        if read == 0 {
+            break;
+        }
+        written += read;
+    }
+    output.truncate(written);
+    Ok(output)
 }
 
 /// Upper bound on how far one LZ4 block can inflate. Every input byte adds at most 255
@@ -337,6 +320,51 @@ fn verify_size(buf: &[u8], expected: usize) -> Result<(), CompressionError> {
 #[cfg(test)]
 mod tests {
     use super::{CompressionKind, compress, decompress};
+    use crate::pb;
+
+    #[test]
+    fn every_codec_round_trips_and_maps_from_wire() {
+        let input = b"tokio scalable compression";
+        for (wire, kind) in [
+            (pb::CompressionType::None, CompressionKind::None),
+            (pb::CompressionType::Lz4, CompressionKind::Lz4),
+            (pb::CompressionType::Zlib, CompressionKind::Zlib),
+            (pb::CompressionType::Zstd, CompressionKind::Zstd),
+            (pb::CompressionType::Snappy, CompressionKind::Snappy),
+        ] {
+            assert_eq!(super::kind_from_pb(wire), kind);
+            let encoded = compress(kind, input).expect("encode codec fixture");
+            assert_eq!(
+                decompress(kind, &encoded, input.len()).expect("decode codec fixture"),
+                input.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_sizes_and_payloads_are_bounded() {
+        assert!(matches!(
+            decompress(CompressionKind::None, b"ignored", crate::MAX_FRAME_SIZE + 1,),
+            Err(super::CompressionError::UncompressedSizeTooLarge { .. })
+        ));
+        for kind in [
+            CompressionKind::Lz4,
+            CompressionKind::Zlib,
+            CompressionKind::Zstd,
+            CompressionKind::Snappy,
+        ] {
+            assert!(
+                decompress(kind, b"invalid", 1).is_err(),
+                "kind={kind:?} must reject malformed input"
+            );
+        }
+        let oversized = vec![0_u8; crate::MAX_FRAME_SIZE + 1];
+        let encoded = compress(CompressionKind::Snappy, &oversized).expect("encode oversized");
+        assert!(matches!(
+            decompress(CompressionKind::Snappy, &encoded, crate::MAX_FRAME_SIZE,),
+            Err(super::CompressionError::UncompressedSizeTooLarge { .. })
+        ));
+    }
 
     fn roundtrip(kind: CompressionKind, payload: &[u8]) {
         let compressed = compress(kind, payload).expect("compress");
@@ -383,10 +411,44 @@ mod tests {
     #[test]
     fn size_mismatch_rejected() {
         let payload = vec![0u8; 1024];
-        let compressed = compress(CompressionKind::Zstd, &payload).unwrap();
+        let compressed = compress(CompressionKind::Zlib, &payload).unwrap();
         // Lie about the uncompressed size — bound is satisfied but verify_size rejects.
-        let err = decompress(CompressionKind::Zstd, &compressed, 999).expect_err("mismatch");
+        let err = decompress(CompressionKind::Zlib, &compressed, 999).expect_err("mismatch");
         assert!(matches!(err, super::CompressionError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    #[allow(clippy::match_same_arms)]
+    fn every_codec_stops_at_the_advertised_size_plus_validation_slack() {
+        let payload = vec![0_u8; 4096];
+        for kind in [
+            CompressionKind::Lz4,
+            CompressionKind::Zlib,
+            CompressionKind::Zstd,
+            CompressionKind::Snappy,
+        ] {
+            let compressed = compress(kind, &payload).expect("compress overexpansion fixture");
+            let error = decompress(kind, &compressed, 1).expect_err("overexpansion rejected");
+            match (kind, error) {
+                (CompressionKind::Lz4, super::CompressionError::Lz4(_)) => {}
+                (
+                    CompressionKind::Zlib,
+                    super::CompressionError::SizeMismatch {
+                        got: 2,
+                        expected: 1,
+                    },
+                ) => {}
+                (CompressionKind::Zstd, super::CompressionError::Zstd(_)) => {}
+                (
+                    CompressionKind::Snappy,
+                    super::CompressionError::SizeMismatch {
+                        got: 4096,
+                        expected: 1,
+                    },
+                ) => {}
+                (_, other) => panic!("kind={kind:?} returned unexpected error {other:?}"),
+            }
+        }
     }
 
     /// A broker (or a tampered MITM) advertising an outlandish
@@ -463,6 +525,7 @@ mod tests {
     /// without paying the 10 MiB allocation cost. A "Got OK" outcome is
     /// the regression we are guarding against.
     #[test]
+    #[allow(clippy::match_same_arms)]
     fn zstd_decompression_bomb_is_bounded() {
         // 10 MiB of zeroes — highly compressible. Real ciphertext is a few
         // hundred bytes; without the bound the decoder would happily produce
@@ -498,8 +561,12 @@ mod tests {
                 // the ceiling) and the post-check spotted the mismatch with the
                 // lying 1-byte advertisement. The point is no 10 MiB alloc.
             }
+            super::CompressionError::Zstd(_) => {
+                // Fixed-destination zstd rejects before producing an oversized
+                // output buffer.
+            }
             other => {
-                panic!("expected UncompressedSizeTooLarge or SizeMismatch from bomb, got {other:?}")
+                panic!("expected a bounded zstd bomb rejection, got {other:?}")
             }
         }
 

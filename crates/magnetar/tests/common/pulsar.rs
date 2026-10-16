@@ -266,6 +266,7 @@ pub struct Pulsar {
     advertise_container_address: bool,
     memory: String,
     admin_token: Option<String>,
+    binary_port: u16,
 }
 
 impl Pulsar {
@@ -281,6 +282,7 @@ impl Pulsar {
             advertise_container_address: false,
             memory: PULSAR_MEM_LIMIT.to_owned(),
             admin_token: None,
+            binary_port: BROKER_BINARY_PORT,
         }
     }
 
@@ -291,6 +293,16 @@ impl Pulsar {
         assert_identifier(key);
         self.config.push((key.to_owned(), value.into()));
         self
+    }
+
+    /// Use `port` inside the standalone container and publish that same port.
+    /// A direct-routing suite can reserve an ephemeral host listener first,
+    /// then forward it to Docker's mapping of this broker-advertised port.
+    #[must_use]
+    pub fn binary_port(mut self, port: u16) -> Self {
+        assert_ne!(port, 0, "the broker binary port must be nonzero");
+        self.binary_port = port;
+        self.config("brokerServicePort", port.to_string())
     }
 
     /// Export `name=value` to the broker process verbatim, for the variables
@@ -417,7 +429,7 @@ impl Pulsar {
         // treats a stashed builder as a violation.
         let container = if self.zookeeper {
             GenericImage::new(image_repo(), tag.as_str().to_owned())
-                .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
+                .with_exposed_port(ContainerPort::Tcp(self.binary_port))
                 .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
                 .with_exposed_port(ContainerPort::Tcp(ZOOKEEPER_PORT))
                 .with_wait_for(WaitFor::Nothing)
@@ -427,7 +439,7 @@ impl Pulsar {
                 .await?
         } else {
             GenericImage::new(image_repo(), tag.as_str().to_owned())
-                .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
+                .with_exposed_port(ContainerPort::Tcp(self.binary_port))
                 .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
                 .with_wait_for(WaitFor::Nothing)
                 .with_env_var("PULSAR_MEM", self.memory.as_str())
@@ -437,7 +449,7 @@ impl Pulsar {
         };
 
         let host = container.get_host().await?.to_string();
-        let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+        let binary_port = container.get_host_port_ipv4(self.binary_port).await?;
         let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
         let zookeeper_port = if self.zookeeper {
             Some(container.get_host_port_ipv4(ZOOKEEPER_PORT).await?)
@@ -469,7 +481,8 @@ impl Pulsar {
                 && self.flags.is_empty()
                 && !self.zookeeper
                 && !self.advertise_container_address
-                && self.admin_token.is_none(),
+                && self.admin_token.is_none()
+                && self.binary_port == BROKER_BINARY_PORT,
             "a proxy is configured with `config` only"
         );
         let tag = self.broker.tag();
@@ -500,7 +513,7 @@ pub struct Running {
     pub admin_url: String,
     /// Host the published ports are reachable on.
     pub host: String,
-    /// Mapped host port of [`BROKER_BINARY_PORT`].
+    /// Mapped host port of the configured binary port (default [`BROKER_BINARY_PORT`]).
     pub binary_port: u16,
     /// Mapped host port of [`BROKER_HTTP_PORT`].
     pub http_port: u16,

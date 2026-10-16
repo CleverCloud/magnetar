@@ -141,6 +141,24 @@ fn configuration_is_exported_then_applied_before_the_broker_execs() {
 }
 
 #[test]
+fn a_custom_binary_port_is_applied_before_the_broker_starts() {
+    let command = Pulsar::new(Broker::Scalable).binary_port(17321).command();
+    let script = &command[2];
+    let configure = script
+        .find("export PULSAR_PREFIX_brokerServicePort='17321'")
+        .expect("the reserved binary port reaches the broker configuration");
+    let apply = script.find("apply-config-from-env.py").unwrap();
+    let launch = script.find("exec bin/pulsar standalone").unwrap();
+    assert!(configure < apply && apply < launch, "{script}");
+}
+
+#[test]
+#[should_panic(expected = "the broker binary port must be nonzero")]
+fn a_zero_binary_port_is_refused_before_startup() {
+    let _ = Pulsar::new(Broker::Scalable).binary_port(0);
+}
+
+#[test]
 fn pre_start_steps_run_between_the_configuration_and_the_launch() {
     let command = Pulsar::new(Broker::Default)
         .config("transactionCoordinatorEnabled", "true")
@@ -345,4 +363,13 @@ mod executed {
         assert!(!image.run(&command[2]).success());
         assert_eq!(image.recorded("launched"), None);
     }
+}
+
+#[tokio::test]
+#[should_panic(expected = "a proxy is configured with `config` only")]
+async fn a_standalone_binary_port_is_refused_before_a_proxy_starts() {
+    let _ = Pulsar::new(Broker::Default)
+        .binary_port(17321)
+        .start_proxy()
+        .await;
 }

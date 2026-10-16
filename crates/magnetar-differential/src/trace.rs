@@ -105,6 +105,8 @@ pub enum Op {
     /// is a no-op on the consumer side) and the consumer if open.
     /// Resolves the producer/consumer close round-trip.
     Close,
+    /// Reliably close two clones of the same ordinary consumer concurrently.
+    ConcurrentClose,
     /// Drop every clone of the trace's producer WITHOUT an explicit
     /// `close().await`. Exercises the engines' last-clone drop guard
     /// (issue #241): the guard enqueues a best-effort
@@ -734,30 +736,31 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         }
     }
 
     #[test]
     fn trace_round_trip() {
+        let operations = vec![
+            Op::Send {
+                payload: b"hi".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(1),
+            },
+            Op::Ack {
+                message_id: mid(1, 0),
+            },
+            Op::Close,
+            Op::ConcurrentClose,
+        ];
         let t = Trace::new(
             "persistent://public/default/t",
             "s",
-            vec![
-                Op::Send {
-                    payload: b"hi".to_vec(),
-                },
-                Op::Recv {
-                    timeout: Duration::from_secs(1),
-                },
-                Op::Ack {
-                    message_id: mid(1, 0),
-                },
-                Op::Close,
-            ],
+            ToOwned::to_owned(&operations),
         );
-        assert_eq!(t.ops.len(), 4);
+        assert_eq!(t.ops.len(), 5);
+        assert_eq!(t.ops, operations);
         assert_eq!(t.topic, "persistent://public/default/t");
         assert_eq!(t.subscription, "s");
     }
@@ -787,8 +790,6 @@ mod tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: 0,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 },
             }],
         };
@@ -800,8 +801,6 @@ mod tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: 0,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 },
             }],
         };

@@ -28,22 +28,21 @@ name: xtask gates
 # This copy covers other pull-request targets, the dispatchable-against-any-
 # branch case, and the daily heartbeat that proves the gate still builds.
 #
-# SCOPE of check-sim-coverage: the run executes only the moonpool +
-# differential test binaries, but it reports coverage over every crate that
-# run compiles — `magnetar-proto`, `magnetar-runtime-tokio`,
-# `magnetar-runtime-moonpool`, `magnetar-differential`,
-# `magnetar-auth-athenz` and `magnetar-auth-sasl`. An added line in one of
-# those that the sim run never executes is REPORTED with a count and FAILS
+# SCOPE of check-sim-coverage: Moonpool + differential tests hard-gate
+# shared/proto/Moonpool/differential/façade/fakes/auth source, while a separate
+# fresh Tokio unit/integration run hard-gates only Tokio adapter source.
+# Domain targets, profiles, objects and reports are disjoint (ADR-0121).
+# An added line its owning domain never executes is REPORTED with a count and FAILS
 # the job: ADR-0092 flipped `SIM_COVERAGE_ENFORCES_UNCOVERED` to `true`,
 # superseding ADR-0090's advisory landing, so no flag is needed to get the
-# verdict. A second case fails too, and did so even while the verdict was
-# advisory — an added file whose whole gated crate emitted no coverage
-# records at all, which means the gate could not measure rather than that a
-# test is missing.
-# The `magnetar-driver` façade is deliberately not compiled here —
-# its e2e suite is Docker-bound (ADR-0046) — so façade additions still print
-# as advisory `not gated` lines and cannot fail the job. That is a scope
-# limit rather than a verdict, and no setting of the constant turns it fatal.
+# verdict. Record-less gated source also fails when the file contains a
+# non-test function body or when its whole crate emitted no coverage records;
+# either means the gate could not measure rather than that a test is merely
+# missing. Genuinely non-executable files remain advisory.
+# The façade and fake are reached through the differential public aggregate
+# suites; the façade's Docker-bound e2e targets still do not execute here.
+# Packages outside these seven-plus-one domains remain advisory
+# `not gated` scope rather than a coverage verdict.
 #
 # Security note: no `github.event.*` inputs are interpolated anywhere in
 # this workflow.
@@ -144,13 +143,13 @@ jobs:
           RANLIB: llvm-ranlib
 
   sim-coverage:
-    name: sim-coverage (patch coverage, sim-instrumented crates)
+    name: sim-coverage (isolated Moonpool + Tokio patch coverage)
     if: ${{ github.event_name != 'pull_request' || github.base_ref != 'main' }}
     runs-on: ubuntu-26.04
     # Budget for one instrumented `--all-features` build of the moonpool +
     # differential test binaries and their dependency closure
     # (aws-lc-fips-sys included) plus the sim run itself. Widening the
-    # report to the six crates named in the header note cost no extra
+    # report to the eight crates named in the header note cost no extra
     # compilation — it is a second `cargo llvm-cov report` over artifacts
     # already on disk — so this number did not move with that change. It
     # Pull requests get the same 180-minute budget as the equivalent per-PR

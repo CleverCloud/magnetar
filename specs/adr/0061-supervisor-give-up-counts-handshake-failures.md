@@ -1,6 +1,6 @@
 # ADR-0061 — Supervisor give-up budget counts post-dial handshake failures
 
-- **Status**: Accepted
+- **Status**: Accepted (amended 2026-10-14 — handshake-confirmed stability)
 - **Date**: 2026-06-09
 - **Decider**: Florentin Dubois
 - **Tags**: reconnect, resilience, runtime, supervisor, sans-io
@@ -43,8 +43,10 @@ Each pass through the inner dial loop increments the counter and checks `should_
 
 ### 3. Reset on the shared stability gate
 
-The counter resets to `0` ONLY when `should_reset_backoff(socket_alive)` is true — the SAME predicate, computed at the same place, that already gates `Backoff::reset`.
-Backoff-reset and give-up-reset now share ONE definition of "the last reconnect counted as stable": a connection that survived `drop_grace`.
+The counter and backoff reset ONLY when the previous socket completed its Pulsar handshake **and** `should_reset_backoff(socket_alive)` is true.
+Both use the existing `pending_rebuild` flag, cleared only after `Connected`, to exclude a socket that is still handshaking.
+This prevents a silent handshake that outlives `drop_grace` from repeatedly renewing the retry budget.
+Backoff-reset and give-up-reset share one definition of stability: a handshake-confirmed connection whose socket lifetime exceeded `drop_grace`.
 A socket that merely accepted TCP and handshaked but died inside `drop_grace`, or never handshaked at all behind a TCP-accepting proxy, resets NEITHER.
 
 ### 4. Count every post-dial failure uniformly
@@ -63,7 +65,7 @@ That site fires even with zero handles to replay (`producers = 0, consumers = 0`
 
 - **Breaking change for callers who set a finite `max_attempts`.** Behind a TCP-accepting proxy whose backend is down, the supervisor now gives up at the budget instead of retrying forever. Callers relying on the old (accidental) infinite-retry-behind-a-proxy behaviour must raise `max_attempts` or leave it `None`. The default is `None` (infinite), so most callers are unaffected.
 - A finite-budget supervised connection behind a TCP-accept storm now terminates: it exhausts `max_attempts`, latches `no_driver` ([ADR-0059](0056-terminal-fast-fail-new-ops.md)), runs `fail_all_pending`, and new ops fast-fail with `ClientError::PeerClosed` instead of hanging.
-- Backoff-reset and give-up-reset share one stability predicate, so a connection that genuinely stabilizes (survives `drop_grace`) clears BOTH the backoff schedule and the give-up budget — a later storm starts the budget from scratch.
+- Backoff-reset and give-up-reset share one stability predicate, so a connection that completes its handshake and survives `drop_grace` clears BOTH the backoff schedule and the give-up budget — a later storm starts the budget from scratch.
 - `magnetar-proto` stays zero-I/O: the only proto-side addition is the stateless `should_give_up` policy method.
 - This **amends** the supervision model of [ADR-0028](0028-supervised-reconnect-anti-thrash-policy.md) (anti-thrash) and [ADR-0052](0052-initial-connect-timeout-retry.md) (connect-timeout-retry): the per-attempt `connect_timeout` of ADR-0052 still bounds each dial, and the anti-thrash cooldown of ADR-0028 still bounds cadence; ADR-0061 only changes WHICH failures the give-up budget counts. Neither prior ADR is superseded.
 - ADR-0024 layers ship in the same commit: a proto unit (`should_give_up` fires at the budget behind a TCP-accept; a stable socket resets the counter; default `None` never gives up; strict-`>` boundary), tokio + moonpool integration twins driving the hoisted-counter decision sequence (kept tokio↔moonpool 1:1), a `magnetar-differential` give-up-sequence-equivalence test, and an e2e (`e2e_reconnect.rs` extended with a localhost handshake-failing stub-acceptor — a real broker always completes the handshake, so the stub is the only way to exercise the budget end-to-end; no `#[ignore]` / no feature gate per [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)).

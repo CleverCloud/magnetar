@@ -98,7 +98,7 @@ pub enum TxnState {
 }
 
 /// User-visible action passed to [`TxnClient::end_txn`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TxnAction {
     /// Commit the transaction (best-effort 2PC: TC writes the commit marker on every
     /// partition + subscription).
@@ -124,6 +124,14 @@ impl TxnAction {
 /// client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TxnError {
+    /// Another caller currently owns the waiter for this transaction's terminal operation.
+    #[error("transaction {txn_id} is already ending with {action:?}")]
+    AlreadyEnding {
+        /// Transaction whose terminal operation is already being awaited.
+        txn_id: TxnId,
+        /// Terminal action owned by the active waiter.
+        action: TxnAction,
+    },
     /// `ServerError::TransactionConflict` — a competing transaction holds the resource (e.g.
     /// a subscription).
     #[error("transaction conflict")]

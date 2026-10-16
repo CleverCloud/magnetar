@@ -497,6 +497,21 @@ pub struct TxnDrainEvent {
 /// (e.g. lookup-before-producer-open).
 pub type FrameLog = Arc<Mutex<Vec<i32>>>;
 
+/// One ordinary consumer-close command observed by the scripted broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerCloseObservation {
+    /// Consumer id carried by `CommandCloseConsumer`.
+    pub consumer_id: u64,
+    /// Request id used for broker response correlation.
+    pub request_id: u64,
+    /// Topic bound to this consumer id when the command arrived.
+    pub topic: Option<String>,
+    /// Subscription bound to this consumer id when the command arrived.
+    pub subscription: Option<String>,
+}
+
+type ConsumerCloseLog = Arc<Mutex<Vec<ConsumerCloseObservation>>>;
+
 /// Cross-session, append-only log of partition indices touched by
 /// `CommandSeek` against partitioned topics. The partition index is
 /// parsed from the consumer's bound topic via the `-partition-N`
@@ -555,6 +570,7 @@ pub type TxnDrainLog = Arc<Mutex<Vec<TxnDrainEvent>>>;
 #[derive(Clone)]
 struct SessionDeps {
     frame_log: FrameLog,
+    consumer_close_log: ConsumerCloseLog,
     seeked_partitions: SeekedPartitionLog,
     flow_grants: FlowGrantLog,
     consumer_permits: ConsumerPermitLog,
@@ -612,6 +628,7 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of every `BaseCommand` kind (as the
     /// `pb::base_command::Type` integer tag) seen across every session.
     frame_log: FrameLog,
+    consumer_close_log: ConsumerCloseLog,
     /// Shared, append-only log of partition indices that received a
     /// `CommandSeek`.
     seeked_partitions: SeekedPartitionLog,
@@ -742,6 +759,8 @@ impl ScriptedBroker {
         let shutdown_clone = shutdown.clone();
         let frame_log: FrameLog = Arc::new(Mutex::new(Vec::new()));
         let frame_log_clone = frame_log.clone();
+        let consumer_close_log: ConsumerCloseLog = Arc::new(Mutex::new(Vec::new()));
+        let consumer_close_log_clone = consumer_close_log.clone();
         let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
         let seeked_partitions_clone = seeked_partitions.clone();
         let flow_grants: FlowGrantLog = Arc::new(Mutex::new(Vec::new()));
@@ -779,6 +798,7 @@ impl ScriptedBroker {
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
             frame_log: frame_log_clone,
+            consumer_close_log: consumer_close_log_clone,
             seeked_partitions: seeked_partitions_clone,
             flow_grants: flow_grants_clone,
             consumer_permits: consumer_permits_clone,
@@ -818,6 +838,7 @@ impl ScriptedBroker {
             shutdown,
             accept_task: Some(accept_task),
             frame_log,
+            consumer_close_log,
             seeked_partitions,
             flow_grants,
             consumer_permits,
@@ -1086,6 +1107,17 @@ impl ScriptedBroker {
     /// engine's snapshot doesn't include the first engine's frames.
     pub fn clear_frame_log(&self) {
         self.frame_log.lock().clear();
+    }
+
+    /// Snapshot exact ordinary consumer-close correlations.
+    #[must_use]
+    pub fn consumer_close_log_snapshot(&self) -> Vec<ConsumerCloseObservation> {
+        self.consumer_close_log.lock().clone()
+    }
+
+    /// Clear ordinary consumer-close observations between engine legs.
+    pub fn clear_consumer_close_log(&self) {
+        self.consumer_close_log.lock().clear();
     }
 
     /// Snapshot the partition indices touched by every `CommandSeek`
@@ -1444,10 +1476,10 @@ fn handle_frame(
                 if sub.consumer_id == 99 {
                     emit_scalable_subscribe_rejection(out, sub.request_id);
                 } else {
-                    emit_scalable_subscribe_response(out, sub.request_id);
+                    emit_scalable_subscribe_response(out, sub.request_id, &sub.topic);
                     // Follow the registration with one rebalance so the
                     // assignment delta path is exercised on both engines.
-                    emit_scalable_assignment_update(out, sub.consumer_id);
+                    emit_scalable_assignment_update(out, sub.consumer_id, &sub.topic);
                 }
             }
         }
@@ -2085,6 +2117,19 @@ fn handle_frame(
         }
         pb::base_command::Type::CloseConsumer => {
             if let Some(c) = &frame.command.close_consumer {
+                let identity = state
+                    .lock()
+                    .consumers
+                    .get(&c.consumer_id)
+                    .map(|(topic, consumer)| (topic.clone(), consumer.subscription.clone()));
+                deps.consumer_close_log
+                    .lock()
+                    .push(ConsumerCloseObservation {
+                        consumer_id: c.consumer_id,
+                        request_id: c.request_id,
+                        topic: identity.as_ref().map(|(topic, _)| topic.clone()),
+                        subscription: identity.map(|(_, subscription)| subscription),
+                    });
                 let mut g = state.lock();
                 let removed = g.consumers.remove(&c.consumer_id);
                 // Issue #414: detaching a Shared consumer returns everything it
@@ -2399,8 +2444,8 @@ fn emit_scalable_layout_rejection(out: &mut BytesMut, session_id: u64, with_mess
 /// Emit the initial two-segment layout for a scalable-topic session.
 fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
     let segments = vec![
-        scalable_segment(1, 0, 32_768, &[]),
-        scalable_segment(2, 32_768, 65_536, &[]),
+        scalable_segment(1, 0, 32_767, &[]),
+        scalable_segment(2, 32_768, 65_535, &[]),
     ];
     let segment_brokers = segments
         .iter()
@@ -2432,10 +2477,19 @@ fn emit_scalable_layout(out: &mut BytesMut, session_id: u64) {
 
 /// Emit a second layout in which segment 1 splits into 3 + 4.
 fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
+    let mut parent = scalable_segment(1, 0, 32_767, &[]);
+    parent.state = pb::SegmentState::Sealed as i32;
+    parent.child_ids = vec![3, 4];
+    parent.sealed_at_epoch = Some(2);
+    let mut child_three = scalable_segment(3, 0, 16_383, &[1]);
+    child_three.created_at_epoch = 2;
+    let mut child_four = scalable_segment(4, 16_384, 32_767, &[1]);
+    child_four.created_at_epoch = 2;
     let segments = vec![
-        scalable_segment(2, 32_768, 65_536, &[]),
-        scalable_segment(3, 0, 16_384, &[1]),
-        scalable_segment(4, 16_384, 32_768, &[1]),
+        parent,
+        scalable_segment(2, 32_768, 65_535, &[]),
+        child_three,
+        child_four,
     ];
     let segment_brokers = segments
         .iter()
@@ -2465,31 +2519,48 @@ fn emit_scalable_split_layout(out: &mut BytesMut, session_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
-fn scalable_assignment(epoch: u64, segs: &[u64]) -> pb::ScalableConsumerAssignment {
+fn scalable_assignment(epoch: u64, segs: &[u64], topic: &str) -> pb::ScalableConsumerAssignment {
     pb::ScalableConsumerAssignment {
         layout_epoch: epoch,
         segments: segs
             .iter()
-            .map(|&id| pb::ScalableAssignedSegment {
-                segment_id: id,
-                hash_start: 0,
-                hash_end: 32_768,
-                segment_topic: format!("segment://public/default/scaled/{id}"),
-                bucket_ranges: Vec::new(),
+            .map(|&id| {
+                let (hash_start, hash_end) = match id {
+                    1 => (0, 32_767),
+                    2 => (32_768, 65_535),
+                    _ => panic!("unsupported scripted assignment segment {id}"),
+                };
+                pb::ScalableAssignedSegment {
+                    bucket_ranges: Vec::new(),
+                    segment_id: id,
+                    hash_start,
+                    hash_end,
+                    segment_topic: format!(
+                        "{}/{hash_start:04x}-{hash_end:04x}-{id}",
+                        topic.replacen("topic://", "segment://", 1)
+                    ),
+                }
             })
             .collect(),
     }
 }
 
+#[cfg(all(test, feature = "scalable-topics"))]
+#[test]
+#[should_panic(expected = "unsupported scripted assignment segment 99")]
+fn scripted_assignment_rejects_unknown_segments() {
+    let _ = scalable_assignment(1, &[99], "topic://public/default/scaled");
+}
+
 /// Emit the response that resolves a consumer registration.
-fn emit_scalable_subscribe_response(out: &mut BytesMut, request_id: u64) {
+fn emit_scalable_subscribe_response(out: &mut BytesMut, request_id: u64, topic: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
         scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
             request_id,
             error: None,
             message: None,
-            assignment: Some(scalable_assignment(1, &[1])),
+            assignment: Some(scalable_assignment(1, &[1], topic)),
         }),
         ..Default::default()
     };
@@ -2512,12 +2583,12 @@ fn emit_scalable_subscribe_rejection(out: &mut BytesMut, request_id: u64) {
 }
 
 /// Emit one rebalance: segment 1 is replaced by segment 2 at epoch 2.
-fn emit_scalable_assignment_update(out: &mut BytesMut, consumer_id: u64) {
+fn emit_scalable_assignment_update(out: &mut BytesMut, consumer_id: u64, topic: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
         scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
             consumer_id,
-            assignment: scalable_assignment(2, &[2]),
+            assignment: scalable_assignment(2, &[2], topic),
         }),
         ..Default::default()
     };

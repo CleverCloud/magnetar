@@ -1361,7 +1361,9 @@ impl Client {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.end_txn(txn, action)
+                .map_err(|err| ClientError::Other(format!("end_txn: {err}")))?
         };
+        let _waiter = EndTxnWaiterGuard::new(self.shared.clone(), txn, action);
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
@@ -1633,6 +1635,24 @@ impl Client {
     // PIP-145 topic-list deltas. No channels.
     // -------------------------------------------------------------------
 
+    /// Create the narrow owned capability used by an assignment-driven
+    /// scalable stream consumer. The public client itself remains non-Clone.
+    #[cfg(feature = "scalable-topics")]
+    pub fn segment_subscriber(&self) -> Result<crate::SegmentSubscriber, ClientError> {
+        let pool = self
+            .pool
+            .clone()
+            .ok_or(ClientError::ControllerRoutingUnsupported {
+                reason: "a URL-based supervised pool is required for direct controller routing",
+            })?;
+        let operation_timeout = self.shared.inner.lock().operation_timeout();
+        Ok(crate::SegmentSubscriber::new(
+            self.shared.clone(),
+            pool,
+            operation_timeout,
+        ))
+    }
+
     /// **Experimental** (PIP-460, ADR-0093). Open a scalable-topic session for
     /// `topic` and await its first layout.
     ///
@@ -1697,6 +1717,8 @@ impl Client {
                 Some(crate::ScalableEvent::LookupResolved {
                     resolved_topic_name,
                     controller_broker_url,
+                    controller_broker_url_tls,
+                    snapshot,
                     segments,
                     epoch,
                     ..
@@ -1705,6 +1727,8 @@ impl Client {
                         session_id,
                         resolved_topic_name,
                         controller_broker_url,
+                        controller_broker_url_tls,
+                        snapshot,
                         segments,
                         epoch,
                     });
@@ -1762,6 +1786,7 @@ impl Client {
         consumer_id: u64,
         consumer_type: magnetar_proto::ScalableConsumerType,
     ) -> Result<magnetar_proto::ConsumerAssignment, ClientError> {
+        let incarnation = self.shared.allocate_controller_incarnation()?;
         {
             let mut conn = self.shared.inner.lock();
             conn.scalable_topic_subscribe(
@@ -1770,6 +1795,7 @@ impl Client {
                 consumer_name,
                 consumer_id,
                 consumer_type,
+                incarnation,
             )
             .map_err(|err| ClientError::Other(err.to_string()))?;
         }
@@ -1794,10 +1820,18 @@ impl Client {
                 pos.and_then(|p| buf.remove(p))
             };
             match drained {
-                Some(crate::ScalableEvent::ConsumerAssigned { assignment, .. }) => {
+                Some(crate::ScalableEvent::ConsumerAssigned {
+                    incarnation: event_incarnation,
+                    assignment,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Ok(assignment);
                 }
-                Some(crate::ScalableEvent::ConsumerRejected { reason, .. }) => {
+                Some(crate::ScalableEvent::ConsumerRejected {
+                    incarnation: event_incarnation,
+                    reason,
+                    ..
+                }) if event_incarnation == incarnation => {
                     return Err(ClientError::Other(reason));
                 }
                 _ => {}
@@ -2222,7 +2256,7 @@ fn direct_broker_url(
 /// call. [`magnetar_proto::broker_authority`] owns authority validation and
 /// default-port synthesis. This adapter preserves the explicit Pulsar scheme
 /// when present and otherwise inherits the bootstrap connection's TLS posture.
-fn parse_direct_broker_url(
+pub(crate) fn parse_direct_broker_url(
     broker_url: &str,
     bootstrap_scheme: Scheme,
 ) -> Result<ParsedUrl, ClientError> {
@@ -2398,6 +2432,35 @@ impl ConnectedFut {
     }
 }
 
+struct EndTxnWaiterGuard {
+    shared: Arc<ConnectionShared>,
+    txn: magnetar_proto::TxnId,
+    action: magnetar_proto::TxnAction,
+}
+
+impl EndTxnWaiterGuard {
+    fn new(
+        shared: Arc<ConnectionShared>,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Self {
+        Self {
+            shared,
+            txn,
+            action,
+        }
+    }
+}
+
+impl Drop for EndTxnWaiterGuard {
+    fn drop(&mut self) {
+        self.shared
+            .inner
+            .lock()
+            .release_end_txn_waiter(self.txn, self.action);
+    }
+}
+
 /// "Wait for the broker reply to a request-id-keyed command" future.
 ///
 /// Reused for lookup, partitioned-metadata, watch-topic-list-snapshot, and
@@ -2559,6 +2622,44 @@ pub(crate) async fn wait_subscribe_acked(
         notification: None,
     }
     .await
+}
+
+#[cfg(feature = "scalable-topics")]
+pub(crate) async fn subscribe_manual_flow_on(
+    shared: Arc<ConnectionShared>,
+    req: SubscribeRequest,
+    operation_timeout: std::time::Duration,
+) -> Result<Consumer, ClientError> {
+    shared.fail_if_no_driver()?;
+    let (handle, slot) = {
+        let mut conn = shared.inner.lock();
+        let handle = conn.subscribe(req);
+        let slot = conn
+            .consumer(handle)
+            .cloned()
+            .ok_or_else(|| ClientError::Other("new segment consumer is missing".to_owned()))?;
+        (handle, slot)
+    };
+    // Set the manual-FLOW fence before the subscribe frame can leave. A zero
+    // queue suppresses initial permits; `paused` suppresses every refill path.
+    slot.state.lock().paused = true;
+    shared.driver_waker.notify_one();
+    let mut guard = PendingConsumerSubscribeGuard::new(shared.clone(), handle);
+    match tokio::time::timeout(
+        operation_timeout,
+        wait_subscribe_acked(&shared, handle, true, None),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            guard.disarm();
+            Ok(Consumer::assemble(shared, handle, slot, None))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ClientError::Timeout(
+            "segment consumer subscribe exceeded operation_timeout".to_owned(),
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2814,12 +2915,619 @@ fn _opoutcome_usage_marker(_o: OpOutcome, _k: PendingOpKey) {}
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use bytes::BytesMut;
     use magnetar_proto::{CreateProducerRequest, SubscribeRequest, decode_one, encode_command, pb};
 
     use super::*;
+
+    fn ordinary_subscription_client_for_test() -> Client {
+        let shared = handshake_complete_shared();
+        while shared.inner.lock().poll_event().is_some() {}
+        let _ = shared.inner.lock().poll_transmit();
+        Client {
+            shared,
+            driver: Mutex::new(None),
+            pool: None,
+            connections_per_broker: 1,
+            connection_rr: AtomicUsize::new(0),
+        }
+    }
+
+    fn apply_ordinary_broker_command(
+        shared: &std::sync::Arc<ConnectionShared>,
+        command: &pb::BaseCommand,
+    ) {
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, command).expect("encode ordinary broker command");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("ordinary broker command");
+    }
+
+    fn next_ordinary_command(shared: &std::sync::Arc<ConnectionShared>) -> pb::BaseCommand {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let command = magnetar_proto::decode_one(&mut bytes)
+            .expect("one ordinary command")
+            .command;
+        assert_eq!(
+            bytes.as_ref(),
+            &[] as &[u8],
+            "only the expected command may be emitted"
+        );
+        command
+    }
+
+    fn acknowledge_ordinary_request(shared: &std::sync::Arc<ConnectionShared>, request_id: u64) {
+        apply_ordinary_broker_command(
+            shared,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn poll_ordinary_subscription<F: std::future::Future>(
+        shared: &std::sync::Arc<ConnectionShared>,
+        mut pending: std::pin::Pin<&mut F>,
+        cx: &mut std::task::Context<'_>,
+    ) -> pb::CommandSubscribe {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        let lookup = next_ordinary_command(shared)
+            .lookup_topic
+            .expect("public subscribe lookup");
+        apply_ordinary_broker_command(
+            shared,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    request_id: lookup.request_id,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(pending.as_mut().poll(cx).is_pending());
+        let subscribed = next_ordinary_command(shared)
+            .subscribe
+            .expect("public ordinary Subscribe");
+        let event = shared.inner.lock().poll_event();
+        assert!(
+            matches!(&event,
+                Some(magnetar_proto::ConnectionEvent::LookupResponse {
+                    request_id,
+                    result: magnetar_proto::LookupOutcome::Connect {
+                        broker_service_url: None,
+                        broker_service_url_tls: None,
+                        proxy_through_service_url: false,
+                    },
+                }) if *request_id == magnetar_proto::RequestId(lookup.request_id)
+            ),
+            "the public lookup observer must be exactly correlated: {event:?}"
+        );
+        assert!(shared.inner.lock().poll_event().is_none());
+        subscribed
+    }
+
+    fn assert_abandoned_ordinary_subscription_reaped(
+        shared: &std::sync::Arc<ConnectionShared>,
+        subscribe: &pb::CommandSubscribe,
+    ) {
+        let close = next_ordinary_command(shared)
+            .close_consumer
+            .expect("cancelled public subscribe must close its broker registration");
+        assert_eq!(close.consumer_id, subscribe.consumer_id);
+        assert_ne!(close.request_id, subscribe.request_id);
+        let handle = magnetar_proto::ConsumerHandle(subscribe.consumer_id);
+        assert!(shared.inner.lock().consumer(handle).is_none());
+        assert!(
+            !shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(subscribe.request_id))
+        );
+        acknowledge_ordinary_request(shared, subscribe.request_id);
+        acknowledge_ordinary_request(shared, close.request_id);
+        let mut conn = shared.inner.lock();
+        assert!(conn.consumer(handle).is_none());
+        assert_eq!(conn.poll_transmit().as_ref(), &[] as &[u8]);
+        let event = conn.poll_event();
+        assert!(
+            event.is_none(),
+            "unexpected event after cancelled subscribe: {event:?}"
+        );
+        assert!(conn.poll_driver_retry().is_none());
+        for request_id in [subscribe.request_id, close.request_id] {
+            assert!(!conn.has_pending_request_for_test(magnetar_proto::RequestId(request_id)));
+            assert!(
+                conn.take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id)
+                ))
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancelled_subscribe_closes_pending_and_unobserved_success() {
+        for acknowledged in [false, true] {
+            let client = ordinary_subscription_client_for_test();
+            let shared = client.shared().to_owned();
+            let request = magnetar_proto::SubscribeRequest {
+                topic: "persistent://public/default/native-cancelled-exclusive".to_owned(),
+                subscription: "workers".to_owned(),
+                consumer_name: Some("worker".to_owned()),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                receiver_queue_size: 0,
+                ..Default::default()
+            };
+            let mut pending = Box::pin(client.subscribe(ToOwned::to_owned(&request)));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let subscribe = poll_ordinary_subscription(&shared, pending.as_mut(), &mut cx);
+            if acknowledged {
+                acknowledge_ordinary_request(&shared, subscribe.request_id);
+            }
+            drop(pending);
+            assert_abandoned_ordinary_subscription_reaped(&shared, &subscribe);
+
+            let mut replacement = Box::pin(client.subscribe(request));
+            let reopened = poll_ordinary_subscription(&shared, replacement.as_mut(), &mut cx);
+            assert_ne!(reopened.consumer_id, subscribe.consumer_id);
+            assert_eq!(reopened.topic, subscribe.topic);
+            assert_eq!(reopened.subscription, subscribe.subscription);
+            assert_eq!(reopened.consumer_name, subscribe.consumer_name);
+            assert_eq!(reopened.sub_type, subscribe.sub_type);
+            acknowledge_ordinary_request(&shared, reopened.request_id);
+            let std::task::Poll::Ready(Ok(consumer)) = replacement.as_mut().poll(&mut cx) else {
+                panic!("same Exclusive identity must open after cancellation cleanup");
+            };
+            drop(replacement);
+            assert_eq!(consumer.handle().0, reopened.consumer_id);
+            let flow = next_ordinary_command(&shared)
+                .flow
+                .expect("replacement initial Flow");
+            assert_eq!(flow.consumer_id, reopened.consumer_id);
+            assert_eq!(flow.message_permits, 0);
+            assert_eq!(shared.inner.lock().poll_transmit().as_ref(), &[] as &[u8]);
+            let mut close = Box::pin(consumer.close());
+            assert!(close.as_mut().poll(&mut cx).is_pending());
+            let command = next_ordinary_command(&shared)
+                .close_consumer
+                .expect("replacement close");
+            assert_eq!(command.consumer_id, reopened.consumer_id);
+            assert_ne!(command.request_id, reopened.request_id);
+            acknowledge_ordinary_request(&shared, command.request_id);
+            assert!(matches!(
+                close.as_mut().poll(&mut cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            drop(close);
+            let mut conn = shared.inner.lock();
+            let slot = conn
+                .consumer(magnetar_proto::ConsumerHandle(reopened.consumer_id))
+                .expect("normally closed consumer retains reusable completion");
+            {
+                let state = slot.state.lock();
+                assert!(state.closed);
+                assert_eq!(
+                    state.close_completion(),
+                    Some(magnetar_proto::consumer::ConsumerCloseCompletion::Success)
+                );
+            }
+            assert!(
+                !conn.has_pending_request_for_test(magnetar_proto::RequestId(command.request_id))
+            );
+            assert_eq!(conn.poll_transmit().as_ref(), &[] as &[u8]);
+            let event = conn.poll_event();
+            assert!(
+                event.is_none(),
+                "unexpected event after replacement close: {event:?}"
+            );
+            assert!(conn.poll_driver_retry().is_none());
+        }
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    async fn raw_cancelled_scalable_subscribe(late_success: bool) {
+        let shared = ConnectionShared::new(magnetar_proto::ConnectionConfig::default());
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags {
+                    supports_scalable_topics: Some(true),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let emit = |command: pb::BaseCommand| {
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &command).expect("encode broker response");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("broker response");
+            crate::driver::drain_scalable_events_for_test(&shared);
+        };
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("begin handshake");
+        emit(connected);
+        assert!(matches!(
+            shared.inner.lock().poll_event(),
+            Some(magnetar_proto::ConnectionEvent::Connected { .. })
+        ));
+        assert!(shared.inner.lock().poll_event().is_none());
+        let _ = shared.inner.lock().poll_transmit();
+        let client = Client {
+            shared: shared.clone(),
+            driver: Mutex::new(None),
+            pool: None,
+            connections_per_broker: 1,
+            connection_rr: AtomicUsize::new(0),
+        };
+        let mut pending = Box::pin(client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "workers",
+            "worker",
+            42,
+            magnetar_proto::ScalableConsumerType::Stream,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let request = magnetar_proto::decode_one(&mut shared.inner.lock().poll_transmit())
+            .expect("raw subscribe")
+            .command
+            .scalable_topic_subscribe
+            .expect("subscribe");
+        drop(pending);
+        assert!(
+            shared.inner.lock().poll_transmit().is_empty(),
+            "cancelled raw leave must not overtake subscribe"
+        );
+        emit(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: request.request_id,
+                error: (!late_success).then_some(pb::ServerError::AuthorizationError as i32),
+                message: (!late_success).then(|| "late rejection".to_owned()),
+                assignment: late_success.then(|| pb::ScalableConsumerAssignment {
+                    layout_epoch: 1,
+                    segments: Vec::new(),
+                }),
+            }),
+            ..Default::default()
+        });
+        if late_success {
+            assert!(
+                shared
+                    .inner
+                    .lock()
+                    .scalable_consumer_assignment(42)
+                    .is_some(),
+                "successful cancelled raw registrations remain observable"
+            );
+            assert!(shared.inner.lock().poll_transmit().is_empty());
+            assert!(matches!(
+                shared.scalable_events.lock().pop_front(),
+                Some(crate::ScalableEvent::ConsumerAssigned {
+                    consumer_id: 42,
+                    ..
+                })
+            ));
+            return;
+        }
+        assert!(
+            shared
+                .inner
+                .lock()
+                .scalable_consumer_assignment(42)
+                .is_none()
+        );
+        let mut bytes = shared.inner.lock().poll_transmit();
+        assert_eq!(
+            magnetar_proto::decode_one(&mut bytes)
+                .expect("terminal cleanup after cancelled raw response")
+                .command
+                .scalable_topic_unsubscribe
+                .expect("unsubscribe")
+                .consumer_id,
+            42
+        );
+        assert!(bytes.is_empty());
+        assert!(
+            matches!(
+                shared.scalable_events.lock().pop_front(),
+                Some(crate::ScalableEvent::ConsumerRejected {
+                    consumer_id: 42,
+                    ..
+                })
+            ),
+            "cancelled raw rejection remains diagnostic"
+        );
+        assert!(shared.inner.lock().poll_event().is_none());
+        let mut reused = Box::pin(client.scalable_topic_subscribe(
+            "topic://public/default/scaled",
+            "new-workers",
+            "new-worker",
+            42,
+            magnetar_proto::ScalableConsumerType::Stream,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reused.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let reused_request = magnetar_proto::decode_one(&mut shared.inner.lock().poll_transmit())
+            .expect("reused identity admission")
+            .command
+            .scalable_topic_subscribe
+            .expect("subscribe");
+        assert_eq!(reused_request.consumer_id, 42);
+        assert_eq!(reused_request.subscription, "new-workers");
+        assert_eq!(reused_request.consumer_name, "new-worker");
+        emit(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: reused_request.request_id,
+                error: None,
+                message: None,
+                assignment: Some(pb::ScalableConsumerAssignment {
+                    layout_epoch: 1,
+                    segments: Vec::new(),
+                }),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            reused
+                .await
+                .expect("reused raw identity after cancellation rejection")
+                .layout_epoch(),
+            1
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[tokio::test]
+    async fn raw_cancelled_scalable_subscribe_cleans_late_rejection() {
+        raw_cancelled_scalable_subscribe(false).await;
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[tokio::test]
+    async fn raw_cancelled_scalable_subscribe_retains_late_success() {
+        raw_cancelled_scalable_subscribe(true).await;
+    }
+
+    /// Java gates transactions on a successful coordinator handshake. Rejection
+    /// must propagate without issuing NewTxn, and a later call must retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transaction_bootstrap_retries_rejection_and_caches_success() {
+        let shared = handshake_complete_shared();
+        let client = Client {
+            shared: shared.clone(),
+            driver: Mutex::new(None),
+            pool: None,
+            connections_per_broker: 1,
+            connection_rr: AtomicUsize::new(0),
+        };
+        let emit = |command: pb::BaseCommand| {
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &command).expect("encode broker command");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("apply broker command");
+        };
+        let next_command = || {
+            let mut bytes = shared.inner.lock().poll_transmit();
+            let command = magnetar_proto::decode_one(&mut bytes)
+                .expect("one outbound command")
+                .command;
+            assert!(
+                bytes.is_empty(),
+                "no transaction may overtake the handshake"
+            );
+            command
+        };
+        shared.inner.lock().poll_transmit(); // CONNECT already completed.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for attempt in 0..2 {
+            let mut request = Box::pin(client.new_txn(Duration::from_secs(30)));
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            let lookup = next_command()
+                .lookup_topic
+                .expect("coordinator lookup before NewTxn");
+            assert_eq!(
+                lookup.topic,
+                "persistent://pulsar/system/transaction_coordinator_assign-partition-0"
+            );
+            emit(pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    request_id: lookup.request_id,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            let handshake = next_command()
+                .tc_client_connect_request
+                .expect("TcClientConnect before NewTxn");
+            assert_eq!(handshake.tc_id, 0);
+            assert!(
+                !shared
+                    .txn_bootstrapped
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            emit(pb::BaseCommand {
+                r#type: pb::base_command::Type::TcClientConnectResponse as i32,
+                tc_client_connect_response: Some(pb::CommandTcClientConnectResponse {
+                    request_id: handshake.request_id,
+                    error: (attempt == 0).then_some(pb::ServerError::AuthorizationError as i32),
+                    message: (attempt == 0).then(|| "coordinator denied".to_owned()),
+                }),
+                ..Default::default()
+            });
+            if attempt == 0 {
+                assert!(
+                    matches!(request.await, Err(ClientError::Broker { code, message })
+                    if code == pb::ServerError::AuthorizationError as i32
+                    && message == "coordinator denied")
+                );
+                assert!(
+                    !shared
+                        .txn_bootstrapped
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+                assert!(shared.inner.lock().poll_transmit().is_empty());
+                continue;
+            }
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                shared
+                    .txn_bootstrapped
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let new_txn = next_command()
+                .new_txn
+                .expect("NewTxn after handshake success");
+            emit(pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_txn.request_id,
+                    txnid_most_bits: Some(0),
+                    txnid_least_bits: Some(7),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_eq!(
+                request.await.expect("broker transaction"),
+                magnetar_proto::TxnId::new(0, 7)
+            );
+        }
+        let mut cached = Box::pin(client.new_txn(Duration::from_secs(30)));
+        assert!(cached.as_mut().poll(&mut cx).is_pending());
+        let new_txn = next_command()
+            .new_txn
+            .expect("cached readiness skips lookup and handshake");
+        emit(pb::BaseCommand {
+            r#type: pb::base_command::Type::NewTxnResponse as i32,
+            new_txn_response: Some(pb::CommandNewTxnResponse {
+                request_id: new_txn.request_id,
+                txnid_most_bits: Some(0),
+                txnid_least_bits: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cached.await.expect("second broker transaction"),
+            magnetar_proto::TxnId::new(0, 8)
+        );
+    }
+
+    /// A coordinator handshake interrupted by reset or terminal peer loss must
+    /// fail the request without admitting a transaction or caching readiness.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transaction_bootstrap_interruption_keeps_readiness_unset() {
+        for terminal in [false, true] {
+            let shared = handshake_complete_shared();
+            let client = Client {
+                shared: shared.clone(),
+                driver: Mutex::new(None),
+                pool: None,
+                connections_per_broker: 1,
+                connection_rr: AtomicUsize::new(0),
+            };
+            let emit = |command: pb::BaseCommand| {
+                let mut frame = BytesMut::new();
+                encode_command(&mut frame, &command).expect("encode broker command");
+                shared
+                    .inner
+                    .lock()
+                    .handle_bytes(Instant::now(), &frame)
+                    .expect("apply broker command");
+            };
+            let next_command = || {
+                let mut bytes = shared.inner.lock().poll_transmit();
+                let command = magnetar_proto::decode_one(&mut bytes)
+                    .expect("one outbound command")
+                    .command;
+                assert!(
+                    bytes.is_empty(),
+                    "no transaction may overtake the handshake"
+                );
+                command
+            };
+            shared.inner.lock().poll_transmit();
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let mut request = Box::pin(client.new_txn(Duration::from_secs(30)));
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            let lookup = next_command()
+                .lookup_topic
+                .expect("coordinator lookup before NewTxn");
+            emit(pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    request_id: lookup.request_id,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert!(next_command().tc_client_connect_request.is_some());
+            {
+                let mut conn = shared.inner.lock();
+                if terminal {
+                    conn.mark_disconnected();
+                    conn.fail_all_pending("peer closed during coordinator handshake");
+                } else {
+                    conn.reset();
+                }
+            }
+            if terminal {
+                shared.mark_no_driver();
+                assert!(matches!(request.await, Err(ClientError::PeerClosed)));
+            } else {
+                assert!(matches!(request.await, Err(ClientError::Other(_))));
+            }
+            assert!(
+                !shared
+                    .txn_bootstrapped
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(
+                shared.inner.lock().poll_transmit().is_empty(),
+                "no NewTxn before TC success"
+            );
+        }
+    }
 
     struct WakeCounter(std::sync::atomic::AtomicUsize);
 

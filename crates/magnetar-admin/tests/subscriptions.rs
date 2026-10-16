@@ -72,8 +72,6 @@ async fn reset_cursor_to_position_posts_reset_cursor_data_body() {
         partition: -1,
         batch_index: -1,
         batch_size: -1,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     admin
         .subscription_reset_cursor_to_position("public/default/orders", "s-a", id, false)
@@ -113,8 +111,6 @@ async fn reset_cursor_to_position_maps_sentinel_u64_max_to_negative_one() {
         partition: -1,
         batch_index: -1,
         batch_size: -1,
-        #[cfg(feature = "scalable-topics")]
-        segment_id: None,
     };
     admin
         .subscription_reset_cursor_to_position("public/default/orders", "s-a", earliest, false)

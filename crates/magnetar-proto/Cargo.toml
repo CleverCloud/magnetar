@@ -44,6 +44,8 @@ buggify          = []
 # closure; every other schema (Bytes, String, JSON, Protobuf, KeyValue, ...)
 # is always available. The façade forwards it as `magnetar-driver/schema-avro`.
 schema-avro = ["dep:apache-avro"]
+# Boundary-state fixtures for runtime tests. Never enabled by default.
+test-support = []
 
 [dependencies]
 bytes        = { workspace = true }
@@ -85,6 +87,7 @@ zstd         = { workspace = true }
 snap         = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 schemars  = { workspace = true, features = ["derive"] }
 # `JsonSchema::schema_data` must parse as an Avro schema, because the broker
 # validates JSON schemas with its Avro parser (`schema/json.rs` unit test).

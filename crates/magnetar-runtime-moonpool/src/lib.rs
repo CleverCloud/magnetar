@@ -63,6 +63,7 @@
 
 pub mod auto_cluster_failover;
 mod client;
+mod compress;
 mod consumer;
 pub mod crypto;
 pub mod dns;
@@ -70,6 +71,8 @@ mod driver;
 mod log_fields;
 mod pool;
 mod producer;
+#[cfg(feature = "scalable-topics")]
+mod scalable;
 pub mod swarm;
 pub mod tls;
 pub mod tls_crypto;
@@ -110,6 +113,13 @@ pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 pub use crate::dns::{DnsResolveFuture, DnsResolver, StaticDnsResolver, arc_dns_resolver};
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
+#[cfg(feature = "scalable-topics")]
+pub use crate::scalable::{
+    ControllerSession, DagSession, ScalableRoute, ScalableRouteError, ScalableRouteFamily,
+    ScalableRouteKey, ScalableTaskHandle, SegmentConsumerOptions, SegmentSubscriber,
+    StreamAckFailure, StreamConsumer, StreamConsumerError, StreamConsumerEvent,
+    StreamConsumerMessage, StreamConsumerOptions,
+};
 use crate::transport::Transport;
 
 pub(crate) type SleepFuture = Pin<Box<dyn Future<Output = Result<(), TimeError>> + Send + 'static>>;
@@ -282,6 +292,10 @@ pub struct ConnectionShared {
     /// (ADR-0024). `AtomicBool` (not a channel) is the right primitive for
     /// this one-way latch ([ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub no_driver: AtomicBool,
+    /// Set after coordinator-partition lookup and `TcClientConnect` both succeed.
+    /// Mirrors Tokio's lazy bootstrap for the client's coordinator id `0`.
+    /// A rejected handshake leaves this false so the next transaction can retry.
+    pub txn_bootstrapped: AtomicBool,
     /// The client-wide publish memory budget (Java `ClientBuilder#memoryLimit`,
     /// issue #867, [ADR-0111](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0111-share-one-memory-limit-controller-per-client.md)).
     /// 1:1 mirror of the tokio engine's field of the same name.
@@ -336,6 +350,17 @@ pub struct ConnectionShared {
     /// Wakeup for `next_scalable_event` futures.
     #[cfg(feature = "scalable-topics")]
     pub scalable_notify: Notify,
+    /// Single-owner high-level scalable event routes.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) scalable_routes: Arc<crate::scalable::ScalableRouteRegistry>,
+    /// Monotonic local authority generation for scalable-controller
+    /// registrations issued on this physical connection.
+    #[cfg(feature = "scalable-topics")]
+    next_controller_incarnation: AtomicU64,
+    /// Runtime-owned scalable consumer ids occupy the upper half of the wire
+    /// id space so diagnostic callers using small explicit ids do not collide.
+    #[cfg(feature = "scalable-topics")]
+    next_scalable_consumer_id: AtomicU64,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -361,6 +386,18 @@ pub enum LookupReissueReadiness {
     /// no driver will recover it. Short-circuit to `PeerClosed` (composes with
     /// the terminal fast-fail).
     Terminal,
+}
+
+#[cfg(feature = "scalable-topics")]
+fn checked_fetch_increment(counter: &AtomicU64) -> Result<u64, u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl ConnectionShared {
@@ -579,6 +616,7 @@ impl ConnectionShared {
             replicated_subscription_marker_notify: Notify::new(),
             pending_rebuild: AtomicBool::new(false),
             no_driver: AtomicBool::new(false),
+            txn_bootstrapped: AtomicBool::new(false),
             memory_limit,
             wall_clock_base_ms,
             wall_clock_ms,
@@ -587,6 +625,30 @@ impl ConnectionShared {
             scalable_events: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "scalable-topics")]
             scalable_notify: Notify::new(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_routes: Arc::new(crate::scalable::ScalableRouteRegistry::default()),
+            #[cfg(feature = "scalable-topics")]
+            next_controller_incarnation: AtomicU64::new(1),
+            #[cfg(feature = "scalable-topics")]
+            next_scalable_consumer_id: AtomicU64::new(1 << 63),
+        })
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_controller_incarnation(
+        &self,
+    ) -> Result<magnetar_proto::ControllerIncarnation, crate::client::ClientError> {
+        checked_fetch_increment(&self.next_controller_incarnation)
+            .map(magnetar_proto::ControllerIncarnation)
+            .map_err(|_| {
+                crate::client::ClientError::Other("controller incarnation exhausted".to_owned())
+            })
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_scalable_consumer_id(&self) -> Result<u64, crate::client::ClientError> {
+        checked_fetch_increment(&self.next_scalable_consumer_id).map_err(|_| {
+            crate::client::ClientError::Other("scalable consumer id exhausted".to_owned())
         })
     }
 
@@ -739,6 +801,10 @@ pub struct ScalableLookup {
     pub resolved_topic_name: Option<String>,
     /// Controller broker serving this topic's layout, when advertised.
     pub controller_broker_url: Option<String>,
+    /// TLS controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url_tls: Option<String>,
+    /// Complete validated initial DAG snapshot.
+    pub snapshot: magnetar_proto::DagSnapshot,
     /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
     /// Layout epoch the snapshot was stamped with.
@@ -759,6 +825,10 @@ pub enum ScalableEvent {
         resolved_topic_name: Option<String>,
         /// Controller broker serving this topic's layout, when advertised.
         controller_broker_url: Option<String>,
+        /// TLS controller broker serving this topic's layout, when advertised.
+        controller_broker_url_tls: Option<String>,
+        /// Complete validated initial DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
         /// Initial DAG snapshot for the topic.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
         /// Layout epoch the snapshot was stamped with.
@@ -770,6 +840,8 @@ pub enum ScalableEvent {
         session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
+        /// Complete validated replacement DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
@@ -789,6 +861,8 @@ pub enum ScalableEvent {
     ConsumerAssigned {
         /// Consumer id that registered.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the baseline.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// The `segment://` topics this consumer owns.
         assignment: magnetar_proto::ConsumerAssignment,
     },
@@ -796,6 +870,10 @@ pub enum ScalableEvent {
     AssignmentChanged {
         /// Consumer id whose share changed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the update.
+        incarnation: magnetar_proto::ControllerIncarnation,
+        /// Complete authoritative assignment after applying the update.
+        assignment: magnetar_proto::ConsumerAssignment,
         /// What to attach to and detach from.
         delta: magnetar_proto::AssignmentDelta,
     },
@@ -803,6 +881,8 @@ pub enum ScalableEvent {
     ConsumerRejected {
         /// Consumer id whose registration failed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the rejection.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// Why the broker rejected it.
         reason: String,
     },
@@ -976,9 +1056,10 @@ impl<P: Providers> MoonpoolEngine<P> {
             config.connect_max_retries,
             operation_timeout,
             || {
-                Transport::<P>::connect_with_resolver(
+                Transport::<P>::connect_selected(
                     self.providers.network(),
                     addr,
+                    None,
                     resolver,
                     self.providers.time(),
                     connect_timeout,
@@ -1046,11 +1127,10 @@ impl<P: Providers> MoonpoolEngine<P> {
             config.connect_max_retries,
             operation_timeout,
             || {
-                Transport::<P>::connect_tls(
+                Transport::<P>::connect_selected(
                     self.providers.network(),
                     addr,
-                    host,
-                    tls_config.clone(),
+                    Some((host, tls_config.clone())),
                     resolver,
                     self.providers.time(),
                     connect_timeout,
@@ -1107,9 +1187,10 @@ impl<P: Providers> MoonpoolEngine<P> {
             config.connect_max_retries,
             operation_timeout,
             || {
-                Transport::<P>::connect_with_resolver(
+                Transport::<P>::connect_selected(
                     self.providers.network(),
                     addr,
+                    None,
                     dns_resolver.as_deref(),
                     self.providers.time(),
                     connect_timeout,
@@ -1130,6 +1211,60 @@ impl<P: Providers> MoonpoolEngine<P> {
         .await?;
         let ctx = driver::ReconnectContext {
             host_port: addr.to_owned(),
+            tls_config: None,
+            tls_server_name: None,
+            service_url_provider,
+            dns_resolver,
+        };
+        let driver =
+            driver::spawn_supervised::<P>(shared.clone(), transport, ctx, self.providers.clone());
+        Ok((shared, driver))
+    }
+
+    /// Connect over TLS and retain the rustls configuration in the supervised
+    /// reconnect context. Provider-native timers and network operations are
+    /// used for the initial dial and every replacement transport.
+    pub async fn connect_tls_supervised(
+        &self,
+        addr: &str,
+        host: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+        config: ConnectionConfig,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn DnsResolver>>,
+    ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
+        let connect_timeout = config.connect_timeout;
+        let operation_timeout = config.operation_timeout;
+        let mut transport = dial_with_retry::<P, _, _>(
+            self.providers.time(),
+            config.connect_max_retries,
+            operation_timeout,
+            || {
+                Transport::<P>::connect_selected(
+                    self.providers.network(),
+                    addr,
+                    Some((host, tls_config.clone())),
+                    dns_resolver.as_deref(),
+                    self.providers.time(),
+                    connect_timeout,
+                )
+            },
+        )
+        .await?;
+        let shared = self.make_shared(config);
+        handshake_plain::<P>(
+            &shared,
+            &mut transport,
+            self.providers.time(),
+            Some(operation_timeout),
+            addr,
+            true,
+        )
+        .await?;
+        let ctx = driver::ReconnectContext {
+            host_port: addr.to_owned(),
+            tls_config: Some(tls_config),
+            tls_server_name: Some(host.to_owned()),
             service_url_provider,
             dns_resolver,
         };
@@ -1416,12 +1551,106 @@ mod tests {
         let _ = engine.providers();
     }
 
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn scalable_id_allocation_is_unique_and_never_wraps() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let start = std::sync::Barrier::new(4);
+        let allocated = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let shared = shared.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        (0..128)
+                            .map(|_| {
+                                (
+                                    shared
+                                        .allocate_controller_incarnation()
+                                        .expect("incarnation")
+                                        .0,
+                                    shared.allocate_scalable_consumer_id().expect("consumer id"),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().expect("allocation thread"))
+                .collect::<Vec<_>>()
+        });
+        let incarnations: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.0).collect();
+        let consumer_ids: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.1).collect();
+        assert_eq!(incarnations, (1..=512).collect());
+        assert_eq!(consumer_ids, ((1_u64 << 63)..(1_u64 << 63) + 512).collect());
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("next incarnation")
+                .0,
+            513
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("next consumer id"),
+            (1_u64 << 63) + 512
+        );
+        shared
+            .next_controller_incarnation
+            .store(u64::MAX - 1, super::Ordering::Release);
+        shared
+            .next_scalable_consumer_id
+            .store(u64::MAX - 1, super::Ordering::Release);
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("last incarnation")
+                .0,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("last consumer id"),
+            u64::MAX - 1
+        );
+        assert!(shared.allocate_controller_incarnation().is_err());
+        assert!(shared.allocate_scalable_consumer_id().is_err());
+        assert_eq!(
+            shared
+                .next_controller_incarnation
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+        assert_eq!(
+            shared
+                .next_scalable_consumer_id
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+    }
+
     #[test]
     fn shared_state_can_be_constructed() {
         let s = ConnectionShared::new(ConnectionConfig::default());
         let _g = s.inner.lock();
         // Topic-list buffer starts empty.
         assert!(s.topic_list_changes.lock().is_empty());
+        #[cfg(feature = "scalable-topics")]
+        {
+            s.next_controller_incarnation
+                .store(u64::MAX, Ordering::Release);
+            s.next_scalable_consumer_id
+                .store(u64::MAX, Ordering::Release);
+            assert!(s.allocate_controller_incarnation().is_err());
+            assert!(s.allocate_scalable_consumer_id().is_err());
+        }
     }
 
     /// ADR-0059 regression: `fail_if_no_driver()` must NOT

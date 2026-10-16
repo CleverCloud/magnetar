@@ -55,9 +55,9 @@
 //! 8. ADR-0108's phase 1 rejected: a broker that refuses the recovery `CommandCloseConsumer` leaves
 //!    the consumer byte-for-byte untouched, no `CommandSubscribe` follows it, and the consumer
 //!    stays both reportable and recoverable.
-//! 9. The session lost between the two phases — through `reset` or `fail_all_pending` — leaves the
-//!    re-attach to the reconnect rebuild and clears the in-flight marker, so the next attempt is
-//!    not gated by a dead one.
+//! 9. A recoverable session loss through `reset` leaves re-attachment to the reconnect rebuild.
+//!    Terminal `fail_all_pending` prevents further recovery. Both consume the abandoned close
+//!    without an orphan outcome or replay, and its late Success cannot revive that attempt.
 //! 10. `Failover` and non-durable subscriptions are refused outright, because the close the
 //!     recovery depends on would trigger an election or discard a cursor — and the stall is still
 //!     reported, since withholding the repair never withholds the diagnosis.
@@ -970,9 +970,35 @@ fn a_rejected_recovery_close_leaves_the_consumer_untouched_and_recoverable() {
     );
 }
 
-/// Losing the session between the two phases hands the re-attach to the reconnect
-/// path, which is its only correct owner: the broker reaped that consumer along with
-/// the connection its close was written on.
+fn assert_terminal_recovery_is_refused(shared: &ConnectionShared, handle: ConsumerHandle) {
+    let mut conn = shared.inner.lock();
+    assert!(conn.consumer_handle_is_terminal(handle));
+    let next_request_id = conn.peek_next_request_id_for_test();
+    assert_eq!(
+        conn.resubscribe_consumer_in_place(handle),
+        None,
+        "terminal driver give-up prevents further in-place recovery"
+    );
+    assert_eq!(
+        conn.rebuild_consumers(),
+        [],
+        "terminal consumers are not replayed by a rebuild"
+    );
+    assert_eq!(
+        conn.peek_next_request_id_for_test(),
+        next_request_id,
+        "terminal recovery refusal allocates no request"
+    );
+    assert_eq!(
+        conn.poll_transmit(),
+        BytesMut::new(),
+        "terminal recovery refusal emits no wire traffic"
+    );
+}
+
+/// Recoverable session loss hands re-attachment to the reconnect rebuild; terminal
+/// driver give-up closes the consumer permanently. Neither replays the abandoned
+/// close or allows its late Success to revive the old attempt.
 ///
 /// `reset` and `fail_all_pending` both take `pending_requests` wholesale, which is
 /// what clears the in-flight marker — and both must consume the entry WITHOUT
@@ -1011,16 +1037,75 @@ fn a_session_lost_between_the_two_phases_defers_to_the_reconnect_rebuild() {
              closes={closes:?} subscribes={subscribes:?}"
         );
 
-        // And nothing from it keeps gating the next one: the marker lived in
-        // `pending_requests`, which both paths emptied.
-        let retry = shared.inner.lock().resubscribe_consumer_in_place(handle);
-        match retry {
-            Some(request_id) => assert_ne!(
-                request_id.0, close_request_id,
-                "{label}: a fresh close, not the abandoned one"
-            ),
-            None => panic!("{label}: the consumer must be recoverable again"),
+        {
+            let mut conn = shared.inner.lock();
+            assert!(
+                conn.take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(close_request_id)
+                ))
+                .is_none(),
+                "{label}: forgotten recovery close leaves no orphan outcome"
+            );
+            conn.handle_bytes(t0, &success_frame(close_request_id))
+                .expect("late abandoned close Success ignored");
+            assert!(
+                conn.take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(close_request_id)
+                ))
+                .is_none(),
+                "{label}: late Success cannot publish an abandoned outcome"
+            );
         }
+        assert_eq!(
+            drain_closes_and_subscribes(&shared),
+            (vec![], vec![]),
+            "{label}: late abandoned Success cannot emit a re-attach"
+        );
+
+        if label == "fail_all_pending" {
+            assert_terminal_recovery_is_refused(&shared, handle);
+            continue;
+        }
+
+        let rebuilt = {
+            let mut conn = shared.inner.lock();
+            assert!(!conn.consumer_handle_is_terminal(handle));
+            conn.begin_handshake().expect("new session handshake");
+            conn.handle_bytes(t0 + WINDOW, &handshake_response_bytes())
+                .expect("new session Connected");
+            conn.rebuild_consumers()
+        };
+        assert_eq!(rebuilt.len(), 1, "reconnect owns exactly one re-attach");
+        assert_ne!(rebuilt[0].0, close_request_id);
+        let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+        assert_eq!(
+            closes,
+            Vec::<u64>::new(),
+            "new session does not replay the abandoned close"
+        );
+        assert_eq!(subscribes, vec![rebuilt[0].0]);
+        shared
+            .inner
+            .lock()
+            .handle_bytes(t0 + WINDOW, &success_frame(rebuilt[0].0))
+            .expect("rebuild Subscribe acknowledged");
+        let _ = drain_closes_and_subscribes(&shared);
+        let retry = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_in_place(handle)
+            .expect("acknowledged rebuilt consumer is recoverable again");
+        assert_ne!(
+            retry.0, close_request_id,
+            "fresh close, not abandoned request"
+        );
+        let (closes, subscribes) = drain_closes_and_subscribes(&shared);
+        assert_eq!(closes, vec![retry.0], "one fresh recovery close");
+        assert_eq!(
+            subscribes,
+            Vec::<u64>::new(),
+            "fresh recovery still awaits its own close acknowledgement"
+        );
     }
 }
 
@@ -1143,7 +1228,11 @@ fn a_consumer_that_became_ineligible_while_the_close_flew_is_not_re_attached() {
     // The application unsubscribes while phase 1 is on the wire. That is the one
     // ineligible state which is also a live stall candidate, so it is the realistic
     // shape of this race.
-    let _ = shared.inner.lock().try_unsubscribe(handle, false);
+    shared
+        .inner
+        .lock()
+        .unsubscribe(handle, false)
+        .expect("unsubscribe owns the attachment during stall recovery");
     let _ = drain_closes_and_subscribes(&shared);
 
     shared

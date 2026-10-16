@@ -19,13 +19,14 @@
 10. [Consumer paths — ack grouping, unacked tracker, nack tracker, DLQ](#consumer-paths--ack-grouping-unacked-tracker-nack-tracker-dlq)
 11. [Multi-topics fan-in](#multi-topics-fan-in)
 12. [Pattern consumer + topic watcher (PIP-145)](#pattern-consumer--topic-watcher-pip-145)
-13. [Runtime engines](#runtime-engines)
-14. [TLS sites](#tls-sites)
-15. [Schemas](#schemas)
-16. [PIP coverage map](#pip-coverage-map)
-17. [Tests](#tests)
-18. [Build & validation](#build--validation)
-19. [Further reading](#further-reading)
+13. [Assignment-driven scalable consumption (PIP-460)](#assignment-driven-scalable-consumption-pip-460)
+14. [Runtime engines](#runtime-engines)
+15. [TLS sites](#tls-sites)
+16. [Schemas](#schemas)
+17. [PIP coverage map](#pip-coverage-map)
+18. [Tests](#tests)
+19. [Build & validation](#build--validation)
+20. [Further reading](#further-reading)
 
 ---
 
@@ -38,13 +39,13 @@ For binding decisions read the [ADR series](specs/adr/); for the user-facing sur
 
 ```text
 crates/
-  magnetar/                       Public façade (crates.io package `magnetar-driver`, library / import name `magnetar`) — PulsarClient<E>, builders, typed schemas, partitioned / multi-topics / pattern / reader / table-view / interceptors
-  magnetar-proto/                 Sans-io state machine + codec + trackers + topic watcher (zero I/O deps)
-  magnetar-runtime-tokio/         Production engine (TCP, tokio-rustls, supervised reconnect)
-  magnetar-runtime-moonpool/      Deterministic-simulation engine over moonpool_core::Providers (rustls byte-pipe)
+  magnetar/                       Public façade (crates.io package `magnetar-driver`, library / import name `magnetar`) — PulsarClient<E>, builders, typed schemas, assignment-driven scalable StreamConsumer, partitioned / multi-topics / pattern / reader / table-view / interceptors
+  magnetar-proto/                 Sans-io state machine + codec + trackers + topic watcher + scalable DAG/aggregate model (zero I/O deps)
+  magnetar-runtime-tokio/         Production engine (TCP, tokio-rustls, supervised reconnect, typed scalable routes)
+  magnetar-runtime-moonpool/      Deterministic-simulation engine over moonpool_core::Providers (rustls byte-pipe, typed scalable routes)
   magnetar-admin/                 reqwest-backed REST admin client (rustls-tls)
   magnetarctl/                   `magnetarctl` crate + binary
-  magnetar-fakes/                 In-process broker stub for tests
+  magnetar-fakes/                 In-process broker stubs, including the stateful scalable-topic broker model
   magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
   magnetar-auth-oauth2/           ClientCredentialsFlow + token caching
   magnetar-auth-sasl/             SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature)
@@ -670,7 +671,7 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
 
 `read_half` / `write_half` are produced ONCE, at loop entry, by splitting the connected socket (`tokio::io::split` on tokio; `Transport::into_split` on moonpool — see "TLS byte-pipe" below for why moonpool's split needs a shared adapter) and held as separate local bindings for the life of the loop — not re-split per iteration.
 
-### Read fairness and the write deadline (ADR-0070, ADR-0074, ADR-0083)
+### Read fairness and the write deadline (ADR-0070, ADR-0074, ADR-0083, ADR-0097)
 
 The tokio driver uses `tokio::select!`; the Moonpool driver uses `moonpool_core::select!`, whose fair branch offset is derived from the simulation seed.
 Both keep `biased;` because ADR-0070 requires a fixed **inbound-read-first** priority before the `driver_waker` arm.
@@ -684,7 +685,8 @@ Issue #370 showed that premise fails against a peer that accepts the connection 
 
 **ADR-0083** (amends ADR-0070 and ADR-0074) makes the write its own `select!` arm — third in order, after read and the waker, before the timer — gated by `write_has_work` so an idle connection never polls it.
 Two independent bounds keep it from starving anything: `DRIVER_WRITE_BUDGET_BYTES` (256 KiB, unchanged from ADR-0074) caps how much one arm win writes before yielding back to read, and `Connection::operation_timeout()` (30 s default — **not** `keepalive_interval`, which only detects read-side silence and would never trip against a peer that keeps ACKing pings while refusing to drain writes) caps how long a single win may block on a peer that never drains.
-The deadline is anchored to a fixed `Instant` computed once, outside the `select!`, when a logical write first has work, and held fixed while it continues across iterations — re-arming it fresh inside the per-iteration arm expression would silently reset to a full budget every time an unrelated arm won a round, so a stalled write racing ordinary background traffic on the same connection would never accumulate real elapsed time toward its own deadline.
+The deadline is anchored to a fixed engine-local instant computed once, outside the `select!`, when a logical write first has work, and held fixed while it continues across iterations — re-arming it fresh inside the per-iteration arm expression would silently reset to a full budget every time an unrelated arm won a round, so a stalled write racing ordinary background traffic on the same connection would never accumulate elapsed time toward its own deadline.
+Tokio stores a `tokio::time::Instant` and calls `timeout_at`, keeping production and paused-test scheduling in one clock domain; Moonpool retains the injected provider clock, and proto-facing `std::time::Instant` values are unaffected (ADR-0097).
 Expiry maps to `io::ErrorKind::TimedOut` and routes through the exact same `mark_disconnected()` + `Err` branch every other write failure already takes, so the supervisor redials unchanged.
 
 Making the write cancellable (droppable mid-poll, routine once it races other arms) required a prerequisite rewrite: both engines' `write_budgeted` now issue single-poll writes and commit `front_offset` synchronously right after each `Ready(n)`, before any further `.await`, so a cancelled write never re-sends bytes the kernel already accepted nor silently drops bytes that were popped out of the queue ahead of the actual I/O (moonpool's old eager `pop_budgeted` detach did exactly that).
@@ -1328,6 +1330,142 @@ Same pattern as the partitioned producer / consumer auto-update tickers.
 
 ---
 
+## Assignment-driven scalable consumption (PIP-460)
+
+The experimental `StreamConsumer<S, E>` is not the ordinary multi-topic `select_all` wrapper and is not a layout-only watch.
+It combines two independent control inputs with an ordinary Pulsar data plane:
+
+```text
+              CommandScalableTopicLookup / whole DAG snapshots
+                                      │
+                                      ▼
+                         validated DagSnapshot
+                  (topology + ordering dependencies)
+                                      │
+                                      │
+ CommandScalableTopicSubscribe ──> ConsumerAssignment
+       + assignment pushes          (ownership authority)
+                                      │
+                                      ▼
+                 typed route: family + id + incarnation
+                                      │
+                         StreamConsumerModel
+                 ┌────────────┬────────────┐
+                 ▼            ▼            ▼
+          segment child 1  child 2  ... child N
+          ordinary child consumers on `segment://` topics
+                 │            │            │
+                 └────────────┴────────────┘
+                              │
+                    one aggregate budget,
+                 manual FLOW, receive reservation,
+                    source-qualified delivery
+```
+
+### Ownership boundary
+
+`PulsarClient::scalable_stream_consumer(topic, Arc<S>)` borrows the public client only while building and subscribing.
+The public Tokio and Moonpool clients remain non-`Clone`; each runtime yields an internal owned `SegmentSubscriber` that retains the narrow pool, identifier, task, clock, and ordinary-child capabilities the aggregate needs.
+The resulting `StreamConsumer<S, E>` is cheap to clone over its own shared state, and `StreamMessage<S>` owns `S::Owned` without adding a `Clone` bound to the schema, decoded value, or runtime client.
+
+The builder requires a subscription, freezes one stable consumer identity and child template, accepts one `ReceiverBudget`, defaults to `OrderingMode::Strict`, and opens assigned whole-segment children as `Exclusive` or non-empty GA bucket ranges as sticky `Key_Shared` with entry-bucket dispatch.
+Controller and child identifiers remain runtime-owned.
+
+### Typed control-plane routing and fencing
+
+High-level resources never race on the client-global `VecDeque<ScalableEvent>`.
+Each runtime owns typed routes keyed by event family, session or consumer id, and a local controller-connection incarnation.
+The driver clones a route under the registry lock, publishes after releasing that lock, and wakes waiters after releasing route state; waiters enroll before draining so `notify_waiters()` cannot strand an event.
+The raw API receives only events no owned route claimed.
+
+Registration installs the route before writing subscribe, buffers assignment pushes that precede the response, installs the validated response as that incarnation's baseline, then replays buffered and later pushes in wire order.
+Changed equal-epoch assignments are valid because `layout_epoch` versions topology rather than membership.
+Old-incarnation assignment, open, close, ack, reconnect, and callback results are discarded; lower-epoch or replacement-baseline regressions fail closed and resynchronize rather than mutating current ownership.
+Resynchronization publishes reconnect intent before old-child teardown, suppresses expected close failures from those obsolete child loops, and does not register a replacement baseline until confirmed children and in-flight child opens are gone.
+Replacement registration rejection retries on provider time because the broker may retain the old logical member until its physical controller connection disappears.
+
+### DAG validation and ordering
+
+`DagSnapshot` application is atomic and validates the whole graph: unique segment and placement identities, matching placement sets, lifecycle states/epochs, dangling/conflicting/reciprocal edges, acyclicity, bounded segments/edges/depth/serialized size, canonical assignment attachments, split containment and exact coverage, merge union coverage, and non-overlapping active leaves covering the key space.
+Hash ranges are inclusive `[start,end]` within `0..=65535`; GA PIP-486 bucket ranges are preserved by the protocol model and attached through sticky entry-bucket children. Bucket cumulative acknowledgements become individual tracked message IDs.
+
+Strict mode grants descendant FLOW only when retained local ownership history proves every transitive ancestor complete.
+A local ancestor is complete only after terminal/end-of-topic and after all delivered messages, pre-terminal reservations, required acks, and participating transaction commits settle.
+Unknown or cross-member ancestry yields observable `OrderingUnprovable` state and no descendant FLOW.
+An assigned active parent that becomes sealed without replacement placement retains its connected child and generation while it drains; the model never invents an unrouteable replacement open, while every other routeable descriptor change still uses confirmation-bearing close/reopen.
+Loss of that retained connection before completion follows the ordinary child-failure resynchronization path; no sealed authority is synthesized.
+A locally completed sealed segment may remain or reappear in a later complete assignment snapshot but is excluded from gained-child generation accounting, pending ownership, and ordinary child opens; active segments in the same assignment reconcile unchanged.
+
+Explicit `BrokerManaged` keeps every locally provable barrier but delegates remote ancestry to the controller.
+It does not upgrade the broker into a cross-member ordering proof.
+Both modes preserve broker FIFO within one segment and define no total order between independent branches.
+
+### Budget and receive linearization
+
+Every child is in manual-FLOW mode.
+One aggregate arbiter reserves `MAX_FRAME_SIZE` before granting one message permit and accounts for retained frames, decompression/chunk/batch work, queue and ledger nodes, canonical-id/source sidecars, position-map nodes, ordering-barrier storage, delivery leases, retiring children, and source-qualified authority.
+Adding segments redistributes capacity; it never multiplies the configured budget.
+Partial-batch dispatch charges only the logical members selected by the broker's `ack_set`; fresh grants remain replayable, while batch overshoot debt is repaid only on the current wire and is discarded with obsolete credit at seek.
+
+The validated minimum is exactly:
+
+```text
+MAX_FRAME_SIZE
++ 5 * MAX_STREAM_POSITION_SIZE
++ 3 * MAX_POSITION_COMPONENTS * POSITION_COMPONENT_NODE_OVERHEAD
++ 2 * DELIVERY_AUTHORITY_OVERHEAD
++ DELIVERY_ACK_GENERATION_OVERHEAD
++ 64 KiB control-plane cleanup reserve
+= 13,697,160 bytes
+```
+
+`DELIVERY_ACK_GENERATION_OVERHEAD` is one `u64` charged once per live delivery lease; the canonical delivered-position map retains its existing charge.
+
+The default is 16 MiB.
+The bound includes allocations Magnetar controls or derives from the wire; arbitrary extra memory allocated by user-defined `S::Owned` during schema decoding is outside it.
+
+Concurrent `receive` and `receive_batch` calls reserve each delivery once under aggregate state.
+Reservation/dequeue order is linearized, future completion order and per-waiter FIFO are not promised, and a batch reserves its complete set atomically after its first-message wait.
+Cancellation before reservation consumes nothing; cancellation after reservation returns an owned delivery synchronously or restores the same authority at its original dequeue sequence.
+If concurrent fencing prevents restoration, both runtimes request resynchronization rather than dropping the failure silently.
+
+### Delivery authority, transactions, and seek
+
+Each delivery carries `SegmentSource`, source-qualified `StreamMessageId`, a delivered `PositionVector`, and a process-local `DeliveryToken` fenced by consumer, controller/child incarnations, delivery epoch, and dequeue sequence.
+`StreamMessageId` and `PositionVector` serialize through the strict version-1 `MSTR` envelope; ordinary `MessageId` has no segment field, and serialized positions are values rather than reconstructed live authority.
+Both construction and decoding enforce the 64 KiB canonical ordinary-`MessageIdData` component limit.
+
+Individual, batch, cumulative-vector, restored-vector, negative, and transactional acknowledgements dispatch to the represented ordinary children.
+Partial-batch expansion preserves the broker's `ack_set` in every canonical delivery id, exposes only selected members, and keeps residual individual/cumulative masks from acknowledging later selected members in the same entry.
+Transaction admission registers each `(segment topic, subscription)`, commit closes admission and waits for every admitted operation, and any failed admitted operation poisons commit before `EndTxn(Commit)` can be emitted.
+Abort leaves cursors unchanged and permits redelivery; an unknown outcome fails participants closed.
+After the coordinator confirms an outcome, an owned completion task records it and checkpoints each completed local participant action independently of the caller that initiated `EndTxn`; retry cannot replay an already-issued FLOW prefix.
+
+Vector seek requires the same layout epoch and exactly every currently owned attached active leaf.
+It rejects live receive/batch/delivery/transaction reservations, cannot cross a topology transition or target sealed/remote ancestry, and invalidates old tokens by advancing the delivery epoch.
+The wire projection follows the wire's effective fields: chunk ids become their first-chunk ids, batch indexes become residual `ack_set` suffixes, and unsupported nested metadata is omitted.
+Both runtimes stage every eligible child seek before awaiting any child response, so child iteration order cannot prevent another current leaf from receiving its SEEK.
+A partial child failure makes the aggregate resynchronization-required.
+That failure fences child loops before awaiting their close confirmations, preventing teardown from recursively racing controller replacement.
+
+### Handoff, routing, and close
+
+Lost ownership stops new FLOW but keeps already permitted, reserved, or delivered work and the old child as an ack target.
+The drain is bounded in memory and unbounded in time; an application that never resolves a delivery can block handoff forever.
+A gained segment remains `PendingOwnership` while another `Exclusive` owner is live, with bounded `ConsumerBusy` attempts repeated on provider time while the assignment remains current.
+
+Controller and segment authority comes from broker-authored direct URLs matching the bootstrap transport.
+Plaintext and TLS stay distinct, and every published target passes the redirect allow-list.
+Before the broker publishes a controller URL, registration reuses only the already-authenticated direct bootstrap connection; missing segment authority, a mismatched or rejected published target, and proxy-any-broker registration still fail closed instead of guessing or downgrading.
+
+Explicit close through any clone is globally definitive for local routes, tasks, and children; final drop performs synchronous best-effort fencing without blocking or spawning. On GA, close marks in-flight registrations to leave after their subscribe responses arrive, then sends type-82 unsubscribe without waiting for its broker response; M1 retains connection-close cleanup behavior. A cancelled registration retains its fixed-size request record until its response or physical connection reset. These control-plane records are outside the aggregate receive budget, and the low-level connection API has no admission cap.
+
+The old drop-on-change event remains only on the raw diagnostic layout-session surface.
+The high-level aggregate reconciles DAG and assignment changes in place under the contracts above.
+See [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md); upstream ancestry, assignment-generation, and proxy-routing gaps remain explicit rather than being papered over by local fencing.
+
+---
+
 ## Runtime engines
 
 The façade exposes `PulsarClient<E: Engine = TokioEngine>`.
@@ -1348,6 +1486,8 @@ trait set:
 | `ConsumerApi` (with `type Producer: ProducerApi<Error = Self::Error>`) | runtime `Consumer` | All inherent methods of `MultiTopicsConsumer<C>` / `PatternConsumer<C>` / `Reader<C>` / `TableView<C>` (and the DLQ + retry helpers route through the associated `Producer`).                                                                |
 | `ProducerApi`                                                          | runtime `Producer` | `PartitionedProducer<P>` inherent methods.                                                                                                                                                                                                   |
 | `BrokerMetadataApi`                                                    | runtime `Client`   | `PulsarClient::partitions_for_topic` / `topic_list_snapshot`; `PartitionedConsumerBuilder` (partition discovery) + `PatternConsumer::update` (PIP-145 delta polling).                                                                        |
+| `SegmentSubscriberApi`                                                 | runtime `Client`   | Owned assignment-driven scalable `StreamConsumerBuilder::subscribe`, typed controller routes, and ordinary segment-child operations without requiring the public client to be `Clone`.                                                       |
+| `ScalableTopicsApi`                                                    | runtime `Client`   | Low-level PIP-460 layout, assignment, namespace-watch, and transaction-coordinator-watch diagnostic surfaces.                                                                                                                                |
 
 Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait methods needed to lift `MultiTopicsConsumer<C>` / `PatternConsumer<C>` impl bodies (13 multi-topic helpers + `pause` / `resume` / `seek_to_message` / `seek_to_timestamp` + the `unsubscribe(force: bool)` overload), and introduced `BrokerMetadataApi` to lift the partition-count + topic-list-watcher lookups so the three builders are engine-generic end-to-end.
 
@@ -1365,6 +1505,8 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | [`tls_insecure.rs`](crates/magnetar-runtime-tokio/src/tls_insecure.rs)                   | `tls_allow_insecure_connection(true)` blanket override.                                                                                                                                                                         |
 | [`tls_no_hostname.rs`](crates/magnetar-runtime-tokio/src/tls_no_hostname.rs)             | `tls_hostname_verification_enable(false)` chain-on / hostname-off.                                                                                                                                                              |
 | [`dns.rs`](crates/magnetar-runtime-tokio/src/dns.rs)                                     | `DnsResolver` trait + `TokioDnsResolver`.                                                                                                                                                                                       |
+| [`scalable.rs`](crates/magnetar-runtime-tokio/src/scalable.rs)                           | Typed incarnation-fenced PIP-460 routes, assignment/DAG control loop, aggregate manual FLOW, ordinary segment children, ack/transaction/seek/drain, and direct plaintext/TLS routing.                                           |
+| [`lib.rs`](crates/magnetar-runtime-tokio/src/lib.rs)                                     | `ConnectionShared` (state, atomic counters, `memory_used` + `memory_wakers` slab) + `TopicListChange`.                                                                                                                          |
 | [`lib.rs`](crates/magnetar-runtime-tokio/src/lib.rs)                                     | `ConnectionShared` (state, atomic counters, the client-wide `memory_limit` controller) + `TopicListChange`.                                                                                                                     |
 
 ### `magnetar-runtime-moonpool` — deterministic simulation
@@ -1379,6 +1521,7 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 | [`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs)             | `RustlsByteAdapter` — drives sans-io `rustls::ClientConnection` over a `NetworkProvider`-supplied byte pipe. Sans-io composition end to end.                                   |
 | [`transport.rs`](crates/magnetar-runtime-moonpool/src/transport.rs) | Plaintext byte pipe over the configured `NetworkProvider::TcpStream`.                                                                                                          |
 | [`dns.rs`](crates/magnetar-runtime-moonpool/src/dns.rs)             | `DnsResolver` trait + `StaticDnsResolver` + `arc_dns_resolver` helper.                                                                                                         |
+| [`scalable.rs`](crates/magnetar-runtime-moonpool/src/scalable.rs)   | Tokio-equivalent PIP-460 aggregate behavior over provider-native tasks, time, network, plaintext/TLS pool, and typed routes.                                                   |
 
 Key properties:
 
@@ -1706,7 +1849,7 @@ The schema is advertised on `CommandProducer.schema` / `CommandSubscribe.schema`
 | PIP-34 / 119 / 282 / 379 | Key_Shared family                        | ✅     | `magnetar_proto::KeySharedConfig` + builder routing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | PIP-391                  | Batch-index ACK polish                   | ✅     | Pairs with PIP-54                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | PIP-409                  | DLQ + retry-letter polish                | ✅     | DLQ + reconsume_later wiring                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| PIP-460                  | Scalable topics                          | 🟡     | Experimental, behind `feature = "scalable-topics"` (default off). Speaks the surface vendored from Apache Pulsar 5.0.0 (GA); the e2e suite runs against a real broker on every push per ADR-0046 (`5.0.0-M1` by default, `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG=5.0.0` for GA). See [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) (supersedes ADR-0031) + [ADR-0095](specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) + [`docs/pip-features.md#scalable-topics-pip-460--experimental`](docs/pip-features.md#scalable-topics-pip-460--experimental)                                                                                      |
+| PIP-460                  | Scalable topics                          | 🟡     | Experimental, behind `feature = "scalable-topics"` (default off). Speaks the surface vendored from Apache Pulsar 5.0.0 (GA); the e2e suite runs against a real broker on every push per ADR-0046 (`5.0.0` GA). Assignment-driven `StreamConsumer` delivery ships under [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md). See [ADR-0093](specs/adr/0093-pip-460-upstream-wire-surface.md) (supersedes ADR-0031) + [ADR-0095](specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md) + [`docs/pip-features.md#scalable-topics-pip-460--experimental`](docs/pip-features.md#scalable-topics-pip-460--experimental)                                                                                      |
 | PIP-466                  | V5 client API surface                    | ✅     | Experimental, engine-generic wrapper behind `feature = "experimental-v5-client"`; no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md) + [`docs/pip-features.md#v5-client-surface-pip-466`](docs/pip-features.md#v5-client-surface-pip-466)                                                                                                                                                                                                                                                                                                                                                                                    |
 | PIP-180                  | Shadow topic                             | ✅     | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/pip-features.md#shadow-topics-pip-180`](docs/pip-features.md#shadow-topics-pip-180) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md).                                                                                                                                                                                               |
 | PIP-415                  | `getMessageIdByIndex`                    | ✅     | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only)                                                                                                                                                                                                                                                                                                                                       |
@@ -1722,8 +1865,12 @@ High-level summary:
 - **Unit + integration**: `cargo test --workspace --all-features`.
   Every sans-io behavior is exercised by feeding bytes, asserting events / transmit / state.
   Trackers ship 13 ported behavioral cases from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer ships 6 ported cases from `BatchMessageContainerImplTest`.
-- **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, and structured-trace invariants under reproducible seeds.
+- **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, the complete scalable aggregate over simulated controller and segment sockets, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
+  The stateful PIP-460 fake drives 29 paired public aggregate scenarios, fourteen baseline and fifteen advanced, across `stream_consumer_equivalence.rs` and `stream_consumer_advanced_equivalence.rs`; the baseline file also contains one public type/value test.
+- **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no dedicated `e2e` feature and no `#[ignore]`; owning product features still gate feature-specific targets ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)), and Docker is the runtime prerequisite.
+  Spins suite-specific Pulsar 4.x images for stable and compatibility coverage and `apachepulsar/pulsar:5.0.0` for PIP-460 via `testcontainers`.
+  Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover, and the hardened scalable aggregate contract.
 - **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no feature gate and no `#[ignore]` ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)); Docker is the runtime prerequisite.
   Spins `apachepulsar/pulsar:4.2.5` via `testcontainers` (CI runs the whole suite on `4.2.5` and `5.0.0` per pull request and on `4.0.14` nightly, [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover.

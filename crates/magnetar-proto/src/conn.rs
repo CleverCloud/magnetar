@@ -45,8 +45,126 @@ use crate::memory_limit::MemoryReservation;
 use crate::pb;
 use crate::producer::{OpSend, ProducerState, SendDecision};
 use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
-use crate::txn::{TxnAction, TxnClient, TxnId};
+use crate::txn::{TxnAction, TxnClient, TxnError, TxnId};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
+
+fn broker_seek_message_id(mut message_id: pb::MessageIdData) -> pb::MessageIdData {
+    while let Some(first_chunk) = message_id.first_chunk_message_id.take() {
+        message_id = *first_chunk;
+    }
+    if let (Some(batch_index), Some(batch_size)) = (message_id.batch_index, message_id.batch_size)
+        && batch_index >= 0
+        && batch_size > 0
+    {
+        message_id.ack_set = crate::consumer::BatchAckEntry::seek_from_ack_set(
+            batch_size,
+            batch_index,
+            &message_id.ack_set,
+        )
+        .ack_set_i64();
+    }
+    message_id.batch_index = None;
+    message_id.batch_size = None;
+    message_id.first_chunk_message_id = None;
+    message_id
+}
+
+fn plain_ack_message_ids(
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    ack.message_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            message_id_data
+                .and_then(|ids| ids.get(index))
+                .cloned()
+                .unwrap_or_else(|| id.to_pb())
+        })
+        .collect()
+}
+
+fn apply_local_ack_state(
+    consumer: &mut crate::consumer::ConsumerState,
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    for id in &ack.message_ids {
+        if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+            tracker.remove(id);
+        }
+        if let Some(tracker) = consumer.nack_tracker.as_mut() {
+            tracker.remove(id);
+        }
+        #[cfg(feature = "scalable-topics")]
+        consumer.canonical_nack_ids.remove(id);
+    }
+    apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
+}
+
+fn apply_batch_ack_state(
+    batch_ack_tracker: &mut rustc_hash::FxHashMap<(u64, u64), crate::consumer::BatchAckEntry>,
+    ack: &AckRequest,
+    message_id_data: Option<&[pb::MessageIdData]>,
+) -> Vec<pb::MessageIdData> {
+    let mut ids = plain_ack_message_ids(ack, message_id_data);
+    for (id, pb_id) in ack.message_ids.iter().zip(&mut ids) {
+        if id.batch_index < 0 {
+            continue;
+        }
+        let key = (id.ledger_id, id.entry_id);
+        if !batch_ack_tracker.contains_key(&key)
+            && let Some(batch_size) = pb_id.batch_size
+            && batch_size > 0
+        {
+            batch_ack_tracker.insert(
+                key,
+                crate::consumer::BatchAckEntry::from_ack_set(batch_size, &pb_id.ack_set),
+            );
+        }
+        pb_id.ack_set.clear();
+        let fully = batch_ack_tracker.get_mut(&key).is_none_or(|entry| {
+            let fully = if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
+                entry.ack_position(id.batch_index)
+            } else {
+                entry.ack_cumulative(id.batch_index)
+            };
+            if !fully {
+                pb_id.ack_set = entry.ack_set_i64();
+            }
+            fully
+        });
+        if fully {
+            batch_ack_tracker.remove(&key);
+        }
+    }
+    if !matches!(ack.ack_type, pb::command_ack::AckType::Individual)
+        && let Some(horizon) = ack
+            .message_ids
+            .iter()
+            .max()
+            .map(|id| (id.ledger_id, id.entry_id))
+    {
+        batch_ack_tracker.retain(|key, _| *key >= horizon);
+        let horizon_is_partial = ack
+            .message_ids
+            .iter()
+            .any(|id| (id.ledger_id, id.entry_id) == horizon && id.batch_index >= 0);
+        if !horizon_is_partial {
+            batch_ack_tracker.remove(&horizon);
+        }
+    }
+    ids
+}
+
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, Copy)]
+struct ScalableSubscribeRequest {
+    consumer_id: u64,
+    incarnation: crate::ControllerIncarnation,
+    leave_after_response: bool,
+}
 
 /// The central sans-io state machine.
 pub struct Connection {
@@ -55,6 +173,9 @@ pub struct Connection {
     /// `ConnectionConfig` struct so adding the feature does not break
     /// downstream exhaustive config literals.
     operation_retry: crate::OperationRetryConfig,
+    /// Terminal driver-exit latch. Set before the final pending-operation
+    /// sweep so later admissions cannot enter behind that sweep.
+    terminal_admission_reason: Option<String>,
     state: HandshakeState,
     broker_max_message_size: Option<usize>,
     broker_protocol_version: i32,
@@ -114,6 +235,17 @@ pub struct Connection {
     wakers: HashMap<PendingOpKey, Waker>,
     /// Pending requests keyed by request id, with the kind of operation that produced them.
     pending_requests: HashMap<RequestId, PendingRequestKind>,
+    /// Cancellation-safe EndTxn request identity. A retry for the same
+    /// transaction and action resumes this request until its outcome is
+    /// consumed instead of issuing a duplicate coordinator mutation.
+    end_txn_requests: HashMap<(TxnId, TxnAction), RequestId>,
+    /// Reverse index used to retire [`Self::end_txn_requests`] when the matching
+    /// outcome is consumed or explicitly cancelled.
+    end_txn_request_keys: HashMap<RequestId, (TxnId, TxnAction)>,
+    /// Exactly one runtime future may consume a canonical EndTxn outcome.
+    /// Cancellation releases this lease without cancelling the wire request, so
+    /// a later caller can resume the same request id safely.
+    end_txn_waiters: HashMap<TxnId, TxnAction>,
     /// Open producers.
     ///
     /// `ProducerState` lives behind a per-slot [`parking_lot::Mutex`] so the
@@ -251,9 +383,9 @@ pub struct Connection {
     #[cfg(feature = "scalable-topics")]
     scalable_consumers: HashMap<u64, crate::scalable_consumer::ScalableConsumerSession>,
     /// PIP-460 (ADR-0093) in-flight `CommandScalableTopicSubscribe` request id →
-    /// consumer id, so the response can find its registration.
+    /// incarnation and deferred leave, so cancelled attempts settle before unregister.
     #[cfg(feature = "scalable-topics")]
-    scalable_subscribe_requests: HashMap<RequestId, u64>,
+    scalable_subscribe_requests: HashMap<RequestId, ScalableSubscribeRequest>,
     /// PIP-460 (ADR-0093) namespace-level topic watches, keyed by `watch_id`.
     #[cfg(feature = "scalable-topics")]
     scalable_topic_watches: HashMap<u64, crate::scalable_consumer::ScalableTopicsWatch>,
@@ -538,6 +670,7 @@ impl Connection {
         Self {
             config,
             operation_retry: crate::OperationRetryConfig::default(),
+            terminal_admission_reason: None,
             state: HandshakeState::Uninitialized,
             broker_max_message_size: None,
             broker_protocol_version: 0,
@@ -554,6 +687,9 @@ impl Connection {
             outcomes: HashMap::new(),
             wakers: HashMap::new(),
             pending_requests: HashMap::new(),
+            end_txn_requests: HashMap::new(),
+            end_txn_request_keys: HashMap::new(),
+            end_txn_waiters: HashMap::new(),
             producers: HashMap::new(),
             producer_create_requests: HashMap::new(),
             abandoned_producer_opens: [const { None }; MAX_ABANDONED_PRODUCER_OPENS],
@@ -945,25 +1081,38 @@ impl Connection {
         self.session_epoch = self.session_epoch.wrapping_add(1);
 
         // (2) Fail every pending request and wake its waiter. Forgotten
-        // producer/consumer closes — and issue #414's close-then-re-attach
-        // first half, whose `Success` was the only thing that would have read
-        // it — have no waiter by construction, so consume them without
-        // materializing an undrainable outcome. Dropping the
-        // `ConsumerCloseForReattach` entry here is also what hands the
-        // re-attach back to `rebuild_consumers`: the session that close was
-        // written on is gone, so the broker reaped that consumer with it.
+        // producer closes have no waiter; consumer terminal operations publish
+        // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
-                self.clear_consumer_unsubscribe(handle, request_id);
-                if !self.wakers.contains_key(&key) {
-                    continue;
-                }
+                self.publish_consumer_unsubscribe(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerUnsubscribeCompletion::SessionLost,
+                    true,
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerClose { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::SessionLost,
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerCloseForgotten { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::SessionLost,
+                );
+                continue;
             }
             if matches!(
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
-                    | PendingRequestKind::ConsumerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
             ) {
                 let _ = self.wakers.remove(&key);
@@ -1064,7 +1213,13 @@ impl Connection {
         // and re-issuing the initial flow.
         for slot in self.consumers.values() {
             let mut consumer = slot.state.lock();
+            consumer.subscribe_waiter_completed = false;
             consumer.queue.clear();
+            #[cfg(feature = "scalable-topics")]
+            {
+                consumer.clear_deferred_messages();
+                consumer.canonical_nack_ids.clear();
+            }
             consumer.pending_seek = None;
             consumer.granted_permits = 0;
             consumer.permit_balance = 0;
@@ -1091,6 +1246,8 @@ impl Connection {
         self.abandoned_producer_opens_next = 0;
         self.outbound.clear();
         self.inbound.clear();
+        #[cfg(feature = "scalable-topics")]
+        self.scalable_subscribe_requests.clear();
 
         // Lookup / topic-watcher registries hold no Wakers themselves — their futures
         // poll via the per-request waker slab we already drained above. Clearing the
@@ -1177,22 +1334,46 @@ impl Connection {
     /// dropped BEFORE the user wakers fire, so a waker that re-enters the
     /// connection cannot deadlock.
     pub fn fail_all_pending(&mut self, reason: &str) {
+        self.terminal_admission_reason = Some(reason.to_owned());
         // (1) Terminate every pending request and wake its waiter. Forgotten
-        // producer/consumer closes, and issue #414's close-then-re-attach first
-        // half, have no waiter by construction, so consume them without
-        // materializing an undrainable outcome.
+        // producer closes have no waiter; consumer terminal operations publish
+        // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
-                self.clear_consumer_unsubscribe(handle, request_id);
-                if !self.wakers.contains_key(&key) {
-                    continue;
-                }
+                self.publish_consumer_unsubscribe(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerUnsubscribeCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                    false,
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerClose { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                );
+                continue;
+            }
+            if let PendingRequestKind::ConsumerCloseForgotten { handle } = kind {
+                self.publish_consumer_close(
+                    handle,
+                    request_id,
+                    crate::consumer::ConsumerCloseCompletion::Terminal {
+                        reason: reason.to_owned(),
+                    },
+                );
+                continue;
             }
             if matches!(
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
-                    | PendingRequestKind::ConsumerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
             ) {
                 let _ = self.wakers.remove(&key);
@@ -1208,6 +1389,29 @@ impl Connection {
             if let Some(w) = self.wakers.remove(&key) {
                 w.wake();
             }
+        }
+
+        let mut terminal_wakers = Vec::new();
+        for slot in self.consumers.values() {
+            let mut consumer = slot.state.lock();
+            if matches!(
+                consumer.terminal_operation,
+                crate::consumer::ConsumerTerminalOperation::Open
+            ) {
+                consumer.terminal_operation =
+                    crate::consumer::ConsumerTerminalOperation::Complete {
+                        request_id: None,
+                        origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                        completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                            reason: reason.to_owned(),
+                        },
+                    };
+                consumer.close();
+                terminal_wakers.extend(consumer.close_waiters.drain());
+            }
+        }
+        for waker in terminal_wakers {
+            waker.wake();
         }
 
         // (2) Terminate every in-flight publish. Drain each producer's pending
@@ -1449,6 +1653,7 @@ impl Connection {
                     c.terminal_failure = Some(reason.to_owned());
                     c.granted_permits = 0;
                     c.permit_balance = 0;
+                    c.manual_flow_permits = 0;
                     (
                         c.receive_wakers.drain().collect(),
                         c.active_change_wakers.drain().collect(),
@@ -1781,8 +1986,16 @@ impl Connection {
 
     /// Cancel a consumer that has not completed its subscribe operation.
     ///
-    /// Idempotent and local-only; detached retry legs stop once the slot and
-    /// replay request disappear.
+    /// Idempotent. Before dropping local state, close the abandoned consumer
+    /// on the current session when its subscribe is pending or its success
+    /// has not yet been observed. The broker can finish subscription creation
+    /// after the caller cancels; `CloseConsumer` also retires that pending
+    /// broker future. The existing forgotten-close operation consumes its
+    /// response without retaining an unowned outcome.
+    ///
+    /// Reset invalidates the success bit while preserving the waiter token;
+    /// cancellation before a rebuilt subscribe emits no successor-session
+    /// close. Detached retry legs stop once the slot and replay request disappear.
     pub fn cancel_consumer_subscribe(&mut self, handle: ConsumerHandle) {
         let request_ids: Vec<RequestId> = self
             .pending_requests
@@ -1792,6 +2005,15 @@ impl Connection {
                     .then_some(*request_id)
             })
             .collect();
+        let broker_may_hold_registration = self.consumers.get(&handle).is_some_and(|slot| {
+            let consumer = slot.state.lock();
+            !consumer.closed
+                && (!request_ids.is_empty()
+                    || (consumer.subscribe_waiter_completed && self.is_connected()))
+        });
+        if broker_may_hold_registration {
+            self.emit_consumer_close(handle, true);
+        }
         for request_id in request_ids {
             self.cancel_request(request_id);
         }
@@ -1950,7 +2172,12 @@ impl Connection {
             .filter_map(|(handle, req)| {
                 let slot = self.consumers.get(handle)?;
                 let state = slot.state.lock();
-                if state.closed || state.unsubscribe_request_id.is_some() {
+                if state.closed
+                    || matches!(
+                        state.terminal_operation,
+                        crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+                    )
+                {
                     return None;
                 }
                 let resume = Self::consumer_reattach_start_message_id(req, &state);
@@ -2016,16 +2243,14 @@ impl Connection {
         // (see the comment block in `CloseConsumer` branch above), so we
         // don't need to reset it here. Drain stale close and acknowledgement
         // events before replacing the logical waiter token.
-        if self
-            .consumers
-            .get(&handle)?
-            .state
-            .lock()
-            .unsubscribe_request_id
-            .is_some()
-        {
+        let consumer = self.consumers.get(&handle)?.state.lock();
+        if !matches!(
+            consumer.terminal_operation,
+            crate::consumer::ConsumerTerminalOperation::Open
+        ) {
             return None;
         }
+        drop(consumer);
         self.events.retain(|ev| {
             !matches!(
                 ev,
@@ -2474,7 +2699,7 @@ impl Connection {
                         }
                     }
                 }
-                let (staged_events, flow_permits): (Vec<ConnectionEvent>, Option<u32>) =
+                let (staged_events, flow_command): (Vec<ConnectionEvent>, Option<pb::CommandFlow>) =
                     if let Some(slot) = self.consumers.get(&handle) {
                         let mut consumer = slot.state.lock();
                         let outcome = consumer.deliver(
@@ -2522,16 +2747,16 @@ impl Connection {
                                 }
                             }
                         }
-                        let flow_permits = consumer.maybe_flow().map(|flow| flow.message_permits);
-                        (events, flow_permits)
+                        let flow_command = consumer.maybe_flow();
+                        (events, flow_command)
                     } else {
                         (Vec::new(), None)
                     };
                 for ev in staged_events {
                     self.push_observational_event(ev);
                 }
-                if let Some(permits) = flow_permits {
-                    self.flow(handle, permits);
+                if let Some(flow_command) = flow_command {
+                    self.stage_flow(flow_command);
                 }
             }
             pb::base_command::Type::ProducerSuccess => {
@@ -2625,11 +2850,13 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation("missing CommandSuccess"))?;
                 let request_id = RequestId(ok.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                let unsubscribe_has_waiter =
-                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
-                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
-                    self.complete_consumer_unsubscribe(handle, request_id);
+                    self.publish_consumer_unsubscribe(
+                        handle,
+                        request_id,
+                        crate::consumer::ConsumerUnsubscribeCompletion::Success,
+                        false,
+                    );
                 }
                 match kind {
                     Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
@@ -2645,6 +2872,11 @@ impl Connection {
                         );
                     }
                     Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::Success,
+                        );
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
@@ -2660,15 +2892,15 @@ impl Connection {
                         // recording an outcome here would leak one permanent `outcomes`
                         // entry per recovery attempt (the issue #241 shape).
                     }
-                    Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
-                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
-                        if !unsubscribe_has_waiter =>
-                    {
-                        // The user cancelled the unsubscribe future, but the
-                        // broker-side operation still completed. Lifecycle is
-                        // finalized above; without a waiter, retaining an
-                        // outcome would leak it permanently.
+                    Some(PendingRequestKind::ConsumerClose { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::Success,
+                        );
                     }
+                    Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -2796,10 +3028,16 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                let unsubscribe_has_waiter =
-                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
-                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
+                    self.publish_consumer_unsubscribe(
+                        handle,
+                        request_id,
+                        crate::consumer::ConsumerUnsubscribeCompletion::BrokerError {
+                            code: err.error,
+                            message: err.message.clone(),
+                        },
+                        true,
+                    );
                     let _ = self.resume_consumer_after_unsubscribe_failure(handle, request_id);
                 }
                 match kind {
@@ -2820,6 +3058,14 @@ impl Connection {
                         );
                     }
                     Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::BrokerError {
+                                code: err.error,
+                                message: err.message.clone(),
+                            },
+                        );
                         let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
                         tracing::warn!(
                             target: "magnetar_proto::conn",
@@ -2853,17 +3099,21 @@ impl Connection {
                              pulsar-admin topics unload if it stays wedged (#414)"
                         );
                     }
+                    Some(PendingRequestKind::ConsumerClose { handle }) => {
+                        self.publish_consumer_close(
+                            handle,
+                            request_id,
+                            crate::consumer::ConsumerCloseCompletion::BrokerError {
+                                code: err.error,
+                                message: err.message.clone(),
+                            },
+                        );
+                    }
                     Some(
                         PendingRequestKind::ProducerOpen { .. }
                         | PendingRequestKind::ConsumerSubscribe { .. },
                     ) => {}
-                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
-                        if !unsubscribe_has_waiter =>
-                    {
-                        // The retry generation was restored above. A cancelled
-                        // waiter cannot drain an error outcome, so consume it
-                        // in-place after applying the protocol-owned lifecycle.
-                    }
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -4304,7 +4554,7 @@ impl Connection {
         // Tracker-driven redeliveries — both negative-ack delay and unacked-message timeout
         // produce the same CommandRedeliverUnacknowledgedMessages payload, so we collect
         // then emit through the shared helper.
-        let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
+        let mut redeliveries: Vec<(ConsumerHandle, Vec<pb::MessageIdData>)> = Vec::new();
         let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
         let mut chunk_acks: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         // Issue #301: receiver-queue auto-adjust flow commands staged inside the
@@ -4324,8 +4574,21 @@ impl Connection {
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
-                for action in tracker.poll(now) {
+                let actions = tracker.poll(now);
+                for action in actions {
                     let crate::trackers::NackAction::RedeliverUnacked { message_ids, .. } = action;
+                    #[cfg(feature = "scalable-topics")]
+                    let message_ids = message_ids
+                        .into_iter()
+                        .map(|message_id| {
+                            consumer
+                                .canonical_nack_ids
+                                .remove(&message_id)
+                                .unwrap_or_else(|| message_id.to_pb())
+                        })
+                        .collect();
+                    #[cfg(not(feature = "scalable-topics"))]
+                    let message_ids = message_ids.into_iter().map(MessageId::to_pb).collect();
                     redeliveries.push((*handle, message_ids));
                 }
             }
@@ -4333,7 +4596,10 @@ impl Connection {
                 for action in tracker.poll(now) {
                     let crate::trackers::UnackedAction::RedeliverExpired { message_ids, .. } =
                         action;
-                    redeliveries.push((*handle, message_ids));
+                    redeliveries.push((
+                        *handle,
+                        message_ids.into_iter().map(MessageId::to_pb).collect(),
+                    ));
                 }
             }
             if let Some(tracker) = consumer.ack_tracker.as_mut() {
@@ -4531,7 +4797,7 @@ impl Connection {
             // ---- END issue #414 / ADR-0103 ----
         }
         for (handle, ids) in redeliveries {
-            self.emit_redeliver_unacked(handle, ids);
+            self.emit_redeliver_unacked_data(handle, ids);
         }
         // Issue #301: emit the staged incremental receiver-queue flow commands.
         for flow in adjust_flows {
@@ -4954,11 +5220,23 @@ impl Connection {
         }
         let _ = self.lookup.take_lookup(request_id);
         let _ = self.lookup.take_partition(request_id);
+        if let Some(end_key) = self.end_txn_request_keys.remove(&request_id) {
+            self.end_txn_requests.remove(&end_key);
+            if self.end_txn_waiters.get(&end_key.0) == Some(&end_key.1) {
+                self.end_txn_waiters.remove(&end_key.0);
+            }
+        }
     }
 
     /// Consume the outcome of a pending op, if one is ready.
     pub fn take_outcome(&mut self, key: PendingOpKey) -> Option<OpOutcome> {
-        self.outcomes.remove(&key)
+        let outcome = self.outcomes.remove(&key)?;
+        if let PendingOpKey::Request(request_id) = key
+            && let Some(end_key) = self.end_txn_request_keys.remove(&request_id)
+        {
+            self.end_txn_requests.remove(&end_key);
+        }
+        Some(outcome)
     }
 
     /// Test/diagnostic accessor: number of wakers currently parked in the
@@ -5294,6 +5572,10 @@ impl Connection {
             req.auto_ack_oldest_chunked_message_on_queue_full;
         state.expire_time_of_incomplete_chunked_message =
             req.expire_time_of_incomplete_chunked_message;
+        #[cfg(feature = "scalable-topics")]
+        {
+            state.defer_payload_processing = req.defer_payload_processing;
+        }
         seed_rate_window_baseline(
             &mut state.last_rate_snapshot,
             self.config.stats_interval,
@@ -5354,7 +5636,7 @@ impl Connection {
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
             // PIP-486 entry-bucket dispatch is for scalable-topic segment
             // sharing only; a plain Key_Shared subscription leaves it unset.
-            entry_bucket_dispatch: None,
+            entry_bucket_dispatch: req.entry_bucket_dispatch.then_some(true),
         });
         let start_message_id = resume_from.map(MessageId::to_pb);
         let consumer_metadata: Vec<pb::KeyValue> = req
@@ -5766,7 +6048,7 @@ impl Connection {
     pub fn consumer_queue_len(&self, handle: ConsumerHandle) -> usize {
         self.consumers
             .get(&handle)
-            .map_or(0, |slot| slot.state.lock().queue.len())
+            .map_or(0, |slot| slot.state.lock().queue_len())
     }
 
     /// Client-accounted unspent dispatch permits: grants recorded locally minus dispatch
@@ -5955,6 +6237,31 @@ impl Connection {
 
     /// Acknowledge messages.
     pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest, now: Instant) -> RequestId {
+        self.ack_inner(handle, ack, None, now)
+    }
+
+    /// Acknowledge messages while retaining every broker `MessageIdData` field.
+    ///
+    /// Scalable aggregate consumers keep the complete protobuf ID outside the
+    /// public [`IncomingMessage`] shape so chunk and batch fields survive the
+    /// aggregate acknowledgement boundary.
+    pub fn ack_with_message_id_data(
+        &mut self,
+        handle: ConsumerHandle,
+        ack: AckRequest,
+        message_id_data: Vec<pb::MessageIdData>,
+        now: Instant,
+    ) -> RequestId {
+        self.ack_inner(handle, ack, Some(message_id_data), now)
+    }
+
+    fn ack_inner(
+        &mut self,
+        handle: ConsumerHandle,
+        ack: AckRequest,
+        message_id_data: Option<Vec<pb::MessageIdData>>,
+        now: Instant,
+    ) -> RequestId {
         let request_id = self.alloc_request_id();
         if matches!(ack.ack_type, pb::command_ack::AckType::Individual)
             && ack.message_ids.iter().any(|id| {
@@ -5977,83 +6284,8 @@ impl Connection {
             return request_id;
         }
         let n_ids = ack.message_ids.len() as u64;
-        // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
-        // (caller may have nacked then acked the same id).
-        if let Some(slot) = self.consumers.get(&handle) {
-            let mut consumer = slot.state.lock();
-            for id in &ack.message_ids {
-                if let Some(t) = consumer.unacked_tracker.as_mut() {
-                    t.remove(id);
-                }
-                if let Some(t) = consumer.nack_tracker.as_mut() {
-                    t.remove(id);
-                }
-            }
-        }
-        // PIP-54: for any message id with `batch_index >= 0`, look up the per-batch ack
-        // tracker, clear the bit at `batch_index`, and emit either a "full" MessageIdData
-        // (no ack_set; the batch is now fully acked, so the broker can advance the cursor
-        // past it) or a partial-ack MessageIdData carrying the bitset of still-unacked
-        // positions so the broker holds the cursor.
-        let pb_ids: Vec<pb::MessageIdData> =
-            if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
-                if let Some(slot) = self.consumers.get(&handle) {
-                    let mut consumer = slot.state.lock();
-                    ack.message_ids
-                        .iter()
-                        .map(|id| {
-                            let mut pb_id = id.to_pb();
-                            if id.batch_index >= 0 {
-                                let key = (id.ledger_id, id.entry_id);
-                                // A reset deliberately clears session-local PIP-54 state because a
-                                // pre-reset ACK may never have reached the broker. Reconstruct a
-                                // conservative all-unacked entry from the MessageId and clear only
-                                // the position explicitly acknowledged by this call. Pulsar
-                                // intersects this ack_set with its persisted cursor state, so an
-                                // ACK that did land before reset
-                                // stays acknowledged without trusting an
-                                // unconfirmed local bit.
-                                let entry =
-                                    consumer.batch_ack_tracker.entry(key).or_insert_with(|| {
-                                        crate::consumer::BatchAckEntry::fresh(id.batch_size)
-                                    });
-                                let fully = entry.ack_position(id.batch_index);
-                                if !fully {
-                                    pb_id.ack_set = entry.ack_set_i64();
-                                }
-                                if fully {
-                                    consumer.batch_ack_tracker.remove(&key);
-                                }
-                            }
-                            pb_id
-                        })
-                        .collect()
-                } else {
-                    ack.message_ids.iter().map(|m| m.to_pb()).collect()
-                }
-            } else {
-                // Cumulative ack — every position up to the supplied id is implicitly acked,
-                // so any per-batch tracker entries AT OR BELOW the cumulative position are
-                // stale, not just the entry of the supplied id itself. Prune them all: a
-                // cumulative-only acking pattern (e.g. a watermark acker) otherwise leaks one
-                // `BatchAckEntry` per batched broker entry for the lifetime of the connection
-                // (issue #326). `(ledger_id, entry_id)` ordering matches the broker's cursor
-                // order within this consumer's partition, and `retain` runs once per
-                // cumulative ack — which is coalesced by construction — so the O(map) sweep
-                // is negligible.
-                if let Some(slot) = self.consumers.get(&handle) {
-                    let mut consumer = slot.state.lock();
-                    let horizon = ack
-                        .message_ids
-                        .iter()
-                        .map(|id| (id.ledger_id, id.entry_id))
-                        .max();
-                    if let Some(horizon) = horizon {
-                        consumer.batch_ack_tracker.retain(|key, _| *key > horizon);
-                    }
-                }
-                ack.message_ids.iter().map(|m| m.to_pb()).collect()
-            };
+        let ack_type = ack.ack_type;
+        let txn_id = ack.txn_id;
         let properties: Vec<pb::KeyLongValue> = ack
             .properties
             .iter()
@@ -6062,14 +6294,57 @@ impl Connection {
                 value: *v as u64,
             })
             .collect();
+        let pb_ids = if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            if let Some(txn_id) = txn_id {
+                let initial_batch_state: Vec<_> = ack
+                    .message_ids
+                    .iter()
+                    .filter(|id| id.batch_index >= 0)
+                    .map(|id| (id.ledger_id, id.entry_id))
+                    .map(|key| (key, consumer.batch_ack_tracker.get(&key).cloned()))
+                    .collect();
+                let pending = consumer
+                    .pending_transactional_acks
+                    .entry(txn_id)
+                    .or_insert_with(|| crate::consumer::PendingTransactionalAcks {
+                        batch_ack_tracker: rustc_hash::FxHashMap::default(),
+                        seeded_batch_keys: rustc_hash::FxHashSet::default(),
+                        acknowledgements: Vec::new(),
+                    });
+                for (key, initial) in initial_batch_state {
+                    if pending.seeded_batch_keys.insert(key)
+                        && let Some(initial) = initial
+                    {
+                        pending.batch_ack_tracker.insert(key, initial);
+                    }
+                }
+                let pb_ids = apply_batch_ack_state(
+                    &mut pending.batch_ack_tracker,
+                    &ack,
+                    message_id_data.as_deref(),
+                );
+                pending
+                    .acknowledgements
+                    .push(crate::consumer::PendingTransactionalAck {
+                        request: ack,
+                        message_id_data,
+                    });
+                pb_ids
+            } else {
+                apply_local_ack_state(&mut consumer, &ack, message_id_data.as_deref())
+            }
+        } else {
+            plain_ack_message_ids(&ack, message_id_data.as_deref())
+        };
         let cmd = pb::CommandAck {
             consumer_id: handle.0,
-            ack_type: ack.ack_type as i32,
+            ack_type: ack_type as i32,
             message_id: pb_ids,
             validation_error: None,
             properties,
-            txnid_least_bits: ack.txn_id.map(|t| t.least_sig_bits),
-            txnid_most_bits: ack.txn_id.map(|t| t.most_sig_bits),
+            txnid_least_bits: txn_id.map(|t| t.least_sig_bits),
+            txnid_most_bits: txn_id.map(|t| t.most_sig_bits),
             request_id: Some(request_id.0),
         };
         let base = pb::BaseCommand {
@@ -6090,6 +6365,32 @@ impl Connection {
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
         }
         request_id
+    }
+
+    /// Apply or discard local consumer state held behind transactional ACKs.
+    /// Broker commit/abort has already settled before runtimes call this method.
+    pub fn settle_transactional_acks(
+        &mut self,
+        handle: ConsumerHandle,
+        txn_id: crate::TxnId,
+        committed: bool,
+    ) {
+        let Some(slot) = self.consumers.get(&handle) else {
+            return;
+        };
+        let mut consumer = slot.state.lock();
+        let Some(pending) = consumer.pending_transactional_acks.remove(&txn_id) else {
+            return;
+        };
+        if committed {
+            for acknowledgement in pending.acknowledgements {
+                let _ = apply_local_ack_state(
+                    &mut consumer,
+                    &acknowledgement.request,
+                    acknowledgement.message_id_data.as_deref(),
+                );
+            }
+        }
     }
 
     /// Stage an individual ack into this consumer's ack-grouping tracker. The state
@@ -6210,13 +6511,41 @@ impl Connection {
 
     /// Issue an explicit FLOW for a consumer.
     pub fn flow(&mut self, handle: ConsumerHandle, permits: u32) {
-        let cmd = pb::CommandFlow {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            if consumer.receiver_queue_size == 0 {
+                consumer.manual_flow_permits = consumer.manual_flow_permits.saturating_add(permits);
+            }
+            consumer.granted_permits = consumer.granted_permits.saturating_add(permits);
+            consumer.permit_balance = consumer.permit_balance.saturating_add(permits);
+        }
+        self.stage_flow(pb::CommandFlow {
             consumer_id: handle.0,
             message_permits: permits,
-        };
+        });
+    }
+
+    /// Issue aggregate-owned FLOW while retaining only fresh delivery credit
+    /// for reconnect replay. `debt` repays permits already consumed by a batch.
+    #[cfg(feature = "scalable-topics")]
+    pub fn flow_for_aggregate(&mut self, handle: ConsumerHandle, fresh: u32, debt: u32) {
+        let permits = fresh.saturating_add(debt);
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            consumer.manual_flow_permits = consumer.manual_flow_permits.saturating_add(fresh);
+            consumer.granted_permits = consumer.granted_permits.saturating_add(permits);
+            consumer.permit_balance = consumer.permit_balance.saturating_add(permits);
+        }
+        self.stage_flow(pb::CommandFlow {
+            consumer_id: handle.0,
+            message_permits: permits,
+        });
+    }
+
+    fn stage_flow(&mut self, flow: pb::CommandFlow) {
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
-            flow: Some(cmd),
+            flow: Some(flow),
             ..Default::default()
         };
         let _ = self.encode_command(&base);
@@ -6352,6 +6681,10 @@ impl Connection {
                         t.remove(id);
                     }
                 }
+                #[cfg(feature = "scalable-topics")]
+                for id in &message_ids {
+                    consumer.canonical_nack_ids.remove(id);
+                }
                 if let Some(tracker) = consumer.nack_tracker.as_mut() {
                     for id in &message_ids {
                         tracker.add(*id, now);
@@ -6361,6 +6694,43 @@ impl Connection {
             }
         }
         self.emit_redeliver_unacked(handle, message_ids);
+    }
+
+    /// Negatively acknowledge complete scalable IDs without projecting away
+    /// chunk or partial-batch fields.
+    #[cfg(feature = "scalable-topics")]
+    pub fn negative_ack_with_message_id_data(
+        &mut self,
+        handle: ConsumerHandle,
+        message_id_data: Vec<pb::MessageIdData>,
+        now: Instant,
+    ) {
+        let message_ids: Vec<_> = message_id_data.iter().map(MessageId::from_pb).collect();
+        if !message_ids.is_empty()
+            && let Some(slot) = self.consumers.get(&handle)
+        {
+            let mut consumer = slot.state.lock();
+            let consumer = &mut *consumer;
+            if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+                for id in &message_ids {
+                    tracker.remove(id);
+                }
+            }
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                for (id, data) in message_ids
+                    .iter()
+                    .copied()
+                    .zip(message_id_data.iter().cloned())
+                {
+                    consumer.canonical_nack_ids.insert(id, data);
+                }
+                for &id in &message_ids {
+                    tracker.add(id, now);
+                }
+                return;
+            }
+        }
+        self.emit_redeliver_unacked_data(handle, message_id_data);
     }
 
     /// Negative-ack a single message with an explicit per-message delay, bypassing the
@@ -6386,6 +6756,8 @@ impl Connection {
             if let Some(t) = consumer.unacked_tracker.as_mut() {
                 t.remove(&message_id);
             }
+            #[cfg(feature = "scalable-topics")]
+            consumer.canonical_nack_ids.remove(&message_id);
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 tracker.add_with_delay(message_id, delay, now);
                 return;
@@ -6396,6 +6768,14 @@ impl Connection {
 
     fn emit_redeliver_unacked(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
         let pb_ids = message_ids.into_iter().map(MessageId::to_pb).collect();
+        self.emit_redeliver_unacked_data(handle, pb_ids);
+    }
+
+    fn emit_redeliver_unacked_data(
+        &mut self,
+        handle: ConsumerHandle,
+        pb_ids: Vec<pb::MessageIdData>,
+    ) {
         let cmd = pb::CommandRedeliverUnacknowledgedMessages {
             consumer_id: handle.0,
             message_ids: pb_ids,
@@ -6436,7 +6816,8 @@ impl Connection {
     pub fn seek(&mut self, handle: ConsumerHandle, target: SeekTarget) -> RequestId {
         let request_id = self.alloc_request_id();
         let (message_id, publish_time) = match target {
-            SeekTarget::MessageId(mid) => (Some(mid.to_pb()), None),
+            SeekTarget::MessageId(mid) => (Some(broker_seek_message_id(mid.to_pb())), None),
+            SeekTarget::MessageIdData(mid) => (Some(broker_seek_message_id(mid)), None),
             SeekTarget::PublishTime(t) => (None, Some(t)),
         };
         let cmd = pb::CommandSeek {
@@ -6816,43 +7197,152 @@ impl Connection {
         request_id
     }
 
-    /// Close a consumer. The caller is expected to await the broker ack via
-    /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
-    /// with [`Self::take_outcome`].
+    /// Admit or reuse this consumer's cancellation-safe close operation.
     ///
     /// `now` (ADR-0011 clock injection) is only consumed when this consumer
     /// has a non-empty ack-grouping tracker to flush — the flush routes
     /// through [`Self::ack`], which stamps the flushed `CommandAck`'s
     /// `enqueued_at` for the `ack_response_timeout` backstop (issue #346).
-    pub fn close_consumer(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
-        self.close_consumer_inner(handle, false, now)
+    pub fn close_consumer(
+        &mut self,
+        handle: ConsumerHandle,
+        now: Instant,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        self.close_consumer_inner(handle, now, crate::consumer::ConsumerCloseOrigin::Reliable)
     }
 
-    /// Fire-and-forget variant of [`Self::close_consumer`] for the engines'
-    /// last-clone drop guard. The broker ack is consumed in-place because no
-    /// waiter exists to drain it.
-    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
-        self.close_consumer_inner(handle, true, now)
+    /// Admission surface used by last-clone drop guards. It shares the same
+    /// reusable operation as [`Self::close_consumer`].
+    pub fn close_consumer_forget(
+        &mut self,
+        handle: ConsumerHandle,
+        now: Instant,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        self.close_consumer_inner(
+            handle,
+            now,
+            crate::consumer::ConsumerCloseOrigin::BestEffort,
+        )
+    }
+
+    /// Emit at most one forgotten retry after the reusable close completed with
+    /// a failure. Pending and successful closes are never duplicated.
+    pub fn force_close_consumer_forget(
+        &mut self,
+        handle: ConsumerHandle,
+        _now: Instant,
+    ) -> Option<RequestId> {
+        if self.terminal_admission_reason.is_some() {
+            return None;
+        }
+        let operation = self
+            .consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().terminal_operation.clone())?;
+        match operation {
+            crate::consumer::ConsumerTerminalOperation::Open
+            | crate::consumer::ConsumerTerminalOperation::Pending { .. }
+            | crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+            | crate::consumer::ConsumerTerminalOperation::Complete {
+                completion: crate::consumer::ConsumerCloseCompletion::Success,
+                ..
+            } => None,
+            crate::consumer::ConsumerTerminalOperation::Complete {
+                request_id: Some(_),
+                origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                ..
+            } => {
+                let should_retry = self.consumers.get(&handle).is_some_and(|slot| {
+                    let mut consumer = slot.state.lock();
+                    if consumer.forced_close_retry_issued {
+                        false
+                    } else {
+                        consumer.forced_close_retry_issued = true;
+                        true
+                    }
+                });
+                should_retry.then(|| self.emit_consumer_close(handle, true))
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete { .. } => None,
+        }
     }
 
     fn close_consumer_inner(
         &mut self,
         handle: ConsumerHandle,
-        forget: bool,
         now: Instant,
-    ) -> RequestId {
-        let ack_actions = self.consumers.get(&handle).and_then(|slot| {
-            slot.state
-                .lock()
-                .ack_tracker
-                .as_mut()
-                .map(crate::trackers::AckGroupingTracker::flush)
-        });
+        origin: crate::consumer::ConsumerCloseOrigin,
+    ) -> Result<RequestId, crate::consumer::ConsumerTerminalAdmissionError> {
+        if let Some(reason) = self.terminal_admission_reason.clone() {
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                if matches!(
+                    consumer.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ) {
+                    consumer.terminal_operation =
+                        crate::consumer::ConsumerTerminalOperation::Complete {
+                            request_id: None,
+                            origin,
+                            completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                                reason,
+                            },
+                        };
+                    consumer.close();
+                }
+            }
+            return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+        }
+        let slot = self
+            .consumers
+            .get(&handle)
+            .cloned()
+            .ok_or(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)?;
+        let mut consumer = slot.state.lock();
+        match consumer.terminal_operation {
+            crate::consumer::ConsumerTerminalOperation::Pending { request_id, .. } => {
+                return Ok(request_id);
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete { request_id, .. } => {
+                return request_id.ok_or(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+            }
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Open => {}
+        }
+        let request_id = self.alloc_request_id();
+        let ack_actions = consumer
+            .ack_tracker
+            .as_mut()
+            .map(crate::trackers::AckGroupingTracker::flush);
+        consumer.terminal_operation =
+            crate::consumer::ConsumerTerminalOperation::Pending { request_id, origin };
+        consumer.close();
+        drop(consumer);
         if let Some(actions) = ack_actions {
             self.dispatch_ack_actions(actions, now);
         }
+        self.emit_consumer_close_with_id(
+            handle,
+            request_id,
+            origin == crate::consumer::ConsumerCloseOrigin::BestEffort,
+        );
+        Ok(request_id)
+    }
 
+    fn emit_consumer_close(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
         let request_id = self.alloc_request_id();
+        self.emit_consumer_close_with_id(handle, request_id, forget);
+        request_id
+    }
+
+    fn emit_consumer_close_with_id(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        forget: bool,
+    ) {
         let cmd = pb::CommandCloseConsumer {
             consumer_id: handle.0,
             request_id: request_id.0,
@@ -6865,16 +7355,63 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().close();
-        }
         let kind = if forget {
             PendingRequestKind::ConsumerCloseForgotten { handle }
         } else {
             PendingRequestKind::ConsumerClose { handle }
         };
         self.pending_requests.insert(request_id, kind);
-        request_id
+    }
+
+    fn publish_consumer_close(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        completion: crate::consumer::ConsumerCloseCompletion,
+    ) {
+        let wakers = self
+            .consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().complete_close(request_id, completion))
+            .unwrap_or_default();
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    fn publish_consumer_unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+        completion: crate::consumer::ConsumerUnsubscribeCompletion,
+        reopen: bool,
+    ) -> bool {
+        let Some((operation, close_slot)) = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            let operation =
+                match &consumer.terminal_operation {
+                    crate::consumer::ConsumerTerminalOperation::UnsubscribePending {
+                        operation,
+                    } if operation.lock().request_id() == request_id => operation.clone(),
+                    _ => return None,
+                };
+            if reopen {
+                consumer.terminal_operation = crate::consumer::ConsumerTerminalOperation::Open;
+            } else {
+                consumer.close();
+            }
+            Some((operation, !reopen))
+        }) else {
+            return false;
+        };
+        let wakers = operation.lock().complete(completion);
+        for waker in wakers {
+            waker.wake();
+        }
+        if close_slot {
+            self.cancel_consumer_subscribe(handle);
+        }
+        true
     }
 
     /// Unsubscribe — remove this consumer's subscription from the broker.
@@ -6887,37 +7424,61 @@ impl Connection {
     /// cancelled; a rejection restores the suspended attachment generation.
     /// `force=true` (PIP-313) drops the subscription even if other consumers
     /// are still attached.
-    pub fn unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
-        if let Some(request_id) = self
+    pub fn unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        force: bool,
+    ) -> Result<
+        crate::consumer::ConsumerUnsubscribeAdmission,
+        crate::consumer::ConsumerTerminalAdmissionError,
+    > {
+        if let Some(reason) = self.terminal_admission_reason.clone() {
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                if matches!(
+                    consumer.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ) {
+                    consumer.terminal_operation =
+                        crate::consumer::ConsumerTerminalOperation::Complete {
+                            request_id: None,
+                            origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                            completion: crate::consumer::ConsumerCloseCompletion::Terminal {
+                                reason,
+                            },
+                        };
+                    consumer.close();
+                }
+            }
+            return Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal);
+        }
+        let slot = self
             .consumers
             .get(&handle)
-            .and_then(|slot| slot.state.lock().unsubscribe_request_id)
-        {
-            return request_id;
+            .cloned()
+            .ok_or(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)?;
+        let mut consumer = slot.state.lock();
+        match consumer.terminal_operation {
+            crate::consumer::ConsumerTerminalOperation::Open => {}
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Pending { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::CloseInProgress);
+            }
+            crate::consumer::ConsumerTerminalOperation::Complete { .. } => {
+                return Err(crate::consumer::ConsumerTerminalAdmissionError::Closed);
+            }
         }
-        self.stage_unsubscribe(handle, force)
-    }
-
-    /// Stage an unsubscribe unless one is already in flight for this handle.
-    ///
-    /// Built-in runtimes use this idempotent admission gate so overlapping
-    /// user futures cannot both claim ownership of the same broker operation.
-    pub fn try_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> Option<RequestId> {
-        if self
-            .consumers
-            .get(&handle)
-            .is_some_and(|slot| slot.state.lock().unsubscribe_request_id.is_some())
-        {
-            return None;
-        }
-        Some(self.stage_unsubscribe(handle, force))
-    }
-
-    fn stage_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
         let request_id = self.alloc_request_id();
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().unsubscribe_request_id = Some(request_id);
-        }
+        let operation = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::consumer::ConsumerUnsubscribeOperation::new(request_id),
+        ));
+        consumer.terminal_operation =
+            crate::consumer::ConsumerTerminalOperation::UnsubscribePending {
+                operation: operation.clone(),
+            };
+        drop(consumer);
         self.events.retain(|event| {
             !matches!(
                 event,
@@ -6943,7 +7504,10 @@ impl Connection {
             request_id,
             PendingRequestKind::ConsumerUnsubscribe { handle },
         );
-        request_id
+        Ok(crate::consumer::ConsumerUnsubscribeAdmission {
+            request_id,
+            operation,
+        })
     }
 
     /// Restore a consumer after the broker rejects an unsubscribe request.
@@ -6956,15 +7520,18 @@ impl Connection {
     fn resume_consumer_after_unsubscribe_failure(
         &mut self,
         handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
+        _unsubscribe_request_id: RequestId,
     ) -> Option<RequestId> {
         let failed_request_id = {
             let slot = self.consumers.get(&handle)?;
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) || consumer.closed {
+            let consumer = slot.state.lock();
+            if !matches!(
+                consumer.terminal_operation,
+                crate::consumer::ConsumerTerminalOperation::Open
+            ) || consumer.closed
+            {
                 return None;
             }
-            consumer.unsubscribe_request_id = None;
             consumer.last_subscribe_error.as_ref()?;
             consumer
                 .subscribe_waiter_request
@@ -6974,38 +7541,6 @@ impl Connection {
             return None;
         }
         self.retry_consumer_subscribe_if_current(handle, failed_request_id)
-    }
-
-    fn complete_consumer_unsubscribe(
-        &mut self,
-        handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
-    ) {
-        let current = self.consumers.get(&handle).is_some_and(|slot| {
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) {
-                return false;
-            }
-            consumer.unsubscribe_request_id = None;
-            consumer.close();
-            true
-        });
-        if current {
-            self.cancel_consumer_subscribe(handle);
-        }
-    }
-
-    fn clear_consumer_unsubscribe(
-        &mut self,
-        handle: ConsumerHandle,
-        unsubscribe_request_id: RequestId,
-    ) {
-        if let Some(slot) = self.consumers.get(&handle) {
-            let mut consumer = slot.state.lock();
-            if consumer.unsubscribe_request_id == Some(unsubscribe_request_id) {
-                consumer.unsubscribe_request_id = None;
-            }
-        }
     }
 
     /// Mutable accessor for the embedded [`TxnClient`].
@@ -7109,7 +7644,18 @@ impl Connection {
 
     /// Commit or abort the transaction. Returns the request id; the matching
     /// [`OpOutcome::EndTxn`] is consumed via [`Self::take_outcome`] once the broker replies.
-    pub fn end_txn(&mut self, txn: TxnId, action: TxnAction) -> RequestId {
+    pub fn end_txn(&mut self, txn: TxnId, action: TxnAction) -> Result<RequestId, TxnError> {
+        let key = (txn, action);
+        if let Some(active_action) = self.end_txn_waiters.get(&txn).copied() {
+            return Err(TxnError::AlreadyEnding {
+                txn_id: txn,
+                action: active_action,
+            });
+        }
+        self.end_txn_waiters.insert(txn, action);
+        if let Some(request_id) = self.end_txn_requests.get(&key) {
+            return Ok(*request_id);
+        }
         let request_id = self.alloc_request_id();
         let cmd = self.txn_client.end_txn(request_id.0, txn, action);
         let base = pb::BaseCommand {
@@ -7120,7 +7666,17 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::EndTxn);
-        request_id
+        self.end_txn_requests.insert(key, request_id);
+        self.end_txn_request_keys.insert(request_id, key);
+        Ok(request_id)
+    }
+
+    /// Release one runtime EndTxn waiter without cancelling its canonical wire request.
+    /// A subsequent caller for the same transaction/action resumes that request id.
+    pub fn release_end_txn_waiter(&mut self, txn: TxnId, action: TxnAction) {
+        if self.end_txn_waiters.get(&txn) == Some(&action) {
+            self.end_txn_waiters.remove(&txn);
+        }
     }
 
     /// Close the whole connection.
@@ -7289,14 +7845,20 @@ impl Connection {
             (msg, flow_cmd)
         };
         if let Some(flow_cmd) = flow_cmd {
-            let base = pb::BaseCommand {
-                r#type: pb::base_command::Type::Flow as i32,
-                flow: Some(flow_cmd),
-                ..Default::default()
-            };
-            let _ = self.encode_command(&base);
+            self.stage_flow(flow_cmd);
         }
         msg
+    }
+
+    /// Drain one raw broker entry reserved for a scalable aggregate.
+    #[cfg(feature = "scalable-topics")]
+    pub fn pop_deferred_message(
+        &mut self,
+        handle: ConsumerHandle,
+        now: Instant,
+    ) -> Option<crate::event::DeferredIncomingMessage> {
+        let slot = self.consumers.get(&handle)?;
+        slot.state.lock().pop_deferred_message(now)
     }
 
     fn alloc_request_id(&mut self) -> RequestId {
@@ -7457,9 +8019,31 @@ impl Connection {
         consumer_name: &str,
         consumer_id: u64,
         consumer_type: crate::scalable_consumer::ScalableConsumerType,
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
     ) -> Result<RequestId, crate::dag_watch::ScalableTopicError> {
         if !self.broker_supports_scalable_topics() {
             return Err(crate::dag_watch::ScalableTopicError::BrokerUnsupported);
+        }
+        if let Some(session) = self.scalable_consumers.get_mut(&consumer_id) {
+            if !session.matches_registration(topic, subscription, consumer_name, consumer_type) {
+                return Err(
+                    crate::scalable_consumer::AssignmentError::RegistrationMismatch { consumer_id }
+                        .into(),
+                );
+            }
+            session.begin_incarnation(incarnation)?;
+        } else {
+            self.scalable_consumers.insert(
+                consumer_id,
+                crate::scalable_consumer::ScalableConsumerSession::new(
+                    consumer_id,
+                    topic.to_owned(),
+                    subscription.to_owned(),
+                    consumer_name.to_owned(),
+                    consumer_type,
+                    incarnation,
+                ),
+            );
         }
         let request_id = self.alloc_request_id();
         let cmd = pb::BaseCommand {
@@ -7475,23 +8059,19 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&cmd);
-        self.scalable_consumers.insert(
-            consumer_id,
-            crate::scalable_consumer::ScalableConsumerSession::new(
+        self.scalable_subscribe_requests.insert(
+            request_id,
+            ScalableSubscribeRequest {
                 consumer_id,
-                topic.to_owned(),
-                subscription.to_owned(),
-                consumer_name.to_owned(),
-                consumer_type,
-            ),
+                incarnation,
+                leave_after_response: false,
+            },
         );
-        self.scalable_subscribe_requests
-            .insert(request_id, consumer_id);
         Ok(request_id)
     }
 
     /// The current assignment for a registered scalable consumer, or `None`
-    /// when the id is unknown or the subscribe has not resolved yet.
+    /// when the id is unknown, rejected, or the subscribe has not resolved yet.
     #[cfg(feature = "scalable-topics")]
     #[must_use]
     pub fn scalable_consumer_assignment(
@@ -7501,6 +8081,88 @@ impl Connection {
         self.scalable_consumers
             .get(&consumer_id)
             .and_then(crate::scalable_consumer::ScalableConsumerSession::assignment)
+    }
+
+    /// Fence a failed controller attempt's assignment while retaining its
+    /// terminal cleanup registration. Late responses and pushes cannot restore
+    /// authority until a fresh incarnation subscribes. This emits no unsubscribe;
+    /// callers must retain an owner and eventually invoke
+    /// [`Self::remove_scalable_consumer_registration`].
+    #[cfg(feature = "scalable-topics")]
+    pub fn invalidate_scalable_consumer_registration(
+        &mut self,
+        consumer_id: u64,
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
+    ) -> bool {
+        let Some(session) = self
+            .scalable_consumers
+            .get_mut(&consumer_id)
+            .filter(|session| session.incarnation() == incarnation)
+        else {
+            return false;
+        };
+        session.invalidate_authority();
+        true
+    }
+
+    /// Retire local authority after a successful controller handoff, without
+    /// unregistering the logical broker member. Old callbacks stay incarnation
+    /// fenced; terminal cancellation uses [`Self::remove_scalable_consumer_registration`].
+    #[cfg(feature = "scalable-topics")]
+    pub fn detach_scalable_consumer_registration(
+        &mut self,
+        consumer_id: u64,
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
+    ) -> bool {
+        if self
+            .scalable_consumers
+            .get(&consumer_id)
+            .is_none_or(|session| session.incarnation() != incarnation)
+        {
+            return false;
+        }
+        self.scalable_consumers.remove(&consumer_id);
+        true
+    }
+
+    /// Leave one scalable-consumer registration only when its controller
+    /// incarnation still matches. Fence the local session immediately, then
+    /// send GA unsubscribe after every in-flight subscribe response settles.
+    #[cfg(feature = "scalable-topics")]
+    pub fn remove_scalable_consumer_registration(
+        &mut self,
+        consumer_id: u64,
+        incarnation: crate::scalable_consumer::ControllerIncarnation,
+    ) -> bool {
+        if !self.detach_scalable_consumer_registration(consumer_id, incarnation) {
+            return false;
+        }
+        let mut pending = false;
+        for request in self
+            .scalable_subscribe_requests
+            .values_mut()
+            .filter(|request| request.consumer_id == consumer_id)
+        {
+            request.leave_after_response = true;
+            pending = true;
+        }
+        if !pending {
+            self.emit_scalable_unsubscribe(consumer_id);
+        }
+        true
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    fn emit_scalable_unsubscribe(&mut self, consumer_id: u64) {
+        let request_id = self.alloc_request_id();
+        let _ = self.encode_command(&pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicUnsubscribe as i32,
+            scalable_topic_unsubscribe: Some(pb::CommandScalableTopicUnsubscribe {
+                request_id: request_id.0,
+                consumer_id,
+            }),
+            ..Default::default()
+        });
     }
 
     /// **Experimental** (PIP-460, ADR-0093). Open a namespace-level watch over
@@ -7631,29 +8293,61 @@ impl Connection {
         resp: pb::CommandScalableTopicSubscribeResponse,
     ) {
         let request_id = RequestId(resp.request_id);
-        // One guard, not two: `scalable_topic_subscribe` writes both maps
-        // together and a rejection clears both, so a known request id always has
-        // its session. Splitting them left a branch nothing could reach.
-        let Some((consumer_id, session)) = self
-            .scalable_subscribe_requests
-            .remove(&request_id)
-            .and_then(|id| self.scalable_consumers.get_mut(&id).map(|s| (id, s)))
+        let Some(request) = self.scalable_subscribe_requests.remove(&request_id) else {
+            return;
+        };
+        let consumer_id = request.consumer_id;
+        if request.leave_after_response {
+            if !self
+                .scalable_subscribe_requests
+                .values()
+                .any(|pending| pending.consumer_id == consumer_id)
+                && !self.scalable_consumers.contains_key(&consumer_id)
+            {
+                self.emit_scalable_unsubscribe(consumer_id);
+            }
+            return;
+        }
+        let Some(session) = self
+            .scalable_consumers
+            .get_mut(&consumer_id)
+            .filter(|session| {
+                session.incarnation() == request.incarnation && !session.is_invalidated()
+            })
         else {
             return;
         };
-        match session.handle_subscribe_response(&resp) {
+        let incarnation = session.incarnation();
+        let result = session.handle_subscribe_response(&resp);
+        let replayed = if result.is_ok() {
+            session.take_replayed_updates()
+        } else {
+            Vec::new()
+        };
+        match result {
             Ok(assignment) => {
                 self.events
                     .push_back(ConnectionEvent::ScalableConsumerAssigned {
                         consumer_id,
+                        incarnation,
                         assignment,
                     });
+                for replay in replayed {
+                    self.events
+                        .push_back(ConnectionEvent::ScalableAssignmentChanged {
+                            consumer_id,
+                            incarnation,
+                            assignment: replay.assignment,
+                            delta: replay.delta,
+                        });
+                }
             }
             Err(err) => {
-                self.scalable_consumers.remove(&consumer_id);
+                self.invalidate_scalable_consumer_registration(consumer_id, incarnation);
                 self.events
                     .push_back(ConnectionEvent::ScalableConsumerRejected {
                         consumer_id,
+                        incarnation,
                         reason: err.to_string(),
                     });
             }
@@ -7667,20 +8361,34 @@ impl Connection {
         let Some(session) = self.scalable_consumers.get_mut(&consumer_id) else {
             return;
         };
+        if session.is_invalidated() {
+            return;
+        }
+        let incarnation = session.incarnation();
         match session.handle_assignment_update(&upd) {
-            Ok(delta) => {
-                self.events
-                    .push_back(ConnectionEvent::ScalableAssignmentChanged { consumer_id, delta });
+            Ok(Some(delta)) => {
+                if let Some(assignment) = session.assignment().cloned() {
+                    self.events
+                        .push_back(ConnectionEvent::ScalableAssignmentChanged {
+                            consumer_id,
+                            incarnation,
+                            assignment,
+                            delta,
+                        });
+                }
             }
+            Ok(None) => {}
             Err(err) => {
-                // A stale or mismatched push is dropped, not applied; the
-                // session keeps the assignment it already holds.
-                tracing::debug!(
-                    target: "magnetar_proto",
-                    consumer_id,
-                    error = %err,
-                    "scalable assignment update rejected"
-                );
+                // Any rejected push makes this incarnation's authority stream
+                // incomplete. Fail closed and require a fresh registration
+                // rather than continuing on a possibly superseded assignment.
+                self.invalidate_scalable_consumer_registration(consumer_id, incarnation);
+                self.events
+                    .push_back(ConnectionEvent::ScalableConsumerRejected {
+                        consumer_id,
+                        incarnation,
+                        reason: err.to_string(),
+                    });
             }
         }
     }
@@ -7769,28 +8477,38 @@ impl Connection {
             // blind to every later epoch, the split among them.
             Ok(None) => {}
             Ok(Some(delta)) => {
-                if first_layout {
-                    let segments = session.snapshot();
-                    let controller_broker_url =
-                        session.controller_broker_url().map(ToOwned::to_owned);
-                    let resolved_topic_name = session.resolved_topic_name().map(ToOwned::to_owned);
-                    self.events
-                        .push_back(ConnectionEvent::ScalableTopicLookupResolved {
-                            session_id,
-                            resolved_topic_name,
-                            controller_broker_url,
-                            segments,
-                            epoch: delta.epoch,
-                        });
-                    return;
-                }
-                let consume_affecting = delta.is_consume_affecting();
-                let reason = delta.change_reason();
-                self.events
-                    .push_back(ConnectionEvent::SegmentDagUpdated { session_id, delta });
-                if consume_affecting {
-                    self.events
-                        .push_back(ConnectionEvent::DagChangedDuringConsume { session_id, reason });
+                if let Some(snapshot) = session.validated_snapshot().cloned() {
+                    if first_layout {
+                        let controller_broker_url =
+                            session.controller_broker_url().map(ToOwned::to_owned);
+                        let controller_broker_url_tls =
+                            session.controller_broker_url_tls().map(ToOwned::to_owned);
+                        let resolved_topic_name =
+                            session.resolved_topic_name().map(ToOwned::to_owned);
+                        self.events
+                            .push_back(ConnectionEvent::ScalableTopicLookupResolved {
+                                session_id,
+                                resolved_topic_name,
+                                controller_broker_url,
+                                controller_broker_url_tls,
+                                snapshot,
+                            });
+                        return;
+                    }
+                    let consume_affecting = delta.is_consume_affecting();
+                    let reason = delta.change_reason();
+                    self.events.push_back(ConnectionEvent::SegmentDagUpdated {
+                        session_id,
+                        delta,
+                        snapshot,
+                    });
+                    if consume_affecting {
+                        self.events
+                            .push_back(ConnectionEvent::DagChangedDuringConsume {
+                                session_id,
+                                reason,
+                            });
+                    }
                 }
             }
             Err(err) => {
@@ -7953,7 +8671,10 @@ impl Connection {
             && self.consumers.get(&handle).is_some_and(|slot| {
                 let consumer = slot.state.lock();
                 !consumer.closed
-                    && consumer.unsubscribe_request_id.is_none()
+                    && matches!(
+                        consumer.terminal_operation,
+                        crate::consumer::ConsumerTerminalOperation::Open
+                    )
                     && consumer.terminal_failure.is_none()
                     && (consumer.subscribe_waiter_request == Some(failed_request_id)
                         || (consumer.flow_on_subscribe_ack
@@ -8081,7 +8802,10 @@ impl Connection {
     /// this must never reach back for the connection mutex (ADR-0038 lock ordering).
     fn consumer_reattach_in_place_is_eligible(c: &crate::consumer::ConsumerState) -> bool {
         !(c.closed
-            || c.unsubscribe_request_id.is_some()
+            || !matches!(
+                c.terminal_operation,
+                crate::consumer::ConsumerTerminalOperation::Open
+            )
             || c.terminal_failure.is_some()
             || c.pending_seek.is_some()
             || c.flow_on_subscribe_ack)
@@ -10234,8 +10958,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let _ = conn.ack(
             c_handle,
@@ -10317,6 +11039,208 @@ mod conn_state_tests {
             .expect("CommandFlow re-emitted on the subscribe ack");
         assert_eq!(flow_cmd.consumer_id, c_handle.0);
         assert_eq!(flow_cmd.message_permits, 128);
+    }
+
+    #[test]
+    fn rebuild_manual_flow_consumer_replays_unobserved_credit_after_subscribe_ack() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let initial_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "segment://public/default/scaled/0000-ffff-1".to_owned(),
+            subscription: "aggregate".to_owned(),
+            receiver_queue_size: 0,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, initial_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        conn.flow(handle, 1);
+        let initial_flow = drain_outbound_commands(&mut conn);
+        assert!(matches!(
+            initial_flow.as_slice(),
+            [pb::BaseCommand {
+                flow: Some(pb::CommandFlow {
+                    message_permits: 1,
+                    ..
+                }),
+                ..
+            }]
+        ));
+
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+        let request_ids = conn.rebuild_consumers();
+        assert_eq!(request_ids.len(), 1);
+        assert!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .all(|command| command.r#type != pb::base_command::Type::Flow as i32),
+            "manual FLOW must wait for the rebuilt subscribe acknowledgement"
+        );
+
+        feed_subscribe_success(&mut conn, request_ids[0].0);
+        let replay = drain_outbound_commands(&mut conn);
+        assert!(matches!(
+            replay.as_slice(),
+            [pb::BaseCommand {
+                flow: Some(pb::CommandFlow {
+                    message_permits: 1,
+                    ..
+                }),
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn aggregate_flow_replays_fresh_credit_without_batch_debt_and_seek_clears_credit() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = drain_outbound_commands(&mut conn);
+        let initial_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "segment://public/default/scaled/0000-ffff-1".to_owned(),
+            subscription: "aggregate".to_owned(),
+            receiver_queue_size: 0,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, initial_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        conn.flow_for_aggregate(handle, 1, 3);
+        let issued = drain_outbound_commands(&mut conn);
+        assert!(matches!(
+            issued.as_slice(),
+            [pb::BaseCommand {
+                flow: Some(pb::CommandFlow {
+                    message_permits: 4,
+                    ..
+                }),
+                ..
+            }]
+        ));
+
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+        let requests = conn.rebuild_consumers();
+        let _ = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, requests[0].0);
+        let replay = drain_outbound_commands(&mut conn);
+        assert!(matches!(
+            replay.as_slice(),
+            [pb::BaseCommand {
+                flow: Some(pb::CommandFlow {
+                    message_permits: 1,
+                    ..
+                }),
+                ..
+            }]
+        ));
+
+        conn.flow_for_aggregate(handle, 1, 5);
+        let _ = drain_outbound_commands(&mut conn);
+        let _ = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let state = conn.consumers.get(&handle).expect("consumer").state.lock();
+        assert_eq!(state.manual_flow_permits, 0);
+        assert_eq!(state.granted_permits, 0);
+        assert_eq!(state.permit_balance, 0);
+    }
+
+    #[test]
+    fn end_txn_rejects_concurrent_waiter_and_resumes_after_cancellation() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let txn = TxnId::new(7, 11);
+        let first = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("first waiter claims EndTxn");
+        assert!(matches!(
+            conn.end_txn(txn, TxnAction::Commit),
+            Err(TxnError::AlreadyEnding {
+                txn_id,
+                action: TxnAction::Commit,
+            }) if txn_id == txn
+        ));
+        assert!(matches!(
+            conn.end_txn(txn, TxnAction::Abort),
+            Err(TxnError::AlreadyEnding {
+                txn_id,
+                action: TxnAction::Commit,
+            }) if txn_id == txn
+        ));
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+        let retry = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("cancelled waiter resumes EndTxn");
+        assert_eq!(retry, first);
+        assert_eq!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .filter(|command| command.r#type == pb::base_command::Type::EndTxn as i32)
+                .count(),
+            1
+        );
+
+        let response = pb::BaseCommand {
+            r#type: pb::base_command::Type::EndTxnResponse as i32,
+            end_txn_response: Some(pb::CommandEndTxnResponse {
+                request_id: first.0,
+                txnid_least_bits: Some(txn.least_sig_bits),
+                txnid_most_bits: Some(txn.most_sig_bits),
+                error: None,
+                message: None,
+            }),
+            ..Default::default()
+        };
+        let mut encoded = BytesMut::new();
+        encode_command(&mut encoded, &response).expect("encode EndTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle EndTxn response");
+
+        assert!(matches!(
+            conn.end_txn(txn, TxnAction::Commit),
+            Err(TxnError::AlreadyEnding { .. })
+        ));
+        assert!(conn.poll_transmit().is_empty());
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(first)),
+            Some(OpOutcome::EndTxn {
+                result: Ok(crate::TxnState::Committed),
+                ..
+            })
+        ));
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+        assert_ne!(
+            conn.end_txn(txn, TxnAction::Commit)
+                .expect("completed waiter releases lease"),
+            first
+        );
     }
 
     #[test]
@@ -10616,8 +11540,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let mut request = SubscribeRequest {
             durable: true,
@@ -11381,12 +12303,15 @@ mod conn_state_tests {
         feed_transient_error(&mut conn, failed_request_id);
         assert!(conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
 
-        let unsubscribe_request_id = conn
-            .try_unsubscribe(handle, false)
+        let admission = conn
+            .unsubscribe(handle, false)
             .expect("first unsubscribe must be staged");
-        assert_eq!(
-            conn.try_unsubscribe(handle, true),
-            None,
+        let unsubscribe_request_id = admission.request_id;
+        assert!(
+            matches!(
+                conn.unsubscribe(handle, true),
+                Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
+            ),
             "overlapping unsubscribe must be rejected"
         );
         assert!(!conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
@@ -11415,6 +12340,15 @@ mod conn_state_tests {
         encode_command(&mut frame, &error).expect("encode unsubscribe error");
         conn.handle_bytes(Instant::now(), &frame)
             .expect("handle unsubscribe error");
+        assert_eq!(
+            admission.operation.lock().completion(),
+            Some(
+                crate::consumer::ConsumerUnsubscribeCompletion::BrokerError {
+                    code: pb::ServerError::MetadataError as i32,
+                    message: "unsubscribe rejected".to_owned(),
+                }
+            )
+        );
         assert!(
             conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
                 .is_none(),
@@ -11458,9 +12392,10 @@ mod conn_state_tests {
         while conn.poll_event().is_some() {}
         let _ = drain_outbound_commands(&mut conn);
 
-        let unsubscribe_request_id = conn
-            .try_unsubscribe(handle, false)
+        let admission = conn
+            .unsubscribe(handle, false)
             .expect("unsubscribe must be staged");
+        let unsubscribe_request_id = admission.request_id;
         let unsubscribe_success = pb::BaseCommand {
             r#type: pb::base_command::Type::Success as i32,
             success: Some(pb::CommandSuccess {
@@ -11477,6 +12412,10 @@ mod conn_state_tests {
         assert!(
             conn.consumer(handle).is_none(),
             "broker success must finalize the local handle without a runtime waiter"
+        );
+        assert_eq!(
+            admission.operation.lock().completion(),
+            Some(crate::consumer::ConsumerUnsubscribeCompletion::Success)
         );
         assert!(
             conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
@@ -13220,6 +14159,96 @@ mod conn_state_tests {
         conn
     }
 
+    #[test]
+    fn cancelled_consumer_subscribe_closes_pending_and_unobserved_success() {
+        for acknowledged in [false, true] {
+            let mut conn = handshaked_connection();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest::default());
+            let subscribed = decode_transmitted(&conn.poll_transmit());
+            assert_eq!(
+                subscribed[0].subscribe.as_ref().unwrap().consumer_id,
+                handle.0
+            );
+            if acknowledged {
+                feed_subscribe_success(&mut conn, request_id);
+            }
+            conn.cancel_consumer_subscribe(handle);
+            let commands = decode_transmitted(&conn.poll_transmit());
+            let closes: Vec<_> = commands
+                .iter()
+                .filter_map(|command| command.close_consumer.as_ref())
+                .collect();
+            assert_eq!(
+                closes.len(),
+                1,
+                "the abandoned current-session subscription must be closed"
+            );
+            assert_eq!(closes[0].consumer_id, handle.0);
+            let close_request_id = closes[0].request_id;
+            assert!(conn.consumer(handle).is_none());
+            assert!(!conn.has_pending_request_for_test(RequestId(request_id)));
+            conn.cancel_consumer_subscribe(handle);
+            feed_subscribe_success(&mut conn, request_id);
+            feed_command_success(&mut conn, close_request_id);
+            assert!(conn.poll_transmit().is_empty());
+            assert!(conn.poll_event().is_none());
+            assert!(
+                conn.take_outcome(PendingOpKey::Request(RequestId(close_request_id)))
+                    .is_none()
+            );
+            assert!(conn.consumer(handle).is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_consumer_subscribe_closes_only_current_session_registration() {
+        for replay in [false, true] {
+            let mut conn = handshaked_connection();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest::default());
+            let _ = conn.poll_transmit();
+            feed_subscribe_success(&mut conn, request_id);
+            conn.reset();
+            conn.begin_handshake().unwrap();
+            conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+                .unwrap();
+            while conn.poll_event().is_some() {}
+            let _ = conn.poll_transmit();
+            if replay {
+                assert_eq!(conn.rebuild_consumers().len(), 1);
+                let _ = conn.poll_transmit();
+            }
+            conn.cancel_consumer_subscribe(handle);
+            let commands = decode_transmitted(&conn.poll_transmit());
+            let closes: Vec<_> = commands
+                .iter()
+                .filter_map(|command| command.close_consumer.as_ref())
+                .collect();
+            assert_eq!(closes.len(), usize::from(replay));
+            if replay {
+                assert_eq!(closes[0].consumer_id, handle.0);
+            }
+            assert_eq!(conn.rebuild_consumers(), [] as [RequestId; 0]);
+        }
+    }
+
+    #[test]
+    fn cancelled_consumer_subscribe_reuses_an_already_pending_close() {
+        let mut conn = handshaked_connection();
+        let handle = conn.subscribe(SubscribeRequest::default());
+        let _ = conn.poll_transmit();
+        let close_request_id = conn.close_consumer_forget(handle, Instant::now()).unwrap();
+        let _ = conn.poll_transmit();
+        conn.cancel_consumer_subscribe(handle);
+        assert!(conn.poll_transmit().is_empty());
+        feed_command_success(&mut conn, close_request_id.0);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(close_request_id))
+                .is_none()
+        );
+    }
+
     /// Issue #406: cancelling a producer open whose `CommandProducer` already
     /// entered the current session's stream must emit a best-effort
     /// `CommandCloseProducer` for the abandoned producer id. Without it the
@@ -14740,6 +15769,106 @@ mod conn_state_tests {
         (conn, handle)
     }
 
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn aggregate_ack_preserves_complete_id_and_seek_projects_broker_effective_id() {
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let message_id_data = pb::MessageIdData {
+            ledger_id: 7,
+            entry_id: 11,
+            partition: Some(2),
+            batch_index: None,
+            ack_set: vec![3, 5],
+            batch_size: None,
+            first_chunk_message_id: Some(Box::new(pb::MessageIdData {
+                ledger_id: 7,
+                entry_id: 9,
+                partition: Some(2),
+                batch_index: None,
+                ack_set: Vec::new(),
+                batch_size: None,
+                first_chunk_message_id: None,
+            })),
+        };
+
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&message_id_data)],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            vec![message_id_data.clone()],
+            Instant::now(),
+        );
+        let mut bytes = conn.poll_transmit();
+        let acknowledgement = crate::frame::decode_one(&mut bytes)
+            .expect("decode acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(acknowledgement.message_id, vec![message_id_data.clone()]);
+
+        conn.negative_ack_with_message_id_data(
+            handle,
+            vec![message_id_data.clone()],
+            Instant::now(),
+        );
+        let mut bytes = conn.poll_transmit();
+        let redelivery = crate::frame::decode_one(&mut bytes)
+            .expect("decode negative acknowledgement")
+            .command
+            .redeliver_unacknowledged_messages
+            .expect("CommandRedeliverUnacknowledgedMessages");
+        assert_eq!(redelivery.message_ids, vec![message_id_data.clone()]);
+
+        let _ = conn.seek(handle, SeekTarget::MessageIdData(message_id_data.clone()));
+        let mut bytes = conn.poll_transmit();
+        let seek = crate::frame::decode_one(&mut bytes)
+            .expect("decode seek")
+            .command
+            .seek
+            .expect("CommandSeek");
+        assert_eq!(
+            seek.message_id,
+            Some(pb::MessageIdData {
+                ledger_id: 7,
+                entry_id: 9,
+                partition: Some(2),
+                ..Default::default()
+            })
+        );
+
+        let batch = pb::MessageIdData {
+            ledger_id: 8,
+            entry_id: 12,
+            partition: Some(2),
+            batch_index: Some(1),
+            ack_set: vec![0b0101],
+            batch_size: Some(4),
+            first_chunk_message_id: None,
+        };
+        let _ = conn.seek(handle, SeekTarget::MessageIdData(batch));
+        let mut bytes = conn.poll_transmit();
+        let seek = crate::frame::decode_one(&mut bytes)
+            .expect("decode batch seek")
+            .command
+            .seek
+            .expect("CommandSeek");
+        assert_eq!(
+            seek.message_id,
+            Some(pb::MessageIdData {
+                ledger_id: 8,
+                entry_id: 12,
+                partition: Some(2),
+                ack_set: vec![0b0100],
+                ..Default::default()
+            })
+        );
+    }
+
     fn drain_command_subscribe(conn: &mut Connection) -> pb::CommandSubscribe {
         let mut bytes = conn.poll_transmit();
         loop {
@@ -14893,6 +16022,7 @@ mod conn_state_tests {
         let (mut conn, handle) = handshake_subscribe_chunk_flow();
         conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
+        let mut expected_granted = 2;
 
         for (chunk_id, body) in [(0, b"aa".as_slice()), (2, b"cc"), (1, b"bb")] {
             let frame = message_frame(handle.0, &chunk_metadata("chunk-flow", chunk_id), body);
@@ -14904,8 +16034,18 @@ mod conn_state_tests {
                     flow.is_none(),
                     "the completing chunk is repaid on logical pop"
                 );
+                let consumer = conn.consumers[&handle].state.lock();
+                assert_eq!(consumer.granted_permits, expected_granted);
+                assert_eq!(consumer.permit_balance, 1);
             } else {
                 assert_eq!(flow.expect("incomplete chunk flow").message_permits, 1);
+                expected_granted += 1;
+                let consumer = conn.consumers[&handle].state.lock();
+                assert_eq!(
+                    consumer.granted_permits, expected_granted,
+                    "one wire permit must be reflected by exactly one local permit"
+                );
+                assert_eq!(consumer.permit_balance, 2);
             }
         }
 
@@ -14920,6 +16060,9 @@ mod conn_state_tests {
                 .message_permits,
             1,
         );
+        let consumer = conn.consumers[&handle].state.lock();
+        assert_eq!(consumer.granted_permits, expected_granted + 1);
+        assert_eq!(consumer.permit_balance, 2);
     }
 
     #[test]
@@ -15373,8 +16516,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -15455,8 +16596,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -15515,8 +16654,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -15621,8 +16758,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -15716,8 +16851,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -15769,8 +16902,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let rid = conn.ack(
             handle,
@@ -16124,8 +17255,6 @@ mod conn_state_tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: -1,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),
@@ -17048,8 +18177,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // Nack it. The nack tracker defers the redelivery to t0 + nack_delay; the fix
         // also drops it from the unacked tracker so the ack-timeout sweep won't fire.
@@ -17083,8 +18210,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: idx,
             batch_size: 2,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         conn.negative_ack(handle, vec![batched(0), batched(1)], t0);
         conn.handle_timeout(t0 + Duration::from_secs(11));
@@ -17114,8 +18239,6 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // Immediate redelivery #1 (no nack tracker to defer it).
         conn.negative_ack(handle, vec![nacked_id], t0);
@@ -17172,8 +18295,6 @@ mod conn_state_tests {
                     partition: -1,
                     batch_index: 1,
                     batch_size: 4,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),
@@ -17210,8 +18331,6 @@ mod conn_state_tests {
                     partition: -1,
                     batch_index: 4,
                     batch_size: 4,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),
@@ -17261,8 +18380,6 @@ mod conn_state_tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: 0,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Cumulative,
                 properties: Vec::new(),
@@ -17276,6 +18393,273 @@ mod conn_state_tests {
             "a cumulative ack must prune every tracker entry at or below its position, \
              not just the exact (ledger, entry) of the acked id (issue #326)"
         );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn cumulative_ack_inside_partial_batch_emits_residual_mask_and_releases_tracker() {
+        let now = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let canonical = |batch_index| pb::MessageIdData {
+            ledger_id: 21,
+            entry_id: 34,
+            partition: Some(-1),
+            batch_index: Some(batch_index),
+            ack_set: vec![0b1110],
+            batch_size: Some(4),
+            first_chunk_message_id: None,
+        };
+
+        let first = canonical(1);
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&first)],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            vec![first],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode partial cumulative ack")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, vec![0b1100]);
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(21, 34)]);
+
+        let last = canonical(3);
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&last)],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            vec![last],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode completing cumulative ack")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, [] as [i64; 0]);
+        assert_eq!(batch_tracker_keys(&conn, handle), [] as [(u64, u64); 0]);
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn individual_ack_inside_partial_batch_starts_from_the_broker_mask() {
+        let now = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let canonical = |batch_index| pb::MessageIdData {
+            ledger_id: 22,
+            entry_id: 35,
+            partition: Some(-1),
+            batch_index: Some(batch_index),
+            ack_set: vec![0b101],
+            batch_size: Some(3),
+            first_chunk_message_id: None,
+        };
+
+        let first = canonical(0);
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&first)],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            vec![first],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode partial individual ack")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, vec![0b100]);
+        assert_eq!(batch_tracker_keys(&conn, handle), vec![(22, 35)]);
+
+        let last = canonical(2);
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&last)],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            vec![last],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode completing individual ack")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, [] as [i64; 0]);
+        assert_eq!(batch_tracker_keys(&conn, handle), [] as [(u64, u64); 0]);
+    }
+
+    #[test]
+    fn transactional_ack_does_not_advance_local_state_before_commit() {
+        let now = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, now, 23, 36);
+        let message_id = MessageId {
+            ledger_id: 23,
+            entry_id: 36,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let txn_id = TxnId::new(7, 11);
+
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![message_id],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            now,
+        );
+
+        {
+            let state = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                Connection::consumer_reattach_start_message_id(
+                    &conn.consumer_subscribe_requests[&handle],
+                    &state,
+                ),
+                None,
+                "broker acceptance into a transaction must not override the durable broker cursor"
+            );
+        }
+        conn.settle_transactional_acks(handle, txn_id, false);
+        conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "an uncommitted transactional acknowledgement must remain timeout-redeliverable"
+        );
+    }
+
+    #[test]
+    fn transactional_ack_applies_local_state_only_after_commit() {
+        let now = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, now, 24, 37);
+        let message_id = MessageId {
+            ledger_id: 24,
+            entry_id: 37,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let txn_id = TxnId::new(8, 12);
+
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![message_id],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            now,
+        );
+        conn.settle_transactional_acks(handle, txn_id, true);
+
+        assert_eq!(
+            Connection::consumer_reattach_start_message_id(
+                &conn.consumer_subscribe_requests[&handle],
+                &conn.consumers[&handle].state.lock(),
+            ),
+            None,
+            "committed acknowledgements still defer to the durable broker cursor"
+        );
+        conn.handle_timeout(now + ack_timeout + Duration::from_secs(1));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            0,
+            "commit must remove the acknowledged message from timeout tracking"
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn transactional_partial_batch_ack_defers_the_durable_mask_until_commit() {
+        let now = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let canonical = pb::MessageIdData {
+            ledger_id: 25,
+            entry_id: 38,
+            partition: Some(-1),
+            batch_index: Some(0),
+            ack_set: vec![0b101],
+            batch_size: Some(3),
+            first_chunk_message_id: None,
+        };
+        let txn_id = TxnId::new(9, 13);
+        {
+            let mut state = conn.consumers[&handle].state.lock();
+            for entry_id in 0..256 {
+                state.batch_ack_tracker.insert(
+                    (99, entry_id),
+                    crate::consumer::BatchAckEntry::from_ack_set(3, &[0b111]),
+                );
+            }
+        }
+
+        let _ = conn.ack_with_message_id_data(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&canonical)],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: Some(txn_id),
+            },
+            vec![canonical],
+            now,
+        );
+        let mut bytes = conn.poll_transmit();
+        let ack = crate::frame::decode_one(&mut bytes)
+            .expect("decode transactional partial acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        assert_eq!(ack.message_id[0].ack_set, vec![0b100]);
+        {
+            let state = conn.consumers[&handle].state.lock();
+            assert!(
+                !state.batch_ack_tracker.contains_key(&(25, 38)),
+                "transaction admission must not create durable batch state"
+            );
+            let pending = &state.pending_transactional_acks[&txn_id];
+            assert_eq!(pending.batch_ack_tracker.len(), 1);
+            assert_eq!(pending.seeded_batch_keys.len(), 1);
+            assert_eq!(state.batch_ack_tracker.len(), 256);
+        }
+
+        conn.settle_transactional_acks(handle, txn_id, true);
+        let state = conn.consumers[&handle].state.lock();
+        assert!(!state.batch_ack_tracker[&(25, 38)].is_unacked(0));
+        assert!(state.batch_ack_tracker[&(25, 38)].is_unacked(2));
+        assert_eq!(state.batch_ack_tracker.len(), 257);
     }
 
     #[test]
@@ -17298,8 +18682,6 @@ mod conn_state_tests {
                             partition: -1,
                             batch_index: -1,
                             batch_size: 0,
-                            #[cfg(feature = "scalable-topics")]
-                            segment_id: None,
                         }],
                         ack_type: pb::command_ack::AckType::Cumulative,
                         properties: Vec::new(),
@@ -18283,8 +19665,6 @@ mod consumer_stall_and_recovery_tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: -1,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),
@@ -18342,8 +19722,6 @@ mod consumer_stall_and_recovery_tests {
                     partition: -1,
                     batch_index: -1,
                     batch_size: -1,
-                    #[cfg(feature = "scalable-topics")]
-                    segment_id: None,
                 }],
                 ack_type: pb::command_ack::AckType::Individual,
                 properties: Vec::new(),
@@ -18567,7 +19945,10 @@ mod consumer_stall_and_recovery_tests {
             (
                 "unsubscribe_request_id",
                 |c: &mut crate::consumer::ConsumerState| {
-                    c.unsubscribe_request_id = Some(RequestId(98));
+                    c.terminal_operation = crate::consumer::ConsumerTerminalOperation::Pending {
+                        request_id: RequestId(98),
+                        origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+                    };
                 },
             ),
         ] {
@@ -18827,7 +20208,10 @@ mod consumer_stall_and_recovery_tests {
             .expect("registered")
             .state
             .lock()
-            .unsubscribe_request_id = Some(RequestId(98));
+            .terminal_operation = crate::consumer::ConsumerTerminalOperation::Pending {
+            request_id: RequestId(98),
+            origin: crate::consumer::ConsumerCloseOrigin::Reliable,
+        };
 
         conn.handle_timeout(t0);
         conn.handle_timeout(t0 + WINDOW);
@@ -18865,6 +20249,11 @@ mod scalable_conn_tests {
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
         );
+        complete_scalable_handshake(&mut conn, supported);
+        conn
+    }
+
+    fn complete_scalable_handshake(conn: &mut Connection, supported: bool) {
         conn.begin_handshake().expect("handshake");
         let cmd = pb::BaseCommand {
             r#type: pb::base_command::Type::Connected as i32,
@@ -18887,7 +20276,6 @@ mod scalable_conn_tests {
         // traffic.
         while conn.poll_event().is_some() {}
         let _ = conn.poll_transmit();
-        conn
     }
 
     fn info(id: u64, start: u32, end: u32, parents: &[u64]) -> pb::SegmentInfoProto {
@@ -18905,6 +20293,41 @@ mod scalable_conn_tests {
             legacy_topic_name: None,
             entry_bucket_splits: Vec::new(),
         }
+    }
+
+    fn sealed_info(
+        id: u64,
+        start: u32,
+        end: u32,
+        children: &[u64],
+        sealed_at_epoch: u64,
+    ) -> pb::SegmentInfoProto {
+        pb::SegmentInfoProto {
+            segment_id: id,
+            hash_start: start,
+            hash_end: end,
+            state: pb::SegmentState::Sealed as i32,
+            parent_ids: Vec::new(),
+            child_ids: children.to_vec(),
+            created_at_epoch: 0,
+            sealed_at_epoch: Some(sealed_at_epoch),
+            created_at_ms: 0,
+            sealed_at_ms: Some(0),
+            legacy_topic_name: None,
+            entry_bucket_splits: Vec::new(),
+        }
+    }
+
+    fn child_info(
+        id: u64,
+        start: u32,
+        end: u32,
+        parent: u64,
+        created_at_epoch: u64,
+    ) -> pb::SegmentInfoProto {
+        let mut child = info(id, start, end, &[parent]);
+        child.created_at_epoch = created_at_epoch;
+        child
     }
 
     /// Encode a broker→client `CommandScalableTopicUpdate` frame.
@@ -18930,7 +20353,7 @@ mod scalable_conn_tests {
                     segments,
                     segment_brokers,
                     controller_broker_url: Some("pulsar://controller:6650".to_owned()),
-                    controller_broker_url_tls: None,
+                    controller_broker_url_tls: Some("pulsar+ssl://controller:6651".to_owned()),
                 }),
                 error: None,
                 message: None,
@@ -18940,6 +20363,36 @@ mod scalable_conn_tests {
         };
         let mut buf = bytes::BytesMut::new();
         crate::frame::encode_command(&mut buf, &cmd).expect("encode update");
+        buf
+    }
+
+    fn assignment(epoch: u64, segments: &[(u64, u32, u32)]) -> pb::ScalableConsumerAssignment {
+        pb::ScalableConsumerAssignment {
+            layout_epoch: epoch,
+            segments: segments
+                .iter()
+                .map(|(id, start, end)| {
+                    let range = crate::KeyRange::new(*start, *end).expect("test range");
+                    pb::ScalableAssignedSegment {
+                        segment_id: *id,
+                        bucket_ranges: Vec::new(),
+                        hash_start: *start,
+                        hash_end: *end,
+                        segment_topic: crate::canonical_segment_topic(
+                            "topic://public/default/scaled",
+                            range,
+                            crate::SegmentId(*id),
+                        )
+                        .expect("test segment topic"),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn command_frame(command: pb::BaseCommand) -> bytes::BytesMut {
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &command).expect("encode test command");
         buf
     }
 
@@ -19025,8 +20478,8 @@ mod scalable_conn_tests {
     ///
     /// The command is client→broker; a broker never sends it. It is still a
     /// vendored `BaseCommand` type this client has no arm for, so this pins that
-    /// the catch-all arm tolerates it rather than ending the connection. Sending
-    /// it is a known gap (ADR-0093 amendment 2026-10-12, `docs/follow-ups.md`).
+    /// the catch-all arm tolerates it rather than ending the connection. Incoming
+    /// unsubscribe is a client command; leaving a session sends it to the broker.
     #[test]
     fn conn_skips_scalable_topic_unsubscribe_frame() {
         let mut conn = connected_conn();
@@ -19076,7 +20529,7 @@ mod scalable_conn_tests {
         let buf = update_frame(
             session_id,
             3,
-            vec![info(1, 0, 32_768, &[]), info(2, 32_768, 65_536, &[])],
+            vec![info(1, 0, 32_767, &[]), info(2, 32_768, 65_535, &[])],
         );
         conn.handle_bytes(Instant::now(), &buf).expect("update");
 
@@ -19086,23 +20539,23 @@ mod scalable_conn_tests {
                 session_id: got,
                 resolved_topic_name,
                 controller_broker_url,
-                segments,
-                epoch,
+                controller_broker_url_tls,
+                snapshot,
             } = ev
             {
                 resolved = Some((
                     got,
                     resolved_topic_name,
                     controller_broker_url,
-                    segments,
-                    epoch,
+                    controller_broker_url_tls,
+                    snapshot,
                 ));
             }
         }
-        let (got, resolved_topic_name, controller_broker_url, segments, epoch) =
+        let (got, resolved_topic_name, controller_broker_url, controller_broker_url_tls, snapshot) =
             resolved.expect("ScalableTopicLookupResolved emitted");
         assert_eq!(got, session_id);
-        assert_eq!(epoch, 3);
+        assert_eq!(snapshot.epoch(), 3);
         assert_eq!(
             resolved_topic_name.as_deref(),
             Some("topic://public/default/scaled"),
@@ -19112,12 +20565,841 @@ mod scalable_conn_tests {
             controller_broker_url.as_deref(),
             Some("pulsar://controller:6650")
         );
+        assert_eq!(
+            controller_broker_url_tls.as_deref(),
+            Some("pulsar+ssl://controller:6651")
+        );
+        let segments = snapshot.segments();
         assert_eq!(segments.len(), 2);
         assert_eq!(
             segments[0].broker_url.as_deref(),
             Some("pulsar://seg1:6650"),
             "placement is joined from the parallel address list"
         );
+    }
+
+    #[test]
+    fn conn_preserves_assignment_incarnation_and_full_replacement() {
+        let mut conn = connected_conn();
+        let incarnation = crate::ControllerIncarnation(17);
+        let request_id = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                41,
+                crate::ScalableConsumerType::Stream,
+                incarnation,
+            )
+            .expect("subscribe");
+        let _ = conn.poll_transmit();
+
+        let baseline = assignment(3, &[(1, 0, 65_535)]);
+        let response = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: request_id.0,
+                error: None,
+                message: None,
+                assignment: Some(baseline.clone()),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &response)
+            .expect("subscribe response");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerAssigned {
+                consumer_id: 41,
+                incarnation: got,
+                assignment,
+            }) if got == incarnation && assignment.to_pb() == baseline
+        ));
+
+        let replacement = assignment(3, &[(2, 0, 65_535)]);
+        let update = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+            scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 41,
+                assignment: replacement.clone(),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &update)
+            .expect("assignment update");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableAssignmentChanged {
+                consumer_id: 41,
+                incarnation: got,
+                assignment,
+                delta,
+            }) if got == incarnation
+                && assignment.to_pb() == replacement
+                && delta.gained.len() == 1
+                && delta.lost == [crate::SegmentId(1)]
+        ));
+    }
+
+    #[test]
+    fn segment_bucket_subscribe_preserves_ga_metadata() {
+        for bucket_dispatch in [false, true] {
+            let mut conn = connected_conn();
+            conn.subscribe(SubscribeRequest {
+                topic: "segment://public/default/scaled/0000-ffff-1".to_owned(),
+                subscription: "workers".to_owned(),
+                sub_type: pb::command_subscribe::SubType::KeyShared,
+                key_shared: Some(KeySharedConfig {
+                    mode: pb::KeySharedMode::Sticky,
+                    sticky_hash_ranges: vec![(0, 32767), (32768, 65535)],
+                    allow_out_of_order_delivery: false,
+                }),
+                entry_bucket_dispatch: bucket_dispatch,
+                ..Default::default()
+            });
+            let command = crate::decode_one(&mut conn.poll_transmit())
+                .expect("subscribe frame")
+                .command;
+            let meta = command
+                .subscribe
+                .expect("subscribe")
+                .key_shared_meta
+                .expect("sticky metadata");
+            assert_eq!(meta.entry_bucket_dispatch, bucket_dispatch.then_some(true));
+            assert_eq!(meta.key_shared_mode, pb::KeySharedMode::Sticky as i32);
+            assert_eq!(
+                meta.hash_ranges,
+                vec![
+                    pb::IntRange {
+                        start: 0,
+                        end: 32767
+                    },
+                    pb::IntRange {
+                        start: 32768,
+                        end: 65535
+                    }
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_scalable_subscribe_leaves_after_its_response() {
+        for replace in [false, true] {
+            let mut conn = connected_conn();
+            let incarnation = crate::ControllerIncarnation(17);
+            let request = conn
+                .scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "workers",
+                    "member",
+                    42,
+                    crate::ScalableConsumerType::Stream,
+                    incarnation,
+                )
+                .expect("subscribe");
+            let _ = conn.poll_transmit();
+            assert!(conn.remove_scalable_consumer_registration(42, incarnation));
+            assert!(
+                conn.poll_transmit().is_empty(),
+                "leave cannot overtake asynchronous authorization"
+            );
+            if replace {
+                conn.scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "workers",
+                    "member",
+                    42,
+                    crate::ScalableConsumerType::Stream,
+                    crate::ControllerIncarnation(18),
+                )
+                .expect("new incarnation");
+                let _ = conn.poll_transmit();
+            }
+            conn.handle_bytes(
+                Instant::now(),
+                &command_frame(pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(
+                        pb::CommandScalableTopicSubscribeResponse {
+                            request_id: request.0,
+                            error: None,
+                            message: None,
+                            assignment: Some(assignment(3, &[(1, 0, 65535)])),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("late subscribe response");
+            assert!(
+                conn.poll_event().is_none(),
+                "closed incarnation cannot regain assignment"
+            );
+            let mut outbound = conn.poll_transmit();
+            if replace {
+                assert!(
+                    outbound.is_empty(),
+                    "old leave cannot unregister the newer incarnation"
+                );
+                assert_eq!(
+                    conn.scalable_consumers[&42].incarnation(),
+                    crate::ControllerIncarnation(18)
+                );
+            } else {
+                assert_eq!(
+                    crate::decode_one(&mut outbound)
+                        .expect("leave after response")
+                        .command
+                        .scalable_topic_unsubscribe
+                        .expect("unsubscribe")
+                        .consumer_id,
+                    42
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_scalable_registration_waits_for_all_overlapping_attempts() {
+        let mut conn = connected_conn();
+        let requests: Vec<_> = [17, 18]
+            .into_iter()
+            .map(|incarnation| {
+                conn.scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "workers",
+                    "member",
+                    42,
+                    crate::ScalableConsumerType::Stream,
+                    crate::ControllerIncarnation(incarnation),
+                )
+                .expect("attempt")
+            })
+            .collect();
+        let _ = conn.poll_transmit();
+        assert!(conn.remove_scalable_consumer_registration(42, crate::ControllerIncarnation(18)));
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "leave must wait for overlapping attempts"
+        );
+        for (index, request) in requests.iter().rev().enumerate() {
+            conn.handle_bytes(
+                Instant::now(),
+                &command_frame(pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(
+                        pb::CommandScalableTopicSubscribeResponse {
+                            request_id: request.0,
+                            error: None,
+                            message: None,
+                            assignment: Some(assignment(3, &[(1, 0, 65535)])),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("reverse-order completion");
+            assert!(conn.poll_event().is_none());
+            let mut outbound = conn.poll_transmit();
+            if index == 0 {
+                assert!(outbound.is_empty(), "older attempt is still in flight");
+            } else {
+                assert_eq!(
+                    crate::decode_one(&mut outbound)
+                        .expect("last attempt triggers leave")
+                        .command
+                        .scalable_topic_unsubscribe
+                        .expect("unsubscribe")
+                        .consumer_id,
+                    42
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_newer_scalable_attempt_cleans_late_older_registration() {
+        let mut conn = connected_conn();
+        let requests: Vec<_> = [17, 18]
+            .into_iter()
+            .map(|incarnation| {
+                conn.scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "workers",
+                    "member",
+                    42,
+                    crate::ScalableConsumerType::Stream,
+                    crate::ControllerIncarnation(incarnation),
+                )
+                .expect("attempt")
+            })
+            .collect();
+        let _ = conn.poll_transmit();
+        for index in [1, 0] {
+            conn.handle_bytes(
+                Instant::now(),
+                &command_frame(pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                    scalable_topic_subscribe_response: Some(
+                        pb::CommandScalableTopicSubscribeResponse {
+                            request_id: requests[index].0,
+                            error: (index == 1)
+                                .then_some(pb::ServerError::AuthorizationError as i32),
+                            message: (index == 1).then(|| "denied".to_owned()),
+                            assignment: (index == 0).then(|| assignment(3, &[(1, 0, 65535)])),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("attempt response");
+            let mut transmit = conn.poll_transmit();
+            if index == 1 {
+                assert!(
+                    transmit.is_empty(),
+                    "wait for older registration before leave"
+                );
+                assert!(conn.scalable_consumer_assignment(42).is_none());
+                assert!(conn.scalable_consumers[&42].is_invalidated());
+                assert!(
+                    conn.remove_scalable_consumer_registration(
+                        42,
+                        crate::ControllerIncarnation(18)
+                    ),
+                    "raw caller retains the terminal owner after rejection"
+                );
+                assert!(
+                    conn.poll_transmit().is_empty(),
+                    "explicit leave still waits for the older response"
+                );
+            } else {
+                assert_eq!(
+                    crate::decode_one(&mut transmit)
+                        .expect("clean failed overlapping registration")
+                        .command
+                        .scalable_topic_unsubscribe
+                        .expect("unsubscribe")
+                        .consumer_id,
+                    42
+                );
+            }
+        }
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerRejected { .. })
+        ));
+        assert!(
+            conn.poll_event().is_none(),
+            "older success cannot revive rejected session"
+        );
+    }
+
+    #[test]
+    fn local_scalable_registration_removal_is_incarnation_fenced() {
+        let mut conn = connected_conn();
+        let incarnation = crate::ControllerIncarnation(17);
+        let request_id = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                42,
+                crate::ScalableConsumerType::Stream,
+                incarnation,
+            )
+            .expect("subscribe");
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(
+            Instant::now(),
+            &command_frame(pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                scalable_topic_subscribe_response: Some(
+                    pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request_id.0,
+                        error: None,
+                        message: None,
+                        assignment: Some(assignment(3, &[(1, 0, 65535)])),
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .expect("established registration");
+        let _ = conn.poll_event();
+
+        assert!(!conn.remove_scalable_consumer_registration(42, crate::ControllerIncarnation(16)));
+        assert!(conn.scalable_consumers.contains_key(&42));
+        assert!(!conn.scalable_subscribe_requests.contains_key(&request_id));
+
+        assert!(conn.remove_scalable_consumer_registration(42, incarnation));
+        assert!(!conn.scalable_consumers.contains_key(&42));
+        assert!(!conn.scalable_subscribe_requests.contains_key(&request_id));
+        let leave = crate::decode_one(&mut conn.poll_transmit())
+            .expect("GA unsubscribe follows admitted subscription")
+            .command
+            .scalable_topic_unsubscribe
+            .expect("CommandScalableTopicUnsubscribe");
+        assert_eq!(leave.consumer_id, 42);
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "one unsubscribe per registration"
+        );
+
+        let delayed = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: request_id.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(3, &[(1, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &delayed)
+            .expect("delayed response frame");
+        assert!(conn.poll_event().is_none());
+        assert!(!conn.remove_scalable_consumer_registration(42, incarnation));
+    }
+
+    #[test]
+    fn conn_emits_response_baseline_before_buffered_assignment_pushes() {
+        let mut conn = connected_conn();
+        let incarnation = crate::ControllerIncarnation(9);
+        let request_id = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                51,
+                crate::ScalableConsumerType::Stream,
+                incarnation,
+            )
+            .expect("subscribe");
+        let _ = conn.poll_transmit();
+
+        let pushed = assignment(1, &[(2, 0, 65_535)]);
+        let update = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+            scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 51,
+                assignment: pushed.clone(),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &update)
+            .expect("pre-response push");
+        assert!(conn.poll_event().is_none());
+
+        let baseline = assignment(1, &[(1, 0, 65_535)]);
+        let response = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: request_id.0,
+                error: None,
+                message: None,
+                assignment: Some(baseline.clone()),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &response)
+            .expect("subscribe response");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerAssigned { assignment, .. })
+                if assignment.to_pb() == baseline
+        ));
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableAssignmentChanged { assignment, delta, .. })
+                if assignment.to_pb() == pushed
+                    && delta.lost == [crate::SegmentId(1)]
+                    && delta.gained[0].segment_id() == crate::SegmentId(2)
+        ));
+    }
+
+    #[test]
+    fn conn_fails_registration_closed_on_invalid_pre_baseline_push() {
+        let mut conn = connected_conn();
+        let request_id = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                52,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(1),
+            )
+            .expect("subscribe");
+        let _ = conn.poll_transmit();
+        let mut invalid = assignment(1, &[(1, 0, 65_535)]);
+        invalid.segments[0].segment_topic.push_str("-noncanonical");
+        let update = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+            scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+                consumer_id: 52,
+                assignment: invalid,
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &update)
+            .expect("invalid push frame");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerRejected {
+                consumer_id: 52,
+                incarnation: crate::ControllerIncarnation(1),
+                ..
+            })
+        ));
+        assert!(conn.scalable_consumers[&52].is_invalidated());
+        assert!(conn.scalable_consumer_assignment(52).is_none());
+        assert!(!conn.scalable_subscribe_requests[&request_id].leave_after_response);
+        assert!(conn.poll_transmit().is_empty());
+        assert!(conn.remove_scalable_consumer_registration(52, crate::ControllerIncarnation(1)));
+        assert!(!conn.scalable_consumers.contains_key(&52));
+        assert!(conn.scalable_subscribe_requests[&request_id].leave_after_response);
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "invalid push cannot let leave overtake registration"
+        );
+        conn.handle_bytes(
+            Instant::now(),
+            &command_frame(pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                scalable_topic_subscribe_response: Some(
+                    pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request_id.0,
+                        error: None,
+                        message: None,
+                        assignment: Some(assignment(1, &[(1, 0, 65535)])),
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .expect("late baseline after rejected push");
+        assert!(conn.poll_event().is_none());
+        assert!(!conn.scalable_subscribe_requests.contains_key(&request_id));
+        assert_eq!(
+            crate::decode_one(&mut conn.poll_transmit())
+                .expect("clean rejected registration")
+                .command
+                .scalable_topic_unsubscribe
+                .expect("unsubscribe")
+                .consumer_id,
+            52
+        );
+    }
+
+    #[test]
+    fn controller_retry_preserves_member_until_terminal_close() {
+        let mut conn = connected_conn();
+        let request = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                54,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(1),
+            )
+            .expect("subscribe");
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(
+            Instant::now(),
+            &command_frame(pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                scalable_topic_subscribe_response: Some(
+                    pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request.0,
+                        assignment: None,
+                        error: Some(pb::ServerError::AuthorizationError as i32),
+                        message: Some("reconnect authorization failed".to_owned()),
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .expect("subscribe error response");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerRejected {
+                consumer_id: 54,
+                ..
+            })
+        ));
+        assert!(
+            conn.poll_transmit().is_empty(),
+            "rejection invalidates local authority without terminating the logical member"
+        );
+        assert!(conn.scalable_consumer_assignment(54).is_none());
+        assert!(
+            conn.remove_scalable_consumer_registration(54, crate::ControllerIncarnation(1)),
+            "explicit terminal owner remains armed"
+        );
+        assert_eq!(
+            crate::decode_one(&mut conn.poll_transmit())
+                .expect("terminal leave")
+                .command
+                .scalable_topic_unsubscribe
+                .expect("leave body")
+                .consumer_id,
+            54
+        );
+    }
+
+    #[test]
+    fn conn_fails_registered_assignment_stream_closed_on_rejected_push() {
+        let stale = assignment(2, &[(1, 0, 65_535)]);
+        let mut malformed = assignment(3, &[(1, 0, 65_535)]);
+        malformed.segments[0]
+            .segment_topic
+            .push_str("-noncanonical");
+
+        for rejected in [stale, malformed] {
+            let mut conn = connected_conn();
+            let incarnation = crate::ControllerIncarnation(2);
+            let request_id = conn
+                .scalable_topic_subscribe(
+                    "topic://public/default/scaled",
+                    "subscription",
+                    "consumer",
+                    53,
+                    crate::ScalableConsumerType::Stream,
+                    incarnation,
+                )
+                .expect("subscribe");
+            let _ = conn.poll_transmit();
+            let response = command_frame(pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+                scalable_topic_subscribe_response: Some(
+                    pb::CommandScalableTopicSubscribeResponse {
+                        request_id: request_id.0,
+                        error: None,
+                        message: None,
+                        assignment: Some(assignment(3, &[(1, 0, 65_535)])),
+                    },
+                ),
+                ..Default::default()
+            });
+            conn.handle_bytes(Instant::now(), &response)
+                .expect("registration baseline");
+            assert!(matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::ScalableConsumerAssigned { .. })
+            ));
+
+            let update = command_frame(pb::BaseCommand {
+                r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+                scalable_topic_assignment_update: Some(pb::CommandScalableTopicAssignmentUpdate {
+                    consumer_id: 53,
+                    assignment: rejected,
+                }),
+                ..Default::default()
+            });
+            conn.handle_bytes(Instant::now(), &update)
+                .expect("rejected post-baseline frame");
+
+            assert!(matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::ScalableConsumerRejected {
+                    consumer_id: 53,
+                    incarnation: got,
+                    ..
+                }) if got == incarnation
+            ));
+            assert!(conn.scalable_consumers[&53].is_invalidated());
+            assert_eq!(conn.scalable_consumers[&53].epoch_floor(), Some(3));
+            assert!(conn.scalable_consumer_assignment(53).is_none());
+            assert!(conn.poll_transmit().is_empty());
+            conn.handle_bytes(
+                Instant::now(),
+                &command_frame(pb::BaseCommand {
+                    r#type: pb::base_command::Type::ScalableTopicAssignmentUpdate as i32,
+                    scalable_topic_assignment_update: Some(
+                        pb::CommandScalableTopicAssignmentUpdate {
+                            consumer_id: 53,
+                            assignment: assignment(4, &[(1, 0, 65_535)]),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .expect("late valid push after authority rejection");
+            assert!(conn.poll_event().is_none());
+            assert!(conn.scalable_consumer_assignment(53).is_none());
+            assert!(conn.remove_scalable_consumer_registration(53, incarnation));
+            assert!(!conn.scalable_consumers.contains_key(&53));
+            assert_eq!(
+                crate::decode_one(&mut conn.poll_transmit())
+                    .expect("terminal leave")
+                    .command
+                    .scalable_topic_unsubscribe
+                    .expect("leave body")
+                    .consumer_id,
+                53
+            );
+        }
+    }
+
+    #[test]
+    fn conn_reconnect_propagates_incarnation_and_epoch_floor() {
+        let mut conn = connected_conn();
+        let request_id = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                61,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(1),
+            )
+            .expect("initial subscribe");
+        let _ = conn.poll_transmit();
+        let response = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: request_id.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(5, &[(1, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &response)
+            .expect("initial response");
+        let _ = conn.poll_event();
+
+        let reconnect = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                61,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(2),
+            )
+            .expect("replacement subscribe");
+        let _ = conn.poll_transmit();
+        let regressed = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: reconnect.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(4, &[(1, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &regressed)
+            .expect("regressed response frame");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerRejected {
+                consumer_id: 61,
+                incarnation: crate::ControllerIncarnation(2),
+                reason,
+            }) if reason.contains("below reconnect floor 5")
+        ));
+        assert!(conn.scalable_consumer_assignment(61).is_none());
+    }
+
+    #[test]
+    fn conn_reset_fences_an_outstanding_scalable_subscribe_response() {
+        let mut conn = connected_conn();
+        let initial = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                71,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(1),
+            )
+            .expect("initial subscribe");
+        let _ = conn.poll_transmit();
+        let initial_response = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: initial.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(5, &[(1, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &initial_response)
+            .expect("initial response");
+        let _ = conn.poll_event();
+
+        let abandoned = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                71,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(2),
+            )
+            .expect("subscribe before transport loss");
+        let _ = conn.poll_transmit();
+        assert!(conn.scalable_subscribe_requests.contains_key(&abandoned));
+        conn.reset();
+        assert!(conn.scalable_subscribe_requests.is_empty());
+        assert_eq!(
+            conn.scalable_consumers[&71].epoch_floor(),
+            Some(5),
+            "logical registration history survives transport reset"
+        );
+
+        complete_scalable_handshake(&mut conn, true);
+        let delayed = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: abandoned.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(6, &[(2, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &delayed)
+            .expect("delayed response frame");
+        assert!(conn.poll_event().is_none());
+        assert!(conn.scalable_consumer_assignment(71).is_none());
+
+        let current = conn
+            .scalable_topic_subscribe(
+                "topic://public/default/scaled",
+                "subscription",
+                "consumer",
+                71,
+                crate::ScalableConsumerType::Stream,
+                crate::ControllerIncarnation(3),
+            )
+            .expect("replacement subscribe");
+        let _ = conn.poll_transmit();
+        let current_response = command_frame(pb::BaseCommand {
+            r#type: pb::base_command::Type::ScalableTopicSubscribeResponse as i32,
+            scalable_topic_subscribe_response: Some(pb::CommandScalableTopicSubscribeResponse {
+                request_id: current.0,
+                error: None,
+                message: None,
+                assignment: Some(assignment(5, &[(1, 0, 65_535)])),
+            }),
+            ..Default::default()
+        });
+        conn.handle_bytes(Instant::now(), &current_response)
+            .expect("replacement response");
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ScalableConsumerAssigned {
+                consumer_id: 71,
+                incarnation: crate::ControllerIncarnation(3),
+                ..
+            })
+        ));
     }
 
     /// Layer (a) test: a second layout on the same session emits
@@ -19132,7 +21414,7 @@ mod scalable_conn_tests {
         let _ = conn.poll_transmit();
 
         // First layout resolves the session.
-        let buf = update_frame(session_id, 1, vec![info(1, 0, 65_536, &[])]);
+        let buf = update_frame(session_id, 1, vec![info(1, 0, 65_535, &[])]);
         conn.handle_bytes(Instant::now(), &buf).expect("initial");
         while conn.poll_event().is_some() {}
 
@@ -19140,7 +21422,11 @@ mod scalable_conn_tests {
         let buf = update_frame(
             session_id,
             2,
-            vec![info(2, 0, 32_768, &[1]), info(3, 32_768, 65_536, &[1])],
+            vec![
+                sealed_info(1, 0, 65_535, &[2, 3], 2),
+                child_info(2, 0, 32_767, 1, 2),
+                child_info(3, 32_768, 65_535, 1, 2),
+            ],
         );
         conn.handle_bytes(Instant::now(), &buf).expect("split");
 
@@ -19151,10 +21437,12 @@ mod scalable_conn_tests {
                 ConnectionEvent::SegmentDagUpdated {
                     session_id: got,
                     delta,
+                    snapshot,
                 } => {
                     assert_eq!(got, session_id);
                     assert_eq!(delta.epoch, 2);
-                    assert_eq!(delta.removed, vec![crate::types::SegmentId(1)]);
+                    assert_eq!(snapshot.epoch(), 2);
+                    assert_eq!(delta.removed, [] as [crate::types::SegmentId; 0]);
                     assert_eq!(delta.split_events.len(), 1);
                     saw_updated = true;
                 }
@@ -19171,9 +21459,9 @@ mod scalable_conn_tests {
         }
         assert!(saw_updated, "SegmentDagUpdated emitted");
         assert!(saw_changed, "DagChangedDuringConsume emitted on split");
-        // Post-split DAG: parent gone, two children present.
+        // Post-split DAG: sealed parent remains as a barrier beside two children.
         let snap = conn.dag_snapshot(session_id).expect("session still open");
-        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.len(), 3);
     }
 
     /// Layer (a) test — **v4 compatibility**. Against a broker that did not
@@ -19306,6 +21594,18 @@ mod consumer_close_contract_tests {
         kinds
     }
 
+    fn drain_close_commands(conn: &mut Connection) -> Vec<pb::CommandCloseConsumer> {
+        let mut bytes = conn.poll_transmit();
+        let mut closes = Vec::new();
+        while !bytes.is_empty() {
+            let frame = decode_one(&mut bytes).expect("staged frame must decode");
+            if let Some(close) = frame.command.close_consumer {
+                closes.push(close);
+            }
+        }
+        closes
+    }
+
     fn ack_success(conn: &mut Connection, request_id: u64, now: Instant) {
         let ack = pb::BaseCommand {
             r#type: pb::base_command::Type::Success as i32,
@@ -19343,7 +21643,7 @@ mod consumer_close_contract_tests {
         let slot = conn.consumer(handle).expect("slot exists").clone();
         assert!(!slot.state.lock().closed, "fresh consumer must be open");
 
-        let _request_id = conn.close_consumer(handle, now);
+        let _request_id = conn.close_consumer(handle, now).expect("close admitted");
 
         assert!(
             slot.state.lock().closed,
@@ -19358,7 +21658,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "close-frame");
         let _ = conn.poll_transmit();
 
-        let _request_id = conn.close_consumer(handle, now);
+        let _request_id = conn.close_consumer(handle, now).expect("close admitted");
 
         assert_eq!(
             drain_command_types(&mut conn),
@@ -19375,8 +21675,6 @@ mod consumer_close_contract_tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
 
         for forget in [false, true] {
@@ -19394,105 +21692,424 @@ mod consumer_close_contract_tests {
             conn.ack_grouped_individual(handle, message_id, now);
 
             if forget {
-                let _request_id = conn.close_consumer_forget(handle, now);
+                let _request_id = conn
+                    .close_consumer_forget(handle, now)
+                    .expect("close admitted");
             } else {
-                let _request_id = conn.close_consumer(handle, now);
+                let _request_id = conn.close_consumer(handle, now).expect("close admitted");
             }
+            let same_request_id = conn.close_consumer(handle, now).expect("close reused");
 
+            let commands = drain_command_types(&mut conn);
             assert_eq!(
-                drain_command_types(&mut conn),
+                commands,
                 vec![
                     pb::base_command::Type::Ack as i32,
                     pb::base_command::Type::CloseConsumer as i32,
                 ],
-                "{forget:?} close must flush grouped acknowledgements before CloseConsumer"
+                "{forget:?} close must flush grouped acknowledgements once before one CloseConsumer"
             );
+            assert!(conn.has_pending_request_for_test(same_request_id));
         }
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_success() {
+    fn close_consumer_completion_is_reusable_after_success() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-success");
         let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         assert!(
             slot.state.lock().closed,
             "forget variant must still flip the closed flag synchronously"
         );
         ack_success(&mut conn, request_id.0, now);
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "fire-and-forget close ack must be consumed in-place, not recorded"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
         );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_broker_error() {
+    fn close_consumer_completion_is_reusable_after_broker_error() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-error");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         ack_error(&mut conn, request_id.0, now);
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "rejected fire-and-forget close must not leak an OpOutcome entry"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::BrokerError {
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "synthetic close rejection".to_owned(),
+            })
         );
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_reset() {
+    fn close_consumer_completion_is_reusable_after_reset() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-reset");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
         conn.reset();
 
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "reset must not materialize an outcome for a forgotten close"
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::SessionLost)
         );
+        assert!(!conn.has_pending_request_for_test(request_id));
+        assert_eq!(conn.close_consumer(handle, now), Ok(request_id));
+        assert!(conn.poll_transmit().is_empty());
     }
 
     #[test]
-    fn close_consumer_forget_records_no_outcome_on_fail_all_pending() {
+    fn close_consumer_completion_is_reusable_after_fail_all_pending() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-fail-all");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle, now);
+        let request_id = conn
+            .close_consumer_forget(handle, now)
+            .expect("close admitted");
+        let _ = conn.poll_transmit();
         conn.fail_all_pending("synthetic terminal drop");
 
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Terminal {
+                reason: "synthetic terminal drop".to_owned(),
+            })
+        );
+        assert!(!conn.has_pending_request_for_test(request_id));
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal)
+        );
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn terminal_sweep_rejects_new_consumer_terminal_admission_without_staging() {
+        let now = Instant::now();
+        for unsubscribe in [false, true] {
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(&mut conn, "terminal-admission");
+            let _ = conn.poll_transmit();
+            let next_request_id = conn.peek_next_request_id_for_test();
+
+            conn.fail_all_pending("peer closed");
+            let result = if unsubscribe {
+                conn.unsubscribe(handle, false)
+                    .map(|value| value.request_id)
+            } else {
+                conn.close_consumer(handle, now)
+            };
+
+            assert_eq!(
+                result,
+                Err(crate::consumer::ConsumerTerminalAdmissionError::Terminal)
+            );
+            assert_eq!(conn.peek_next_request_id_for_test(), next_request_id);
+            assert!(!conn.has_pending_request_for_test(RequestId(next_request_id)));
+            assert!(conn.poll_transmit().is_empty());
+            assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        }
+    }
+
+    #[test]
+    fn reset_does_not_latch_consumer_terminal_admission() {
+        let now = Instant::now();
+        for unsubscribe in [false, true] {
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(&mut conn, "reset-admission");
+            let _ = conn.poll_transmit();
+
+            conn.reset();
+            let request_id = if unsubscribe {
+                conn.unsubscribe(handle, false)
+                    .expect("reset stays reconnectable")
+                    .request_id
+            } else {
+                conn.close_consumer(handle, now)
+                    .expect("reset stays reconnectable")
+            };
+
+            assert!(conn.has_pending_request_for_test(request_id));
+            assert!(!conn.poll_transmit().is_empty());
+        }
+    }
+
+    #[test]
+    fn forced_forgotten_close_retries_a_failure_at_most_once() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forced-retry");
+        let _ = conn.poll_transmit();
+
+        let request_id = conn.close_consumer(handle, now).expect("close admitted");
+        let first = drain_close_commands(&mut conn);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].consumer_id, handle.0);
+        assert_eq!(first[0].request_id, request_id.0);
+        ack_error(&mut conn, request_id.0, now);
+
+        let retry = conn
+            .force_close_consumer_forget(handle, now)
+            .expect("one failure retry");
+        assert_ne!(retry, request_id);
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        let second = drain_close_commands(&mut conn);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].consumer_id, handle.0);
+        assert_eq!(second[0].request_id, retry.0);
+    }
+
+    #[test]
+    fn unsolicited_broker_close_does_not_complete_client_close() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "broker-close");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+        let broker_close = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 991,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut bytes = bytes::BytesMut::new();
+        encode_command(&mut bytes, &broker_close).expect("encode broker close");
+        conn.handle_bytes(now, &bytes).expect("apply broker close");
+
+        assert!(slot.state.lock().close_completion().is_none());
+        let request_id = conn.close_consumer(handle, now).expect("close admitted");
+        assert_ne!(request_id.0, 991);
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, request_id.0);
+    }
+
+    #[test]
+    fn close_pending_rejects_unsubscribe_without_staging() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "close-before-unsubscribe");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+
+        let close_request = conn.close_consumer(handle, now).expect("close admitted");
+        assert!(matches!(
+            conn.unsubscribe(handle, false),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::CloseInProgress)
+        ));
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, close_request.0);
+        assert_eq!(conn.peek_next_request_id_for_test(), close_request.0 + 1);
+
+        ack_success(&mut conn, close_request.0, now);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+        assert!(!conn.has_pending_request_for_test(close_request));
         assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "fail_all_pending must not materialize an outcome for a forgotten close"
+            conn.take_outcome(PendingOpKey::Request(close_request))
+                .is_none()
         );
     }
 
     #[test]
-    fn close_consumer_awaited_still_records_outcome() {
+    fn unsubscribe_pending_rejects_close_then_rejection_allows_one_close() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
-        let handle = subscribe(&mut conn, "awaited-close");
+        let handle = subscribe(&mut conn, "unsubscribe-before-close-error");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
 
-        let request_id = conn.close_consumer(handle, now);
-        ack_success(&mut conn, request_id.0, now);
-
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_some(),
-            "awaited close must record the outcome its RequestFut drains"
+        let unsubscribe_request = conn
+            .unsubscribe(handle, false)
+            .expect("unsubscribe admitted")
+            .request_id;
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
         );
+        let commands = drain_command_types(&mut conn);
+        assert_eq!(commands, vec![pb::base_command::Type::Unsubscribe as i32]);
+        assert!(slot.state.lock().close_waiters.is_empty());
+
+        ack_error(&mut conn, unsubscribe_request.0, now);
+        assert!(!conn.has_pending_request_for_test(unsubscribe_request));
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request))
+                .is_none()
+        );
+        let close_request = conn
+            .close_consumer(handle, now)
+            .expect("close admitted after error");
+        let close = drain_close_commands(&mut conn);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].consumer_id, handle.0);
+        assert_eq!(close[0].request_id, close_request.0);
+        ack_success(&mut conn, close_request.0, now);
+        assert_eq!(
+            slot.state.lock().close_completion(),
+            Some(crate::consumer::ConsumerCloseCompletion::Success)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_success_removes_slot_before_late_close_admission() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "unsubscribe-before-close-success");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        let _ = conn.poll_transmit();
+
+        let unsubscribe_request = conn
+            .unsubscribe(handle, true)
+            .expect("unsubscribe admitted")
+            .request_id;
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnsubscribeInProgress)
+        );
+        let commands = drain_command_types(&mut conn);
+        assert_eq!(commands, vec![pb::base_command::Type::Unsubscribe as i32]);
+        ack_success(&mut conn, unsubscribe_request.0, now);
+
+        assert!(conn.consumer(handle).is_none());
+        assert_eq!(
+            conn.close_consumer(handle, now),
+            Err(crate::consumer::ConsumerTerminalAdmissionError::UnknownConsumer)
+        );
+        assert!(slot.state.lock().close_waiters.is_empty());
+        assert!(!conn.has_pending_request_for_test(unsubscribe_request));
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request))
+                .is_none()
+        );
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_reset_and_terminal_failure_release_admission_without_close_artifacts() {
+        for terminal in [false, true] {
+            let now = Instant::now();
+            let mut conn = handshake_complete(now);
+            let handle = subscribe(
+                &mut conn,
+                if terminal {
+                    "unsubscribe-fail-all"
+                } else {
+                    "unsubscribe-reset"
+                },
+            );
+            let slot = conn.consumer(handle).expect("slot exists").clone();
+            let _ = conn.poll_transmit();
+            let admission = conn
+                .unsubscribe(handle, false)
+                .expect("unsubscribe admitted");
+            let request = admission.request_id;
+            let _ = conn.poll_transmit();
+
+            if terminal {
+                conn.fail_all_pending("peer closed");
+                assert_eq!(
+                    admission.operation.lock().completion(),
+                    Some(crate::consumer::ConsumerUnsubscribeCompletion::Terminal {
+                        reason: "peer closed".to_owned(),
+                    })
+                );
+            } else {
+                conn.reset();
+                assert_eq!(
+                    admission.operation.lock().completion(),
+                    Some(crate::consumer::ConsumerUnsubscribeCompletion::SessionLost)
+                );
+            }
+
+            assert!(!conn.has_pending_request_for_test(request));
+            assert!(slot.state.lock().close_waiters.is_empty());
+            assert!(slot.state.lock().close_completion().is_none());
+            assert!(conn.take_outcome(PendingOpKey::Request(request)).is_none());
+            if terminal {
+                assert!(matches!(
+                    slot.state.lock().terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    slot.state.lock().terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Open
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn forced_retry_requires_cached_failed_reliable_close() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "force-requires-failure");
+        let _ = conn.poll_transmit();
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
+
+        let close_request = conn.close_consumer(handle, now).expect("close admitted");
+        let _ = conn.poll_transmit();
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        ack_success(&mut conn, close_request.0, now);
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
+    fn failed_best_effort_close_cannot_force_retry() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "best-effort-no-retry");
+        let _ = conn.poll_transmit();
+
+        let request = conn
+            .close_consumer_forget(handle, now)
+            .expect("best-effort close admitted");
+        let _ = conn.poll_transmit();
+        ack_error(&mut conn, request.0, now);
+
+        assert!(conn.force_close_consumer_forget(handle, now).is_none());
+        assert!(conn.poll_transmit().is_empty());
     }
 }
 

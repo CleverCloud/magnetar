@@ -105,6 +105,8 @@ The façade's `MessageCryptoBridge` ([`crates/magnetar/src/crypto_bridge.rs`](..
 
 - **Producer (encrypt-on-send).** The moonpool producer encrypts the payload, stamping `pb::MessageMetadata` `encryption_keys` / `encryption_algo` / `encryption_param`.
   This mirrors the tokio producer's **compression → encryption** ordering for the encryption step; compression itself is not yet wired on the moonpool engine — non-`None` `CompressionKind` is refused on send until the runtime codec lands (M3) — so in practice the moonpool path is encrypt-only.
+- **Consumer (decrypt-then-decompress on receive).** The moonpool consumer decrypts the payload — honoring the three `CryptoFailureAction` arms (`Fail`, `Discard`, `Consume`) identically to tokio — then bounded-decompresses broker-authored LZ4, ZSTD, Snappy, or ZLIB payloads before delivery.
+  The decompressor validates the announced output size and applies the same inflation ceiling as tokio, so send-side refusal does not prevent Moonpool from consuming compressed messages produced by other clients.
 - **Consumer (decrypt-on-receive).** The moonpool consumer decrypts the payload — honoring the three `CryptoFailureAction` arms (`Fail`, `Discard`, `Consume`) identically to tokio — then delivers it.
   Because compression is refused on send, there is no decompression step to mirror: the receive path reduces to **decrypt, then deliver** (tokio's decrypt-first → decompress ordering, with the decompress branch a no-op on moonpool until codecs land).
   A compressed **batched** entry is the exception, and needs no engine step at all: `ConsumerState::deliver` decodes it before splitting it and surfaces plaintext members on both engines ([ADR-0112](../specs/adr/0112-compress-and-decompress-a-batch-as-one-body.md)).

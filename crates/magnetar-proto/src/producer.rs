@@ -1638,8 +1638,6 @@ impl ProducerState {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             });
         self.last_sequence_id_published = seq.0 as i64;
         // Record the broker round-trip latency (enqueue → receipt) against the INJECTED `now`,
@@ -3036,8 +3034,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let mut msg = small_message(b"replicated payload");
         msg.source_message_id = Some(source_id);
@@ -3110,8 +3106,6 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let mut msg = small_message(b"x");
         msg.source_message_id = Some(source_id);

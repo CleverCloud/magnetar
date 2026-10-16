@@ -6,7 +6,8 @@
 //! the old path as a re-export, and this pins that every public item an existing caller could
 //! have named still resolves through it and still round-trips.
 //!
-//! Tokio-only: the moonpool crate never had a `compress` module, so there is no path to keep.
+//! Tokio preserves its public codec path; Moonpool delegates its private inbound path to the same
+//! core.
 
 use magnetar_proto::pb;
 use magnetar_proto::types::CompressionKind;
@@ -32,4 +33,69 @@ fn compress_module_reexport_keeps_its_public_path() {
     let err: CompressionError = decompress(CompressionKind::Zstd, b"not zstd", 8)
         .expect_err("garbage is rejected through the re-exported path too");
     assert!(matches!(err, CompressionError::Zstd(_)), "{err:?}");
+}
+
+#[test]
+fn uncompressed_codec_preserves_bytes_and_validates_the_size_ceiling() {
+    assert_eq!(
+        kind_from_pb(pb::CompressionType::None),
+        CompressionKind::None
+    );
+    let payload = b"uncompressed segment entry";
+    assert_eq!(
+        decompress(CompressionKind::None, payload, payload.len())
+            .expect("plain")
+            .as_ref(),
+        payload
+    );
+    assert!(matches!(
+        decompress(
+            CompressionKind::None,
+            payload,
+            magnetar_proto::MAX_FRAME_SIZE + 1
+        ),
+        Err(CompressionError::UncompressedSizeTooLarge { .. })
+    ));
+}
+
+#[test]
+fn malformed_compressed_payloads_and_size_mismatches_are_rejected() {
+    for kind in [
+        CompressionKind::Lz4,
+        CompressionKind::Zlib,
+        CompressionKind::Zstd,
+        CompressionKind::Snappy,
+    ] {
+        assert!(
+            decompress(kind, b"invalid", 1).is_err(),
+            "{kind:?} accepted malformed bytes"
+        );
+        let payload = b"segment size mismatch";
+        let encoded = compress(kind, payload).expect("encode fixture");
+        assert!(
+            decompress(kind, &encoded, payload.len() + 1).is_err(),
+            "{kind:?} accepted a wrong size"
+        );
+    }
+}
+
+#[test]
+fn each_public_codec_rejects_expansion_beyond_the_advertised_and_legacy_limits() {
+    let payload = vec![0_u8; 4096];
+    for kind in [
+        CompressionKind::Lz4,
+        CompressionKind::Zlib,
+        CompressionKind::Zstd,
+        CompressionKind::Snappy,
+    ] {
+        let encoded = compress(kind, &payload).expect("encode compressed segment");
+        assert!(
+            decompress(kind, &encoded, 1).is_err(),
+            "{kind:?} accepted overexpansion"
+        );
+        assert!(
+            decompress_within(kind, &encoded, 1).is_err(),
+            "{kind:?} exceeded the legacy output bound"
+        );
+    }
 }

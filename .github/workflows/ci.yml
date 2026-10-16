@@ -164,6 +164,54 @@ jobs:
             cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
           done
 
+  differential-quarantine:
+    name: differential quarantine diagnostics
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
+      - name: Compile quarantined differential targets
+        run: |
+          set -euo pipefail
+          cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence --no-run
+          cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence --no-run
+      - name: Verify aggregate receiver budget selection
+        run: |
+          set -euo pipefail
+          selected=$(cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence -- --ignored --exact aggregate_receiver_budget_is_equivalent --list)
+          printf '%s\n' "$selected"
+          count=$(printf '%s\n' "$selected" | awk '/^aggregate_receiver_budget_is_equivalent: test$/ { count++ } END { print count + 0 }')
+          test "$count" -eq 1
+      - name: Run aggregate receiver budget diagnostic
+        id: run_aggregate_receiver_budget
+        continue-on-error: true
+        run: cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence -- --ignored --exact aggregate_receiver_budget_is_equivalent --nocapture
+      - name: Verify busy and withdrawn child opens selection
+        run: |
+          set -euo pipefail
+          selected=$(cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence -- --ignored --exact busy_and_withdrawn_child_opens_are_equivalent --list)
+          printf '%s\n' "$selected"
+          count=$(printf '%s\n' "$selected" | awk '/^busy_and_withdrawn_child_opens_are_equivalent: test$/ { count++ } END { print count + 0 }')
+          test "$count" -eq 1
+      - name: Run busy and withdrawn child opens diagnostic
+        id: run_busy_child_opens
+        continue-on-error: true
+        run: cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence -- --ignored --exact busy_and_withdrawn_child_opens_are_equivalent --nocapture
+      - name: Report quarantined differential results
+        if: always()
+        env:
+          AGGREGATE_OUTCOME: ${{ steps.run_aggregate_receiver_budget.outcome }}
+          BUSY_CHILD_OUTCOME: ${{ steps.run_busy_child_opens.outcome }}
+        run: |
+          {
+            printf '%s\n' "aggregate_receiver_budget_is_equivalent: $AGGREGATE_OUTCOME (diagnostic; test result does not gate CI)."
+            printf '%s\n' "busy_and_withdrawn_child_opens_are_equivalent: $BUSY_CHILD_OUTCOME (diagnostic; test result does not gate CI)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   e2e:
     name: e2e (Pulsar ${{ matrix.pulsar }})
     # The whole e2e suite once per Pulsar version (ADR-0116): `pulsar` is the
@@ -187,6 +235,13 @@ jobs:
     with:
       pulsar: ${{ matrix.pulsar }}
       pip33: ${{ matrix.pip33 }}
+
+  e2e-quarantine:
+    name: e2e quarantine diagnostics (Pulsar 5.0.0)
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: "5.0.0"
+      quarantine_test: e2e_seek_per_partition_callback
 
   seed-replay:
     # Per ADR-0047: replay every `status = "open"` seed listed in
@@ -404,7 +459,7 @@ jobs:
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
 
   check-sim-coverage:
-    name: check-sim-coverage (patch coverage, sim-instrumented crates)
+    name: check-sim-coverage (isolated Moonpool + Tokio patch coverage)
     # ADR-0024 requires 100% moonpool patch coverage on the diff. ADR-0092
     # flips the gate to enforcing and gives it the per-PR home it never had.
     # `xtask-gates.yml` still carries the same job on its daily cron and on
@@ -426,12 +481,12 @@ jobs:
     # SIM_COVERAGE_EXCLUDE_FRAGMENTS in xtask/src/main.rs, which is the
     # authority). Note what that does NOT cover: the bail is not keyed on
     # SIM_COVERAGE_GATED_CRATE_PREFIXES, so a PR touching only a crate the
-    # sim run never compiles — the façade, magnetar-admin, magnetarctl —
-    # still pays the full instrumented build and then prints those files as
-    # advisory `not gated`. Measured over the last 40 merged PRs: 30%
-    # short-circuit, 60% build and can produce a verdict, 10% build for a
-    # verdict that is impossible. Keeping that 10% is deliberate — bailing
-    # early would suppress the `not gated` report ADR-0088 exists to print.
+    # sim run never compiles — magnetar-admin, magnetarctl, or another package
+    # outside the seven-plus-one coverage domains — still pays the full instrumented
+    # build and then prints those files as advisory `not gated`. The façade
+    # and fakes are compiled and hard-gated through the differential aggregate
+    # suites. The older 30/60/10 measurement predates that closure expansion
+    # and is not used to characterize the current job.
     runs-on: ubuntu-26.04
     # 180 to match the two comparable `--all-features` jobs (`test` above,
     # `crypto-matrix` in xtask-gates.yml) rather than the 90 the scheduled
@@ -456,11 +511,10 @@ jobs:
       # against `origin/main`" — a red check for an infrastructure reason,
       # wearing a message that reads like a coverage failure.
       - run: git fetch --force origin +refs/heads/main:refs/remotes/origin/main
-      # check-sim-coverage runs `cargo llvm-cov --all-features` over the
-      # moonpool + differential test binaries — which builds aws-lc-fips-sys
-      # under coverage instrumentation — then re-exports the same profile
-      # data over the wider report package set. Reclaim disk like the heavy
-      # build jobs.
+      # check-sim-coverage runs two fresh all-feature domains: Moonpool +
+      # differential for shared/sim source, then Tokio unit/integration tests
+      # for private Tokio adapter source. Their targets, profiles, objects and
+      # reports are disjoint under one invocation-owned scratch root (ADR-0121).
       - name: Free disk space
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
@@ -498,10 +552,19 @@ jobs:
       # `sim_coverage_enforces_uncovered_by_default` in xtask/src/main.rs,
       # since this flag would otherwise mask such a regression.
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage --enforce
+      - name: Upload fresh simulation coverage reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sim-coverage-reports-${{ github.sha }}
+          path: |
+            target/sim-coverage.lcov
+            target/tokio-coverage.lcov
+          if-no-files-found: warn
 
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its
   # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron
-  # schedule with 16 freshly-generated random seeds in parallel. Per
+  # schedule with 128 freshly-generated random seeds in parallel. Per
   # ADR-0036, fixed seeds in per-PR / per-push CI are useless — they
   # always cover the same scheduling — while random seeds over time
   # cover the seed space much better. The regular `test` job above

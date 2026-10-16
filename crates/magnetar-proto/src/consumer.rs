@@ -33,6 +33,8 @@ use prost::Message as _;
 use slab::Slab;
 
 use crate::error::ConsumerError;
+#[cfg(feature = "scalable-topics")]
+use crate::event::DeferredIncomingMessage;
 use crate::event::IncomingMessage;
 use crate::pb;
 use crate::trackers::{NegativeAcksTracker, UnackedMessageTracker};
@@ -85,6 +87,150 @@ pub struct ConsumerSlot {
     /// Mutex-guarded state-machine state. Hot path for queue / waker /
     /// flow-control operations.
     pub state: parking_lot::Mutex<ConsumerState>,
+}
+
+/// Reusable result of an ordinary consumer close operation.
+///
+/// This protocol-owned value is cloneable so any number of runtime waiters can
+/// observe the same completion without requiring the public runtime error type
+/// to implement `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerCloseCompletion {
+    /// The broker acknowledged the close.
+    Success,
+    /// The broker rejected the close.
+    BrokerError {
+        /// Pulsar `ServerError` integer.
+        code: i32,
+        /// Broker-provided diagnostic.
+        message: String,
+    },
+    /// The transport session carrying the close request was reset.
+    SessionLost,
+    /// The connection terminated without a replacement session.
+    Terminal {
+        /// Local terminal reason.
+        reason: String,
+    },
+}
+
+/// Origin of the first close admitted for a consumer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerCloseOrigin {
+    /// A caller is waiting for the broker result.
+    Reliable,
+    /// Last-clone cleanup admitted the operation without a waiter.
+    BestEffort,
+}
+
+/// Reusable result of an unsubscribe operation.
+pub type ConsumerUnsubscribeCompletion = ConsumerCloseCompletion;
+
+/// Slot-owned unsubscribe operation retained by runtime waiters after success
+/// removes the consumer from the connection registry.
+#[derive(Debug)]
+pub struct ConsumerUnsubscribeOperation {
+    request_id: RequestId,
+    completion: Option<ConsumerUnsubscribeCompletion>,
+    waiters: Slab<Waker>,
+}
+
+/// Result of admitting one unsubscribe operation.
+#[derive(Debug, Clone)]
+pub struct ConsumerUnsubscribeAdmission {
+    /// Wire request correlation id.
+    pub request_id: RequestId,
+    /// Reusable slot-owned completion authority.
+    pub operation: std::sync::Arc<parking_lot::Mutex<ConsumerUnsubscribeOperation>>,
+}
+
+impl ConsumerUnsubscribeOperation {
+    /// Construct one pending operation.
+    #[must_use]
+    pub fn new(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            completion: None,
+            waiters: Slab::new(),
+        }
+    }
+
+    /// Correlation id allocated at admission.
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Cached completion, including completions published before first poll.
+    #[must_use]
+    pub fn completion(&self) -> Option<ConsumerUnsubscribeCompletion> {
+        self.completion.clone()
+    }
+
+    /// Register one independently cancellable waiter.
+    pub fn register(&mut self, waker: Waker) -> usize {
+        self.waiters.insert(waker)
+    }
+
+    /// Remove one waiter without changing operation ownership or completion.
+    pub fn cancel(&mut self, key: usize) {
+        if self.waiters.contains(key) {
+            self.waiters.remove(key);
+        }
+    }
+
+    /// Publish once and return waiters for waking after releasing the lock.
+    pub(crate) fn complete(&mut self, completion: ConsumerUnsubscribeCompletion) -> Vec<Waker> {
+        if self.completion.is_some() {
+            return Vec::new();
+        }
+        self.completion = Some(completion);
+        self.waiters.drain().collect()
+    }
+
+    /// Exercise a second publication through the production idempotence guard.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn complete_for_test(&mut self, completion: ConsumerUnsubscribeCompletion) -> Vec<Waker> {
+        self.complete(completion)
+    }
+}
+
+/// Singleflight lifecycle for an ordinary consumer close.
+#[derive(Debug, Clone)]
+pub enum ConsumerTerminalOperation {
+    /// No close has been admitted yet.
+    Open,
+    /// One wire request is in flight.
+    Pending {
+        request_id: RequestId,
+        origin: ConsumerCloseOrigin,
+    },
+    /// The first admitted request completed and its result is reusable.
+    Complete {
+        request_id: Option<RequestId>,
+        origin: ConsumerCloseOrigin,
+        completion: ConsumerCloseCompletion,
+    },
+    /// One unsubscribe request owns terminal admission.
+    UnsubscribePending {
+        operation: std::sync::Arc<parking_lot::Mutex<ConsumerUnsubscribeOperation>>,
+    },
+}
+
+/// Deterministic rejection from mutually-exclusive close/unsubscribe admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerTerminalAdmissionError {
+    /// The consumer handle is absent.
+    UnknownConsumer,
+    /// Unsubscribe already owns terminal admission.
+    UnsubscribeInProgress,
+    /// Reliable close already owns terminal admission.
+    CloseInProgress,
+    /// Reliable close has completed and the consumer stays terminal.
+    Closed,
+    /// The connection has no remaining driver and cannot admit terminal work.
+    Terminal,
 }
 
 impl ConsumerSlot {
@@ -214,6 +360,11 @@ pub struct ConsumerState {
     /// starvation signal instead of the never-decrementing mirror `granted_permits` was before
     /// this split.
     pub permit_balance: u32,
+    /// Explicit permits issued through [`crate::Connection::flow`] for a
+    /// zero-queue consumer. Unlike automatic receiver-queue credit, this is
+    /// caller-owned authority and must survive a supervised transport rebuild
+    /// until the caller observes the corresponding delivery.
+    pub(crate) manual_flow_permits: u32,
     /// Monotonic count of broker dispatch units this consumer has observed since it
     /// was constructed (issue #414). Bumped by [`Self::record_dispatch_unit`], the single
     /// helper that also decrements [`Self::permit_balance`], so the two can never drift:
@@ -268,6 +419,13 @@ pub struct ConsumerState {
     pub(crate) consumed_since_flow: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
+    /// Raw broker entries owned by an aggregate receive budget. Ordinary
+    /// consumers never populate this queue.
+    #[cfg(feature = "scalable-topics")]
+    deferred_queue: VecDeque<DeferredIncomingMessage>,
+    /// Whether broker entries bypass local chunk/batch processing.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) defer_payload_processing: bool,
     /// Per-uuid chunk reassembly state.
     chunk_reassembly: HashMap<String, ChunkBuffer>,
     /// FIFO insertion-order index over `chunk_reassembly`, mirroring Java
@@ -318,15 +476,14 @@ pub struct ConsumerState {
     /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
     /// (see [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub receive_wakers: Slab<Waker>,
+    /// Reusable ordinary-close operation shared by every consumer clone.
+    pub terminal_operation: ConsumerTerminalOperation,
+    /// Independently cancellable waiters for [`Self::terminal_operation`].
+    pub close_waiters: Slab<Waker>,
+    /// At-most-once gate for a forgotten retry after a cached close failure.
+    pub forced_close_retry_issued: bool,
     /// Closed flag.
     pub closed: bool,
-    /// The unsubscribe request currently in flight, if any.
-    ///
-    /// This mirrors Java's `Closing` state closely enough for retry ownership:
-    /// detached re-attachment legs must stop before they can enqueue a
-    /// `CommandSubscribe` behind `CommandUnsubscribe`. A broker rejection
-    /// clears the flag and restores the prior attachment generation.
-    pub(crate) unsubscribe_request_id: Option<RequestId>,
     /// Whether this consumer has completed at least one broker attachment.
     /// Provisional retries belong to the routing-aware client operation;
     /// established-handle retries remain connection-local reattachment.
@@ -363,8 +520,8 @@ pub struct ConsumerState {
     /// same-handle replies cannot satisfy the stable waiter.
     pub(crate) subscribe_waiter_request: Option<RequestId>,
     /// The active wire request succeeded, but the runtime has not yet consumed
-    /// the stable waiter completion. Preserved across reset so rebuild can
-    /// transfer the same waiter onto the replacement session.
+    /// the stable waiter completion. Reset invalidates this success bit;
+    /// the stable waiter token is retained for the rebuilt session's reply.
     pub(crate) subscribe_waiter_completed: bool,
     /// Re-attach flow gate: set while a driver-owned subscribe waits for its
     /// acknowledgement. Kept public as a boolean for source compatibility;
@@ -425,6 +582,9 @@ pub struct ConsumerState {
     /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
     /// delay has elapsed. `None` means immediate redelivery (the default).
     pub nack_tracker: Option<NegativeAcksTracker>,
+    /// Complete scalable IDs retained while a delayed negative ack is pending.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) canonical_nack_ids: rustc_hash::FxHashMap<MessageId, crate::pb::MessageIdData>,
     /// Optional unacked-message tracker. When configured via
     /// `SubscribeRequest::ack_timeout`, every delivered message is recorded into a
     /// sliding-window bucket and re-delivered if no positive ack arrives within the
@@ -437,6 +597,10 @@ pub struct ConsumerState {
     /// ack carrying this bitset so the broker knows not to advance the cursor past the
     /// batch until every position is acked.
     pub batch_ack_tracker: rustc_hash::FxHashMap<(u64, u64), BatchAckEntry>,
+    /// Local acknowledgement mutations accepted into an open Pulsar transaction.
+    /// They remain isolated from reconnect and redelivery state until commit.
+    pub(crate) pending_transactional_acks:
+        rustc_hash::FxHashMap<crate::TxnId, PendingTransactionalAcks>,
     /// Optional ack-grouping tracker. When configured via
     /// `SubscribeRequest::ack_group_time`, the runtime's `Consumer::ack_grouped` family
     /// stages individual / cumulative acks here and the state machine flushes them as one
@@ -570,6 +734,67 @@ impl BatchAckEntry {
         }
     }
 
+    /// Construct from the broker's bitset of positions that remain unacked.
+    /// An absent wire bitset means every member of the batch is available.
+    #[must_use]
+    pub fn from_ack_set(batch_size: i32, ack_set: &[i64]) -> Self {
+        if ack_set.is_empty() {
+            return Self::fresh(batch_size);
+        }
+        let size = batch_size.max(0) as usize;
+        let words = size.div_ceil(64);
+        let mut unacked = ack_set
+            .iter()
+            .take(words)
+            .map(|word| *word as u64)
+            .collect::<Vec<_>>();
+        unacked.resize(words, 0);
+        if let Some(last) = unacked.last_mut() {
+            let used = size % 64;
+            if used != 0 {
+                *last &= (1u64 << used) - 1;
+            }
+        }
+        Self {
+            batch_size,
+            unacked,
+        }
+    }
+
+    /// Construct the broker seek mask that retains the target member and every
+    /// later member in the same batch.
+    #[must_use]
+    pub fn seek_from(batch_size: i32, position: i32) -> Self {
+        let mut entry = Self::fresh(batch_size);
+        entry.clear_before(position.max(0));
+        entry
+    }
+
+    /// Construct the broker seek mask by applying an inclusive suffix to the
+    /// batch members that are still effective in `ack_set`.
+    #[must_use]
+    pub fn seek_from_ack_set(batch_size: i32, position: i32, ack_set: &[i64]) -> Self {
+        let mut entry = Self::from_ack_set(batch_size, ack_set);
+        entry.clear_before(position.max(0));
+        entry
+    }
+
+    fn clear_before(&mut self, position: i32) {
+        for index in 0..position.min(self.batch_size).max(0) {
+            self.clear(index);
+        }
+    }
+
+    fn clear(&mut self, position: i32) {
+        if position < 0 || position >= self.batch_size {
+            return;
+        }
+        let position = position as usize;
+        if let Some(word) = self.unacked.get_mut(position / 64) {
+            *word &= !(1u64 << (position % 64));
+        }
+    }
+
     /// Construct the entry a broker-delivered `CommandMessage.ack_set` describes for a batch of
     /// `batch_size` messages (issue #436, ADR-0105).
     ///
@@ -625,14 +850,22 @@ impl BatchAckEntry {
     /// (bitset all-zero), which means the caller can drop this entry and send a "full"
     /// ack (no `ack_set`) so the broker advances the cursor past the batch.
     pub fn ack_position(&mut self, position: i32) -> bool {
-        if position < 0 || position >= self.batch_size {
-            return self.is_fully_acked();
-        }
-        let p = position as usize;
-        if let Some(word) = self.unacked.get_mut(p / 64) {
-            *word &= !(1u64 << (p % 64));
-        }
+        self.clear(position);
         self.is_fully_acked()
+    }
+
+    /// Clear every member through `position` for cumulative acknowledgement.
+    pub fn ack_cumulative(&mut self, position: i32) -> bool {
+        self.clear_before(position.saturating_add(1));
+        self.is_fully_acked()
+    }
+
+    /// Number of selected members whose dispatch consumed broker permits.
+    #[must_use]
+    pub fn unacked_count(&self) -> u32 {
+        self.unacked
+            .iter()
+            .fold(0u32, |count, word| count.saturating_add(word.count_ones()))
     }
 
     /// `true` if every position in the batch has been acked.
@@ -930,11 +1163,16 @@ impl ConsumerState {
             last_adjust_at: None,
             granted_permits: 0,
             permit_balance: 0,
+            manual_flow_permits: 0,
             dispatch_units_received: 0,
             stall_watch: None,
             stall_recovery_attempts: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
+            #[cfg(feature = "scalable-topics")]
+            deferred_queue: VecDeque::new(),
+            #[cfg(feature = "scalable-topics")]
+            defer_payload_processing: false,
             chunk_reassembly: HashMap::new(),
             chunk_reassembly_order: VecDeque::new(),
             chunk_buffered_bytes: 0,
@@ -946,8 +1184,10 @@ impl ConsumerState {
             chunk_auto_ack_pending: Vec::new(),
             pending_seek: None,
             receive_wakers: Slab::new(),
+            terminal_operation: ConsumerTerminalOperation::Open,
+            close_waiters: Slab::new(),
+            forced_close_retry_issued: false,
             closed: false,
-            unsubscribe_request_id: None,
             has_ever_attached: false,
             transient_subscribe_attempts: 0,
             last_subscribe_error: None,
@@ -969,8 +1209,11 @@ impl ConsumerState {
             total_msgs_dead_lettered: 0,
             total_chunked_msgs_received: 0,
             nack_tracker: None,
+            #[cfg(feature = "scalable-topics")]
+            canonical_nack_ids: rustc_hash::FxHashMap::default(),
             unacked_tracker: None,
             batch_ack_tracker: rustc_hash::FxHashMap::default(),
+            pending_transactional_acks: rustc_hash::FxHashMap::default(),
             ack_tracker: None,
             crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
             // 3 significant digits, auto-resizing — same precision the Java client uses for
@@ -1194,7 +1437,11 @@ impl ConsumerState {
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
     pub fn maybe_flow(&mut self) -> Option<pb::CommandFlow> {
-        if self.closed || self.pending_seek.is_some() || self.paused {
+        if self.closed
+            || self.pending_seek.is_some()
+            || self.paused
+            || self.receiver_queue_size == 0
+        {
             return None;
         }
         let threshold = self.flow_threshold();
@@ -1419,7 +1666,11 @@ impl ConsumerState {
     /// Failover active-consumer-change re-arm — route through here, so each
     /// grants the policy's CURRENT target rather than a stale raw value.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
-        let permits = self.receiver_queue_size as u32;
+        let permits = if self.receiver_queue_size == 0 {
+            self.manual_flow_permits
+        } else {
+            self.receiver_queue_size as u32
+        };
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
@@ -1583,6 +1834,9 @@ impl ConsumerState {
     /// [ADR-0086]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0086-inject-now-into-proto-latency-recording.md
     pub fn pop_message(&mut self, now: std::time::Instant) -> Option<IncomingMessage> {
         let msg = self.queue.pop_front()?;
+        if self.receiver_queue_size == 0 {
+            self.manual_flow_permits = self.manual_flow_permits.saturating_sub(1);
+        }
         // Issue #301: keep the buffered-queue-bytes counter in lock-step with
         // the enqueue bump in `classify_and_queue`.
         self.queued_bytes = self.queued_bytes.saturating_sub(msg.payload.len() as u64);
@@ -1600,9 +1854,51 @@ impl ConsumerState {
         Some(msg)
     }
 
+    /// Pop one raw entry reserved for an owning scalable aggregate.
+    #[cfg(feature = "scalable-topics")]
+    pub fn pop_deferred_message(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<DeferredIncomingMessage> {
+        let entry = self.deferred_queue.pop_front()?;
+        self.manual_flow_permits = self
+            .manual_flow_permits
+            .saturating_sub(entry.dispatch_permits);
+        self.queued_bytes = self
+            .queued_bytes
+            .saturating_sub(entry.message.payload.len() as u64);
+        self.consumed_since_flow = self
+            .consumed_since_flow
+            .saturating_add(entry.dispatch_permits);
+        if let Some(histogram) = self.receive_latency_hist.as_mut() {
+            let latency_ms = u64::try_from(
+                now.saturating_duration_since(entry.message.arrived_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            histogram.saturating_record(latency_ms);
+        }
+        Some(entry)
+    }
+
+    /// Drop every raw aggregate entry during seek or session reset.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn clear_deferred_messages(&mut self) {
+        self.deferred_queue.clear();
+    }
+
     /// Number of messages waiting to be popped.
     pub fn queue_len(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + {
+            #[cfg(feature = "scalable-topics")]
+            {
+                self.deferred_queue.len()
+            }
+            #[cfg(not(feature = "scalable-topics"))]
+            {
+                0
+            }
+        }
     }
 
     /// Number of distinct incomplete chunked messages currently buffered.
@@ -1751,6 +2047,36 @@ impl ConsumerState {
             return Ok(DeliverOutcome::Dropped);
         }
         let redelivery = cmd.redelivery_count.unwrap_or(0);
+        #[cfg(feature = "scalable-topics")]
+        if self.defer_payload_processing {
+            let batch_size = metadata.num_messages_in_batch.unwrap_or(1);
+            let dispatch_permits = if batch_size > 1 {
+                BatchAckEntry::from_ack_set(batch_size, &cmd.ack_set).unacked_count()
+            } else {
+                1
+            };
+            let message = IncomingMessage {
+                message_id: MessageId::from_pb(&cmd.message_id),
+                metadata: std::sync::Arc::new(metadata),
+                single_metadata: None,
+                payload: body,
+                redelivery_count: redelivery,
+                broker_entry_metadata: broker_entry_metadata.map(std::sync::Arc::new),
+                arrived_at: now,
+            };
+            self.permit_balance = self.permit_balance.saturating_sub(dispatch_permits);
+            self.queued_bytes = self
+                .queued_bytes
+                .saturating_add(message.payload.len() as u64);
+            self.deferred_queue.push_back(DeferredIncomingMessage {
+                message,
+                message_id_data: cmd.message_id.clone(),
+                ack_set: cmd.ack_set.clone(),
+                dispatch_permits,
+            });
+            self.wake_receivers();
+            return Ok(DeliverOutcome::Buffered);
+        }
         let mut message_id = MessageId::from_pb(&cmd.message_id);
 
         // Chunked message path.
@@ -2058,17 +2384,19 @@ impl ConsumerState {
                 let mut single_mid = message_id;
                 single_mid.batch_index = idx;
                 single_mid.batch_size = num_in_batch;
-                let im = IncomingMessage {
-                    message_id: single_mid,
-                    metadata: shared_meta.clone(),
-                    single_metadata: Some(single),
-                    payload,
-                    redelivery_count: redelivery,
-                    broker_entry_metadata: shared_bem.clone(),
-                    arrived_at: now,
-                };
-                self.classify_and_queue(im, redelivery, now);
-                delivered += 1;
+                {
+                    let im = IncomingMessage {
+                        message_id: single_mid,
+                        metadata: shared_meta.clone(),
+                        single_metadata: Some(single),
+                        payload,
+                        redelivery_count: redelivery,
+                        broker_entry_metadata: shared_bem.clone(),
+                        arrived_at: now,
+                    };
+                    self.classify_and_queue(im, redelivery, now);
+                    delivered += 1;
+                }
             }
             // ADR-0112: every position the broker charged and no layout could decode is debited
             // AND refunded here, at delivery, like a dead-lettered unit (ADR-0107): it will
@@ -2204,6 +2532,18 @@ impl ConsumerState {
         self.pending_seek = Some(request_id);
         // Drop buffered messages — the broker will resend from the new position.
         self.queue.clear();
+        #[cfg(feature = "scalable-topics")]
+        {
+            self.deferred_queue.clear();
+            self.canonical_nack_ids.clear();
+        }
+        self.queued_bytes = 0;
+        // A successful seek replaces the broker-side consumer. Existing manual
+        // credit belongs to the old incarnation and must never be replayed.
+        self.manual_flow_permits = 0;
+        self.granted_permits = 0;
+        self.permit_balance = 0;
+        self.consumed_since_flow = 0;
     }
 
     /// Acknowledge a previously-issued seek. Returns the request id, if one was pending.
@@ -2229,6 +2569,53 @@ impl ConsumerState {
         if self.receive_wakers.contains(slab_key) {
             self.receive_wakers.remove(slab_key);
         }
+    }
+
+    /// Return the reusable ordinary-close completion, if it has landed.
+    #[must_use]
+    pub fn close_completion(&self) -> Option<ConsumerCloseCompletion> {
+        match &self.terminal_operation {
+            ConsumerTerminalOperation::Complete { completion, .. } => Some(completion.clone()),
+            ConsumerTerminalOperation::Open
+            | ConsumerTerminalOperation::Pending { .. }
+            | ConsumerTerminalOperation::UnsubscribePending { .. } => None,
+        }
+    }
+
+    /// Register one independently cancellable ordinary-close waiter.
+    pub fn register_close_waker(&mut self, waker: Waker) -> usize {
+        self.close_waiters.insert(waker)
+    }
+
+    /// Remove only one ordinary-close waiter, leaving operation ownership and
+    /// completion untouched.
+    pub fn cancel_close_waker(&mut self, slab_key: usize) {
+        if self.close_waiters.contains(slab_key) {
+            self.close_waiters.remove(slab_key);
+        }
+    }
+
+    /// Publish a reusable ordinary-close completion and return all waiters for
+    /// the connection to wake after releasing this slot lock.
+    pub(crate) fn complete_close(
+        &mut self,
+        request_id: RequestId,
+        completion: ConsumerCloseCompletion,
+    ) -> Vec<Waker> {
+        if let ConsumerTerminalOperation::Pending {
+            request_id: pending,
+            origin,
+        } = self.terminal_operation
+            && pending == request_id
+        {
+            self.terminal_operation = ConsumerTerminalOperation::Complete {
+                request_id: Some(request_id),
+                origin,
+                completion,
+            };
+            return self.close_waiters.drain().collect();
+        }
+        Vec::new()
     }
 
     /// Mark the consumer closed. Wakes every parked receive future so they can
@@ -2291,6 +2678,19 @@ impl ConsumerState {
             w.wake();
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTransactionalAck {
+    pub(crate) request: crate::AckRequest,
+    pub(crate) message_id_data: Option<Vec<crate::pb::MessageIdData>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingTransactionalAcks {
+    pub(crate) batch_ack_tracker: rustc_hash::FxHashMap<(u64, u64), BatchAckEntry>,
+    pub(crate) seeded_batch_keys: rustc_hash::FxHashSet<(u64, u64)>,
+    pub(crate) acknowledgements: Vec<PendingTransactionalAck>,
 }
 
 /// One member of a batched entry: its `SingleMessageMetadata` and its payload bytes.
@@ -2523,6 +2923,82 @@ mod tests {
         assert_eq!(m2.message_id.batch_index, 1);
         assert_eq!(m1.payload.as_ref(), b"a");
         assert_eq!(m2.payload.as_ref(), b"bb");
+    }
+
+    #[test]
+    fn partial_batch_delivers_only_selected_members_and_preserves_tracker_mask() {
+        let mut consumer =
+            ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = consumer.initial_flow();
+        let mut body = bytes::BytesMut::new();
+        for payload in [b"zero".as_ref(), b"one".as_ref(), b"two".as_ref()] {
+            let metadata = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            body.extend_from_slice(&(metadata.encoded_len() as u32).to_be_bytes());
+            metadata.encode(&mut body).expect("encode batch member");
+            body.extend_from_slice(payload);
+        }
+        let mut command = message_cmd(0);
+        command.ack_set = vec![0b101];
+
+        let outcome = consumer
+            .deliver(
+                &command,
+                metadata(3),
+                None,
+                body.freeze(),
+                std::time::Instant::now(),
+            )
+            .expect("deliver partial batch");
+
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 2 }));
+        let first = consumer
+            .pop_message(std::time::Instant::now())
+            .expect("first selected member");
+        let second = consumer
+            .pop_message(std::time::Instant::now())
+            .expect("second selected member");
+        assert_eq!(first.message_id.batch_index, 0);
+        assert_eq!(first.payload.as_ref(), b"zero");
+        assert_eq!(second.message_id.batch_index, 2);
+        assert_eq!(second.payload.as_ref(), b"two");
+        assert!(consumer.pop_message(std::time::Instant::now()).is_none());
+        assert_eq!(consumer.permit_balance, 98);
+        assert_eq!(
+            consumer
+                .batch_ack_tracker
+                .get(&(1, 1))
+                .expect("partial tracker")
+                .ack_set_i64(),
+            vec![0b101]
+        );
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn deferred_partial_batch_carries_command_mask_and_selected_permit_count() {
+        let mut consumer = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 0);
+        consumer.defer_payload_processing = true;
+        let mut command = message_cmd(0);
+        command.ack_set = vec![0b1010];
+
+        let outcome = consumer
+            .deliver(
+                &command,
+                metadata(4),
+                None,
+                Bytes::from_static(b"encoded batch"),
+                std::time::Instant::now(),
+            )
+            .expect("defer partial batch");
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        let deferred = consumer
+            .pop_deferred_message(std::time::Instant::now())
+            .expect("deferred entry");
+        assert_eq!(deferred.ack_set, vec![0b1010]);
+        assert_eq!(deferred.dispatch_permits, 2);
     }
 
     #[test]
@@ -3036,6 +3512,16 @@ mod tests {
         let _ = e.ack_position(99);
         assert!(!e.is_fully_acked());
         assert_eq!(e.unacked, vec![0b1111]);
+    }
+
+    #[test]
+    fn batch_ack_entry_seeds_wire_mask_and_cumulative_ack_is_bounded() {
+        let mut entry = BatchAckEntry::from_ack_set(5, &[0b1_1110, -1]);
+        assert_eq!(entry.ack_set_i64(), vec![0b1_1110]);
+        assert_eq!(entry.unacked_count(), 4);
+        assert!(!entry.ack_cumulative(2));
+        assert_eq!(entry.ack_set_i64(), vec![0b1_1000]);
+        assert!(entry.ack_cumulative(4));
     }
 
     // -------------------------------------------------------------------
@@ -4303,8 +4789,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // chunkMsgId2 := (first=2/2/2, last=3/3/3) — its "logical" id is 3/3/3.
         let id2 = MessageId {
@@ -4313,8 +4797,6 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         use core::cmp::Ordering;
         assert_eq!(id1.cmp(&id2), Ordering::Less);
@@ -4339,8 +4821,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         let logical_id_of_chunk2 = MessageId {
             ledger_id: 3,
@@ -4348,8 +4828,6 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
 
         // A plain `MessageId` matching the lastChunkMessageId of chunk1.
@@ -4359,8 +4837,6 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
-            #[cfg(feature = "scalable-topics")]
-            segment_id: None,
         };
         // Equal to itself.
         assert_eq!(logical_id_of_chunk1, logical_id_of_chunk1);
@@ -4428,6 +4904,30 @@ mod tests {
         // should leave the previous rate untouched.
         c.record_rate_window(t0);
         assert!(c.current_msgs_per_sec.is_finite());
+    }
+
+    #[test]
+    fn seek_clears_buffered_message_bytes_with_the_queue() {
+        let mut consumer =
+            ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 10);
+        let _ = consumer.initial_flow();
+        consumer
+            .deliver(
+                &message_cmd(0),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"buffered"),
+                std::time::Instant::now(),
+            )
+            .expect("buffer one message");
+        assert_eq!(consumer.queue_len(), 1);
+        assert_eq!(consumer.queued_bytes, 8);
+
+        consumer.begin_seek(RequestId(7));
+
+        assert_eq!(consumer.queue_len(), 0);
+        assert_eq!(consumer.queued_bytes, 0);
+        assert_eq!(consumer.pending_seek, Some(RequestId(7)));
     }
 
     /// Counter-backed `Wake` implementation used by the
@@ -4594,8 +5094,6 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
-                #[cfg(feature = "scalable-topics")]
-                segment_id: None,
             },
             metadata: std::sync::Arc::new(meta),
             single_metadata: None,

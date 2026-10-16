@@ -87,6 +87,8 @@ mod error;
 mod log_fields;
 mod pool;
 mod producer;
+#[cfg(feature = "scalable-topics")]
+mod scalable;
 pub mod tls_crypto;
 pub mod tls_insecure;
 pub mod tls_no_hostname;
@@ -94,6 +96,8 @@ mod transport;
 mod url_parse;
 
 use std::sync::Arc;
+#[cfg(feature = "scalable-topics")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
@@ -109,6 +113,13 @@ pub use crate::dns::{DnsResolveFuture, DnsResolver, TokioDnsResolver, arc_dns_re
 pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;
 pub use crate::producer::{Producer, SendFut};
+#[cfg(feature = "scalable-topics")]
+pub use crate::scalable::{
+    ControllerSession, DagSession, ScalableRoute, ScalableRouteError, ScalableRouteFamily,
+    ScalableRouteKey, ScalableTaskHandle, SegmentConsumerOptions, SegmentSubscriber,
+    StreamAckFailure, StreamConsumer, StreamConsumerError, StreamConsumerEvent,
+    StreamConsumerMessage, StreamConsumerOptions,
+};
 pub use crate::tls_insecure::insecure_tls_config;
 pub use crate::tls_no_hostname::tls_config_no_hostname;
 pub use crate::transport::default_tls_config;
@@ -242,6 +253,17 @@ pub struct ConnectionShared {
     /// `scalable_events`.
     #[cfg(feature = "scalable-topics")]
     pub scalable_notify: Notify,
+    /// Single-owner high-level scalable event routes.
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) scalable_routes: Arc<crate::scalable::ScalableRouteRegistry>,
+    /// Monotonic local authority generation for scalable-controller
+    /// registrations issued on this physical connection.
+    #[cfg(feature = "scalable-topics")]
+    next_controller_incarnation: AtomicU64,
+    /// Runtime-owned scalable consumer ids occupy the upper half of the wire
+    /// id space so diagnostic callers using small explicit ids do not collide.
+    #[cfg(feature = "scalable-topics")]
+    next_scalable_consumer_id: AtomicU64,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -288,6 +310,18 @@ pub enum LookupReissueReadiness {
     /// no driver will recover it. Short-circuit to `PeerClosed` (composes with
     /// the terminal fast-fail).
     Terminal,
+}
+
+#[cfg(feature = "scalable-topics")]
+fn checked_fetch_increment(counter: &AtomicU64) -> Result<u64, u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl ConnectionShared {
@@ -448,7 +482,28 @@ impl ConnectionShared {
             scalable_events: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "scalable-topics")]
             scalable_notify: Notify::new(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_routes: Arc::new(crate::scalable::ScalableRouteRegistry::default()),
+            #[cfg(feature = "scalable-topics")]
+            next_controller_incarnation: AtomicU64::new(1),
+            #[cfg(feature = "scalable-topics")]
+            next_scalable_consumer_id: AtomicU64::new(1 << 63),
         })
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_controller_incarnation(
+        &self,
+    ) -> Result<magnetar_proto::ControllerIncarnation, crate::ClientError> {
+        checked_fetch_increment(&self.next_controller_incarnation)
+            .map(magnetar_proto::ControllerIncarnation)
+            .map_err(|_| crate::ClientError::Other("controller incarnation exhausted".to_owned()))
+    }
+
+    #[cfg(feature = "scalable-topics")]
+    pub(crate) fn allocate_scalable_consumer_id(&self) -> Result<u64, crate::ClientError> {
+        checked_fetch_increment(&self.next_scalable_consumer_id)
+            .map_err(|_| crate::ClientError::Other("scalable consumer id exhausted".to_owned()))
     }
 }
 
@@ -465,6 +520,10 @@ pub struct ScalableLookup {
     pub resolved_topic_name: Option<String>,
     /// Controller broker serving this topic's layout, when advertised.
     pub controller_broker_url: Option<String>,
+    /// TLS controller broker serving this topic's layout, when advertised.
+    pub controller_broker_url_tls: Option<String>,
+    /// Complete validated initial DAG snapshot.
+    pub snapshot: magnetar_proto::DagSnapshot,
     /// Initial DAG snapshot for the topic.
     pub segments: Vec<magnetar_proto::SegmentDescriptor>,
     /// Layout epoch the snapshot was stamped with.
@@ -486,6 +545,10 @@ pub enum ScalableEvent {
         resolved_topic_name: Option<String>,
         /// Controller broker serving this topic's layout, when advertised.
         controller_broker_url: Option<String>,
+        /// TLS controller broker serving this topic's layout, when advertised.
+        controller_broker_url_tls: Option<String>,
+        /// Complete validated initial DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
         /// Initial DAG snapshot for the topic.
         segments: Vec<magnetar_proto::SegmentDescriptor>,
         /// Layout epoch the snapshot was stamped with.
@@ -497,6 +560,8 @@ pub enum ScalableEvent {
         session_id: u64,
         /// The applied delta.
         delta: magnetar_proto::DagDelta,
+        /// Complete validated replacement DAG snapshot.
+        snapshot: magnetar_proto::DagSnapshot,
     },
     /// The segment DAG changed under a live consumer (drop-on-change).
     DagChangedDuringConsume {
@@ -516,6 +581,8 @@ pub enum ScalableEvent {
     ConsumerAssigned {
         /// Consumer id that registered.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the baseline.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// The `segment://` topics this consumer owns.
         assignment: magnetar_proto::ConsumerAssignment,
     },
@@ -523,6 +590,10 @@ pub enum ScalableEvent {
     AssignmentChanged {
         /// Consumer id whose share changed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the update.
+        incarnation: magnetar_proto::ControllerIncarnation,
+        /// Complete authoritative assignment after applying the update.
+        assignment: magnetar_proto::ConsumerAssignment,
         /// What to attach to and detach from.
         delta: magnetar_proto::AssignmentDelta,
     },
@@ -530,6 +601,8 @@ pub enum ScalableEvent {
     ConsumerRejected {
         /// Consumer id whose registration failed.
         consumer_id: u64,
+        /// Local controller-connection incarnation carrying the rejection.
+        incarnation: magnetar_proto::ControllerIncarnation,
         /// Why the broker rejected it.
         reason: String,
     },
@@ -570,6 +643,91 @@ mod tests {
     use magnetar_proto::ConnectionConfig;
 
     use super::{ConnectionShared, TopicListChange};
+
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn scalable_id_allocation_is_unique_and_never_wraps() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let start = std::sync::Barrier::new(4);
+        let allocated = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let shared = shared.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        (0..128)
+                            .map(|_| {
+                                (
+                                    shared
+                                        .allocate_controller_incarnation()
+                                        .expect("incarnation")
+                                        .0,
+                                    shared.allocate_scalable_consumer_id().expect("consumer id"),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().expect("allocation thread"))
+                .collect::<Vec<_>>()
+        });
+        let incarnations: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.0).collect();
+        let consumer_ids: std::collections::BTreeSet<_> =
+            allocated.iter().map(|pair| pair.1).collect();
+        assert_eq!(incarnations, (1..=512).collect());
+        assert_eq!(consumer_ids, ((1_u64 << 63)..(1_u64 << 63) + 512).collect());
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("next incarnation")
+                .0,
+            513
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("next consumer id"),
+            (1_u64 << 63) + 512
+        );
+        shared
+            .next_controller_incarnation
+            .store(u64::MAX - 1, super::Ordering::Release);
+        shared
+            .next_scalable_consumer_id
+            .store(u64::MAX - 1, super::Ordering::Release);
+        assert_eq!(
+            shared
+                .allocate_controller_incarnation()
+                .expect("last incarnation")
+                .0,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            shared
+                .allocate_scalable_consumer_id()
+                .expect("last consumer id"),
+            u64::MAX - 1
+        );
+        assert!(shared.allocate_controller_incarnation().is_err());
+        assert!(shared.allocate_scalable_consumer_id().is_err());
+        assert_eq!(
+            shared
+                .next_controller_incarnation
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+        assert_eq!(
+            shared
+                .next_scalable_consumer_id
+                .load(super::Ordering::Acquire),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn shared_state_can_be_constructed() {

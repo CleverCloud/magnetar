@@ -1,6 +1,6 @@
 # ADR-0052 — Initial-connect timeout + bounded retry
 
-- **Status**: Accepted (amended 2026-06-12 — post-dial handshake bound)
+- **Status**: Accepted (amended 2026-10-14 — supervised handshake bound)
 - **Date**: 2026-06-03
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, connection, resilience, moonpool, java-parity, determinism
@@ -93,7 +93,7 @@ A broker that accepts the SYN but never replies to `CommandConnect` — moonpool
 The bootstrap tokio path (`Client::start_handshake` / `start_supervised_handshake`) and every moonpool `handshake_plain` caller had no timeout; only the multi-broker **pool** path already bounded its handshake wait (the `operation_timeout` deadline added for the pool-dial wait above).
 GitHub #177 reproduced this on moonpool seed `0x269b4b0a1c962f41`: the dial succeeded, the silent broker never answered, and the run went quiescent until the `run_time_budget` detector tripped a DEADLOCK.
 
-The fix extends the **same `operation_timeout` total budget** to the post-dial handshake (Java `operationTimeoutMs` parity — `operationTimeoutMs` bounds the whole connect operation, not just the socket open):
+The fix applies the existing **`operation_timeout` budget** to the post-dial binary handshake, separately from the socket dial:
 
 - **moonpool** (`handshake_plain`): `handshake_plain` takes a `bound: Option<Duration>`.
   When `Some(operation_timeout)`, it arms **exactly one** `TimeProvider::sleep(operation_timeout)` deadline _before_ the read loop, `Box::pin`s it, and polls it via `select! { biased; r = read => …, _ = deadline => Err(Io(TimedOut)) }` across every iteration.
@@ -142,3 +142,21 @@ It is **not** the lever that greens the seed sweep — the moonpool `run_time_bu
   Mirrors the moonpool shape, keeping the tokio ↔ moonpool 1:1 test count (four each).
 - **`magnetar-differential`**: `tests/connect_resilience_equivalence.rs::fault_free_connect_event_stream_parity` — a fault-free connect → producer-open → close leaves the tokio and moonpool `EventStream`s byte-identical (the dual-cap retry **and** the post-dial handshake bound are transparent pass-throughs on the happy path: the handshake deadline is armed but never fires).
 - **e2e**: `crates/magnetar/tests/e2e_connect_resilience.rs::e2e_client_retries_until_broker_reachable` — a client started before its gate (a delayed loopback proxy to the real broker) is reachable rides out the `ConnectionRefused` window under the default dual cap, connects, and completes a produce/consume round-trip.
+
+### Amendment (2026-10-14): supervised redials retain a handshake deadline
+
+After each successful supervised TCP/TLS redial, the binary handshake must reach `Connected` within the existing `ConnectionConfig::operation_timeout`.
+The driver anchors this deadline once, includes it in its existing timer, and checks it before selecting more I/O.
+Received bytes, authentication challenges and notifications do not extend the deadline.
+Once connected, ordinary keepalive and operation deadlines continue to apply; later authentication refresh does not start another initial handshake budget.
+User-requested close retains priority.
+
+On expiry the driver reports `Io(TimedOut)` and follows the existing supervisor backoff and `max_attempts` policy.
+A socket that never completed its handshake does not reset the attempt budget or backoff merely by outliving `drop_grace`.
+Tokio uses its runtime clock; Moonpool uses its injected monotonic clock and existing timer.
+No new timeout configuration is introduced.
+
+This preserves the Java client's liveness property, rather than equating its timeout values: Pulsar 4.2.5 `PulsarHandler.channelActive` schedules keepalive before the handshake, and `handleKeepAliveTimeout` closes a channel whose handshake never completed.
+Magnetar uses the operation budget already applied to initial handshakes.
+A controlled healthy → silent-handshake → healthy server regression exercises both engines; a finite-attempt variant checks that silent sessions cannot renew the budget.
+The assertions cover transport abandonment, successful recovery and terminal exit at a finite attempt budget.

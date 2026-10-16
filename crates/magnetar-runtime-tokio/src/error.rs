@@ -39,6 +39,10 @@ pub enum ClientError {
     #[error("connection is closed")]
     Closed,
 
+    /// Internal scalable-child receive reached its broker terminal marker.
+    #[error("consumer reached end of topic")]
+    EndOfTopic,
+
     /// Send was rejected by the broker.
     #[error("send rejected: code={code} message={message}")]
     SendRejected {
@@ -99,6 +103,34 @@ pub enum ClientError {
         /// The topic whose lookup triggered the proxy-routing requirement.
         topic: String,
     },
+
+    /// No controller authority matches the active bootstrap transport.
+    #[error("scalable-topic controller authority is unavailable for the active transport")]
+    ControllerUnavailable,
+
+    /// Direct controller routing cannot be represented by this client shape.
+    #[error("scalable-topic controller routing is unsupported: {reason}")]
+    ControllerRoutingUnsupported {
+        /// Stable, non-secret reason.
+        reason: &'static str,
+    },
+
+    /// The configured redirect allow-list rejected a broker-authored authority.
+    #[error("broker-authored scalable authority was rejected by the redirect allow-list")]
+    ScalableAuthorityRejected,
+
+    /// The controller rejected an assignment stream or registration baseline.
+    #[cfg(feature = "scalable-topics")]
+    #[error("scalable-topic assignment was rejected: {reason}")]
+    ScalableAssignmentRejected {
+        /// Stable controller/protocol rejection reason.
+        reason: String,
+    },
+
+    /// An owned scalable control-plane route failed or was fenced.
+    #[cfg(feature = "scalable-topics")]
+    #[error(transparent)]
+    ScalableRoute(#[from] crate::ScalableRouteError),
 
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]

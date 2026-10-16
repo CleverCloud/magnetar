@@ -42,9 +42,13 @@ CI runs `cargo tree -p magnetar-proto -e features` and fails if forbidden names 
 
 The state machine never reads a clock it was not handed.
 
-- Monotonic time arrives as an explicit `now: Instant` parameter, placed **last** in the argument list (`queue_send(msg, publish_time_ms, now)`, `Connection::ack(handle, ack, now)`, `pop_message(handle, now)`). Wall-clock time arrives through the `wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>` provider.
-- `Instant::now()`, `SystemTime::now()`, and `.elapsed()` are forbidden in `crates/magnetar-proto/src/**` outside `#[cfg(test)]`. There is no file allowlist. Engines snapshot the clock at the call boundary — and **before** taking the connection mutex, per the lock ordering below — so `magnetar-runtime-moonpool` can substitute a virtual clock and reproduce every derived value bit-for-bit per seed.
-- `Instant` arithmetic must not panic (invariant: no panics in `magnetar-proto`). Use `now.saturating_duration_since(base)` instead of `now - base`, and `crate::time::deadline_with_clamp(base, delta)` instead of `base + delta`.
+- Monotonic time arrives as an explicit `now: Instant` parameter, placed **last** in the argument list (`queue_send(msg, publish_time_ms, now)`, `Connection::ack(handle, ack, now)`, `pop_message(handle, now)`).
+  Wall-clock time arrives through the `wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>` provider.
+- `Instant::now()`, `SystemTime::now()`, and `.elapsed()` are forbidden in `crates/magnetar-proto/src/**` outside `#[cfg(test)]`.
+  There is no file allowlist.
+  Engines snapshot the clock at the call boundary — and **before** taking the connection mutex, per the lock ordering below — so `magnetar-runtime-moonpool` can substitute a virtual clock and reproduce every derived value bit-for-bit per seed.
+- `Instant` arithmetic must not panic (invariant: no panics in `magnetar-proto`).
+  Use `now.saturating_duration_since(base)` instead of `now - base`, and `crate::time::deadline_with_clamp(base, delta)` instead of `base + delta`.
 - Enforcement → `cargo run -p xtask -- check-no-internal-clock`, whose scanner skips `#[cfg(test)]` spans and comments / string literals and is unit-tested in `xtask/src/main.rs`.
 - Two documented non-time leaks (`uuid::Uuid::new_v4()` in chunked emit, `std::env::var()` in `TokenAuth` bootstrap) are tracked in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-non-determinism-leaks-documented) and are **not** mechanically enforced.
 - See [ADR-0011](specs/adr/0011-clock-injection-sans-io.md) and [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md).
@@ -114,27 +118,29 @@ Any change that alters runtime behavior, public API, wire format, or touches `ma
 2. **`magnetar-runtime-tokio` integration test** under `crates/magnetar-runtime-tokio/tests/`.
 3. **`magnetar-runtime-moonpool` integration test** under `crates/magnetar-runtime-moonpool/tests/`.
 4. **`magnetar-differential` equivalence test** asserting tokio ↔ moonpool user-visible `EventStream` parity.
-5. **Docker end-to-end test** under `crates/magnetar/tests/e2e_*.rs` — no Cargo feature and no `#[ignore]`.
-   The `e2e` and `e2e-multi-cluster` features were deleted, so these run on every `cargo test --workspace --all-features` and every CI push; a host without Docker fails them instead of skipping them ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)).
+5. **Docker end-to-end test** under `crates/magnetar/tests/e2e_*.rs` — no dedicated `e2e` Cargo feature; exact quarantine exceptions and reactivation criteria are listed in the canonical [test-quarantine register](docs/test-quarantine.md) ([ADR-0123](specs/adr/0123-quarantine-exact-intermittent-test-scenarios.md)). The ACK/NACK exception and pre-existing issue #462 ignore remain separate policy deviations.
+   Owning product features still gate feature-specific targets (`e2e_scalable_topic.rs` requires `scalable-topics`); `cargo test --workspace --all-features` activates them all on every CI push, and a host without Docker fails instead of skipping.
 
-**Sim coverage** — every line the diff (`merge-base origin/main HEAD`) adds inside the gate's reported scope must be executed by the moonpool run: **100% line coverage on the diff**.
-Measured by `cargo run -p xtask -- check-sim-coverage`, which drives `cargo llvm-cov` to the LCOV report `target/sim-coverage.lcov` and intersects it with the merge-base diff.
+**Patch coverage** — every executable line the diff (`merge-base origin/main HEAD`) adds inside either reported domain must have **100% line coverage on the diff**. `cargo run -p xtask -- check-sim-coverage` runs Moonpool+differential evidence for shared/proto/Moonpool/differential/façade/fakes/auth source and a separate Tokio unit/integration+differential pass for Tokio adapter source (ADR-0121). A nonzero test exit does not stop fresh reporting in either domain; valid current-pass reports remain diagnostic while the test failure stays fatal, and collection/infrastructure failures remain separately fatal (ADR-0123).
+One locked, invocation-owned scratch root contains separate targets, objects, profiles, profdata, and reports for the two domains; neither can discharge the other, LCOV outputs are diagnostic only, and no cached or cross-domain input is reused ([ADR-0118](specs/adr/0118-isolate-sim-coverage-current-pass-artifacts.md), [ADR-0121](specs/adr/0121-isolate-moonpool-and-tokio-coverage-evidence.md)).
 The requirement on the author is hard, and since [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) the gate's enforcement of it is too — see **Enforcing landing** below.
 
 Execution scope and report scope are two different sets, and the distinction is binding:
 
-- **Executed** — `-p magnetar-runtime-moonpool -p magnetar-differential`.
-  Only those two crates' test binaries run, so an added `magnetar-proto` line counts as covered only when a moonpool or differential test reaches it.
-  A `magnetar-proto` unit test never satisfies this gate.
-- **Reported** — `magnetar-proto`, `magnetar-runtime-tokio`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl` (measured 2026-07-31: 63 `SF:` records, against 16 before).
-  Instrumentation is workspace-wide regardless of `-p`, so the wider report is a second `cargo llvm-cov report` pass over artifacts already on disk — no extra compilation and no second test run.
+- **Moonpool domain** — executes `-p magnetar-runtime-moonpool -p magnetar-differential` and reports `magnetar-proto`, `magnetar-runtime-moonpool`, `magnetar-differential`, `magnetar-auth-athenz`, `magnetar-auth-sasl`, `magnetar-driver`, and `magnetar-fakes`.
+  A proto or shared line still requires Moonpool or differential evidence.
+- **Tokio domain** — executes `-p magnetar-runtime-tokio -p magnetar-differential` but reports only `magnetar-runtime-tokio`.
+  Honest Tokio unit and integration tests discharge private adapter lines, while Tokio profiles can never satisfy the Moonpool/shared domain.
+  The original six-package widening measured 63 `SF:` records on 2026-07-31 against 16 before; that is historical evidence, not the current seven-plus-one topology. Each current domain performs its own execution and report in a distinct target.
+  Reports are read inside scratch and retained in memory; diagnostics are atomically published only after cleanup.
   Generated code under `crates/magnetar-proto/src/pb/` stays excluded, as is every line inside a `#[cfg(test)]` span — span membership via the shared `cfg_test_line_flags`, the same scanner `check-no-internal-clock` and `check-log-fields` use.
-  Until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) this gate instead cut at a file's **first** `#[cfg(test)]` line and dropped everything below it; because that line is usually a gated `use` or helper rather than the bottom `mod tests`, it exempted 48% of all gated lines and 71% of those added over the preceding ten merged PRs. Do not reintroduce a line-cut heuristic here.
+  Until [ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md) this gate instead cut at a file's **first** `#[cfg(test)]` line and dropped everything below it; because that line is usually a gated `use` or helper rather than the bottom `mod tests`, it exempted 48% of all gated lines and 71% of those added over the preceding ten merged PRs.
+  Do not reintroduce a line-cut heuristic here.
 
-The `magnetar` façade is deliberately in neither set: the run never compiles it, which keeps its Docker-bound `crates/magnetar/tests/e2e_*.rs` suite out of the coverage run.
-Additions under `crates/magnetar/src/**` therefore print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md), which also records the narrower scope this widening replaces.
-That holds under `--enforce` too: the ungated report is a scope limit, not a verdict, so no flag turns it fatal.
-See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the policy the gate serves.
+The `magnetar` façade library and `magnetar-fakes` are in the reported and hard-gated set because `magnetar-differential` now compiles and exercises both.
+The façade's Docker-bound `crates/magnetar/tests/e2e_*.rs` targets do not run under either coverage domain.
+Additions in `magnetar-admin`, `magnetarctl`, `magnetar-auth-oauth2`, `magnetar-messagecrypto`, and any other uncompiled package still print as `not gated` and do not fail the check — advisory only, per [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md) as amended by [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md).
+That holds under `--enforce` too: the ungated report is a scope limit, not a verdict, so no flag turns it fatal. See [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) for the policy the gate serves.
 
 **Enforcing landing** — `SIM_COVERAGE_ENFORCES_UNCOVERED = true` in `xtask/src/main.rs`, so an uncovered added line inside the reported scope is printed in full, with a count, and **fails** the check ([ADR-0092](specs/adr/0092-enforce-sim-coverage-and-gate-every-pull-request.md)).
 A green `check-sim-coverage` is therefore evidence of the 100%-on-the-diff requirement above, for the lines in the reported scope — and still says nothing about anything outside it, which is what the `not gated` lines are for.
@@ -146,9 +152,11 @@ Making that job actually block a merge is a branch-protection step in repository
 Because the flag would mask exactly that regression, the constant is pinned outside the CI job by a `const` assertion in `sim_coverage_enforces_uncovered_by_default`: reverting the flip stops the `xtask` **test** build compiling (`cargo test` / `clippy --all-targets`, both of which CI runs workspace-wide), while a plain `cargo build` is unaffected since the assertion lives in a `#[cfg(test)]` module.
 Cutting the call site instead — `let enforcing = enforce;` — slips past that assertion and past the whole test; what catches it is `dead_code` under `-D warnings`, which is why `sim_coverage_enforcing` exists as a named `const fn` with one production call site.
 
-One failure stays unconditional: an added file in a gated crate whose crate emitted **no** coverage records at all fails the check whatever the constant says.
-That signals a broken or misconfigured gate rather than a missing test, and a gate that cannot measure must never report success.
-A record-less file inside a crate that did emit records stays advisory — it simply has no executable lines.
+ADR-0120's missing-file evidence rule stays unconditional: an added file in a gated crate with no `SF:` record fails when its crate emitted no records or the file contains a non-test function body.
+Executable `unreachable!`, `unimplemented!`, and `todo!` lines have no lexical exclusion.
+Missing `DA:` mappings inside an otherwise recorded file remain an unresolved follow-up; no lexical function parser is part of this gate.
+That signals a broken or incomplete measurement rather than a missing test, and a gate that cannot measure must never report success.
+A record-less file with no non-test function body stays advisory because module/export/constant/bodyless-declaration source has no executable coverage mapping.
 
 **Runtime parity** — `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep **strict 1:1 test count** (`#[test]`
 
