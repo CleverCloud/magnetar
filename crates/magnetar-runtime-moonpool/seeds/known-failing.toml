@@ -439,6 +439,28 @@ per-PR seed-replay re-validates this fix.
 """
 
 [[seed]]
+value        = "0xf6ce08aa819ecabe"
+discovered   = "2026-10-12"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/38238716077"
+commit_sha   = "50b67023fcec2859593e293687a71e36b5fff9c7"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/876"
+note         = """
+The daily sweep reported this seed against 50b67023. The exact targeted
+replay fails on that commit: clogged consumer 0 receives nothing while
+consumers 1–4 receive all eight messages, with restore_order=[0]. The same
+test passes on main 46792879ecde265c50ffaf10616396f14a894f7b. A controlled
+main replay with manual FLOW credit accounting and reconnect replay removed
+also passes, so the failure's cause is not attributed to that behavior and
+no causal fix is claimed here.
+
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay reruns this deterministic seed against current code to
+detect recurrence; it does not reproduce the historical failure.
+"""
+
+[[seed]]
 value        = "0xc364f2c842343a83"
 discovered   = "2026-10-06"
 workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37448794181"
