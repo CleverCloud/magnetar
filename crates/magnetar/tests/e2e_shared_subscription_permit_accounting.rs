@@ -69,12 +69,31 @@
 //! | `5.0.0-M2` | 5.0.0-M2 | 12 | 1 | 0 in eleven runs, −2 in one |
 //!
 //! The −2 `5.0.0-M2` result is reported in the 2026-09-18 investigation,
-//! but its raw log and hash were not archived with that report. The current
+//! but its raw log and hash were not archived with that report. The 2026-09-30
 //! four-run reproduction is archived separately in the issue #462 record.
-//! As observed on 2026-09-30, no tested stable GA image passed; `latest` is
-//! 4.2.4, and 4.0.14 / 4.2.5 were unpublished. `5.0.0-M2` is a milestone
-//! build carrying both merged patches, but the historical matrix also reports
-//! one negative run on that image.
+//!
+//! ## Published GA images, observed on 2026-10-16
+//!
+//! The tags `4.0.14`, `4.2.5`, and `5.0.0` are now published. This bounded
+//! post-PR-399 sample ran the test binary built from `46792879ecde265c50ffaf10616396f14a894f7b`
+//! and used the following multi-platform image-index digests:
+//!
+//! | tag | index digest | current runs and broker result |
+//! | --- | --- | --- |
+//! | `4.0.14` | `sha256:d404b4db9b809cd4e8b65fc2120a97dbc024c222fc2d53041d900c7d5a5f1f2d` | 3/3 passed; 98, 102, and 99 observations; minimum 0 and no negative readings in each run; 8, 4, and 7 discarded deferred credits. |
+//! | `4.2.5` | `sha256:34954c978ecf26808243091495660c8feda6d40241a3ff77aa17bc49f93041a1` | Run 1 passed (102 observations, minimum 0, no negatives, 4 discarded credits); run 2 failed (101 observations, minimum −2, 1 negative, 5 discarded credits). The failing raw log SHA-256 is `0107369d8a0b47b7b93e9254f13f994e4f67d5768989e2a51c8000720aa825a7`. |
+//! | `5.0.0` | — | Not run in this campaign: it stopped at the first current-source GA failure on `4.2.5`. |
+//!
+//! The first `4.2.5` run reused the already-built test executable (`cargo`
+//! reported the test profile finished in 0.45s); its `RANLIB` environment
+//! value was mistyped, but no compiler ran in that invocation. The failing
+//! run used `RANLIB=llvm-ranlib`. Only the failing run's raw log was retained;
+//! raw logs for the four passing runs were not archived. The 2026-10-12
+//! matrix report ([PR #881](https://github.com/CleverCloud/magnetar/pull/881))
+//! recorded 7/10 passing runs on each of `4.2.5` and `5.0.0`, with red results
+//! reaching −2; those results predate PR #399 and are not combined with this
+//! sample. The current sample does not establish a reliably green published
+//! image, and the ignore remains pending issue #462.
 //!
 //! Two limits of those historical results:
 //!
@@ -105,7 +124,8 @@
 //! ```
 //!
 //! `MAGNETAR_PULSAR_IMAGE_TAG` selects the broker under test, so the same
-//! binary runs a compatibility matrix (`4.0.4`, `4.2.4`, `5.0.0-M2`, …).
+//! binary runs a compatibility matrix (for example, `4.0.14`, `4.2.5`, and
+//! `5.0.0`), selected by the exact published tag.
 //!
 //! Requires Docker on the host.
 
@@ -664,25 +684,27 @@ async fn churn_round(
 /// [ADR-0046](../../../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) makes the
 /// e2e suite run as a regular `cargo test`, deliberately: an e2e test behind `#[ignore]` is an
 /// e2e test nobody runs. This existing ignore conflicts with that policy and
-/// remains tracked by issue #462 while the tested GA broker fails the assertion.
+/// remains tracked by issue #462 while a tested published GA broker fails the
+/// assertion intermittently.
 ///
 /// Every other e2e test asserts something about **magnetar**. This one asserts
 /// something about the **broker**: that `apache/pulsar#26416`'s deferred-flow
 /// accounting leak is absent under this client's Flow/Subscribe traffic and
-/// timing. No tested generally available image has passed — Docker Hub's `apachepulsar/pulsar`
-/// stopped at 4.0.13 and 4.2.4 when checked on 2026-09-30, while 4.0.14 / 4.2.5
-/// were unpublished. The published 4.0.13 image failed this test on 2026-09-30:
-/// its aggregate reached -16, with 79 negative readings among 98 observations.
-/// Left running on that `latest` default it would be **red in CI on a
-/// defect this repository cannot fix**, which is the failure mode the enforcement rules
-/// exist to prevent: a check that is always failing stops being read.
+/// timing. On 2026-10-16, commit `46792879ecde265c50ffaf10616396f14a894f7b`
+/// was tested against the published `4.2.5` image (index digest
+/// `sha256:34954c978ecf26808243091495660c8feda6d40241a3ff77aa17bc49f93041a1`);
+/// it passed one run and failed the next: the second run observed 1 negative
+/// `totalAvailablePermits` reading of −2 among 101 observations. The published
+/// `4.0.14` image passed three diagnostic runs, but that small sample does not
+/// establish reliability. Earlier reports also include 7/10 passing runs on
+/// both `4.2.5` and `5.0.0`, with a minimum of −2; they predate PR #399.
 ///
-/// It keeps the `latest` default rather than pinning the milestone image. A
-/// qualifying stable image must pass repeatedly before the `#[ignore]` can be removed — tracked by
-/// [issue #462](https://github.com/CleverCloud/magnetar/issues/462), which also owns the
-/// choice between removing it and recording the exception in ADR-0046 itself.
+/// The current default remains `4.2.5`; `MAGNETAR_PULSAR_IMAGE_TAG` selects
+/// another exact tag for reproduction. Keep this test ignored until issue
+/// #462's reliable-green criterion is met; do not infer a fix from merged
+/// upstream patches or a short run of passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "asserts apache/pulsar#26416; tested GA 4.0.13/4.2.4 fail (4.0.14/4.2.5 unpublished). Reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.4 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting -- --ignored"]
+#[ignore = "issue #462: published GA 4.2.5 still reached totalAvailablePermits=-2; reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.5 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting --locked -- --ignored --nocapture"]
 async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, container) = start_pulsar().await?;
