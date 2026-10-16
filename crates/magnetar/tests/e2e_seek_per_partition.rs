@@ -28,8 +28,10 @@ use common::pulsar::start_pulsar;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
+#[ignore = "quarantine: intermittent Pulsar 5.0.0 redelivery; see docs/test-quarantine.md"]
 async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
+    eprintln!("QUARANTINE_PULSAR_READY");
 
     // Create a 4-partition topic via the admin API.
     let admin = magnetar_admin::AdminClient::builder()

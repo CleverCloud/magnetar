@@ -32,6 +32,11 @@ on:
           sets this; the other runs skip that one target (ADR-0116 decision 4).
         type: boolean
         default: false
+      quarantine_test:
+        description: Exact ignored test name to run diagnostically after the regular e2e preflight.
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -46,21 +51,13 @@ env:
 
 jobs:
   e2e:
-    name: e2e ${{ matrix.label }}${{ inputs.pip33 && matrix.shard == 3 && ' + PIP-33' || '' }}
+    name: "e2e ${{ matrix.label }}${{ inputs.quarantine_test != '' && format(' (quarantine: {0})', inputs.quarantine_test) || '' }}${{ inputs.pip33 && matrix.shard == 3 && ' + PIP-33' || '' }}"
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shard: 0
-            label: 1/4
-          - shard: 1
-            label: 2/4
-          - shard: 2
-            label: 3/4
-          - shard: 3
-            label: 4/4
+        include: ${{ inputs.quarantine_test != '' && fromJSON('[{"shard":0,"label":"diagnostic"}]') || fromJSON('[{"shard":0,"label":"1/4"},{"shard":1,"label":"2/4"},{"shard":2,"label":"3/4"},{"shard":3,"label":"4/4"}]') }}
     steps:
       - name: Check the Pulsar tag is a plain version
         env:
@@ -70,8 +67,19 @@ jobs:
             echo "::error::'$PULSAR_TAG' is not an exact Pulsar version tag"
             exit 1
           fi
+      - name: Check the quarantined test name
+        if: ${{ inputs.quarantine_test != '' }}
+        env:
+          QUARANTINE_TEST: ${{ inputs.quarantine_test }}
+        run: |
+          if [ "$QUARANTINE_TEST" != e2e_seek_per_partition_callback ]; then
+            echo "::error::unsupported quarantined e2e test '$QUARANTINE_TEST'"
+            exit 1
+          fi
       - uses: actions/checkout@v7
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
       - name: Free disk space
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           android: true
@@ -82,10 +90,14 @@ jobs:
           preinstalled-runtimes: false
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
       - uses: Swatinem/rust-cache@v2
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - name: Pre-pull Pulsar broker images
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
         run: |
           # The axis tag first (`${{ inputs.pulsar }}`, what every Broker::Default suite boots),
           # then one line per tag constant of crates/magnetar/tests/common/pulsar.rs that a
@@ -99,8 +111,10 @@ jobs:
           docker pull apachepulsar/pulsar:4.2.5
           docker pull apachepulsar/pulsar:5.0.0
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
         run: docker pull gcavalcante8808/krb5-server:alpine_3.19.0
       - name: Pre-pull Athenz ZTS image
+        if: ${{ inputs.quarantine_test == '' || matrix.shard == 0 }}
         run: docker pull athenz/athenz-zts-server:1.12.47
       - name: Bring up two-cluster Pulsar fixture (PIP-33)
         if: ${{ inputs.pip33 && matrix.shard == 3 }}
@@ -144,7 +158,66 @@ jobs:
         if: ${{ inputs.pip33 && matrix.shard == 3 }}
         working-directory: crates/magnetar/tests/fixtures
         run: ./configure_replicated_subs.sh
+      - name: Compile quarantined e2e target
+        if: ${{ inputs.quarantine_test != '' && matrix.shard == 0 }}
+        env:
+          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
+        run: cargo test -p magnetar-driver --all-features --locked --test e2e_seek_per_partition --no-run
+      - name: Verify quarantined e2e selection
+        if: ${{ inputs.quarantine_test != '' && matrix.shard == 0 }}
+        env:
+          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
+        run: |
+          set -euo pipefail
+          selected=$(cargo test -p magnetar-driver --all-features --locked --test e2e_seek_per_partition -- --ignored --exact e2e_seek_per_partition_callback --list)
+          printf '%s\n' "$selected"
+          count=$(printf '%s\n' "$selected" | awk '/^e2e_seek_per_partition_callback: test$/ { count++ } END { print count + 0 }')
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly one quarantined e2e test, found $count"
+            exit 1
+          fi
+      - name: Run quarantined e2e test
+        id: run_quarantined_e2e
+        if: ${{ inputs.quarantine_test != '' && matrix.shard == 0 }}
+        continue-on-error: true
+        env:
+          MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
+        run: |
+          set -uo pipefail
+          cargo test -p magnetar-driver --all-features --locked --test e2e_seek_per_partition -- --ignored --exact e2e_seek_per_partition_callback --nocapture 2>&1 | tee "$RUNNER_TEMP/quarantine-e2e.log"
+          statuses=("${PIPESTATUS[@]}")
+          test_status=${statuses[0]}
+          tee_status=${statuses[1]}
+          printf 'test_status=%s\ntee_status=%s\n' "$test_status" "$tee_status" >> "$GITHUB_OUTPUT"
+          if [ "$tee_status" -ne 0 ]; then
+            exit 125
+          fi
+          exit "$test_status"
+      - name: Require successful broker startup for a diagnostic result
+        if: ${{ steps.run_quarantined_e2e.outcome == 'failure' && matrix.shard == 0 }}
+        env:
+          TEE_STATUS: ${{ steps.run_quarantined_e2e.outputs.tee_status }}
+        run: |
+          if [ "$TEE_STATUS" != 0 ]; then
+            echo "::error::failed to preserve the quarantined e2e log; treating this as infrastructure failure"
+            exit 1
+          fi
+          if ! grep -Fq 'QUARANTINE_PULSAR_READY' "$RUNNER_TEMP/quarantine-e2e.log"; then
+            echo "::error::quarantined e2e failed before its Pulsar readiness marker; treating this as infrastructure failure"
+            exit 1
+          fi
+          echo "The test reached its Pulsar-backed scenario and failed after startup; preserving it as a non-gating diagnostic."
+      - name: Report quarantined e2e result
+        if: ${{ always() && inputs.quarantine_test != '' && matrix.shard == 0 }}
+        env:
+          TEST_OUTCOME: ${{ steps.run_quarantined_e2e.outcome }}
+          TEST_STATUS: ${{ steps.run_quarantined_e2e.outputs.test_status }}
+          TEE_STATUS: ${{ steps.run_quarantined_e2e.outputs.tee_status }}
+          PULSAR_TAG: ${{ inputs.pulsar }}
+        run: >-
+          printf '%s\n' "e2e_seek_per_partition_callback on Pulsar $PULSAR_TAG: step=$TEST_OUTCOME test_exit=$TEST_STATUS log_exit=$TEE_STATUS (diagnostic; test result does not gate CI)." >> "$GITHUB_STEP_SUMMARY"
       - name: Run e2e shard
+        if: ${{ inputs.quarantine_test == '' }}
         env:
           MAGNETAR_PULSAR_IMAGE_TAG: ${{ inputs.pulsar }}
           PIP33_FIXTURE: ${{ inputs.pip33 }}

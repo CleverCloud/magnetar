@@ -1,6 +1,6 @@
 # ADR-0121 — Isolate Moonpool and Tokio patch-coverage evidence
 
-- **Status**: Accepted
+- **Status**: Accepted, **runner result contract amended by [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md)**: after test failure both domains' report collection is attempted; only valid current-pass reports are published, and test, infrastructure, collection, and coverage failures stay fatal. Domain ownership and the 100% diff threshold are unchanged.
 - **Date**: 2026-08-12
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, tokio, moonpool, artifact-provenance, ci

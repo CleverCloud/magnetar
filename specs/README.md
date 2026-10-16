@@ -137,6 +137,7 @@ ADRs are immutable once `Accepted` — if a decision is reversed, write a new AD
 | [0120](adr/0120-assignment-driven-m1-hardened-stream-consumer.md) | Implement assignment-driven scalable StreamConsumer with bounded delivery and lifecycle fencing | Accepted |
 | [0121](adr/0121-isolate-moonpool-and-tokio-coverage-evidence.md) | Isolate Moonpool and Tokio coverage evidence | Accepted |
 | [0122](adr/0122-cancellation-safe-consumer-close-singleflight.md) | Make consumer close cancellation-safe and single-flight | Accepted |
+| [0123](adr/0123-quarantine-exact-intermittent-test-scenarios.md) | Quarantine exact intermittent test scenarios with visible diagnostics | Accepted |
 | ADR-0069's fixed retry count, backoff, and error classification are historical and superseded by ADR-0080; its terminal failure surfaces and recoverable receive gating remain binding.                                                                                                                                                                         |
 | ADR-0070's "outbound is not starved because the write runs at the top of the loop" premise and ADR-0074's fixed unconditional write-continuation arm are both amended by ADR-0083, which makes the write a genuine, cancellable, deadline-bound `select!` arm instead; both ADRs' read-arm-first ordering and `DRIVER_WRITE_BUDGET_BYTES` bound remain binding. |
 

@@ -1,6 +1,6 @@
 # ADR-0046 — e2e tests are casual: no feature flag, no `#[ignore]`
 
-- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); §5's single-job CI topology superseded by [ADR-0098](0098-parallelize-per-pr-test-execution.md). The no-feature-gate decision stands; this amendment records one new temporary, test-specific `#[ignore]` exception. The pre-existing issue #462 ignore remains a separate tracked policy deviation and is not authorized or changed here.
+- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); §5's single-job CI topology superseded by [ADR-0098](0098-parallelize-per-pr-test-execution.md). The no-feature-gate decision stands. [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md) adds a separate exact-name E2E quarantine and its test-specific diagnostics; the canonical inventory and reactivation criteria are in [test-quarantine.md](../../docs/test-quarantine.md). The ACK/NACK exception documented below remains distinct, as does the pre-existing issue #462 policy deviation.
 - **Date**: 2026-06-01
 - **Decider**: Florentin Dubois
 - **Tags**: testing, ci, process, agents
@@ -56,6 +56,8 @@ They are already pulled in for every `cargo test`; the `#![cfg(feature = "e2e")]
 `crates/magnetar/tests/e2e_reconnect_safety.rs::e2e_unconfirmed_high_ack_never_skips_nacked_lower_message` remains in the test tree with all assertions intact and carries this amendment's only new temporary E2E `#[ignore]`. It covers durable and non-durable reconnect behavior after a higher ACK and a lower NACK. The upstream [apache/pulsar#26924](https://github.com/apache/pulsar/issues/26924) proposes a source-level non-durable cursor-cleanup race, but that race has not been reproduced at runtime and its connection to this intermittent result is unproven.
 
 Remove this `#[ignore]` only after the investigation determines whether the issue applies and any confirmed cause is corrected or shown not to reproduce on supported brokers. The unchanged test must then pass three isolated runs on each CI E2E image (`4.2.5` and `5.0.0`), and the regular per-PR broker matrix must be green. No assertion may be weakened or removed.
+
+The separate exact-name E2E quarantine added by [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md) is tracked with the other approved scenarios in the canonical [test-quarantine register](../../docs/test-quarantine.md); it does not broaden this ACK/NACK exception.
 
 The `scalable-topics` and `experimental-v5-client` features remain "default off" per ADR-0031 / ADR-0032 because they gate the **production surface**, not the test gate.
 Under `--all-features` (the validation chain default) their e2e tests still run.

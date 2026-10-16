@@ -6549,6 +6549,7 @@ async fn compressed_partial_batch_and_chunk_delivery_are_equivalent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "quarantine: intermittent fake-broker regression; see docs/test-quarantine.md"]
 async fn busy_and_withdrawn_child_opens_are_equivalent() {
     let _serial = advanced_socket_test_guard();
     let tokio_trace = run_tokio_child_open_lifecycle().await;

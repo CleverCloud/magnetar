@@ -108,8 +108,8 @@ The feature flags catalog:
 | `schema-avro`        | no      | Compiles `AvroSchema` and its `apache-avro` dependency (`magnetar-proto/schema-avro`). Needed to name `magnetar::proto::schema::AvroSchema`; every other schema is always available. See [ADR-0117](specs/adr/0117-make-avro-schema-support-opt-in-behind-schema-avro.md).                                                               |
 
 <!-- `e2e` and `e2e-multi-cluster` features removed per ADR-0046: the
-end-to-end suite runs as regular `cargo test` targets with no dedicated e2e gate and no `#[ignore]`.
-Owning product features still apply, and Docker on the host is the runtime prerequisite. -->
+end-to-end suite has no dedicated e2e gate; exact quarantines are listed in
+docs/test-quarantine.md per ADR-0123. Owning product features and Docker still apply. -->
 
 | `experimental-v5-client` | no | Enables the PIP-466 V5 wrapper surface (`magnetar::v5`) over the v4 wire commands. |
 | `scalable-topics` | no | Enables the experimental PIP-460 scalable-topic surface (`topic://`, assignment-driven typed `StreamConsumer`, raw layout sessions, `topic-info`). Negotiated per connection; refuses locally without emitting a scalable command against Pulsar 4.x. |
@@ -908,7 +908,7 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`); per-PR CI parallelizes that surface into one non-e2e cell and four e2e cells per Pulsar version ([ADR-0098](specs/adr/0098-parallelize-per-pr-test-execution.md), [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
+End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`); the exact `#[ignore]` quarantines are listed in [docs/test-quarantine.md](docs/test-quarantine.md) under ADR-0123. Per-PR CI parallelizes the regular surface into one non-e2e cell and four e2e cells per Pulsar version ([ADR-0098](specs/adr/0098-parallelize-per-pr-test-execution.md), [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
 Docker is the only prerequisite; the suite spins `apachepulsar/pulsar:4.2.5` via `testcontainers-rs`, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` (or `4.0.14`) runs the same suite on another broker.
 
 Additional `xtask` checks specific to the sans-io invariants:

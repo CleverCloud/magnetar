@@ -3211,6 +3211,7 @@ async fn concurrent_and_batch_receive_are_equivalent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "quarantine: intermittent fake-broker regression; see docs/test-quarantine.md"]
 async fn aggregate_receiver_budget_is_equivalent() {
     let tokio = run_tokio_budget().await;
     let moonpool = run_moonpool_budget().await;

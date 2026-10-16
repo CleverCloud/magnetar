@@ -2665,6 +2665,14 @@ struct DomainEvidence {
     elapsed: Duration,
 }
 
+#[derive(Debug, Default)]
+struct SimCoverageRun {
+    evidence: Vec<DomainEvidence>,
+    test_failures: Vec<String>,
+    infrastructure_failures: Vec<String>,
+    collection_failures: Vec<String>,
+}
+
 const MOONPOOL_COVERAGE_REPORT_PACKAGES: &[&str] = &[
     "magnetar-proto",
     "magnetar-runtime-moonpool",
@@ -3436,11 +3444,12 @@ fn create_sim_coverage_domain_targets(
 /// inputs. The children also remove all four variables so empty inherited values cannot drift.
 ///
 /// Each report is read and validated inside scratch, then retained as
-/// authoritative in-memory bytes through cleanup. After both domain evidence
-/// values are retained, diagnostics are atomically published as
-/// `target/sim-coverage.lcov` and `target/tokio-coverage.lcov`; the returned
-/// in-memory bytes then drive the aggregate verdict. Diagnostics are outputs,
-/// never authoritative inputs, and are not reread by a fresh run.
+/// authoritative in-memory bytes through cleanup. Test execution failures are
+/// kept separately from collection failures; both domains still attempt a
+/// fresh report. Valid reports are atomically published as diagnostics even
+/// when tests fail, and the caller keeps the overall verdict fatal. Stale
+/// diagnostics are removed before a fresh run and are never authoritative
+/// inputs.
 ///
 /// An owned crate that emits no record at all is a hard failure
 /// ([`report_missing_gated`]). A record-less file in a
@@ -3453,7 +3462,7 @@ fn create_sim_coverage_domain_targets(
 /// With `reuse_lcov`, both commands are skipped and both diagnostics are loaded
 /// once for sizing and debugging only. Reused diagnostics are explicitly
 /// non-authoritative and tagged with [`SIM_COVERAGE_REUSE_MARKER`].
-fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<Vec<DomainEvidence>> {
+fn run_sim_lcov(workspace_root: &Path, reuse_lcov: bool) -> Result<SimCoverageRun> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     run_sim_lcov_with_cargo(workspace_root, reuse_lcov, &cargo)
 }
@@ -3485,7 +3494,7 @@ fn run_sim_lcov_with_cargo(
     workspace_root: &Path,
     reuse_lcov: bool,
     cargo: &OsStr,
-) -> Result<Vec<DomainEvidence>> {
+) -> Result<SimCoverageRun> {
     run_sim_lcov_with_cargo_environment(workspace_root, reuse_lcov, cargo, &[])
 }
 
@@ -3498,12 +3507,12 @@ fn run_sim_lcov_with_cargo_environment(
     reuse_lcov: bool,
     cargo: &OsStr,
     command_environment: &[(&str, Option<&OsStr>)],
-) -> Result<Vec<DomainEvidence>> {
+) -> Result<SimCoverageRun> {
     let workspace_root = fs::canonicalize(workspace_root)
         .with_context(|| format!("resolving workspace root {}", workspace_root.display()))?;
     let diagnostics = workspace_root.join("target");
     if reuse_lcov {
-        return SIM_COVERAGE_DOMAINS
+        let evidence = SIM_COVERAGE_DOMAINS
             .iter()
             .map(|domain| {
                 let path = diagnostics.join(domain.lcov_file);
@@ -3521,7 +3530,11 @@ fn run_sim_lcov_with_cargo_environment(
                     elapsed: Duration::ZERO,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(SimCoverageRun {
+            evidence,
+            ..SimCoverageRun::default()
+        });
     }
 
     validate_sim_coverage_flag_environment(|name| env::var_os(name))?;
@@ -3529,15 +3542,16 @@ fn run_sim_lcov_with_cargo_environment(
 
     fs::create_dir_all(&diagnostics)
         .with_context(|| format!("creating {}", diagnostics.display()))?;
+    remove_stale_coverage_diagnostics(&diagnostics)?;
 
     // Keep the cold all-feature build on Cargo's configured storage filesystem,
     // but in a fresh sibling the cache never restores or saves.
     let coverage_target = create_sim_coverage_target(&storage)?;
     let coverage_target_path = coverage_target.path().to_path_buf();
 
-    let result = (|| -> Result<Vec<DomainEvidence>> {
+    let result = (|| -> Result<SimCoverageRun> {
         let domain_targets = create_sim_coverage_domain_targets(&coverage_target_path)?;
-        let mut evidence = Vec::with_capacity(domain_targets.len());
+        let mut run = SimCoverageRun::default();
         for (domain, domain_target) in domain_targets {
             let domain_started = std::time::Instant::now();
             let domain_lcov_path = domain_target.join("report.lcov");
@@ -3558,64 +3572,149 @@ fn run_sim_lcov_with_cargo_environment(
             let (mut exec, mut report) =
                 sim_lcov_commands(cargo, &workspace_root, &domain_lcov_path, domain);
             apply_coverage_target(&mut exec);
-            let status = exec.status().context("failed to invoke `cargo llvm-cov`")?;
-            if !status.success() {
-                bail!(
-                    "{} coverage execution exited with status {status}",
+            match exec.status() {
+                Ok(status) if !status.success() => {
+                    run.test_failures.push(format!(
+                        "{} test execution exited with status {status}",
+                        domain.name
+                    ));
+                }
+                Err(error) => run.infrastructure_failures.push(format!(
+                    "{} test execution could not start: {error:#}",
                     domain.name
-                );
+                )),
+                Ok(_) => {}
             }
-            if domain_lcov_path.exists() {
-                bail!(
-                    "{} coverage execution left unexpected pre-report output {}",
-                    domain.name,
-                    domain_lcov_path.display()
-                );
+            match fs::symlink_metadata(&domain_lcov_path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    fs::remove_file(&domain_lcov_path).with_context(|| {
+                        format!(
+                            "removing unexpected pre-report output {}",
+                            domain_lcov_path.display()
+                        )
+                    })?;
+                    run.collection_failures.push(format!(
+                        "{} coverage execution left unexpected pre-report output {}",
+                        domain.name,
+                        domain_lcov_path.display()
+                    ));
+                }
+                Ok(_) => {
+                    run.collection_failures.push(format!(
+                        "{} coverage execution left non-file pre-report output {}; report skipped",
+                        domain.name,
+                        domain_lcov_path.display()
+                    ));
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspecting pre-report output {}",
+                            domain_lcov_path.display()
+                        )
+                    });
+                }
             }
 
             apply_coverage_target(&mut report);
-            let status = report
-                .status()
-                .context("failed to invoke `cargo llvm-cov report`")?;
-            if !status.success() {
-                bail!(
-                    "{} coverage report exited with status {status}",
-                    domain.name
-                );
+            match report.status() {
+                Ok(status) if !status.success() => {
+                    run.collection_failures.push(format!(
+                        "{} coverage report exited with status {status}",
+                        domain.name
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    run.collection_failures.push(format!(
+                        "{} coverage report could not start: {error:#}",
+                        domain.name
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
             }
-            if !fs::symlink_metadata(&domain_lcov_path)
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                bail!(
-                    "{} coverage report did not replace scratch output {} with a regular file",
-                    domain.name,
-                    domain_lcov_path.display()
-                );
+            match fs::symlink_metadata(&domain_lcov_path) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => {
+                    run.collection_failures.push(format!(
+                        "{} coverage report did not replace scratch output {} with a regular file",
+                        domain.name,
+                        domain_lcov_path.display()
+                    ));
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    run.collection_failures.push(format!(
+                        "{} coverage report did not replace scratch output {} with a regular file",
+                        domain.name,
+                        domain_lcov_path.display()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting coverage report {}", domain_lcov_path.display())
+                    });
+                }
             }
-            let lcov = fs::read(&domain_lcov_path)
-                .with_context(|| format!("reading {}", domain_lcov_path.display()))?;
-            validate_domain_lcov(domain, &lcov)?;
+            let lcov = match fs::read(&domain_lcov_path) {
+                Ok(lcov) => lcov,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading {}", domain_lcov_path.display()));
+                }
+            };
+            if let Err(error) = validate_domain_lcov(domain, &lcov) {
+                run.collection_failures.push(format!("{error:#}"));
+                continue;
+            }
             let elapsed = domain_started.elapsed();
             eprintln!(
-                "xtask check-sim-coverage: {} domain fresh execution + report completed in {:.3}s",
+                "xtask check-sim-coverage: {} domain fresh report collected in {:.3}s",
                 domain.name,
                 elapsed.as_secs_f64()
             );
-            evidence.push(DomainEvidence {
+            run.evidence.push(DomainEvidence {
                 domain,
                 lcov,
                 elapsed,
             });
         }
-        Ok(evidence)
+        Ok(run)
     })();
 
     let cleanup = coverage_target.close();
-    let evidence = finish_sim_coverage_run(result, cleanup, &coverage_target_path)?;
-    for item in &evidence {
+    let run = finish_sim_coverage_run(result, cleanup, &coverage_target_path)?;
+    for item in &run.evidence {
         publish_coverage_diagnostic(&diagnostics.join(item.domain.lcov_file), &item.lcov)?;
     }
-    Ok(evidence)
+    Ok(run)
+}
+
+fn remove_stale_coverage_diagnostics(diagnostics: &Path) -> Result<()> {
+    for domain in SIM_COVERAGE_DOMAINS {
+        let path = diagnostics.join(domain.lcov_file);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(&path).with_context(|| {
+                    format!("removing stale coverage diagnostic {}", path.display())
+                })?;
+            }
+            Ok(_) => bail!(
+                "refusing to replace non-file coverage diagnostic {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting coverage diagnostic {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_domain_lcov(domain: &SimCoverageDomain, lcov: &[u8]) -> Result<()> {
@@ -3666,6 +3765,36 @@ fn publish_coverage_diagnostic(path: &Path, contents: &[u8]) -> Result<()> {
             )
         })?;
     Ok(())
+}
+
+fn sim_coverage_run_failures(run: &SimCoverageRun) -> Vec<String> {
+    run.test_failures
+        .iter()
+        .map(|failure| format!("test execution: {failure}"))
+        .chain(
+            run.infrastructure_failures
+                .iter()
+                .map(|failure| format!("infrastructure: {failure}")),
+        )
+        .chain(
+            run.collection_failures
+                .iter()
+                .map(|failure| format!("coverage collection: {failure}")),
+        )
+        .collect()
+}
+
+fn finish_sim_coverage_verdict(run: &SimCoverageRun, coverage_failures: Vec<String>) -> Result<()> {
+    let mut failures = sim_coverage_run_failures(run);
+    failures.extend(coverage_failures);
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "xtask check-sim-coverage: {} test, infrastructure, collection, or coverage failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    )
 }
 
 fn sim_lcov_commands(
@@ -4357,11 +4486,20 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
         );
     }
 
-    let evidence = run_sim_lcov(&workspace_root, reuse_lcov)?;
+    let run = run_sim_lcov(&workspace_root, reuse_lcov)?;
+    for failure in &run.test_failures {
+        eprintln!("xtask check-sim-coverage: TEST EXECUTION FAILED — {failure}");
+    }
+    for failure in &run.infrastructure_failures {
+        eprintln!("xtask check-sim-coverage: INFRASTRUCTURE FAILED — {failure}");
+    }
+    for failure in &run.collection_failures {
+        eprintln!("xtask check-sim-coverage: COVERAGE COLLECTION FAILED — {failure}");
+    }
     let mut failures = Vec::new();
     let mut total_gated = 0_usize;
     let mut total_advisory = unowned.len();
-    for item in &evidence {
+    for item in &run.evidence {
         let domain = item.domain;
         if !reuse_lcov {
             eprintln!(
@@ -4403,13 +4541,7 @@ fn check_sim_coverage(base: &str, reuse_lcov: bool, enforce: bool) -> Result<()>
             );
         }
     }
-    if !failures.is_empty() {
-        bail!(
-            "xtask check-sim-coverage: {} isolated coverage domain(s) failed:\n{}",
-            failures.len(),
-            failures.join("\n")
-        );
-    }
+    finish_sim_coverage_verdict(&run, failures)?;
 
     // Three buckets now: measured-and-clean, advisory record-less, and missing
     // gated executable source. The last is empty here (it bails above), but
@@ -6922,9 +7054,10 @@ esac
 
             let evidence = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
                 .unwrap_or_else(|err| panic!("{case} poison selected: {err:#}"));
-            assert_eq!(evidence.len(), 2, "{case}");
+            assert_eq!(evidence.evidence.len(), 2, "{case}");
             assert!(
                 evidence
+                    .evidence
                     .iter()
                     .all(|item| item.lcov == b"TN:current-pass\n")
             );
@@ -6962,42 +7095,104 @@ esac
     #[test]
     fn sim_coverage_isolated_target_is_removed_after_each_child_failure() {
         let failure_cases = [
-            ("moonpool execution", "fail-moonpool-execution", 1_usize),
-            ("moonpool report", "fail-moonpool-report", 2_usize),
-            ("tokio execution", "fail-tokio-execution", 3_usize),
-            ("tokio report", "fail-tokio-report", 4_usize),
+            (
+                "moonpool execution",
+                "fail-moonpool-execution",
+                true,
+                false,
+                2,
+            ),
+            ("moonpool report", "fail-moonpool-report", false, true, 1),
+            ("tokio execution", "fail-tokio-execution", true, false, 2),
+            ("tokio report", "fail-tokio-report", false, true, 1),
         ];
 
-        for (case, failure_marker, expected_invocations) in failure_cases {
+        for (case, failure_marker, test_failed, collection_failed, expected_evidence) in
+            failure_cases
+        {
             let tmp = tempfile::tempdir().expect("create temp dir");
             let root = tmp.path().join("workspace");
             fs::create_dir_all(&root).expect("create fake workspace");
             fs::write(root.join(failure_marker), "fail").expect("write failure marker");
+            let diagnostics = root.join("target");
+            fs::create_dir_all(&diagnostics).expect("create diagnostics directory");
+            for domain in SIM_COVERAGE_DOMAINS {
+                fs::write(
+                    diagnostics.join(domain.lcov_file),
+                    "stale previous-pass report\n",
+                )
+                .expect("seed stale diagnostic");
+            }
             let cargo = fake_coverage_cargo(&root);
 
-            let err = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
-                .expect_err("fake cargo failure must propagate");
+            let run = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+                .expect("child outcomes must be returned for aggregate evaluation");
+            assert_eq!(
+                run.evidence.len(),
+                expected_evidence,
+                "{case}: valid reports"
+            );
+            assert_eq!(run.test_failures.len(), usize::from(test_failed), "{case}");
+            assert_eq!(
+                run.collection_failures.len(),
+                usize::from(collection_failed),
+                "{case}"
+            );
+            assert!(run.infrastructure_failures.is_empty(), "{case}");
+            assert_eq!(
+                finish_sim_coverage_verdict(&run, Vec::new()).is_err(),
+                test_failed || collection_failed,
+                "{case}: the final verdict remains fatal for failed execution or collection"
+            );
+            if test_failed {
+                assert!(
+                    sim_coverage_run_failures(&run)
+                        .iter()
+                        .any(|failure| failure.starts_with("test execution:")),
+                    "{case}: a nonzero test command remains separately visible"
+                );
+            }
+            if collection_failed {
+                assert!(
+                    sim_coverage_run_failures(&run)
+                        .iter()
+                        .any(|failure| failure.starts_with("coverage collection:")),
+                    "{case}: report failure is distinct from test failure"
+                );
+            }
+
+            let rendered = finish_sim_coverage_verdict(&run, Vec::new())
+                .expect_err("test or report failure must remain a nonzero verdict");
             assert!(
-                format!("{err:#}").contains("coverage"),
-                "{case}: child failure must remain the primary error: {err:#}"
+                format!("{rendered:#}").contains("test execution:")
+                    || format!("{rendered:#}").contains("coverage collection:"),
+                "{case}: final error must identify the failure class: {rendered:#}"
             );
 
-            let invocations = fake_coverage_invocations(&root);
-            assert_eq!(invocations.len(), expected_invocations, "{case}");
+            let isolated_target =
+                assert_fake_coverage_contract(&root, &tmp.path().join("build-storage"), case);
             assert!(
-                invocations.iter().all(|invocation| {
-                    invocation.llvm_target == invocation.llvm_build
-                        && invocation.llvm_target == invocation.cargo_target
-                        && invocation.cargo_build.as_ref() == Some(&invocation.llvm_target)
-                        && invocation.artifact_flags.is_empty()
-                }),
-                "{case}: every reached child must stay in its domain target"
-            );
-            let isolated_target = &invocations[0].llvm_target;
-            assert!(
-                !isolated_target.parent().expect("scratch root").exists(),
+                !isolated_target.exists(),
                 "{case}: failed run must remove its isolated target"
             );
+            for (domain, report_failed) in SIM_COVERAGE_DOMAINS
+                .iter()
+                .zip([case == "moonpool report", case == "tokio report"])
+            {
+                let published = diagnostics.join(domain.lcov_file);
+                if report_failed {
+                    assert!(
+                        !published.exists(),
+                        "{case}: stale report must not survive a failed fresh report"
+                    );
+                } else {
+                    assert_eq!(
+                        fs::read_to_string(&published).expect("read fresh diagnostic"),
+                        "TN:current-pass\n",
+                        "{case}: every valid fresh report remains available for diagnostics"
+                    );
+                }
+            }
         }
     }
 
@@ -7016,9 +7211,13 @@ esac
             fs::create_dir_all(&root).expect("create workspace");
             fs::write(root.join(marker), marker).expect("write marker");
             let cargo = fake_coverage_cargo(&root);
-            let err = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
-                .expect_err("invalid scratch report must fail");
-            let rendered = format!("{err:#}");
+            let run = run_sim_lcov_with_cargo(&root, false, cargo.as_os_str())
+                .expect("report integrity outcomes are aggregated after both domains");
+            let rendered = sim_coverage_run_failures(&run).join("\n");
+            assert!(
+                !run.collection_failures.is_empty(),
+                "{marker}: invalid scratch report must remain fatal: {rendered}"
+            );
             assert!(
                 rendered.contains("did not replace scratch output")
                     || rendered.contains("unexpected pre-report output")
@@ -7319,13 +7518,12 @@ esac
             .expect("isolated real-tool coverage run");
             assert!(
                 evidence
+                    .evidence
                     .iter()
-                    .all(|item| String::from_utf8_lossy(&item.lcov).contains("SF:")),
-                "fixture must produce a real LCOV report"
-            );
-            assert!(
-                String::from_utf8_lossy(&evidence[0].lcov).contains("magnetar-proto/src/lib.rs"),
-                "dependency coverage must survive isolation"
+                    .all(|item| String::from_utf8_lossy(&item.lcov).contains("SF:"))
+                    && String::from_utf8_lossy(&evidence.evidence[0].lcov)
+                        .contains("magnetar-proto/src/lib.rs"),
+                "fresh LCOV must include source records and dependency coverage"
             );
             assert_no_real_fixture_scratch(tmp.path());
         };

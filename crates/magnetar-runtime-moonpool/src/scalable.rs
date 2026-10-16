@@ -4420,6 +4420,198 @@ mod tests {
         })
     }
 
+    async fn next_staged_command(
+        shared: &Arc<ConnectionShared>,
+    ) -> magnetar_proto::pb::BaseCommand {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut staged = shared.inner.lock().poll_transmit();
+                if !staged.is_empty() {
+                    let command =
+                        magnetar_proto::decode_one(&mut staged).expect("decode staged command");
+                    assert!(staged.is_empty(), "one command was expected");
+                    return command.command;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("command is staged before the bounded timeout")
+    }
+
+    fn send_broker_error(
+        shared: &Arc<ConnectionShared>,
+        request_id: u64,
+        error_code: magnetar_proto::pb::ServerError,
+        message: &str,
+    ) {
+        let error = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+            error: Some(magnetar_proto::pb::CommandError {
+                request_id,
+                error: error_code as i32,
+                message: message.to_owned(),
+            }),
+            ..Default::default()
+        };
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&error))
+            .expect("inject broker error");
+        shared.event_waker.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn withdrawn_child_open_ignores_busy_and_other_broker_errors() {
+        for error_code in [
+            magnetar_proto::pb::ServerError::ConsumerBusy,
+            magnetar_proto::pb::ServerError::MetadataError,
+        ] {
+            let inner = empty_aggregate_inner();
+            let shared = inner.subscriber.bootstrap.clone();
+            connect_shared(&shared);
+            let (source, incarnation, generation) = {
+                let state = inner.state.lock();
+                let source = state
+                    .model
+                    .assignment()
+                    .expect("initial assignment")
+                    .segments()[0]
+                    .source();
+                (
+                    source.clone(),
+                    state.model.controller_incarnation(),
+                    state
+                        .model
+                        .child_generation(&source)
+                        .expect("initial child generation"),
+                )
+            };
+
+            let mut opening = Box::pin(inner.open_child(source, incarnation, generation));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(opening.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let subscribe = next_staged_command(&shared)
+                .await
+                .subscribe
+                .expect("opening stages Subscribe");
+            let actions = inner
+                .state
+                .lock()
+                .model
+                .require_resync()
+                .expect("withdraw pending child open");
+            assert!(matches!(
+                actions.as_slice(),
+                [magnetar_proto::StreamConsumerAction::CancelOpen { .. }]
+            ));
+
+            send_broker_error(
+                &shared,
+                subscribe.request_id,
+                error_code,
+                "injected broker error",
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), opening)
+                .await
+                .expect("stale open result is finalized")
+                .expect("withdrawn open does not propagate a stale broker error");
+            let state = inner.state.lock();
+            assert_eq!(
+                state.model.phase(),
+                magnetar_proto::AggregatePhase::ResyncRequired
+            );
+            assert!(state.children.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_during_child_open_reports_compensating_close_failure() {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let (source, incarnation, generation) = {
+            let state = inner.state.lock();
+            let source = state
+                .model
+                .assignment()
+                .expect("initial assignment")
+                .segments()[0]
+                .source();
+            (
+                source.clone(),
+                state.model.controller_incarnation(),
+                state
+                    .model
+                    .child_generation(&source)
+                    .expect("initial child generation"),
+            )
+        };
+        inner.spawn_open_task(source, incarnation, generation);
+        let subscribe = next_staged_command(&shared)
+            .await
+            .subscribe
+            .expect("opening stages Subscribe");
+
+        let mut closing = Box::pin(inner.close());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(closing.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(inner.state.lock().close_state, AggregateCloseState::Closing);
+        assert_eq!(inner.state.lock().open_tasks, 1);
+
+        let success = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: subscribe.request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&success))
+            .expect("complete staged Subscribe");
+        shared.event_waker.notify_waiters();
+
+        let close = next_staged_command(&shared)
+            .await
+            .close_consumer
+            .expect("cancelled consumer stages compensating Close");
+        send_broker_error(
+            &shared,
+            close.request_id,
+            magnetar_proto::pb::ServerError::MetadataError,
+            "close failed",
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), closing)
+            .await
+            .expect("aggregate close joins the cancelled open task");
+        assert!(
+            matches!(
+                result,
+                Err(StreamConsumerError::Failed(ref message)) if message.contains("close failed")
+            ),
+            "unexpected aggregate close result: {result:?}"
+        );
+        let state = inner.state.lock();
+        assert_eq!(state.close_state, AggregateCloseState::Closed);
+        assert!(
+            state
+                .close_error
+                .as_deref()
+                .is_some_and(|error| error.contains("close failed"))
+        );
+        assert!(state.children.is_empty());
+    }
+
     fn attached_child_consumer(
         source: &magnetar_proto::SegmentSource,
     ) -> (

@@ -164,6 +164,54 @@ jobs:
             cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
           done
 
+  differential-quarantine:
+    name: differential quarantine diagnostics
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
+      - name: Compile quarantined differential targets
+        run: |
+          set -euo pipefail
+          cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence --no-run
+          cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence --no-run
+      - name: Verify aggregate receiver budget selection
+        run: |
+          set -euo pipefail
+          selected=$(cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence -- --ignored --exact aggregate_receiver_budget_is_equivalent --list)
+          printf '%s\n' "$selected"
+          count=$(printf '%s\n' "$selected" | awk '/^aggregate_receiver_budget_is_equivalent: test$/ { count++ } END { print count + 0 }')
+          test "$count" -eq 1
+      - name: Run aggregate receiver budget diagnostic
+        id: run_aggregate_receiver_budget
+        continue-on-error: true
+        run: cargo test -p magnetar-differential --all-features --locked --test stream_consumer_equivalence -- --ignored --exact aggregate_receiver_budget_is_equivalent --nocapture
+      - name: Verify busy and withdrawn child opens selection
+        run: |
+          set -euo pipefail
+          selected=$(cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence -- --ignored --exact busy_and_withdrawn_child_opens_are_equivalent --list)
+          printf '%s\n' "$selected"
+          count=$(printf '%s\n' "$selected" | awk '/^busy_and_withdrawn_child_opens_are_equivalent: test$/ { count++ } END { print count + 0 }')
+          test "$count" -eq 1
+      - name: Run busy and withdrawn child opens diagnostic
+        id: run_busy_child_opens
+        continue-on-error: true
+        run: cargo test -p magnetar-differential --all-features --locked --test stream_consumer_advanced_equivalence -- --ignored --exact busy_and_withdrawn_child_opens_are_equivalent --nocapture
+      - name: Report quarantined differential results
+        if: always()
+        env:
+          AGGREGATE_OUTCOME: ${{ steps.run_aggregate_receiver_budget.outcome }}
+          BUSY_CHILD_OUTCOME: ${{ steps.run_busy_child_opens.outcome }}
+        run: |
+          {
+            printf '%s\n' "aggregate_receiver_budget_is_equivalent: $AGGREGATE_OUTCOME (diagnostic; test result does not gate CI)."
+            printf '%s\n' "busy_and_withdrawn_child_opens_are_equivalent: $BUSY_CHILD_OUTCOME (diagnostic; test result does not gate CI)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   e2e:
     name: e2e (Pulsar ${{ matrix.pulsar }})
     # The whole e2e suite once per Pulsar version (ADR-0116): `pulsar` is the
@@ -187,6 +235,13 @@ jobs:
     with:
       pulsar: ${{ matrix.pulsar }}
       pip33: ${{ matrix.pip33 }}
+
+  e2e-quarantine:
+    name: e2e quarantine diagnostics (Pulsar 5.0.0)
+    uses: ./.github/workflows/e2e-pulsar.yml
+    with:
+      pulsar: "5.0.0"
+      quarantine_test: e2e_seek_per_partition_callback
 
   seed-replay:
     # Per ADR-0047: replay every `status = "open"` seed listed in

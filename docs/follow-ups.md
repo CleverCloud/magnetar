@@ -152,6 +152,12 @@ Consumer side: a Java batched + encrypted entry has to be decrypted as one body,
 
 **Why it stays open.** The proposed upstream cursor-cleanup race itself has not been reproduced at runtime, and its causal link to this intermittent result is unproven.
 
+## 30. Exact intermittent test quarantine scenarios
+
+**Gap.** Three exact scenarios have temporary, non-gating test-result diagnostics while their intermittent results are investigated. Names, source evidence, owner, the 2026-10-30 review date, and reactivation conditions are recorded in the [test-quarantine register](test-quarantine.md) under [ADR-0123](../specs/adr/0123-quarantine-exact-intermittent-test-scenarios.md). The separate ACK/NACK exception remains item 29.
+
+**Why it stays open.** Test assertions remain intact, and the focused diagnostic runs provide evidence for deciding when each exact scenario can return to the blocking suite.
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.
