@@ -262,8 +262,10 @@ jobs:
             echo "::group::$target"
             if [ "$target" = e2e_scalable_topic ]; then
               cargo build -p magnetarctl --all-features --locked
+              cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture --test-threads=1
+            else
+              cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
             fi
-            cargo test -p magnetar-driver --all-features --locked --test "$target" -- --nocapture
             echo "::endgroup::"
           done
           if [ "$selected" -eq 0 ]; then

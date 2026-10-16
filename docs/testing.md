@@ -69,7 +69,7 @@ cargo test -p magnetar-driver --tests
 # The PIP-460 target is behind its owning default-off product feature:
 cargo build -p magnetarctl --features scalable-topics
 cargo test -p magnetar-driver --features scalable-topics \
-  --test e2e_scalable_topic
+  --test e2e_scalable_topic -- --test-threads=1
 ```
 
 Contributors with a FIPS toolchain installed locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
@@ -80,7 +80,7 @@ The crypto matrix does not execute test cases. Sim patch coverage uses the PR ta
 The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** in one local command.
 Per ADR-0098, per-PR CI executes the same surface as one non-e2e matrix cell and four e2e cells so they run concurrently and each stays below the 180-minute ceiling; since [ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md) the four e2e cells run once per Pulsar version (see [The Pulsar version matrix](#the-pulsar-version-matrix)).
 The e2e cells derive their inventory from the sorted `e2e_*.rs` filenames, and only the cell containing `e2e_replicated_subscriptions` in the default-broker run starts the PIP-33 fixture and runs that target.
-The cell containing `e2e_scalable_topic` builds `magnetarctl` before that target because its CLI round-trip test consumes the companion binary and target-specific Cargo test commands do not build other workspace packages.
+The cell containing `e2e_scalable_topic` builds `magnetarctl` before that target because its CLI round-trip test consumes the companion binary and target-specific Cargo test commands do not build other workspace packages. It runs that target with `--test-threads=1` to reduce overlap between its JVM-backed broker fixtures on the four-core CI runner. This is a contention mitigation; the intermittent strict-descendant receive timeout has not been attributed to one root cause.
 
 ## Unit tests
 
