@@ -552,6 +552,15 @@ jobs:
       # `sim_coverage_enforces_uncovered_by_default` in xtask/src/main.rs,
       # since this flag would otherwise mask such a regression.
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage --enforce
+      - name: Upload fresh simulation coverage reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sim-coverage-reports-${{ github.sha }}
+          path: |
+            target/sim-coverage.lcov
+            target/tokio-coverage.lcov
+          if-no-files-found: warn
 
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its
   # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron
