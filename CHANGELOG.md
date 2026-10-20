@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-10-20
+
+### Fixed
+
+- Use the `zstd` 0.13 dependency line so applications that also depend on the Pulsar 6.9 client can resolve one `zstd` / `zstd-safe` pair. Zstd compression remains enabled; codec implementation and bounded decoding are unchanged.
+- Refresh the lockfile from the yanked `yoke-derive` 0.8.3 to 0.8.4.
+
+### Security
+
+- Raise the `rustls` floor to 0.23.46, fixing RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349.
+
 ## [1.7.2] - 2026-09-21
 
 ### Fixed
@@ -704,7 +715,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.2...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.3...HEAD
+[1.7.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.3
 [1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2
 [1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
 [1.7.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.0

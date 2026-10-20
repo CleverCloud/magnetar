@@ -1794,7 +1794,7 @@ checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "magnetar-admin"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "http",
  "magnetar-auth-oauth2",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-athenz"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-oauth2"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "bytes",
  "magnetar-proto",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-sasl"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "bytes",
  "libgssapi",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-differential"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-driver"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-fakes"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "bytes",
  "magnetar-proto",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-messagecrypto"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-proto"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "apache-avro",
  "bytes",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-moonpool"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-tokio"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "bytes",
  "flate2",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "magnetarctl"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "anstream",
  "anstyle",
@@ -3036,9 +3036,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4445,9 +4445,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4543,18 +4543,18 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "7.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
 dependencies = [
  "zstd-sys",
 ]
