@@ -1032,7 +1032,7 @@ fn scalable_consumer_session_and_watch_accessors() {
         watch.topics().is_empty(),
         "no matching set before the first update"
     );
-    assert!(watch.topics().is_empty());
+    assert_eq!(watch.topics(), [] as [std::string::String; 0]);
     watch
         .handle_update(&pb::CommandWatchScalableTopicsUpdate {
             watch_id: 3,

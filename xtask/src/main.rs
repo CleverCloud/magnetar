@@ -3321,7 +3321,10 @@ fn run() {
     info!(count);
 }
 "#;
-        assert!(scan_log_field_violations(src).is_empty());
+        assert_eq!(
+            scan_log_field_violations(src),
+            [] as [(usize, &str, &str); 0]
+        );
     }
 
     #[test]
@@ -3362,7 +3365,10 @@ mod tests {
     }
 }
 "#;
-        assert!(scan_log_field_violations(src).is_empty());
+        assert_eq!(
+            scan_log_field_violations(src),
+            [] as [(usize, &str, &str); 0]
+        );
     }
 
     #[test]
@@ -3412,7 +3418,10 @@ fn run() {
     tracing::trace!("trace is exempt");
 }
 "#;
-        assert!(scan_log_field_violations(src).is_empty());
+        assert_eq!(
+            scan_log_field_violations(src),
+            [] as [(usize, &str, &str); 0]
+        );
     }
 
     // ── check-e2e-container-memory parser ───────────────────────────
@@ -3471,7 +3480,7 @@ async fn start_pulsar() {{
 "
         );
         let scan = scan_container_memory(&src);
-        assert!(scan.violations.is_empty());
+        assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 1);
     }
 
@@ -3533,7 +3542,7 @@ async fn start_zts() {
 }
 "#;
         let scan = scan_container_memory(src);
-        assert!(scan.violations.is_empty());
+        assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 0);
         assert_eq!(scan.out_of_scope, 2);
     }
@@ -3562,7 +3571,7 @@ async fn start_pulsar() {
 }
 "#;
         let scan = scan_container_memory(capped);
-        assert!(scan.violations.is_empty());
+        assert_eq!(scan.violations, [] as [(usize, &str); 0]);
         assert_eq!(scan.capped, 1);
     }
 
@@ -4244,7 +4253,10 @@ mod tests {
             "generated proto must not hard-fail"
         );
         assert!(ungated.is_empty(), "generated proto must not be advisory");
-        assert!(intersect_diff_with_coverage(root, &tracked, &covered).is_empty());
+        assert_eq!(
+            intersect_diff_with_coverage(root, &tracked, &covered),
+            [] as [(std::string::String, u32); 0]
+        );
     }
 
     /// Regression: the diff side keys on `workspace_root.join(relpath)` while

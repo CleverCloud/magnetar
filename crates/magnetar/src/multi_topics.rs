@@ -1485,7 +1485,7 @@ mod tests {
         };
         assert_eq!(consumer.len(), 0);
         assert!(consumer.is_empty());
-        assert!(consumer.topics().is_empty());
+        assert_eq!(consumer.topics(), [] as [std::string::String; 0]);
         assert_eq!(consumer.subscription(), "sub");
         let lookup = consumer.lookup("missing");
         assert!(lookup.is_err());

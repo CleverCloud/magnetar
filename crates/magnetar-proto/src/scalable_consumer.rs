@@ -796,7 +796,7 @@ mod tests {
             w.topics().is_empty(),
             "no matching set before the first update"
         );
-        assert!(w.topics().is_empty());
+        assert_eq!(w.topics(), [] as [std::string::String; 0]);
     }
 
     /// The consumer-type enum round-trips and saturates unknown wire values,

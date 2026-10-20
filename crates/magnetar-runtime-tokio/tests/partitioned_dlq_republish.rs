@@ -374,14 +374,23 @@ async fn serve_connection(mut stream: TcpStream, control: Arc<BrokerControl>) {
             }
         }
 
-        while !pending_receipts.is_empty()
-            && control
-                .releases
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                    count.checked_sub(1)
-                })
-                .is_ok()
-        {
+        'release_receipts: while !pending_receipts.is_empty() {
+            let mut count = control.releases.load(Ordering::SeqCst);
+            loop {
+                if count == 0 {
+                    break 'release_receipts;
+                }
+                match control.releases.compare_exchange_weak(
+                    count,
+                    count - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => count = actual,
+                }
+            }
+
             let (producer_id, sequence) = pending_receipts
                 .pop_front()
                 .expect("pending receipt exists");

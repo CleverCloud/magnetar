@@ -496,7 +496,7 @@ mod tests {
         assert!(s.is_resolved());
         assert_eq!(delta.epoch, 4);
         assert_eq!(delta.added.len(), 2);
-        assert!(delta.removed.is_empty());
+        assert_eq!(delta.removed, [] as [crate::types::SegmentId; 0]);
         assert!(
             !delta.is_consume_affecting(),
             "initial layout is not a change"

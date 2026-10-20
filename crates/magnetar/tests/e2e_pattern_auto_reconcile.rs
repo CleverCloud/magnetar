@@ -64,7 +64,9 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "Created namespace public/default",
+        ))
         .with_startup_timeout(Duration::from_mins(2))
         .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
         // The test pattern uses a UUID suffix that pushes the regex past the
