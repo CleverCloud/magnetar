@@ -23,7 +23,7 @@
 //! An assignment whose `layout_epoch` does not advance is **rejected**, not
 //! applied: the broker recomputes assignments per layout, so an out-of-order
 //! push would hand the consumer segments that no longer exist. The
-//! [`DagWatchSession`](crate::dag_watch::DagWatchSession) epoch guard and this
+//! [`DagWatchSession`] epoch guard and this
 //! one are the same rule applied to the two halves of the protocol.
 
 use std::collections::BTreeSet;

@@ -9,7 +9,7 @@
 //! [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
 //! sans-io contract. The runtime engines drive it from inside their
 //! connection lock and translate the returned [`DagDelta`] into
-//! [`ConnectionEvent`](crate::ConnectionEvent) variants.
+//! [`ConnectionEvent`] variants.
 //!
 //! # One session, no separate subscribe
 //!
