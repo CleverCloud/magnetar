@@ -44,7 +44,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

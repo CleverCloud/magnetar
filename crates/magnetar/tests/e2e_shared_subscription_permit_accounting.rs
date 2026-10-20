@@ -116,7 +116,7 @@ use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "latest";
+const DEFAULT_IMAGE_TAG: &str = "4.2.4";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
@@ -732,13 +732,13 @@ async fn churn_round(
 /// accounting leak is absent. The client's behaviour cannot make it pass or fail, and
 /// no generally-available image carries the fix — Docker Hub's `apachepulsar/pulsar`
 /// stops at 4.0.13 and 4.2.4, and the fixed 4.0.14 / 4.2.5 are unpublished. Left
-/// running on the `latest` default it would therefore be **permanently red in CI on a
+/// running on the pinned 4.2.4 default it would therefore be **permanently red in CI on a
 /// defect this repository cannot fix**, which is the failure mode the enforcement rules
 /// exist to prevent: a check that is always failing stops being read.
 ///
-/// It keeps the `latest` default rather than pinning a green image, so the day an image
-/// with the fix ships as `latest` the reproduce command below goes green with no edit.
-/// Remove the `#[ignore]` then — tracked by
+/// Per ADR-0109, changing the default broker is a deliberate compatibility decision;
+/// `MAGNETAR_PULSAR_IMAGE_TAG` can select a candidate image carrying the fix explicitly.
+/// Remove the `#[ignore]` after that evidence and decision — tracked by
 /// [issue #462](https://github.com/CleverCloud/magnetar/issues/462), which also owns the
 /// choice between removing it and recording the exception in ADR-0046 itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

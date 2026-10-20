@@ -155,7 +155,10 @@ jobs:
       - name: Pre-pull Pulsar broker images
         if: ${{ matrix.suite == 'e2e' }}
         run: |
-          docker pull apachepulsar/pulsar:latest
+          # 4.2.4 is the e2e default (ADR-0109): `latest` moved to Pulsar 5.0.0 on
+          # 2026-10-01 and its structured startup log no longer prints the line
+          # the harness waits for, so every shard timed out at container start.
+          docker pull apachepulsar/pulsar:4.2.4
           docker pull apachepulsar/pulsar:5.0.0-M1
           docker pull apachepulsar/pulsar:4.0.4
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
