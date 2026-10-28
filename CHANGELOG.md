@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-10-29
+
+### Security
+
+- Restore the `zstd` 0.14 dependency line, resolving `zstd` 0.14.3, `zstd-safe` 8.2.0, and `zstd-sys` 2.1.2 to fix RUSTSEC-2026-0391, RUSTSEC-2026-0395 through RUSTSEC-2026-0406, and RUSTSEC-2026-0410. Applications that also depend on the Pulsar 6.9 Rust client now resolve its vulnerable 0.13 wrapper and Magnetar's corrected 0.14 wrapper around one `zstd-sys` version instead of sharing one vulnerable wrapper pair; Pulsar's own advisories remain until that client updates.
+- Refresh the lockfile to `rustls-webpki` 0.103.16, `webpki-root-certs` 1.0.11, and `tokio` 1.54.1, fixing RUSTSEC-2026-0382, RUSTSEC-2026-0383, and RUSTSEC-2026-0386.
+
 ## [1.7.3] - 2026-10-20
 
 ### Fixed
@@ -715,7 +722,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.3...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.7.4...HEAD
+[1.7.4]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.4
 [1.7.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.3
 [1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2
 [1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
