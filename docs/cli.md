@@ -193,7 +193,7 @@ Outside a git checkout (e.g. released tarballs) the SHA is `unknown` and the dir
 
   ```
   magnetarctl 1.7.2 (a1b2c3d4e5f6-dirty)
-  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
+  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.95.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
   os: linux · report bugs at https://github.com/CleverCloud/magnetar

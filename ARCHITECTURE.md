@@ -1897,7 +1897,7 @@ Round-trip-encodes `BaseCommand` shapes and asserts re-decode equality.
 
 ## Build & validation
 
-Stable Rust **1.91** (workspace `rust-version` in `Cargo.toml`; see [ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
+Stable Rust **1.95** (workspace `rust-version` in `Cargo.toml`; see [ADR-0124](specs/adr/0124-raise-msrv-to-rust-1-95.md)).
 
 ### Per-commit chain
 

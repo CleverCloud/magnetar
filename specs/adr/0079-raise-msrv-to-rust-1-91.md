@@ -1,6 +1,6 @@
 # ADR-0079 — Raise the MSRV to Rust 1.91
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-0124
 - **Date**: 2026-07-16
 - **Decider**: Florentin Dubois
 - **Tags**: toolchain, msrv, dependencies, moonpool

@@ -2,7 +2,7 @@
 
 > A blazing-fast, async, sans-io Apache Pulsar client for Rust.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.91-orange.svg)](specs/adr/0079-raise-msrv-to-rust-1-91.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.95-orange.svg)](specs/adr/0124-raise-msrv-to-rust-1-95.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
 > **Status: stable (1.7.2).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
@@ -184,7 +184,7 @@ The `magnetarctl` binary exposes a sozu / systemd-style identification banner:
 ```
 $ magnetarctl --version
 magnetarctl 1.7.2 (a1b2c3d4e5f6)
-built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
+built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.95.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
@@ -889,7 +889,7 @@ The public API is stable as of `1.0.0` and follows Semantic Versioning; the expe
 
 ## Validation
 
-The whole workspace builds against stable Rust 1.91 ([ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
+The whole workspace builds against stable Rust 1.95 ([ADR-0124](specs/adr/0124-raise-msrv-to-rust-1-95.md)).
 
 ```sh
 # Build / lint / format

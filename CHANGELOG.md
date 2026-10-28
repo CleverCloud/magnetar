@@ -46,6 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
 
+### Changed
+
+- **Dependencies and MSRV:** raised the workspace compiler floor from Rust 1.91 to 1.95 and updated `tokio` 1.53.3→1.54.1, `uuid` 1.28.0→1.29.0, `aws-lc-rs` 1.18.2→1.19.0, and direct workspace use of `parking_lot` 0.12.5→0.13.0. The exact-version MSRV CI job, Clippy policy, and public documentation now enforce Rust 1.95 (ADR-0124). `moonpool-sim` 0.8.0 still resolves its own transitive `parking_lot` 0.12.5 until that upstream requirement changes.
+
 ### Fixed
 
 - **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**

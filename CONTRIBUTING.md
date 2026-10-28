@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-- Rust **stable ≥ 1.91** (edition 2024; [ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
+- Rust **stable ≥ 1.95** (edition 2024; [ADR-0124](specs/adr/0124-raise-msrv-to-rust-1-95.md)).
   `Cargo.toml` declares the minimum; `rust-toolchain.toml` selects the rolling stable toolchain for development.
 - Rust **nightly** is needed only for `cargo +nightly fmt` (unstable rustfmt features).
 - **`protoc` ≥ 3.19** if you re-run `xtask codegen`.
