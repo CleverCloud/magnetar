@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-- Restore the `zstd` 0.14 dependency line, resolving `zstd` 0.14.3, `zstd-safe` 8.2.0, and `zstd-sys` 2.1.2 to fix RUSTSEC-2026-0391, RUSTSEC-2026-0395 through RUSTSEC-2026-0406, and RUSTSEC-2026-0410. Applications that also depend on the Pulsar 6.9 Rust client now resolve its vulnerable 0.13 wrapper and Magnetar's corrected 0.14 wrapper around one `zstd-sys` version instead of sharing one vulnerable wrapper pair; Pulsar's own advisories remain until that client updates.
+- Restore the `zstd` 0.14 dependency line, resolving `zstd` 0.14.3, `zstd-safe` 8.2.0, and `zstd-sys` 2.1.2 to fix RUSTSEC-2026-0391, RUSTSEC-2026-0395 through RUSTSEC-2026-0406, and RUSTSEC-2026-0410. Applications that also depend on the Pulsar 6.9 Rust client now resolve its vulnerable 0.13 wrapper and Magnetar's corrected 0.14 wrapper around one `zstd-sys` version instead of sharing one vulnerable wrapper pair; Pulsar's own advisories remain until that client updates. This restores duplicate `zstd`/`zstd-safe` wrapper versions in applications that also use Pulsar 6.9; consumers enforcing `multiple-versions = "deny"` cannot adopt this patch without changing that policy or the Pulsar dependency.
 - Refresh the lockfile to `rustls-webpki` 0.103.16, `webpki-root-certs` 1.0.11, and `tokio` 1.54.1, fixing RUSTSEC-2026-0382, RUSTSEC-2026-0383, and RUSTSEC-2026-0386.
 
 ## [1.7.3] - 2026-10-20
