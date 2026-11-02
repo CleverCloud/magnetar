@@ -60,8 +60,8 @@ Short of all five, ADR-0046 §7 applies unchanged.
 
 The one instance authorized today is `e2e_shared_subscription_permit_accounting_survives_repeated_churn`, owned by issue #462, reviewed by **2026-12-15**.
 Its conditions 3 and 4 are satisfied by PR #885, which rewrites the reason string to name the measured `totalAvailablePermits=-2` and the reproduce command, and the `docs/testing.md` row to carry the per-image evidence with digests.
-Until that PR lands, `main` carries a reason string still saying `4.0.14 / 4.2.5 unpublished` and an evidence row holding only the 2026-09-30 sample, so the instance is authorized in principle and not yet conformant in the tree.
-This ADR landed before PR #885, so conditions 3 and 4 are **owed by the tree** until that PR merges: nothing here licenses leaving those two surfaces stale, and the carve-out does not excuse a reason string that still names an unpublished image.
+This ADR landed first, so for a short window `main` carried a reason string still saying `4.0.14 / 4.2.5 unpublished` and an evidence row holding only the 2026-09-30 sample — authorized in principle, not yet conformant in the tree.
+PR #885 closed that window: the reason string now names the measured `totalAvailablePermits=-2` with its reproduce command, and the `docs/testing.md` row carries the per-image evidence with index digests and the failing run's raw-log hash. Conditions 3 and 4 are satisfied.
 
 **Reactivation is a measurement, not a release note.** The attribute comes off when both per-PR axes — the `Broker::Default` image and `5.0.0` — pass the unmodified test repeatedly on their published images, with each run's observation count and minimum recorded.
 A new broker release that merely contains an upstream patch does not qualify; neither does a single green run.
