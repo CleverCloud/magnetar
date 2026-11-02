@@ -483,6 +483,19 @@ const SEND_TIMEOUT_CODE: i32 = -1;
 /// Error message paired with [`SEND_TIMEOUT_CODE`]. Callers match on this exact string.
 const SEND_TIMEOUT_MESSAGE: &str = "send timeout";
 
+/// Error code surfaced when a `CommandProducer` the broker never answers reaches its
+/// `operation_timeout` deadline (issue #887, ADR-0125).
+///
+/// Same `-1` sentinel as [`SEND_TIMEOUT_CODE`] — Pulsar's wire-protocol `ServerError` enum has
+/// no timeout variant — paired with [`PRODUCER_OPEN_TIMEOUT_MESSAGE`].
+const PRODUCER_OPEN_TIMEOUT_CODE: i32 = -1;
+
+/// Error message paired with [`PRODUCER_OPEN_TIMEOUT_CODE`]. Callers match on this exact
+/// string, which is deliberately DISTINCT from [`SEND_TIMEOUT_MESSAGE`]: the two sentinels
+/// share the `-1` code, and an expired attachment must be tellable apart from an expired
+/// publish in a bug report.
+const PRODUCER_OPEN_TIMEOUT_MESSAGE: &str = "producer open timeout";
+
 /// Error surfaced when a batched publish cannot be replayed after a connection reset.
 const BATCH_RESET_ERROR_CODE: i32 = -1;
 
@@ -582,6 +595,19 @@ enum PendingRequestKind {
     PartitionedMetadata,
     ProducerOpen {
         handle: ProducerHandle,
+        /// Injected-clock (ADR-0011) baseline the `operation_timeout` deadline of issue #887
+        /// is measured from, feeding [`Connection::poll_timeout`] /
+        /// [`Connection::handle_timeout`] exactly as [`PendingRequestKind::Ack`]'s does.
+        ///
+        /// [`Connection::emit_command_producer`] has no `now` parameter — `create_producer`,
+        /// `rebuild_producers` and `retry_producer_open*` are not clock-injected entries — so
+        /// this carries the connection's `last_activity`, the timestamp the last decoded frame
+        /// handed in. Each established re-attach site is triggered by a frame that just
+        /// refreshed it (`Connected` → rebuild, `LookupTopicResponse` → retry leg,
+        /// `CloseProducer` → in-place re-attach), so the baseline is the re-attach's own
+        /// instant there. `None` before any frame is decoded, which arms no deadline at all —
+        /// the same "no instant to anchor to" shape `seed_rate_window_baseline` has.
+        enqueued_at: Option<Instant>,
     },
     ConsumerSubscribe {
         handle: ConsumerHandle,
@@ -1934,7 +1960,7 @@ impl Connection {
             .pending_requests
             .iter()
             .filter_map(|(request_id, kind)| {
-                matches!(kind, PendingRequestKind::ProducerOpen { handle: h } if *h == handle)
+                matches!(kind, PendingRequestKind::ProducerOpen { handle: h, .. } if *h == handle)
                     .then_some(*request_id)
             })
             .collect();
@@ -2775,7 +2801,7 @@ impl Connection {
                 // announces is already reaped by the time the client sees it
                 // (issue #406). A session that died instead of acking took its
                 // producers with it, and its bytes never reach this decoder.
-                if let Some(PendingRequestKind::ProducerOpen { handle }) =
+                if let Some(PendingRequestKind::ProducerOpen { handle, .. }) =
                     self.pending_requests.remove(&request_id)
                 {
                     let current = self
@@ -3140,7 +3166,7 @@ impl Connection {
                 // failure event. Producer-open additionally retries both quota variants and
                 // `ProducerBusy`; subscribe additionally retries `ConsumerBusy`.
                 match kind {
-                    Some(PendingRequestKind::ProducerOpen { handle }) => {
+                    Some(PendingRequestKind::ProducerOpen { handle, .. }) => {
                         let current = self.producers.get(&handle).is_some_and(|slot| {
                             slot.state.lock().open_request_id == Some(request_id)
                         });
@@ -4375,6 +4401,46 @@ impl Connection {
         Some(event)
     }
 
+    /// Deadline of a pending `CommandProducer`, or `None` when this request arms none
+    /// (issue #887, ADR-0125).
+    ///
+    /// ONE predicate for both [`Self::poll_timeout`]'s arm and [`Self::handle_timeout`]'s
+    /// sweep: a deadline either side computed alone would either never fire or, worse, fire
+    /// forever — `poll_timeout` returning an already-elapsed instant that the sweep refuses
+    /// to clear spins the driver loop.
+    ///
+    /// Two requests arm nothing. An open with no `enqueued_at` baseline has no instant to
+    /// measure from (nothing decoded yet on this connection). An open for a producer that
+    /// has never attached belongs to the routing-aware client open loop, which owns the first
+    /// attachment and bounds it with its own provider-backed `operation_timeout` timer
+    /// (`cancel_producer_open` tears the slot and this request down when it fires) — and
+    /// whose `last_activity` baseline can legitimately be a whole keepalive interval old,
+    /// since `create_producer` is user-driven rather than frame-driven.
+    ///
+    /// Lock-ordering (ADR-0038): `&self` means the connection-wide mutex is already held by
+    /// the caller; the per-slot mutex is taken BELOW it in a single acquisition.
+    fn pending_producer_open_deadline(
+        &self,
+        kind: &PendingRequestKind,
+    ) -> Option<(ProducerHandle, Instant)> {
+        let PendingRequestKind::ProducerOpen {
+            handle,
+            enqueued_at: Some(enqueued_at),
+        } = kind
+        else {
+            return None;
+        };
+        self.producers
+            .get(handle)
+            .is_some_and(|slot| slot.state.lock().has_ever_attached)
+            .then(|| {
+                (
+                    *handle,
+                    crate::time::deadline_with_clamp(*enqueued_at, self.config.operation_timeout),
+                )
+            })
+    }
+
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
     /// per-consumer tracker deadline (negative-ack delay + unacked-message timeout).
     ///
@@ -4475,6 +4541,18 @@ impl Connection {
                 if let PendingRequestKind::Ack { enqueued_at, .. } = kind {
                     consider(crate::time::deadline_with_clamp(*enqueued_at, timeout));
                 }
+            }
+        }
+        // Issue #887: surface the earliest pending-producer-open deadline so the driver
+        // schedules a deterministic wake for `handle_timeout`'s sweep. Without it the sweep
+        // would only fire opportunistically on an unrelated tick — seed-divergent under the
+        // moonpool engine, and up to a whole keepalive interval late in production.
+        // `operation_timeout` has no disabled form, so the arm is unconditional; it exists
+        // only while an open is actually pending, and `pending_producer_open_deadline` is the
+        // same predicate the sweep applies.
+        for kind in self.pending_requests.values() {
+            if let Some((_, deadline)) = self.pending_producer_open_deadline(kind) {
+                consider(deadline);
             }
         }
         // ADR-0089: rolling-rate sampling. Java's stats recorders self-tick on
@@ -5007,6 +5085,98 @@ impl Connection {
                 });
             }
         }
+
+        // Issue #887: `operation_timeout` backstop for a pending `CommandProducer`. Until
+        // ADR-0125 this sweep covered `PendingRequestKind::Ack` alone, so a re-attach the
+        // broker never answered parked its slot at `broker_ready = false,
+        // open_request_id = Some(_)` for the life of the connection: every publish routed
+        // there resolved `code=-1 send timeout` forever, and every LATER broker close was
+        // refused an in-place re-attach because `open_request_id.is_some()`
+        // (`producer_reattach_in_place_is_eligible`). Two-phase collect-then-mutate, the same
+        // shape as the two sweeps above.
+        let expired_opens: Vec<(RequestId, ProducerHandle)> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(rid, kind)| {
+                let (handle, deadline) = self.pending_producer_open_deadline(kind)?;
+                (now >= deadline).then_some((*rid, handle))
+            })
+            .collect();
+        for (rid, handle) in expired_opens {
+            self.expire_pending_producer_open(rid, handle);
+        }
+    }
+
+    /// Dispose of one `CommandProducer` whose `operation_timeout` elapsed without a reply
+    /// (issue #887, ADR-0125).
+    ///
+    /// Treats the silence as the transient open failure it is and rides the ADR-0080 legs the
+    /// `CommandError` arm already owns: the drain gate stays shut (Pulsar closes the WHOLE
+    /// connection on a `CommandSend` for a producer that is not ready), the per-handle
+    /// failure counter is bumped under the same slot lock, and the configured
+    /// [`crate::OperationRetryConfig`] decides between one more `DriverRetry::Producer` leg
+    /// and [`Self::fail_producer_open_with_broker_error`]. The caller has already proved the
+    /// slot `has_ever_attached`, so the first-attachment branch of the `CommandError` arm
+    /// cannot apply here.
+    ///
+    /// `open_request_id` is deliberately LEFT at the expired generation, exactly as the
+    /// `CommandError` arm leaves it: it is the retry leg's liveness token
+    /// (`producer_open_retry_is_current` requires `open_request_id == Some(failed_request_id)`
+    /// before `retry_producer_open_if_current` re-emits), so clearing it here would arm a leg
+    /// that then refuses to fire and leave the slot with neither a pending open nor a retry.
+    /// In-place re-attach eligibility returns when the retry's own `CommandProducerSuccess`
+    /// clears the id, or when the budget runs out and the slot is terminalized.
+    ///
+    /// Lock-ordering (ADR-0038): the global mutex is held by the `&mut self` receiver, the
+    /// per-slot mutex is taken below it in one scoped acquisition, and
+    /// `fail_producer_open_with_broker_error` (which wakes user futures) runs after that guard
+    /// is dropped.
+    fn expire_pending_producer_open(&mut self, rid: RequestId, handle: ProducerHandle) {
+        self.pending_requests.remove(&rid);
+        // `u32::MAX` for a slot that is already gone, exactly as the `CommandError` arm
+        // does: the retry budget then refuses, and `fail_producer_open_with_broker_error`
+        // tolerates a missing slot (it pushes the terminal event and nothing else).
+        let attempts = self.producers.get(&handle).map_or(u32::MAX, |slot| {
+            let mut producer = slot.state.lock();
+            slot.set_broker_ready(&mut producer, false, false);
+            producer.last_open_error = Some((
+                PRODUCER_OPEN_TIMEOUT_CODE,
+                PRODUCER_OPEN_TIMEOUT_MESSAGE.to_owned(),
+            ));
+            producer.transient_open_attempts = producer.transient_open_attempts.saturating_add(1);
+            producer.transient_open_attempts
+        });
+        // Bounded outside the macro: a `tracing` field expression only runs when a
+        // subscriber enables the level, and the sim-coverage gate runs with none.
+        let operation_timeout_ms = self.config.operation_timeout.as_millis() as u64;
+        tracing::warn!(
+            target: "magnetar_proto::conn",
+            handle = ?handle,
+            request_id = ?rid,
+            attempts,
+            operation_timeout_ms,
+            "producer open unanswered within operation_timeout",
+        );
+        if self.operation_retry.should_retry_after_failure(attempts) {
+            self.driver_retries.push_back(crate::DriverRetry::Producer {
+                handle,
+                failed_request_id: rid,
+                code: PRODUCER_OPEN_TIMEOUT_CODE,
+                message: PRODUCER_OPEN_TIMEOUT_MESSAGE.to_owned(),
+            });
+            self.events
+                .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                    handle,
+                    code: PRODUCER_OPEN_TIMEOUT_CODE,
+                    message: PRODUCER_OPEN_TIMEOUT_MESSAGE.to_owned(),
+                });
+        } else {
+            self.fail_producer_open_with_broker_error(
+                handle,
+                PRODUCER_OPEN_TIMEOUT_CODE,
+                PRODUCER_OPEN_TIMEOUT_MESSAGE,
+            );
+        }
     }
 
     /// Install an `OpOutcome::Terminal` for each op drained out of `handle`'s pending queue and
@@ -5523,8 +5693,13 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::ProducerOpen { handle });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::ProducerOpen {
+                handle,
+                enqueued_at: self.last_activity,
+            },
+        );
         if let Some(slot) = self.producers.get(&handle) {
             slot.state.lock().open_request_id = Some(request_id);
         }
@@ -18939,6 +19114,251 @@ mod conn_state_tests {
                 .lock()
                 .broker_ready,
             "ProducerSuccess re-opens the drain gate"
+        );
+    }
+
+    /// Handshake + one attached producer on a connection whose `operation_timeout` is
+    /// shorter than its keepalive interval, so a deadline surfaced by `poll_timeout` can
+    /// only have come from the pending-open arm.
+    fn open_deadline_connection(
+        topic: &str,
+        retry: crate::OperationRetryConfig,
+    ) -> (Connection, ProducerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                operation_timeout: OPEN_DEADLINE_TIMEOUT,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.set_operation_retry_config(retry);
+        let handle = reattach_attached_producer(&mut conn, topic);
+        (conn, handle)
+    }
+
+    /// Deliberately below `ConnectionConfig::default().keepalive_interval` (30 s).
+    const OPEN_DEADLINE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// #887 root cause: ADR-0106 re-attaches a broker-closed producer in place, but a
+    /// pending `CommandProducer` carried NO deadline — `handle_timeout` swept
+    /// `PendingRequestKind::Ack` alone (ADR-0106 § Consequences, recorded and not fixed
+    /// there). A re-attach the broker never answered parked the slot at
+    /// `broker_ready = false, open_request_id = Some(_)` for the life of the connection:
+    /// every publish routed there resolved `code=-1 send timeout` forever, and every later
+    /// broker close was refused an in-place re-attach by
+    /// `producer_reattach_in_place_is_eligible`.
+    ///
+    /// The deadline turns that permanent wedge into one bounded ADR-0080 retry leg.
+    #[test]
+    fn pending_producer_open_expires_into_a_bounded_retry_instead_of_wedging_the_slot() {
+        let (mut conn, handle) = open_deadline_connection(
+            "persistent://public/default/open-deadline-887",
+            crate::OperationRetryConfig::default(),
+        );
+
+        // The broker closes the attached producer on the LIVE socket; the in-place
+        // re-attach goes out and the broker never answers it.
+        let t0 = Instant::now();
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(t0, &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+        let reattach = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&reattach, handle),
+            vec![(reattach_rid, Some(1))],
+            "the close must re-emit exactly one CommandProducer"
+        );
+        assert!(
+            conn.has_pending_request_for_test(RequestId(reattach_rid)),
+            "the re-attach open is pending with no reply"
+        );
+
+        // The deadline is armed, measured from the close frame's own injected instant —
+        // and it is EARLIER than the keepalive deadline, so only the new arm can produce it.
+        let deadline = crate::time::deadline_with_clamp(t0, OPEN_DEADLINE_TIMEOUT);
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(deadline),
+            "poll_timeout must surface the pending open's deadline so the sweep fires \
+             deterministically instead of riding an unrelated tick"
+        );
+
+        // One millisecond before it, nothing happens.
+        conn.handle_timeout(
+            deadline
+                .checked_sub(Duration::from_millis(1))
+                .expect("the deadline is far enough past the process epoch to step back from"),
+        );
+        assert!(
+            conn.has_pending_request_for_test(RequestId(reattach_rid)),
+            "the open must survive its own deadline minus one millisecond"
+        );
+        assert_eq!(conn.producer_transient_open_attempts(handle), 0);
+
+        // The deadline fires.
+        conn.handle_timeout(deadline);
+        assert!(
+            !conn.has_pending_request_for_test(RequestId(reattach_rid)),
+            "the expired open must leave `pending_requests`, or `poll_timeout` would keep \
+             returning an elapsed instant and spin the driver loop"
+        );
+        assert_eq!(
+            conn.producer_transient_open_attempts(handle),
+            1,
+            "the expiry consumes exactly one ADR-0080 attempt"
+        );
+        {
+            let slot = conn
+                .producer(handle)
+                .expect("the slot survives a retryable expiry");
+            let producer = slot.state.lock();
+            assert!(
+                !producer.broker_ready,
+                "the drain gate stays shut: Pulsar closes the whole connection on a send \
+                 to a producer that is not ready"
+            );
+            assert!(
+                !producer.closed,
+                "a retryable expiry must not close the producer"
+            );
+            assert_eq!(
+                producer.open_request_id,
+                Some(RequestId(reattach_rid)),
+                "the expired generation stays the retry leg's liveness token"
+            );
+            assert_eq!(
+                producer.last_open_error,
+                Some((
+                    PRODUCER_OPEN_TIMEOUT_CODE,
+                    PRODUCER_OPEN_TIMEOUT_MESSAGE.to_owned()
+                )),
+                "the expiry records its own diagnostic rather than a stale broker one"
+            );
+        }
+
+        // The runtime-facing half of the retry: the generation-correlated leg, carrying the
+        // expired request id. Its public twin `ProducerOpenFailedTransient` is removed with
+        // it by `poll_driver_retry` (the documented pairing).
+        assert!(
+            matches!(
+                conn.poll_driver_retry(),
+                Some(crate::DriverRetry::Producer {
+                    handle: retry_handle,
+                    failed_request_id,
+                    code,
+                    ref message,
+                }) if retry_handle == handle
+                    && failed_request_id == RequestId(reattach_rid)
+                    && code == PRODUCER_OPEN_TIMEOUT_CODE
+                    && message == PRODUCER_OPEN_TIMEOUT_MESSAGE
+            ),
+            "a budget-remaining expiry arms the existing ADR-0080 retry leg"
+        );
+
+        // And that leg can actually fire: this is why the expiry LEAVES `open_request_id`
+        // at the expired generation. `producer_open_retry_is_current` demands
+        // `open_request_id == Some(failed_request_id)`, so clearing it here would arm a leg
+        // that then refuses to re-emit and leave the slot with neither a pending open nor a
+        // retry — a quieter version of the same wedge.
+        assert!(
+            conn.producer_open_retry_is_current(handle, RequestId(reattach_rid)),
+            "the armed leg must still own the producer's open generation"
+        );
+        let retry_rid = conn.peek_next_request_id_for_test();
+        assert_eq!(
+            conn.retry_producer_open_if_current(handle, RequestId(reattach_rid)),
+            Some(RequestId(retry_rid)),
+            "the leg re-emits CommandProducer at the next epoch"
+        );
+        let retried = drain_outbound_commands(&mut conn);
+        assert_eq!(
+            reattach_producer_opens(&retried, handle),
+            vec![(retry_rid, Some(2))],
+            "the retry carries a strictly higher epoch so the broker takes it as a successor"
+        );
+
+        // The broker answers THIS one: the gate reopens and the slot is eligible again.
+        ack_producer_success(&mut conn, retry_rid);
+        let slot = conn.producer(handle).expect("slot");
+        let producer = slot.state.lock();
+        assert!(
+            producer.broker_ready,
+            "the retry ack reopens the drain gate"
+        );
+        assert_eq!(
+            producer.open_request_id, None,
+            "a later broker close is eligible for an in-place re-attach again"
+        );
+        assert_eq!(
+            producer.transient_open_attempts, 0,
+            "a successful attachment clears the ADR-0080 budget"
+        );
+    }
+
+    /// #887: once the configured `OperationRetryConfig` refuses another re-issue, the
+    /// expiry terminalizes through the existing `fail_producer_open_with_broker_error`
+    /// path instead of arming a leg nobody would honour — the parked publishes resolve
+    /// `Err` rather than hanging until their own `send_timeout`.
+    #[test]
+    fn pending_producer_open_terminalizes_once_the_retry_budget_is_exhausted() {
+        let (mut conn, handle) = open_deadline_connection(
+            "persistent://public/default/open-deadline-887-exhausted",
+            crate::OperationRetryConfig {
+                max_retries: Some(0),
+                ..crate::OperationRetryConfig::default()
+            },
+        );
+
+        let t0 = Instant::now();
+        let reattach_rid = conn.peek_next_request_id_for_test();
+        conn.handle_bytes(t0, &close_producer_frame(handle, None))
+            .expect("handle CommandCloseProducer");
+        let _ = drain_outbound_commands(&mut conn);
+        while conn.poll_event().is_some() {}
+
+        conn.handle_timeout(crate::time::deadline_with_clamp(t0, OPEN_DEADLINE_TIMEOUT));
+
+        assert!(
+            !conn.has_pending_request_for_test(RequestId(reattach_rid)),
+            "the expired open leaves `pending_requests` on the terminal path too"
+        );
+        assert!(
+            conn.producer(handle).is_none(),
+            "a terminalized open drops the slot so no reconnect rebuild re-emits it"
+        );
+        assert!(
+            conn.poll_driver_retry().is_none(),
+            "an exhausted budget must not arm another retry leg"
+        );
+        let mut failed = None;
+        while let Some(event) = conn.poll_event() {
+            if let ConnectionEvent::ProducerOpenFailed {
+                handle: event_handle,
+                code,
+                message,
+            } = event
+            {
+                if event_handle == handle {
+                    failed = Some((code, message));
+                }
+            }
+        }
+        assert_eq!(
+            failed,
+            Some((
+                PRODUCER_OPEN_TIMEOUT_CODE,
+                PRODUCER_OPEN_TIMEOUT_MESSAGE.to_owned()
+            )),
+            "the terminal disposition reaches a future parked on the event stream, under a \
+             message distinct from the `send timeout` sentinel"
+        );
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(crate::time::deadline_with_clamp(
+                t0,
+                Duration::from_secs(30)
+            )),
+            "with the open gone only the keepalive deadline remains armed"
         );
     }
 

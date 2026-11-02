@@ -2541,12 +2541,6 @@ struct ProxySessionRecord {
 /// advertise.
 struct ProxyThroughBroker {
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
-    /// Index of the session that first issues a Lookup — the real
-    /// bootstrap session. Accept order alone can't identify it: a
-    /// chaos-killed dial can occupy session 0 and never issue one, so the
-    /// bootstrap can land on any accept index. `None` until the first
-    /// Lookup is observed.
-    bootstrap_session_idx: Arc<Mutex<Option<usize>>>,
 }
 
 #[async_trait]
@@ -2565,13 +2559,6 @@ impl Workload for ProxyThroughBroker {
 
         let shutdown = ctx.shutdown().clone();
         let sessions = self.sessions.clone();
-        let bootstrap_session_idx = self.bootstrap_session_idx.clone();
-        // Fresh per run() invocation: this workload is reused across every
-        // sweep iteration, and each iteration re-derives session_idx from
-        // scratch (sessions is cleared by the client's check()), so a
-        // bootstrap decision latched from a prior iteration must not carry
-        // over.
-        *bootstrap_session_idx.lock() = None;
         let task = ctx.providers().task().clone();
         loop {
             moonpool_core::select! {
@@ -2585,12 +2572,10 @@ impl Workload for ProxyThroughBroker {
                                 s.len() - 1
                             };
                             let sessions_for_task = sessions.clone();
-                            let bootstrap_session_idx_for_task = bootstrap_session_idx.clone();
                             let _handle = task.spawn_task("proxy-session", async move {
                                 let _ = handle_proxy_session(
                                     stream,
                                     sessions_for_task,
-                                    bootstrap_session_idx_for_task,
                                     session_idx,
                                 ).await;
                             });
@@ -2606,7 +2591,6 @@ impl Workload for ProxyThroughBroker {
 async fn handle_proxy_session<S>(
     mut stream: S,
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
-    bootstrap_session_idx: Arc<Mutex<Option<usize>>>,
     session_idx: usize,
 ) -> SimulationResult<()>
 where
@@ -2667,20 +2651,29 @@ where
                 pb::base_command::Type::Ping => emit_pong(&mut out_buf),
                 pb::base_command::Type::Lookup => {
                     if let Some(l) = &frame.command.lookup_topic {
-                        // Only the bootstrap session advertises
-                        // proxy_through=true — the first session to issue
-                        // a Lookup, not accept order: a chaos-killed dial
-                        // can occupy an earlier accept slot and never get
-                        // this far, shifting the real bootstrap to a
-                        // later session_idx. Subsequent pinned sessions
-                        // shouldn't be issuing lookups in this test;
-                        // tolerating them with proxy_through=false avoids
-                        // a redirect loop.
-                        let proxy_through = {
-                            let mut bootstrap = bootstrap_session_idx.lock();
-                            let idx = *bootstrap.get_or_insert(session_idx);
-                            idx == session_idx
-                        };
+                        // The answer is a function of THIS session's own CONNECT
+                        // shape, exactly like the Apache Pulsar Proxy: a
+                        // bootstrap-shaped session (`proxy_to_broker_url` absent —
+                        // the client is talking to the proxy itself) is always told
+                        // to route through the proxy, and a pinned session
+                        // (`proxy_to_broker_url` present) is told not to, so a
+                        // pinned session that issues a lookup cannot start a
+                        // redirect loop.
+                        //
+                        // Deriving it from a run-global "first session to issue a
+                        // Lookup" latch instead was the #892 defect: chaos can drop
+                        // the bootstrap session after its lookup, the supervisor
+                        // then reconnects a NEW bootstrap-shaped session, and the
+                        // stale latch made this emulated proxy answer that session
+                        // `proxy_through=false` with its own advertised URL — i.e.
+                        // tell the client to bypass the proxy and dial
+                        // `broker-sim.proxy.internal:6650` directly, an authority no
+                        // simulated peer owns. A real proxy never disowns a lookup
+                        // on a connection a client made to it, whether or not an
+                        // earlier connection died.
+                        let proxy_through = sessions.lock()[session_idx]
+                            .connect_proxy_to_broker_url
+                            .is_none();
                         emit_proxy_lookup(&mut out_buf, l.request_id, proxy_through);
                     }
                 }
@@ -2906,7 +2899,6 @@ fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
-            bootstrap_session_idx: Arc::new(Mutex::new(None)),
         })
         .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(sweep_seeds(8))
@@ -2947,7 +2939,6 @@ fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
-            bootstrap_session_idx: Arc::new(Mutex::new(None)),
         })
         .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(vec![
@@ -2961,6 +2952,47 @@ fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
     assert_eq!(
         report.successful_runs,
         4,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+    assert_eq!(
+        report.failed_runs,
+        0,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+}
+
+/// Regression pin for the re-bootstrap sub-seed (#892, surfaced under
+/// `MOONPOOL_SEED=0xb104b915c362676b`). Chaos dropped the proxy bootstrap
+/// session after it had issued its lookup but before the response resolved,
+/// the supervisor reconnected a second, equally bootstrap-shaped session
+/// (`CommandConnect.proxy_to_broker_url` absent), and `ProxyThroughBroker` —
+/// which then latched "the first session to issue a Lookup" for the whole run
+/// — answered that new session `proxy_through_service_url = false` while still
+/// advertising its own `pulsar://broker-sim.proxy.internal:6650`. The client
+/// correctly took the DIRECT route that answer names and dialled an authority
+/// no simulated peer owns, so all sixteen `retry_setup` attempts burned on
+/// `pool dial to broker-sim.proxy.internal:6650 exceeded operation_timeout
+/// (10s)` and no pinned session was ever created. The emulated proxy now
+/// answers from each session's own CONNECT shape, the way the real proxy does.
+/// Pin the exact failing sub-seed, independent of `MOONPOOL_SEED` derivation.
+#[test]
+fn sim_chaos_pulsar_proxy_rebootstrap_sub_seed_892() {
+    let sessions = Arc::new(Mutex::new(Vec::<ProxySessionRecord>::new()));
+    let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(ProxyThroughBroker {
+            sessions: sessions.clone(),
+        })
+        .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
+        .set_debug_seeds(vec![3_734_608_893_952_018_932])
+        .set_iterations(1)
+        .run();
+    assert_eq!(
+        report.successful_runs,
+        1,
         "report: {report:?}; diagnostics: {:?}",
         diagnostics.lock()
     );
@@ -2992,7 +3024,6 @@ fn sim_chaos_pulsar_proxy_corrupted_broker_host_sub_seed_859() {
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
-            bootstrap_session_idx: Arc::new(Mutex::new(None)),
         })
         .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(vec![275_959_541_064_554_753])
@@ -3068,6 +3099,32 @@ const SWIZZLE_CONSUMERS: u64 = 4;
 /// at least one consumer mid-stream.
 const SWIZZLE_PRODUCE_COUNT: u32 = 8;
 
+/// Virtual-time anti-hang backstop for the whole drain phase of one
+/// swizzle iteration — an ABSOLUTE deadline armed once per consumer, not a
+/// per-`receive()` budget, so the phase is bounded whatever the message
+/// cadence.
+///
+/// **It must be strictly longer than every deadline nested inside it.** The
+/// supervised client of [`supervised_config`] owns a bounded recovery path:
+/// `keepalive_interval` 1s (dead-link detection costs a small multiple of it),
+/// `operation_timeout` 5s, and `supervisor.mandatory_stop` 5s; add the ~115 ms
+/// clog window on top. A guard shorter than that does not merely report early
+/// — it exits the drain task, which DROPS the `Consumer`, and
+/// `ConsumerCloseGuard::drop` enqueues a best-effort `CloseConsumer`
+/// (`magnetar-runtime-moonpool/src/consumer.rs`). A closed consumer is skipped
+/// by `Connection::rebuild_consumers`, so the handle is gone from the
+/// reconnect replay and the client's own recovery can never serve it. The old
+/// 2s budget did exactly that: it fired while the client still reported
+/// `is_connected() == true`, i.e. BEFORE the client had even begun its bounded
+/// error path, and the reconnect 280 ms later redelivered the full backlog to
+/// the two consumers whose tasks happened to still be alive.
+///
+/// Sized at 10s: comfortably above the 5s client deadlines and comfortably
+/// below [`CHAOS_RUN_TIME_BUDGET`] (30s), which is the single outer bound. Do
+/// NOT re-tighten this to "make the test faster" — a genuinely wedged
+/// consumer still fails the iteration, just later, never silently.
+const SWIZZLE_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+
 /// Phase cursor exposed to the broker's session handler so it can
 /// short-circuit deliveries to clogged consumers. The state machine is
 /// `Clogging → Restoring → Done`; `Done` matches the no-clog hot path
@@ -3105,9 +3162,24 @@ struct SwizzleState {
     /// Consumer ids currently barred from receiving pushes. Cleared
     /// as the controller walks `restore_order`.
     clogged_set: HashSet<u64>,
-    /// The ids of every consumer the broker has seen subscribe so
-    /// far. Used by the controller to decide when the client side has
-    /// finished spinning up.
+    /// The ids of every consumer the client has proved it HOLDS — a
+    /// consumer the broker has both accepted a `Subscribe` for *and*
+    /// been granted flow permits on. Used by the controller to decide
+    /// when the client side has finished spinning up, and as the pool
+    /// the clogged subset is drawn from.
+    ///
+    /// Keyed on `CommandFlow`, not on `CommandSubscribe`, and that is
+    /// load-bearing: control frames carry no CRC32C, so a bit flip on a
+    /// `Subscribe`'s `request_id` is undetectable by design — the broker
+    /// accepts the subscribe and answers a request id the client's pending
+    /// map does not hold, the client's `Success` arm silently drops it, and
+    /// `retry_setup` re-issues under a FRESH consumer id. The first id is then
+    /// ORPHANED: the broker holds a consumer for it, but no client code will
+    /// ever call `receive()` on it and the flow pump will never grant it
+    /// permits, so it can never satisfy the "every clogged consumer eventually
+    /// received" window property. Registering on the client's FLOW is what
+    /// keeps such an orphan out of the clog candidate pool; a subscribe-keyed
+    /// pool admitted it and asserted the physically impossible.
     registered: HashSet<u64>,
     /// The order ids were inserted into the clog — useful for both
     /// debugging and asserting `restore_order != clog_order`.
@@ -3253,11 +3325,23 @@ async fn swizzle_controller<T, R>(
     T: TimeProvider,
     R: RandomProvider,
 {
-    // Wait for the client workload to register every consumer. The
-    // sim budget bounds this loop — if the client never subscribes we
-    // bail without engaging the clog (the iteration's `check()` then
-    // catches the missing-receive case).
-    for _ in 0..200 {
+    // Wait for the client workload to register every consumer, bounded ONLY by
+    // the iteration's shutdown (and behind it the simulation's own
+    // `run_time_budget`). Deliberately uncapped: a fixed window here would be
+    // an outer guard shorter than the deadlines nested inside it. Client setup
+    // goes through `retry_setup`, whose worst case is `MAX_ATTEMPTS` (16) x
+    // `ATTEMPT_TIMEOUT` (2s) PER operation across four subscribes and a
+    // producer open — far more than `CHAOS_RUN_TIME_BUDGET`, so no finite tick
+    // count can be strictly longer than it. The old 200 x 10ms = 2s window was
+    // exactly one `ATTEMPT_TIMEOUT`, so a single bit-flipped subscribe
+    // exhausted it and the controller armed the clog from a partial
+    // `registered` set — once from a set holding nothing but an orphaned id,
+    // which made `n = n_clogged.min(1) = 1` clog the whole pool and broke this
+    // test's "at least one unaffected consumer" design invariant.
+    //
+    // If the client never gets there, its own `run()` surfaces the setup error
+    // and the iteration fails for that reason; the clog simply never engages.
+    loop {
         let ready = state.lock().registered.len() >= SWIZZLE_CONSUMERS as usize;
         if ready {
             break;
@@ -3405,16 +3489,25 @@ where
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
             handle_stateful_frame(&mut session, &shared, &source, &frame, &mut out_buf);
-            // An accepted Subscribe registers the consumer id with the
-            // shared swizzle state so the controller can see how many
-            // consumers exist. A refused one (topic not served) is not a
-            // consumer and must never become a clog candidate.
-            if let Ok(pb::base_command::Type::Subscribe) =
+            // A `Flow` for a consumer this session knows registers that id with
+            // the shared swizzle state, so the controller can see how many
+            // consumers exist and which ids are legitimate clog candidates.
+            //
+            // FLOW, not Subscribe: an accepted `Subscribe` only proves the
+            // BROKER has a consumer. A bit flip on the subscribe's `request_id`
+            // (a CONTROL frame — no CRC32C, undetectable by design) leaves the
+            // client unable to correlate the `CommandSuccess`, so it re-issues
+            // under a fresh consumer id and ORPHANS the first one. The client
+            // grants permits only to the consumer it actually holds, so keying
+            // on FLOW admits exactly the drainable ids — see
+            // `SwizzleState::registered`. A refused subscribe (topic not
+            // served) has no session slot and never reaches this arm either.
+            if let Ok(pb::base_command::Type::Flow) =
                 pb::base_command::Type::try_from(frame.command.r#type)
             {
-                if let Some(s) = &frame.command.subscribe {
-                    if session.consumers.contains_key(&s.consumer_id) {
-                        state.lock().registered.insert(s.consumer_id);
+                if let Some(f) = &frame.command.flow {
+                    if session.consumers.contains_key(&f.consumer_id) {
+                        state.lock().registered.insert(f.consumer_id);
                     }
                 }
             }
@@ -3676,7 +3769,6 @@ impl Workload for SwizzleClogClientWorkload {
         // moonpool's pending-event count, not tokio's, so plain
         // `tokio::time::timeout` would let the sim go idle during the
         // clog window).
-        let drain_budget = Duration::from_secs(2);
         let mut drain_handles = Vec::with_capacity(consumers.len());
         let received_per_consumer = self.received_per_consumer.clone();
         let time_provider = ctx.providers().time().clone();
@@ -3736,17 +3828,22 @@ impl Workload for SwizzleClogClientWorkload {
                 // duplicate from eating the receive budget. The widened budget
                 // (`2 * SWIZZLE_PRODUCE_COUNT`) absorbs the redelivered copies.
                 let mut seen: HashSet<(u64, u64)> = HashSet::new();
+                // One ABSOLUTE deadline for the whole drain, armed before the
+                // first `receive()` — see [`SWIZZLE_DRAIN_BUDGET`]. A
+                // per-attempt timer would both re-arm the guard on every
+                // message (so the phase is only bounded by reasoning about
+                // cadence) and, far worse, cut a consumer off mid-recovery.
+                let deadline = time_for_task.sleep(SWIZZLE_DRAIN_BUDGET);
+                tokio::pin!(deadline);
                 for _ in 0..(2 * SWIZZLE_PRODUCE_COUNT) {
                     if got.len() >= SWIZZLE_PRODUCE_COUNT as usize {
                         break;
                     }
-                    let timer = time_for_task.sleep(drain_budget);
-                    tokio::pin!(timer);
                     let msg = moonpool_core::select! {
                         biased;
                         () = shutdown_for_task.cancelled() => break,
                         m = consumer.receive() => m,
-                        _ = &mut timer => break,
+                        _ = &mut deadline => break,
                     };
                     let Ok(msg) = msg else {
                         break;
@@ -3795,7 +3892,10 @@ fn sim_chaos_swizzle_clog_sweep_16_seeds() {
     // Picked so `n_clogged < SWIZZLE_CONSUMERS` always holds — every
     // iteration has at least one consumer that's not in the clogged
     // subset (the "unaffected" partition the no-dup assertion pins
-    // against).
+    // against). That only holds because the controller waits for ALL
+    // `SWIZZLE_CONSUMERS` client-held consumers to register before it picks
+    // the subset: `n = n_clogged.min(registered.len())`, so arming from a
+    // partial pool could make the clogged subset the ENTIRE pool.
     let n_clogged: usize = 2;
     let clog_duration_ms: u64 = 100;
 
@@ -3904,6 +4004,63 @@ fn sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds() {
         "swizzle invariant violation(s): {report:?}"
     );
     assert_eq!(report.successful_runs, 3, "report: {report:?}");
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
+}
+
+/// Regression pin for two swizzle-clog sub-seeds whose failures were both
+/// workload-side, and distinct.
+///
+/// `MOONPOOL_SEED=0x44dd3d23baefd4e0` (sub-seed 3891654041110413884): a bit
+/// flip rewrote the first `SUBSCRIBE`'s `request_id` from 1 to 9 — a CONTROL
+/// frame, so no CRC32C caught it. The broker accepted the subscribe and
+/// answered request id 9; the client's pending map held 1, dropped the
+/// `Success`, and `retry_setup` re-issued under a fresh consumer id. Wire id 0
+/// was left ORPHANED — held by the broker, held by no client handle, never
+/// granted permits. The clog pool was keyed on `Subscribe`, so it admitted
+/// that orphan, and the controller's 200 x 10ms = 2s readiness window (exactly
+/// one `retry_setup::ATTEMPT_TIMEOUT`) expired 22 ms before the first real
+/// consumer existed, arming the clog on the orphan ALONE. The window property
+/// then demanded a delivery nothing could ever read.
+///
+/// `MOONPOOL_SEED=0x8199610c78ff7f85` (2303720487047045006): all four
+/// consumers subscribed cleanly, the broker wrote the full 8-message backlog
+/// to the two clogged consumers when the window lifted (t=110ms, t=115ms), and
+/// the simulated network lost it. The client's own bounded recovery was
+/// pre-empted: the 2s per-`receive()` drain budget fired at t=2.0155s while
+/// the client still reported `is_connected() == true` — before it had even
+/// detected the dead link (it flipped to false at t=2.0655s) — and the
+/// expiring drain task dropped its `Consumer`, whose close guard enqueued a
+/// `CloseConsumer`. The supervised reconnect ~280 ms later (t~2.294s)
+/// therefore skipped those two closed handles in `rebuild_consumers` and
+/// redelivered the backlog only to the two consumers whose tasks happened to
+/// still be alive (8/8 each at t~2.300s).
+///
+/// The clog pool is now keyed on the client's `Flow`, the controller waits for
+/// every client-held consumer, and the drain phase carries one absolute
+/// [`SWIZZLE_DRAIN_BUDGET`] deadline that outlives every client deadline
+/// nested inside it. The swizzle-window assertions are unchanged.
+#[test]
+fn sim_chaos_swizzle_clog_orphaned_and_preempted_sub_seeds() {
+    let broker = SwizzleClogBrokerWorkload::new(2, 100);
+    let swizzle_snapshot = Arc::new(Mutex::new(None));
+    let state_for_mirror = broker.state.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(SwizzleClogMirroringClient::new(
+            swizzle_snapshot,
+            state_for_mirror,
+        ))
+        .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(vec![3_891_654_041_110_413_884, 2_303_720_487_047_045_006])
+        .set_iterations(2)
+        .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "swizzle invariant violation(s): {report:?}"
+    );
+    assert_eq!(report.successful_runs, 2, "report: {report:?}");
     assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }
 

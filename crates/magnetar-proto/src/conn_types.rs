@@ -196,8 +196,18 @@ pub struct ConnectionConfig {
     /// instead of parking forever. ADR-0052's dual cap scopes to the *dial*;
     /// this extends the same total budget to the handshake (Java
     /// `operationTimeoutMs` parity).
+    /// Since [ADR-0125](../../specs/adr/0125-deadline-on-a-pending-producer-open.md) it is
+    /// also the deadline on a pending `CommandProducer` that NO caller is waiting on — a
+    /// reconnect rebuild, an ADR-0080 retry re-issue, or ADR-0106's in-place re-attach — for
+    /// any producer that has attached at least once. An open the broker never answers expires
+    /// with `code=-1, "producer open timeout"`, consumes one
+    /// [`OperationRetryConfig`](crate::OperationRetryConfig) attempt, and either re-issues or
+    /// terminalizes the producer instead of leaving its send-drain gate shut for the life of
+    /// the connection (issue #887). A first attachment is excluded: the runtime's own open
+    /// loop owns and bounds it with this same budget.
     /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md),
-    /// [ADR-0080](../../specs/adr/0080-configurable-operation-retry-policy.md))
+    /// [ADR-0080](../../specs/adr/0080-configurable-operation-retry-policy.md),
+    /// [ADR-0125](../../specs/adr/0125-deadline-on-a-pending-producer-open.md))
     pub operation_timeout: Duration,
     /// Per-attempt timeout for the *initial* TCP/TLS dial. A dial that does not
     /// complete within this budget is abandoned and retried (see

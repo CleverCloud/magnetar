@@ -27,7 +27,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                           | 🟡 deferred              |
 | 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                 | 🧠 needs design decision |
 | 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection) | 🧠 needs design decision |
-| 20  | [No deadline on a pending `ProducerOpen` / `Subscribe` request](#20-no-deadline-on-a-pending-produceropen--subscribe-request)                            | ⚡ ready to dispatch     |
+| 20  | [No deadline on a pending `Subscribe` request](#20-no-deadline-on-a-pending-subscribe-request)                                                           | ⚡ ready to dispatch     |
 | 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
 | 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                       | 🟡 deferred              |
 | 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                   | ⚡ ready to dispatch     |
@@ -88,14 +88,15 @@ The current behaviour is a bounded terminal error rather than a silent hang, whi
 
 The consumer arm's own `assigned_broker_service_url = Some(url)` branch belongs to the same decision: it still diverts to the supervised reconnect, and ADR-0106 deliberately did not transfer the producer-side argument to it without separate evidence.
 
-## 20. No deadline on a pending `ProducerOpen` / `Subscribe` request
+## 20. No deadline on a pending `Subscribe` request
 
-**Gap.** `Connection::handle_timeout` sweeps only `PendingRequestKind::Ack`.
-A `CommandProducer` or `CommandSubscribe` the broker never answers leaves the slot at `broker_ready = false` (or the consumer's flow gate armed) with `open_request_id = Some(_)` forever.
-That reproduces the issue #451 symptom exactly — every publish resolves `code=-1 send timeout` — and it additionally makes every LATER broker close ineligible for an in-place re-attach, because `open_request_id.is_some()` is a refusal.
+**Gap.** `Connection::handle_timeout` now sweeps `PendingRequestKind::Ack` and `PendingRequestKind::ProducerOpen` ([ADR-0125](../specs/adr/0125-deadline-on-a-pending-producer-open.md), issue #887), but not `PendingRequestKind::ConsumerSubscribe`.
+A `CommandSubscribe` the broker never answers still leaves the consumer with its flow gate unarmed and `subscribe_waiter_request = Some(_)` forever, and it makes every LATER broker `CommandCloseConsumer` ineligible for the issue #307 in-place re-subscribe for the same reason the producer path had: an in-flight open is a refusal.
 
-**Why it stays open.** It is shared by every re-attach path — the ADR-0080 retry leg, the reconnect rebuilds, the issue #307 consumer re-subscribe and ADR-0106's producer re-attach — so it belongs to the request-deadline surface as a whole, not to any one of them.
-Java covers it with `operationTimeout` applied to every pending request; the equivalent here is a per-kind deadline on `pending_requests` plus the terminalization each kind already has.
+**Why it stays open.** The producer half was closed under a production reproduction (#887) that gave its deadline, its attempt accounting and its terminalization an evidence base; the consumer half has none yet.
+Its shape is not a copy either: a subscribe carries `flow_on_subscribe_ack` / `flow_on_subscribe_ack_request` alongside the waiter request, and the terminal disposition goes through `fail_consumer_subscribe_with_broker_error` and the `terminal_failure` marker rather than a slot removal, so the "which request is current" predicate and the expiry's effect both need deciding on their own.
+Java covers both with `operationTimeout` applied to every pending request.
+ADR-0125's `pending_producer_open_deadline` / `expire_pending_producer_open` pair is the template: one predicate shared by `poll_timeout` and `handle_timeout`, and an expiry that feeds the ADR-0080 legs the `CommandError` arm already owns.
 
 ## 22. Memory reservations of publishes the broker will never answer
 
