@@ -34,7 +34,7 @@ No client behaviour makes that pass or fail, so leaving it enabled puts CI perma
 | `4.2.5`                 | 2026-10-12, 2026-10-16 | green 7/10 with a residual −2, then run 1 green and run 2 at −2 |
 | `5.0.0`                 | 2026-10-12             | green 7/10, residual −2                                         |
 
-The 2026-10-16 campaign is recorded with image-index digests and the failing run's raw-log SHA-256 by [PR #885](https://github.com/CleverCloud/magnetar/pull/885), which is open at the time of writing and not yet on `main`; the 2026-10-12 matrix is reported in [PR #881](https://github.com/CleverCloud/magnetar/pull/881).
+The 2026-10-16 campaign is recorded with image-index digests and the failing run's raw-log SHA-256 by [PR #885](https://github.com/CleverCloud/magnetar/pull/885), which was still open when this ADR merged and is the PR that brings those two surfaces into conformance; the 2026-10-12 matrix is reported in [PR #881](https://github.com/CleverCloud/magnetar/pull/881).
 The test selects `Broker::Default`, so the per-PR axes are `4.2.5` and `5.0.0` — the two cells that still reproduce a negative aggregate in roughly three runs of ten.
 `4.0.14` is green in 8 of 8 runs across two campaigns, but it is the nightly axis only.
 
@@ -61,7 +61,7 @@ Short of all five, ADR-0046 §7 applies unchanged.
 The one instance authorized today is `e2e_shared_subscription_permit_accounting_survives_repeated_churn`, owned by issue #462, reviewed by **2026-12-15**.
 Its conditions 3 and 4 are satisfied by PR #885, which rewrites the reason string to name the measured `totalAvailablePermits=-2` and the reproduce command, and the `docs/testing.md` row to carry the per-image evidence with digests.
 Until that PR lands, `main` carries a reason string still saying `4.0.14 / 4.2.5 unpublished` and an evidence row holding only the 2026-09-30 sample, so the instance is authorized in principle and not yet conformant in the tree.
-This ADR therefore lands after PR #885, and nothing here licenses leaving those two surfaces stale.
+This ADR landed before PR #885, so conditions 3 and 4 are **owed by the tree** until that PR merges: nothing here licenses leaving those two surfaces stale, and the carve-out does not excuse a reason string that still names an unpublished image.
 
 **Reactivation is a measurement, not a release note.** The attribute comes off when both per-PR axes — the `Broker::Default` image and `5.0.0` — pass the unmodified test repeatedly on their published images, with each run's observation count and minimum recorded.
 A new broker release that merely contains an upstream patch does not qualify; neither does a single green run.
