@@ -1,6 +1,6 @@
 # ADR-0106 — Re-attach a broker-closed producer in place on a live connection
 
-- **Status**: Accepted
+- **Status**: Accepted (its recorded pending-`ProducerOpen` deadline residual is fixed by [ADR-0125](0125-deadline-on-a-pending-producer-open.md) for the producer path; the consumer half of that residual stays open)
 - **Date**: 2026-09-17
 - **Decider**: Florentin Dubois
 - **Tags**: producer, recovery, sans-io, bundle-unload, issue-451
@@ -63,7 +63,7 @@ A broker `CommandCloseProducer` that arrives on a live connection re-attaches th
 
 - The production symptom is gone: a `topics unload` of one partition costs a bounded re-attach instead of a permanent per-partition publish outage, and the close is now visible in the log.
 - **A cross-broker bundle move is degraded, not fixed.** The retry leg re-issues on the same connection and terminalizes on a lookup redirect or after the retry budget. Publishes then fail `Err` rather than hanging, and the application must re-create the producer. A pool-level re-home needs its own ADR.
-- **A pending `ProducerOpen` still carries no deadline** — `handle_timeout` sweeps only `PendingRequestKind::Ack`. A re-attach the broker never answers leaves the slot at `broker_ready = false, open_request_id = Some(_)`, reproducing the old symptom and making later closes ineligible. Shared with the #307 consumer path and with every reconnect rebuild; recorded, not fixed here.
+- **A pending `ProducerOpen` still carries no deadline** — `handle_timeout` sweeps only `PendingRequestKind::Ack`. A re-attach the broker never answers leaves the slot at `broker_ready = false, open_request_id = Some(_)`, reproducing the old symptom and making later closes ineligible. Shared with the #307 consumer path and with every reconnect rebuild; recorded, not fixed here — fixed for the producer path by [ADR-0125](0125-deadline-on-a-pending-producer-open.md) after issue #887 reproduced it in production, which leaves the `CommandSubscribe` half open.
 - **At-least-once across the re-attach.** `drain_timed_out_sends` pops only `pending`, so a timed-out publish's staged frame is still flushed once the gate reopens, and a publish already receipted-pending at close time is replayed by `replay_pending_outbound`. Same shape as the ADR-0080 reconnect path. Batched frames already on the wire before the close carry no `replay_frames` (ADR-0096) and resolve only through `send_timeout`.
 - **A broker that keeps closing is not rate-limited.** Each close triggers one `CommandProducer`, and a success resets `transient_open_attempts`, so the ADR-0080 budget never trips on a close streak. Identical exposure to the #307 consumer path; a streak budget in the shape of ADR-0103 is the answer if a storm is ever observed.
 - `emit_command_producer` still sends `topic_epoch: None`, so for `Exclusive`, `WaitForExclusive`, and `ExclusiveWithFencing` producers the broker arbitrates the re-attach and may answer `ProducerFenced`, which terminalizes the slot. Parity with Java on that path is UNVERIFIED.

@@ -1947,6 +1947,19 @@ where
                 // ADR-0011: route the tick-now through the engine clock so
                 // virtual-time sim runs see deterministic timeout firings.
                 shared.inner.lock().handle_timeout(shared.now_instant());
+                // Issue #887: the proto sweep can now raise driver-actionable work from a
+                // timer tick — a `DriverRetry::Producer` for a `CommandProducer` that
+                // reached its `operation_timeout` — so the tick drains the same subset the
+                // inbound arm does. Until ADR-0125 every retry was raised by a decoded
+                // `CommandError`, which always arrived through that arm; leaving the drain
+                // out here parks the expiry's retry leg until the next inbound frame, a
+                // whole keepalive interval away on the silent broker that caused it.
+                let mut retries: Vec<RetryRequest> = Vec::new();
+                handle_pending_events(&shared, &mut retries)?;
+                for req in retries {
+                    spawn_retry_leg::<P>(&shared, &time, &task, req);
+                }
+                shared.event_waker.notify_waiters();
             }
         }
     }
