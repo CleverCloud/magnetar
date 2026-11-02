@@ -683,9 +683,13 @@ async fn churn_round(
 ///
 /// [ADR-0046](../../../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) makes the
 /// e2e suite run as a regular `cargo test`, deliberately: an e2e test behind `#[ignore]` is an
-/// e2e test nobody runs. This existing ignore conflicts with that policy and
-/// remains tracked by issue #462 while a tested published GA broker fails the
-/// assertion intermittently.
+/// e2e test nobody runs.
+/// [ADR-0126](../../../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md) authorizes
+/// this one narrowly, on five conditions, because the assertion is about an external component no
+/// available version has fixed; its removal is still owed and tracked by issue #462, which a tested
+/// published GA broker keeps failing intermittently. The measurement below is what satisfies that
+/// carve-out's conditions 3 and 4 — the reason string naming the measured value, and the per-image
+/// evidence written down.
 ///
 /// Every other e2e test asserts something about **magnetar**. This one asserts
 /// something about the **broker**: that `apache/pulsar#26416`'s deferred-flow

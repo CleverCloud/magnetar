@@ -79,7 +79,7 @@ The previous 2026-10-12 matrix report recorded 5/5 passing runs on `4.0.14` and 
    A failure on one version is one of three things, and each has its own fix: a client bug (fix the client), a test assumption the broker legitimately changed (change the test, with the broker change named in a comment, so that it holds on every axis), or a broker defect (a tracked issue and a decision recorded here; never a silent skip).
    A red nightly is a regression on the minimum broker and is treated like a red pull-request cell.
    The `#[ignore]` on the permit-accounting suite for apache/pulsar#26416 is not part of this decision.
-   The published-image evidence in the 2026-10-16 amendment does not confirm a reliable fix on `4.2.5`; the existing issue #462 ignore remains a separately tracked policy deviation and is not authorized or removed by this matrix decision.
+   The published-image evidence in the 2026-10-16 amendment does not confirm a reliable fix on `4.2.5`; the existing issue #462 ignore is authorized narrowly by [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md), not by this matrix decision, and its removal remains owed.
    Landing the axes found the three test assumptions listed under "5.0 / 4.2.5 behaviour changes the suites had to accommodate"; each is a change of the third kind above, made without touching an assertion.
 
 6. **The gate keeps it honest.**
