@@ -680,7 +680,7 @@ Every `Producer::send` pulses `driver_waker.notify_one()`, so under sustained pu
 The read arm is cancel-safe — bytes land in the persistent `read_buf` and are consumed via `split()` only after the arm wins — so the reorder drops no bytes.
 
 Through 2026-07, the write ran unconditionally at the top of every loop iteration (ADR-0074 bounded it to 256 KiB per turn after issue #319, with a fixed continuation arm keeping it flushing whenever bytes remained), and ADR-0070's fairness argument leaned on that: "the outbound path is not starved by giving reads priority, because `poll_transmit` + `write_all` run at the TOP of every loop iteration regardless of which arm wins."
-Issue #370 showed that premise fails against a peer that accepts the connection and then simply stops draining its receive window: the write parks inside that unconditional top-of-loop step, which blocks the ENTIRE loop — not just the write path — starving the read arm, the `driver_waker` arm, and (critically) the timer arm that drives `Connection::handle_timeout` (the keepalive watchdog, the `send_timeout` sweep, and the `ack_response_timeout` backstop).
+Issue #370 showed that premise fails against a peer that accepts the connection and then simply stops draining its receive window: the write parks inside that unconditional top-of-loop step, which blocks the ENTIRE loop — not just the write path — starving the read arm, the `driver_waker` arm, and (critically) the timer arm that drives `Connection::handle_timeout` (the keepalive watchdog, the `send_timeout` sweep, the `ack_response_timeout` backstop, and the `operation_timeout` deadline on a pending `CommandProducer` of ADR-0125).
 `mark_disconnected()` was never reached, so `is_connected()` kept reporting `true` on a functionally dead connection.
 
 **ADR-0083** (amends ADR-0070 and ADR-0074) makes the write its own `select!` arm — third in order, after read and the waker, before the timer — gated by `write_has_work` so an idle connection never polls it.
@@ -714,6 +714,9 @@ After the lock drops, the driver pulls semantic events via `poll_event()` and re
 The `MessageReceivedFromShadow` variant (PIP-180 / ADR-0033) is emitted in place of `Message` for shadow-topic consumers; user-facing futures pick it up directly via the same Waker slab as `Message`, so the driver does not need to special-case it.
 
 Every other event has already been turned into a future-completion via the Waker slab inside the state machine; the driver does not need to touch it.
+
+Both engines run that drain after a **timer tick** as well, not only after an inbound frame.
+Until [ADR-0125](specs/adr/0125-deadline-on-a-pending-producer-open.md) every generation-correlated retry (`poll_driver_retry`) was raised by a decoded `CommandError` and therefore always arrived through the inbound arm; the `operation_timeout` expiry of a pending `CommandProducer` is raised by `handle_timeout` instead, and without the drain its retry leg would wait for the next inbound frame — one whole keepalive interval away on the silent broker that caused it.
 
 ### Supervised reconnect
 

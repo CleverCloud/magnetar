@@ -52,6 +52,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A `CommandProducer` the broker never answers no longer wedges a producer for the life of the connection (issue #887).**
+  `Connection::handle_timeout` swept only `PendingRequestKind::Ack`, so a re-attach left unanswered parked the slot at `broker_ready = false, open_request_id = Some(_)` forever: every publish the router sent there failed `code=-1 "send timeout"`, and every later broker close was refused an in-place re-attach because an open was still "in flight". magnetar 1.7.2 lost its publishers on 2 of 12 partitions that way, with no recovery short of a process restart.
+  A pending `ProducerOpen` now carries the connection's existing `operation_timeout` as its deadline, surfaced through `poll_timeout` and swept by `handle_timeout` for any producer that has attached at least once. The expiry shuts the drain gate, consumes one `operation_retry` attempt and either arms one more ADR-0080 retry leg or terminalizes the producer, so publishes resolve `Err` instead of hanging once the budget is gone.
+  Its code is the same `-1` the send timeout uses, under the distinct message `producer open timeout`. Both engines' driver loops now drain driver-actionable retries after a timer tick, not only after an inbound frame.
+  A first attachment is unaffected: the client open loop still owns and bounds it. A pending `CommandSubscribe` still carries no deadline.
+  ([ADR-0125](specs/adr/0125-deadline-on-a-pending-producer-open.md), closing the producer half of [ADR-0106](specs/adr/0106-reattach-broker-closed-producer-in-place.md)'s recorded residual)
+
 - **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
   Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.
   JSON output gains a leading `"source": "topic" | "namespace" | "broker"` key next to the policy fields, and human output a first `SOURCE` row.
