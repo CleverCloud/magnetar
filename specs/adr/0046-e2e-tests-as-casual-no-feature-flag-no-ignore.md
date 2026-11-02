@@ -1,6 +1,6 @@
 # ADR-0046 — e2e tests are casual: no feature flag, no `#[ignore]`
 
-- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); §5's single-job CI topology superseded by [ADR-0098](0098-parallelize-per-pr-test-execution.md). The no-feature-gate decision stands. [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md) adds a separate exact-name E2E quarantine and its test-specific diagnostics; the canonical inventory and reactivation criteria are in [test-quarantine.md](../../docs/test-quarantine.md). The ACK/NACK exception documented below remains distinct, as does the pre-existing issue #462 policy deviation.
+- **Status**: Accepted — §6 ("delete `.github/workflows/e2e-replicated-subs.yml`") reversed by [ADR-0075](0075-retain-weekly-two-cluster-pip33-gate.md); §5's single-job CI topology superseded by [ADR-0098](0098-parallelize-per-pr-test-execution.md). The no-feature-gate decision stands. [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md) adds a separate exact-name E2E quarantine and its test-specific diagnostics; the canonical inventory and reactivation criteria are in [test-quarantine.md](../../docs/test-quarantine.md). The ACK/NACK exception documented below remains distinct. §7 and the decision paragraph are amended by [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md), which records the pre-existing issue #462 deviation as a narrow, condition-bound carve-out for a test asserting an external defect no available broker has fixed; everything else below remains binding.
 - **Date**: 2026-06-01
 - **Decider**: Florentin Dubois
 - **Tags**: testing, ci, process, agents
@@ -27,7 +27,7 @@ The two-cluster docker-compose fixture costs ~60s to spin up; that's acceptable 
 
 ## Decision
 
-End-to-end tests run as **regular tests**, with no compile-time feature gate and no runtime `#[ignore]`, except for this amendment's single new temporary test-specific exception below. The pre-existing issue #462 ignore remains a separate tracked policy deviation and is not amended here.
+End-to-end tests run as **regular tests**, with no compile-time feature gate and no runtime `#[ignore]`, except for this amendment's single new temporary test-specific exception below. The pre-existing issue #462 ignore is reconciled by [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md)'s five-condition carve-out, not by this amendment.
 
 Concretely:
 
@@ -44,7 +44,7 @@ Concretely:
 5. **Fold the `e2e` CI job into the `test` job** in `.github/workflows/ci.yml`.
    The single `test` job runs `cargo test --workspace --all-features --locked` and pre-pulls the Pulsar 4.0.4 broker image, the KDC image, and brings up the two-cluster docker-compose fixture before invocation.
 6. **Delete `.github/workflows/e2e-replicated-subs.yml`**. PIP-33 two-cluster coverage is now part of the per-PR `test` job.
-7. **`#[ignore]` is forbidden for every other end-to-end test.** The "environment-dependency" carve-out in ADR-0021 §1 is _removed_ for e2e; this amendment's single new temporary exception does not restore a general carve-out. The pre-existing issue #462 deviation remains tracked separately and is not authorized by this amendment.
+7. **`#[ignore]` is forbidden for every other end-to-end test.** The "environment-dependency" carve-out in ADR-0021 §1 is _removed_ for e2e; this amendment's single new temporary exception does not restore a general carve-out. The pre-existing issue #462 deviation is not authorized by this amendment either; [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md) authorizes it narrowly, for one named test, against recorded per-image evidence, and still owes its removal.
    If a test cannot run on the CI host, the fix is to provision the dependency on the host (the `test` job already installs `libkrb5-dev`, `libclang-dev`, pulls Docker images, etc.), not to silently skip the test at runtime.
    `#[ignore]` for non-e2e tests covered by ADR-0021's other clauses (a future GSSAPI-only test that genuinely cannot be provisioned, the `broker_smoke` deferral) is unchanged.
 
@@ -72,7 +72,7 @@ Under `--all-features` (the validation chain default) their e2e tests still run.
 - One Cargo profile per CI run.
   The duplicate `e2e` job goes away; the `test` job rebuilds the workspace once and runs everything against the live broker.
 - PR-shaped broker regressions are caught per-PR instead of per-week (PIP-33).
-- The new ACK/NACK exception has a named test, an explicit upstream lead caveat, and measurable reactivation criteria; the existing issue #462 policy deviation remains documented separately.
+- The new ACK/NACK exception has a named test, an explicit upstream lead caveat, and measurable reactivation criteria; the existing issue #462 policy deviation is recorded with the same shape by [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md).
 
 **Negative**
 

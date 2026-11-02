@@ -185,7 +185,7 @@ ADR-0120 adds the façade and fake without claiming a later record total. ADR-01
 
 ## End-to-end (Docker)
 
-Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite has no dedicated `e2e` feature. Exact quarantines and reactivation criteria are maintained in the [test-quarantine register](test-quarantine.md); the ACK/NACK exception and pre-existing issue #462 policy deviation remain separate. Feature-specific targets still use their owning product feature, so `e2e_scalable_topic.rs` is discovered only with `--features scalable-topics` (or `--all-features`).
+Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite has no dedicated `e2e` feature. Exact quarantines and reactivation criteria are maintained in the [test-quarantine register](test-quarantine.md); the ACK/NACK exception remains separate, and issue #462's ignore is the one instance [ADR-0126](../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md)'s external-defect carve-out authorizes. Feature-specific targets still use their owning product feature, so `e2e_scalable_topic.rs` is discovered only with `--features scalable-topics` (or `--all-features`).
 Contributors without Docker on the host should run unit / integration / moonpool tests crate-by-crate (`-p magnetar-proto`, `-p magnetar-runtime-tokio`, `-p magnetar-runtime-moonpool`, `-p magnetar-differential`) which never touch the network boundary.
 The CI sharding in [ADR-0098](../specs/adr/0098-parallelize-per-pr-test-execution.md) changes execution topology only; it does not make e2e optional or alter the local command.
 
@@ -367,7 +367,7 @@ Every `#[ignore]` annotation must:
 2. Either gate on an actual environment requirement (Docker, network), **or** link to a tracked follow-up in [`follow-ups.md`](follow-ups.md).
 
 The exact-name quarantines are listed in the [test-quarantine register](test-quarantine.md) and authorized by [ADR-0123](../specs/adr/0123-quarantine-exact-intermittent-test-scenarios.md); they create no general bug-hider carve-out. The separate ACK/NACK exception remains governed by ADR-0046.
-The pre-existing issue #462 ignore remains a separately tracked policy deviation and is neither authorized nor changed here. For every other test, bug-hiders are not acceptable: fix the underlying defect or remove the test with a written rationale rather than silently ignoring it.
+Issue #462's ignore is authorized narrowly by [ADR-0126](../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md), on five conditions, with its removal owed and reviewed by 2026-12-15; reactivation is a repeated measurement on both per-PR axes, never a broker release note. For every other test, bug-hiders are not acceptable: fix the underlying defect or remove the test with a written rationale rather than silently ignoring it.
 
 ## Mutation testing (scoped)
 
