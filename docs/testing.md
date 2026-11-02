@@ -185,7 +185,7 @@ ADR-0120 adds the façade and fake without claiming a later record total. ADR-01
 
 ## End-to-end (Docker)
 
-Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite has no dedicated `e2e` feature. Exact quarantines and reactivation criteria are maintained in the [test-quarantine register](test-quarantine.md); the ACK/NACK exception and pre-existing issue #462 policy deviation remain separate. Feature-specific targets still use their owning product feature, so `e2e_scalable_topic.rs` is discovered only with `--features scalable-topics` (or `--all-features`).
+Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite has no dedicated `e2e` feature. Exact quarantines and reactivation criteria are maintained in the [test-quarantine register](test-quarantine.md); the ACK/NACK exception remains separate, and issue #462's ignore is the one instance [ADR-0126](../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md)'s external-defect carve-out authorizes. Feature-specific targets still use their owning product feature, so `e2e_scalable_topic.rs` is discovered only with `--features scalable-topics` (or `--all-features`).
 Contributors without Docker on the host should run unit / integration / moonpool tests crate-by-crate (`-p magnetar-proto`, `-p magnetar-runtime-tokio`, `-p magnetar-runtime-moonpool`, `-p magnetar-differential`) which never touch the network boundary.
 The CI sharding in [ADR-0098](../specs/adr/0098-parallelize-per-pr-test-execution.md) changes execution topology only; it does not make e2e optional or alter the local command.
 
@@ -336,6 +336,8 @@ The fresh-coordinator bootstrap has a minimal GA regression, `e2e_moonpool_trans
 
 The issue #463 real-broker check is `MAGNETAR_PULSAR_IMAGE_TAG=4.0.4 cargo test -p magnetar-driver --test e2e_producer_partition_unload_reattach e2e_producer_partition_unload_reattach --locked -- --exact`. It unloads one partition, sends sequentially with an in-flight window of one under a single 30-second workload deadline, then waits separately for the retrying child to become ready and confirms that child rejoins the rotation. On a real unload, the first re-attach can be rejected with `ServiceNotReady`, so immediate readiness at the end of the fast send loop is not an invariant. The sustained one-child-unready window and keyed-affinity cases are deterministic façade regressions in `partitioned_producer.rs`; the e2e test confirms broker behavior but does not claim to hold the broker outage open for a chosen duration.
 
+The issue #887 companion is `cargo test -p magnetar-driver --test e2e_producer_open_deadline --locked`. It repeats that unload under an `operation_timeout` of 10 seconds instead of the 30-second default, so the pending-`CommandProducer` deadline of [ADR-0125](../specs/adr/0125-deadline-on-a-pending-producer-open.md) is armed close to the broker's own re-attach window, and asserts the producer still recovers in place with both partitions ready and the connection intact. It cannot cover the deadline FIRING: that needs a broker which receives a `CommandProducer` and answers neither `CommandProducerSuccess` nor `CommandError`, which no `pulsar-admin` surface produces. The firing, its attempt accounting and both of its dispositions are owned by the proto, two runtime and differential layers (`producer_open_deadline.rs` in each runtime's `tests/`, `producer_open_deadline_equivalence.rs` in `magnetar-differential`).
+
 ### Running the PIP-33 two-cluster fixture locally
 
 `e2e_replicated_subscriptions.rs` is the one e2e test whose broker topology `testcontainers` does not spawn.
@@ -373,7 +375,7 @@ Every `#[ignore]` annotation must:
 2. Either gate on an actual environment requirement (Docker, network), **or** link to a tracked follow-up in [`follow-ups.md`](follow-ups.md).
 
 The exact-name quarantines are listed in the [test-quarantine register](test-quarantine.md) and authorized by [ADR-0123](../specs/adr/0123-quarantine-exact-intermittent-test-scenarios.md); they create no general bug-hider carve-out. The separate ACK/NACK exception remains governed by ADR-0046.
-The pre-existing issue #462 ignore remains a separately tracked policy deviation and is neither authorized nor changed here. For every other test, bug-hiders are not acceptable: fix the underlying defect or remove the test with a written rationale rather than silently ignoring it.
+Issue #462's ignore is authorized narrowly by [ADR-0126](../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md), on five conditions, with its removal owed and reviewed by 2026-12-15; reactivation is a repeated measurement on both per-PR axes, never a broker release note. For every other test, bug-hiders are not acceptable: fix the underlying defect or remove the test with a written rationale rather than silently ignoring it.
 
 ## Mutation testing (scoped)
 

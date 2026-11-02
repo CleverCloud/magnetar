@@ -46,7 +46,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A default build's public API is unchanged — the Cargo feature now gates client logic only, since the generated wire types are always compiled.
   (ADR-0093, supersedes ADR-0031; vendor bump per ADR-0026 §D4)
 
+### Changed
+
+- **Dependencies and MSRV:** raised the workspace compiler floor from Rust 1.91 to 1.95 and updated `tokio` 1.53.3→1.54.1, `uuid` 1.28.0→1.29.0, `aws-lc-rs` 1.18.2→1.19.0, and direct workspace use of `parking_lot` 0.12.5→0.13.0. The exact-version MSRV CI job, Clippy policy, and public documentation now enforce Rust 1.95 (ADR-0124). `moonpool-sim` 0.8.0 still resolves its own transitive `parking_lot` 0.12.5 until that upstream requirement changes.
+
 ### Fixed
+
+- **A `CommandProducer` the broker never answers no longer wedges a producer for the life of the connection (issue #887).**
+  `Connection::handle_timeout` swept only `PendingRequestKind::Ack`, so a re-attach left unanswered parked the slot at `broker_ready = false, open_request_id = Some(_)` forever: every publish the router sent there failed `code=-1 "send timeout"`, and every later broker close was refused an in-place re-attach because an open was still "in flight". magnetar 1.7.2 lost its publishers on 2 of 12 partitions that way, with no recovery short of a process restart.
+  A pending `ProducerOpen` now carries the connection's existing `operation_timeout` as its deadline, surfaced through `poll_timeout` and swept by `handle_timeout` for any producer that has attached at least once. The expiry shuts the drain gate, consumes one `operation_retry` attempt and either arms one more ADR-0080 retry leg or terminalizes the producer, so publishes resolve `Err` instead of hanging once the budget is gone.
+  Its code is the same `-1` the send timeout uses, under the distinct message `producer open timeout`. Both engines' driver loops now drain driver-actionable retries after a timer tick, not only after an inbound frame.
+  A first attachment is unaffected: the client open loop still owns and bounds it. A pending `CommandSubscribe` still carries no deadline.
+  ([ADR-0125](specs/adr/0125-deadline-on-a-pending-producer-open.md), closing the producer half of [ADR-0106](specs/adr/0106-reattach-broker-closed-producer-in-place.md)'s recorded residual)
 
 - **Every `magnetarctl admin namespaces/topics get-*` policy getter now reports the policy the cluster applies and which level supplied it, instead of a client-side constant or a bare `null`.**
   Retention, persistence, backlog quotas, message TTL, the three dispatch rates, publish rate, deduplication and its snapshot interval, compaction threshold, delayed delivery, max producers/consumers and max unacked messages: a namespace without a policy of its own gets the broker default read from the runtime configuration, and a topic without one falls back to its namespace, then to the broker.

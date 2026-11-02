@@ -439,6 +439,28 @@ per-PR seed-replay re-validates this fix.
 """
 
 [[seed]]
+value        = "0xf6ce08aa819ecabe"
+discovered   = "2026-10-12"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/38238716077"
+commit_sha   = "50b67023fcec2859593e293687a71e36b5fff9c7"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/876"
+note         = """
+The daily sweep reported this seed against 50b67023. The exact targeted
+replay fails on that commit: clogged consumer 0 receives nothing while
+consumers 1–4 receive all eight messages, with restore_order=[0]. The same
+test passes on main 46792879ecde265c50ffaf10616396f14a894f7b. A controlled
+main replay with manual FLOW credit accounting and reconnect replay removed
+also passes, so the failure's cause is not attributed to that behavior and
+no causal fix is claimed here.
+
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay reruns this deterministic seed against current code to
+detect recurrence; it does not reproduce the historical failure.
+"""
+
+[[seed]]
 value        = "0xc364f2c842343a83"
 discovered   = "2026-10-06"
 workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/37448794181"
@@ -564,6 +586,168 @@ LOOKUP response and refuses any other SUBSCRIBE/PRODUCER with
 ServiceNotReady, so the client looks the topic up again; the swizzle
 session registers a consumer only once the broker accepted its bind. Pinned
 by `sim_chaos_swizzle_clog_corrupted_setup_frame_sub_seeds`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+# --- 2026-11-02 triage of the 2026-10-24 sweep (#889-#892) ---
+# Four seeds flagged by one daily run (40076790324) against 0cfbd30. All four
+# reproduced locally against f8b7465 at exit 101, across three distinct panic
+# sites, and all four are fixed in the changeset that adds these entries.
+# Clustered by panic site plus derived sub-seed, not by test name. None was a
+# production defect: every one is a sim workload or an anti-hang guard that
+# could not survive moonpool-sim's default-on chaos (ADR-0055) — the same two
+# shapes the #362-#368 triage recorded. All four are RETAINED as regression
+# anchors per the convention above.
+
+[[seed]]
+value        = "0x44dd3d23baefd4e0"
+discovered   = "2026-10-24"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/40076790324"
+commit_sha   = "0cfbd30a3c148b20c060a84f1826455125994cfa"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/889"
+note         = """
+Derived sub-seed 3891654041110413884: the sim's bit flip rewrote the first
+client->broker SUBSCRIBE's request_id from 1 to 9 while the frame still
+decoded (a CONTROL frame — no CRC32C, undetectable by design). The broker
+accepted the subscribe, registered wire consumer id 0 and answered request
+id 9; the client's pending map held 1, dropped the unmatched Success (as
+Java's ClientCnx does), and retry_setup re-issued under wire id 1. Wire id 0
+was left ORPHANED — held by the broker, held by no client handle, never
+granted flow permits. The swizzle clog pool was keyed on SUBSCRIBE, so it
+admitted that orphan, and the controller's 200 x 10ms = 2s readiness window
+(exactly one retry_setup ATTEMPT_TIMEOUT) expired at t=2s, 22ms before the
+first real consumer existed — so it armed the clog from a registered set
+holding nothing but the orphan. n = n_clogged.min(1) = 1 clogged the whole
+pool, and the window property then demanded a delivery nothing could read.
+
+FIXED in the harness: the swizzle session registers a clog candidate on the
+client's FLOW (permits are granted only to the consumer the client actually
+holds), not on SUBSCRIBE, and the controller's readiness wait is bounded
+only by the iteration shutdown / run_time_budget instead of a window
+shorter than the setup deadline nested inside it. Pinned by
+`sim_chaos_swizzle_clog_orphaned_and_preempted_sub_seeds`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x8199610c78ff7f85"
+discovered   = "2026-10-24"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/40076790324"
+commit_sha   = "0cfbd30a3c148b20c060a84f1826455125994cfa"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/890"
+note         = """
+Derived sub-seed 2303720487047045006: a DIFFERENT cause from #889 despite
+the identical panic site. All four consumers subscribed cleanly; the
+controller clogged wire ids 3 and 2; and when the window lifted the broker
+wrote their full 8-message backlog (t=110.97ms and t=115.97ms, both writes
+successful) and the simulated network lost it. The client's own bounded
+recovery was then PRE-EMPTED by the harness: the 2s per-receive() drain
+budget fired at t=2.0155s while the client still reported
+is_connected() == true — before it had even detected the dead link (it
+flipped to false at t=2.0655s) — and the expiring drain task dropped its
+Consumer, whose ConsumerCloseGuard enqueued a best-effort CloseConsumer.
+Connection::rebuild_consumers skips a closed consumer, so the supervised
+reconnect at t~2.294s replayed only the two handles whose drain tasks
+happened to still be alive and redelivered the backlog to them alone
+(got 8/8 each at t~2.300s). No client defect: the same recovery would have
+served the clogged pair had the guard not destroyed them.
+
+FIXED in the harness: the drain phase carries ONE absolute
+SWIZZLE_DRAIN_BUDGET (10s virtual) armed before the first receive(),
+strictly longer than every client deadline nested inside it
+(keepalive_interval 1s, operation_timeout 5s, supervisor mandatory_stop 5s)
+and strictly inside CHAOS_RUN_TIME_BUDGET (30s) — which is also what
+ADR-0050's "by the end of the sim budget" wording always required. Pinned by
+`sim_chaos_swizzle_clog_orphaned_and_preempted_sub_seeds`.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0xb104b915c362676b"
+discovered   = "2026-10-24"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/40076790324"
+commit_sha   = "0cfbd30a3c148b20c060a84f1826455125994cfa"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/892"
+note         = """
+Derived sub-seed 3734608893952018932. Chaos dropped the proxy bootstrap
+session after it had issued its lookup but before the response resolved. The
+supervisor reconnected a second, equally bootstrap-shaped session
+(CommandConnect.proxy_to_broker_url absent), but ProxyThroughBroker latched
+"the first session to issue a Lookup" for the whole run, so it answered that
+NEW bootstrap session proxy_through_service_url = false while still
+advertising its own pulsar://broker-sim.proxy.internal:6650. The client
+correctly took the DIRECT route that answer names and dialled an authority no
+simulated peer owns, so all sixteen retry_setup attempts burned on "pool dial
+to broker-sim.proxy.internal:6650 exceeded operation_timeout (10s)" and no
+pinned session was ever created. Sixteen distinct lookup request ids were each
+answered and each driven to a dial, and the client's own 10s bound fired every
+time, which rules out a pending-map or waker defect in the driver. A real
+Pulsar Proxy never disowns a lookup arriving on a connection the client made
+to it, whatever happened to an earlier connection.
+
+FIXED in the harness: the emulated proxy answers proxy_through from each
+session's OWN recorded CONNECT shape (connect_proxy_to_broker_url.is_none()),
+and the run-global latch is gone; pinned sessions still get false, so the
+redirect-loop tolerance the old comment described is preserved. Pinned by
+`sim_chaos_pulsar_proxy_rebootstrap_sub_seed_892`. Noted and deliberately not
+changed: retry_setup's 2s ATTEMPT_TIMEOUT is shorter than the client's 10s
+operation_timeout — the known fragility shape — but it is not causal here, and
+widening it cannot route around an unroutable authority.
+RETAINED as a regression anchor — do NOT remove on a green replay: the
+per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x86fe8eb1a656fe8f"
+discovered   = "2026-10-24"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/40076790324"
+commit_sha   = "0cfbd30a3c148b20c060a84f1826455125994cfa"
+test_name    = "moonpool_malformed_mid_session_frame_terminates_driver_not_deadlock"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/891"
+note         = """
+Derived sub-seed 11989488914469334314. The driver did NOT fail to terminate:
+with the budget raised the same seed reaches post-timeout state=Failed at
+t=60.0507s, closes with nothing pending, and joins Ok -> CleanExit, which is
+the ADR-0058 watchdog contract this test already documents as a tolerated
+outcome. The failure was the test's own anti-hang guard.
+
+The sim bit-flipped the injected [0,0,0,0] malformed prefix to
+[00,00,01,80] (two flips, captured as sim_fault kind="bit_flip"), announcing
+total_size 384 inside MAX_FRAME_SIZE. magnetar-proto/src/frame.rs:318-320
+then correctly returns Ok(None) for an incomplete frame instead of
+BadLength(0), so the driver parks and waits for the rest, as designed. The
+connection therefore ends through the keepalive watchdog rather than the
+reject path, and escalation costs TWO keepalive intervals
+(magnetar-proto/src/conn.rs:4527: the first due tick only sends the ping and
+refreshes last_activity), i.e. about 60s at the default 30s interval. The
+test's RUN_TIME_BUDGET was 30s, written 2026-06-03 in ef0754b; the
+two-interval watchdog landed nine days later in 0ef7717 and nothing
+re-checked the relation. Bisected: 30s fails, 31s and above pass with the run
+reaching simulated_time 60.0507s.
+
+The #305/#308 pins that were supposed to anchor this CleanExit path no longer
+reach it — seed 8009627293563187958 now yields RejectedAndTerminated with
+zero bit flips because the prefix arrives split — which is why a budget too
+short for the watchdog went unnoticed.
+
+FIXED in the harness: RUN_TIME_BUDGET raised to 150s of virtual time (zero
+wall cost) with its arithmetic documented, and the test now ASSERTS
+RUN_TIME_BUDGET > connect_timeout + SETTLE_DELAY + 2 * keepalive_interval
+computed from ConnectionConfig::default(), so a later default bump fails
+loudly instead of silently recreating this issue. The seed is pinned in
+CHAOS_REGRESSION_SEEDS. Nothing weakened: observed_reject still demands a
+chaos-free BadLength(0), OtherError still hard-fails, and the ADR-0038
+re-entrant-mutex regression still hangs the sim thread regardless of budget.
 RETAINED as a regression anchor — do NOT remove on a green replay: the
 per-PR seed-replay re-validates this fix.
 """

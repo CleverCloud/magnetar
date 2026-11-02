@@ -59,14 +59,41 @@ use common::sweep_seeds;
 /// Port the in-sim broker binds to (the sim hands every workload its own IP).
 const BROKER_PORT: u16 = 6650;
 
-/// Per-run virtual-time budget. The legitimate path here is a handshake, a
-/// short settle delay, and one rejected frame — well under a simulated
-/// second — so a generous 30 s ceiling still trips the orchestrator's
-/// no-progress detector on a runaway, while a `parking_lot` self-deadlock
-/// (which blocks the sim thread outright) wedges the process regardless.
-/// Pure function of the simulated schedule → never perturbs replay
+/// Per-run virtual-time budget — an **anti-hang backstop, not a timing
+/// assertion**, and therefore strictly longer than every deadline nested
+/// inside it.
+///
+/// The uncorrupted path here is a handshake, `SETTLE_DELAY`, and one rejected
+/// frame — well under a simulated second. But the chaos paths this test
+/// documents as *tolerated* are far longer, and the budget has to clear the
+/// longest of them or it pre-empts a bounded client recovery and the
+/// orchestrator reports the pre-emption as a deadlock (issue #891):
+///
+/// - the bit-flip path (`DriverOutcome::CleanExit`) parks the driver on a plausible-but-incomplete
+///   header and is resolved only by the ADR-0058 keepalive watchdog, which needs **two** full
+///   `keepalive_interval`s — one to emit the ping, a second to observe it unanswered — before
+///   `Connection::handle_timeout` escalates to `Failed` (magnetar-proto/src/conn.rs:4514-4551).
+///   With `ConnectionConfig::default()`'s 30 s interval that is ~60 s of virtual time;
+/// - a chaos-severed dial (`DriverOutcome::Severed`) first spends the bounded `connect_timeout` (10
+///   s by default).
+///
+/// The pre-fix 30 s ceiling was *shorter* than the first of those, so the
+/// `CleanExit` outcome was physically unreachable: the orchestrator breached
+/// its run-phase budget at the ping tick (~30.05 s) and its post-shutdown
+/// stall guard then declared the still-parked client a deadlock, instead of
+/// letting the watchdog's second interval fire at ~60.05 s. Issue #891 is
+/// exactly that: the guard pre-empting the deadline it wraps, never a driver
+/// that failed to terminate — raising the budget to 31 s is already enough
+/// for the same seed to reach `Failed` and close cleanly.
+///
+/// Sized well past `connect_timeout + SETTLE_DELAY + 2 * keepalive_interval`
+/// (~70.3 s), and the test asserts that relation from
+/// `ConnectionConfig::default()` so a later default bump fails loudly instead
+/// of silently recreating #891. Still finite, so a driver that genuinely
+/// never terminates is still converted into a bounded failure. Pure virtual
+/// time: raising it costs no wall clock and never perturbs replay
 /// determinism (ADR-0011).
-const RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
+const RUN_TIME_BUDGET: Duration = Duration::from_secs(150);
 
 /// Virtual-time beat the broker waits after acking the handshake before
 /// injecting the malformed frame. Long enough that `connect_plain` has
@@ -104,6 +131,17 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 ///   master seed that lands the *same* bit-flip → `Ok(None)` → watchdog → `CleanExit` interleaving
 ///   as #305. Confirms the reclassification is generic (not a per-seed whitelist); pinned here as
 ///   an explicit regression anchor.
+/// - **Mid-session bit-flip → watchdog close, pre-empted by a too-short budget** (issue #891
+///   `MOONPOOL_SEED=0x86fe8eb1a656fe8f`, derived sub-seed 11989488914469334314): the same
+///   `bit_flip_probability = 0.0001` chaos as #305 / #308, flipping two bits (captured `sim_fault
+///   kind="bit_flip" flip_count=2`) in the injected prefix at the `SETTLE_DELAY` beat and turning
+///   `[0,0,0,0]` into `[0,0,1,128]` — an announced `total_size` of 384, *inside* `MAX_FRAME_SIZE` —
+///   so `peek_full_frame_len` (magnetar-proto/src/frame.rs:318-321) answered `Ok(None)`
+///   ("incomplete") and the driver parked. The ADR-0058 watchdog then pinged at t≈30.05 s and
+///   escalated to `Failed` at t≈60.05 s → `DriverOutcome::CleanExit`. This seed is the anchor for
+///   `RUN_TIME_BUDGET`: with the pre-fix 30 s ceiling the orchestrator breached its run-phase
+///   budget at the ping tick and declared the still-parked client a deadlock, so the `CleanExit`
+///   outcome the test already documents as tolerated could never actually be reached.
 /// - **Mid-session bit-flip → oversize-length reject** (issue #416
 ///   `MOONPOOL_SEED=0x62be2ae39ff4cf2b`, derived sub-seed 2165939632932382826): the same
 ///   `bit_flip_probability = 0.0001` chaos as #305 / #308, landing on the *other*
@@ -115,12 +153,13 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 ///   `BadLength(0)`. The reject still travelled the driver's error arm, so this is bounded
 ///   termination — the property under test — and it is classified
 ///   `DriverOutcome::CorruptedLengthReject`.
-const CHAOS_REGRESSION_SEEDS: [u64; 5] = [
+const CHAOS_REGRESSION_SEEDS: [u64; 6] = [
     9_388_503_268_189_738_858,
     17_161_897_233_139_508_114,
     8_009_627_293_563_187_958,
     10_325_270_525_572_099_338,
     2_165_939_632_932_382_826,
+    11_989_488_914_469_334_314,
 ];
 
 /// What the client workload observed for the driver after the broker
@@ -468,7 +507,7 @@ impl Workload for ClientWorkload {
 /// Deterministic seed sweep: 16 seeds derived from `MOONPOOL_SEED` (so the
 /// daily sweep keeps exploring this path under fresh randoms) plus the
 /// regression seeds in `CHAOS_REGRESSION_SEEDS` the sweep flagged for #290 /
-/// #291 / #305 / #308 / #416. The original test drove a single **unpinned**
+/// #291 / #305 / #308 / #416 / #891. The original test drove a single **unpinned**
 /// `SimulationBuilder::new().run()` whose seed came from the wall clock, so the
 /// daily sweep's failures were unreproducible from `MOONPOOL_SEED` — pinning
 /// the seeds fixes that.
@@ -484,7 +523,8 @@ impl Workload for ClientWorkload {
 ///   `total_size` is non-zero and within `MAX_FRAME_SIZE`, so `peek_full_frame_len` returns
 ///   `Ok(None)` instead of `BadLength(0)`, the driver parks, and the ADR-0058 watchdog escalates
 ///   the wedged socket to `Failed` → a clean `should_close` exit → a `CleanExit` outcome (issue
-///   #305); and
+///   #305). That escalation costs **two** `keepalive_interval`s of virtual time, which is why
+///   `RUN_TIME_BUDGET` must clear it — issue #891 is the seed where a 30 s budget did not; and
 /// - a bit-flip that corrupts the same prefix past `MAX_FRAME_SIZE`, so `peek_full_frame_len`
 ///   rejects on its oversize branch and the driver terminates with `BadLength(announced)` rather
 ///   than `BadLength(0)` → a `CorruptedLengthReject` outcome (issue #416).
@@ -499,6 +539,25 @@ impl Workload for ClientWorkload {
 /// unset.
 #[test]
 fn moonpool_malformed_mid_session_frame_terminates_driver_not_deadlock() {
+    // The anti-hang backstop must stay strictly longer than every deadline
+    // nested inside it (issue #891). The longest is the ADR-0058 keepalive
+    // watchdog's two-interval escalation — the only thing that resolves the
+    // tolerated `CleanExit` path, where the bit-flip chaos turns the injected
+    // prefix into a plausible-but-incomplete header — preceded on a severed
+    // dial by one bounded `connect_timeout`. Asserted against
+    // `ConnectionConfig::default()` rather than hard-coded, so raising either
+    // default fails here instead of silently re-pre-empting the recovery it
+    // wraps.
+    let defaults = ConnectionConfig::default();
+    let nested_ceiling = defaults.connect_timeout + SETTLE_DELAY + 2 * defaults.keepalive_interval;
+    assert!(
+        RUN_TIME_BUDGET > nested_ceiling,
+        "RUN_TIME_BUDGET ({RUN_TIME_BUDGET:?}) must exceed the deadlines nested inside it \
+         ({nested_ceiling:?} = connect_timeout + SETTLE_DELAY + 2 * keepalive_interval), or the \
+         orchestrator's run-phase budget pre-empts the keepalive watchdog and reports a bounded \
+         CleanExit as a deadlock (issue #891)",
+    );
+
     let mut seeds = sweep_seeds(16);
     seeds.extend_from_slice(&CHAOS_REGRESSION_SEEDS);
     let iterations = seeds.len();

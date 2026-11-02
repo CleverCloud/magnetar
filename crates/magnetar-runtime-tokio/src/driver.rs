@@ -1778,6 +1778,15 @@ where
                 }
             } => {
                 shared.inner.lock().handle_timeout(Instant::now());
+                // Issue #887: the proto sweep can now raise driver-actionable work from a
+                // timer tick — a `DriverRetry::Producer` for a `CommandProducer` that
+                // reached its `operation_timeout` — so the tick drains the same subset the
+                // inbound arm does. Until ADR-0125 every retry was raised by a decoded
+                // `CommandError`, which always arrived through that arm; leaving the drain
+                // out here parks the expiry's retry leg until the next inbound frame, a
+                // whole keepalive interval away on the silent broker that caused it.
+                handle_pending_events(shared)?;
+                shared.event_waker.notify_waiters();
             }
         }
     }
