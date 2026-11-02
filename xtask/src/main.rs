@@ -6560,6 +6560,14 @@ fn pop(now: Instant) {
             r#"#!/bin/sh
 set -eu
 
+# Side-effect-free liveness probe used by `fake_coverage_cargo` to close the
+# write-then-exec race before the fixture is handed to a test. It returns
+# before anything is appended to `fake-cargo.log`, so the recorded invocation
+# list a test asserts on is unaffected.
+if [ "${1:-}" = "__probe" ]; then
+    exit 0
+fi
+
 if [ "${1:-}" = "metadata" ]; then
     printf 'metadata\t%s\n' "$*" >> "$PWD/fake-cargo.log"
     workspace_parent="${PWD%/*}"
@@ -6663,6 +6671,33 @@ esac
             .permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&cargo, permissions).expect("make fake cargo executable");
+
+        // Close the write-then-exec race before any test execs this file.
+        // `fs::write` above holds a write descriptor on it for the duration of
+        // the call, and `cargo test` runs these cases on parallel threads: when
+        // another thread forks in that window — every `StdCommand` here does —
+        // the child inherits the descriptor, and Linux then refuses to exec the
+        // file with ETXTBSY ("Text file busy", os error 26) until that child
+        // execs or exits. The descriptor is `O_CLOEXEC`, so the window is short,
+        // but it is real: measured 2 failures in 12 local `cargo test -p xtask`
+        // runs on 2026-11-02, on three different cases in this family, and twice
+        // in CI on pull request #885. Probing until one exec succeeds drains the
+        // window for THIS file, so the test body only ever sees a real verdict.
+        // Retry ONLY on ETXTBSY: every other error is a genuine broken fixture.
+        let mut attempts = 0;
+        loop {
+            match StdCommand::new(&cargo).arg("__probe").output() {
+                Ok(_) => break,
+                Err(error) if error.raw_os_error() == Some(26) && attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    panic!("fake cargo must be executable (after {attempts} retries): {error}")
+                }
+            }
+        }
+
         cargo
     }
 
