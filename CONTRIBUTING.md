@@ -41,6 +41,9 @@ cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warni
 cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
+# An example's `#[cfg(test)]` module: neither `--all-targets` clippy nor the
+# workspace test run compiles it; only this line and the nightly performance run do.
+cargo test -p magnetar-driver --no-default-features --features "$FEATURES" --locked --examples
 cargo deny check
 RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked

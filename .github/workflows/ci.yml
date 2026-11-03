@@ -154,6 +154,10 @@ jobs:
           cargo test --workspace --exclude magnetar-driver --all-features --locked -- --nocapture
           cargo test -p magnetar-driver --all-features --locked --lib -- --nocapture
           cargo test -p magnetar-driver --all-features --locked --doc -- --nocapture
+          # An example's `#[cfg(test)]` module compiles only here: clippy's
+          # `--all-targets` checks examples as binaries, and otherwise only the
+          # nightly performance contracts step builds it (ADR-0113).
+          cargo test -p magnetar-driver --all-features --locked --examples -- --nocapture
           paths=(crates/magnetar/tests/*.rs)
           for path in "${paths[@]}"; do
             target="${path##*/}"

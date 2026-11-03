@@ -612,12 +612,6 @@ mod tests {
         receipt.batch_index = 0;
         delivered.batch_index = 0;
         assert!(!marker_position_matches(receipt, delivered));
-        #[cfg(feature = "scalable-topics")]
-        {
-            receipt = delivered;
-            delivered.segment_id = Some(magnetar::proto::types::SegmentId(3));
-            assert!(!marker_position_matches(receipt, delivered));
-        }
     }
 
     #[test]

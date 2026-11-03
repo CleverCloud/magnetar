@@ -161,6 +161,8 @@ cargo doc -p magnetar-driver --no-deps --locked  # also catches links to admin/m
 cargo clippy -p magnetar-driver --no-default-features --lib --locked -- -D warnings
 cargo clippy -p magnetar-driver --no-default-features --lib --profile test --no-deps --locked -- -D warnings
 cargo test --workspace --all-features
+# an example's `#[cfg(test)]` module — neither line above compiles it
+cargo test -p magnetar-driver --all-features --locked --examples
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. performance.yml also replays fixed
 # seeds 1..32 plus open registry anchors nightly on main, without buggify
