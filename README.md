@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.95-orange.svg)](specs/adr/0124-raise-msrv-to-rust-1-95.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (1.7.2).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
+> **Status: stable (1.8.0).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
 > PIP-460 scalable topics ship as an experimental, assignment-driven StreamConsumer behind a default-off feature; the CLI `produce`/`consume` subcommands remain not-yet-implemented.
 > Both experimental surfaces are excluded from the 1.0 stability promise.
@@ -73,7 +73,7 @@ Its current coverage is explicitly partial; a baseline must be qualified before 
 
 ## Installation
 
-Magnetar's current release is `1.7.2`.
+Magnetar's current release is `1.8.0`.
 The façade is published to crates.io under the package name `magnetar-driver` (the `magnetar` name is held by an unrelated crate); its library / import name stays `magnetar`, so `use magnetar::...` is unchanged.
 
 Depend on it directly from crates.io:
@@ -81,14 +81,14 @@ Depend on it directly from crates.io:
 ```toml
 [dependencies]
 # crates.io package is `magnetar-driver`; the import path stays `magnetar`.
-magnetar-driver = "1.7.2"
+magnetar-driver = "1.8.0"
 ```
 
 Or pin the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.7.2" }
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.8.0" }
 ```
 
 The default feature set enables the tokio engine.
@@ -183,14 +183,14 @@ The `magnetarctl` binary exposes a sozu / systemd-style identification banner:
 
 ```
 $ magnetarctl --version
-magnetarctl 1.7.2 (a1b2c3d4e5f6)
+magnetarctl 1.8.0 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.95.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
-- `-V` prints a single-line, never-colorized form: `magnetarctl 1.7.2 (sha)`.
+- `-V` prints a single-line, never-colorized form: `magnetarctl 1.8.0 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for reproducible builds.
