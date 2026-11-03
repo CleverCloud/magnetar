@@ -1,6 +1,6 @@
 # ADR-0126 — Allow one e2e `#[ignore]` for an external defect no available broker has fixed
 
-- **Status**: Accepted (amends [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) §7 and its decision paragraph, narrowly and for one named test — everything else in ADR-0046 remains binding)
+- **Status**: Accepted (amends [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) §7 and its decision paragraph, narrowly and for one named test — everything else in ADR-0046 remains binding). Its one instance was retired by the 2026-11-03 amendment below; the five conditions remain in force for any new instance.
 - **Date**: 2026-11-02
 - **Decider**: Florentin Dubois
 - **Tags**: testing, e2e, process, pulsar, shared-subscription, issue-462
@@ -69,6 +69,22 @@ The removal lands with that evidence in the PR description.
 
 This carve-out is narrow on purpose.
 It does not restore ADR-0021 §1's general "environment-dependency" exemption, which ADR-0046 §7 removed for e2e; it does not cover an intermittent test of our own, which is [ADR-0123](0123-quarantine-exact-intermittent-test-scenarios.md)'s register; and it does not cover a test that is merely slow, awkward, or unfinished.
+
+## Amendment — 2026-11-03: the one instance is retired, by correcting its assertion
+
+The reactivation rule above asked for the _unmodified_ test to pass repeatedly. That rule assumed the test asserted an invariant of the broker. It did not. The test required the dispatcher's `totalAvailablePermits` to stay non-negative at every log sample. apache/pulsar#26289, the patch that fixes the leak, makes a negative sample part of the design. A Flow credits the consumer at once and the aggregate later, and `readMoreEntries` dispatches against `max(totalAvailablePermits, firstAvailableConsumerPermits)`, so the broker spends permits the aggregate has not received yet. `Consumer.getAvailablePermitsForDispatcherRemoval` documents the resulting balance as negative and forbids clamping it. Every such dip closes when the pending Flow task runs. The leak never closes, because the credit `internalConsumerFlow` discards is lost.
+
+The test now replays the dispatcher ledger from every line that moves it, including the dispatch debits, which the former parser did not read. It asserts that the settled total equals the sum of the consumers' settled `availablePermits`, and it fails as an infrastructure fault when the replay cannot reproduce a printed total. CI run [41681792538](https://github.com/CleverCloud/magnetar/actions/runs/41681792538) made ten runs per image with every dispatcher line dumped:
+
+| image               | former `min >= 0` | settled total − consumers' sum |
+| ------------------- | ----------------- | ------------------------------ |
+| `4.2.4` (no #26289) | red 10/10         | −12 to −20 in 10/10            |
+| `4.2.5`             | red 9/10          | 0 in 10/10                     |
+| `5.0.0`             | red 9/10          | 0 in 10/10                     |
+
+The replay matched every printed total in all thirty runs. Every red run on the patched images failed only the `min >= 0` assertion: delivery, the drained backlog and the per-consumer bounds passed. The corrected assertion still catches the defect it exists for, red on every unpatched run, and is green on both per-PR axes. Condition 2 therefore no longer holds, and the `#[ignore]` is removed. A red run of this test on a matrix image now means that image leaks.
+
+This is not the version-number argument that the alternatives below reject. The test does not pass because a release note claims a fix. It passes because the property it asserted was measured to be the wrong property, and the right one was measured on all three images.
 
 ## Consequences
 

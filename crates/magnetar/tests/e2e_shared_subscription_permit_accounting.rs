@@ -47,7 +47,9 @@
 //!
 //! Four assertions, all on numbers the broker reported about itself:
 //!
-//! 1. the dispatcher's `totalAvailablePermits` is never negative — the aggregate defect;
+//! 1. once the subscription is quiescent, the dispatcher's `totalAvailablePermits`, replayed from
+//!    the broker's own log, equals the sum of the per-consumer `availablePermits` — the aggregate
+//!    defect. It may dip below zero along the way; see "The residual −2" below;
 //! 2. every **per-consumer** `availablePermits` stays inside `[0, receiver_queue_size]`. A negative
 //!    settled reading resembles one numeric part of issue #414's production report; a reading above
 //!    the queue size needs separate investigation against issue #426. Neither value alone
@@ -92,8 +94,8 @@
 //! matrix report ([PR #881](https://github.com/CleverCloud/magnetar/pull/881))
 //! recorded 7/10 passing runs on each of `4.2.5` and `5.0.0`, with red results
 //! reaching −2; those results predate PR #399 and are not combined with this
-//! sample. The current sample does not establish a reliably green published
-//! image, and the ignore remains pending issue #462.
+//! sample. Those runs asserted the aggregate never went negative, which the
+//! next section shows is not an invariant of a patched broker.
 //!
 //! Two limits of those historical results:
 //!
@@ -105,6 +107,33 @@
 //!   although the discard window was entered 2–10 times per run. The production wedge signature — a
 //!   per-consumer `availablePermits` stuck at −177300 — did **not** reproduce; this test observed
 //!   the separate aggregate defect under its own client traffic and churn.
+//!
+//! ## The residual −2 is the pending-Flow window, measured 2026-11-03
+//!
+//! The −2 that kept this test ignored on `4.2.5` and `5.0.0` is not a leak.
+//! Since apache/pulsar#26289, `readMoreEntries` dispatches against
+//! `max(totalAvailablePermits, firstAvailableConsumerPermits)`. A Flow credits
+//! the consumer at once and the aggregate later on the broker executor, so the
+//! broker spends permits the aggregate has not received yet:
+//! `Consumer.getAvailablePermitsForDispatcherRemoval` documents that balance as
+//! negative by design. The pending Flow task closes every such dip. The leak
+//! does not close, because the credit `internalConsumerFlow` discards is gone
+//! for good. The suite therefore replays the dispatcher ledger from every line
+//! that moves it, the dispatch debits included, which the former parser never
+//! read. It asserts the settled total, not the minimum.
+//!
+//! CI run 41681792538 made ten runs per image with every dispatcher line
+//! dumped, and the replay closed with 0 mismatches in all thirty:
+//!
+//! | image | former `min >= 0` | settled total − consumers' sum |
+//! | ----- | ----------------- | ------------------------------ |
+//! | `4.2.4` (no #26289) | red 10/10 | −12 to −20 in 10/10 |
+//! | `4.2.5` | red 9/10 (replayed minimum −2 to −6) | 0 in 10/10 |
+//! | `5.0.0` | red 9/10 (replayed minimum −2 to −6) | 0 in 10/10 |
+//!
+//! Delivery, the drained backlog and the per-consumer bounds passed in all
+//! thirty. The settled-total assertion is red on the leaking broker and green
+//! on both patched ones, so the `#[ignore]` ADR-0126 authorized is retired.
 //!
 //! ## The shape being reproduced
 //!
@@ -428,84 +457,184 @@ fn parse_leading_i64(text: &str) -> Option<i64> {
     text.get(..end).and_then(|digits| digits.parse().ok())
 }
 
-/// Every `i64` that follows an occurrence of `needle` in `line`.
-fn values_after(line: &str, needle: &str, out: &mut Vec<i64>) {
-    let mut rest = line;
-    while let Some(offset) = rest.find(needle) {
-        rest = &rest[offset + needle.len()..];
-        if let Some(value) = parse_leading_i64(rest) {
-            out.push(value);
-        }
-    }
+/// The first `i64` that follows `needle` in `line`.
+fn value_after(line: &str, needle: &str) -> Option<i64> {
+    let offset = line.find(needle)?;
+    parse_leading_i64(&line[offset + needle.len()..])
 }
 
-/// Every value of the dispatcher's `totalAvailablePermits` the broker printed,
-/// plus how many times it took `internalConsumerFlow`'s discard branch.
+/// One dispatcher log line that moves `totalAvailablePermits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerEvent {
+    /// A Flow credit or a removal debit. The broker prints the change and the
+    /// total it left behind, so the replay can be checked against it.
+    Anchor { change: i64, total: i64 },
+    /// A dispatch debit. The broker prints the messages sent and the
+    /// batch-index acks deducted, but not the total.
+    Dispatch { debit: i64 },
+}
+
+/// The ledger event `line` records, in either spelling the matrix spans
+/// (measured 2026-11-03 on 4.2.4, 4.2.5 and 5.0.0):
 ///
-/// Three spellings of the same field, because the message changed between
-/// broker generations and the matrix spans both (all measured 2026-09-18):
-///
-/// * 4.x — `… with permits <N> after adding <M> permits`
-/// * 4.x — `… New dispatcher permit count is <N>`
-/// * 5.x — structured key/value, `… {…, totalAvailablePermits=<N>}`
+/// | event | 4.x | 5.x (structured key/value) |
+/// | ----- | --- | -------------------------- |
+/// | Flow credit | `… with permits <total> after adding <n> permits` | `Trigger new read after receiving flow control message {additionalNumberOfMessages=<n>, …, totalAvailablePermits=<total>}` |
+/// | removal debit | `Decreased totalAvailablePermits by <n> … New dispatcher permit count is <total>` | `Decreased totalAvailablePermits {availablePermits=<n>, …, totalAvailablePermits=<total>}` |
+/// | dispatch debit | `Added -(<sent> minus <acked>) permits …` | `Added permits to TOTAL_AVAILABLE_PERMITS_UPDATER {msgSent=<sent>, …, totalAckedIndexCount=<acked>}` |
 ///
 /// Only lines from the dispatcher logger are considered: `Consumer` logs
 /// "Added more flow control message permits" with the same vocabulary for the
 /// *per-consumer* counter, which is a different number.
-fn dispatcher_aggregate_permits(logs: &str) -> (Vec<i64>, usize) {
-    let mut values = Vec::new();
-    let mut discards = 0;
-    for line in logs.lines() {
-        if !line.contains(DISPATCHER_LOGGER) {
-            continue;
-        }
-        if line.contains(DISCARD_MARKER) {
-            discards += 1;
-        }
-        values_after(line, "totalAvailablePermits=", &mut values);
-        values_after(line, "with permits ", &mut values);
-        values_after(line, "New dispatcher permit count is ", &mut values);
+fn ledger_event(line: &str) -> Option<LedgerEvent> {
+    if !line.contains(DISPATCHER_LOGGER) {
+        return None;
     }
-    (values, discards)
+    if let (Some(total), Some(change)) = (
+        value_after(line, "with permits "),
+        value_after(line, "after adding "),
+    ) {
+        return Some(LedgerEvent::Anchor { change, total });
+    }
+    if line.contains("Trigger new read after receiving flow control message {") {
+        return Some(LedgerEvent::Anchor {
+            change: value_after(line, "additionalNumberOfMessages=")?,
+            total: value_after(line, "totalAvailablePermits=")?,
+        });
+    }
+    if let (Some(debit), Some(total)) = (
+        value_after(line, "Decreased totalAvailablePermits by "),
+        value_after(line, "New dispatcher permit count is "),
+    ) {
+        return Some(LedgerEvent::Anchor {
+            change: -debit,
+            total,
+        });
+    }
+    if line.contains("Decreased totalAvailablePermits {") {
+        return Some(LedgerEvent::Anchor {
+            change: -value_after(line, "{availablePermits=")?,
+            total: value_after(line, "totalAvailablePermits=")?,
+        });
+    }
+    if let (Some(sent), Some(acked)) = (value_after(line, "Added -("), value_after(line, " minus "))
+    {
+        return Some(LedgerEvent::Dispatch {
+            debit: sent - acked,
+        });
+    }
+    if line.contains("Added permits to TOTAL_AVAILABLE_PERMITS_UPDATER {") {
+        return Some(LedgerEvent::Dispatch {
+            debit: value_after(line, "msgSent=")? - value_after(line, "totalAckedIndexCount=")?,
+        });
+    }
+    None
 }
 
-/// Assert the broker aggregate-accounting invariant: the dispatcher's
-/// subscription-wide permit ledger never goes negative.
+/// The dispatcher's `totalAvailablePermits`, replayed from the broker's own
+/// log.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Lines that printed the total itself.
+    anchors: usize,
+    /// Anchors whose printed total disagreed with the replay: a debit the
+    /// parser does not see, or a renamed message.
+    mismatches: usize,
+    /// Dispatch debits seen before the first anchor, which the replay cannot
+    /// place.
+    unanchored: usize,
+    /// The replayed total after the last line, `None` without an anchor.
+    total: Option<i64>,
+    /// The lowest replayed total and how many events left it negative,
+    /// reported only.
+    minimum: Option<i64>,
+    negatives: usize,
+    /// `internalConsumerFlow`'s discard branch, reported only.
+    discards: usize,
+}
+
+fn replay_ledger(logs: &str) -> Ledger {
+    let mut ledger = Ledger::default();
+    for line in logs.lines() {
+        if line.contains(DISPATCHER_LOGGER) && line.contains(DISCARD_MARKER) {
+            ledger.discards += 1;
+        }
+        let total = match (ledger_event(line), ledger.total) {
+            (None, _) => continue,
+            (Some(LedgerEvent::Anchor { change, total }), previous) => {
+                ledger.anchors += 1;
+                if previous.is_some_and(|previous| previous + change != total) {
+                    ledger.mismatches += 1;
+                }
+                total
+            }
+            (Some(LedgerEvent::Dispatch { debit }), Some(previous)) => previous - debit,
+            (Some(LedgerEvent::Dispatch { .. }), None) => {
+                ledger.unanchored += 1;
+                continue;
+            }
+        };
+        ledger.total = Some(total);
+        ledger.minimum = Some(ledger.minimum.map_or(total, |minimum| minimum.min(total)));
+        if total < 0 {
+            ledger.negatives += 1;
+        }
+    }
+    ledger
+}
+
+/// Assert the broker aggregate-accounting invariant: once the subscription is
+/// quiescent, the dispatcher's `totalAvailablePermits` equals the sum of the
+/// per-consumer `availablePermits` the broker reports for the same consumers.
 ///
-/// Reading zero observations is its own, separately-worded failure. It means
-/// the debug logger did not come up or the broker renamed the message — an
-/// infrastructure fault, not a clean ledger — and a check that cannot measure
+/// The aggregate is *not* required to stay non-negative along the way. Since
+/// apache/pulsar#26289, `readMoreEntries` dispatches against
+/// `max(totalAvailablePermits, firstAvailableConsumerPermits)`, and a Flow
+/// credits the consumer at once but the aggregate later on the broker
+/// executor, so the broker spends permits the aggregate has not received yet.
+/// `Consumer.getAvailablePermitsForDispatcherRemoval` documents the resulting
+/// negative balance as required. Every such dip closes when the pending Flow
+/// task runs. The apache/pulsar#26416 leak does not close: the credit
+/// `internalConsumerFlow` discards is gone for good, so the leak shows up as a
+/// settled aggregate below the consumers' sum.
+///
+/// A ledger that cannot be measured or replayed fails with its own wording: an
+/// infrastructure fault, not a clean ledger, and a check that cannot measure
 /// must never report success.
-fn assert_aggregate_invariant(logs: &str) {
-    let (values, discards) = dispatcher_aggregate_permits(logs);
-    let minimum = values.iter().copied().min();
-    let negatives = values.iter().filter(|value| **value < 0).count();
+fn assert_aggregate_invariant(logs: &str, settled_permit_sum: i64) {
+    let ledger = replay_ledger(logs);
     eprintln!(
-        "[#462-permits] dispatcher totalAvailablePermits: observations={} min={minimum:?} \
-         negatives={negatives} discardedDeferredCredits={discards}",
-        values.len(),
+        "[#462-permits] dispatcher totalAvailablePermits: {ledger:?} settledPermitSum={settled_permit_sum}"
     );
     assert!(
-        !values.is_empty(),
+        ledger.anchors > 0,
         "could not observe the dispatcher's `totalAvailablePermits` at all: the \
          `{DISPATCHER_LOGGER}` debug logger did not come up, or this broker renamed the \
          message the parser looks for. This is an infrastructure failure, NOT a clean \
          permit ledger — the aggregate is exposed by no admin endpoint, so the broker's \
          own log is the only oracle for it."
     );
-    let minimum = minimum.unwrap_or_default();
     assert!(
-        minimum >= 0,
-        "the dispatcher's subscription-wide `totalAvailablePermits` reached {minimum}, which \
-         is negative — the broker aggregate-accounting defect tracked by issue #462 \
-         (apache/pulsar#26416), not proof of issue #414's per-consumer wedge. The \
-         deferred flow credit of a consumer that has already left `consumerSet` is discarded \
-         by `internalConsumerFlow` while `removeConsumer` still debits the aggregate by that \
-         consumer's full counter. Observed {negatives} negative reading(s) of {} total, with \
-         {discards} discarded deferred credit(s) during the run. Related upstream \
-         patches merged as apache/pulsar#26289 and apache/pulsar#26422; this \
-         result still fails on the tested GA broker.",
-        values.len(),
+        ledger.mismatches == 0 && ledger.unanchored == 0,
+        "could not replay the dispatcher's `totalAvailablePermits` from its own log: \
+         {} of {} printed total(s) disagreed with the replay and {} dispatch debit(s) came \
+         before any total. A debit the parser does not see or a renamed message is an \
+         infrastructure failure, NOT a permit leak. Ledger: {ledger:?}",
+        ledger.mismatches,
+        ledger.anchors,
+        ledger.unanchored,
+    );
+    let total = ledger.total.unwrap_or_default();
+    assert_eq!(
+        total, settled_permit_sum,
+        "the dispatcher's subscription-wide `totalAvailablePermits` settled at {total}, not \
+         at the {settled_permit_sum} permits its consumers hold: the broker \
+         aggregate-accounting leak tracked by issue #462 (apache/pulsar#26416), not proof of \
+         issue #414's per-consumer wedge. `internalConsumerFlow` discards the deferred Flow \
+         credit of a consumer that has already left `consumerSet` while `removeConsumer` \
+         debits the aggregate as if it had arrived. The broker took that discard branch {} \
+         time(s) during the run. Fixed upstream by apache/pulsar#26289. Ledger: {ledger:?}",
+        ledger.discards,
     );
 }
 
@@ -675,40 +804,19 @@ async fn churn_round(
 }
 
 /// Repeated `Shared`-subscription scale-downs must leave the broker's own
-/// permit ledger intact: no per-consumer `availablePermits` outside
-/// `[0, receiver_queue_size]`, no negative `unackedMessages`, and a backlog
-/// that still reaches zero.
-///
-/// # Why this one e2e test is `#[ignore]`d
-///
-/// [ADR-0046](../../../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) makes the
-/// e2e suite run as a regular `cargo test`, deliberately: an e2e test behind `#[ignore]` is an
-/// e2e test nobody runs.
-/// [ADR-0126](../../../specs/adr/0126-narrow-external-defect-e2e-ignore-carveout.md) authorizes
-/// this one narrowly, on five conditions, because the assertion is about an external component no
-/// available version has fixed; its removal is still owed and tracked by issue #462, which a tested
-/// published GA broker keeps failing intermittently. The measurement below is what satisfies that
-/// carve-out's conditions 3 and 4 — the reason string naming the measured value, and the per-image
-/// evidence written down.
+/// permit ledger intact: a settled dispatcher total equal to the consumers'
+/// sum, no per-consumer `availablePermits` outside `[0, receiver_queue_size]`,
+/// no negative `unackedMessages`, and a backlog that still reaches zero.
 ///
 /// Every other e2e test asserts something about **magnetar**. This one asserts
 /// something about the **broker**: that `apache/pulsar#26416`'s deferred-flow
 /// accounting leak is absent under this client's Flow/Subscribe traffic and
-/// timing. On 2026-10-16, commit `46792879ecde265c50ffaf10616396f14a894f7b`
-/// was tested against the published `4.2.5` image (index digest
-/// `sha256:34954c978ecf26808243091495660c8feda6d40241a3ff77aa17bc49f93041a1`);
-/// it passed one run and failed the next: the second run observed 1 negative
-/// `totalAvailablePermits` reading of −2 among 101 observations. The published
-/// `4.0.14` image passed three diagnostic runs, but that small sample does not
-/// establish reliability. Earlier reports also include 7/10 passing runs on
-/// both `4.2.5` and `5.0.0`, with a minimum of −2; they predate PR #399.
-///
-/// The current default remains `4.2.5`; `MAGNETAR_PULSAR_IMAGE_TAG` selects
-/// another exact tag for reproduction. Keep this test ignored until issue
-/// #462's reliable-green criterion is met; do not infer a fix from merged
-/// upstream patches or a short run of passes.
+/// timing. It ran behind ADR-0126's `#[ignore]` while it asserted a
+/// never-negative aggregate, which patched brokers do not guarantee. It runs
+/// on every axis now that it asserts the settled total (module docs, "The
+/// residual −2"). A red run on a matrix image means that broker leaks: pin
+/// past it, do not ignore the test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "issue #462: published GA 4.2.5 still reached totalAvailablePermits=-2; reproduce: MAGNETAR_PULSAR_IMAGE_TAG=4.2.5 cargo test -p magnetar-driver --test e2e_shared_subscription_permit_accounting --locked -- --ignored --nocapture"]
 async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, container) = start_pulsar().await?;
@@ -775,6 +883,10 @@ async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
     }
     let final_stats = settled_stats(&admin, &topic, &subscription, live.len()).await?;
     observe(&final_stats, &subscription, "final settled reading");
+    let settled_permit_sum: i64 = consumer_rows(&final_stats, &subscription)
+        .iter()
+        .filter_map(|row| row.available_permits)
+        .sum();
 
     producer.close().await?;
     for (_, consumer) in live {
@@ -808,7 +920,68 @@ async fn e2e_shared_subscription_permit_accounting_survives_repeated_churn()
     // on is not part of what this is measuring.
     let mut logs = String::from_utf8_lossy(&container.stdout_to_vec().await?).into_owned();
     logs.push_str(&String::from_utf8_lossy(&container.stderr_to_vec().await?));
-    assert_aggregate_invariant(&logs);
+    assert_aggregate_invariant(&logs, settled_permit_sum);
 
     Ok(())
+}
+
+/// The replay on dispatcher lines as 4.2.5 and 5.0.0 printed them on
+/// 2026-11-03 (topic and connection details shortened): a dispatch against a
+/// still-pending Flow dips the aggregate to −2, and that Flow's credit closes
+/// it again. Runs without Docker, so the parser is checked even where the
+/// broker is not.
+#[test]
+fn ledger_replay_closes_a_pending_flow_dip_in_both_log_spellings() {
+    const PREFIX: &str = "DEBUG org.apache.pulsar.broker.service.persistent.\
+                          PersistentDispatcherMultipleConsumers - ";
+    let four = [
+        "[t / s-Consumer{consumerId=0, consumerName=c0}] Trigger new read after receiving flow \
+         control message with permits 4 after adding 4 permits",
+        "[t / s] Added -(4 minus 0) permits to TOTAL_AVAILABLE_PERMITS_UPDATER in \
+         PersistentDispatcherMultipleConsumers",
+        "[t / s] Added -(2 minus 0) permits to TOTAL_AVAILABLE_PERMITS_UPDATER in \
+         PersistentDispatcherMultipleConsumers",
+        "[t / s] Decreased totalAvailablePermits by 0 in PersistentDispatcherMultipleConsumers. \
+         New dispatcher permit count is -2",
+        "[t / s-Consumer{consumerId=0, consumerName=c0}] Trigger new read after receiving flow \
+         control message with permits 0 after adding 2 permits",
+    ];
+    let five = [
+        "Trigger new read after receiving flow control message {additionalNumberOfMessages=4, \
+         consumer=Consumer{consumerId=0, consumerName=c0}, subscription=s, topic=t, \
+         totalAvailablePermits=4}",
+        "Added permits to TOTAL_AVAILABLE_PERMITS_UPDATER {msgSent=4, subscription=s, topic=t, \
+         totalAckedIndexCount=0}",
+        "Added permits to TOTAL_AVAILABLE_PERMITS_UPDATER {msgSent=2, subscription=s, topic=t, \
+         totalAckedIndexCount=0}",
+        "Decreased totalAvailablePermits {availablePermits=0, subscription=s, topic=t, \
+         totalAvailablePermits=-2}",
+        "Trigger new read after receiving flow control message {additionalNumberOfMessages=2, \
+         consumer=Consumer{consumerId=0, consumerName=c0}, subscription=s, topic=t, \
+         totalAvailablePermits=0}",
+    ];
+    for lines in [four, five] {
+        let logs = lines.iter().fold(String::new(), |mut logs, line| {
+            logs.push_str(PREFIX);
+            logs.push_str(line);
+            logs.push('\n');
+            logs
+        });
+        let ledger = replay_ledger(&logs);
+        assert_eq!(
+            (ledger.anchors, ledger.mismatches, ledger.unanchored),
+            (3, 0, 0),
+            "{ledger:?}"
+        );
+        assert_eq!(ledger.total, Some(0), "{ledger:?}");
+        assert_eq!(ledger.minimum, Some(-2), "{ledger:?}");
+
+        // A printed total the replay cannot reach is a parse fault, reported
+        // as such rather than as a leak.
+        let unseen = lines[0]
+            .replace("with permits 4", "with permits 9")
+            .replace("totalAvailablePermits=4}", "totalAvailablePermits=9}");
+        let tail = replay_ledger(&format!("{logs}{PREFIX}{unseen}\n"));
+        assert_eq!(tail.mismatches, 1, "{tail:?}");
+    }
 }
