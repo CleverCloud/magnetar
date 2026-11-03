@@ -373,6 +373,23 @@ impl Pulsar {
         self.command_for(Role::Standalone)
     }
 
+    /// The proxy's container command. A proxy is configured with
+    /// [`Self::config`] only, so any other setting panics here, before
+    /// [`Self::start_proxy`] creates a container.
+    pub fn proxy_command(&self) -> Vec<String> {
+        assert!(
+            self.env.is_empty()
+                && self.pre_start.is_empty()
+                && self.flags.is_empty()
+                && !self.zookeeper
+                && !self.advertise_container_address
+                && self.admin_token.is_none()
+                && self.binary_port == BROKER_BINARY_PORT,
+            "a proxy is configured with `config` only"
+        );
+        self.command_for(Role::Proxy)
+    }
+
     fn command_for(&self, role: Role) -> Vec<String> {
         let needs_shell = role == Role::Proxy
             || !self.config.is_empty()
@@ -475,18 +492,8 @@ impl Pulsar {
     /// so it waits for the proxy's own `Started Pulsar Proxy at` line, which
     /// 4.x and 5.x both print. Configure it with [`Self::config`] only.
     pub async fn start_proxy(self) -> Result<RunningProxy, BoxError> {
-        assert!(
-            self.env.is_empty()
-                && self.pre_start.is_empty()
-                && self.flags.is_empty()
-                && !self.zookeeper
-                && !self.advertise_container_address
-                && self.admin_token.is_none()
-                && self.binary_port == BROKER_BINARY_PORT,
-            "a proxy is configured with `config` only"
-        );
+        let command = self.proxy_command();
         let tag = self.broker.tag();
-        let command = self.command_for(Role::Proxy);
         let container = GenericImage::new(image_repo(), tag.as_str().to_owned())
             .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
             .with_wait_for(WaitFor::message_on_stdout("Started Pulsar Proxy at"))

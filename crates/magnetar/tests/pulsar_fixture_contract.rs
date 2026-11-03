@@ -365,11 +365,10 @@ mod executed {
     }
 }
 
-#[tokio::test]
+#[test]
 #[should_panic(expected = "a proxy is configured with `config` only")]
-async fn a_standalone_binary_port_is_refused_before_a_proxy_starts() {
+fn a_standalone_binary_port_is_refused_before_a_proxy_starts() {
     let _ = Pulsar::new(Broker::Default)
         .binary_port(17321)
-        .start_proxy()
-        .await;
+        .proxy_command();
 }
