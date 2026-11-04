@@ -79,7 +79,7 @@ The previous 2026-10-12 matrix report recorded 5/5 passing runs on `4.0.14` and 
    A failure on one version is one of three things, and each has its own fix: a client bug (fix the client), a test assumption the broker legitimately changed (change the test, with the broker change named in a comment, so that it holds on every axis), or a broker defect (a tracked issue and a decision recorded here; never a silent skip).
    A red nightly is a regression on the minimum broker and is treated like a red pull-request cell.
    The `#[ignore]` on the permit-accounting suite for apache/pulsar#26416 is not part of this decision.
-   The published-image evidence in the 2026-10-16 amendment does not confirm a reliable fix on `4.2.5`; the existing issue #462 ignore is authorized narrowly by [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md), not by this matrix decision, and its removal remains owed.
+   The published-image evidence in the 2026-10-16 amendment used an assertion that patched brokers do not satisfy. [ADR-0126](0126-narrow-external-defect-e2e-ignore-carveout.md)'s 2026-11-03 amendment corrects it and retires the issue #462 ignore, so the test runs on every axis of this matrix.
    Landing the axes found the three test assumptions listed under "5.0 / 4.2.5 behaviour changes the suites had to accommodate"; each is a change of the third kind above, made without touching an assertion.
 
 6. **The gate keeps it honest.**
@@ -129,7 +129,7 @@ None is a client defect, and none needed an assertion, a timeout or a skipped te
   The `test` job's five cells become nine (one non-e2e, eight e2e), which adds four e2e cells per pull request, roughly 40–65 runner-minutes at the measured 10–16 minutes each.
   They run in parallel, so wall-clock time stays about that of one e2e cell.
 - Compatibility with 5.0 stops being a claim and becomes a result of every pull request, and the 4.0 minimum is exercised nightly instead of by three suites.
-- `4.2.5` is the baseline broker. The fix for apache/pulsar#26416 is not confirmed on that published image; the ignored diagnostic remains tracked separately by issue #462 (amendment dated 2026-10-16).
+- `4.2.5` is the baseline broker. Measured 2026-11-03, its settled permit ledger closes exactly, so the apache/pulsar#26416 fix holds on that published image. The issue #462 test runs on every axis (ADR-0126 amendment of 2026-11-03).
 - The required-check names change: `test (e2e 1/4)` and its siblings become `e2e (Pulsar 4.2.5) / e2e 1/4` and so on.
   A branch-protection rule that names them must be updated; `main` carried none as of the last record of ADR-0092.
 - `e2e_consumer_drop.rs` and `e2e_reconnect_safety.rs` now honour `MAGNETAR_PULSAR_IMAGE_TAG` again; ADR-0115's note that they no longer do is superseded.
