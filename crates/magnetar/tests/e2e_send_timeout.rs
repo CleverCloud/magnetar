@@ -43,8 +43,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -57,8 +57,7 @@ use common::pulsar::{Broker, Pulsar, init_tracing};
 /// production but too slow for a test).
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
-async fn start_pulsar()
--> Result<(String, u16, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, u16, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default).start().await?;
     Ok((broker.host, broker.binary_port, broker.container))

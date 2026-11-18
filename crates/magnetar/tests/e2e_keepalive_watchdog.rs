@@ -56,8 +56,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
-use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -73,8 +73,7 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 /// two keepalive intervals, so the watchdog must escalate during the window.
 const BLACKHOLE_WINDOW: Duration = Duration::from_secs(4);
 
-async fn start_pulsar()
--> Result<(String, u16, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, u16, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default).start().await?;
     Ok((broker.host, broker.binary_port, broker.container))

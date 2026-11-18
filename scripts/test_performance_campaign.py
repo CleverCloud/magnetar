@@ -188,7 +188,8 @@ class CampaignContracts(unittest.TestCase):
     def test_baseline_overlay_copies_only_the_audited_harness_sources(self):
         fixture = "crates/magnetar/tests/e2e_reconnect_safety.rs"
         proxy = "crates/magnetar/tests/e2e_pulsar_proxy.rs"
-        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
+        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs",
+                  "crates/magnetar/tests/common/container.rs")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); base = root / "base"; candidate = root / "candidate"
             output = root / "output"; output.mkdir()
@@ -226,7 +227,8 @@ class CampaignContracts(unittest.TestCase):
     def test_baseline_overlay_adds_the_shared_fixture_a_base_checkout_lacks(self):
         # The nightly's base is an older `main` that predates `tests/common/`: the overlaid
         # `e2e_*` harness files `mod common;`, so the shared fixture must arrive with them.
-        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs")
+        shared = ("crates/magnetar/tests/common/mod.rs", "crates/magnetar/tests/common/pulsar.rs",
+                  "crates/magnetar/tests/common/container.rs")
         harness = tuple(CAMPAIGN.BASELINE_HARNESS_SOURCES)
         self.assertTrue(set(shared) <= set(harness))
         with tempfile.TemporaryDirectory() as temporary:

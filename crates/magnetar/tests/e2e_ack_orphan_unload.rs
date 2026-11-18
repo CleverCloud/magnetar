@@ -31,7 +31,6 @@ use std::time::Duration;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 
 mod common;
 
@@ -80,10 +79,7 @@ async fn e2e_ack_orphan_unload() -> Result<(), Box<dyn std::error::Error>> {
     // the topic's dispatcher down and reloads it on itself — no TCP drop,
     // exactly the #307/#346 root cause.
     container
-        .exec(
-            ExecCommand::new(["bin/pulsar-admin", "topics", "unload", topic])
-                .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec(["bin/pulsar-admin", "topics", "unload", topic])
         .await?;
 
     // The pending ack must not hang: either it landed Ok before the close

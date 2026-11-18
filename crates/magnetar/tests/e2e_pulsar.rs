@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tests against a real Apache Pulsar 4.x standalone broker
-//! spun up via `testcontainers-rs`.
+//! started through the shared Docker fixture.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!

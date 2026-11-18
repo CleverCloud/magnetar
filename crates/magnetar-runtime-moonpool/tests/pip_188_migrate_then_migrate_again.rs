@@ -12,7 +12,7 @@
 //! the supervised reconnect path must dial both targets in order, and
 //! the consumer must end up live on broker-A (the final target).
 //!
-//! Why this is moonpool territory: `testcontainers` can simulate one
+//! Why this is moonpool territory: a Docker e2e test can simulate one
 //! `TOPIC_MIGRATED` via the broker's namespace policy machinery, but
 //! sequencing two back-to-back migrations across distinct sockets requires
 //! a scripted broker — exactly what synthetic frame injection provides.

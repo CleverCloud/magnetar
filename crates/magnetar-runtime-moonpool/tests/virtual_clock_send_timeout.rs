@@ -8,7 +8,7 @@
 //! Chaos scenario: `send_timeout` must fire at exactly the configured
 //! deadline relative to the *virtual* clock — not the host wall-clock.
 //!
-//! Why this is moonpool territory: a `testcontainers` test would have to
+//! Why this is moonpool territory: a Docker e2e test would have to
 //! sleep for the real timeout duration on the host wall-clock — slow,
 //! flaky, and not actually a determinism check. The sans-io state machine
 //! exposes [`magnetar_proto::Connection::handle_timeout`] with a caller-

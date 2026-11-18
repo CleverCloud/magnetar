@@ -40,11 +40,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::ServiceUrlProvider;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::auto_cluster_failover::{AutoClusterFailover, TokioHealthProbe};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -59,8 +59,7 @@ const CORRUPTED_PRIMARY: &str = "ptlsar://magnetar-corrupted-primary.invalid:665
 /// to spin against the container.
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

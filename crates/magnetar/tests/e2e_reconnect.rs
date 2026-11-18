@@ -12,7 +12,7 @@
 //!   re-issue `CommandProducer` / `CommandSubscribe`, so a `send` / `receive` issued after the
 //!   restart succeeds without the user re-creating the handles.
 //!
-//! The simulation we can realistically run with `testcontainers` is "stop
+//! The simulation we can realistically run against a Docker broker is "stop
 //! the broker, start it back up." Mid-frame chaos (in-flight ops cut
 //! mid-byte, virtual-clock backoff jitter) is moonpool territory and
 //! lives in the deterministic-simulation engine.
@@ -140,10 +140,9 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 /// round-trip a message after the broker returns. Pins the
 /// supervised-reconnect + transparent-rebuild contract end-to-end.
 ///
-/// `testcontainers` 0.27 has no `restart_async`. `stop_with_timeout` +
-/// `start` doesn't work either: `bin/pulsar standalone` exits cleanly on
-/// `SIGTERM` and `container.start()` only re-runs `docker start`, which does
-/// NOT re-execute the entrypoint. The container would come back alive but
+/// `docker stop` + `docker start` doesn't work: `bin/pulsar standalone` exits
+/// cleanly on `SIGTERM` and `docker start` does NOT re-execute the
+/// entrypoint. The container would come back alive but
 /// with no broker inside, and the supervisor would spin on `Connection
 /// refused` until the test budget ran out (the symptom we observed before
 /// this fix). We shell out to `docker restart` instead — that re-runs the
@@ -154,7 +153,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
-    // testcontainers maps the broker's 6650 to a random host port and reuses
+    // The fixture maps the broker's 6650 to a random host port and reuses
     // that port across `docker restart` only when the port is explicitly
     // pinned. Default `-P` random binding gets a fresh host port on every
     // restart — so wrap the URL in a `ControlledClusterFailover` and bump it
@@ -207,7 +206,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     // Re-query the (possibly new) host port and feed it to the supervisor's
     // failover provider — `docker restart` against an `-P` binding picks a
     // fresh random port.
-    let new_host = container.get_host().await?;
+    let new_host = container.host().to_owned();
     let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     let new_url = format!("pulsar://{new_host}:{new_port}");
     tracing::info!(%new_url, "redirecting supervisor to post-restart port");
@@ -355,7 +354,7 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
     })
     .await??;
     assert!(status.success(), "docker restart failed: {status:?}");
-    let new_host = container.get_host().await?;
+    let new_host = container.host().to_owned();
     let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     failover.set_url(format!("pulsar://{new_host}:{new_port}"));
 
@@ -419,7 +418,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     // See the producer-restart test for why we wrap in
-    // `ControlledClusterFailover` — `docker restart` against testcontainers'
+    // `ControlledClusterFailover` — `docker restart` against the fixture's
     // random port binding picks a fresh host port, and the supervisor must
     // be redirected.
     let failover = ControlledClusterFailover::new(service_url);
@@ -464,7 +463,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     // `container.start()` doesn't actually re-run `bin/pulsar standalone`.
     tracing::info!("stopping pulsar container to force in-flight replay");
     let container_id = container.id().to_string();
-    container.stop_with_timeout(Some(5)).await?;
+    container.stop(Duration::from_secs(5)).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Spawn `N` concurrent send futures. None of them complete until the
@@ -496,7 +495,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     assert!(status.success(), "docker restart failed: {status:?}");
     // Redirect supervisor to the post-restart port (random-mapped, see the
     // producer-restart test for the rationale).
-    let new_host = container.get_host().await?;
+    let new_host = container.host().to_owned();
     let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     failover.set_url(format!("pulsar://{new_host}:{new_port}"));
 
@@ -634,7 +633,7 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
     })
     .await??;
     assert!(status.success(), "docker restart failed: {status:?}");
-    let new_host = container.get_host().await?;
+    let new_host = container.host().to_owned();
     let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     failover.set_url(format!("pulsar://{new_host}:{new_port}"));
 
@@ -749,7 +748,7 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
     })
     .await??;
     assert!(status.success(), "docker restart failed: {status:?}");
-    let new_host = container.get_host().await?;
+    let new_host = container.host().to_owned();
     let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
     failover.set_url(format!("pulsar://{new_host}:{new_port}"));
 

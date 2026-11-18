@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tests for the PIP-466 V5 client surface against a real
-//! Apache Pulsar 4.x standalone broker spun up via `testcontainers-rs`.
+//! Apache Pulsar 4.x standalone broker started through the shared Docker fixture.
 //!
 //! Gated behind the `experimental-v5-client` feature.
 //! flags. Run with:

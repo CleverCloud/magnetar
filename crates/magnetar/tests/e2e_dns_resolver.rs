@@ -3,7 +3,7 @@
 //! End-to-end test for the pluggable DNS resolver
 //! (`ClientBuilder::dns_resolver` — ADR-0015).
 //!
-//! Spins up a real Pulsar 4.x standalone broker via `testcontainers-rs`,
+//! Spins up a real Pulsar 4.x standalone broker through the shared Docker fixture,
 //! wires a recording resolver that captures every `(host, port)` lookup
 //! and delegates to tokio's built-in resolver, and confirms:
 //!
@@ -115,8 +115,8 @@ async fn e2e_custom_dns_resolver_invoked_and_roundtrip() -> Result<(), Box<dyn s
         "custom DnsResolver must be invoked at least once on initial connect"
     );
     // Extract the host portion from the broker service URL ("pulsar://<host>:<port>")
-    // and assert at least one recorded lookup targeted it. Testcontainers usually
-    // returns `127.0.0.1` as the host, but we don't hard-code that — we match on
+    // and assert at least one recorded lookup targeted it. The fixture usually
+    // returns `localhost` as the host, but we don't hard-code that — we match on
     // whatever the container reports.
     let expected_host = service_url
         .trim_start_matches("pulsar://")

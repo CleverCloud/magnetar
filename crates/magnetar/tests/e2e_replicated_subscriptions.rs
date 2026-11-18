@@ -3,7 +3,7 @@
 //! PIP-33 (ADR-0034) — end-to-end test against a real two-cluster Pulsar 4.x
 //! fixture.
 //!
-//! Unlike the single-broker e2e tests (which use testcontainers-rs), PIP-33
+//! Unlike the single-broker e2e tests (which use the shared Docker fixture), PIP-33
 //! is only meaningfully exercised against **two clusters** configured as
 //! geo-replication peers — a single-cluster broker silently ignores
 //! `replicate_subscription_state(true)` and the cursor-sync mechanism never
@@ -36,7 +36,7 @@ use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 
 // Host-side ports — match `fixtures/docker-compose.replicated-subs.yml`.
 // They're off the default Pulsar 6650 to avoid colliding with the
-// `testcontainers`-spawned brokers that other e2e tests start (those
+// fixture-spawned brokers that other e2e tests start (those
 // brokers advertise themselves as `localhost:8080` internally, so a
 // fixed `localhost:6650` mapping here would route their lookup
 // responses back to the wrong broker).

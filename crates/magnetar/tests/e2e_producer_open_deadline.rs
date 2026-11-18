@@ -31,7 +31,6 @@
 use std::time::Duration;
 
 use magnetar::{MessageRoutingMode, OutgoingMessage, PulsarClient};
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 
 mod common;
 
@@ -55,17 +54,14 @@ async fn e2e_producer_open_deadline_does_not_preempt_an_answered_reattach()
     let topic = "persistent://public/default/magnetar-e2e-producer-open-deadline";
 
     container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "topics",
-                "create-partitioned-topic",
-                "-p",
-                "2",
-                topic,
-            ])
-            .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec([
+            "bin/pulsar-admin",
+            "topics",
+            "create-partitioned-topic",
+            "-p",
+            "2",
+            topic,
+        ])
         .await?;
 
     let client = PulsarClient::builder()
@@ -95,15 +91,12 @@ async fn e2e_producer_open_deadline_does_not_preempt_an_answered_reattach()
     // itself: no TCP drop, so nothing resets the connection and the recovery is ADR-0106's
     // in-place re-attach, now running under an armed deadline.
     container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "topics",
-                "unload",
-                &format!("{topic}-partition-1"),
-            ])
-            .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec([
+            "bin/pulsar-admin",
+            "topics",
+            "unload",
+            &format!("{topic}-partition-1"),
+        ])
         .await?;
 
     // Bound the whole post-unload workload, not each send: a sequential caller has an

@@ -6,7 +6,7 @@
 //! at `t = 3500s` returns the cached token; driving it again at
 //! `t = 3601s` returns a refreshed token.
 //!
-//! Why this is moonpool territory: a `testcontainers` test would have to
+//! Why this is moonpool territory: a Docker e2e test would have to
 //! run for an hour of real wall-clock time or stub the IDP — the first is
 //! flaky, the second is a unit test in disguise. The clean way to pin the
 //! refresh-edge contract is to drive a synthetic [`Clock`] forward and

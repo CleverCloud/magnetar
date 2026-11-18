@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::proto::{FrameError, decode_one, encode_command, pb};
 use magnetar::runtime_moonpool::{
@@ -38,7 +39,6 @@ use magnetar::runtime_moonpool::{
 use magnetar::{OutgoingMessage, PulsarClient};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
-use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -48,8 +48,7 @@ use common::pulsar::BROKER_BINARY_PORT;
 
 const PORTLESS_BROKER_HOST: &str = "resolved-broker.internal";
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

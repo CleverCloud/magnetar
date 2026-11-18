@@ -9,7 +9,7 @@
 //! `magnetar-runtime-moonpool/src/**` — synthetic broker frames go in via
 //! [`Connection::handle_bytes`], synthetic `Instant`s drive every timer, and
 //! virtual deadlines never touch the host wall clock. That makes the
-//! resulting tests deterministic in a way `testcontainers`-based e2e tests
+//! resulting tests deterministic in a way Docker e2e tests
 //! never can be, regardless of whether the workspace eventually pulls in the
 //! `moonpool-sim` providers.
 

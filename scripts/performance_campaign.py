@@ -65,7 +65,8 @@ SEED_REGISTRY = "crates/magnetar-runtime-moonpool/seeds/known-failing.toml"
 EXAMPLE_SOURCE = "crates/magnetar/examples/performance.rs"
 FIXTURE_SOURCE = "crates/magnetar/tests/common/pulsar.rs"
 BASELINE_HARNESS_SOURCES = (EXAMPLE_SOURCE, "crates/magnetar/tests/e2e_reconnect_safety.rs", "crates/magnetar/tests/e2e_pulsar_proxy.rs",
-                            "crates/magnetar/tests/common/mod.rs", FIXTURE_SOURCE)
+                            "crates/magnetar/tests/common/mod.rs", FIXTURE_SOURCE,
+                            "crates/magnetar/tests/common/container.rs")
 PROXY_GATEWAY = "MAGNETAR_E2E_DOCKER_HOST_GATEWAY"
 PIP33_BINDINGS = ("MAGNETAR_PIP33_CLUSTER_A_URL", "MAGNETAR_PIP33_CLUSTER_B_URL", "MAGNETAR_PIP33_ADMIN_B_URL")
 
@@ -1656,7 +1657,7 @@ def main():
     parser.add_argument("--build-session", help="reuse checked per-reference targets across sequential replay seeds")
     parser.add_argument("--axis", choices=perf.AXES, default="workspace-all-features")
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--docker-socket", action="store_true", help="allow testcontainers on this private suite runner")
+    parser.add_argument("--docker-socket", action="store_true", help="allow Docker containers on this private suite runner")
     parser.add_argument("--binding", action="append", default=[], help="inspected private PIP33/proxy NAME=value binding")
     parser.add_argument("--fixture-images", type=Path, help="inspected image identities of suite fixtures")
     parser.add_argument("--pip33-fixture", type=Path, help="owned default-port fixture inspection for the exact main PIP-33 tests")

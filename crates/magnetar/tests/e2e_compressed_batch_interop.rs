@@ -47,12 +47,11 @@
 
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::InitialPosition;
 use magnetar::proto::types::CompressionKind;
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::GenericImage;
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 use uuid::Uuid;
 
 mod common;
@@ -89,21 +88,17 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const JAVA_CONSUME_TIMEOUT_SECS: &str = "90";
 
 /// Run a Java CLI inside the broker container, wait for it to exit, and return
-/// (`exit_code`, `stdout`, `stderr`). The exit code is read only once the process has exited
-/// (`CmdWaitFor::exit()`); before that testcontainers is free to answer `None`.
+/// (`exit_code`, `stdout`, `stderr`). `exit_code` is `None` only when a signal ended the process.
 async fn run_in_container(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     command: &[&str],
 ) -> Result<(Option<i64>, String, String), Box<dyn std::error::Error>> {
-    let mut out = container
-        .exec(
-            ExecCommand::new(command.iter().map(|arg| (*arg).to_owned()))
-                .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+    let out = container
+        .exec(command.iter().map(|arg| (*arg).to_owned()))
         .await?;
-    let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
-    Ok((out.exit_code().await?, stdout, stderr))
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Ok((out.exit_code, stdout, stderr))
 }
 
 /// The broker's own `availablePermits` for every consumer of every subscription on the topic.

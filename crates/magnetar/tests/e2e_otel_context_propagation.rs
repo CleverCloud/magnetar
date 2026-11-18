@@ -24,9 +24,9 @@
 
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -52,8 +52,7 @@ async fn install_trace_context_propagator() -> TraceContextPropagatorGuard {
     TraceContextPropagatorGuard { _guard: guard }
 }
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

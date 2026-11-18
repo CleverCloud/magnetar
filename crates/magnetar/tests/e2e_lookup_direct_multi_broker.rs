@@ -65,14 +65,13 @@
 //! the DIRECT path, per the container-memory budget in
 //! [`docs/testing.md` § "e2e container memory budget"](../../../docs/testing.md).
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

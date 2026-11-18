@@ -20,18 +20,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::InitialPosition;
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
 use common::pulsar::{Broker, Pulsar, init_tracing};
 
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar() -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     // The test pattern uses a UUID suffix that pushes the regex past the
     // broker's default `subscriptionPatternMaxLength=50` limit, so raise it.

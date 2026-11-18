@@ -373,7 +373,7 @@ By convention, magnetar treats `ConnectionEvent` as `#[non_exhaustive]`, so the 
 
 The producer-side replicator entry (`Producer::send_with_source_message_id`) is exercised by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) (the executable reference). The test runs on the default broker of the shared e2e fixture (`crates/magnetar/tests/common/pulsar.rs`, [ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)); `MAGNETAR_PULSAR_IMAGE_TAG` can select an explicit compatibility image. The earlier 4.0.4 description is historical, not the image selected by the current default or CI.
 Shadow topics are opt-in on Pulsar 4.0.14, 4.2.5 and 5.0.0 (`enableShadowTopics=false` in `standalone.conf`, the admin REST answers `405 Shadow topics are disabled`), so both shadow-topic e2e suites enable them with `.config("enableShadowTopics", "true")` ([ADR-0116](../specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)); a broker you run yourself needs `enableShadowTopics=true` before `create-shadow-topic` works.
-The fixture is **self-hosting** — one standalone container via `testcontainers-rs`, no external broker dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster geo-replication is PIP-33, covered by [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)).
+The fixture is **self-hosting** — one standalone container through the shared Docker fixture, no external broker dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster geo-replication is PIP-33, covered by [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)).
 
 #### Shadow fixture (`start_pulsar_with_token_auth_and_replicator_role`)
 
@@ -1099,7 +1099,7 @@ cargo test --features auth-athenz-zts \
 
 #### Athenz hybrid fixture shape
 
-The Athenz ZTS server is operationally non-trivial to spin up in testcontainers — the upstream image expects a co-deployed ZMS (manager), per-tenant public-key seeding via the ZMS admin REST, and a chained TLS server certificate (Athenz's [`make deploy-dev`](https://github.com/AthenZ/athenz/blob/master/docker/README.md) orchestrates four containers + a cert-bootstrap pre-flight that together take ~15 minutes to build).
+The Athenz ZTS server is operationally non-trivial to spin up in one container — the upstream image expects a co-deployed ZMS (manager), per-tenant public-key seeding via the ZMS admin REST, and a chained TLS server certificate (Athenz's [`make deploy-dev`](https://github.com/AthenZ/athenz/blob/master/docker/README.md) orchestrates four containers + a cert-bootstrap pre-flight that together take ~15 minutes to build).
 The test file therefore takes a hybrid shape:
 
 | Test                                                       | Fixture                                     | What it proves                                                                                                                                                                                    |

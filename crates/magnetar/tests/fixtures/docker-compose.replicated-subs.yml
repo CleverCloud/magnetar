@@ -43,7 +43,7 @@
 # where the host mapping does not exist). Host networking gives both sides
 # the same answer: `localhost:<host-port>` is correct for the host-side e2e
 # client AND for the peer broker's replicator. Ports stay off the default
-# 6650/8080 so the fixture never collides with the `testcontainers`-spawned
+# 6650/8080 so the fixture never collides with the fixture-spawned
 # brokers of the other e2e tests (which advertise `localhost` on their own
 # mapped ports):
 #   cluster-a broker: pulsar://localhost:16650, admin http://localhost:18080

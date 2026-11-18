@@ -57,10 +57,10 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -113,10 +113,7 @@ const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// The shared fixture writes it into `conf/standalone.conf` with
 /// `bin/apply-config-from-env.py` before the broker boots (the `e2e_reconnect_safety.rs`
 /// pattern).
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar() -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default)
         .config("acknowledgmentAtBatchIndexLevelEnabled", "true")

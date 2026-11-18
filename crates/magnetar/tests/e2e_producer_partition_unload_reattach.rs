@@ -40,7 +40,6 @@
 use std::time::Duration;
 
 use magnetar::{MessageRoutingMode, OutgoingMessage, PulsarClient};
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 
 mod common;
 
@@ -60,17 +59,14 @@ async fn e2e_producer_partition_unload_reattach() -> Result<(), Box<dyn std::err
     // `pulsar-admin` inside the container owns partitioned-topic creation here:
     // the unload below is exec'd the same way, so both go through one surface.
     container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "topics",
-                "create-partitioned-topic",
-                "-p",
-                "2",
-                topic,
-            ])
-            .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec([
+            "bin/pulsar-admin",
+            "topics",
+            "create-partitioned-topic",
+            "-p",
+            "2",
+            topic,
+        ])
         .await?;
 
     let client = PulsarClient::builder()
@@ -97,15 +93,12 @@ async fn e2e_producer_partition_unload_reattach() -> Result<(), Box<dyn std::err
     // Detach the producer on ONE partition. The standalone broker reloads the
     // bundle on itself: no TCP drop, so nothing resets the connection.
     container
-        .exec(
-            ExecCommand::new([
-                "bin/pulsar-admin",
-                "topics",
-                "unload",
-                &format!("{topic}-partition-1"),
-            ])
-            .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec([
+            "bin/pulsar-admin",
+            "topics",
+            "unload",
+            &format!("{topic}-partition-1"),
+        ])
         .await?;
 
     // A sequential caller has W=1: a single send parked on the detached
@@ -188,10 +181,7 @@ async fn e2e_producer_exclusive_unload_outcome() -> Result<(), Box<dyn std::erro
         .await?;
 
     container
-        .exec(
-            ExecCommand::new(["bin/pulsar-admin", "topics", "unload", topic])
-                .with_cmd_ready_condition(CmdWaitFor::exit()),
-        )
+        .exec(["bin/pulsar-admin", "topics", "unload", topic])
         .await?;
 
     let outcome = tokio::time::timeout(

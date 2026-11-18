@@ -25,9 +25,9 @@
 
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -45,10 +45,8 @@ const ABORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// default standalone image does NOT enable this — if the coordinator fails to bootstrap the
 /// new-txn RPC will hang or be rejected; that's why these tests are marked
 /// `e2e: requires transaction-coordinator-enabled broker` and stay opt-in.
-async fn start_pulsar_with_txn() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar_with_txn() -> Result<(String, String, Container), Box<dyn std::error::Error>>
+{
     init_tracing();
     // Transactions require three things the default standalone image does not wire up:
     //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`, which the shared fixture

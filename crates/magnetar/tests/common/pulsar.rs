@@ -73,9 +73,7 @@
 
 use std::time::Duration;
 
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use super::container::{Container, ContainerPort, GenericImage, WaitFor};
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -249,7 +247,7 @@ pub fn init_tracing() {
 ///
 /// Installs the shared tracing subscriber first. The container is held by the
 /// returned guard; dropping it stops the broker.
-pub async fn start_pulsar() -> Result<(String, String, ContainerAsync<GenericImage>), BoxError> {
+pub async fn start_pulsar() -> Result<(String, String, Container), BoxError> {
     init_tracing();
     Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
@@ -448,7 +446,7 @@ impl Pulsar {
                 .await?
         };
 
-        let host = container.get_host().await?.to_string();
+        let host = container.host().to_owned();
         let binary_port = container.get_host_port_ipv4(self.binary_port).await?;
         let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
         let zookeeper_port = if self.zookeeper {
@@ -495,7 +493,7 @@ impl Pulsar {
             .with_cmd(command)
             .start()
             .await?;
-        let host = container.get_host().await?;
+        let host = container.host().to_owned();
         let port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
         Ok(RunningProxy {
             service_url: format!("pulsar://{host}:{port}"),
@@ -521,12 +519,12 @@ pub struct Running {
     /// [`Pulsar::zookeeper_metadata`].
     pub zookeeper_port: Option<u16>,
     /// The container handle.
-    pub container: ContainerAsync<GenericImage>,
+    pub container: Container,
 }
 
 impl Running {
     /// `(service_url, admin_url, container)`, the shape most suites destructure.
-    pub fn into_parts(self) -> (String, String, ContainerAsync<GenericImage>) {
+    pub fn into_parts(self) -> (String, String, Container) {
         (self.service_url, self.admin_url, self.container)
     }
 }
@@ -537,7 +535,7 @@ pub struct RunningProxy {
     /// `pulsar://<host>:<mapped binary port>`.
     pub service_url: String,
     /// The container handle.
-    pub container: ContainerAsync<GenericImage>,
+    pub container: Container,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,7 +592,7 @@ fn authorized(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest:
 /// verdict. Only a version that answers and disagrees with the tag is final.
 /// Fails early, quoting the broker's logs, when the container exits.
 async fn await_ready(
-    container: &ContainerAsync<GenericImage>,
+    container: &Container,
     admin_url: &str,
     token: Option<&str>,
     tag: &str,
@@ -660,7 +658,7 @@ fn check_series(reported: &str, expected: (u32, u32), tag: &str) -> Result<(), B
     .into())
 }
 
-async fn failure(reason: &str, last: &str, container: &ContainerAsync<GenericImage>) -> BoxError {
+async fn failure(reason: &str, last: &str, container: &Container) -> BoxError {
     let stdout = container.stdout_to_vec().await.unwrap_or_default();
     let stderr = container.stderr_to_vec().await.unwrap_or_default();
     format!(

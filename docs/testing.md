@@ -342,7 +342,7 @@ The issue #887 companion is `cargo test -p magnetar-driver --test e2e_producer_o
 
 ### Running the PIP-33 two-cluster fixture locally
 
-`e2e_replicated_subscriptions.rs` is the one e2e test whose broker topology `testcontainers` does not spawn.
+`e2e_replicated_subscriptions.rs` is the one e2e test whose broker topology the shared fixture does not spawn.
 CI brings the fixture up for you; locally it takes **two** steps, not one:
 
 ```bash
