@@ -736,6 +736,41 @@ pub struct DeferredIncomingMessage {
 }
 
 impl IncomingMessage {
+    /// The producer-side metadata a republish of this message (dead-letter or retry-letter
+    /// topic) should start from: partition key, ordering key, event time and properties.
+    ///
+    /// For a batch member the member's own values live in [`Self::single_metadata`], while
+    /// [`Self::metadata`] is the batch envelope shared by every member, so the member's values
+    /// win. The member's `properties` replace the envelope's outright (the envelope's belong to
+    /// the batch, not to the member); the key, ordering key and event time fall back to the
+    /// envelope when the member carries none. An unbatched message is returned unchanged.
+    #[must_use]
+    pub fn republish_metadata(&self) -> pb::MessageMetadata {
+        let envelope = self.metadata.as_ref();
+        let mut out = pb::MessageMetadata {
+            partition_key: envelope.partition_key.clone(),
+            partition_key_b64_encoded: envelope.partition_key_b64_encoded,
+            ordering_key: envelope.ordering_key.clone(),
+            event_time: envelope.event_time,
+            properties: envelope.properties.clone(),
+            ..pb::MessageMetadata::default()
+        };
+        if let Some(single) = self.single_metadata.as_ref() {
+            if single.partition_key.is_some() {
+                out.partition_key.clone_from(&single.partition_key);
+                out.partition_key_b64_encoded = single.partition_key_b64_encoded;
+            }
+            if single.ordering_key.is_some() {
+                out.ordering_key.clone_from(&single.ordering_key);
+            }
+            if single.event_time.is_some() {
+                out.event_time = single.event_time;
+            }
+            out.properties.clone_from(&single.properties);
+        }
+        out
+    }
+
     /// Conservative retained-byte charge for aggregate receive accounting.
     /// Dynamic protobuf content is charged by canonical encoded length and
     /// fixed Rust handles are covered by the enclosing struct size.
@@ -754,5 +789,88 @@ impl IncomingMessage {
                     .as_deref()
                     .map_or(0, prost::Message::encoded_len),
             )
+    }
+}
+
+#[cfg(test)]
+mod republish_metadata_tests {
+    use super::*;
+
+    fn kv(key: &str, value: &str) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn message(
+        envelope: pb::MessageMetadata,
+        single: Option<pb::SingleMessageMetadata>,
+    ) -> IncomingMessage {
+        IncomingMessage {
+            message_id: MessageId {
+                ledger_id: 1,
+                entry_id: 2,
+                partition: -1,
+                batch_index: -1,
+                batch_size: -1,
+            },
+            metadata: std::sync::Arc::new(envelope),
+            single_metadata: single,
+            payload: Bytes::new(),
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+
+    fn envelope() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            partition_key: Some("envelope-key".to_owned()),
+            ordering_key: Some(Bytes::from_static(b"envelope-order")),
+            event_time: Some(10),
+            properties: vec![kv("custom", "envelope")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unbatched_message_keeps_envelope_metadata() {
+        let out = message(envelope(), None).republish_metadata();
+        assert_eq!(out.partition_key.as_deref(), Some("envelope-key"));
+        assert_eq!(out.ordering_key.as_deref(), Some(&b"envelope-order"[..]));
+        assert_eq!(out.event_time, Some(10));
+        assert_eq!(out.properties, vec![kv("custom", "envelope")]);
+    }
+
+    #[test]
+    fn batch_member_metadata_wins_over_the_envelope() {
+        let single = pb::SingleMessageMetadata {
+            partition_key: Some("member-key".to_owned()),
+            partition_key_b64_encoded: Some(true),
+            ordering_key: Some(Bytes::from_static(b"member-order")),
+            event_time: Some(20),
+            properties: vec![kv("traceparent", "member")],
+            ..Default::default()
+        };
+        let out = message(envelope(), Some(single)).republish_metadata();
+        assert_eq!(out.partition_key.as_deref(), Some("member-key"));
+        assert_eq!(out.partition_key_b64_encoded, Some(true));
+        assert_eq!(out.ordering_key.as_deref(), Some(&b"member-order"[..]));
+        assert_eq!(out.event_time, Some(20));
+        assert_eq!(out.properties, vec![kv("traceparent", "member")]);
+    }
+
+    #[test]
+    fn batch_member_without_own_scalars_falls_back_to_the_envelope() {
+        let single = pb::SingleMessageMetadata::default();
+        let out = message(envelope(), Some(single)).republish_metadata();
+        assert_eq!(out.partition_key.as_deref(), Some("envelope-key"));
+        assert_eq!(out.ordering_key.as_deref(), Some(&b"envelope-order"[..]));
+        assert_eq!(out.event_time, Some(10));
+        assert!(
+            out.properties.is_empty(),
+            "envelope properties are not the member's"
+        );
     }
 }

@@ -541,3 +541,146 @@ async fn e2e_dlq_flow_survives_a_receiver_queue_of_dead_letters()
     client.close().await;
     Ok(())
 }
+
+/// A dead-lettered BATCH member must be republished with its OWN key, ordering key, event
+/// time and properties, not the batch envelope's.
+///
+/// For a batch member `IncomingMessage::metadata` is the envelope shared by every member and the
+/// member's own fields live in `single_metadata`. The republish used to copy the envelope, so
+/// every member of a batch of 2+ lost its own properties (trace context, event properties)
+/// and carried the first member's key. Java producers batch by default, so this is the common
+/// shape of a real DLQ input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn e2e_dlq_batch_member_republishes_with_its_own_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-dlq-batch-{id}");
+    let dlq_topic = format!("{topic}-DLQ");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    // A long publish delay so the two concurrent sends are packed into ONE broker entry.
+    let producer = client
+        .producer(&topic)
+        .batching(10, 128 * 1024)
+        .batching_max_publish_delay(Duration::from_secs(2))
+        .create()
+        .await?;
+    let expected = [
+        (
+            "poison-0",
+            "key-0",
+            b"order-0".as_slice(),
+            1_700_000_001_000,
+            "value-0",
+        ),
+        (
+            "poison-1",
+            "key-1",
+            b"order-1".as_slice(),
+            1_700_000_001_001,
+            "value-1",
+        ),
+    ];
+    let sends = expected.map(|(payload, key, ordering_key, event_time, property)| {
+        producer.send(
+            OutgoingMessage::with_payload(payload.as_bytes().to_vec())
+                .key(key)
+                .ordering_key(ordering_key.to_vec())
+                .event_time_ms(event_time)
+                .property("custom", property)
+                .into(),
+        )
+    });
+    let [first, second] = sends;
+    let (first, second) = tokio::try_join!(first, second)?;
+    assert_eq!(
+        (first.entry_id, first.ledger_id),
+        (second.entry_id, second.ledger_id),
+        "both messages must share one batched broker entry"
+    );
+    producer.close().await?;
+
+    let consumer = client
+        .consumer(&topic)
+        .subscription(format!("magnetar-dlq-batch-{id}"))
+        .subscription_type(SubType::Shared)
+        .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    for _round in 0..2 {
+        for _ in 0..expected.len() {
+            tokio::time::timeout(Duration::from_secs(15), consumer.receive()).await??;
+        }
+        consumer.redeliver_unacked();
+    }
+
+    let dlq_producer = client.producer(&dlq_topic).create().await?;
+    let mut republished = 0usize;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while republished < expected.len() {
+            republished += consumer.republish_dead_letters(&dlq_producer).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await
+    .map_err(|_| "timed out republishing both batch members")??;
+
+    let dlq_consumer = client
+        .consumer(&dlq_topic)
+        .subscription(format!("magnetar-dlq-batch-tail-{id}"))
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let mut replacements = std::collections::BTreeMap::new();
+    for _ in 0..expected.len() {
+        let message =
+            tokio::time::timeout(Duration::from_secs(15), dlq_consumer.receive()).await??;
+        let custom = message
+            .metadata
+            .properties
+            .iter()
+            .find(|property| property.key == "custom")
+            .map(|property| property.value.clone());
+        replacements.insert(
+            String::from_utf8(message.payload.to_vec())?,
+            (
+                message.metadata.partition_key.clone(),
+                message.metadata.ordering_key.clone(),
+                message.metadata.event_time,
+                custom,
+            ),
+        );
+        dlq_consumer.ack(message.message_id).await?;
+    }
+    for (payload, key, ordering_key, event_time, custom) in expected {
+        let replacement = replacements
+            .get(payload)
+            .ok_or_else(|| format!("missing DLQ replacement for {payload}"))?;
+        assert_eq!(replacement.0.as_deref(), Some(key), "{payload}: key");
+        assert_eq!(
+            replacement.1.as_deref(),
+            Some(ordering_key),
+            "{payload}: ordering key"
+        );
+        assert_eq!(replacement.2, Some(event_time), "{payload}: event time");
+        assert_eq!(
+            replacement.3.as_deref(),
+            Some(custom),
+            "{payload}: property"
+        );
+    }
+
+    dlq_consumer.close().await?;
+    dlq_producer.close().await?;
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
