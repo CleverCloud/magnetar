@@ -192,9 +192,12 @@ fn emit_batch(out: &mut BytesMut, consumer_id: u64) {
         let payload = format!("member-{member}");
         let single = pb::SingleMessageMetadata {
             payload_size: i32::try_from(payload.len()).expect("payload fits i32"),
-            partition_key: Some(format!("member-key-{member}")),
-            ordering_key: Some(Bytes::from(format!("member-order-{member}"))),
-            event_time: Some(1_700_000_001_000 + member),
+            // Member 1 is keyless and has no event time: it must republish with NO key and
+            // NO ordering key (Java clears the first member's copy the envelope carries) and
+            // inherit only the envelope's event time.
+            partition_key: (member == 0).then(|| format!("member-key-{member}")),
+            ordering_key: (member == 0).then(|| Bytes::from(format!("member-order-{member}"))),
+            event_time: (member == 0).then_some(1_700_000_001_000 + member),
             properties: vec![pb::KeyValue {
                 key: "custom".to_owned(),
                 value: format!("member-{member}"),
@@ -419,15 +422,20 @@ async fn spawn_broker() -> (String, Arc<BrokerControl>, tokio::task::JoinHandle<
     (format!("pulsar://{address}"), control, task)
 }
 
-/// What the DLQ must receive: each member's OWN key / ordering key / event time / property.
+/// What the DLQ (or retry topic) must receive: each member's OWN key / ordering key / property;
+/// the event time is the member's, else the envelope's.
 fn expected_sends() -> Vec<WireEvent> {
     (0..2_u64)
         .map(|member| WireEvent::Send {
             sequence: member,
             payload: Bytes::from(format!("member-{member}")),
-            key: Some(format!("member-key-{member}")),
-            ordering_key: Some(Bytes::from(format!("member-order-{member}"))),
-            event_time: Some(1_700_000_001_000 + member),
+            key: (member == 0).then(|| format!("member-key-{member}")),
+            ordering_key: (member == 0).then(|| Bytes::from(format!("member-order-{member}"))),
+            event_time: Some(if member == 0 {
+                1_700_000_001_000
+            } else {
+                1_700_000_000_500
+            }),
             custom: format!("member-{member}"),
             real_topic: CHILD_TOPICS[0].to_owned(),
             original_id: format!("11:0:0:{member}"),
@@ -478,6 +486,74 @@ async fn dead_lettered_batch_members_republish_with_their_own_metadata() {
         .expect("republish did not time out")
         .expect("runtime republish");
     assert_eq!(republished, 2, "both batch members are dead-lettered");
+
+    let sends: Vec<WireEvent> = control
+        .trace()
+        .into_iter()
+        .filter(|event| matches!(event, WireEvent::Send { .. }))
+        .collect();
+    assert_eq!(sends, expected_sends());
+
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    broker.abort();
+}
+
+/// `reconsume_later` shares the republish metadata with the DLQ path: the retry-topic
+/// `CommandSend` for a batch member must carry the member's own key / ordering key / event time /
+/// properties, not the envelope's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconsumed_batch_members_republish_with_their_own_metadata() {
+    let (url, control, broker) = spawn_broker().await;
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect(&url, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect");
+
+    // No dead-letter policy: the members are delivered to the application.
+    let consumer = tokio::time::timeout(
+        HANG_GUARD,
+        client.subscribe(SubscribeRequest {
+            topic: CHILD_TOPICS[0].to_owned(),
+            subscription: "orders-subscription".to_owned(),
+            receiver_queue_size: 8,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe");
+    control.wait_for_pongs(1).await;
+    let retry_producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: DLQ_TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open producer did not time out")
+    .expect("open producer");
+
+    control.release_receipt();
+    control.release_receipt();
+    for _ in 0..2 {
+        let member = tokio::time::timeout(HANG_GUARD, consumer.receive())
+            .await
+            .expect("receive did not time out")
+            .expect("receive");
+        tokio::time::timeout(
+            HANG_GUARD,
+            consumer.reconsume_later(&retry_producer, member, std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("reconsume did not time out")
+        .expect("reconsume_later");
+    }
 
     let sends: Vec<WireEvent> = control
         .trace()

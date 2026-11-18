@@ -736,39 +736,71 @@ pub struct DeferredIncomingMessage {
 }
 
 impl IncomingMessage {
-    /// The producer-side metadata a republish of this message (dead-letter or retry-letter
-    /// topic) should start from: partition key, ordering key, event time and properties.
+    /// The member's own partition key when this message is a batch member, else the envelope's.
     ///
-    /// For a batch member the member's own values live in [`Self::single_metadata`], while
-    /// [`Self::metadata`] is the batch envelope shared by every member, so the member's values
-    /// win. The member's `properties` replace the envelope's outright (the envelope's belong to
-    /// the batch, not to the member); the key, ordering key and event time fall back to the
-    /// envelope when the member carries none. An unbatched message is returned unchanged.
+    /// A batch member without a key has none (Java `MessageImpl.init` clears it): the
+    /// envelope's key is the batch's FIRST member's (`Commands.initBatchMessageMetadata`), so it
+    /// must not leak into a keyless member.
     #[must_use]
-    pub fn republish_metadata(&self) -> pb::MessageMetadata {
-        let envelope = self.metadata.as_ref();
-        let mut out = pb::MessageMetadata {
-            partition_key: envelope.partition_key.clone(),
-            partition_key_b64_encoded: envelope.partition_key_b64_encoded,
-            ordering_key: envelope.ordering_key.clone(),
-            event_time: envelope.event_time,
-            properties: envelope.properties.clone(),
-            ..pb::MessageMetadata::default()
-        };
+    pub fn effective_partition_key(&self) -> Option<&str> {
+        match self.single_metadata.as_ref() {
+            Some(single) => single.partition_key.as_deref(),
+            None => self.metadata.partition_key.as_deref(),
+        }
+    }
+
+    /// The member's own properties when this message is a batch member, else the envelope's.
+    /// The envelope's properties belong to the batch, not to the member.
+    #[must_use]
+    pub fn effective_properties(&self) -> &[pb::KeyValue] {
+        match self.single_metadata.as_ref() {
+            Some(single) => &single.properties,
+            None => &self.metadata.properties,
+        }
+    }
+
+    /// The batch envelope [`Self::metadata`] with a batch member's own values laid over it, so
+    /// every accessor reading it sees the member (Java `MessageImpl` semantics).
+    ///
+    /// For a batch member, [`Self::single_metadata`] holds the member's own values while
+    /// [`Self::metadata`] is the envelope shared by every member. The member's `properties`, key
+    /// and ordering key replace the envelope's outright: a Java envelope carries the batch's
+    /// FIRST member's key and ordering key (`Commands.initBatchMessageMetadata`), and Java's
+    /// `MessageImpl.init` clears both on a member that has none. Only the event time falls back to
+    /// the envelope. An unbatched message returns the envelope unchanged.
+    #[must_use]
+    pub fn effective_metadata(&self) -> pb::MessageMetadata {
+        let mut out = self.metadata.as_ref().clone();
         if let Some(single) = self.single_metadata.as_ref() {
-            if single.partition_key.is_some() {
-                out.partition_key.clone_from(&single.partition_key);
-                out.partition_key_b64_encoded = single.partition_key_b64_encoded;
-            }
-            if single.ordering_key.is_some() {
-                out.ordering_key.clone_from(&single.ordering_key);
-            }
+            out.partition_key.clone_from(&single.partition_key);
+            out.partition_key_b64_encoded = single
+                .partition_key
+                .as_ref()
+                .and(single.partition_key_b64_encoded);
+            out.ordering_key.clone_from(&single.ordering_key);
             if single.event_time.is_some() {
                 out.event_time = single.event_time;
             }
             out.properties.clone_from(&single.properties);
         }
         out
+    }
+
+    /// The producer-side metadata a republish of this message (dead-letter or retry-letter
+    /// topic) should start from: partition key, ordering key, event time and properties, as in
+    /// [`Self::effective_metadata`]. Nothing else of the envelope (producer name, sequence id,
+    /// batch size, ...) is carried over.
+    #[must_use]
+    pub fn republish_metadata(&self) -> pb::MessageMetadata {
+        let effective = self.effective_metadata();
+        pb::MessageMetadata {
+            partition_key: effective.partition_key,
+            partition_key_b64_encoded: effective.partition_key_b64_encoded,
+            ordering_key: effective.ordering_key,
+            event_time: effective.event_time,
+            properties: effective.properties,
+            ..pb::MessageMetadata::default()
+        }
     }
 
     /// Conservative retained-byte charge for aggregate receive accounting.
@@ -862,15 +894,65 @@ mod republish_metadata_tests {
     }
 
     #[test]
-    fn batch_member_without_own_scalars_falls_back_to_the_envelope() {
+    fn batch_member_without_own_keys_has_none_but_inherits_the_event_time() {
         let single = pb::SingleMessageMetadata::default();
         let out = message(envelope(), Some(single)).republish_metadata();
-        assert_eq!(out.partition_key.as_deref(), Some("envelope-key"));
-        assert_eq!(out.ordering_key.as_deref(), Some(&b"envelope-order"[..]));
+        assert_eq!(
+            out.partition_key, None,
+            "the envelope key is the first member's"
+        );
+        assert_eq!(
+            out.ordering_key, None,
+            "the envelope ordering key is the first member's"
+        );
+        assert_eq!(out.partition_key_b64_encoded, None);
         assert_eq!(out.event_time, Some(10));
         assert!(
             out.properties.is_empty(),
             "envelope properties are not the member's"
         );
+    }
+
+    #[test]
+    fn effective_accessors_see_the_member_not_the_envelope() {
+        let keyed = pb::SingleMessageMetadata {
+            partition_key: Some("member-key".to_owned()),
+            properties: vec![kv("traceparent", "member")],
+            ..Default::default()
+        };
+        let keyed = message(envelope(), Some(keyed));
+        assert_eq!(keyed.effective_partition_key(), Some("member-key"));
+        assert_eq!(keyed.effective_properties(), &[kv("traceparent", "member")]);
+
+        let keyless = message(envelope(), Some(pb::SingleMessageMetadata::default()));
+        assert_eq!(keyless.effective_partition_key(), None);
+        assert_eq!(keyless.effective_properties(), &[]);
+
+        let unbatched = message(envelope(), None);
+        assert_eq!(unbatched.effective_partition_key(), Some("envelope-key"));
+        assert_eq!(
+            unbatched.effective_properties(),
+            &[kv("custom", "envelope")]
+        );
+    }
+
+    #[test]
+    fn effective_metadata_overlays_the_member_and_keeps_the_rest_of_the_envelope() {
+        let mut env = envelope();
+        env.producer_name = "producer".to_owned();
+        env.num_messages_in_batch = Some(2);
+        let single = pb::SingleMessageMetadata {
+            partition_key: Some("member-key".to_owned()),
+            event_time: Some(20),
+            properties: vec![kv("traceparent", "member")],
+            ..Default::default()
+        };
+        let out = message(env, Some(single)).effective_metadata();
+        assert_eq!(out.partition_key.as_deref(), Some("member-key"));
+        assert_eq!(out.ordering_key, None, "the member has no ordering key");
+        assert_eq!(out.event_time, Some(20));
+        assert_eq!(out.properties, vec![kv("traceparent", "member")]);
+        assert_eq!(out.producer_name, "producer");
+        assert_eq!(out.num_messages_in_batch, Some(2));
     }
 }

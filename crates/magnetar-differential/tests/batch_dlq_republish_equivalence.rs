@@ -226,9 +226,11 @@ fn emit_entries(out: &mut BytesMut, consumer_id: u64) {
         let payload = format!("member-{member}");
         let single = pb::SingleMessageMetadata {
             payload_size: i32::try_from(payload.len()).expect("payload fits i32"),
-            partition_key: Some(format!("member-key-{member}")),
-            ordering_key: Some(Bytes::from(format!("member-order-{member}"))),
-            event_time: Some(1_700_000_001_000 + member),
+            // Member 1 is keyless and has no event time: no key, no ordering key (Java clears the
+            // first member's copy the envelope carries), and only the event time is inherited.
+            partition_key: (member == 0).then(|| format!("member-key-{member}")),
+            ordering_key: (member == 0).then(|| Bytes::from(format!("member-order-{member}"))),
+            event_time: (member == 0).then_some(1_700_000_001_000 + member),
             properties: vec![kv("custom", &format!("member-{member}"))],
             ..Default::default()
         };
@@ -561,8 +563,8 @@ async fn run_moonpool() -> Outcome {
 fn send(
     sequence: u64,
     payload: &str,
-    key: &str,
-    order: &str,
+    key: Option<&str>,
+    order: Option<&str>,
     time: u64,
     custom: &str,
     id: &str,
@@ -570,8 +572,8 @@ fn send(
     RuntimeEvent::Send {
         sequence,
         payload: Bytes::from(payload.to_owned()),
-        key: Some(key.to_owned()),
-        ordering_key: Some(Bytes::from(order.to_owned())),
+        key: key.map(str::to_owned),
+        ordering_key: order.map(|order| Bytes::from(order.to_owned())),
         event_time: Some(time),
         custom: custom.to_owned(),
         real_topic: CHILD_TOPIC.to_owned(),
@@ -579,14 +581,15 @@ fn send(
     }
 }
 
-/// Each batch member keeps its OWN metadata; the unbatched message is unchanged.
+/// Each batch member keeps its OWN metadata (the keyless member has no key and inherits only
+/// the envelope's event time); the unbatched message is unchanged.
 fn expected_events() -> Vec<RuntimeEvent> {
     vec![
         send(
             0,
             "member-0",
-            "member-key-0",
-            "member-order-0",
+            Some("member-key-0"),
+            Some("member-order-0"),
             1_700_000_001_000,
             "member-0",
             "11:0:0:0",
@@ -594,17 +597,17 @@ fn expected_events() -> Vec<RuntimeEvent> {
         send(
             1,
             "member-1",
-            "member-key-1",
-            "member-order-1",
-            1_700_000_001_001,
+            None,
+            None,
+            1_700_000_000_500,
             "member-1",
             "11:0:0:1",
         ),
         send(
             2,
             "plain",
-            "plain-key",
-            "plain-order",
+            Some("plain-key"),
+            Some("plain-order"),
             1_700_000_002_000,
             "plain",
             "11:1:0:-1",
