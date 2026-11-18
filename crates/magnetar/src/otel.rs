@@ -207,7 +207,8 @@ fn extract_from_properties(properties: &[pb::KeyValue]) -> opentelemetry::Contex
 /// current context for the duration of message processing, prefer
 /// [`attach_context`].
 pub fn extract_context(msg: &magnetar_proto::event::IncomingMessage) -> opentelemetry::Context {
-    extract_from_properties(&msg.metadata.properties)
+    // A batch member's own properties, not the shared envelope's.
+    extract_from_properties(msg.effective_properties())
 }
 
 /// Extract a parent OpenTelemetry context from a façade
@@ -459,5 +460,39 @@ mod tests {
                 opentelemetry::trace::noop::NoopTextMapPropagator::new(),
             );
         }
+    }
+
+    /// A batch member's consumer span is parented on the MEMBER's own `traceparent`, not the
+    /// envelope's (the first member's), for both the proto and the façade message types.
+    #[test]
+    fn extract_context_reads_the_batch_members_own_properties() {
+        let _lock = PROPAGATOR_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = PropagatorGuard::install();
+
+        let traceparent = |span: &str| pb::KeyValue {
+            key: "traceparent".to_owned(),
+            value: format!("00-0af7651916cd43dd8448eb211c80319c-{span}-01"),
+        };
+        let mut member = dummy_incoming(vec![traceparent("1111111111111111")]);
+        member.single_metadata = Some(pb::SingleMessageMetadata {
+            properties: vec![traceparent("2222222222222222")],
+            ..Default::default()
+        });
+        let span_of = |cx: &opentelemetry::Context| cx.span().span_context().span_id();
+        let expected = SpanId::from_hex("2222222222222222").unwrap();
+        assert_eq!(span_of(&extract_context(&member)), expected);
+        #[cfg(feature = "tokio")]
+        assert_eq!(
+            span_of(&extract_context_facade(&crate::IncomingMessage::from(
+                member.clone()
+            ))),
+            expected
+        );
+
+        // A member that carries no trace context gets none, not the envelope's.
+        member.single_metadata = Some(pb::SingleMessageMetadata::default());
+        assert!(!extract_context(&member).span().span_context().is_valid());
     }
 }
