@@ -133,21 +133,25 @@ fn spawn_host_port_proxy(listener: tokio::net::TcpListener, target: String) -> H
 ///
 /// `CARGO_BIN_EXE_magnetarctl` is only injected for tests in the `magnetarctl`
 /// package, so this test — which lives with the façade's e2e suite — resolves it
-/// from its own executable's directory instead (`target/<profile>/deps/<test>`
-/// → `target/<profile>/magnetarctl`).
+/// as the nearest `magnetarctl` in an ancestor of its own executable.
+/// The test binary's depth below `target/<profile>/` depends on Cargo's build
+/// layout: `target/<profile>/deps/<test>` up to Rust 1.99, and
+/// `target/<profile>/build/<package>/<hash>/out/<test>` from Rust 1.100.
+/// The final binary stays at `target/<profile>/magnetarctl` in both.
 fn magnetarctl_binary() -> std::path::PathBuf {
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let exe = dir.join(format!("magnetarctl{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        exe.exists(),
-        "magnetarctl not built at {}; run `cargo build -p magnetarctl --features scalable-topics`",
-        exe.display()
-    );
-    exe
+    let test_exe = std::env::current_exe().expect("test executable path");
+    let name = format!("magnetarctl{}", std::env::consts::EXE_SUFFIX);
+    test_exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&name))
+        .find(|exe| exe.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "magnetarctl not found in any ancestor of {}; run `cargo build -p magnetarctl --features scalable-topics`",
+                test_exe.display()
+            )
+        })
 }
 
 /// Bring up one unauthenticated standalone broker.

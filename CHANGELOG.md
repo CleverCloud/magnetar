@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `apache-avro` 0.23 is the `schema-avro` feature's public `apache_avro::Value` type, so a consumer that enables that feature and names `apache-avro` itself must move to 0.23 as well.
   `bindgen` 0.73.2 accepts `syn` 2 or 3 and `prettyplease` 0.2 or 0.3 independently, so a plain `cargo update` can pair `syn` 3 with `prettyplease` 0.2 and fail to compile `aws-lc-fips-sys`; the lock pairs it with `prettyplease` 0.3 and `syn` 3, and `cargo update -p prettyplease@0.2.37` restores that pairing after a refresh.
 
+### Fixed
+
+- **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
+  Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.
+  It now takes the nearest `magnetarctl` among the ancestors of its own executable, which holds for both layouts.
+
 ### Removed
 
 - **`testcontainers` is no longer a dev-dependency; the e2e suites start their Docker containers through the `docker` CLI** ([ADR-0127](specs/adr/0127-run-e2e-containers-through-the-docker-cli.md)).
