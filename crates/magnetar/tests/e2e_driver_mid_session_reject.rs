@@ -39,9 +39,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OperationRetryConfig, OutgoingMessage, PulsarClient, SupervisorConfig};
-use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -52,8 +52,7 @@ use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Start a Pulsar 4.x standalone container; return (`broker_host`,
 /// `broker_port`, `container_handle`). Dropping the guard stops the broker.
-async fn start_pulsar()
--> Result<(String, u16, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, u16, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default).start().await?;
     Ok((broker.host, broker.binary_port, broker.container))

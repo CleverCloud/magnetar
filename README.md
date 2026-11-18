@@ -909,7 +909,7 @@ RUSTDOCFLAGS="-D warnings" \
 ```
 
 End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`); the exact `#[ignore]` quarantines are listed in [docs/test-quarantine.md](docs/test-quarantine.md) under ADR-0123. Per-PR CI parallelizes the regular surface into one non-e2e cell and four e2e cells per Pulsar version ([ADR-0098](specs/adr/0098-parallelize-per-pr-test-execution.md), [ADR-0116](specs/adr/0116-run-the-e2e-suite-on-a-pulsar-version-matrix.md)).
-Docker is the only prerequisite; the suite spins `apachepulsar/pulsar:4.2.5` via `testcontainers-rs`, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` (or `4.0.14`) runs the same suite on another broker.
+Docker is the only prerequisite; the suite spins `apachepulsar/pulsar:4.2.5` through the `docker` CLI, and `MAGNETAR_PULSAR_IMAGE_TAG=5.0.0` (or `4.0.14`) runs the same suite on another broker.
 
 Additional `xtask` checks specific to the sans-io invariants:
 

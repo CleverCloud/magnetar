@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ADR-0054 end-to-end logging capture against a real Apache Pulsar 4.x
-//! standalone broker spun up via `testcontainers-rs` (ADR-0024 e2e layer
+//! standalone broker started through the shared Docker fixture (ADR-0024 e2e layer
 //! for the logging changeset).
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046 — no `#[ignore]`,
@@ -48,11 +48,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::auth::TokenAuth;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{AuthProvider, OutgoingMessage, PulsarClient};
 use parking_lot::Mutex;
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -96,8 +96,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// minus the env-filter `init_tracing` — this binary installs its own
 /// global capturing subscriber before the container starts, which is why it
 /// calls the shared builder directly instead of `common::pulsar::start_pulsar`.
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let broker = Pulsar::new(Broker::Default).start().await?;
     Ok((broker.service_url, broker.container))
 }

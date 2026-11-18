@@ -19,10 +19,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::container::Container;
 use futures_util::future::join_all;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -42,20 +42,15 @@ struct PartitionReceive {
 
 /// Start a Pulsar standalone container and return (`service_url`, `admin_url`,
 /// `container_handle`).
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar() -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
 
 /// Start Pulsar with an 8,192-byte broker message limit so each
 /// 35,840-byte issue-#331 payload is split into exactly five 7,168-byte chunks.
-async fn start_small_message_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_small_message_pulsar()
+-> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default)
         .config("maxMessageSize", "8192")

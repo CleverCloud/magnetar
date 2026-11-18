@@ -42,7 +42,7 @@
 //! Per [ADR-0021] this test must not be `#[ignore]`d or silently skipped, so an
 //! occupied `[::1]:6650` fails loudly with a message naming the cause rather
 //! than passing vacuously. In CI nothing binds it — the Pulsar container's
-//! `6650` is published on a random host port by testcontainers.
+//! `6650` is published on a random host port by the fixture.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046 — no `#[ignore]`, no
 //! feature gate). Run with:
@@ -56,11 +56,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::ServiceUrlProvider;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::auto_cluster_failover::{AutoClusterFailover, TokioHealthProbe};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -81,8 +81,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// really considers the port-less IPv6 primary healthy.
 const HOLD_CYCLES: u32 = 10;
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tests for PIP-4 end-to-end encryption against a real Apache
-//! Pulsar 4.x standalone broker spun up via `testcontainers-rs`.
+//! Pulsar 4.x standalone broker started through the shared Docker fixture.
 //!
 //! Gated behind the `encryption` feature. Run with:
 //!

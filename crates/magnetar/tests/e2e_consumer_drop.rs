@@ -18,10 +18,10 @@
 
 use std::time::{Duration, Instant};
 
+use common::container::Container;
 use magnetar::PulsarClient;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -38,8 +38,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// The matrix broker (`Broker::Default`): `MAGNETAR_PULSAR_IMAGE_TAG` selects it, so
 /// this suite runs on every Pulsar axis CI exercises (ADR-0116).
-async fn start_pulsar() -> TestResult<(String, String, testcontainers::ContainerAsync<GenericImage>)>
-{
+async fn start_pulsar() -> TestResult<(String, String, Container)> {
     init_tracing();
     Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }

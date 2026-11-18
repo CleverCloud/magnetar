@@ -31,13 +31,13 @@
 
 #![cfg(feature = "auth-sasl-kerberos")]
 
+mod common;
+
 use std::time::Duration;
 
+use common::container::{Container, ContainerPort, GenericImage, WaitFor};
 use magnetar_auth_sasl::SaslKerberos;
 use magnetar_proto::AuthProvider;
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_KDC_IMAGE_REPO: &str = "gcavalcante8808/krb5-server";
 // Docker Hub's alpine_3.19.0 and latest currently resolve to the same digest;
@@ -77,8 +77,7 @@ fn service_principal() -> String {
 /// startup CRIT line about the unauthenticated inet HTTP server once
 /// the child processes are spawned; that's the latest reliable signal
 /// in the boot transcript, so we wait for it.
-async fn start_kdc()
--> Result<testcontainers::ContainerAsync<GenericImage>, Box<dyn std::error::Error>> {
+async fn start_kdc() -> Result<Container, Box<dyn std::error::Error>> {
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(KDC_PORT))
         .with_exposed_port(ContainerPort::Udp(KDC_PORT))
@@ -118,7 +117,7 @@ async fn e2e_sasl_kerberos_provider_runs_against_dockerised_kdc()
         .try_init();
 
     let container = start_kdc().await?;
-    let host = container.get_host().await?;
+    let host = container.host().to_owned();
     let kdc_port_tcp = container.get_host_port_ipv4(KDC_PORT).await?;
     tracing::info!(
         target: "magnetar::e2e::sasl_kerberos",

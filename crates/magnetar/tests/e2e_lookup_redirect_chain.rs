@@ -34,9 +34,9 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use common::container::Container;
 use magnetar::PulsarClient;
 use magnetar_proto::{FrameError, decode_one, encode_command, pb};
-use testcontainers::GenericImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -44,8 +44,7 @@ mod common;
 
 use common::pulsar::init_tracing;
 
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

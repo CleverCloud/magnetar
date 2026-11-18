@@ -27,10 +27,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_auth_oauth2::{ClientCredentialsFlow, Clock, Credentials, REFRESH_LEEWAY};
-use testcontainers::GenericImage;
 use url::Url;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -43,8 +43,7 @@ mod common;
 /// stored on the session without further validation. That is *exactly* what we
 /// want here: every other axis except the auth-provider behaviour is held
 /// fixed.
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = common::pulsar::start_pulsar().await?;
     Ok((service_url, container))
 }

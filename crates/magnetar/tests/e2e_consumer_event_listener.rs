@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end test for `ConsumerEventListener` push delivery (issue #348,
-//! ADR-0081) against a real Apache Pulsar 4.x standalone broker via
-//! `testcontainers-rs`.
+//! ADR-0081) against a real Apache Pulsar 4.x standalone broker started
+//! through the shared Docker fixture.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker +
 //! `apachepulsar/pulsar` reachable.

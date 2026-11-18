@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
+use common::container::Container;
 use futures_util::future::join_all;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
 use magnetar_proto::{FrameError, decode_one, pb};
 use magnetar_runtime_tokio::ClientError;
-use testcontainers::GenericImage;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -341,8 +341,7 @@ where
 /// Start the matrix broker (`Broker::Default`, so this suite runs on every Pulsar axis CI
 /// exercises, ADR-0116) with batch-index acknowledgement on, and return (`host:port`,
 /// `container_handle`).
-async fn start_pulsar()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, Container), Box<dyn std::error::Error>> {
     let broker = Pulsar::new(Broker::Default)
         .config("acknowledgmentAtBatchIndexLevelEnabled", "true")
         .start()

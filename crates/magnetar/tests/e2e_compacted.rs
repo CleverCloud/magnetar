@@ -2,7 +2,7 @@
 
 //! End-to-end tests for Pulsar 4.x compacted-topic semantics (PIP-94) and
 //! the [`magnetar::TableView`] round-trip. Each test spins up a Pulsar
-//! standalone broker via `testcontainers-rs`, runs producer/consumer
+//! standalone broker through the shared Docker fixture, runs producer/consumer
 //! traffic, and exercises one branch of the compaction story.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Run with:

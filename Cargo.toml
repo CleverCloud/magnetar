@@ -164,7 +164,6 @@ anyhow             = "^1.0.104"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 
 # Test infrastructure
-testcontainers = "^0.28.0"
 proptest = "^1.12.0"
 # Dev-only. `magnetar-differential` needs `SO_LINGER = 0` to make a fixture
 # reset a connection rather than close it cleanly, so the drivers' read-error

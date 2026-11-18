@@ -7,7 +7,7 @@
 //! reflect every swap, in order, so the next reconnect attempt dials the
 //! freshly-active broker.
 //!
-//! Why this is moonpool territory: `testcontainers` can spin up two
+//! Why this is moonpool territory: a Docker e2e test can spin up two
 //! brokers and kill the primary, but it cannot deterministically schedule
 //! the "primary recovers → swap back" leg of the cycle. A health probe
 //! driven by virtual instants does. The moonpool engine's

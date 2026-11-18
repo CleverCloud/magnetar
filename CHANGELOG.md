@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `apache-avro` 0.23 is the `schema-avro` feature's public `apache_avro::Value` type, so a consumer that enables that feature and names `apache-avro` itself must move to 0.23 as well.
   `bindgen` 0.73.2 accepts `syn` 2 or 3 and `prettyplease` 0.2 or 0.3 independently, so a plain `cargo update` can pair `syn` 3 with `prettyplease` 0.2 and fail to compile `aws-lc-fips-sys`; the lock pairs it with `prettyplease` 0.3 and `syn` 3, and `cargo update -p prettyplease@0.2.37` restores that pairing after a refresh.
 
+### Removed
+
+- **`testcontainers` is no longer a dev-dependency; the e2e suites start their Docker containers through the `docker` CLI** ([ADR-0127](specs/adr/0127-run-e2e-containers-through-the-docker-cli.md)).
+  `testcontainers` 0.28.0, the latest release, depends unconditionally on `astral-tokio-tar`, which RustSec marks unmaintained ([RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440)), so `cargo deny check` failed with no version to move to.
+  `crates/magnetar/tests/common/container.rs` keeps the builder the suites used (`GenericImage::new(…)…start()`), runs `docker run`, `docker port`, `docker logs`, `docker exec` and `docker stop`, and force-removes the container on drop; sixty dev-only entries leave `Cargo.lock`.
+  The `docker` client must be on `PATH` wherever the e2e suite runs, as it already was for the suites that call `docker restart`.
+
 ### Security
 
 - **`libz-sys` 1.1.31 → 1.1.33** — [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544), a heap buffer overflow in the bundled zlib's `gz_vacate()`, reached through `flate2` (the Pulsar `ZLIB` codec).

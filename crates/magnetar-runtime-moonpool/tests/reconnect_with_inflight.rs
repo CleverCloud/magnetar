@@ -18,7 +18,7 @@
 //! 4. The session epoch is bumped by exactly one, so callers that snapshot the epoch before issuing
 //!    an op can still detect the reset on completion.
 //!
-//! Why this is moonpool territory: `testcontainers` cannot enumerate the
+//! Why this is moonpool territory: a Docker e2e test cannot enumerate the
 //! reset → rebuild sequence with N in-flight ops. The proto layer
 //! exposes the hooks directly; this test pins the invariant that the
 //! N pending publishes survive the reset transparently, with no

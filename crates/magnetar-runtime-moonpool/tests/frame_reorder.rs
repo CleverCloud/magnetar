@@ -11,7 +11,7 @@
 //! pending-publish slab is sequence-id-indexed, so each receipt resolves
 //! its own slot regardless of arrival order. Pins the contract.
 //!
-//! Why this is moonpool territory and not a `testcontainers` test: a real
+//! Why this is moonpool territory and not a Docker e2e test: a real
 //! Pulsar broker preserves per-producer publish order — it will never emit
 //! receipts out of order on a single TCP stream. But a future broker
 //! optimisation (PIP-188 broker migration, partial fail-over, intentional

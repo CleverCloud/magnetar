@@ -35,9 +35,9 @@
 
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -51,10 +51,10 @@ use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, init_tracing};
 /// store and follow the broker's lookup answers over the bridge network.
 async fn start_standalone() -> Result<
     (
-        String,                                       /* service_url (host:port for binary
-                                                       * protocol) */
-        u16,                                          // mapped zk port
-        testcontainers::ContainerAsync<GenericImage>, // standalone handle
+        String,    /* service_url (host:port for binary
+                    * protocol) */
+        u16,       // mapped zk port
+        Container, // standalone handle
     ),
     Box<dyn std::error::Error>,
 > {
@@ -78,7 +78,7 @@ async fn start_proxy(
 ) -> Result<
     (
         String, // proxy service_url
-        testcontainers::ContainerAsync<GenericImage>,
+        Container,
     ),
     Box<dyn std::error::Error>,
 > {
