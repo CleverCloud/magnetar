@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies:** bumped workspace manifest floors — `prost`/`prost-build`/`prost-types` 0.14.4→0.14.6, `bytes` 1.12.1→1.12.2, `crc32c` 0.6.8→0.6.9, `rustls-pki-types` 1.15.1→1.16.0, `lz4_flex` 0.14.0→0.14.2, `zstd` 0.14.3→0.14.4, `flate2` 1.1.10→1.1.11, `apache-avro` 0.22.0→0.23.0, `uuid` 1.29.0→1.29.3, `zeroize` 1.9.1→1.9.2, and `clap` 4.6.7→4.6.8 — and refreshed `Cargo.lock` and the `magnetar-proto` fuzz lockfile.
+  `apache-avro` 0.23 is the `schema-avro` feature's public `apache_avro::Value` type, so a consumer that enables that feature and names `apache-avro` itself must move to 0.23 as well.
+  `bindgen` 0.73.2 accepts `syn` 2 or 3 and `prettyplease` 0.2 or 0.3 independently, so a plain `cargo update` can pair `syn` 3 with `prettyplease` 0.2 and fail to compile `aws-lc-fips-sys`; the lock pairs it with `prettyplease` 0.3 and `syn` 3, and `cargo update -p prettyplease@0.2.37` restores that pairing after a refresh.
+
+### Fixed
+
+- **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
+  Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.
+  It now takes the nearest `magnetarctl` among the ancestors of its own executable, which holds for both layouts.
+
+### Removed
+
+- **`testcontainers` is no longer a dev-dependency; the e2e suites start their Docker containers through the `docker` CLI** ([ADR-0127](specs/adr/0127-run-e2e-containers-through-the-docker-cli.md)).
+  `testcontainers` 0.28.0, the latest release, depends unconditionally on `astral-tokio-tar`, which RustSec marks unmaintained ([RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440)), so `cargo deny check` failed with no version to move to.
+  `crates/magnetar/tests/common/container.rs` keeps the builder the suites used (`GenericImage::new(…)…start()`), runs `docker run`, `docker port`, `docker logs`, `docker exec` and `docker stop`, and force-removes the container on drop; sixty dev-only entries leave `Cargo.lock`.
+  The `docker` client must be on `PATH` wherever the e2e suite runs, as it already was for the suites that call `docker restart`.
+
+### Security
+
+- **`libz-sys` 1.1.31 → 1.1.33** — [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544), a heap buffer overflow in the bundled zlib's `gz_vacate()`, reached through `flate2` (the Pulsar `ZLIB` codec).
+
 ## [1.8.0] - 2026-11-02
 
 ### Added

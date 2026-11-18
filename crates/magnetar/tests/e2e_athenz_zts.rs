@@ -13,7 +13,7 @@
 //! # Fixture shape — wiremock stub + Docker reachability probe
 //!
 //! The Athenz ZTS server is operationally non-trivial to spin up in
-//! testcontainers: the upstream `athenz/athenz-zts-server` image
+//! one container: the upstream `athenz/athenz-zts-server` image
 //! requires (a) a reachable ZMS (manager) instance for tenant-key
 //! lookup, (b) a TLS server certificate chained to a CA the tenant
 //! trusts, (c) per-tenant public-key pre-seeding through the ZMS admin
@@ -22,7 +22,7 @@
 //! orchestrates the bring-up via a `Makefile` (`make deploy-dev`) that
 //! provisions four containers (ZMS DB, ZMS, ZTS DB, ZTS) plus a
 //! certificate-bootstrap pre-flight — a ~15-minute build that does not
-//! fit cleanly behind a single `testcontainers-rs` spawn.
+//! fit cleanly behind a single container start.
 //!
 //! Per the goal's "honest scope check" we therefore split this file:
 //!
@@ -34,7 +34,7 @@
 //!   deterministic responses.
 //! - **Docker reachability probe** (`e2e_athenz_zts_image_pulls_and_serves_status`) spins the real
 //!   `athenz/athenz-zts-server:1.12.47` image to prove the upstream image is pullable and the
-//!   wiring (testcontainers, port mapping) is correct. It does **not** complete a token exchange
+//!   wiring (container start, port mapping) is correct. It does **not** complete a token exchange
 //!   because the standalone container has no ZMS to talk to and surfaces a startup error on the
 //!   `/zts/v1/status` probe — the test treats either successful status (host has a co-deployed ZMS)
 //!   or expected failure (no ZMS) as proof of reachability, matching the pattern in
@@ -59,14 +59,14 @@
 #![cfg(feature = "auth-athenz-zts")]
 #![cfg(any(feature = "crypto-aws-lc-rs", feature = "crypto-ring"))]
 
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::container::{ContainerPort, GenericImage, WaitFor};
 use magnetar::proto::pb;
 use magnetar_auth_athenz::{AthenzConfig, AthenzProvider};
 use magnetar_proto::{AuthChallengeState, AuthProvider};
-use testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -419,7 +419,7 @@ async fn e2e_athenz_zts_cached_token_used_on_auth_challenge()
 /// Real-image reachability probe — proves the upstream
 /// `athenz/athenz-zts-server` image is pullable, boots into a state
 /// where the listener binds the advertised port, and the
-/// `testcontainers-rs` wiring (port mapping, host resolution, image
+/// container wiring (port mapping, host resolution, image
 /// override env vars) is correct.
 ///
 /// Per the module doc: the upstream Athenz Docker bring-up needs a
@@ -428,8 +428,8 @@ async fn e2e_athenz_zts_cached_token_used_on_auth_challenge()
 /// will either:
 ///
 /// 1. Fail to complete its own startup (the most common case — it exits because it cannot reach the
-///    configured ZMS host); we detect this via the testcontainers startup-timeout firing and treat
-///    it as expected, mirroring the SASL Kerberos pattern for unprovisioned hosts.
+///    configured ZMS host); we detect this via the container's startup timeout firing and treat it
+///    as expected, mirroring the SASL Kerberos pattern for unprovisioned hosts.
 /// 2. Boot far enough to bind the TLS port (rare; only if the build host already has a bootstrapped
 ///    Athenz deployment exporting a ZMS endpoint reachable from the container's network). We probe
 ///    `/zts/v1/status` over HTTP and accept any non-network response (the broker will reject the
@@ -469,7 +469,7 @@ async fn e2e_athenz_zts_image_pulls_and_serves_status() -> Result<(), Box<dyn st
         }
     };
 
-    let host = container.get_host().await?;
+    let host = container.host().to_owned();
     let port = container.get_host_port_ipv4(ZTS_TLS_PORT).await?;
     tracing::info!(
         target: "magnetar::e2e::athenz_zts",

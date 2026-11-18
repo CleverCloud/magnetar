@@ -2,7 +2,7 @@
 
 //! End-to-end test for **wrapper** consumer push delivery
 //! (`WrapperMessageListener`, ADR-0064 wrapper extension) against a real Apache
-//! Pulsar 4.x standalone broker via `testcontainers-rs`.
+//! Pulsar 4.x standalone broker through the shared Docker fixture.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker +
 //! `apachepulsar/pulsar` reachable.

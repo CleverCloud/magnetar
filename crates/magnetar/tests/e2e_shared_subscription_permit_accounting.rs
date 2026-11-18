@@ -161,11 +161,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::Consumer;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, TopicStats};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -263,10 +263,7 @@ const DISCARD_MARKER: &str = "Ignoring flow control from disconnected consumer";
 /// opaque `StartupTimeout`, because its structured `Created namespace
 /// {clientAppId=null, namespace=public/default}` line differs from 4.x's. The
 /// dispatcher's debug logger is patched in before the broker boots.
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar() -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default)
         .pre_start(DISPATCHER_DEBUG_LOGGER_PATCH)

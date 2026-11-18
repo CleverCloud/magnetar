@@ -37,9 +37,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::container::Container;
 use magnetar::proto::TokenAuth;
 use magnetar::{AuthProvider, PulsarClient};
-use testcontainers::GenericImage;
 
 mod common;
 
@@ -53,8 +53,7 @@ const TOKEN_SECRET: &[u8; 32] = b"magnetar-handshake-err-e2e-bytes";
 /// Spin up a Pulsar standalone container with token-auth enabled.
 /// The broker rejects any CONNECT carrying a malformed / unsigned token,
 /// which is exactly the condition we want to exercise the enrichment for.
-async fn start_pulsar_with_token_auth()
--> Result<(String, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar_with_token_auth() -> Result<(String, Container), Box<dyn std::error::Error>> {
     init_tracing();
 
     let secret_b64 = URL_SAFE_NO_PAD.encode(TOKEN_SECRET);

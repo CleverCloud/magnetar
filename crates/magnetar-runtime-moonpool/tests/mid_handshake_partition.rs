@@ -6,7 +6,7 @@
 //! recoverable error so the runtime supervisor can retry against a fresh
 //! transport.
 //!
-//! Why this is moonpool territory and not a `testcontainers` test: a
+//! Why this is moonpool territory and not a Docker e2e test: a
 //! containerised broker cannot half-drop the handshake mid-way without
 //! injecting an OS-level network blocker (`iptables`, `tc netem`). The
 //! sans-io state machine + a synthetic transport substitute it deterministically.

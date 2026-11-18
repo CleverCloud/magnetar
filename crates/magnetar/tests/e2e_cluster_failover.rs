@@ -46,10 +46,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::ControlledClusterFailover;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
-use testcontainers::GenericImage;
 use uuid::Uuid;
 
 mod common;
@@ -86,10 +86,7 @@ fn init_tracing() {
 /// diagnostic tracing: producer.send succeeds against broker-b, then
 /// consumer.receive blocks on a supervisor reconnect that finds broker-b
 /// unreachable).
-async fn start_pulsar() -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar() -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     Ok(Pulsar::new(Broker::Default).start().await?.into_parts())
 }
@@ -195,7 +192,7 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     assert_eq!(failover.current_url(), service_url_b);
 
     tracing::info!("stopping broker-a to force reconnect");
-    container_a.stop_with_timeout(Some(5)).await?;
+    container_a.stop(Duration::from_secs(5)).await?;
 
     // Drain producer.send() until the supervisor has reconnected to
     // broker-B. The first attempts will likely fail with a session-lost

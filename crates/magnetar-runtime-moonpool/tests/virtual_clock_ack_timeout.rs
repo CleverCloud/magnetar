@@ -10,7 +10,7 @@
 //! the configured virtual deadline — not the host wall-clock.
 //!
 //! Why this is moonpool territory: same as the send-timeout sibling
-//! ([`virtual_clock_send_timeout`](crate::common)) — `testcontainers`
+//! ([`virtual_clock_send_timeout`](crate::common)) — a Docker e2e test
 //! cannot drive a fast deterministic deadline; only synthetic [`Instant`]s
 //! can pin the boundary condition.
 //!

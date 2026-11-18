@@ -2,7 +2,7 @@
 
 //! End-to-end coverage for issue #414: a `Shared` subscription must keep
 //! draining after a consumer leaves mid-drain, against a real Apache Pulsar 4.x
-//! standalone broker spun up via `testcontainers-rs`.
+//! standalone broker started through the shared Docker fixture.
 //!
 //! ## The production failure
 //!

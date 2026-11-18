@@ -27,7 +27,7 @@
 //! `pulsar-admin namespaces grant-permission` against `public/default` is
 //! sufficient to gate the assertion. The "self-hosting (no external broker
 //! dependency)" constraint from the goal is preserved — the fixture spins
-//! up the broker via `testcontainers-rs` and seeds the role grant +
+//! up the broker through the shared Docker fixture and seeds the role grant +
 //! shadow-topic create via `pulsar-admin` exec'd inside the container. See
 //! the commit body for the full scope reasoning.
 //!
@@ -81,11 +81,10 @@ use std::time::Duration;
 use aws_lc_rs::hmac;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::container::Container;
 use magnetar::proto::TokenAuth;
 use magnetar::{AuthProvider, PulsarClient};
 use magnetar_proto::MessageId;
-use testcontainers::GenericImage;
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 
 mod common;
 
@@ -135,7 +134,7 @@ const TOKEN_AUTH_PLUGIN: &str = "org.apache.pulsar.client.impl.auth.Authenticati
 /// Run `bin/pulsar-admin` inside the container, authenticated with
 /// `admin_token`, and require it to exit zero.
 async fn pulsar_admin(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     admin_token: &str,
     args: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -147,12 +146,10 @@ async fn pulsar_admin(
         format!("token:{admin_token}"),
     ];
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
-    let mut result = container
-        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
-        .await?;
-    let stdout = String::from_utf8_lossy(&result.stdout_to_vec().await?).into_owned();
-    let stderr = String::from_utf8_lossy(&result.stderr_to_vec().await?).into_owned();
-    match result.exit_code().await? {
+    let result = container.exec(command).await?;
+    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    match result.exit_code {
         Some(0) => Ok(()),
         code => Err(format!(
             "pulsar-admin {} exited {code:?}:\n{stdout}{stderr}",
@@ -172,7 +169,7 @@ async fn pulsar_admin(
 ///   namespace grants);
 /// - `replicator_token` — HS256 JWT with `sub: "replicator"`;
 /// - `non_replicator_token` — HS256 JWT with `sub: "magnetar-test-user"`;
-/// - `container` — the kept-alive `ContainerAsync<GenericImage>` (drop to tear down).
+/// - `container` — the kept-alive `Container` (drop to tear down).
 ///
 /// The broker's `standalone.conf` is overlaid by the shared fixture, which
 /// exports each `.config(…)` pair as `PULSAR_PREFIX_<key>` and runs
@@ -181,17 +178,8 @@ async fn pulsar_admin(
 /// plain `bin/pulsar standalone` would ignore the variables.
 /// We seed the HS256 secret via `tokenSecretKey=data:base64,...` so no
 /// bind-mount is needed.
-async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
-    (
-        String,
-        String,
-        String,
-        String,
-        String,
-        testcontainers::ContainerAsync<GenericImage>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+async fn start_pulsar_with_token_auth_and_replicator_role()
+-> Result<(String, String, String, String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
 
     // The broker reads `tokenSecretKey=data:base64,<b64>` and treats the

@@ -13,7 +13,7 @@
 //! corrupting at-least-once-without-duplication.
 //!
 //! Moonpool territory: the same virtual-clock rationale as
-//! [`virtual_clock_ack_timeout`](crate::common) — `testcontainers` cannot drive a
+//! [`virtual_clock_ack_timeout`](crate::common) — a Docker e2e test cannot drive a
 //! fast deterministic nack-delay + ack-timeout boundary; only synthetic
 //! [`Instant`]s can pin it.
 //!

@@ -2,7 +2,7 @@
 
 //! End-to-end coverage for the non-Exclusive subscription types — `Shared`,
 //! `Failover`, and `Key_Shared` — against a real Apache Pulsar 4.x standalone
-//! broker spun up via `testcontainers-rs`.
+//! broker started through the shared Docker fixture.
 //!
 //! Mirrors the Java client's `SharedSubscriptionTest`, `FailoverSubscriptionTest`,
 //! and `KeySharedSubscriptionTest`, but pared down to broker-observable

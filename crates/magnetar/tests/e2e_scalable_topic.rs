@@ -56,6 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::container::Container;
 use futures_util::future::select_all;
 use magnetar::PulsarClient;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
@@ -64,8 +65,6 @@ use magnetar::scalable::{
     OrderingMode, PositionVector, ReceiverBudget, SegmentSource, StreamConsumer,
     StreamConsumerError, StreamConsumerEvent, StreamMessage, TransactionOutcome,
 };
-use testcontainers::GenericImage;
-use testcontainers::core::{CmdWaitFor, ExecCommand};
 
 mod common;
 
@@ -80,7 +79,7 @@ const NO_DELIVERY_WINDOW: Duration = Duration::from_secs(3);
 const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-type PulsarContainer = testcontainers::ContainerAsync<GenericImage>;
+type PulsarContainer = Container;
 type ByteStreamConsumer<E = magnetar::TokioEngine> = StreamConsumer<BytesSchema, E>;
 type ByteStreamMessage = StreamMessage<BytesSchema>;
 type ReceiveFuture<'a> = Pin<
@@ -134,21 +133,25 @@ fn spawn_host_port_proxy(listener: tokio::net::TcpListener, target: String) -> H
 ///
 /// `CARGO_BIN_EXE_magnetarctl` is only injected for tests in the `magnetarctl`
 /// package, so this test — which lives with the façade's e2e suite — resolves it
-/// from its own executable's directory instead (`target/<profile>/deps/<test>`
-/// → `target/<profile>/magnetarctl`).
+/// as the nearest `magnetarctl` in an ancestor of its own executable.
+/// The test binary's depth below `target/<profile>/` depends on Cargo's build
+/// layout: `target/<profile>/deps/<test>` up to Rust 1.99, and
+/// `target/<profile>/build/<package>/<hash>/out/<test>` from Rust 1.100.
+/// The final binary stays at `target/<profile>/magnetarctl` in both.
 fn magnetarctl_binary() -> std::path::PathBuf {
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let exe = dir.join(format!("magnetarctl{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        exe.exists(),
-        "magnetarctl not built at {}; run `cargo build -p magnetarctl --features scalable-topics`",
-        exe.display()
-    );
-    exe
+    let test_exe = std::env::current_exe().expect("test executable path");
+    let name = format!("magnetarctl{}", std::env::consts::EXE_SUFFIX);
+    test_exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&name))
+        .find(|exe| exe.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "magnetarctl not found in any ancestor of {}; run `cargo build -p magnetarctl --features scalable-topics`",
+                test_exe.display()
+            )
+        })
 }
 
 /// Bring up one unauthenticated standalone broker.
@@ -164,10 +167,7 @@ fn magnetarctl_binary() -> std::path::PathBuf {
 /// effect.
 async fn start_broker(
     broker: Broker,
-) -> Result<
-    (String, String, testcontainers::ContainerAsync<GenericImage>),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(String, String, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let mut pulsar = Pulsar::new(broker)
         .flag("--no-functions-worker")
@@ -239,22 +239,18 @@ async fn start_hardened_broker() -> TestResult<(String, PulsarContainer, HostPor
 /// its first iteration — which is how a correct exit-code check took all four
 /// e2e tests red at once.
 async fn pulsar_admin_raw(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     args: &[&str],
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let mut command = vec!["bin/pulsar-admin".to_owned()];
     command.extend(args.iter().map(|a| (*a).to_owned()));
-    // `CmdWaitFor::exit()` so the exec is only read back once the process has
-    // terminated. Without it `exit_code()` is free to answer `None`, which
-    // testcontainers documents as "the command has not yet exited" — not as
-    // success.
-    let mut out = container
-        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
-        .await?;
-    let stdout = String::from_utf8_lossy(&out.stdout_to_vec().await?).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr_to_vec().await?).into_owned();
+    // `exec` returns once the process has terminated, so `exit_code` is the
+    // command's own; `None` means a signal ended it — not success.
+    let out = container.exec(command).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let combined = format!("{stdout}{stderr}");
-    Ok((out.exit_code().await?, combined))
+    Ok((out.exit_code, combined))
 }
 
 /// Run `pulsar-admin` inside the container, asserting it exited zero.
@@ -270,7 +266,7 @@ async fn pulsar_admin_raw(
 /// contract this repository can verify, and asserting on one is a guess about
 /// another project's stdout. Callers assert the observable *effect* instead.
 async fn pulsar_admin(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     args: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let (code, combined) = pulsar_admin_raw(container, args).await?;
@@ -315,7 +311,7 @@ fn describe_layout(epoch: u64, segments: &[magnetar::scalable::SegmentDescriptor
 
 /// Create a scalable topic with `segments` initial segments.
 async fn create_scalable_topic(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     topic: &str,
     segments: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -334,7 +330,7 @@ async fn create_scalable_topic(
 /// Publish distinct opaque payloads through Pulsar's bundled V5 client. This is the
 /// real scalable producer path, not one producer opened directly per segment.
 async fn publish_scalable_messages(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     service_url: &str,
     topic: &str,
     payloads: &[String],
@@ -366,12 +362,10 @@ async fn publish_scalable_messages_with_key(
     if let Some(key) = key {
         command.extend(["--key".to_owned(), key.to_owned()]);
     }
-    let mut output = container
-        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
-        .await?;
-    let stdout = String::from_utf8_lossy(&output.stdout_to_vec().await?).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr_to_vec().await?).into_owned();
-    match output.exit_code().await? {
+    let output = container.exec(command).await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    match output.exit_code {
         Some(0) => Ok(()),
         Some(code) => Err(format!(
             "bundled V5 pulsar-client failed to publish to {topic} with exit {code}:\n{stdout}{stderr}"
@@ -643,7 +637,7 @@ async fn wait_for_transaction_outcome<E: magnetar::Engine>(
 }
 
 async fn scalable_consumer_count(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     topic: &str,
     subscription: &str,
 ) -> TestResult<usize> {
@@ -675,7 +669,7 @@ async fn scalable_consumer_count(
 }
 
 async fn wait_for_consumer_count(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+    container: &Container,
     topic: &str,
     subscription: &str,
     expected: usize,
@@ -697,10 +691,7 @@ async fn wait_for_consumer_count(
     }
 }
 
-async fn force_delete_scalable_topics(
-    container: &testcontainers::ContainerAsync<GenericImage>,
-    topics: &[String],
-) -> TestResult {
+async fn force_delete_scalable_topics(container: &Container, topics: &[String]) -> TestResult {
     let mut failures = Vec::new();
     for topic in topics {
         if let Err(error) =

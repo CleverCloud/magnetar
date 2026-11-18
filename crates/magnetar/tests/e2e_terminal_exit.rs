@@ -14,7 +14,7 @@
 //!
 //! ## How a mid-flight outage is forced against a real broker
 //!
-//! testcontainers only hands back the broker's mapped port once it is up, and
+//! The fixture only hands back the broker's mapped port once it is up, and
 //! a `docker stop` mid-test would be slow and racy. Instead we point the
 //! client at a local loopback **kill-gate** that splices client↔broker bytes,
 //! then drop every spliced connection on demand: after a healthy
@@ -34,9 +34,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use common::container::Container;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use testcontainers::GenericImage;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -47,8 +47,7 @@ use common::pulsar::{Broker, Pulsar, init_tracing};
 
 /// Start a Pulsar 4.x standalone container; return (`broker_host`,
 /// `broker_port`, `container_handle`). Dropping the guard stops the broker.
-async fn start_pulsar()
--> Result<(String, u16, testcontainers::ContainerAsync<GenericImage>), Box<dyn std::error::Error>> {
+async fn start_pulsar() -> Result<(String, u16, Container), Box<dyn std::error::Error>> {
     init_tracing();
     let broker = Pulsar::new(Broker::Default).start().await?;
     Ok((broker.host, broker.binary_port, broker.container))

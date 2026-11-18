@@ -1501,7 +1501,7 @@ fn check_log_fields() -> Result<()> {
 }
 
 /// Workspace-relative directory the e2e-fixture gate scans. Only the
-/// façade's e2e suite starts `testcontainers` images.
+/// façade's e2e suite starts images through `tests/common/container.rs`.
 const E2E_TESTS_DIR: &str = "crates/magnetar/tests";
 
 /// Workspace-relative directory of the shared fixture (ADR-0115). The only
@@ -1533,7 +1533,7 @@ const MIN_SUPPORTED_CONSTANT: &str = "MIN_SUPPORTED_TAG";
 /// matrix hook CI sets from the axis.
 const PULSAR_TAG_ENV: &str = "MAGNETAR_PULSAR_IMAGE_TAG";
 
-/// The `testcontainers` constructor every e2e container is built from.
+/// The `tests/common/container.rs` constructor every e2e container is built from.
 const CONTAINER_CTOR: &str = "GenericImage::new";
 
 /// A chain is a Pulsar container iff its resolved image repository starts
