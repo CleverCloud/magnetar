@@ -630,3 +630,194 @@ async fn batch_member_republish_outcomes_are_equivalent() {
     );
     assert_eq!(tokio, moonpool, "runtime republish outcomes diverged");
 }
+
+/// What the consumer-side surfaces report for one received message.
+#[derive(Debug, PartialEq, Eq)]
+struct MemberView {
+    payload: String,
+    effective_key: Option<String>,
+    effective_properties: Vec<(String, String)>,
+    facade_key: Option<String>,
+    facade_ordering_key: Option<Bytes>,
+    facade_event_time_ms: u64,
+    facade_custom: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FacadeOutcome {
+    members: Vec<MemberView>,
+    table: std::collections::BTreeMap<String, Bytes>,
+}
+
+fn view(msg: &magnetar_proto::event::IncomingMessage) -> MemberView {
+    // `extract_context*` must accept a batch member (no propagator is installed here, so the
+    // context is empty and there is nothing to compare; the parent-span assertion lives in the
+    // façade's `otel` unit tests).
+    #[cfg(feature = "opentelemetry")]
+    {
+        let facade = magnetar::IncomingMessage::from(msg.clone());
+        drop(magnetar::otel::extract_context(msg));
+        drop(magnetar::otel::extract_context_facade(&facade));
+    }
+    let facade = magnetar::IncomingMessage::from(msg.clone());
+    MemberView {
+        payload: String::from_utf8(msg.payload.to_vec()).expect("utf8 payload"),
+        effective_key: msg.effective_partition_key().map(str::to_owned),
+        effective_properties: msg
+            .effective_properties()
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.value.clone()))
+            .collect(),
+        facade_key: facade.key().map(str::to_owned),
+        facade_ordering_key: facade.ordering_key().cloned(),
+        facade_event_time_ms: facade.event_time_ms(),
+        facade_custom: facade.property("custom").map(str::to_owned),
+    }
+}
+
+async fn wait_for_table_key<C: magnetar::ConsumerApi + Clone>(
+    table_view: &magnetar::TableView<C>,
+    key: &str,
+) {
+    tokio::time::timeout(HANG_GUARD, async {
+        while !table_view.contains_key(key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("table view did not observe the sentinel key");
+}
+
+async fn run_tokio_facade() -> FacadeOutcome {
+    let (address, _control, broker) = spawn_broker().await;
+    let client = magnetar::PulsarClient::builder()
+        .service_url(format!("pulsar://{address}"))
+        .build()
+        .await
+        .expect("tokio facade connect");
+    let consumer = client
+        .consumer(CHILD_TOPIC)
+        .subscription("orders-subscription")
+        .subscribe()
+        .await
+        .expect("tokio subscribe");
+    let mut members = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
+            .await
+            .expect("receive did not time out")
+            .expect("receive");
+        members.push(view(&msg));
+    }
+    // The plain message is the last entry, so once it is in the table both members were handled.
+    let table_view = client
+        .table_view(CHILD_TOPIC)
+        .subscription_name("table-view")
+        .create()
+        .await
+        .expect("tokio table view");
+    wait_for_table_key(&table_view, "plain-key").await;
+    let table = table_view.snapshot().into_iter().collect();
+    table_view.close().await;
+    client.close().await;
+    broker.abort();
+    FacadeOutcome { members, table }
+}
+
+async fn run_moonpool_facade() -> FacadeOutcome {
+    let (address, _control, broker) = spawn_broker().await;
+    let engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let runtime_client = magnetar_runtime_moonpool::Client::connect_plain(
+        &engine,
+        &address,
+        ConnectionConfig::default(),
+    )
+    .await
+    .expect("moonpool connect");
+    let client = magnetar::PulsarClient::from_runtime_client(runtime_client);
+    let consumer = client
+        .consumer(CHILD_TOPIC)
+        .subscription("orders-subscription")
+        .subscribe()
+        .await
+        .expect("moonpool subscribe");
+    let mut members = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
+            .await
+            .expect("receive did not time out")
+            .expect("receive");
+        members.push(view(&msg));
+    }
+    let table_view = client
+        .table_view(CHILD_TOPIC)
+        .subscription_name("table-view")
+        .create()
+        .await
+        .expect("moonpool table view");
+    wait_for_table_key(&table_view, "plain-key").await;
+    let table = table_view.snapshot().into_iter().collect();
+    table_view.close().await;
+    client.close().await;
+    broker.abort();
+    FacadeOutcome { members, table }
+}
+
+fn member(
+    payload: &str,
+    key: Option<&str>,
+    ordering_key: Option<&str>,
+    event_time_ms: u64,
+    custom: &str,
+) -> MemberView {
+    MemberView {
+        payload: payload.to_owned(),
+        effective_key: key.map(str::to_owned),
+        effective_properties: vec![("custom".to_owned(), custom.to_owned())],
+        facade_key: key.map(str::to_owned),
+        facade_ordering_key: ordering_key.map(|order| Bytes::from(order.to_owned())),
+        facade_event_time_ms: event_time_ms,
+        facade_custom: Some(custom.to_owned()),
+    }
+}
+
+/// A batch member surfaces its OWN key, ordering key and properties through the effective
+/// accessors, the façade and the table view; the keyless member has no key (the envelope's is the
+/// first member's) and is skipped by the table view; an unbatched message is unchanged.
+fn expected_facade_outcome() -> FacadeOutcome {
+    FacadeOutcome {
+        members: vec![
+            member(
+                "member-0",
+                Some("member-key-0"),
+                Some("member-order-0"),
+                1_700_000_001_000,
+                "member-0",
+            ),
+            member("member-1", None, None, 1_700_000_000_500, "member-1"),
+            member(
+                "plain",
+                Some("plain-key"),
+                Some("plain-order"),
+                1_700_000_002_000,
+                "plain",
+            ),
+        ],
+        table: [
+            ("member-key-0".to_owned(), Bytes::from_static(b"member-0")),
+            ("plain-key".to_owned(), Bytes::from_static(b"plain")),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_member_facade_surfaces_are_equivalent() {
+    let tokio = run_tokio_facade().await;
+    let moonpool = run_moonpool_facade().await;
+    let expected = expected_facade_outcome();
+    assert_eq!(tokio, expected, "tokio must match the oracle");
+    assert_eq!(moonpool, expected, "moonpool must match the oracle");
+    assert_eq!(tokio, moonpool, "facade surfaces diverged");
+}
