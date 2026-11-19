@@ -60,7 +60,7 @@ parking_lot               = { workspace = true }
 tokio                     = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 
 [dev-dependencies]
-magnetar-driver = { workspace = true, default-features = false, features = ["tokio", "moonpool", "crypto-aws-lc-rs"] }
+magnetar-driver = { workspace = true, default-features = false, features = ["tokio", "moonpool", "crypto-aws-lc-rs", "experimental-v5-client"] }
 magnetar-fakes  = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "test-util", "time", "sync"] }
 # Already a workspace dep of `magnetar-proto`. `tests/aggregate_stats_equivalence.rs`

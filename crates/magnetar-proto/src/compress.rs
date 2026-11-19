@@ -302,14 +302,12 @@ pub fn decompress_within_limit(
                 .map_err(|e| CompressionError::Lz4(e.to_string()))?
         }
         CompressionKind::Zlib => read_within(flate2::read::ZlibDecoder::new(ciphertext), limit)?,
-        CompressionKind::Zstd => {
-            let mut decoder = zstd::stream::Decoder::new(ciphertext)
-                .map_err(|e| CompressionError::Zstd(e.to_string()))?;
-            decoder
-                .window_log_max(zstd_window_log(ceiling.max(LEGACY_ZSTD_WINDOW_SIZE)))
-                .map_err(|e| CompressionError::Zstd(e.to_string()))?;
-            read_within(decoder, limit).map_err(|e| CompressionError::Zstd(e.to_string()))?
-        }
+        CompressionKind::Zstd => zstd::stream::Decoder::new(ciphertext)
+            .and_then(|mut decoder| {
+                decoder.window_log_max(zstd_window_log(ceiling.max(LEGACY_ZSTD_WINDOW_SIZE)))?;
+                read_within(decoder, limit)
+            })
+            .map_err(|e| CompressionError::Zstd(e.to_string()))?,
         CompressionKind::Snappy => {
             let announced = snap::raw::decompress_len(ciphertext)
                 .map_err(|e| CompressionError::Snappy(e.to_string()))?;
@@ -428,6 +426,22 @@ mod tests {
     }
 
     #[test]
+    fn configured_ceiling_rejects_isize_max_before_validation_allocation() {
+        assert!(matches!(
+            decompress_with_limit(
+                CompressionKind::None,
+                b"unused",
+                isize::MAX as usize,
+                usize::MAX,
+            ),
+            Err(super::CompressionError::UncompressedSizeTooLarge {
+                got,
+                ceiling,
+            }) if got == isize::MAX as usize && ceiling == (isize::MAX as usize) - 1
+        ));
+    }
+
+    #[test]
     fn legacy_stream_window_floor_does_not_change_output_budget() {
         let payload = vec![0x61; 768 * 1024];
         let encoded = zstd::bulk::compress(&payload, 3).expect("compress member");
@@ -497,6 +511,15 @@ mod tests {
                 "kind={kind:?} must reject malformed input"
             );
         }
+        assert!(matches!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                b"invalid",
+                1,
+                crate::MAX_FRAME_SIZE,
+            ),
+            Err(super::CompressionError::Zstd(_))
+        ));
         let oversized = vec![0_u8; crate::MAX_FRAME_SIZE + 1];
         let encoded = compress(CompressionKind::Snappy, &oversized).expect("encode oversized");
         assert!(matches!(

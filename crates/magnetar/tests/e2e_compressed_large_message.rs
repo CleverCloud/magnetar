@@ -28,11 +28,6 @@ async fn configured_consumer_receives_and_acks_compressed_payload_above_default_
         .compression(CompressionKind::Zstd)
         .create()
         .await?;
-    producer
-        .send(OutgoingMessage::with_payload(payload.clone()).into())
-        .await?;
-    producer.close().await?;
-
     let default_consumer = client
         .consumer(topic)
         .subscription("large-message-default")
@@ -40,16 +35,6 @@ async fn configured_consumer_receives_and_acks_compressed_payload_above_default_
         .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
-    let error = default_consumer
-        .receive()
-        .await
-        .expect_err("default ceiling rejects 6 MiB");
-    assert!(
-        error
-            .to_string()
-            .contains("configured decompression ceiling")
-    );
-    default_consumer.close().await?;
 
     let consumer = client
         .consumer(topic)
@@ -59,9 +44,26 @@ async fn configured_consumer_receives_and_acks_compressed_payload_above_default_
         .max_uncompressed_message_size(8 * 1024 * 1024)
         .subscribe()
         .await?;
+
+    producer
+        .send(OutgoingMessage::with_payload(payload.clone()).into())
+        .await?;
+    producer.close().await?;
+
+    let error = default_consumer
+        .receive()
+        .await
+        .expect_err("default ceiling rejects 6 MiB");
+    assert!(
+        error
+            .to_string()
+            .contains("configured decompression ceiling")
+    );
+
     let message = consumer.receive().await?;
     assert_eq!(message.payload, payload);
     consumer.ack(message.message_id).await?;
+    default_consumer.close().await?;
     consumer.close().await?;
     client.close().await;
     Ok(())

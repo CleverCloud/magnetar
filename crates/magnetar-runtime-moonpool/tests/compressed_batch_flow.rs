@@ -37,7 +37,7 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -65,6 +65,14 @@ const ALL_CODECS: [CompressionKind; 4] = [
 
 /// The magnetar frame ceiling every decompression is bounded by (`MAX_FRAME_SIZE`, 5 MiB).
 const CEILING: usize = magnetar_proto::MAX_FRAME_SIZE;
+
+static WARNING_CALLSITE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn warning_callsite_test_guard() -> MutexGuard<'static, ()> {
+    WARNING_CALLSITE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// In-memory sink for a capturing `fmt` subscriber (the `crates/magnetar-proto/tests/
 /// log_capture.rs` pattern): proto logs synchronously on the caller's thread, so a thread-local
@@ -467,6 +475,7 @@ fn overflowing_send_does_not_overtake_the_pending_batch() {
 /// positions the broker never charged. Each such entry logs exactly one structured `warn!`.
 #[test]
 fn undecodable_compressed_batch_refunds_its_permits() {
+    let _warning_callsite_guard = warning_callsite_test_guard();
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(capture.clone())
@@ -767,6 +776,7 @@ fn producer_emits_the_java_layout_and_it_round_trips() {
 
 #[test]
 fn shared_connection_keeps_decompression_limits_per_consumer() {
+    let _warning_callsite_guard = warning_callsite_test_guard();
     let shared = ConnectionShared::new(ConnectionConfig::default());
     let at = Instant::now();
     let default = open_consumer(

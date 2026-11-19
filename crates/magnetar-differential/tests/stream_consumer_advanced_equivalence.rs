@@ -5325,6 +5325,7 @@ where
                 ..Default::default()
             },
             snappy(b"codec"),
+            magnetar_proto::MAX_FRAME_SIZE,
             "decompress",
             true,
         ),
@@ -5337,6 +5338,7 @@ where
                 ..Default::default()
             },
             Bytes::from_static(b"x"),
+            magnetar_proto::MAX_FRAME_SIZE,
             "chunk id is absent",
             false,
         ),
@@ -5344,11 +5346,24 @@ where
             "transform-budget",
             magnetar::proto::pb::MessageMetadata {
                 compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                uncompressed_size: Some(64 * 1024 * 1024),
+                ..Default::default()
+            },
+            snappy(b"x"),
+            64 * 1024 * 1024,
+            "data budget is",
+            false,
+        ),
+        (
+            "decompression-ceiling",
+            magnetar::proto::pb::MessageMetadata {
+                compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
                 uncompressed_size: Some(u32::MAX),
                 ..Default::default()
             },
             snappy(b"x"),
-            "data budget is",
+            magnetar_proto::MAX_FRAME_SIZE,
+            "decompressed message size 4294967295 exceeds configured ceiling 5242880",
             false,
         ),
         (
@@ -5358,6 +5373,7 @@ where
                 ..Default::default()
             },
             Bytes::new(),
+            magnetar_proto::MAX_FRAME_SIZE,
             "single-message metadata length is truncated",
             false,
         ),
@@ -5365,13 +5381,22 @@ where
     let mut resync_reasons = Vec::with_capacity(cases.len());
     let mut close_routes = Vec::with_capacity(cases.len());
     let mut after_close = Vec::with_capacity(cases.len());
-    for (label, metadata, payload, reason_fragment, fail_child_close) in cases {
+    for (
+        label,
+        metadata,
+        payload,
+        max_uncompressed_message_size,
+        reason_fragment,
+        fail_child_close,
+    ) in cases
+    {
         let consumer = client
             .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
             .subscription(format!("malformed-{label}-sub"))
             .consumer_name(format!("malformed-{label}-member"))
             .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
             .receiver_budget(two_frame_receiver_budget())
+            .max_uncompressed_message_size(max_uncompressed_message_size)
             .subscribe()
             .await
             .expect("subscribe malformed-delivery aggregate");
