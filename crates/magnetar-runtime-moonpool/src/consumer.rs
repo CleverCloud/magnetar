@@ -132,19 +132,20 @@ struct ConsumerCloseGuard {
 
 impl Drop for ConsumerCloseGuard {
     fn drop(&mut self) {
-        if self.shared.is_no_driver() {
-            return;
-        }
+        let no_driver = self.shared.is_no_driver();
         // ADR-0038: release the per-slot probe before taking the global
         // Connection mutex. The locks are sequential, never nested.
         let already_closed = self.slot.state.lock().closed;
-        if already_closed {
-            return;
-        }
         {
             let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_consumer_forget(self.handle, now);
+            if !no_driver && !already_closed {
+                let _ = conn.close_consumer_forget(self.handle, now);
+            }
+            conn.release_consumer_close(self.handle);
+        }
+        if no_driver || already_closed {
+            return;
         }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -952,7 +953,7 @@ impl<P: Providers> Consumer<P> {
                     // Ack and continue — the caller should never see this message.
                     let now = self.shared.now_instant();
                     let mut conn = self.shared.inner.lock();
-                    let _ = conn.ack(
+                    conn.ack_forget(
                         self.handle,
                         magnetar_proto::AckRequest {
                             message_ids: vec![msg.message_id],
@@ -1218,8 +1219,9 @@ impl<P: Providers> Consumer<P> {
         };
         self.shared.driver_waker.notify_one();
         let shared = self.shared.clone();
+        let request = RequestFut { shared, request_id };
         async move {
-            let outcome = RequestFut { shared, request_id }.await;
+            let outcome = request.await;
             map_ack_outcome(outcome)
         }
     }
@@ -2030,6 +2032,7 @@ impl Drop for RequestFut {
         let mut conn = self.shared.inner.lock();
         conn.unregister_waker(key);
         let _ = conn.take_outcome(key);
+        conn.abandon_ack(self.request_id);
     }
 }
 
@@ -2175,7 +2178,7 @@ impl Future for ReceiveFut {
                         // (an explicit ack) when the policy is `DISCARD`.
                         let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
-                        let _ = conn.ack(
+                        conn.ack_forget(
                             handle,
                             magnetar_proto::AckRequest {
                                 message_ids: vec![msg.message_id],
@@ -3165,6 +3168,48 @@ mod tests {
 
     fn handshake_complete_shared() -> Arc<ConnectionShared> {
         handshake_complete_shared_with_config(ConnectionConfig::default())
+    }
+
+    #[test]
+    fn dropped_ack_before_or_after_poll_leaves_no_outcome() {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest::default());
+        let consumer = make_consumer::<TokioProviders>(shared.clone(), handle);
+        let id = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+        };
+        let rid = magnetar_proto::RequestId(shared.inner.lock().peek_next_request_id_for_test());
+        drop(consumer.ack(id));
+        assert_eq!(shared.inner.lock().peek_next_request_id_for_test(), rid.0);
+        let mut future = Box::pin(consumer.ack(id));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        drop(future);
+        let response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut bytes = BytesMut::new();
+        encode_command(&mut bytes, &response).expect("encode");
+        let mut conn = shared.inner.lock();
+        assert!(conn.has_pending_request_for_test(rid));
+        conn.handle_bytes(Instant::now(), &bytes).expect("response");
+        assert!(
+            conn.take_outcome(magnetar_proto::PendingOpKey::Request(rid))
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

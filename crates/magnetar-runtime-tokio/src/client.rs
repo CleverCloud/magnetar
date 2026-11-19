@@ -3098,6 +3098,7 @@ mod tests {
             assert_eq!(flow.consumer_id, reopened.consumer_id);
             assert_eq!(flow.message_permits, 0);
             assert_eq!(shared.inner.lock().poll_transmit().as_ref(), &[] as &[u8]);
+            let remaining_owner = consumer.clone();
             let mut close = Box::pin(consumer.close());
             assert!(close.as_mut().poll(&mut cx).is_pending());
             let command = next_ordinary_command(&shared)
@@ -3132,6 +3133,16 @@ mod tests {
                 event.is_none(),
                 "unexpected event after replacement close: {event:?}"
             );
+            assert!(conn.poll_driver_retry().is_none());
+            drop(conn);
+            drop(remaining_owner);
+            let mut conn = shared.inner.lock();
+            assert!(
+                conn.consumer(magnetar_proto::ConsumerHandle(reopened.consumer_id))
+                    .is_none()
+            );
+            assert_eq!(conn.poll_transmit().as_ref(), &[] as &[u8]);
+            assert!(conn.poll_event().is_none());
             assert!(conn.poll_driver_retry().is_none());
         }
     }

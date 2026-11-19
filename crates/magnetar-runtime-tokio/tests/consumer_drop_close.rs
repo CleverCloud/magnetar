@@ -146,6 +146,23 @@ fn answer_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
                 let _ = encode_command(out, &cmd);
             }
         }
+        pb::base_command::Type::Ack => {
+            if let Some(ack) = &frame.command.ack {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::AckResponse as i32,
+                    ack_response: Some(pb::CommandAckResponse {
+                        consumer_id: ack.consumer_id,
+                        request_id: ack.request_id,
+                        error: None,
+                        message: None,
+                        txnid_least_bits: None,
+                        txnid_most_bits: None,
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
         pb::base_command::Type::CloseConsumer => {
             if let Some(c) = &frame.command.close_consumer {
                 let cmd = pb::BaseCommand {
@@ -161,6 +178,60 @@ fn answer_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
         }
         _ => {}
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ack_response_events_are_capped_without_losing_completions() {
+    let (url, _) = spawn_recording_broker().await;
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect");
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/ack-event-cap".to_owned(),
+            subscription: "ack-event-cap".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe");
+    for entry in 0..(magnetar_proto::conn::EVENT_QUEUE_OBSERVATIONAL_CAP as u64 + 100) {
+        consumer
+            .ack(MessageId {
+                ledger_id: 1,
+                entry_id: entry,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+            })
+            .await
+            .expect("ack");
+    }
+    assert!(client.shared().inner.lock().dropped_observational_events() >= 100);
+    consumer.close().await.expect("close");
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_consumer_slot_is_reclaimed_after_last_clone() {
+    let (url, _) = spawn_recording_broker().await;
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect");
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/close-reclaim".to_owned(),
+            subscription: "close-reclaim".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe");
+    let handle = consumer.handle();
+    let other = consumer.clone();
+    consumer.close().await.expect("close");
+    assert!(client.shared().inner.lock().consumer(handle).is_some());
+    other.close().await.expect("repeated close");
+    assert!(client.shared().inner.lock().consumer(handle).is_none());
+    client.close().await;
 }
 
 fn close_consumer_count(log: &FrameLog) -> usize {

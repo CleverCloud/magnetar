@@ -138,6 +138,8 @@ pub struct OpSend {
     pub num_messages: i32,
     /// Optional waker registered by the runtime's user-facing send Future.
     pub waker: Option<Waker>,
+    /// Whether the sender still owns the operation outcome.
+    pub(crate) has_waiter: bool,
     /// `None` until receipt arrives; `Some` once we have it (consumed by `take_outcome`).
     pub receipt: Option<MessageId>,
     /// `None` if no error; `Some` if the broker returned a `CommandSendError`.
@@ -1203,6 +1205,7 @@ impl ProducerState {
             sequence_id: seq,
             num_messages,
             waker: None,
+            has_waiter: true,
             receipt: None,
             error: None,
             enqueued_at: now,
@@ -1276,6 +1279,7 @@ impl ProducerState {
             sequence_id: SequenceId(msg_seq),
             num_messages: 1,
             waker: None,
+            has_waiter: true,
             receipt: None,
             error: None,
             enqueued_at: now,
@@ -1585,6 +1589,7 @@ impl ProducerState {
             sequence_id: ctx.sequence_id,
             num_messages: 1,
             waker: None,
+            has_waiter: true,
             receipt: None,
             error: None,
             enqueued_at: now,
@@ -1721,6 +1726,15 @@ impl ProducerState {
             if let Some(op) = self.pending.get_mut(idx) {
                 op.waker = None;
             }
+        }
+    }
+
+    pub(crate) fn abandon_send(&mut self, sequence_id: SequenceId) {
+        if let Some(idx) = self.pending_index.get(&sequence_id).copied()
+            && let Some(op) = self.pending.get_mut(idx)
+        {
+            op.has_waiter = false;
+            op.waker = None;
         }
     }
 
