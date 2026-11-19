@@ -131,7 +131,10 @@ See [`moonpool-engine.md#deterministic-chaos-pack`](moonpool-engine.md#determini
 ### Swarm configurations (ADR-0097)
 
 Each `sim_chaos.rs` produce/consume iteration derives a `SwarmConfig` from its seed — a pure splitmix64 hash over `moonpool_sim::current_sim_seed()` that consumes no RNG stream — and runs a subset of the optional campaign features: the four [ADR-0048](../specs/adr/0048-buggify-fault-injection.md) buggify labels (armed per-label through `Buggify::with_rng_and_filter` and the `ConnectionConfig.buggify` engine-arming slot, which only the moonpool engine honours) plus the optional workload operations `op.client_ack` and `op.client_close`, each drawn at 50% inclusion.
-1 in 4 seeds runs the inclusive `full()` configuration, an all-off draw collapses to `full()`, and the sub-seed-pinning regression tests force the recorded `baseline()` shape so their trajectories stay byte-identical.
+1 in 4 seeds runs the inclusive `full()` configuration and an all-off draw collapses to `full()`.
+Sub-seed regression tests preserve the original configuration: the pre-swarm pins force `baseline()`, while the [issue #902](https://github.com/CleverCloud/magnetar/issues/902) pin retains its seed-derived swarm draw.
+If a CRC-corrupted delivery is dropped while the connection remains live, the produce/consume workload requests redelivery once after an idle receive and keeps its delivery assertion.
+The simulated broker tracks in-flight entries and sparse individual acknowledgements, replays only unacknowledged entries under flow permits, and preserves acknowledgement holes across reconnects.
 The canonical config line — seed, slot, labels, operations, effective weights, knowingly-vacuous invariants — prints before the workload runs and is embedded in every gate and invariant failure message, so a failing seed reproduces from `MOONPOOL_SEED` alone.
 Purity and campaign composition are pinned by [`swarm_config.rs`](../crates/magnetar-runtime-moonpool/tests/swarm_config.rs); the production engine's indifference to the whole surface is pinned by the tokio twin [`swarm_off_is_nop.rs`](../crates/magnetar-runtime-tokio/tests/swarm_off_is_nop.rs).
 See [ADR-0097](../specs/adr/0097-swarm-testing-sim-configurations.md).
