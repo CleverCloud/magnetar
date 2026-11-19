@@ -274,6 +274,8 @@ That rule is about brokers **stalled** by memory pressure — it does not cover 
 There the client default is measuring the wrong thing: `send_timeout` defaults to 30 s for Java parity ([ADR-0072](../specs/adr/0072-java-parity-default-send-timeout.md)), a statement about production publish latency, while the send-timeout budget of a publish relocated across a reconnect runs from the op's original `enqueued_at` and so must also cover `docker restart` → JVM boot → namespace load → `rebuild_producers` → `CommandSendReceipt`.
 `BROKER_RESTART_SEND_TIMEOUT` in [`e2e_reconnect.rs`](../crates/magnetar/tests/e2e_reconnect.rs) sizes that window from a measurement recorded in its doc comment.
 The distinction that keeps this honest: the assertion is unchanged (every `SendFut` must still resolve `Ok`), the deadline stays finite so the test still proves replay completes in bounded time, and the number is measured rather than inflated until green.
+The in-flight replay test configures its colocated standalone bookie to use a loopback endpoint independent of Docker's bridge IP across the same container's restart (issue #909).
+Pulsar 4.2.5 persists the address in its cookie; a fresh 5.0.0 bookie uses a logical ID with a loopback endpoint.
 
 `cargo run -p xtask -- check-e2e-fixture` enforces this, in the local validation chain and as a per-PR CI job ([ADR-0115](../specs/adr/0115-share-one-version-agnostic-pulsar-e2e-fixture.md)).
 It walks every `GenericImage::new(…)` chain under `crates/magnetar/tests/`, resolves the image repository the first constructor argument denotes — a string literal, a `&str` const, or a zero-argument accessor returning one — and applies three rules:

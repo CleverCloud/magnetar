@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 mod common;
 
-use common::pulsar::{BROKER_BINARY_PORT, start_pulsar};
+use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, init_tracing, start_pulsar};
 
 static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -415,7 +415,16 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
 async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
-    let (service_url, _admin_url, container) = start_pulsar().await?;
+    // The broker and bookie share this container. Use a stable loopback endpoint
+    // even if Docker assigns a new bridge IP: Pulsar 4.2.5 persists the address
+    // in the cookie; a fresh 5.0.0 bookie uses a logical ID and loopback endpoint.
+    init_tracing();
+    let (service_url, _admin_url, container) = Pulsar::new(Broker::Default)
+        .config("listeningInterface", "lo")
+        .config("allowLoopback", "true")
+        .start()
+        .await?
+        .into_parts();
 
     // See the producer-restart test for why we wrap in
     // `ControlledClusterFailover` — `docker restart` against the fixture's
