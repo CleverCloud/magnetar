@@ -6,13 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-19
+
 ### Changed
 
+- **BREAKING for `schema-avro`:** `AvroSchema::writer_schema()` now returns `&apache_avro::Schema` from `apache-avro` 0.23. If your application uses that return value with a direct `apache-avro` dependency, upgrade the dependency to 0.23. See [#906](https://github.com/CleverCloud/magnetar/pull/906).
+
 - **Dependencies:** bumped workspace manifest floors — `prost`/`prost-build`/`prost-types` 0.14.4→0.14.6, `bytes` 1.12.1→1.12.2, `crc32c` 0.6.8→0.6.9, `rustls-pki-types` 1.15.1→1.16.0, `lz4_flex` 0.14.0→0.14.2, `zstd` 0.14.3→0.14.4, `flate2` 1.1.10→1.1.11, `apache-avro` 0.22.0→0.23.0, `uuid` 1.29.0→1.29.3, `zeroize` 1.9.1→1.9.2, and `clap` 4.6.7→4.6.8 — and refreshed `Cargo.lock` and the `magnetar-proto` fuzz lockfile.
-  `apache-avro` 0.23 is the `schema-avro` feature's public `apache_avro::Value` type, so a consumer that enables that feature and names `apache-avro` itself must move to 0.23 as well.
   `bindgen` 0.73.2 accepts `syn` 2 or 3 and `prettyplease` 0.2 or 0.3 independently, so a plain `cargo update` can pair `syn` 3 with `prettyplease` 0.2 and fail to compile `aws-lc-fips-sys`; the lock pairs it with `prettyplease` 0.3 and `syn` 3, and `cargo update -p prettyplease@0.2.37` restores that pairing after a refresh.
 
 ### Fixed
+
+- **Pulsar batch members retain their own metadata.** Tokio and Moonpool use the member's key, ordering key, event time and properties when republishing to a dead-letter or retry topic. The same metadata reaches the façade accessors, `TableView` and OpenTelemetry context extraction. Keyless members stay keyless, and only a missing event time inherits from the batch envelope. See [#905](https://github.com/CleverCloud/magnetar/pull/905).
 
 - **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
   Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.
@@ -995,7 +1000,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/CleverCloud/magnetar/releases/tag/v2.0.0
 [1.8.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.8.0
 [1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2
 [1.7.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.1
