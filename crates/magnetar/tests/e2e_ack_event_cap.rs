@@ -56,7 +56,8 @@ async fn next_event(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn answered_acks_are_bounded_without_losing_completions() -> TestResult {
-    let running = Pulsar::new(Broker::Default).start().await?;
+    let broker = Pulsar::new(Broker::Default).advertise_container_address();
+    let running = broker.start().await?;
     let topic = topic("magnetar-ack-cap");
     let publisher = direct_client(&running).await?;
     let producer = publisher
@@ -139,7 +140,8 @@ async fn answered_acks_are_bounded_without_losing_completions() -> TestResult {
 
 #[tokio::test(flavor = "current_thread")]
 async fn answered_unawaited_operations_and_closed_handles_are_released() -> TestResult {
-    let running = Pulsar::new(Broker::Default).start().await?;
+    let broker = Pulsar::new(Broker::Default).advertise_container_address();
+    let running = broker.start().await?;
     let client = direct_client(&running).await?;
     let topic = topic("magnetar-release");
     let producer = client
