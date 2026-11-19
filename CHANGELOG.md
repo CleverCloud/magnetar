@@ -11,6 +11,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit. The option is also available on reader and V5 consumer builders; bounded codec output and the aggregate batch-memory budget still apply. Raw `None` payloads are not decompressed and retain the normal wire-frame limit.
 - Adding `max_uncompressed_message_size` to public `SubscribeRequest`, `StreamConsumerOptions`, and `SegmentConsumerOptions` requires downstream struct-literal initializers to provide the field; callers using `Default` or builders remain source-compatible.
 
+### Fixed
+
+- **A driver that ends on `CommandTopicMigrated` or an unanswerable auth challenge no longer leaves the connection reporting `Connected`.**
+  The two `handle_pending_events(..)?` exits of the driver loop (the inbound-bytes arm and the timer arm) ran neither `mark_disconnected()` nor `wake_close_waiters`, unlike every other error exit, and the terminal wrapper's `fail_all_pending` does not touch the handshake state.
+  An unsupervised connection (the façade default) therefore kept `is_connected()` true and `is_closed()` false after its driver was gone, so the ADR-0059 fast-fail never armed, lookups and opens waited out `operation_timeout`, and a parked `next_topic_list_change` / `next_replicated_subscription_marker` was never woken.
+  Both engines now take the same teardown as a transport drop before the error propagates.
+- **The graceful driver exit wakes parked `next_topic_list_change`, `next_replicated_subscription_marker` and scalable-topic waiters.**
+  A local `close()` (the moonpool `DriverHandle::abort` is exactly that) ends the driver through an `Ok(())` exit that pulsed none of the per-client-buffer `Notify`s those waiters sleep on, so a waiter parked on a `&Client` stayed pending until its task was dropped.
+  The terminal wrapper of every driver spawn, plain and supervised on both engines, now calls `wake_close_waiters` after latching the no-driver signal.
+
 ## [2.0.0] - 2026-11-19
 
 ### Changed

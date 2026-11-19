@@ -156,6 +156,27 @@ fn wake_close_waiters(shared: &ConnectionShared) {
         .notify_waiters();
 }
 
+/// [`handle_pending_events`] for the two arms of [`driver_loop_inner`] that drain the
+/// driver-actionable events (inbound bytes and the timer tick).
+///
+/// An `Err` from the drain ends the loop: `TopicMigrated` (PIP-188), an `AuthChallenge` with no
+/// provider, or a failed credential refresh. Unlike every other error exit of the loop, a bare `?`
+/// there leaves the state machine untouched, and the terminal wrapper's `fail_all_pending` does
+/// not change the handshake state either, so the dead connection would keep reporting
+/// `Connected`: `is_connected()` stays true, the ADR-0059 fast-fail (`is_closed()`) never arms and
+/// parked per-client-buffer waiters are never woken. Run the same `mark_disconnected()` +
+/// [`wake_close_waiters`] pair the other error exits run before the error propagates. 1:1 with the
+/// tokio engine.
+fn drain_driver_events_or_disconnect(
+    shared: &Arc<ConnectionShared>,
+    retries: &mut Vec<RetryRequest>,
+) -> Result<(), EngineError> {
+    handle_pending_events(shared, retries).inspect_err(|_| {
+        shared.inner.lock().mark_disconnected();
+        wake_close_waiters(shared);
+    })
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (`Connected`, `SendReceipt`,
 /// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
@@ -1122,6 +1143,14 @@ where
         driver_shared.mark_no_driver();
         #[cfg(feature = "scalable-topics")]
         driver_shared.scalable_routes.close_all();
+        // The graceful `Ok(())` exits of `driver_loop_inner` (a local `close()` or
+        // `DriverHandle::abort`, plus the flush) pulse nothing, and a waiter parked on a
+        // per-client buffer's `Notify` (`next_topic_list_change`,
+        // `next_replicated_subscription_marker`, `next_scalable_event`, ...) only re-checks
+        // `is_closed()` when it is woken. `close()` already snapped the state and the
+        // connection is terminal now, so wake them. Idempotent after an Err exit that
+        // already pulsed: `notify_waiters` stores no permit. 1:1 with the tokio engine.
+        wake_close_waiters(&driver_shared);
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab, so they
         // observe the terminal connection state and stop waiting.
@@ -1193,6 +1222,9 @@ where
         driver_shared.mark_no_driver();
         #[cfg(feature = "scalable-topics")]
         driver_shared.scalable_routes.close_all();
+        // Same terminal wake as the plain `spawn` above: the graceful exit pulses nothing a
+        // parked per-client-buffer waiter sleeps on.
+        wake_close_waiters(&driver_shared);
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab.
         driver_shared.event_waker.notify_waiters();
@@ -1876,7 +1908,7 @@ where
                     }
                 }
                 let mut retries: Vec<RetryRequest> = Vec::new();
-                handle_pending_events(&shared, &mut retries)?;
+                drain_driver_events_or_disconnect(&shared, &mut retries)?;
                 // Dispatch any transient producer-open / subscribe retries as
                 // detached tasks on the engine providers — the delayed lookup +
                 // re-attach sleeps on the INJECTED clock (`time`), so the leg
@@ -1955,7 +1987,7 @@ where
                 // out here parks the expiry's retry leg until the next inbound frame, a
                 // whole keepalive interval away on the silent broker that caused it.
                 let mut retries: Vec<RetryRequest> = Vec::new();
-                handle_pending_events(&shared, &mut retries)?;
+                drain_driver_events_or_disconnect(&shared, &mut retries)?;
                 for req in retries {
                     spawn_retry_leg::<P>(&shared, &time, &task, req);
                 }

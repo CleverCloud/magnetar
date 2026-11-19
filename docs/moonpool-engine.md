@@ -189,6 +189,7 @@ Source: [`crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs`](../cra
 
 `magnetar-proto::Connection::handle_bytes` decodes `CommandTopicMigrated` and emits `ConnectionEvent::TopicMigrated` on the event queue.
 The moonpool driver consumes the event, logs the new-URL hint, and returns an error from `driver_loop_inner` — exactly the mechanism used by the tokio engine.
+Before the error propagates the driver marks the connection disconnected and wakes the per-client-buffer waiters (`drain_driver_events_or_disconnect`), as every other error exit of the loop does, so an unsupervised connection does not keep reporting `Connected`.
 The supervisor catches the error, calls `Connection::reset()`, and reconnects against the migrated broker.
 See [ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md).
 
