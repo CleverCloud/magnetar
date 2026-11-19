@@ -30,7 +30,7 @@
 #![allow(clippy::expect_used)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -799,6 +799,8 @@ struct SharedBroker {
     /// subscription. Keyed by subscription NAME (NOT the per-session
     /// consumer id), so a re-subscribe resumes from the acked position.
     cursors: HashMap<String, u64>,
+    /// Individually acknowledged entries above a gap in the durable cursor.
+    acked: HashMap<String, HashSet<u64>>,
     /// Send dedup: `(topic, sequence_id)` → the `(ledger_id, entry_id)` the
     /// broker already assigned. A replayed in-flight publish re-emits the
     /// existing receipt rather than appending a duplicate ledger entry.
@@ -823,6 +825,7 @@ impl SharedBroker {
         self.ledger.clear();
         self.next_entry_id.clear();
         self.cursors.clear();
+        self.acked.clear();
         self.dedup.clear();
         self.served_topics.clear();
     }
@@ -866,6 +869,10 @@ struct ConsumerSlot {
     /// cursor at subscribe time; advanced as messages are pushed. Resets to
     /// the ack cursor on every re-subscribe (redelivering the un-acked tail).
     delivery_pos: u64,
+    /// Entries pushed on this session and not yet acknowledged.
+    in_flight: HashSet<u64>,
+    /// Requested redeliveries wait for flow permits like normal deliveries.
+    redelivery: VecDeque<u64>,
 }
 
 impl SessionState {
@@ -1128,6 +1135,8 @@ fn handle_stateful_frame(
                         subscription: s.subscription.clone(),
                         permits: 0,
                         delivery_pos,
+                        in_flight: HashSet::new(),
+                        redelivery: VecDeque::new(),
                     },
                 );
                 emit_success(out, s.request_id);
@@ -1142,19 +1151,40 @@ fn handle_stateful_frame(
         }
         pb::base_command::Type::Ack => {
             if let Some(a) = &frame.command.ack {
-                // Advance the DURABLE per-subscription cursor past every acked
-                // entry so a re-subscribe resumes from the un-acked tail
-                // (ADR-0055 §3). `ledger_id` is always 1 here, so the entry id
-                // alone orders the cursor.
-                let subscription = session
-                    .consumers
-                    .get(&a.consumer_id)
-                    .map(|c| c.subscription.clone());
+                // Individual acks above a gap must survive reconnect without
+                // advancing the cursor over that gap. The ledger id is 1.
+                let subscription = session.consumers.get_mut(&a.consumer_id).map(|c| {
+                    for mid in &a.message_id {
+                        if mid.ledger_id == 1 {
+                            if a.ack_type == pb::command_ack::AckType::Cumulative as i32 {
+                                c.in_flight.retain(|entry| *entry > mid.entry_id);
+                            } else if a.ack_type == pb::command_ack::AckType::Individual as i32 {
+                                c.in_flight.remove(&mid.entry_id);
+                            }
+                        }
+                    }
+                    c.subscription.clone()
+                });
                 if let Some(subscription) = subscription {
                     let mut b = shared.lock();
-                    let cursor = b.cursors.entry(subscription).or_insert(0);
+                    let SharedBroker { cursors, acked, .. } = &mut *b;
+                    let cursor = cursors.entry(subscription.clone()).or_insert(0);
+                    let sparse = acked.entry(subscription).or_default();
                     for mid in &a.message_id {
-                        *cursor = (*cursor).max(mid.entry_id.saturating_add(1));
+                        if mid.ledger_id != 1 {
+                            continue;
+                        }
+                        if a.ack_type == pb::command_ack::AckType::Cumulative as i32 {
+                            *cursor = (*cursor).max(mid.entry_id.saturating_add(1));
+                            sparse.retain(|entry| *entry >= *cursor);
+                        } else if a.ack_type == pb::command_ack::AckType::Individual as i32
+                            && mid.entry_id >= *cursor
+                        {
+                            sparse.insert(mid.entry_id);
+                        }
+                    }
+                    while sparse.remove(cursor) {
+                        *cursor = cursor.saturating_add(1);
                     }
                 }
                 for mid in &a.message_id {
@@ -1169,6 +1199,17 @@ fn handle_stateful_frame(
                 }
                 if let Some(rid) = a.request_id {
                     emit_ack_response(out, a.consumer_id, rid);
+                }
+            }
+        }
+        pb::base_command::Type::RedeliverUnacknowledgedMessages => {
+            if let Some(r) = &frame.command.redeliver_unacknowledged_messages {
+                if r.message_ids.is_empty() {
+                    if let Some(c) = session.consumers.get_mut(&r.consumer_id) {
+                        let mut entries: Vec<_> = c.in_flight.iter().copied().collect();
+                        entries.sort_unstable();
+                        c.redelivery = entries.into();
+                    }
                 }
             }
         }
@@ -1232,12 +1273,27 @@ fn drain_pending(
         // `delivery_pos` indexes the next entry to deliver directly.
         let ledger = b.ledger.get(&slot.topic).cloned().unwrap_or_default();
         let mut pushed = Vec::new();
+        let cursor = b.cursors.get(&slot.subscription).copied().unwrap_or(0);
+        let acked = b.acked.get(&slot.subscription);
         while slot.permits > 0 {
-            let Some(m) = ledger.iter().find(|m| m.entry_id == slot.delivery_pos) else {
+            let entry_id = if let Some(entry) = slot.redelivery.pop_front() {
+                entry
+            } else {
+                let entry = slot.delivery_pos;
+                if !ledger.iter().any(|m| m.entry_id == entry) {
+                    break;
+                }
+                slot.delivery_pos = slot.delivery_pos.saturating_add(1);
+                entry
+            };
+            if entry_id < cursor || acked.is_some_and(|entries| entries.contains(&entry_id)) {
+                continue;
+            }
+            let Some(m) = ledger.iter().find(|m| m.entry_id == entry_id) else {
                 break;
             };
             pushed.push(m.clone());
-            slot.delivery_pos = slot.delivery_pos.saturating_add(1);
+            slot.in_flight.insert(entry_id);
             slot.permits -= 1;
         }
         if !pushed.is_empty() {
@@ -1787,6 +1843,7 @@ impl ProducerConsumerWorkload {
         time: &T,
     ) {
         let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
+        let mut requested_redelivery = false;
         for _ in 0..(swarm.receive_budget_multiplier() * PRODUCE_COUNT) {
             if self.received.lock().len() >= PRODUCE_COUNT as usize {
                 break;
@@ -1794,8 +1851,14 @@ impl ProducerConsumerWorkload {
             let recv = time
                 .timeout(Duration::from_secs(10), consumer.receive())
                 .await;
-            let Ok(Ok(msg)) = recv else {
-                break;
+            let msg = match recv {
+                Ok(Ok(msg)) => msg,
+                Err(_) if !requested_redelivery => {
+                    requested_redelivery = true;
+                    consumer.redeliver_unacked();
+                    continue;
+                }
+                _ => break,
             };
             let id = (msg.message_id.ledger_id, msg.message_id.entry_id);
             if seen_ids.insert(id) && msg.payload.len() == 4 {
@@ -3041,6 +3104,133 @@ fn sim_chaos_pulsar_proxy_corrupted_broker_host_sub_seed_859() {
         "report: {report:?}; diagnostics: {:?}",
         diagnostics.lock()
     );
+}
+
+#[test]
+fn stateful_broker_redelivers_ack_holes_only_with_permits() {
+    let shared = SharedBroker::new_shared();
+    let mut session = SessionState::new();
+    shared.lock().ledger.insert(
+        "topic".to_owned(),
+        (0..4)
+            .map(|entry_id| StoredMessage {
+                ledger_id: 1,
+                entry_id,
+                payload: Bytes::new(),
+            })
+            .collect(),
+    );
+    session.consumers.insert(
+        7,
+        ConsumerSlot {
+            topic: "topic".to_owned(),
+            subscription: "sub".to_owned(),
+            permits: 4,
+            delivery_pos: 0,
+            in_flight: HashSet::new(),
+            redelivery: VecDeque::new(),
+        },
+    );
+    let first = drain_pending(&mut session, &shared, &HashSet::new());
+    assert_eq!(first[0].1.len(), 4);
+    let ack = magnetar_proto::Frame {
+        command: pb::BaseCommand {
+            r#type: pb::base_command::Type::Ack as i32,
+            ack: Some(pb::CommandAck {
+                consumer_id: 7,
+                ack_type: pb::command_ack::AckType::Individual as i32,
+                message_id: [0, 2, 3]
+                    .into_iter()
+                    .map(|entry_id| pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        payload: None,
+    };
+    let mut out = BytesMut::new();
+    handle_stateful_frame(&mut session, &shared, "broker", &ack, &mut out);
+    assert_eq!(shared.lock().cursors["sub"], 1);
+
+    // A fresh session resumes at the gap but skips sparse acknowledgements.
+    let mut reconnected = SessionState::new();
+    reconnected.consumers.insert(
+        8,
+        ConsumerSlot {
+            topic: "topic".to_owned(),
+            subscription: "sub".to_owned(),
+            permits: 4,
+            delivery_pos: shared.lock().cursors["sub"],
+            in_flight: HashSet::new(),
+            redelivery: VecDeque::new(),
+        },
+    );
+    let resumed = drain_pending(&mut reconnected, &shared, &HashSet::new());
+    assert_eq!(
+        resumed[0].1.iter().map(|m| m.entry_id).collect::<Vec<_>>(),
+        [1]
+    );
+
+    let redeliver = magnetar_proto::Frame {
+        command: pb::BaseCommand {
+            r#type: pb::base_command::Type::RedeliverUnacknowledgedMessages as i32,
+            redeliver_unacknowledged_messages: Some(pb::CommandRedeliverUnacknowledgedMessages {
+                consumer_id: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        payload: None,
+    };
+    handle_stateful_frame(&mut session, &shared, "broker", &redeliver, &mut out);
+    assert!(drain_pending(&mut session, &shared, &HashSet::new()).is_empty());
+    session.consumers.get_mut(&7).expect("consumer").permits = 1;
+    let replay = drain_pending(&mut session, &shared, &HashSet::new());
+    assert_eq!(
+        replay[0].1.iter().map(|m| m.entry_id).collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(session.consumers[&7].permits, 0);
+    let mut gap_ack = ack;
+    gap_ack.command.ack.as_mut().expect("ack").message_id = vec![pb::MessageIdData {
+        ledger_id: 1,
+        entry_id: 1,
+        ..Default::default()
+    }];
+    handle_stateful_frame(&mut session, &shared, "broker", &gap_ack, &mut out);
+    assert_eq!(shared.lock().cursors["sub"], 4);
+}
+
+/// A corrupt delivery is dropped without closing the connection (#902). The
+/// consumer must request redelivery and the broker must retain the ack hole.
+/// Preserve the seed's swarm draw (ACK and close off); forcing the pre-swarm
+/// baseline changes the trajectory and does not reproduce this failure.
+#[test]
+fn sim_chaos_produce_consume_corrupt_delivery_sub_seed_902() {
+    let client = ProducerConsumerWorkload::new();
+    let swarm = client.swarm_handle();
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(StatefulBrokerWorkload::new())
+        .workload(client)
+        .invariant(MonotonicMsgIdInvariant::with_config(swarm.clone()))
+        .invariant(AckAfterReceiveInvariant::with_config(swarm.clone()))
+        .invariant(NoDupOnAckedInvariant::with_config(swarm.clone()))
+        .invariant(HandleResolutionInvariant::with_config(swarm))
+        .set_debug_seeds(vec![5_794_240_658_554_191_539])
+        .set_iterations(1)
+        .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "invariant violation(s): {report:?}"
+    );
+    assert_eq!(report.successful_runs, 1, "report: {report:?}");
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }
 
 /// Regression pin for the produce-consume dial sub-seed (#366). Before the

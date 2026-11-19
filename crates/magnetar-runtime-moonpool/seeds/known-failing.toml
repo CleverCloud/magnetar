@@ -45,6 +45,29 @@
 # "consider removing / stale" log line is advisory and does not apply to
 # anchors.
 
+[[seed]]
+value        = "0x234d85b721726451"
+discovered   = "2026-11-12"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/43206642391"
+commit_sha   = "0be98de7a090b433e87b1cc6e0ccda8a32102bcf"
+test_name    = "sim_chaos_produce_consume_with_invariants"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/902"
+note         = """
+Derived sub-seed 5794240658554191539 corrupts a CRC-protected delivery.
+The client drops that frame but keeps its connection alive. The sim broker
+advanced past the unacknowledged entry, and the workload stopped on its first
+idle receive without requesting redelivery. This swarm draw has ACK disabled;
+separately, the broker's individual-ACK cursor would skip holes when ACKs
+were enabled.
+
+FIXED in the harness: individual ACKs preserve gaps, the broker redelivers
+in-flight unacknowledged entries under flow permits, and the workload makes
+one bounded redelivery request on idle. The pinned regression uses the
+original swarm configuration rather than forcing the baseline.
+RETAINED as a regression anchor — do NOT remove on a green replay.
+"""
+
 # --- ADR-0038 re-entrant-mutex driver deadlock (fixed by ef0754b) ---
 # The two seeds the daily sweep flagged that exercised the driver's
 # re-entrant `parking_lot::Mutex` self-deadlock. Both pass since ef0754b;
