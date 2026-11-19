@@ -22,6 +22,7 @@ pub(crate) struct ConsumerTemplate {
     pub(crate) consumer_name: Option<String>,
     pub(crate) sub_type: magnetar_proto::pb::command_subscribe::SubType,
     pub(crate) receiver_queue_size: usize,
+    pub(crate) max_uncompressed_message_size: Option<usize>,
     /// Issue #301: pluggable receiver-queue policy propagated to every child
     /// consumer so partitioned / multi-topics consumers self-tune too. `None`
     /// keeps the `Fixed(receiver_queue_size)` default.
@@ -63,6 +64,9 @@ impl ConsumerTemplate {
             .read_compacted(self.read_compacted);
         if let Some(name) = &self.consumer_name {
             builder = builder.name(name.clone());
+        }
+        if let Some(bytes) = self.max_uncompressed_message_size {
+            builder = builder.max_uncompressed_message_size(bytes);
         }
         // Issue #301: propagate the receiver-queue policy (and its tick cadence)
         // to every per-topic child so partitioned / multi-topics consumers

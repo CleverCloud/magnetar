@@ -4,7 +4,9 @@
 
 #[cfg(test)]
 pub(crate) use magnetar_proto::compress::CompressionError;
-pub(crate) use magnetar_proto::compress::{decompress, kind_from_pb};
+#[cfg(test)]
+pub(crate) use magnetar_proto::compress::decompress;
+pub(crate) use magnetar_proto::compress::{decompress_with_limit, kind_from_pb};
 #[cfg(test)]
 use magnetar_proto::{pb, types::CompressionKind};
 

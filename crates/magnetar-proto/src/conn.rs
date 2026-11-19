@@ -5827,6 +5827,7 @@ impl Connection {
             policy,
             req.receiver_queue_adjust_interval,
         );
+        state.max_uncompressed_message_size = req.max_uncompressed_message_size;
         state.max_redeliver_count = req.max_redeliver_count;
         state.consumer_name = req.consumer_name.clone();
         if let Some(delay) = req.negative_ack_redelivery_delay {
@@ -6392,6 +6393,16 @@ impl Connection {
             .get(&handle)
             .map_or(CryptoFailureAction::Fail, |slot| {
                 slot.state.lock().crypto_failure_action()
+            })
+    }
+
+    /// Configured decompressed message size ceiling for this consumer.
+    #[must_use]
+    pub fn consumer_max_uncompressed_message_size(&self, handle: ConsumerHandle) -> usize {
+        self.consumers
+            .get(&handle)
+            .map_or(crate::MAX_FRAME_SIZE, |slot| {
+                slot.state.lock().max_uncompressed_message_size
             })
     }
 

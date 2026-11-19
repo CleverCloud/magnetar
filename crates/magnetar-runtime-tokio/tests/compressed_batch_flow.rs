@@ -37,7 +37,7 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -65,6 +65,14 @@ const ALL_CODECS: [CompressionKind; 4] = [
 
 /// The magnetar frame ceiling every decompression is bounded by (`MAX_FRAME_SIZE`, 5 MiB).
 const CEILING: usize = magnetar_proto::MAX_FRAME_SIZE;
+
+static WARNING_CALLSITE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn warning_callsite_test_guard() -> MutexGuard<'static, ()> {
+    WARNING_CALLSITE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// In-memory sink for a capturing `fmt` subscriber (the `crates/magnetar-proto/tests/
 /// log_capture.rs` pattern): proto logs synchronously on the caller's thread, so a thread-local
@@ -167,6 +175,15 @@ fn open_consumer(shared: &ConnectionShared, topic: &str, at: Instant) -> Consume
             .expect("Connected");
         while conn.poll_event().is_some() {}
     }
+    subscribe_connected_consumer(shared, topic, at, None)
+}
+
+fn subscribe_connected_consumer(
+    shared: &ConnectionShared,
+    topic: &str,
+    at: Instant,
+    max_uncompressed_message_size: Option<usize>,
+) -> ConsumerHandle {
     let (handle, request_id) = {
         let mut conn = shared.inner.lock();
         let request_id = conn.peek_next_request_id_for_test();
@@ -175,6 +192,8 @@ fn open_consumer(shared: &ConnectionShared, topic: &str, at: Instant) -> Consume
             subscription: "magnetar-test-860".to_owned(),
             sub_type: pb::command_subscribe::SubType::Shared,
             receiver_queue_size: RQ,
+            max_uncompressed_message_size: max_uncompressed_message_size
+                .unwrap_or(magnetar_proto::MAX_FRAME_SIZE),
             ..Default::default()
         });
         (handle, request_id)
@@ -456,6 +475,7 @@ fn overflowing_send_does_not_overtake_the_pending_batch() {
 /// positions the broker never charged. Each such entry logs exactly one structured `warn!`.
 #[test]
 fn undecodable_compressed_batch_refunds_its_permits() {
+    let _warning_callsite_guard = warning_callsite_test_guard();
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(capture.clone())
@@ -751,6 +771,115 @@ fn producer_emits_the_java_layout_and_it_round_trips() {
             .map(|(batched, unkeyed, payload)| (*batched, *unkeyed, payload.to_vec()))
             .collect::<Vec<_>>(),
         vec![(None, false, b"s0".to_vec()), (None, false, b"s1".to_vec())]
+    );
+}
+
+#[test]
+fn shared_connection_keeps_decompression_limits_per_consumer() {
+    let _warning_callsite_guard = warning_callsite_test_guard();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let at = Instant::now();
+    let default = open_consumer(
+        &shared,
+        "persistent://public/default/decompression-default",
+        at,
+    );
+    let configured = subscribe_connected_consumer(
+        &shared,
+        "persistent://public/default/decompression-configured",
+        at,
+        Some(8 * 1024 * 1024),
+    );
+    let smaller = subscribe_connected_consumer(
+        &shared,
+        "persistent://public/default/decompression-smaller",
+        at,
+        Some(1024 * 1024),
+    );
+    assert_eq!(
+        shared
+            .inner
+            .lock()
+            .consumer_max_uncompressed_message_size(default),
+        magnetar_proto::MAX_FRAME_SIZE
+    );
+    assert_eq!(
+        shared
+            .inner
+            .lock()
+            .consumer_max_uncompressed_message_size(configured),
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        shared
+            .inner
+            .lock()
+            .consumer_max_uncompressed_message_size(smaller),
+        1024 * 1024
+    );
+
+    let members = vec![vec![0x31; 768 * 1024]; 8];
+    let (default_messages, default_flow) = deliver_and_drain(
+        &shared,
+        default,
+        &entry_frame(
+            default,
+            90,
+            8,
+            legacy_layout(CompressionKind::Zstd, &members),
+            vec![],
+        ),
+        at,
+    );
+    assert!(
+        default_messages.is_empty(),
+        "default rejects the 6 MiB entry atomically"
+    );
+    assert_eq!(
+        default_flow,
+        vec![8],
+        "default rejection refunds every member"
+    );
+
+    let (configured_messages, configured_flow) = deliver_and_drain(
+        &shared,
+        configured,
+        &entry_frame(
+            configured,
+            91,
+            8,
+            legacy_layout(CompressionKind::Zstd, &members),
+            vec![],
+        ),
+        at,
+    );
+    assert_eq!(
+        configured_messages, members,
+        "configured consumer surfaces all exact members"
+    );
+    assert_eq!(configured_flow, vec![4, 4]);
+
+    let four_members = members[..4].to_vec();
+    let (smaller_messages, smaller_flow) = deliver_and_drain(
+        &shared,
+        smaller,
+        &entry_frame(
+            smaller,
+            92,
+            4,
+            legacy_layout(CompressionKind::Zstd, &four_members),
+            vec![],
+        ),
+        at,
+    );
+    assert!(
+        smaller_messages.is_empty(),
+        "entry total exceeds the 1 MiB consumer ceiling"
+    );
+    assert_eq!(
+        smaller_flow,
+        vec![4],
+        "failed legacy batch refunds all charged permits"
     );
 }
 

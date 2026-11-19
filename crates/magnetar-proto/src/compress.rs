@@ -42,13 +42,12 @@ pub enum CompressionError {
     /// Decompressed size deviates from the broker-stamped `uncompressed_size`.
     #[error("decompressed size mismatch: got {got}, expected {expected}")]
     SizeMismatch { got: usize, expected: usize },
-    /// Broker-supplied `uncompressed_size` exceeds the per-frame ceiling. A peer
+    /// The broker-supplied size cannot be represented safely within the configured ceiling. A peer
     /// can otherwise drive an arbitrarily large `Vec::with_capacity` through
     /// the `expires_in`-style allocation hint and exhaust the process heap
     /// without ever producing a real frame. Capped at
-    /// [`crate::MAX_FRAME_SIZE`] (5 MiB), matching the wire ceiling
-    /// the frame codec already enforces on the outer length.
-    #[error("uncompressed_size {got} exceeds frame ceiling {ceiling}")]
+    /// configured consumer ceiling, independent of the wire ceiling.
+    #[error("uncompressed_size {got} exceeds configured decompression ceiling {ceiling}")]
     UncompressedSizeTooLarge {
         /// Broker-advertised uncompressed size.
         got: usize,
@@ -127,26 +126,43 @@ pub fn decompress(
     ciphertext: &[u8],
     uncompressed_size: usize,
 ) -> Result<Bytes, CompressionError> {
+    decompress_with_limit(kind, ciphertext, uncompressed_size, crate::MAX_FRAME_SIZE)
+}
+
+/// Decompress with a caller-selected uncompressed output ceiling. The wire-frame limit remains
+/// independent and must be enforced by the frame decoder.
+pub fn decompress_with_limit(
+    kind: CompressionKind,
+    ciphertext: &[u8],
+    uncompressed_size: usize,
+    ceiling: usize,
+) -> Result<Bytes, CompressionError> {
     // Cap the broker-controlled `uncompressed_size` BEFORE allocating. Without
     // this guard a peer can advertise e.g. `uncompressed_size = u32::MAX` (4
     // GiB) and drive `Vec::with_capacity(uncompressed_size)` in the Zlib path
     // (or the `lz4_flex::decompress` output-buffer pre-allocation) to exhaust
     // the process heap, never producing a real frame. The outer wire codec
-    // already rejects frames larger than `MAX_FRAME_SIZE`; cap the inflated
-    // payload at the same ceiling.
-    if uncompressed_size > crate::MAX_FRAME_SIZE {
+    // already rejects frames larger than `MAX_FRAME_SIZE`; the independent
+    // per-consumer ceiling bounds inflated output.
+    if uncompressed_size > ceiling {
         return Err(CompressionError::UncompressedSizeTooLarge {
             got: uncompressed_size,
-            ceiling: crate::MAX_FRAME_SIZE,
+            ceiling,
         });
     }
-    let ceiling = crate::MAX_FRAME_SIZE;
     let validation_len = uncompressed_size
         .checked_add(crate::DECOMPRESSION_VALIDATION_SLACK)
         .ok_or(CompressionError::UncompressedSizeTooLarge {
             got: usize::MAX,
             ceiling,
         })?;
+    if validation_len > isize::MAX as usize {
+        return Err(CompressionError::UncompressedSizeTooLarge {
+            got: uncompressed_size,
+            ceiling: ceiling
+                .min((isize::MAX as usize).saturating_sub(crate::DECOMPRESSION_VALIDATION_SLACK)),
+        });
+    }
     match kind {
         CompressionKind::None => Ok(Bytes::copy_from_slice(ciphertext)),
         CompressionKind::Lz4 => {
@@ -212,8 +228,10 @@ pub fn decompress(
 fn zstd_window_log(uncompressed_size: usize) -> u32 {
     let window = uncompressed_size
         .max(crate::ZSTD_MIN_WINDOW_SIZE)
-        .next_power_of_two();
-    usize::BITS - window.leading_zeros() - 1
+        .checked_next_power_of_two()
+        .unwrap_or(1_usize << (usize::BITS - 2));
+    let maximum = if usize::BITS > 32 { 31 } else { 30 };
+    (usize::BITS - window.leading_zeros() - 1).clamp(10, maximum)
 }
 
 fn read_bounded(
@@ -238,9 +256,13 @@ fn read_bounded(
 /// block of `n` bytes never decodes to more than `255 × n`. Used to size the output buffer
 /// when the wire does not name the uncompressed size (see [`decompress_within`]).
 const LZ4_MAX_INFLATE_RATIO: usize = 255;
+/// Legacy Pulsar producers use zstd level 3, whose default frame window is 2 MiB.
+const LEGACY_ZSTD_WINDOW_SIZE: usize = 2 * 1024 * 1024;
 
 /// Decompress `ciphertext` when the wire does NOT carry its exact uncompressed size, refusing
-/// to produce more than `limit` bytes (itself capped at [`crate::MAX_FRAME_SIZE`]).
+/// to produce more than `limit` bytes. This compatibility entry point uses
+/// [`crate::MAX_FRAME_SIZE`] as its default ceiling; [`decompress_within_limit`] accepts a separate
+/// configured ceiling.
 ///
 /// The one caller is the batch layout magnetar's producer wrote up to and including 1.7.2
 /// (ADR-0112): it compressed every batch member on its own and stamped the batch's
@@ -259,7 +281,19 @@ pub fn decompress_within(
     ciphertext: &[u8],
     limit: usize,
 ) -> Result<Bytes, CompressionError> {
-    let limit = limit.min(crate::MAX_FRAME_SIZE);
+    decompress_within_limit(kind, ciphertext, limit, crate::MAX_FRAME_SIZE)
+}
+
+/// Decompress an individual legacy batch member within the supplied remaining aggregate budget.
+pub fn decompress_within_limit(
+    kind: CompressionKind,
+    ciphertext: &[u8],
+    limit: usize,
+    ceiling: usize,
+) -> Result<Bytes, CompressionError> {
+    let limit = limit
+        .min(ceiling)
+        .min((isize::MAX as usize).saturating_sub(1));
     let mut out = match kind {
         CompressionKind::None => ciphertext.to_vec(),
         CompressionKind::Lz4 => {
@@ -269,7 +303,10 @@ pub fn decompress_within(
         }
         CompressionKind::Zlib => read_within(flate2::read::ZlibDecoder::new(ciphertext), limit)?,
         CompressionKind::Zstd => zstd::stream::Decoder::new(ciphertext)
-            .and_then(|decoder| read_within(decoder, limit))
+            .and_then(|mut decoder| {
+                decoder.window_log_max(zstd_window_log(ceiling.max(LEGACY_ZSTD_WINDOW_SIZE)))?;
+                read_within(decoder, limit)
+            })
             .map_err(|e| CompressionError::Zstd(e.to_string()))?,
         CompressionKind::Snappy => {
             let announced = snap::raw::decompress_len(ciphertext)
@@ -319,7 +356,7 @@ fn verify_size(buf: &[u8], expected: usize) -> Result<(), CompressionError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionKind, compress, decompress};
+    use super::{CompressionKind, compress, decompress, decompress_with_limit};
     use crate::pb;
 
     #[test]
@@ -342,6 +379,122 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_compressed_payload_above_the_wire_frame_limit_when_configured() {
+        let plaintext = vec![0x5a; crate::MAX_FRAME_SIZE + 1];
+        let encoded = compress(CompressionKind::Zstd, &plaintext).expect("compress payload");
+        assert!(encoded.len() < crate::MAX_FRAME_SIZE);
+        let decoded = decompress_with_limit(
+            CompressionKind::Zstd,
+            &encoded,
+            plaintext.len(),
+            plaintext.len(),
+        )
+        .expect("configured decompression ceiling accepts payload");
+        assert_eq!(decoded, plaintext);
+    }
+
+    #[test]
+    fn configured_limit_accepts_exact_boundary_and_rejects_one_byte_over() {
+        let payload = vec![0x35; 8192];
+        let encoded = compress(CompressionKind::Zstd, &payload).expect("compress payload");
+        assert_eq!(
+            decompress_with_limit(
+                CompressionKind::Zstd,
+                &encoded,
+                payload.len(),
+                payload.len()
+            )
+            .expect("exact configured boundary is accepted"),
+            payload
+        );
+        assert!(matches!(
+            decompress_with_limit(
+                CompressionKind::Zstd,
+                &encoded,
+                payload.len(),
+                payload.len() - 1
+            ),
+            Err(super::CompressionError::UncompressedSizeTooLarge {
+                got: 8192,
+                ceiling: 8191,
+            })
+        ));
+        assert!(matches!(
+            decompress_with_limit(CompressionKind::Zstd, &encoded, usize::MAX, usize::MAX),
+            Err(super::CompressionError::UncompressedSizeTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn configured_ceiling_rejects_isize_max_before_validation_allocation() {
+        assert!(matches!(
+            decompress_with_limit(
+                CompressionKind::None,
+                b"unused",
+                isize::MAX as usize,
+                usize::MAX,
+            ),
+            Err(super::CompressionError::UncompressedSizeTooLarge {
+                got,
+                ceiling,
+            }) if got == isize::MAX as usize && ceiling == (isize::MAX as usize) - 1
+        ));
+    }
+
+    #[test]
+    fn legacy_stream_window_floor_does_not_change_output_budget() {
+        let payload = vec![0x61; 768 * 1024];
+        let encoded = zstd::bulk::compress(&payload, 3).expect("compress member");
+        assert!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                &encoded,
+                1024 * 1024,
+                1024 * 1024,
+            )
+            .is_ok()
+        );
+        let streamed = zstd::stream::encode_all(payload.as_slice(), 3).expect("encode stream");
+        assert_eq!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                &streamed,
+                1024 * 1024,
+                1024 * 1024,
+            )
+            .expect("legacy stream's 2 MiB window is compatible"),
+            payload
+        );
+        assert!(matches!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                &streamed,
+                1024 * 1024 - 768 * 1024,
+                1024 * 1024,
+            ),
+            Err(super::CompressionError::UncompressedSizeTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_zstd_stream_rejects_a_window_above_compatibility_floor() {
+        let payload = vec![0x61; 768 * 1024];
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.window_log(22).expect("large window");
+        std::io::Write::write_all(&mut encoder, &payload).expect("write frame");
+        let encoded = encoder.finish().expect("finish frame");
+        assert!(matches!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                &encoded,
+                1024 * 1024,
+                1024 * 1024,
+            ),
+            Err(super::CompressionError::Zstd(_))
+        ));
+    }
+
+    #[test]
     fn malformed_sizes_and_payloads_are_bounded() {
         assert!(matches!(
             decompress(CompressionKind::None, b"ignored", crate::MAX_FRAME_SIZE + 1,),
@@ -358,6 +511,15 @@ mod tests {
                 "kind={kind:?} must reject malformed input"
             );
         }
+        assert!(matches!(
+            super::decompress_within_limit(
+                CompressionKind::Zstd,
+                b"invalid",
+                1,
+                crate::MAX_FRAME_SIZE,
+            ),
+            Err(super::CompressionError::Zstd(_))
+        ));
         let oversized = vec![0_u8; crate::MAX_FRAME_SIZE + 1];
         let encoded = compress(CompressionKind::Snappy, &oversized).expect("encode oversized");
         assert!(matches!(
@@ -456,8 +618,8 @@ mod tests {
     /// multi-GiB output buffer. The Zlib path used `Vec::with_capacity(
     /// uncompressed_size)` directly, so without the cap a peer could drive
     /// the process to OOM with a tiny payload that claims `u32::MAX` bytes
-    /// of plaintext. The ceiling matches `crate::MAX_FRAME_SIZE`,
-    /// which the frame codec already enforces on the outer wire length.
+    /// of plaintext. This compatibility API uses the default 5 MiB consumer
+    /// ceiling; the configurable entry point accepts a caller-selected bound.
     #[test]
     fn unchecked_uncompressed_size_is_rejected_before_allocation() {
         // A vanishingly small Zlib body — its actual plaintext is empty, but
@@ -515,7 +677,7 @@ mod tests {
     /// alone was insufficient because `zstd::stream::decode_all` ignored the
     /// header entirely — it just expanded the ciphertext into a fresh `Vec`
     /// whatever the announced size. With the R2 streaming decoder, the
-    /// `take(MAX_FRAME_SIZE + 1)` cap stops the decode at the wire ceiling
+    /// `take(configured_limit + 1)` cap stops the decode at the output ceiling
     /// regardless of the lying header.
     ///
     /// The test asserts an error is surfaced (no panic, no OOM); either

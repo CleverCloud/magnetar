@@ -1,6 +1,6 @@
 # ADR-0112 — Compress and decompress a batched entry as one body
 
-- **Status**: Accepted (amends [ADR-0107](0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md), its four-site refund list; amends [ADR-0044](0044-moonpool-message-crypto-bridge.md), its "no decompression step on moonpool" for batched entries)
+- **Status**: Superseded by [ADR-0128](0128-configurable-per-consumer-decompression-ceiling.md)
 - **Date**: 2026-10-08
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, producer, batch, compression, flow-control, wire-format, java-parity, sans-io, issue-860

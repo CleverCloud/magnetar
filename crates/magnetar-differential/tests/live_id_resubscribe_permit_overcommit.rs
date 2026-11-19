@@ -63,6 +63,7 @@ fn overcommit_trace(topic: &str, subscription: &str) -> Trace {
                 name: "a".to_owned(),
                 receiver_queue_size: RQ,
                 max_redeliver_count: 0,
+                max_uncompressed_message_size: None,
             },
             // The #414 recovery entry point, on a consumer that is still live.
             Op::ResubscribeShared {

@@ -274,6 +274,7 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> super::SegmentSubscrib
                     consumer_name: options.consumer_name,
                     schema: options.schema,
                     receiver_budget: options.receiver_budget,
+                    max_uncompressed_message_size: options.max_uncompressed_message_size,
                     ordering_mode: options.ordering_mode,
                 })
                 .await

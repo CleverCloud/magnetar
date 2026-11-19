@@ -38,6 +38,7 @@ pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     consumer_name: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
+    max_uncompressed_message_size: Option<usize>,
     /// Issue #301: pluggable receiver-queue policy forwarded to every per-partition child.
     receiver_queue_policy: Option<std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>>,
     receiver_queue_adjust_interval: Option<std::time::Duration>,
@@ -85,6 +86,7 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
             consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
+            max_uncompressed_message_size: None,
             receiver_queue_policy: None,
             receiver_queue_adjust_interval: None,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
@@ -312,6 +314,13 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
         self
     }
 
+    /// Set the per-partition decompressed payload ceiling in bytes. Defaults to 5 MiB.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.max_uncompressed_message_size = Some(bytes);
+        self
+    }
+
     /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
     #[must_use]
     pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
@@ -427,6 +436,9 @@ where
             .initial_position(self.initial_position)
             .durable(self.durable)
             .read_compacted(self.read_compacted);
+        if let Some(bytes) = self.max_uncompressed_message_size {
+            builder = builder.max_uncompressed_message_size(bytes);
+        }
         if let Some(name) = self.consumer_name {
             builder = builder.name(name);
         }

@@ -616,6 +616,8 @@ struct SessionDeps {
     /// session is answered with a bare `CommandSuccess` and changes no broker state.
     /// See [`ScriptedBroker::subscribe_on_live_consumer_id_is_a_success_noop`].
     live_id_subscribe_is_noop: Arc<Mutex<bool>>,
+    /// Optional initial topic snapshot for pattern-consumer integration tests.
+    topic_list_response: Arc<Mutex<Option<Vec<String>>>>,
     cross_session: Arc<Mutex<CrossSession>>,
 }
 
@@ -731,6 +733,8 @@ pub struct ScriptedBroker {
     /// is a `CommandSuccess` no-op. Armed by
     /// [`Self::subscribe_on_live_consumer_id_is_a_success_noop`].
     live_id_subscribe_is_noop: Arc<Mutex<bool>>,
+    /// Optional initial topic snapshot for pattern-consumer integration tests.
+    topic_list_response: Arc<Mutex<Option<Vec<String>>>>,
     /// Cross-session ledger + durable cursors, consulted only when
     /// [`Self::drop_after`] is armed. Shared by every session of this broker
     /// so resume-relevant state survives the client's per-reconnect id churn
@@ -794,6 +798,8 @@ impl ScriptedBroker {
         let leak_shared_permits_on_churn_clone = leak_shared_permits_on_churn.clone();
         let live_id_subscribe_is_noop = Arc::new(Mutex::new(false));
         let live_id_subscribe_is_noop_clone = live_id_subscribe_is_noop.clone();
+        let topic_list_response = Arc::new(Mutex::new(None));
+        let topic_list_response_clone = topic_list_response.clone();
         let cross_session = Arc::new(Mutex::new(CrossSession::default()));
         let cross_session_clone = cross_session.clone();
         let deps = SessionDeps {
@@ -815,6 +821,7 @@ impl ScriptedBroker {
             announce_active_consumer: announce_active_consumer_clone,
             leak_shared_permits_on_churn: leak_shared_permits_on_churn_clone,
             live_id_subscribe_is_noop: live_id_subscribe_is_noop_clone,
+            topic_list_response: topic_list_response_clone,
             cross_session: cross_session_clone,
         };
         let accept_task = tokio::spawn(async move {
@@ -855,6 +862,7 @@ impl ScriptedBroker {
             announce_active_consumer,
             leak_shared_permits_on_churn,
             live_id_subscribe_is_noop,
+            topic_list_response,
             cross_session,
         })
     }
@@ -1211,6 +1219,12 @@ impl ScriptedBroker {
         self.addr.to_string()
     }
 
+    /// Configure the initial topic snapshot returned for `WATCH_TOPIC_LIST`.
+    /// When unset, the scripted broker keeps its existing unsupported-watch behavior.
+    pub fn set_topic_list_response(&self, topics: Vec<String>) {
+        *self.topic_list_response.lock() = Some(topics);
+    }
+
     /// Wait for the broker to finish in-flight work and shut down. The
     /// internal accept loop terminates on next iteration; outstanding
     /// session tasks are detached.
@@ -1433,6 +1447,24 @@ fn handle_frame(
             }
         }
         pb::base_command::Type::Ping => emit_pong(out),
+        pb::base_command::Type::WatchTopicList => {
+            if let (Some(watch), Some(topics)) = (
+                frame.command.watch_topic_list.as_ref(),
+                deps.topic_list_response.lock().clone(),
+            ) {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::WatchTopicListSuccess as i32,
+                    watch_topic_list_success: Some(pb::CommandWatchTopicListSuccess {
+                        request_id: watch.request_id,
+                        watcher_id: watch.watcher_id,
+                        topic: topics,
+                        topics_hash: "scripted-topic-list".to_owned(),
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
         // PIP-460 (ADR-0093). The lookup doubles as the layout subscribe, so a
         // single `CommandScalableTopicUpdate` answers it and the session stays
         // open. Two segments at epoch 1, each with a placement entry.

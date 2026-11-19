@@ -237,6 +237,8 @@ pub enum Op {
         /// pre-#437 trace passes — disables the dead-letter branch entirely and
         /// leaves the subscribe frame byte-identical.
         max_redeliver_count: u32,
+        /// Optional per-consumer decompressed-payload ceiling. `None` preserves the 5 MiB default.
+        max_uncompressed_message_size: Option<usize>,
     },
     /// Issue #414: receive from the named Shared consumer.
     RecvShared {
@@ -351,6 +353,8 @@ pub struct SharedConsumerWindow {
     /// pre-#437 trace passes — disables the dead-letter branch entirely and
     /// leaves the subscribe frame byte-identical.
     pub max_redeliver_count: u32,
+    /// Per-consumer decompressed-payload ceiling.
+    pub max_uncompressed_message_size: usize,
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`

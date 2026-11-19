@@ -806,12 +806,14 @@ impl<P: Providers> Consumer<P> {
         &self,
         message: &mut IncomingMessage,
     ) -> PostProcessOutcome {
-        let action = self
-            .shared
-            .inner
-            .lock()
-            .consumer_crypto_failure_action(self.handle);
-        post_process_message(message, self.decryptor.as_ref(), action)
+        let (action, limit) = {
+            let conn = self.shared.inner.lock();
+            (
+                conn.consumer_crypto_failure_action(self.handle),
+                conn.consumer_max_uncompressed_message_size(self.handle),
+            )
+        };
+        post_process_message(message, self.decryptor.as_ref(), action, limit)
     }
 
     #[cfg(feature = "scalable-topics")]
@@ -930,21 +932,18 @@ impl<P: Providers> Consumer<P> {
             // `Instant::now()`, and before the connection mutex (ADR-0038). This is what makes
             // the receive-latency histogram reproducible per seed under simulation.
             let now = self.shared.now_instant();
-            let msg = {
+            let (msg, action, limit) = {
                 let mut conn = self.shared.inner.lock();
-                conn.pop_message(self.handle, now)
+                let action = conn.consumer_crypto_failure_action(self.handle);
+                let limit = conn.consumer_max_uncompressed_message_size(self.handle);
+                (conn.pop_message(self.handle, now), action, limit)
             };
             let Some(mut msg) = msg else { break };
             // PIP-4: honor the per-consumer crypto failure action for every encrypted message
             // popped here (the first message went through `receive()` which already does this).
             // Without this, messages 2..N of a batch would leak ciphertext to the caller and
             // ignore the Fail/Discard/Consume policy. 1:1 with the tokio batch path.
-            let action = self
-                .shared
-                .inner
-                .lock()
-                .consumer_crypto_failure_action(self.handle);
-            match post_process_message(&mut msg, self.decryptor.as_ref(), action) {
+            match post_process_message(&mut msg, self.decryptor.as_ref(), action, limit) {
                 PostProcessOutcome::Deliver => {
                     acc_bytes = acc_bytes.saturating_add(msg.payload.len());
                     out.push(msg);
@@ -2059,6 +2058,7 @@ fn post_process_message(
     msg: &mut IncomingMessage,
     decryptor: Option<&Arc<dyn MessageDecryptor>>,
     crypto_failure_action: magnetar_proto::CryptoFailureAction,
+    max_uncompressed_message_size: usize,
 ) -> PostProcessOutcome {
     if !msg.metadata.encryption_keys.is_empty() {
         let decrypt_result: Result<bytes::Bytes, ClientError> = match decryptor {
@@ -2096,7 +2096,12 @@ fn post_process_message(
                 .metadata
                 .uncompressed_size
                 .map_or(msg.payload.len(), |size| size as usize);
-            match crate::compress::decompress(kind, &msg.payload, expected) {
+            match crate::compress::decompress_with_limit(
+                kind,
+                &msg.payload,
+                expected,
+                max_uncompressed_message_size,
+            ) {
                 Ok(plain) => msg.payload = plain,
                 Err(error) => {
                     return PostProcessOutcome::Fail(ClientError::Other(format!(
@@ -2149,6 +2154,8 @@ impl Future for ReceiveFut {
             // ADR-0011/ADR-0086: injected provider, before the connection mutex (ADR-0038).
             let now = shared.now_instant();
             let mut conn = shared.inner.lock();
+            let action = conn.consumer_crypto_failure_action(handle);
+            let limit = conn.consumer_max_uncompressed_message_size(handle);
             if let Some(mut msg) = conn.pop_message(handle, now) {
                 // Clear any stale slab entry; we resolved successfully.
                 if let Some(key) = this.slab_key.take() {
@@ -2166,8 +2173,7 @@ impl Future for ReceiveFut {
                 // unconditionally failing. Inbound compression remains valid even though the
                 // moonpool producer currently refuses compressed sends; the shared helper
                 // decrypts first and then performs bounded decompression.
-                let action = shared.inner.lock().consumer_crypto_failure_action(handle);
-                match post_process_message(&mut msg, this.decryptor.as_ref(), action) {
+                match post_process_message(&mut msg, this.decryptor.as_ref(), action, limit) {
                     PostProcessOutcome::Deliver => return Poll::Ready(Ok(msg)),
                     PostProcessOutcome::Fail(err) => return Poll::Ready(Err(err)),
                     PostProcessOutcome::Discard => {
@@ -4619,6 +4625,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn consumer_limit_is_per_slot_and_applies_to_receive_batch() {
+        let plaintext = vec![0x5a; magnetar_proto::MAX_FRAME_SIZE + 1];
+        let encoded = magnetar_proto::compress::compress(
+            magnetar_proto::types::CompressionKind::Zstd,
+            &plaintext,
+        )
+        .expect("zstd");
+        let metadata = pb::MessageMetadata {
+            compression: Some(pb::CompressionType::Zstd as i32),
+            uncompressed_size: Some(plaintext.len() as u32),
+            ..Default::default()
+        };
+        let shared = handshake_complete_shared();
+        let make = |topic: &str, limit| {
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: "s".to_owned(),
+                max_uncompressed_message_size: limit,
+                ..Default::default()
+            });
+            make_consumer::<TokioProviders>(shared.clone(), handle)
+        };
+        let default = make(
+            "persistent://public/default/default-limit",
+            magnetar_proto::MAX_FRAME_SIZE,
+        );
+        let configured = make(
+            "persistent://public/default/configured-limit",
+            8 * 1024 * 1024,
+        );
+        let feed = |consumer: &Consumer<TokioProviders>, entry_id| {
+            let cmd = pb::BaseCommand {
+                r#type: pb::base_command::Type::Message as i32,
+                message: Some(pb::CommandMessage {
+                    consumer_id: consumer.handle.0,
+                    message_id: pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id,
+                        ..Default::default()
+                    },
+                    redelivery_count: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_payload(&mut frame, &cmd, &metadata, &encoded).expect("encode entry");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("handle entry");
+        };
+        feed(&default, 0);
+        feed(&configured, 0);
+        feed(&configured, 1);
+
+        let error = default
+            .receive()
+            .await
+            .expect_err("default rejects the payload");
+        assert!(
+            error
+                .to_string()
+                .contains("configured decompression ceiling")
+        );
+        let messages = configured
+            .receive_batch_with_bytes_cap(2, 16 * 1024 * 1024, std::time::Duration::ZERO)
+            .await
+            .expect("configured batch receive");
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.payload == plaintext));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn receive_on_closed_consumer_yields_closed_error() {
         let shared = ConnectionShared::new(ConnectionConfig::default());
         // Consumer handle is unknown to the state machine — `consumer_is_closed`
@@ -6052,6 +6133,7 @@ mod tests {
                 &mut msg,
                 Some(&(Arc::new(XorDecryptor) as Arc<dyn MessageDecryptor>)),
                 magnetar_proto::CryptoFailureAction::Fail,
+                magnetar_proto::MAX_FRAME_SIZE,
             ),
             PostProcessOutcome::Deliver
         ));
@@ -6079,6 +6161,7 @@ mod tests {
             &mut unknown,
             None,
             magnetar_proto::CryptoFailureAction::Fail,
+            magnetar_proto::MAX_FRAME_SIZE,
         ) {
             PostProcessOutcome::Fail(ClientError::Other(message)) => {
                 assert!(message.contains("unknown compression code"));
@@ -6090,6 +6173,7 @@ mod tests {
             &mut malformed,
             None,
             magnetar_proto::CryptoFailureAction::Fail,
+            magnetar_proto::MAX_FRAME_SIZE,
         ) {
             PostProcessOutcome::Fail(ClientError::Other(message)) => {
                 assert!(message.contains("decompress:"));
@@ -6102,6 +6186,7 @@ mod tests {
                 &mut uncompressed,
                 None,
                 magnetar_proto::CryptoFailureAction::Fail,
+                magnetar_proto::MAX_FRAME_SIZE,
             ),
             PostProcessOutcome::Deliver
         ));

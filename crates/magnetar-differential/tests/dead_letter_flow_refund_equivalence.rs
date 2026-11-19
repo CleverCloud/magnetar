@@ -146,6 +146,7 @@ fn trace() -> Trace {
                 name: CONSUMER.to_owned(),
                 receiver_queue_size: RQ,
                 max_redeliver_count: MAX_REDELIVER,
+                max_uncompressed_message_size: None,
             },
             // 2, 3 — first dispatch (`redelivery_count` 0): queued, popped, nacked.
             recv(),

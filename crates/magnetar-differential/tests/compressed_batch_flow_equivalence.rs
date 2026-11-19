@@ -108,6 +108,7 @@ fn trace() -> Trace {
         name: CONSUMER.to_owned(),
         receiver_queue_size: BATCH_SIZE,
         max_redeliver_count: 0,
+        max_uncompressed_message_size: None,
     });
     let decodable = entries()
         .iter()
@@ -201,6 +202,7 @@ async fn batching_producer_keeps_send_order_event_streams_agree() {
             name: CONSUMER.to_owned(),
             receiver_queue_size: BATCH_SIZE,
             max_redeliver_count: 0,
+            max_uncompressed_message_size: None,
         },
     ];
     ops.extend(payloads.iter().map(|_| Op::RecvShared {

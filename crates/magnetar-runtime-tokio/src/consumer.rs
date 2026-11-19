@@ -454,12 +454,14 @@ impl Consumer {
         &self,
         message: &mut IncomingMessage,
     ) -> PostProcessOutcome {
-        let action = self
-            .shared
-            .inner
-            .lock()
-            .consumer_crypto_failure_action(self.handle);
-        post_process_message(message, self.decryptor.as_ref(), action)
+        let (action, limit) = {
+            let conn = self.shared.inner.lock();
+            (
+                conn.consumer_crypto_failure_action(self.handle),
+                conn.consumer_max_uncompressed_message_size(self.handle),
+            )
+        };
+        post_process_message(message, self.decryptor.as_ref(), action, limit)
     }
 
     #[cfg(any(feature = "scalable-topics", test))]
@@ -1502,20 +1504,17 @@ impl Consumer {
             // ADR-0011/ADR-0086: host-clock snapshot at the engine boundary, taken before the
             // connection mutex (ADR-0038).
             let now = std::time::Instant::now();
-            let msg = {
+            let (msg, action, limit) = {
                 let mut conn = self.shared.inner.lock();
-                conn.pop_message(self.handle, now)
+                let action = conn.consumer_crypto_failure_action(self.handle);
+                let limit = conn.consumer_max_uncompressed_message_size(self.handle);
+                (conn.pop_message(self.handle, now), action, limit)
             };
             let Some(mut msg) = msg else { break };
             // PIP-4: honor the per-consumer crypto failure action for any encrypted message
             // popped here (the first message went through `receive()` which already does
             // this).
-            let action = self
-                .shared
-                .inner
-                .lock()
-                .consumer_crypto_failure_action(self.handle);
-            match post_process_message(&mut msg, self.decryptor.as_ref(), action) {
+            match post_process_message(&mut msg, self.decryptor.as_ref(), action, limit) {
                 PostProcessOutcome::Deliver => {
                     acc_bytes = acc_bytes.saturating_add(msg.payload.len());
                     out.push(msg);
@@ -1611,6 +1610,7 @@ fn post_process_message(
     msg: &mut IncomingMessage,
     decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
     crypto_failure_action: magnetar_proto::CryptoFailureAction,
+    max_uncompressed_message_size: usize,
 ) -> PostProcessOutcome {
     // Step 1 — PIP-4 decryption (outermost wrapper on the wire).
     if !msg.metadata.encryption_keys.is_empty() {
@@ -1653,7 +1653,12 @@ fn post_process_message(
                 .metadata
                 .uncompressed_size
                 .map_or(msg.payload.len(), |s| s as usize);
-            match crate::compress::decompress(kind, &msg.payload, expected) {
+            match crate::compress::decompress_with_limit(
+                kind,
+                &msg.payload,
+                expected,
+                max_uncompressed_message_size,
+            ) {
                 Ok(plain) => msg.payload = plain,
                 Err(err) => {
                     return PostProcessOutcome::Fail(ClientError::Other(format!(
@@ -1709,6 +1714,7 @@ impl Future for ReceiveFut {
             // connection mutex (ADR-0038).
             let now = std::time::Instant::now();
             let mut conn = shared.inner.lock();
+            let max_uncompressed_message_size = conn.consumer_max_uncompressed_message_size(handle);
             let Some(mut msg) = conn.pop_message(handle, now) else {
                 // No message ready. First, check whether this consumer handle
                 // has reached a GENUINELY-terminal state — a graceful close, a
@@ -1875,8 +1881,13 @@ impl Future for ReceiveFut {
                         .metadata
                         .uncompressed_size
                         .map_or(msg.payload.len(), |s| s as usize);
-                    let plain = crate::compress::decompress(kind, &msg.payload, expected_size)
-                        .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
+                    let plain = crate::compress::decompress_with_limit(
+                        kind,
+                        &msg.payload,
+                        expected_size,
+                        max_uncompressed_message_size,
+                    )
+                    .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
                     msg.payload = plain;
                 }
             }
@@ -5144,6 +5155,7 @@ mod tests {
                 &mut uncompressed,
                 None,
                 magnetar_proto::CryptoFailureAction::Fail,
+                magnetar_proto::MAX_FRAME_SIZE,
             ),
             super::PostProcessOutcome::Deliver
         ));
@@ -5153,11 +5165,21 @@ mod tests {
     /// Subscribe a consumer on a handshaken connection and feed it one inbound entry carrying
     /// `metadata` over `body`. Returns the assembled tokio `Consumer`.
     fn consumer_fed_with(topic: &str, metadata: &pb::MessageMetadata, body: &[u8]) -> Consumer {
+        consumer_fed_with_limit(topic, metadata, body, magnetar_proto::MAX_FRAME_SIZE)
+    }
+
+    fn consumer_fed_with_limit(
+        topic: &str,
+        metadata: &pb::MessageMetadata,
+        body: &[u8],
+        max_uncompressed_message_size: usize,
+    ) -> Consumer {
         let shared = handshake_complete_shared();
         let handle = shared.inner.lock().subscribe(SubscribeRequest {
             topic: topic.to_owned(),
             subscription: "s".to_owned(),
             sub_type: pb::command_subscribe::SubType::Exclusive,
+            max_uncompressed_message_size,
             ..Default::default()
         });
         let cmd = pb::BaseCommand {
@@ -5186,6 +5208,37 @@ mod tests {
         Consumer::assemble(shared, handle, slot, None)
     }
 
+    fn feed_compressed_message(
+        consumer: &Consumer,
+        entry_id: u64,
+        metadata: &pb::MessageMetadata,
+        body: &[u8],
+    ) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: consumer.handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_payload(&mut frame, &cmd, metadata, body).expect("encode compressed message");
+        consumer
+            .shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle compressed message");
+    }
+
     /// Issue #860 / ADR-0112: a NON-batched compressed message is still decompressed after the
     /// pop, exactly as before — only batched entries moved into `ConsumerState::deliver`.
     /// Both runtimes use the shared bounded decompression kernel after popping an unbatched
@@ -5208,6 +5261,58 @@ mod tests {
         );
         let msg = consumer.receive().await.expect("decompressed receive");
         assert_eq!(msg.payload.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_limit_is_per_slot_and_applies_to_receive_batch() {
+        use magnetar_proto::types::CompressionKind;
+
+        let plaintext = vec![0x5a; magnetar_proto::MAX_FRAME_SIZE + 1];
+        let encoded = crate::compress::compress(CompressionKind::Zstd, &plaintext).expect("zstd");
+        let metadata = pb::MessageMetadata {
+            compression: Some(pb::CompressionType::Zstd as i32),
+            uncompressed_size: Some(plaintext.len() as u32),
+            ..Default::default()
+        };
+        let shared = handshake_complete_shared();
+        let make = |topic: &str, limit| {
+            let handle = shared.inner.lock().subscribe(SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                max_uncompressed_message_size: limit,
+                ..Default::default()
+            });
+            let slot = consumer_slot_for(&shared, handle);
+            Consumer::assemble(shared.clone(), handle, slot, None)
+        };
+        let default = make(
+            "persistent://public/default/default-limit",
+            magnetar_proto::MAX_FRAME_SIZE,
+        );
+        let configured = make(
+            "persistent://public/default/configured-limit",
+            8 * 1024 * 1024,
+        );
+        feed_compressed_message(&default, 0, &metadata, &encoded);
+        feed_compressed_message(&configured, 0, &metadata, &encoded);
+        feed_compressed_message(&configured, 1, &metadata, &encoded);
+
+        let error = default
+            .receive()
+            .await
+            .expect_err("default limit rejects the payload");
+        assert!(
+            error
+                .to_string()
+                .contains("configured decompression ceiling")
+        );
+        let messages = configured
+            .receive_batch_with_bytes_cap(2, 16 * 1024 * 1024, std::time::Duration::ZERO)
+            .await
+            .expect("batch receives both configured payloads");
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.payload == plaintext));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1183,6 +1183,8 @@ impl Workload for ProviderAggregateClient {
                     schema: pb::Schema::default(),
                     receiver_budget,
                     ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+                    max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
                 }),
             )
             .await

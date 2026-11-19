@@ -39,6 +39,29 @@ fn control_plane_error_is_terminal(error: &ClientError) -> bool {
     )
 }
 
+fn validate_decompression_ceiling(
+    message: &magnetar_proto::IncomingMessage,
+    ceiling: usize,
+) -> Result<(), StreamConsumerError> {
+    let compressed = message
+        .metadata
+        .compression
+        .and_then(|kind| magnetar_proto::pb::CompressionType::try_from(kind).ok())
+        .is_some_and(|kind| kind != magnetar_proto::pb::CompressionType::None);
+    if compressed {
+        let size = message
+            .metadata
+            .uncompressed_size
+            .map_or(message.payload.len(), |size| size as usize);
+        if size > ceiling {
+            return Err(StreamConsumerError::Failed(format!(
+                "decompressed message size {size} exceeds configured ceiling {ceiling}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Complete runtime configuration for one assignment-driven aggregate.
 #[derive(Debug, Clone)]
 pub struct StreamConsumerOptions {
@@ -52,6 +75,8 @@ pub struct StreamConsumerOptions {
     pub schema: magnetar_proto::pb::Schema,
     /// One aggregate receive budget.
     pub receiver_budget: magnetar_proto::ReceiverBudget,
+    /// Per-child decompressed payload ceiling.
+    pub max_uncompressed_message_size: usize,
     /// Parent-before-child ordering contract.
     pub ordering_mode: magnetar_proto::OrderingMode,
 }
@@ -160,6 +185,8 @@ pub struct SegmentConsumerOptions {
     pub consumer_name: String,
     /// Broker schema metadata copied to every child subscribe.
     pub schema: magnetar_proto::pb::Schema,
+    /// Per-child decompressed payload ceiling.
+    pub max_uncompressed_message_size: usize,
 }
 
 /// Narrow owned capability used after the public [`crate::Client`] borrow ends.
@@ -582,6 +609,7 @@ impl SegmentSubscriber {
             entry_bucket_dispatch: !bucket_ranges.is_empty(),
             receiver_queue_size: 0,
             defer_payload_processing: true,
+            max_uncompressed_message_size: options.max_uncompressed_message_size,
             consumer_name: Some(format!(
                 "{}-seg-{}",
                 options.consumer_name,
@@ -1154,6 +1182,7 @@ impl StreamConsumer {
                 subscription: options.subscription.clone(),
                 consumer_name: options.consumer_name.clone(),
                 schema: options.schema,
+                max_uncompressed_message_size: options.max_uncompressed_message_size,
             },
             topic,
             subscription: options.subscription,
@@ -2121,6 +2150,8 @@ impl StreamConsumerInner {
             magnetar_proto::StreamEntryAcceptance::Complete(complete) => complete,
         };
 
+        let message = complete.message_mut();
+        validate_decompression_ceiling(message, self.child_options.max_uncompressed_message_size)?;
         let transform_bytes = complete.transform_reservation_bytes()?;
         let mut work = Vec::new();
         if transform_bytes > 0 {
@@ -3795,6 +3826,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn scalable_preflight_exempts_stamped_none_and_checks_compressed_fallback_size() {
+        let raw = deferred_message(
+            1,
+            magnetar_proto::pb::MessageMetadata {
+                compression: Some(magnetar_proto::pb::CompressionType::None as i32),
+                ..Default::default()
+            },
+            bytes::Bytes::from(vec![0; 16]),
+            1,
+        );
+        assert!(validate_decompression_ceiling(&raw.message, 1).is_ok());
+
+        let compressed = deferred_message(
+            2,
+            magnetar_proto::pb::MessageMetadata {
+                compression: Some(magnetar_proto::pb::CompressionType::Zstd as i32),
+                uncompressed_size: None,
+                ..Default::default()
+            },
+            bytes::Bytes::from(vec![0; 16]),
+            1,
+        );
+        assert!(matches!(
+            validate_decompression_ceiling(&compressed.message, 1),
+            Err(StreamConsumerError::Failed(message)) if message.contains("size 16")
+        ));
+    }
+
     fn encode(command: &magnetar_proto::pb::BaseCommand) -> bytes::BytesMut {
         let mut bytes = bytes::BytesMut::new();
         magnetar_proto::encode_command(&mut bytes, command).expect("encode command");
@@ -4298,6 +4358,8 @@ mod tests {
                 subscription: "workers".to_owned(),
                 consumer_name: "worker-a".to_owned(),
                 schema: magnetar_proto::pb::Schema::default(),
+
+                max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
@@ -4347,6 +4409,8 @@ mod tests {
                 subscription: "workers".to_owned(),
                 consumer_name: "worker-a".to_owned(),
                 schema: magnetar_proto::pb::Schema::default(),
+
+                max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
@@ -4569,6 +4633,7 @@ mod tests {
 
     fn attached_child_consumer(
         source: &magnetar_proto::SegmentSource,
+        max_uncompressed_message_size: usize,
     ) -> (crate::Consumer, Arc<ConnectionShared>) {
         let shared = connected_shared();
         let (handle, slot) = {
@@ -4578,6 +4643,7 @@ mod tests {
                 topic: source.topic().to_owned(),
                 subscription: "workers".to_owned(),
                 receiver_queue_size: 0,
+                max_uncompressed_message_size,
                 ..Default::default()
             });
             let slot = conn.consumer(handle).expect("child slot").clone();
@@ -4618,6 +4684,22 @@ mod tests {
         assignment: magnetar_proto::ConsumerAssignment,
         ordering_mode: magnetar_proto::OrderingMode,
     ) -> (Arc<StreamConsumerInner>, Arc<ConnectionShared>) {
+        aggregate_inner_with_child_from_ordered_limits(
+            snapshot,
+            assignment,
+            ordering_mode,
+            magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024).expect("valid budget"),
+            magnetar_proto::MAX_FRAME_SIZE,
+        )
+    }
+
+    fn aggregate_inner_with_child_from_ordered_limits(
+        snapshot: magnetar_proto::DagSnapshot,
+        assignment: magnetar_proto::ConsumerAssignment,
+        ordering_mode: magnetar_proto::OrderingMode,
+        receiver_budget: magnetar_proto::ReceiverBudget,
+        max_uncompressed_message_size: usize,
+    ) -> (Arc<StreamConsumerInner>, Arc<ConnectionShared>) {
         let subscriber = subscriber_with_allow_list();
         let source = assignment.segments()[0].source();
         let segment_id = source.segment_id();
@@ -4627,7 +4709,7 @@ mod tests {
             magnetar_proto::ControllerIncarnation(1),
             ordering_mode,
             snapshot.clone(),
-            magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024).expect("valid budget"),
+            receiver_budget,
         )
         .expect("aggregate model");
         let open = model
@@ -4655,13 +4737,15 @@ mod tests {
             })
             .expect("flow reservation");
 
-        let (child, child_shared) = attached_child_consumer(&source);
+        let (child, child_shared) = attached_child_consumer(&source, max_uncompressed_message_size);
         let inner = Arc::new(StreamConsumerInner {
             subscriber,
             child_options: SegmentConsumerOptions {
                 subscription: "workers".to_owned(),
                 consumer_name: "worker-a".to_owned(),
                 schema: magnetar_proto::pb::Schema::default(),
+
+                max_uncompressed_message_size,
             },
             topic: "topic://public/default/scaled".to_owned(),
             subscription: "workers".to_owned(),
@@ -4701,6 +4785,20 @@ mod tests {
     fn aggregate_inner_with_child() -> (Arc<StreamConsumerInner>, Arc<ConnectionShared>) {
         let (snapshot, assignment) = control_plane_fixture();
         aggregate_inner_with_child_from(snapshot, assignment)
+    }
+
+    fn aggregate_inner_with_child_limits(
+        receiver_budget: magnetar_proto::ReceiverBudget,
+        max_uncompressed_message_size: usize,
+    ) -> (Arc<StreamConsumerInner>, Arc<ConnectionShared>) {
+        let (snapshot, assignment) = control_plane_fixture();
+        aggregate_inner_with_child_from_ordered_limits(
+            snapshot,
+            assignment,
+            magnetar_proto::OrderingMode::BrokerManaged,
+            receiver_budget,
+            max_uncompressed_message_size,
+        )
     }
 
     #[test]
@@ -4886,7 +4984,7 @@ mod tests {
             )
             .await;
         assert!(matches!(
-            result,
+            &result,
             Err(StreamConsumerError::Failed(message)) if message == DISCARD_POLICY_ERROR
         ));
         assert!(inner.state.lock().queue.is_empty());
@@ -5905,6 +6003,7 @@ mod tests {
             consumer_name: "worker-a".to_owned(),
             schema: proto::pb::Schema::default(),
             receiver_budget: ReceiverBudget::bytes(16 * 1024 * 1024).expect("budget"),
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
             ordering_mode: proto::OrderingMode::BrokerManaged,
         }));
         std::future::poll_fn(|cx| {
@@ -7310,6 +7409,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_ceiling_and_receiver_budget_bound_real_scaled_delivery() {
+        const CEILING: usize = 8 * 1024 * 1024;
+        let payload = vec![0x5a; 6 * 1024 * 1024];
+        let compressed = magnetar_proto::compress::compress(
+            magnetar_proto::types::CompressionKind::Zstd,
+            &payload,
+        )
+        .expect("compress scalable payload");
+        let receiver_budget =
+            magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024).expect("valid receiver budget");
+        let (inner, child_shared) = aggregate_inner_with_child_limits(receiver_budget, CEILING);
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        let message = deferred_message(
+            77,
+            magnetar_proto::pb::MessageMetadata {
+                compression: Some(magnetar_proto::pb::CompressionType::Zstd as i32),
+                uncompressed_size: Some(u32::try_from(payload.len()).expect("fits wire field")),
+                ..Default::default()
+            },
+            compressed,
+            1,
+        );
+        let epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                epoch,
+                &child.consumer,
+                message,
+            )
+            .await
+            .expect("configured child accepts a 6 MiB payload");
+        let messages = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve scaled delivery");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.payload.as_ref(), payload);
+        assert!(
+            inner.state.lock().model.status().receiver_budget_used()
+                <= receiver_budget.data_limit()
+        );
+        drop(messages);
+        let refill = next_staged_command(&child_shared).await;
+        assert_eq!(
+            refill
+                .flow
+                .expect("successful transformed delivery refills child FLOW")
+                .message_permits,
+            1
+        );
+        close_scaled_child(&inner, &child_shared).await;
+
+        let receiver_budget = magnetar_proto::ReceiverBudget::bytes(14 * 1024 * 1024)
+            .expect("valid smaller receiver budget");
+        let (inner, child_shared) = aggregate_inner_with_child_limits(receiver_budget, CEILING);
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        let compressed = magnetar_proto::compress::compress(
+            magnetar_proto::types::CompressionKind::Zstd,
+            &payload,
+        )
+        .expect("compress scalable payload");
+        let message = deferred_message(
+            78,
+            magnetar_proto::pb::MessageMetadata {
+                compression: Some(magnetar_proto::pb::CompressionType::Zstd as i32),
+                uncompressed_size: Some(u32::try_from(payload.len()).expect("fits wire field")),
+                ..Default::default()
+            },
+            compressed,
+            1,
+        );
+        let epoch = child_shared.inner.lock().session_epoch();
+        let result = inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                epoch,
+                &child.consumer,
+                message,
+            )
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(StreamConsumerError::Model(
+                    magnetar_proto::StreamConsumerModelError::Budget(
+                        magnetar_proto::BudgetError::MessageTooLargeForBudget {
+                            required: 14_942_209,
+                            limit: 14_614_528,
+                        }
+                    )
+                ))
+            ),
+            "unexpected aggregate-budget result: {result:?}"
+        );
+        assert!(inner.state.lock().queue.is_empty());
+        resync_and_confirm_child(&inner, &child_shared).await;
+    }
+
+    async fn close_scaled_child(inner: &Arc<StreamConsumerInner>, shared: &Arc<ConnectionShared>) {
+        let close_inner = inner.clone();
+        let close_task = tokio::spawn(async move { close_inner.close().await });
+        let close = next_staged_command(shared)
+            .await
+            .close_consumer
+            .expect("close child command");
+        let success = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&success))
+            .expect("confirm child close");
+        shared.event_waker.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), close_task)
+            .await
+            .expect("scaled child close completes")
+            .expect("close task joins")
+            .expect("scaled aggregate closes");
+        assert_eq!(inner.state.lock().model.status().receiver_budget_used(), 0);
+        assert!(inner.state.lock().flow_reservations.is_empty());
+    }
+
+    async fn resync_and_confirm_child(
+        inner: &Arc<StreamConsumerInner>,
+        shared: &Arc<ConnectionShared>,
+    ) {
+        inner.request_resync("receiver budget rejected decode workspace".to_owned());
+        let close = next_staged_command(shared)
+            .await
+            .close_consumer
+            .expect("resync closes the child");
+        let success = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&success))
+            .expect("confirm resync child close");
+        shared.event_waker.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                inner.reap_completed_tasks();
+                let complete = {
+                    let state = inner.state.lock();
+                    let complete = state.children.is_empty() && state.flow_reservations.is_empty();
+                    if complete {
+                        assert_eq!(state.model.status().receiver_budget_used(), 0);
+                    }
+                    complete
+                };
+                if complete {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resync child cleanup releases aggregate reservation");
+    }
+
+    #[tokio::test]
     async fn partial_batch_delivers_selected_members_with_exact_ids_and_debt() {
         let (inner, child_shared) = aggregate_inner_with_child();
         let child = inner
@@ -7518,7 +7807,8 @@ mod tests {
             .expect("second segment topic"),
         )
         .expect("second source");
-        let (second_consumer, second_shared) = attached_child_consumer(&second_source);
+        let (second_consumer, second_shared) =
+            attached_child_consumer(&second_source, magnetar_proto::MAX_FRAME_SIZE);
         inner.state.lock().children.insert(
             second_source.segment_id(),
             ChildRuntime {
@@ -8352,6 +8642,8 @@ mod tests {
             subscription: "workers".to_owned(),
             consumer_name: "worker-a".to_owned(),
             schema: magnetar_proto::pb::Schema::default(),
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         };
         let mut descriptor = snapshot
             .segment(source.segment_id())
@@ -8522,6 +8814,8 @@ mod tests {
                 subscription: "workers".to_owned(),
                 consumer_name: "member".to_owned(),
                 schema: magnetar_proto::pb::Schema::default(),
+
+                max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
             };
             let mut opening = Box::pin(subscriber.open_segment_consumer(
                 &source,

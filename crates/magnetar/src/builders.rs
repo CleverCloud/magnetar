@@ -515,6 +515,18 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         self
     }
 
+    /// Set the maximum decompressed payload size accepted by this consumer, in bytes.
+    /// Defaults to 5 MiB, independently of the 5 MiB wire-frame limit. Larger values allow
+    /// larger compressed messages but increase the maximum memory retained for each queued
+    /// message; aggregate batch memory accounting remains independently bounded. Values above
+    /// `isize::MAX - 1` cannot be used for a decompression allocation. Raw `None` payloads are not
+    /// decompressed and remain subject to the wire-frame limit.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.req.max_uncompressed_message_size = bytes;
+        self
+    }
+
     /// Set a pluggable receiver-queue-size policy (issue #301, PIP-74
     /// `autoScaledReceiverQueueSizeEnabled` parity).
     ///
@@ -1039,6 +1051,14 @@ impl<'a, E: crate::Engine> ReaderBuilder<'a, E> {
     #[must_use]
     pub fn receiver_queue_size(mut self, size: usize) -> Self {
         self.inner = self.inner.receiver_queue_size(size);
+        self
+    }
+
+    /// Set the maximum decompressed payload size accepted by this reader, in bytes.
+    /// Defaults to 5 MiB, independently of the wire-frame limit.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.max_uncompressed_message_size(bytes);
         self
     }
 
