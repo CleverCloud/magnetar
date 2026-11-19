@@ -597,11 +597,7 @@ fn spawn_drain<C: crate::ConsumerApi + Clone>(
             let Ok(msg) = crate::ConsumerApi::receive(&consumer).await else {
                 break;
             };
-            let key = msg
-                .single_metadata
-                .as_ref()
-                .and_then(|sm| sm.partition_key.clone())
-                .or_else(|| msg.metadata.partition_key.clone());
+            let key = table_key(&msg);
             let Some(key) = key else {
                 let _ = crate::ConsumerApi::ack(&consumer, msg.message_id).await;
                 continue;
@@ -921,8 +917,65 @@ impl<S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'_, S, TokioEngine
     }
 }
 
+/// The table key of a received message: a batch member's OWN key. A keyless member has none and
+/// is skipped like Java's `TableView` (the envelope's key is the batch's FIRST member's, so it
+/// must not overwrite that member's entry).
+fn table_key(msg: &magnetar_proto::event::IncomingMessage) -> Option<String> {
+    msg.effective_partition_key().map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
+    fn batch_member(
+        envelope_key: Option<&str>,
+        single: Option<magnetar_proto::pb::SingleMessageMetadata>,
+    ) -> magnetar_proto::event::IncomingMessage {
+        magnetar_proto::event::IncomingMessage {
+            message_id: magnetar_proto::MessageId {
+                ledger_id: 1,
+                entry_id: 2,
+                partition: -1,
+                batch_index: 0,
+                batch_size: 2,
+            },
+            metadata: Arc::new(magnetar_proto::pb::MessageMetadata {
+                partition_key: envelope_key.map(str::to_owned),
+                ..Default::default()
+            }),
+            single_metadata: single,
+            payload: Bytes::new(),
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+
+    /// A Java envelope carries the FIRST member's key: a keyless member must be skipped, and a
+    /// keyed member must use its own key, never the envelope's.
+    #[test]
+    fn table_key_is_the_batch_members_own_key() {
+        let keyed = magnetar_proto::pb::SingleMessageMetadata {
+            partition_key: Some("member-key".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            table_key(&batch_member(Some("first-key"), Some(keyed))).as_deref(),
+            Some("member-key")
+        );
+        assert_eq!(
+            table_key(&batch_member(
+                Some("first-key"),
+                Some(magnetar_proto::pb::SingleMessageMetadata::default())
+            )),
+            None,
+            "a keyless member is skipped, not filed under the first member's key"
+        );
+        assert_eq!(
+            table_key(&batch_member(Some("plain-key"), None)).as_deref(),
+            Some("plain-key")
+        );
+    }
+
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use super::*;

@@ -1290,12 +1290,7 @@ impl Consumer {
         let drained = self.drain_dead_letter();
         let mut count = 0;
         for msg in drained {
-            let mut metadata = magnetar_proto::pb::MessageMetadata::default();
-            metadata.partition_key = msg.metadata.partition_key.clone();
-            metadata.partition_key_b64_encoded = msg.metadata.partition_key_b64_encoded;
-            metadata.ordering_key = msg.metadata.ordering_key.clone();
-            metadata.event_time = msg.metadata.event_time;
-            metadata.properties = msg.metadata.properties.clone();
+            let mut metadata = msg.republish_metadata();
             // Re-inject / override (e.g. OTel traceparent) before the correlation stamps.
             // Mirrors Java's DeadLetterTopicMessageId property convention.
             Self::apply_property_overrides(&mut metadata.properties, extra_properties.clone());
@@ -1398,14 +1393,7 @@ impl Consumer {
             delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             "scheduling reconsume"
         );
-        let mut metadata = magnetar_proto::pb::MessageMetadata {
-            partition_key: msg.metadata.partition_key.clone(),
-            partition_key_b64_encoded: msg.metadata.partition_key_b64_encoded,
-            ordering_key: msg.metadata.ordering_key.clone(),
-            event_time: msg.metadata.event_time,
-            properties: msg.metadata.properties.clone(),
-            ..magnetar_proto::pb::MessageMetadata::default()
-        };
+        let mut metadata = msg.republish_metadata();
         // Apply custom properties (overrides on key collision).
         Self::apply_property_overrides(&mut metadata.properties, custom_properties);
         // Bump the RECONSUMETIMES property if present, otherwise stamp it at 1. Mirrors

@@ -766,9 +766,16 @@ impl IncomingMessage {
 
 impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
     fn from(msg: magnetar_proto::event::IncomingMessage) -> Self {
+        // A batch member surfaces its OWN key, ordering key, event time and properties through
+        // every accessor, not the shared batch envelope's (Java `MessageImpl` semantics).
+        let metadata = if msg.single_metadata.is_some() {
+            std::sync::Arc::new(msg.effective_metadata())
+        } else {
+            msg.metadata
+        };
         Self {
             id: msg.message_id,
-            metadata: msg.metadata,
+            metadata,
             payload: msg.payload,
             redelivery_count: msg.redelivery_count,
             broker_entry_metadata: msg.broker_entry_metadata,
@@ -1651,5 +1658,84 @@ mod outgoing_message_tests {
         let mut msg = message_with(pb::MessageMetadata::default());
         i.before_consume(&mut msg);
         assert_eq!(i.seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod batch_member_accessor_tests {
+    use super::*;
+
+    fn incoming(
+        single: Option<pb::SingleMessageMetadata>,
+    ) -> magnetar_proto::event::IncomingMessage {
+        let envelope = pb::MessageMetadata {
+            partition_key: Some("envelope-key".to_owned()),
+            ordering_key: Some(Bytes::from_static(b"envelope-order")),
+            event_time: Some(10),
+            properties: vec![pb::KeyValue {
+                key: "custom".to_owned(),
+                value: "envelope".to_owned(),
+            }],
+            ..Default::default()
+        };
+        magnetar_proto::event::IncomingMessage {
+            message_id: magnetar_proto::MessageId {
+                ledger_id: 1,
+                entry_id: 2,
+                partition: -1,
+                batch_index: 0,
+                batch_size: 2,
+            },
+            metadata: std::sync::Arc::new(envelope),
+            single_metadata: single,
+            payload: Bytes::new(),
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn batch_member_accessors_return_the_members_own_values() {
+        let single = pb::SingleMessageMetadata {
+            partition_key: Some("member-key".to_owned()),
+            ordering_key: Some(Bytes::from_static(b"member-order")),
+            event_time: Some(20),
+            properties: vec![pb::KeyValue {
+                key: "custom".to_owned(),
+                value: "member".to_owned(),
+            }],
+            ..Default::default()
+        };
+        let msg = IncomingMessage::from(incoming(Some(single)));
+        assert_eq!(msg.key(), Some("member-key"));
+        assert_eq!(
+            msg.ordering_key().map(Bytes::as_ref),
+            Some(&b"member-order"[..])
+        );
+        assert_eq!(msg.event_time_ms(), 20);
+        assert_eq!(msg.property("custom"), Some("member"));
+        assert_eq!(
+            msg.properties().collect::<Vec<_>>(),
+            vec![("custom", "member")]
+        );
+    }
+
+    #[test]
+    fn keyless_batch_member_has_no_key_and_inherits_the_event_time() {
+        let msg = IncomingMessage::from(incoming(Some(pb::SingleMessageMetadata::default())));
+        assert_eq!(msg.key(), None);
+        assert!(!msg.has_key());
+        assert_eq!(msg.ordering_key(), None);
+        assert_eq!(msg.event_time_ms(), 10);
+        assert!(!msg.has_properties());
+    }
+
+    #[test]
+    fn unbatched_message_accessors_are_unchanged() {
+        let msg = IncomingMessage::from(incoming(None));
+        assert_eq!(msg.key(), Some("envelope-key"));
+        assert_eq!(msg.event_time_ms(), 10);
+        assert_eq!(msg.property("custom"), Some("envelope"));
     }
 }

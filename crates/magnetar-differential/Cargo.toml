@@ -28,6 +28,10 @@ scalable-topics = [
     "magnetar-runtime-moonpool/scalable-topics",
 ]
 
+# ADR-0053: lets `tests/batch_dlq_republish_equivalence.rs` execute the façade's
+# `otel::extract_context*` so the gated coverage domain instruments `otel.rs`.
+opentelemetry = ["magnetar-driver/opentelemetry"]
+
 # FoundationDB-style buggify fault-injection (ADR-0048). Default OFF.
 # Forwards to proto + engines. The differential harness itself does
 # NOT enable buggify in any of its assertions: the equivalence
