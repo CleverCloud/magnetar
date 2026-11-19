@@ -1076,6 +1076,8 @@ pub struct StreamConsumerOptions {
     pub schema: magnetar_proto::pb::Schema,
     /// One aggregate receive budget, never multiplied by child count.
     pub receiver_budget: magnetar_proto::ReceiverBudget,
+    /// Per-child decompressed payload ceiling.
+    pub max_uncompressed_message_size: usize,
     /// Parent-before-child ordering policy.
     pub ordering_mode: magnetar_proto::OrderingMode,
 }

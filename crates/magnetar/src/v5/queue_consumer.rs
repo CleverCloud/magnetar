@@ -161,6 +161,13 @@ impl<'a, E: Engine> QueueConsumerBuilder<'a, E> {
         self
     }
 
+    /// Set the maximum decompressed payload size accepted by this consumer, in bytes.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.max_uncompressed_message_size(bytes);
+        self
+    }
+
     /// Set the ack timeout. `None` disables.
     #[must_use]
     pub fn ack_timeout(mut self, d: Option<std::time::Duration>) -> Self {

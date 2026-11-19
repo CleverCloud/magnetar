@@ -170,6 +170,7 @@ fn trace() -> Trace {
             receiver_queue_size: RQ,
             // Issue #437: no dead-letter threshold — this trace predates it.
             max_redeliver_count: 0,
+            max_uncompressed_message_size: None,
         },
         // 2
         recv(),
@@ -410,6 +411,7 @@ async fn unbatched_shared_delivery_is_unchanged() {
         receiver_queue_size: RQ,
         // Issue #437: no dead-letter threshold — this trace predates it.
         max_redeliver_count: 0,
+        max_uncompressed_message_size: None,
     });
     for _ in &payloads {
         ops.push(recv());

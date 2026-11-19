@@ -472,6 +472,7 @@ impl super::SegmentSubscriberApi for magnetar_runtime_tokio::Client {
                     consumer_name: options.consumer_name,
                     schema: options.schema,
                     receiver_budget: options.receiver_budget,
+                    max_uncompressed_message_size: options.max_uncompressed_message_size,
                     ordering_mode: options.ordering_mode,
                 })
                 .await

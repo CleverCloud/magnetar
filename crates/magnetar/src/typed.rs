@@ -1151,6 +1151,7 @@ pub struct TypedConsumerBuilder<'a, S: Schema, E: crate::Engine = crate::TokioEn
     durable: bool,
     initial_position: pb::command_subscribe::InitialPosition,
     receiver_queue_size: usize,
+    max_uncompressed_message_size: Option<usize>,
     consumer_name: Option<String>,
     priority_level: Option<i32>,
     properties: Vec<(String, String)>,
@@ -1194,6 +1195,7 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
             durable: true,
             initial_position: pb::command_subscribe::InitialPosition::Latest,
             receiver_queue_size: 1000,
+            max_uncompressed_message_size: None,
             consumer_name: None,
             priority_level: None,
             properties: Vec::new(),
@@ -1308,6 +1310,14 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
     #[must_use]
     pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
         self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Set the maximum decompressed payload size accepted by the underlying consumer, in bytes.
+    /// Defaults to 5 MiB.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.max_uncompressed_message_size = Some(bytes);
         self
     }
 
@@ -1462,6 +1472,9 @@ where
             .receiver_queue_size(self.receiver_queue_size)
             .read_compacted(self.read_compacted)
             .schema(schema_pb);
+        if let Some(bytes) = self.max_uncompressed_message_size {
+            builder = builder.max_uncompressed_message_size(bytes);
+        }
         if let Some(name) = self.consumer_name {
             builder = builder.name(name);
         }

@@ -893,6 +893,7 @@ pub struct StreamConsumerBuilder<'a, S: Schema, E: Engine = crate::TokioEngine> 
     subscription: Option<String>,
     consumer_name: Option<String>,
     receiver_budget: ReceiverBudget,
+    max_uncompressed_message_size: usize,
     ordering_mode: OrderingMode,
 }
 
@@ -924,6 +925,7 @@ where
             subscription: None,
             consumer_name: None,
             receiver_budget,
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
             ordering_mode: OrderingMode::Strict,
         }
     }
@@ -948,6 +950,13 @@ where
     #[must_use]
     pub const fn receiver_budget(mut self, receiver_budget: ReceiverBudget) -> Self {
         self.receiver_budget = receiver_budget;
+        self
+    }
+
+    /// Set the per-child decompressed payload ceiling, independently of the wire-frame limit.
+    #[must_use]
+    pub const fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.max_uncompressed_message_size = bytes;
         self
     }
 
@@ -1000,6 +1009,7 @@ where
             consumer_name: consumer_name.clone(),
             schema,
             receiver_budget: self.receiver_budget,
+            max_uncompressed_message_size: self.max_uncompressed_message_size,
             ordering_mode: self.ordering_mode,
         };
         let backend = crate::engine::SegmentSubscriberApi::subscribe_stream_consumer(
@@ -1843,6 +1853,7 @@ mod tests {
             .subscription("workers")
             .consumer_name("worker-a")
             .receiver_budget(budget)
+            .max_uncompressed_message_size(8 * 1024 * 1024)
             .ordering_mode(OrderingMode::BrokerManaged)
             .subscribe()
             .await
@@ -1852,6 +1863,7 @@ mod tests {
         assert_eq!(options.subscription, "workers");
         assert_eq!(options.consumer_name, "worker-a");
         assert_eq!(options.receiver_budget, budget);
+        assert_eq!(options.max_uncompressed_message_size, 8 * 1024 * 1024);
         assert_eq!(options.ordering_mode, OrderingMode::BrokerManaged);
         assert_eq!(consumer.subscription(), "workers");
     }

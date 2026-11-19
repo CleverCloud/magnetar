@@ -293,6 +293,8 @@ pub struct ConsumerState {
     /// policy it never changes, so behaviour is identical to the raw-`usize`
     /// design; an [`crate::receiver_queue::Auto`] policy ramps it under load.
     pub receiver_queue_size: usize,
+    /// Per-message decompressed output ceiling, independent of the wire-frame limit.
+    pub max_uncompressed_message_size: usize,
     /// Pluggable receiver-queue-size policy (issue #301). Holds only immutable
     /// configuration — all mutable target state lives in
     /// [`Self::receiver_queue_size`]. `Arc<dyn>` so a subscribe replay clones the
@@ -1159,6 +1161,7 @@ impl ConsumerState {
             subscription,
             consumer_name: None,
             receiver_queue_size,
+            max_uncompressed_message_size: crate::MAX_FRAME_SIZE,
             policy,
             queued_bytes: 0,
             adjust_interval,
@@ -2351,7 +2354,12 @@ impl ConsumerState {
             // Members surfaced from a decoded body carry `compression = None`, which is what
             // keeps both engines' post-pop decompression off them.
             let mut metadata = metadata;
-            let members = unpack_batch_members(&mut metadata, body, num_in_batch);
+            let members = unpack_batch_members(
+                &mut metadata,
+                body,
+                num_in_batch,
+                self.max_uncompressed_message_size,
+            );
             let decoded = members.len();
             // Wrap the per-batch metadata once so every sub-message shares
             // a refcount instead of deep-cloning. For a 100-message batch
@@ -2712,8 +2720,8 @@ type BatchMember = (pb::SingleMessageMetadata, Bytes);
 /// 2. **magnetar ≤ 1.7.2 layout** — a raw packed body whose members were each compressed on their
 ///    own, with `uncompressed_size` holding the sum of the COMPRESSED member sizes. No field names
 ///    a member's real size, so each member is decoded by [`crate::compress::decompress_within`]
-///    under one [`crate::MAX_FRAME_SIZE`] budget shared by the whole entry. No client could read
-///    this layout before ADR-0112: the post-pop decompression checked every member against the
+///    under one configured output budget shared by the whole entry. No client could read this
+///    layout before ADR-0112: the post-pop decompression checked every member against the
 ///    batch-level size and rejected it.
 ///
 /// Members are committed only when a layout decodes in full, so a Java attempt that fails
@@ -2727,6 +2735,7 @@ fn unpack_batch_members(
     metadata: &mut pb::MessageMetadata,
     body: Bytes,
     num_in_batch: i32,
+    max_uncompressed_message_size: usize,
 ) -> Vec<BatchMember> {
     let codec = match metadata.compression.map(pb::CompressionType::try_from) {
         None | Some(Ok(pb::CompressionType::None)) => {
@@ -2737,13 +2746,21 @@ fn unpack_batch_members(
     };
     let java = metadata
         .uncompressed_size
-        .and_then(|size| crate::compress::decompress(codec, &body, size as usize).ok())
+        .and_then(|size| {
+            crate::compress::decompress_with_limit(
+                codec,
+                &body,
+                size as usize,
+                max_uncompressed_message_size,
+            )
+            .ok()
+        })
         .map(|whole| split_batch_body(whole, num_in_batch));
     let members = match java {
         Some((members, true)) => members,
         // A body that decoded to exactly `uncompressed_size` but split short is still the Java
         // layout: like `receiveIndividualMessagesFromBatch`, deliver what parsed.
-        java => legacy_batch_members(codec, body, num_in_batch)
+        java => legacy_batch_members(codec, body, num_in_batch, max_uncompressed_message_size)
             .or_else(|| java.map(|(prefix, _)| prefix))
             .unwrap_or_default(),
     };
@@ -2755,19 +2772,26 @@ fn unpack_batch_members(
 
 /// Decode the magnetar ≤ 1.7.2 batch layout: a raw packed body whose every member payload was
 /// compressed on its own with `codec`. `None` unless the body splits into all `num_in_batch`
-/// members AND every member decodes within the entry's shared [`crate::MAX_FRAME_SIZE`] budget.
+/// members AND every member decodes within the entry's shared configured output budget.
 fn legacy_batch_members(
     codec: crate::types::CompressionKind,
     body: Bytes,
     num_in_batch: i32,
+    max_uncompressed_message_size: usize,
 ) -> Option<Vec<BatchMember>> {
     let (members, complete) = split_batch_body(body, num_in_batch);
-    let mut budget = crate::MAX_FRAME_SIZE;
+    let mut budget = max_uncompressed_message_size;
     complete
         .then_some(members)?
         .into_iter()
         .map(|(single, payload)| {
-            let plain = crate::compress::decompress_within(codec, &payload, budget).ok()?;
+            let plain = crate::compress::decompress_within_limit(
+                codec,
+                &payload,
+                budget,
+                max_uncompressed_message_size,
+            )
+            .ok()?;
             budget = budget.saturating_sub(plain.len());
             Some((single, plain))
         })
@@ -5445,6 +5469,65 @@ mod tests {
                 "{codec:?}: a legacy member must be decoded on its own, not handed over compressed"
             );
         }
+    }
+
+    #[test]
+    fn legacy_batch_uses_one_configured_entry_budget_and_refunds_on_overflow() {
+        let large = vec![0x42; 3 * 1024 * 1024];
+        let payloads = vec![large.clone(), large.clone()];
+        let (meta, body) = legacy_layout(crate::types::CompressionKind::Zstd, &payloads);
+        assert!(body.len() < crate::MAX_FRAME_SIZE);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_uncompressed_message_size = 8 * 1024 * 1024;
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 2 }));
+        assert_eq!(drain_plaintext(&mut c), payloads);
+
+        let smaller = vec![0x24; 768 * 1024];
+        let (meta, body) = legacy_layout(
+            crate::types::CompressionKind::Zstd,
+            std::slice::from_ref(&smaller),
+        );
+        let mut c = ConsumerState::new(ConsumerHandle(3), "t".to_owned(), "s".to_owned(), 4);
+        c.max_uncompressed_message_size = 1024 * 1024;
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 1 }));
+        assert_eq!(drain_plaintext(&mut c), vec![smaller.clone()]);
+
+        let payloads = vec![smaller.clone(), smaller];
+        let (meta, body) = legacy_layout(crate::types::CompressionKind::Zstd, &payloads);
+        let mut c = ConsumerState::new(ConsumerHandle(2), "t".to_owned(), "s".to_owned(), 4);
+        c.max_uncompressed_message_size = 1024 * 1024;
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 0 }));
+        assert_eq!(c.queue_len(), 0, "legacy members are all-or-nothing");
+        assert_eq!(c.permit_balance, 2);
+        assert_eq!(c.maybe_flow().unwrap().message_permits, 2);
+    }
+
+    #[test]
+    fn java_batch_above_wire_limit_uses_consumer_ceiling() {
+        let large = vec![0x58; 3 * 1024 * 1024];
+        let payloads = vec![large.clone(), large];
+        let (meta, body) = java_layout(crate::types::CompressionKind::Zstd, &payloads);
+        assert!(body.len() < crate::MAX_FRAME_SIZE);
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        c.max_uncompressed_message_size = 8 * 1024 * 1024;
+        let _ = c.initial_flow();
+        let outcome = c
+            .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { count: 2 }));
+        assert_eq!(drain_plaintext(&mut c), payloads);
     }
 
     #[test]

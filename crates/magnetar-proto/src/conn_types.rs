@@ -1024,6 +1024,9 @@ impl Default for CreateProducerRequest {
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SubscribeRequest {
+    /// Maximum uncompressed bytes accepted for one message; this is independent of the wire
+    /// frame ceiling. Defaults to [`crate::MAX_FRAME_SIZE`].
+    pub max_uncompressed_message_size: usize,
     /// Topic name.
     pub topic: String,
     /// Subscription name.
@@ -1189,6 +1192,7 @@ impl Default for KeySharedConfig {
 impl Default for SubscribeRequest {
     fn default() -> Self {
         Self {
+            max_uncompressed_message_size: crate::MAX_FRAME_SIZE,
             topic: String::new(),
             subscription: String::new(),
             sub_type: pb::command_subscribe::SubType::Exclusive,

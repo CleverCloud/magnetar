@@ -168,6 +168,8 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
                 .expect("valid direct aggregate budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open direct Tokio aggregate");
@@ -312,6 +314,8 @@ async fn run_tokio_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace {
         subscription: subscription.clone(),
         consumer_name: consumer_name.clone(),
         schema: magnetar_proto::pb::Schema::default(),
+
+        max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
     };
 
     let mut mismatched = descriptor.clone();
@@ -520,6 +524,8 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
                 .expect("valid direct aggregate budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open direct Moonpool aggregate");
@@ -664,6 +670,8 @@ async fn run_moonpool_surface(cluster: &M1SocketCluster) -> RuntimeSurfaceTrace 
         subscription: subscription.clone(),
         consumer_name: consumer_name.clone(),
         schema: magnetar_proto::pb::Schema::default(),
+
+        max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
     };
 
     let mut mismatched = descriptor.clone();
@@ -979,6 +987,8 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
                     subscription: "failure-sub".to_owned(),
                     consumer_name: "segment-timeout-member".to_owned(),
                     schema: magnetar_proto::pb::Schema::default(),
+
+                    max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
                 },
                 &[],
             )
@@ -1073,6 +1083,8 @@ async fn run_tokio_failures() -> RuntimeFailureTrace {
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
                 .expect("valid close-failure budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open Tokio close-failure aggregate");
@@ -1360,6 +1372,8 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
                     subscription: "failure-sub".to_owned(),
                     consumer_name: "segment-timeout-member".to_owned(),
                     schema: magnetar_proto::pb::Schema::default(),
+
+                    max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
                 },
                 &[],
             )
@@ -1476,6 +1490,8 @@ async fn run_moonpool_failures() -> RuntimeFailureTrace {
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(16 * 1024 * 1024)
                 .expect("valid close-failure budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open Moonpool close-failure aggregate");
@@ -1632,6 +1648,8 @@ async fn run_tokio_transactions(cluster: &M1SocketCluster) -> RuntimeTransaction
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
                 .expect("valid Tokio transaction-surface budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open Tokio transaction-surface aggregate");
@@ -1890,6 +1908,8 @@ async fn run_moonpool_transactions(cluster: &M1SocketCluster) -> RuntimeTransact
             receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
                 .expect("valid Moonpool transaction-surface budget"),
             ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
         })
         .await
         .expect("open Moonpool transaction-surface aggregate");

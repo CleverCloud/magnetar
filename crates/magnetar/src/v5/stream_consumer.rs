@@ -162,6 +162,13 @@ impl<'a, E: Engine> StreamConsumerBuilder<'a, E> {
         self
     }
 
+    /// Set the maximum decompressed payload size accepted by this consumer, in bytes.
+    #[must_use]
+    pub fn max_uncompressed_message_size(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.max_uncompressed_message_size(bytes);
+        self
+    }
+
     /// Set the ack timeout. `None` disables (matches v4 `ack_timeout_ms == 0`).
     #[must_use]
     pub fn ack_timeout(mut self, d: Option<std::time::Duration>) -> Self {

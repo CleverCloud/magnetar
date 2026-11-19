@@ -481,6 +481,7 @@ async fn replay(
                 name,
                 receiver_queue_size,
                 max_redeliver_count,
+                max_uncompressed_message_size,
             } => {
                 stream.push(
                     open_shared_consumer(
@@ -492,6 +493,8 @@ async fn replay(
                         SharedConsumerWindow {
                             receiver_queue_size: *receiver_queue_size,
                             max_redeliver_count: *max_redeliver_count,
+                            max_uncompressed_message_size: max_uncompressed_message_size
+                                .unwrap_or(magnetar_proto::MAX_FRAME_SIZE),
                         },
                         shared_ack_timeout,
                     )
@@ -869,6 +872,7 @@ async fn open_shared_consumer(
     let SharedConsumerWindow {
         receiver_queue_size,
         max_redeliver_count,
+        max_uncompressed_message_size,
     } = window;
     let consumer = client
         .subscribe(SubscribeRequest {
@@ -879,6 +883,7 @@ async fn open_shared_consumer(
             // Issue #437: `0` — what every pre-#437 trace passes — disables the
             // dead-letter branch and leaves the subscribe frame byte-identical.
             max_redeliver_count,
+            max_uncompressed_message_size,
             durable: true,
             // Issue #436: `None` (the default) leaves the unacked-message tracker unbuilt,
             // which is the shape every other Shared trace runs in.
