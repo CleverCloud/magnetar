@@ -63,9 +63,7 @@ fn retention_message() -> magnetar_proto::producer::OutgoingMessage {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn dropped_send_and_closed_consumer_leave_no_retained_state() {
-    let broker = ScriptedBroker::bind().await.expect("broker bind");
+async fn run_tokio_retention(broker: &ScriptedBroker) -> magnetar_differential::EventStream {
     let tokio = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
         .await
         .expect("tokio connect");
@@ -137,7 +135,13 @@ async fn dropped_send_and_closed_consumer_leave_no_retained_state() {
     tokio_stream.push(Event::Sent { message_id });
     producer.close().await.expect("producer close");
     tokio.close().await;
+    tokio_stream
+}
 
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_send_and_closed_consumer_leave_no_retained_state() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio_stream = run_tokio_retention(&broker).await;
     let engine = MoonpoolEngine::new(TokioProviders::new());
     let moonpool =
         MoonpoolClient::connect_plain(&engine, &broker.host_port(), ConnectionConfig::default())

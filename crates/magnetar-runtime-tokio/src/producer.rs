@@ -1079,6 +1079,11 @@ mod tests {
             std::task::Poll::Ready(Ok(_))
         ));
         assert!(!matches!(future.state, super::SendState::Pending { .. }));
+        assert!(matches!(
+            std::pin::Pin::new(&mut future).poll(&mut cx),
+            std::task::Poll::Ready(Err(ClientError::Other(message)))
+                if message == "send future polled after completion"
+        ));
     }
 
     /// Capture the per-slot Arc for `handle`, panicking if the slot is gone

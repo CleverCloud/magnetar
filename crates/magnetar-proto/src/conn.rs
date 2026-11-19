@@ -7722,10 +7722,10 @@ impl Connection {
                     _ => return None,
                 };
             let close_slot = !reopen || (consumer.release_after_close && session_lost);
-            if !close_slot {
-                consumer.terminal_operation = crate::consumer::ConsumerTerminalOperation::Open;
-            } else {
+            if close_slot {
                 consumer.close();
+            } else {
+                consumer.terminal_operation = crate::consumer::ConsumerTerminalOperation::Open;
             }
             Some((operation, close_slot))
         }) else {

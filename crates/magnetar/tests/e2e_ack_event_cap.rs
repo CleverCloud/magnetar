@@ -242,11 +242,17 @@ async fn answered_unawaited_operations_and_closed_handles_are_released() -> Test
             .is_none()
     );
 
+    churn_handles(&client, &topic).await?;
+    client.close().await;
+    Ok(())
+}
+
+async fn churn_handles(client: &Client, topic: &str) -> TestResult {
     // Churn both explicit-close and final-clone paths on the same live connection.
     for index in 0..20 {
         let producer = client
             .open_producer(CreateProducerRequest {
-                topic: topic.clone(),
+                topic: topic.to_owned(),
                 ..Default::default()
             })
             .await?;
@@ -267,7 +273,7 @@ async fn answered_unawaited_operations_and_closed_handles_are_released() -> Test
 
         let consumer = client
             .subscribe(SubscribeRequest {
-                topic: topic.clone(),
+                topic: topic.to_owned(),
                 subscription: format!("churn-{index}"),
                 ..Default::default()
             })
@@ -290,6 +296,5 @@ async fn answered_unawaited_operations_and_closed_handles_are_released() -> Test
         client.is_connected(),
         "churn must leave the connection usable"
     );
-    client.close().await;
     Ok(())
 }

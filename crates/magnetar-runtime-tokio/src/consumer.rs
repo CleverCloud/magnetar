@@ -713,10 +713,7 @@ impl Consumer {
             }
         };
         shared.driver_waker.notify_one();
-        let request = RequestFut {
-            shared,
-            key: PendingOpKey::Request(request_id),
-        };
+        let request = RequestFut { shared, request_id };
         async move {
             let outcome = request.await;
             match outcome {
@@ -824,7 +821,7 @@ impl Consumer {
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -888,7 +885,7 @@ impl Consumer {
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -977,7 +974,7 @@ impl Consumer {
         } = staged;
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -2027,7 +2024,7 @@ impl Future for ActiveChangeFut {
 
 struct RequestFut {
     shared: Arc<ConnectionShared>,
-    key: PendingOpKey,
+    request_id: magnetar_proto::RequestId,
 }
 
 impl Future for RequestFut {
@@ -2035,11 +2032,12 @@ impl Future for RequestFut {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut conn = self.shared.inner.lock();
-        if let Some(outcome) = conn.take_outcome(self.key) {
+        let key = PendingOpKey::Request(self.request_id);
+        if let Some(outcome) = conn.take_outcome(key) {
             drop(conn);
             return Poll::Ready(outcome);
         }
-        conn.register_waker(self.key, cx.waker().clone());
+        conn.register_waker(key, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -2054,11 +2052,10 @@ impl Drop for RequestFut {
     /// the lookup multi-agent review MEDIUM-4 finding.
     fn drop(&mut self) {
         let mut conn = self.shared.inner.lock();
-        conn.unregister_waker(self.key);
-        let _ = conn.take_outcome(self.key);
-        if let PendingOpKey::Request(request_id) = self.key {
-            conn.abandon_ack(request_id);
-        }
+        let key = PendingOpKey::Request(self.request_id);
+        conn.unregister_waker(key);
+        let _ = conn.take_outcome(key);
+        conn.abandon_ack(self.request_id);
     }
 }
 
