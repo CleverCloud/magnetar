@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use magnetar::v5::PulsarClientV5;
 use magnetar::{MoonpoolEngine, PulsarClient};
 use magnetar_differential::broker::ScriptedBroker;
@@ -15,8 +16,9 @@ use magnetar_proto::compress::{
 };
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::types::CompressionKind;
-use magnetar_proto::{ConnectionConfig, pb};
+use magnetar_proto::{ConnectionConfig, decode_one, encode_command, pb};
 use moonpool_core::TokioProviders;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOPIC: &str = "persistent://public/default/configured-decompression-limit-partition-0";
 const SUBSCRIPTION: &str = "configured-decompression-limit";
@@ -350,6 +352,79 @@ async fn v5_consumer_builders_deliver_configured_compressed_payloads() {
         .expect("close V5 stream consumer");
 
     client.into_v4().close().await;
+    broker.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scripted_broker_does_not_answer_topic_watch_when_unconfigured() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let mut socket = tokio::net::TcpStream::connect(broker.host_port())
+        .await
+        .expect("connect raw scripted broker socket");
+    let watch = pb::BaseCommand {
+        r#type: pb::base_command::Type::WatchTopicList as i32,
+        watch_topic_list: Some(pb::CommandWatchTopicList {
+            request_id: 41,
+            watcher_id: 7,
+            namespace: "public/default".to_owned(),
+            topics_pattern: "configured-decompression-limit.*".to_owned(),
+            topics_hash: None,
+        }),
+        ..Default::default()
+    };
+    let ping = pb::BaseCommand {
+        r#type: pb::base_command::Type::Ping as i32,
+        ping: Some(pb::CommandPing {}),
+        ..Default::default()
+    };
+    let mut requests = BytesMut::new();
+    encode_command(&mut requests, &watch).expect("encode topic-watch request");
+    encode_command(&mut requests, &ping).expect("encode response barrier ping");
+    socket
+        .write_all(&requests)
+        .await
+        .expect("write watch and barrier commands");
+
+    let mut response_bytes = BytesMut::new();
+    let (response, bytes_after_response) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut framed = response_bytes.clone().freeze();
+            match decode_one(&mut framed) {
+                Ok(response) => break (response, framed.len()),
+                Err(magnetar_proto::FrameError::Incomplete { .. }) => {
+                    let bytes_read = socket
+                        .read_buf(&mut response_bytes)
+                        .await
+                        .expect("read scripted broker response");
+                    assert!(
+                        bytes_read > 0,
+                        "broker closed before a complete response frame"
+                    );
+                }
+                Err(error) => panic!("decode scripted broker response: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("ping response barrier did not time out");
+
+    assert_eq!(
+        broker.frame_log_snapshot(),
+        vec![
+            pb::base_command::Type::WatchTopicList as i32,
+            pb::base_command::Type::Ping as i32,
+        ],
+        "the broker must process WATCH_TOPIC_LIST before the response barrier"
+    );
+    assert_eq!(
+        response.command.r#type,
+        pb::base_command::Type::Pong as i32,
+        "unconfigured WATCH_TOPIC_LIST must not produce a response before PONG"
+    );
+    assert_eq!(
+        bytes_after_response, 0,
+        "no extra response follows the PONG"
+    );
     broker.shutdown().await;
 }
 
