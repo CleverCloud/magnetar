@@ -88,18 +88,19 @@ pub(crate) struct ConsumerCloseGuard {
 
 impl Drop for ConsumerCloseGuard {
     fn drop(&mut self) {
-        if self.shared.is_no_driver() {
-            return;
-        }
+        let no_driver = self.shared.is_no_driver();
         // ADR-0038: release the per-slot probe before taking the global
         // Connection mutex. The locks are sequential, never nested.
         let already_closed = self.slot.state.lock().closed;
-        if already_closed {
-            return;
-        }
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_consumer_forget(self.handle, std::time::Instant::now());
+            if !no_driver && !already_closed {
+                let _ = conn.close_consumer_forget(self.handle, std::time::Instant::now());
+            }
+            conn.release_consumer_close(self.handle);
+        }
+        if no_driver || already_closed {
+            return;
         }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -712,12 +713,12 @@ impl Consumer {
             }
         };
         shared.driver_waker.notify_one();
+        let request = RequestFut {
+            shared,
+            key: PendingOpKey::Request(request_id),
+        };
         async move {
-            let outcome = RequestFut {
-                shared,
-                key: PendingOpKey::Request(request_id),
-            }
-            .await;
+            let outcome = request.await;
             match outcome {
                 OpOutcome::Success { .. } => Ok(()),
                 OpOutcome::Error { code, message, .. } => {
@@ -1525,7 +1526,7 @@ impl Consumer {
                 PostProcessOutcome::Discard => {
                     // Ack and continue — the caller should never see this message.
                     let mut conn = self.shared.inner.lock();
-                    let _ = conn.ack(
+                    conn.ack_forget(
                         self.handle,
                         magnetar_proto::AckRequest {
                             message_ids: vec![msg.message_id],
@@ -1835,7 +1836,7 @@ impl Future for ReceiveFut {
                             // `discardMessage(...)` (an explicit ack) when the policy is
                             // `DISCARD`.
                             let mut conn = shared.inner.lock();
-                            let _ = conn.ack(
+                            conn.ack_forget(
                                 handle,
                                 magnetar_proto::AckRequest {
                                     message_ids: vec![msg.message_id],
@@ -2055,6 +2056,9 @@ impl Drop for RequestFut {
         let mut conn = self.shared.inner.lock();
         conn.unregister_waker(self.key);
         let _ = conn.take_outcome(self.key);
+        if let PendingOpKey::Request(request_id) = self.key {
+            conn.abandon_ack(request_id);
+        }
     }
 }
 
@@ -2506,6 +2510,52 @@ mod tests {
                 .expect("connected");
         }
         shared
+    }
+
+    #[test]
+    fn dropped_ack_before_or_after_poll_leaves_no_outcome() {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest::default());
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer::assemble(shared.clone(), handle, slot, None);
+        let id = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+        };
+        for polled in [false, true] {
+            let rid =
+                magnetar_proto::RequestId(shared.inner.lock().peek_next_request_id_for_test());
+            let mut future = Box::pin(consumer.ack(id));
+            if polled {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+            }
+            drop(future);
+            let response = pb::BaseCommand {
+                r#type: pb::base_command::Type::AckResponse as i32,
+                ack_response: Some(pb::CommandAckResponse {
+                    consumer_id: handle.0,
+                    request_id: Some(rid.0),
+                    error: None,
+                    message: None,
+                    txnid_least_bits: None,
+                    txnid_most_bits: None,
+                }),
+                ..Default::default()
+            };
+            let mut bytes = BytesMut::new();
+            encode_command(&mut bytes, &response).expect("encode");
+            let mut conn = shared.inner.lock();
+            assert!(conn.has_pending_request_for_test(rid));
+            conn.handle_bytes(Instant::now(), &bytes).expect("response");
+            assert!(
+                conn.take_outcome(magnetar_proto::PendingOpKey::Request(rid))
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

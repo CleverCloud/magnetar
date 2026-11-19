@@ -357,12 +357,13 @@ The state machine owns:
 - A slab of `(PendingOpKey -> Waker)` where `PendingOpKey` is one of `Request(RequestId)` for lookups / seeks / acks-with-response, or `Send(ProducerHandle, SequenceId)` for publishes.
 - A slab of `(PendingOpKey -> OpOutcome)` where the matching response is parked until the future polls it.
 
-When `handle_bytes` decodes a `CommandSendReceipt`, it stores the `OpOutcome::SendReceipt` in the outcome slab keyed by `(producer_handle, sequence_id)`, then calls `Waker::wake()` on whatever the producer future registered.
+When `handle_bytes` decodes a `CommandSendReceipt`, it stores the `OpOutcome::SendReceipt` in the outcome slab keyed by `(producer_handle, sequence_id)` while the caller still owns the send result, then calls `Waker::wake()` on whatever the producer future registered.
 The future polls again, locks the connection, finds the outcome, and resolves.
+Dropping a pending send relinquishes only its result and waker: the publish and its memory reservation remain through replay until a receipt, timeout or terminal failure resolves the operation.
 
 This is the cancer-free equivalent of a `oneshot<Result<MessageId, SendError>>`.
 The "channel" is the slab entry; the "send" is the state machine populating it; the "receive" is the future polling it.
-No backpressure surface, no orphaned senders, no `Drop` glue.
+The send future's `Drop` relinquishes its result without cancelling the publish.
 
 The diagram above shows the _outcome_ side — the path the broker-response → future-wake takes through the global `inner` lock.
 The _send_ side has been lifted off that global lock per [ADR-0038](specs/adr/0038-split-connection-mutex.md): `Producer::send` calls `magnetar_proto::ProducerSlot::queue_send` (per-slot mutex only), and the driver merges per-slot staged frames into the connection-wide outbound buffer through `Connection::poll_transmit` on its next tick.
@@ -859,17 +860,23 @@ Two independent mechanisms resolve a pending ack that would otherwise park its `
 
 Both mechanisms mirror the pre-existing per-producer `send_timeout` sweep in shape (two-phase collect-then-mutate over the pending map, then wake + record the outcome), and both also bump `ConsumerState::total_acks_failed` and push a `ConnectionEvent::AckResponse { request_id: Some(rid), result: Err(..) }` so the failure is observable through the same seams a real broker-rejected ack would use.
 
-**Waiter guard (issue #241 shape, applied to the ack path).**
-Neither runtime engine's `RequestFut::drop` calls `cancel_request` — only `unregister_waker` + `take_outcome` — so a caller that drops its `ack()` future before it resolves (a `select!` timeout, a cancelled task) leaves the `pending_requests` entry behind with no waker.
-Nothing ever prunes `outcomes` wholesale (entries leave only via `take_outcome` or `cancel_request`), so recording an `OpOutcome` for that entry would leak it permanently — the same shape the `Success` arm's `ProducerCloseForgotten` / `ConsumerCloseForgotten` fire-and-forget handling and `unsubscribe_has_waiter` guard already cover for issue #241.
-Both mechanisms above, and the `AckResponse` command arm that resolves a _waited_ ack, now record an outcome only when there is still someone to drain it: the two sweeps check `self.wakers.contains_key(&PendingOpKey::Request(rid))` before inserting, and the `AckResponse` arm inserts only when `pending_requests.remove` actually found an entry (mirroring the `Success` arm's own `None => {}` case) — a late broker reply for an ack a sweep already resolved no longer overwrites `outcomes` with a second, undrainable entry.
-`pending_requests` removal, the `total_acks_failed` bump, and the emitted `ConnectionEvent::AckResponse` stay unconditional in all three sites; only the `outcomes` write and its paired wake are guarded, so a caller that still holds its `ack()` future observes no change.
+The observational event queue bounds message, send, ACK, terminal lookup and partition-metadata events using `EVENT_QUEUE_OBSERVATIONAL_CAP` against the total queue length.
+At the bound, it drops and counts the observational event after settling the operation outcome; lookup redirects and other driver-facing events bypass this bound.
+
+**ACK outcome ownership.**
+An awaited ACK owns its outcome as soon as it is staged, including before its first poll; an ACK emitted for grouping or chunk cleanup has no outcome owner.
+Dropping an ACK future relinquishes that ownership while retaining the pending request and wire ID for broker-error and timeout accounting.
+Responses, timeouts, reattachment and session loss record an outcome only for a live owner, and a late response after resolution cannot recreate it.
 
 ### Producer / consumer states
 
 `ProducerState` lives at [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/producer.rs).
 `ConsumerState` lives at [`crates/magnetar-proto/src/consumer.rs`](crates/magnetar-proto/src/consumer.rs).
 Both are owned by the parent `Connection` and addressed by stable `ProducerHandle` / `ConsumerHandle` ids.
+
+An answered producer close retires its slot and recovery request after resolving pending publishes, guarded by the slot's own close request so an older close cannot retire a reused id.
+Consumer close results remain reusable while runtime clones exist; the last runtime clone releases that ownership, and the connection reclaims the slot when the close settles.
+Raw protocol callers retain reusable consumer-close state until they call `Connection::release_consumer_close`.
 
 A `ProducerState` carries:
 

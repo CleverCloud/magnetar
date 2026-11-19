@@ -772,6 +772,12 @@ pub struct SendFut {
 
 impl Drop for SendFut {
     fn drop(&mut self) {
+        if let SendState::Pending { sequence_id } = self.state {
+            self.shared
+                .inner
+                .lock()
+                .abandon_send(self.handle, sequence_id);
+        }
         // Dropped while `ProducerBlock` still held the send back: the message never reached
         // the state machine, so it is cancelled — never published, no error surfaced (ADR-0111).
         // Cancel the registration so a later release does not wake a dead future; a drained
@@ -791,6 +797,7 @@ impl Drop for SendFut {
 
 #[derive(Debug)]
 enum SendState {
+    Completed,
     Pending {
         sequence_id: SequenceId,
     },
@@ -862,6 +869,7 @@ impl Future for SendFut {
                 let mut conn = shared.inner.lock();
                 if let Some(outcome) = conn.take_outcome(key) {
                     drop(conn);
+                    self.state = SendState::Completed;
                     Poll::Ready(translate_send_outcome(outcome))
                 } else {
                     conn.register_waker(key, cx.waker().clone());
@@ -869,6 +877,9 @@ impl Future for SendFut {
                 }
             }
             SendState::Reserving { .. } => unreachable!("Reserving handled above"),
+            SendState::Completed => Poll::Ready(Err(ClientError::Other(
+                "send future polled after completion".into(),
+            ))),
         }
     }
 }
@@ -960,6 +971,114 @@ mod tests {
                 .expect("connected");
         }
         shared
+    }
+
+    #[test]
+    fn dropped_pending_send_does_not_retain_receipt_outcome() {
+        let shared = handshake_complete_shared();
+        let handle = shared
+            .inner
+            .lock()
+            .create_producer(CreateProducerRequest::default());
+        let producer = Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
+        let future = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"payload"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 7,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        });
+        let sequence_id = match &future.state {
+            super::SendState::Pending { sequence_id } => *sequence_id,
+            _ => panic!("send must be pending"),
+        };
+        drop(future);
+        let receipt = pb::BaseCommand {
+            r#type: pb::base_command::Type::SendReceipt as i32,
+            send_receipt: Some(pb::CommandSendReceipt {
+                producer_id: handle.0,
+                sequence_id: sequence_id.0,
+                message_id: Some(pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    ..Default::default()
+                }),
+                highest_sequence_id: None,
+            }),
+            ..Default::default()
+        };
+        let mut bytes = BytesMut::new();
+        encode_command(&mut bytes, &receipt).expect("encode receipt");
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(Instant::now(), &bytes).expect("receipt");
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert!(
+            conn.take_outcome(magnetar_proto::PendingOpKey::Send(handle, sequence_id))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_send_no_longer_owns_pending_operation() {
+        use std::future::Future;
+        let shared = handshake_complete_shared();
+        let handle = shared
+            .inner
+            .lock()
+            .create_producer(CreateProducerRequest::default());
+        let producer = Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
+        let mut future = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"payload"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 7,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        });
+        let sequence_id = match &future.state {
+            super::SendState::Pending { sequence_id } => *sequence_id,
+            _ => panic!("pending"),
+        };
+        let receipt = pb::BaseCommand {
+            r#type: pb::base_command::Type::SendReceipt as i32,
+            send_receipt: Some(pb::CommandSendReceipt {
+                producer_id: handle.0,
+                sequence_id: sequence_id.0,
+                message_id: Some(pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    ..Default::default()
+                }),
+                highest_sequence_id: None,
+            }),
+            ..Default::default()
+        };
+        let mut bytes = BytesMut::new();
+        encode_command(&mut bytes, &receipt).expect("encode");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &bytes)
+            .expect("receipt");
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::pin::Pin::new(&mut future).poll(&mut cx),
+            std::task::Poll::Ready(Ok(_))
+        ));
+        assert!(!matches!(future.state, super::SendState::Pending { .. }));
     }
 
     /// Capture the per-slot Arc for `handle`, panicking if the slot is gone

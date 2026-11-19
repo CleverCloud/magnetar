@@ -478,6 +478,8 @@ pub struct ConsumerState {
     pub receive_wakers: Slab<Waker>,
     /// Reusable ordinary-close operation shared by every consumer clone.
     pub terminal_operation: ConsumerTerminalOperation,
+    /// Reclaim this slot after the current close settles, once its owner releases it.
+    pub(crate) release_after_close: bool,
     /// Independently cancellable waiters for [`Self::terminal_operation`].
     pub close_waiters: Slab<Waker>,
     /// At-most-once gate for a forgotten retry after a cached close failure.
@@ -1185,6 +1187,7 @@ impl ConsumerState {
             pending_seek: None,
             receive_wakers: Slab::new(),
             terminal_operation: ConsumerTerminalOperation::Open,
+            release_after_close: false,
             close_waiters: Slab::new(),
             forced_close_retry_issued: false,
             closed: false,

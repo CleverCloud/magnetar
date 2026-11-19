@@ -216,16 +216,9 @@ pub struct Connection {
     inbound: BytesMut,
     /// Event queue.
     events: VecDeque<ConnectionEvent>,
-    /// Observational events (per-message `Message` / `MessageReceivedFromShadow`
-    /// clones) dropped because [`Self::events`] was at
-    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`]. Issue #413: nothing in the production
-    /// runtime consumes those events (`ReceiveFut` drains via `pop_message`,
-    /// `MessageListener` loops over `receive()`, `EventWaitFut` matches only
-    /// producer/subscribe families), so an unconsumed backlog of them retained
-    /// every received payload and grew the queue without bound — the OOM class
-    /// diagnosed on the accesslogs converter (heap profile: `VecDeque` growth +
-    /// `BytesMut` retention). Dropping them is always safe: they are emitted
-    /// for observability only and carry no protocol obligation.
+    /// Observational events dropped because the total queue reached
+    /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`]. Their delivery or operation results
+    /// use separate state; driver-facing events bypass the cap.
     dropped_observational_events: u64,
     /// Exact failed generations for built-in runtime retry legs.
     driver_retries: VecDeque<crate::DriverRetry>,
@@ -458,18 +451,12 @@ struct AbandonedProducerOpen {
     next_epoch: u64,
 }
 
-/// Cap on OBSERVATIONAL events queued in `Connection::events` — the ones
-/// emitted once per message, on either side of the connection:
-/// `ConnectionEvent::Message` / `MessageReceivedFromShadow` when consuming,
-/// `SendReceipt` / `SendError` when producing. No production consumer drains
-/// them (issue #413), so without a bound they grow the queue until OOM.
-/// Issue #423 is the same defect on the producer side: a steady sender queued
-/// one event per acknowledged message for the whole life of the connection.
-/// Dropping them is always safe — payload delivery goes through
-/// `pop_message`, send completion through the operation outcome and its
-/// waker, and both are settled before the event is queued. Protocol-bearing
-/// events (subscribe/producer/connection lifecycle) are NEVER dropped and are
-/// not counted against this cap.
+/// Cap on observational events queued in `Connection::events`. The queue
+/// holds message, send, ack, terminal lookup and partition metadata events
+/// that production drivers do not drain. Delivery and request completion use
+/// separate state and are settled before the event is queued. Driver-facing
+/// events, including lookup redirects, bypass the cap. The total queue length
+/// is used as the bound when deciding whether to drop an observational event.
 pub const EVENT_QUEUE_OBSERVATIONAL_CAP: usize = 4096;
 
 /// Error code surfaced when a publish exceeds its configured `send_timeout`.
@@ -623,6 +610,8 @@ enum PendingRequestKind {
     },
     Ack {
         handle: ConsumerHandle,
+        /// Whether a caller still owns the corresponding outcome.
+        has_waiter: bool,
         /// Injected-clock (ADR-0011) timestamp `Connection::ack` recorded this
         /// request at. Feeds the `ack_response_timeout` backstop deadline
         /// (`poll_timeout` / `handle_timeout`, issue #346) — a `CommandAck`
@@ -1111,6 +1100,11 @@ impl Connection {
         // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
+            if let PendingRequestKind::ProducerClose { handle }
+            | PendingRequestKind::ProducerCloseForgotten { handle } = kind
+            {
+                self.fail_sends_of_closed_producer(handle, request_id);
+            }
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
                 self.publish_consumer_unsubscribe(
                     handle,
@@ -1140,6 +1134,10 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
+                    | PendingRequestKind::Ack {
+                        has_waiter: false,
+                        ..
+                    }
             ) {
                 let _ = self.wakers.remove(&key);
                 continue;
@@ -1202,6 +1200,7 @@ impl Connection {
                         BATCH_RESET_ERROR_CODE,
                         BATCH_RESET_ERROR_MESSAGE,
                         op.waker.take(),
+                        op.has_waiter,
                     );
                     // Dropping the op releases its memory reservation (ADR-0111).
                 }
@@ -1366,6 +1365,11 @@ impl Connection {
         // reusable slot-owned completion even when no waiter exists yet.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
+            if let PendingRequestKind::ProducerClose { handle }
+            | PendingRequestKind::ProducerCloseForgotten { handle } = kind
+            {
+                self.fail_sends_of_closed_producer(handle, request_id);
+            }
             if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
                 self.publish_consumer_unsubscribe(
                     handle,
@@ -1401,6 +1405,10 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
+                    | PendingRequestKind::Ack {
+                        has_waiter: false,
+                        ..
+                    }
             ) {
                 let _ = self.wakers.remove(&key);
                 continue;
@@ -2612,13 +2620,15 @@ impl Connection {
                         let seq = op.sequence_id;
                         let waker = op.waker.take();
                         let key = PendingOpKey::Send(handle, seq);
-                        self.outcomes.insert(
-                            key,
-                            OpOutcome::SendReceipt {
-                                sequence_id: seq,
-                                message_id: mid,
-                            },
-                        );
+                        if op.has_waiter {
+                            self.outcomes.insert(
+                                key,
+                                OpOutcome::SendReceipt {
+                                    sequence_id: seq,
+                                    message_id: mid,
+                                },
+                            );
+                        }
                         if let Some(w) = waker {
                             w.wake();
                         } else if let Some(w) = self.wakers.remove(&key) {
@@ -2655,14 +2665,16 @@ impl Connection {
                     let seq = op.sequence_id;
                     let waker = op.waker.take();
                     let key = PendingOpKey::Send(handle, seq);
-                    self.outcomes.insert(
-                        key,
-                        OpOutcome::SendError {
-                            sequence_id: seq,
-                            code,
-                            message: message.clone(),
-                        },
-                    );
+                    if op.has_waiter {
+                        self.outcomes.insert(
+                            key,
+                            OpOutcome::SendError {
+                                sequence_id: seq,
+                                code,
+                                message: message.clone(),
+                            },
+                        );
+                    }
                     if let Some(w) = waker {
                         w.wake();
                     } else if let Some(w) = self.wakers.remove(&key) {
@@ -2927,6 +2939,9 @@ impl Connection {
                     }
                     Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
                     Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
+                    Some(PendingRequestKind::Ack {
+                        has_waiter: false, ..
+                    }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -3054,6 +3069,12 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
+                if let Some(PendingRequestKind::Ack { handle, .. }) = kind
+                    && let Some(slot) = self.consumers.get(&handle)
+                {
+                    let mut consumer = slot.state.lock();
+                    consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+                }
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
                     self.publish_consumer_unsubscribe(
                         handle,
@@ -3064,7 +3085,15 @@ impl Connection {
                         },
                         true,
                     );
-                    let _ = self.resume_consumer_after_unsubscribe_failure(handle, request_id);
+                    let released = self
+                        .consumers
+                        .get(&handle)
+                        .is_some_and(|slot| slot.state.lock().release_after_close);
+                    if released {
+                        let _ = self.close_consumer_forget(handle, now);
+                    } else {
+                        let _ = self.resume_consumer_after_unsubscribe_failure(handle, request_id);
+                    }
                 }
                 match kind {
                     Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
@@ -3140,6 +3169,9 @@ impl Connection {
                         | PendingRequestKind::ConsumerSubscribe { .. },
                     ) => {}
                     Some(PendingRequestKind::ConsumerUnsubscribe { .. }) => {}
+                    Some(PendingRequestKind::Ack {
+                        has_waiter: false, ..
+                    }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -3152,6 +3184,13 @@ impl Connection {
                         self.wake_for_request(request_id);
                     }
                     None => {}
+                }
+                if let Some(
+                    PendingRequestKind::ProducerClose { handle }
+                    | PendingRequestKind::ProducerCloseForgotten { handle },
+                ) = kind
+                {
+                    self.fail_sends_of_closed_producer(handle, request_id);
                 }
                 // When a request id correlates with producer-open or subscribe, surface a
                 // typed event so the runtime waiter cannot hang.
@@ -3395,7 +3434,13 @@ impl Connection {
                     // never had) its waiter. Recording a second `outcomes` entry here
                     // for the broker's late reply would leak it permanently, since
                     // nothing is left to `take_outcome` it.
-                    if kind.is_some() {
+                    if matches!(
+                        kind,
+                        Some(PendingRequestKind::Ack {
+                            has_waiter: true,
+                            ..
+                        })
+                    ) {
                         self.outcomes.insert(
                             PendingOpKey::Request(rid),
                             match &result {
@@ -3410,8 +3455,7 @@ impl Connection {
                         self.wake_for_request(rid);
                     }
                 }
-                self.events
-                    .push_back(ConnectionEvent::AckResponse { request_id, result });
+                self.push_observational_event(ConnectionEvent::AckResponse { request_id, result });
             }
             pb::base_command::Type::LookupResponse => {
                 let resp =
@@ -3467,10 +3511,16 @@ impl Connection {
                         },
                     );
                     self.wake_for_request(chain_origin);
-                    self.events.push_back(ConnectionEvent::LookupResponse {
+                    let redirect = matches!(outcome, LookupOutcome::Redirected { .. });
+                    let event = ConnectionEvent::LookupResponse {
                         request_id: chain_origin,
                         result: outcome,
-                    });
+                    };
+                    if redirect {
+                        self.events.push_back(event);
+                    } else {
+                        self.push_observational_event(event);
+                    }
                 }
             }
             pb::base_command::Type::PartitionedMetadataResponse => {
@@ -3495,12 +3545,11 @@ impl Connection {
                         },
                     );
                     self.wake_for_request(rid);
-                    self.events
-                        .push_back(ConnectionEvent::PartitionedMetadataResponse {
-                            request_id: rid,
-                            partitions,
-                            error,
-                        });
+                    self.push_observational_event(ConnectionEvent::PartitionedMetadataResponse {
+                        request_id: rid,
+                        partitions,
+                        error,
+                    });
                 }
             }
             pb::base_command::Type::GetLastMessageIdResponse => {
@@ -4270,17 +4319,10 @@ impl Connection {
         crate::Transmit::Contiguous(&self.pending_vectored_drain.insert(out)[..])
     }
 
-    /// Queue an OBSERVATIONAL event — one emitted per message, either received
-    /// (`Message` / `MessageReceivedFromShadow`) or acknowledged by the broker
-    /// (`SendReceipt` / `SendError`) — dropping it instead when the queue
-    /// already holds [`EVENT_QUEUE_OBSERVATIONAL_CAP`] entries.
-    /// Issues #413 and #423: nothing in the production runtime consumes these
-    /// events, so an unbounded queue grows for the life of the connection —
-    /// until OOM on a busy consumer, and equally on a busy producer. Dropping
-    /// is always safe: delivery goes through `pop_message` and send completion
-    /// through the operation outcome and its waker, both settled before the
-    /// event is queued. Non-observational events must keep going through
-    /// `self.events.push_back` directly (they are never dropped).
+    /// Queue an observational event, or count it as dropped when the total
+    /// queue has reached [`EVENT_QUEUE_OBSERVATIONAL_CAP`]. Delivery and
+    /// operation outcomes are settled separately. Driver-facing events must
+    /// keep going through `self.events.push_back` directly, including redirects.
     fn push_observational_event(&mut self, event: ConnectionEvent) {
         debug_assert!(matches!(
             event,
@@ -4288,6 +4330,12 @@ impl Connection {
                 | ConnectionEvent::MessageReceivedFromShadow { .. }
                 | ConnectionEvent::SendReceipt { .. }
                 | ConnectionEvent::SendError { .. }
+                | ConnectionEvent::AckResponse { .. }
+                | ConnectionEvent::PartitionedMetadataResponse { .. }
+                | ConnectionEvent::LookupResponse {
+                    result: LookupOutcome::Connect { .. } | LookupOutcome::Failed { .. },
+                    ..
+                }
         ));
         // O(1) proxy: compare the TOTAL queue length against the cap rather
         // than counting observational entries. Non-observational events are
@@ -4302,17 +4350,19 @@ impl Connection {
         self.events.push_back(event);
     }
 
-    /// Number of observational per-message events dropped at the
+    /// Number of observational events dropped at the
     /// [`EVENT_QUEUE_OBSERVATIONAL_CAP`] bound since the connection was
-    /// created. A nonzero value means message events are being emitted faster
-    /// than anything drains them — harmless (they are observability-only),
-    /// but a signal that no listener is consuming what the queue produces.
+    /// created. A nonzero value means observational events are being emitted
+    /// faster than they are drained.
     #[must_use]
     pub fn dropped_observational_events(&self) -> u64 {
         self.dropped_observational_events
     }
 
     /// Pull the next [`ConnectionEvent`], if any.
+    /// Message, send, ACK, terminal lookup and partition-metadata events are
+    /// lossy at [`EVENT_QUEUE_OBSERVATIONAL_CAP`]; their delivery or operation
+    /// outcome is settled separately before an event is dropped.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         let event = self.events.pop_front()?;
         self.remove_driver_retry_for_event(&event);
@@ -4890,7 +4940,7 @@ impl Connection {
         // `auto_ack = true` policy. Individual acks; the broker treats the
         // partial as consumed and stops redelivering it.
         for (handle, ids) in chunk_acks {
-            self.ack(
+            self.ack_inner(
                 handle,
                 AckRequest {
                     message_ids: ids,
@@ -4898,7 +4948,9 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                None,
                 now,
+                false,
             );
         }
         // Flush the ack-grouping tracker. The actions go through the shared dispatcher
@@ -4960,6 +5012,7 @@ impl Connection {
                 SEND_TIMEOUT_CODE,
                 SEND_TIMEOUT_MESSAGE,
                 op.waker.take(),
+                op.has_waiter,
             );
         }
 
@@ -5017,6 +5070,7 @@ impl Connection {
                 SEND_TIMEOUT_CODE,
                 SEND_TIMEOUT_MESSAGE,
                 op.waker.take(),
+                op.has_waiter,
             );
             tracing::warn!(
                 target: "magnetar_proto::conn",
@@ -5042,29 +5096,27 @@ impl Connection {
         // disabled (`None`) — `poll_timeout` never arms a deadline in that
         // case either, so this loop is then a guaranteed no-op.
         //
-        // Same issue #241 leak shape as `fail_acks_orphaned_by_consumer_reattach`:
-        // only records an `outcomes` entry when a waker is still parked, since a
-        // dropped `ack()` future (never calling `cancel_request`, see that
-        // function's doc comment) reaches this deadline sweep exactly the same
-        // way it reaches the close-triggered one.
+        // Record an outcome only while the caller owns it, including before its
+        // first poll. Abandonment leaves the pending request for accounting.
         if let Some(timeout) = self.config.ack_response_timeout {
-            let expired_acks: Vec<(RequestId, ConsumerHandle)> = self
+            let expired_acks: Vec<(RequestId, ConsumerHandle, bool)> = self
                 .pending_requests
                 .iter()
                 .filter_map(|(rid, kind)| match kind {
                     PendingRequestKind::Ack {
                         handle,
                         enqueued_at,
+                        has_waiter,
                     } if now >= crate::time::deadline_with_clamp(*enqueued_at, timeout) => {
-                        Some((*rid, *handle))
+                        Some((*rid, *handle, *has_waiter))
                     }
                     _ => None,
                 })
                 .collect();
-            for (rid, handle) in expired_acks {
+            for (rid, handle, has_waiter) in expired_acks {
                 self.pending_requests.remove(&rid);
                 let message = "ack timeout".to_owned();
-                if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+                if has_waiter {
                     self.outcomes.insert(
                         PendingOpKey::Request(rid),
                         OpOutcome::Error {
@@ -5079,7 +5131,7 @@ impl Connection {
                     let mut consumer = slot.state.lock();
                     consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
                 }
-                self.events.push_back(ConnectionEvent::AckResponse {
+                self.push_observational_event(ConnectionEvent::AckResponse {
                     request_id: Some(rid),
                     result: Err(message),
                 });
@@ -5194,13 +5246,15 @@ impl Connection {
     ) {
         for mut op in drained {
             let key = PendingOpKey::Send(handle, op.sequence_id);
-            self.outcomes.insert(
-                key,
-                OpOutcome::Terminal {
+            if op.has_waiter {
+                self.outcomes.insert(
                     key,
-                    reason: reason.to_owned(),
-                },
-            );
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+            }
             // Prefer the producer-stored waker; drop any connection-level slab waker for
             // this key too so it is not double-fired by a later sweep.
             let slab_waker = self.wakers.remove(&key);
@@ -5227,18 +5281,34 @@ impl Connection {
     fn fail_sends_of_closed_producer(&mut self, handle: ProducerHandle, acked: RequestId) {
         let drained = self.producers.get(&handle).and_then(|slot| {
             let mut state = slot.state.lock();
-            (state.close_request == Some(acked)).then(|| state.drain_pending_sends())
+            (state.close_request == Some(acked))
+                .then(|| (state.drain_pending_sends(), state.open_request_id))
         });
-        if let Some(drained) = drained {
+        if let Some((drained, open_request_id)) = drained {
             self.terminalize_drained_sends(handle, drained, PRODUCER_CLOSED_REASON);
             self.terminalize_snapshot_bucket(handle, PRODUCER_CLOSED_REASON);
+            if let Some(open_request_id) = open_request_id
+                && matches!(self.pending_requests.get(&open_request_id),
+                    Some(PendingRequestKind::ProducerOpen { handle: h, .. }) if *h == handle)
+            {
+                self.cancel_request(open_request_id);
+            }
+            self.producers.remove(&handle);
+            self.producer_create_requests.remove(&handle);
+            self.driver_retries.retain(|retry| {
+                !matches!(retry, crate::DriverRetry::Producer { handle: h, .. } if *h == handle)
+            });
+            self.events.retain(|event| {
+                !matches!(event,
+                ConnectionEvent::ProducerOpenFailedTransient { handle: h, .. } if *h == handle)
+            });
         }
     }
 
     /// Terminalize every publish relocated into `in_flight_publish_snapshots` for `handle`.
     ///
-    /// Removes the whole bucket and installs an `OpOutcome::Terminal` per snapshot. The wake
-    /// goes through the snapshot's own waker when it still carries one and falls back to the
+    /// Removes the whole bucket and installs an `OpOutcome::Terminal` for each owned result. The
+    /// wake goes through the snapshot's own waker when it still carries one and falls back to the
     /// connection-wide slab otherwise: `reset()` clears a relocated `OpSend`'s waker, so which
     /// of the two holds the wake depends on whether the future has re-polled since.
     ///
@@ -5251,13 +5321,15 @@ impl Connection {
         };
         for mut snapshot in snapshots {
             let key = PendingOpKey::Send(handle, snapshot.sequence_id);
-            self.outcomes.insert(
-                key,
-                OpOutcome::Terminal {
+            if snapshot.has_waiter {
+                self.outcomes.insert(
                     key,
-                    reason: reason.to_owned(),
-                },
-            );
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+            }
             if let Some(w) = snapshot.waker.take() {
                 let _ = self.wakers.remove(&key);
                 w.wake();
@@ -5286,23 +5358,26 @@ impl Connection {
         code: i32,
         message: &str,
         waker: Option<Waker>,
+        has_waiter: bool,
     ) {
         let key = PendingOpKey::Send(handle, seq);
-        self.outcomes.insert(
-            key,
-            OpOutcome::SendError {
-                sequence_id: seq,
-                code,
-                message: message.to_owned(),
-            },
-        );
+        if has_waiter {
+            self.outcomes.insert(
+                key,
+                OpOutcome::SendError {
+                    sequence_id: seq,
+                    code,
+                    message: message.to_owned(),
+                },
+            );
+        }
         let slab_waker = self.wakers.remove(&key);
         if let Some(w) = waker {
             w.wake();
         } else if let Some(w) = slab_waker {
             w.wake();
         }
-        self.events.push_back(ConnectionEvent::SendError {
+        self.push_observational_event(ConnectionEvent::SendError {
             handle,
             sequence_id: seq,
             code,
@@ -5372,6 +5447,21 @@ impl Connection {
         }
     }
 
+    /// Relinquish a send outcome without cancelling the publish or its reservation.
+    pub fn abandon_send(&mut self, handle: ProducerHandle, sequence_id: SequenceId) {
+        let key = PendingOpKey::Send(handle, sequence_id);
+        let _ = self.wakers.remove(&key);
+        let _ = self.outcomes.remove(&key);
+        if let Some(slot) = self.producers.get(&handle) {
+            slot.state.lock().abandon_send(sequence_id);
+        }
+        if let Some(ops) = self.in_flight_publish_snapshots.get_mut(&handle) {
+            if let Some(op) = ops.iter_mut().find(|op| op.sequence_id == sequence_id) {
+                op.has_waiter = false;
+            }
+        }
+    }
+
     /// Cancel a request-id-correlated operation.
     ///
     /// Removes every local correlation surface: parked waker, landed outcome,
@@ -5395,6 +5485,17 @@ impl Connection {
             if self.end_txn_waiters.get(&end_key.0) == Some(&end_key.1) {
                 self.end_txn_waiters.remove(&end_key.0);
             }
+        }
+    }
+
+    /// Relinquish an ACK result while retaining its wire correlation and failure accounting.
+    /// This does not remove a parked waker or an outcome that has already landed;
+    /// a dropping future must clear both separately.
+    pub fn abandon_ack(&mut self, request_id: RequestId) {
+        if let Some(PendingRequestKind::Ack { has_waiter, .. }) =
+            self.pending_requests.get_mut(&request_id)
+        {
+            *has_waiter = false;
         }
     }
 
@@ -6412,7 +6513,13 @@ impl Connection {
 
     /// Acknowledge messages.
     pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest, now: Instant) -> RequestId {
-        self.ack_inner(handle, ack, None, now)
+        self.ack_inner(handle, ack, None, now, true)
+    }
+
+    /// Acknowledge without retaining an outcome for a caller.
+    /// The request ID remains on the wire so failures and timeouts are counted.
+    pub fn ack_forget(&mut self, handle: ConsumerHandle, ack: AckRequest, now: Instant) {
+        let _ = self.ack_inner(handle, ack, None, now, false);
     }
 
     /// Acknowledge messages while retaining every broker `MessageIdData` field.
@@ -6427,7 +6534,7 @@ impl Connection {
         message_id_data: Vec<pb::MessageIdData>,
         now: Instant,
     ) -> RequestId {
-        self.ack_inner(handle, ack, Some(message_id_data), now)
+        self.ack_inner(handle, ack, Some(message_id_data), now, true)
     }
 
     fn ack_inner(
@@ -6436,6 +6543,7 @@ impl Connection {
         ack: AckRequest,
         message_id_data: Option<Vec<pb::MessageIdData>>,
         now: Instant,
+        has_waiter: bool,
     ) -> RequestId {
         let request_id = self.alloc_request_id();
         if matches!(ack.ack_type, pb::command_ack::AckType::Individual)
@@ -6444,14 +6552,16 @@ impl Connection {
             })
         {
             let key = PendingOpKey::Request(request_id);
-            self.outcomes.insert(
-                key,
-                OpOutcome::Error {
-                    request_id,
-                    code: INVALID_BATCH_ACK_CODE,
-                    message: INVALID_BATCH_ACK_MESSAGE.to_owned(),
-                },
-            );
+            if has_waiter {
+                self.outcomes.insert(
+                    key,
+                    OpOutcome::Error {
+                        request_id,
+                        code: INVALID_BATCH_ACK_CODE,
+                        message: INVALID_BATCH_ACK_MESSAGE.to_owned(),
+                    },
+                );
+            }
             if let Some(slot) = self.consumers.get(&handle) {
                 let mut consumer = slot.state.lock();
                 consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
@@ -6533,6 +6643,7 @@ impl Connection {
             PendingRequestKind::Ack {
                 handle,
                 enqueued_at: now,
+                has_waiter,
             },
         );
         if let Some(slot) = self.consumers.get(&handle) {
@@ -6591,7 +6702,7 @@ impl Connection {
         if let Some(actions) = actions {
             self.dispatch_ack_actions(actions, now);
         } else {
-            let _ = self.ack(
+            let _ = self.ack_inner(
                 handle,
                 AckRequest {
                     message_ids: vec![message_id],
@@ -6599,7 +6710,9 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                None,
                 now,
+                false,
             );
         }
     }
@@ -6622,7 +6735,7 @@ impl Connection {
         if let Some(actions) = actions {
             self.dispatch_ack_actions(actions, now);
         } else {
-            let _ = self.ack(
+            let _ = self.ack_inner(
                 handle,
                 AckRequest {
                     message_ids: vec![message_id],
@@ -6630,7 +6743,9 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                None,
                 now,
+                false,
             );
         }
     }
@@ -6642,7 +6757,7 @@ impl Connection {
                     handle,
                     message_ids,
                 } => {
-                    let _ = self.ack(
+                    let _ = self.ack_inner(
                         handle,
                         AckRequest {
                             message_ids,
@@ -6650,11 +6765,13 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        None,
                         now,
+                        false,
                     );
                 }
                 crate::trackers::AckAction::SendCumulativeAck { handle, message_id } => {
-                    let _ = self.ack(
+                    let _ = self.ack_inner(
                         handle,
                         AckRequest {
                             message_ids: vec![message_id],
@@ -6662,7 +6779,9 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        None,
                         now,
+                        false,
                     );
                 }
             }
@@ -7145,7 +7264,7 @@ impl Connection {
             },
         );
         self.wake_for_request(request_id);
-        self.events.push_back(ConnectionEvent::LookupResponse {
+        self.push_observational_event(ConnectionEvent::LookupResponse {
             request_id,
             result: outcome,
         });
@@ -7282,12 +7401,11 @@ impl Connection {
             },
         );
         self.wake_for_request(request_id);
-        self.events
-            .push_back(ConnectionEvent::PartitionedMetadataResponse {
-                request_id,
-                partitions,
-                error,
-            });
+        self.push_observational_event(ConnectionEvent::PartitionedMetadataResponse {
+            request_id,
+            partitions,
+            error,
+        });
     }
 
     /// Start a topic-list watcher (PIP-145).
@@ -7538,17 +7656,46 @@ impl Connection {
         self.pending_requests.insert(request_id, kind);
     }
 
+    /// Release ownership of a consumer's reusable close result.
+    /// A pending close is reclaimed after settlement; a completed close is reclaimed now.
+    /// Raw callers retain reusable close state until they explicitly release it.
+    pub fn release_consumer_close(&mut self, handle: ConsumerHandle) {
+        let release_now = self.consumers.get(&handle).is_some_and(|slot| {
+            let mut consumer = slot.state.lock();
+            match consumer.terminal_operation {
+                crate::consumer::ConsumerTerminalOperation::Pending { .. }
+                | crate::consumer::ConsumerTerminalOperation::UnsubscribePending { .. } => {
+                    consumer.release_after_close = true;
+                    false
+                }
+                crate::consumer::ConsumerTerminalOperation::Complete { .. } => true,
+                _ => false,
+            }
+        });
+        if release_now {
+            self.cancel_consumer_subscribe(handle);
+        }
+    }
+
     fn publish_consumer_close(
         &mut self,
         handle: ConsumerHandle,
         request_id: RequestId,
         completion: crate::consumer::ConsumerCloseCompletion,
     ) {
-        let wakers = self
+        let (wakers, release) = self
             .consumers
             .get(&handle)
-            .map(|slot| slot.state.lock().complete_close(request_id, completion))
+            .map(|slot| {
+                let mut consumer = slot.state.lock();
+                let release = consumer.release_after_close && matches!(consumer.terminal_operation,
+                    crate::consumer::ConsumerTerminalOperation::Pending { request_id: pending, .. } if pending == request_id);
+                (consumer.complete_close(request_id, completion), release)
+            })
             .unwrap_or_default();
+        if release {
+            self.cancel_consumer_subscribe(handle);
+        }
         for waker in wakers {
             waker.wake();
         }
@@ -7561,6 +7708,10 @@ impl Connection {
         completion: crate::consumer::ConsumerUnsubscribeCompletion,
         reopen: bool,
     ) -> bool {
+        let session_lost = matches!(
+            completion,
+            crate::consumer::ConsumerUnsubscribeCompletion::SessionLost
+        );
         let Some((operation, close_slot)) = self.consumers.get(&handle).and_then(|slot| {
             let mut consumer = slot.state.lock();
             let operation =
@@ -7570,12 +7721,13 @@ impl Connection {
                     } if operation.lock().request_id() == request_id => operation.clone(),
                     _ => return None,
                 };
-            if reopen {
+            let close_slot = !reopen || (consumer.release_after_close && session_lost);
+            if !close_slot {
                 consumer.terminal_operation = crate::consumer::ConsumerTerminalOperation::Open;
             } else {
                 consumer.close();
             }
-            Some((operation, !reopen))
+            Some((operation, close_slot))
         }) else {
             return false;
         };
@@ -9000,34 +9152,26 @@ impl Connection {
     /// Two-phase collect-then-mutate (mirrors the send-timeout sweep shape in
     /// [`Self::handle_timeout`]) avoids mutating `pending_requests` while iterating it.
     ///
-    /// Only records an `outcomes` entry when a waker is still parked for the request
-    /// (mirrors the `Success` arm's `unsubscribe_has_waiter` guard, issue #241's
-    /// continuous-eviction fix). Both runtime engines' `RequestFut::drop` clear the waker
-    /// and take any outcome that already landed but never call `cancel_request`
-    /// (`magnetar-runtime-moonpool/src/consumer.rs`, `magnetar-runtime-tokio/src/consumer.rs`),
-    /// so a caller that dropped its `ack()` future before it resolved — a `select!` timeout,
-    /// a cancelled task — leaves this `pending_requests` entry with no waker. Recording an
-    /// outcome nobody is left to `take_outcome` would leak it permanently, since nothing
-    /// ever prunes `outcomes` wholesale. `pending_requests.remove`, the `total_acks_failed`
-    /// accounting, and the emitted [`ConnectionEvent::AckResponse`] stay unconditional —
-    /// they are not the leak. This narrows an already-accepted race: a sweep that lands in
-    /// the gap between a live `ack()` releasing the connection lock and its future's first
-    /// poll (which is when the waker registers) also finds no waker yet and skips recording
-    /// — the same shape `unsubscribe_has_waiter` already carries, here without a broker
-    /// round trip.
+    /// Records an outcome while the caller owns it, including before the first poll.
+    /// Abandoned and fire-and-forget ACKs retain correlation for failure accounting
+    /// but have no outcome to collect.
     fn fail_acks_orphaned_by_consumer_reattach(&mut self, handle: ConsumerHandle) {
-        let orphaned_acks: Vec<RequestId> = self
+        let orphaned_acks: Vec<(RequestId, bool)> = self
             .pending_requests
             .iter()
             .filter_map(|(rid, kind)| match kind {
-                PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
+                PendingRequestKind::Ack {
+                    handle: h,
+                    has_waiter,
+                    ..
+                } if *h == handle => Some((*rid, *has_waiter)),
                 _ => None,
             })
             .collect();
-        for rid in orphaned_acks {
+        for (rid, has_waiter) in orphaned_acks {
             self.pending_requests.remove(&rid);
             let message = "ack orphaned by broker consumer close".to_owned();
-            if self.wakers.contains_key(&PendingOpKey::Request(rid)) {
+            if has_waiter {
                 self.outcomes.insert(
                     PendingOpKey::Request(rid),
                     OpOutcome::Error {
@@ -9042,7 +9186,7 @@ impl Connection {
                 let mut consumer = slot.state.lock();
                 consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
             }
-            self.events.push_back(ConnectionEvent::AckResponse {
+            self.push_observational_event(ConnectionEvent::AckResponse {
                 request_id: Some(rid),
                 result: Err(message),
             });
@@ -16748,10 +16892,9 @@ mod conn_state_tests {
     /// Complementary to `ack_orphaned_by_same_broker_close_fails_fast`: a
     /// caller that dropped its `ack()` future before it resolved — a
     /// `select!` timeout, a cancelled task — leaves this `pending_requests`
-    /// entry with no waker, because both runtime engines' `RequestFut::drop`
-    /// clear the waker and take any already-landed outcome but never call
-    /// `cancel_request` (`magnetar-runtime-moonpool/src/consumer.rs`,
-    /// `magnetar-runtime-tokio/src/consumer.rs`). The sweep must not write an
+    /// entry with no waiter. Both runtime engines' `RequestFut::drop` clear
+    /// the waker and relinquish the outcome while retaining correlation.
+    /// The sweep must not write an
     /// `outcomes` entry for it — the same issue #241 leak shape the
     /// `Success` arm's `ProducerCloseForgotten` / `ConsumerCloseForgotten` /
     /// `unsubscribe_has_waiter` guards already cover, on the ack sweep this
@@ -16783,11 +16926,11 @@ mod conn_state_tests {
             t0,
         );
         let _ = conn.poll_transmit();
+        conn.abandon_ack(rid);
         assert_eq!(
             conn.pending_waker_count(),
             0,
-            "precondition: no ack future is parked on this request — dropped before its \
-             first poll, or dropped after being polled and cancelled; both leave no waker"
+            "precondition: abandoned ack has no parked waker"
         );
 
         let close = close_consumer_frame(handle);
@@ -16897,6 +17040,32 @@ mod conn_state_tests {
     /// `handle_timeout`'s reap sweep resolves the pending ack with
     /// `code=-1, "ack timeout"` and wakes the parked waker. Mirrors the
     /// `default_send_timeout_fires_when_receipt_lost` shape (this file).
+    #[test]
+    fn ack_deadline_before_first_poll_preserves_outcome() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let now = Instant::now();
+        let request = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            now,
+        );
+        assert_eq!(conn.pending_waker_count(), 0);
+        conn.handle_timeout(now + Duration::from_secs(31));
+        assert!(matches!(conn.take_outcome(PendingOpKey::Request(request)),
+            Some(OpOutcome::Error { message, .. }) if message == "ack timeout"));
+    }
+
     #[test]
     fn pending_ack_deadline_reaps_when_broker_silent() {
         use std::sync::Arc;
@@ -17626,6 +17795,116 @@ mod conn_state_tests {
             }
             other => panic!("expected Update, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grouped_ack_response_does_not_leave_an_outcome() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = ConsumerHandle(1);
+        conn.ack_grouped_individual(
+            handle,
+            MessageId {
+                ledger_id: 1,
+                entry_id: 2,
+                partition: -1,
+                batch_index: -1,
+                batch_size: -1,
+            },
+            Instant::now(),
+        );
+        let rid = *conn.pending_requests.keys().next().expect("ack pending");
+        let response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &response).expect("encode ack response");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("ack response");
+        assert!(conn.take_outcome(PendingOpKey::Request(rid)).is_none());
+    }
+
+    #[test]
+    fn ack_response_events_are_capped() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: 1,
+                request_id: None,
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &response).expect("encode ack response");
+        for _ in 0..EVENT_QUEUE_OBSERVATIONAL_CAP + 100 {
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("ack response");
+        }
+        assert_eq!(conn.events.len(), EVENT_QUEUE_OBSERVATIONAL_CAP);
+        assert_eq!(conn.dropped_observational_events(), 100);
+
+        let metadata =
+            conn.get_partitioned_topic_metadata("persistent://public/default/a-partition-0");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(metadata)),
+            Some(OpOutcome::PartitionedMetadata { partitions: 0, .. })
+        ));
+        assert_eq!(conn.dropped_observational_events(), 101);
+
+        let request_id = conn.lookup("persistent://public/default/a", false);
+        let redirect = pb::BaseCommand {
+            r#type: pb::base_command::Type::LookupResponse as i32,
+            lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                broker_service_url: Some("pulsar://broker:6650".to_owned()),
+                broker_service_url_tls: None,
+                response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+                request_id: request_id.0,
+                authoritative: Some(true),
+                error: None,
+                message: None,
+                proxy_through_service_url: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &redirect).expect("encode redirect");
+        conn.handle_bytes(Instant::now(), &buf).expect("redirect");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(request_id)),
+            Some(OpOutcome::LookupResponse {
+                outcome: LookupOutcome::Redirected { .. },
+                ..
+            })
+        ));
+        assert!(
+            conn.poll_event_if(|event| matches!(
+                event,
+                ConnectionEvent::LookupResponse {
+                    result: LookupOutcome::Redirected { .. },
+                    ..
+                }
+            ))
+            .is_some()
+        );
     }
 
     #[test]
@@ -18926,6 +19205,24 @@ mod conn_state_tests {
         ack_producer_success(conn, open_rid);
         while conn.poll_event().is_some() {}
         handle
+    }
+
+    #[test]
+    fn closed_producer_reclaims_pending_reattach_request() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle =
+            reattach_attached_producer(&mut conn, "persistent://public/default/close-reattach");
+        let reattach = RequestId(conn.peek_next_request_id_for_test());
+        conn.handle_bytes(Instant::now(), &close_producer_frame(handle, None))
+            .expect("broker close");
+        assert!(conn.has_pending_request_for_test(reattach));
+        let close = conn.close_producer(handle);
+        feed_command_success(&mut conn, close.0);
+        assert!(conn.producer(handle).is_none());
+        assert!(!conn.has_pending_request_for_test(reattach));
     }
 
     /// #463: the per-slot gate exposed through both runtime producer handles
@@ -22056,6 +22353,34 @@ mod consumer_close_contract_tests {
     }
 
     #[test]
+    fn released_unsubscribe_rejection_closes_consumer_and_reset_reclaims_it() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "released-unsubscribe-error");
+        let _ = conn.poll_transmit();
+        let request = conn
+            .unsubscribe(handle, false)
+            .expect("unsubscribe")
+            .request_id;
+        let _ = conn.poll_transmit();
+        conn.release_consumer_close(handle);
+        ack_error(&mut conn, request.0, now);
+        let closes = drain_close_commands(&mut conn);
+        assert_eq!(closes.len(), 1);
+        ack_success(&mut conn, closes[0].request_id, now);
+        assert!(conn.consumer(handle).is_none());
+
+        let handle = subscribe(&mut conn, "released-unsubscribe-reset");
+        let _ = conn.poll_transmit();
+        conn.unsubscribe(handle, false).expect("unsubscribe");
+        let _ = conn.poll_transmit();
+        conn.release_consumer_close(handle);
+        conn.reset();
+        assert!(conn.consumer(handle).is_none());
+        assert!(conn.poll_transmit().is_empty());
+    }
+
+    #[test]
     fn close_consumer_marks_slot_closed_synchronously() {
         let now = Instant::now();
         let mut conn = handshake_complete(now);
@@ -23656,6 +23981,23 @@ mod memory_limit_release_tests {
     }
 
     #[test]
+    fn acknowledged_producer_close_reclaims_slot_and_recovery_state() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("close-reclaim"));
+        assert!(conn.producer_create_requests.contains_key(&handle));
+        let close = conn.close_producer(handle);
+        feed(&mut conn, at, &success(close));
+        assert!(!conn.producers.contains_key(&handle));
+        assert!(!conn.producer_create_requests.contains_key(&handle));
+        assert!(!conn.in_flight_publish_snapshots.contains_key(&handle));
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Request(close)),
+            Some(OpOutcome::Success { .. })
+        ));
+    }
+
+    #[test]
     fn close_ack_fails_pending_sends_and_releases_them() {
         let at = Instant::now();
         let mut conn = handshaked(at);
@@ -23843,6 +24185,87 @@ mod memory_limit_release_tests {
             conn.take_outcome(PendingOpKey::Send(handle, seq)),
             Some(OpOutcome::Terminal { .. })
         ));
+    }
+
+    #[test]
+    fn abandoned_snapshot_replays_and_releases_reservation_without_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountWake(AtomicUsize);
+        impl std::task::Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("abandoned-replay"));
+        let budget = budget(100);
+        let seq = send(&mut conn, handle, &budget, 20, at);
+        let key = PendingOpKey::Send(handle, seq);
+        let counter = Arc::new(CountWake(AtomicUsize::new(0)));
+        conn.register_waker(key, std::task::Waker::from(counter.clone()));
+        let _ = conn.poll_transmit();
+        conn.reset();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.used_bytes(), 20);
+        conn.abandon_send(handle, seq);
+        conn.begin_handshake().expect("re-handshake");
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            },
+        );
+        let _ = conn.poll_transmit();
+        let opens = conn.rebuild_producers();
+        let _ = conn.poll_transmit();
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: opens[0].0,
+                    producer_name: "replay".to_owned(),
+                    producer_ready: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let mut wire = conn.poll_transmit();
+        let replay = decode_one(&mut wire).expect("replayed send");
+        assert_eq!(replay.command.send.expect("send").sequence_id, seq.0);
+        assert_eq!(replay.payload.expect("payload").body.as_ref(), &[7; 20]);
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: seq.0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 1,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert!(conn.take_outcome(key).is_none());
     }
 
     #[test]

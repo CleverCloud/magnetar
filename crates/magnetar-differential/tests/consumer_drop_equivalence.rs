@@ -52,6 +52,230 @@ fn subscribe_request(topic_suffix: &str, ack_group_time: Option<Duration>) -> Su
     }
 }
 
+fn retention_message() -> magnetar_proto::producer::OutgoingMessage {
+    magnetar_proto::producer::OutgoingMessage {
+        payload: bytes::Bytes::from_static(b"retention"),
+        metadata: pb::MessageMetadata::default(),
+        uncompressed_size: 9,
+        num_messages: 1,
+        txn_id: None,
+        source_message_id: None,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_send_and_closed_consumer_leave_no_retained_state() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
+        .await
+        .expect("tokio connect");
+    let consumer = tokio
+        .subscribe(subscribe_request("retention-tokio", None))
+        .await
+        .expect("subscribe");
+    let consumer_handle = consumer.handle();
+    let clone = consumer.clone();
+    consumer.close().await.expect("close");
+    assert!(
+        tokio
+            .shared()
+            .inner
+            .lock()
+            .consumer(consumer_handle)
+            .is_some()
+    );
+    clone.close().await.expect("repeated close");
+    assert!(
+        tokio
+            .shared()
+            .inner
+            .lock()
+            .consumer(consumer_handle)
+            .is_none()
+    );
+    let producer = tokio
+        .open_producer(magnetar_proto::CreateProducerRequest {
+            topic: "persistent://public/default/retention-tokio".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("producer");
+    let handle = producer.handle();
+    let forgotten = producer.send(retention_message());
+    let seq = tokio
+        .shared()
+        .inner
+        .lock()
+        .producer(handle)
+        .expect("slot")
+        .state
+        .lock()
+        .pending
+        .back()
+        .expect("pending")
+        .sequence_id;
+    drop(forgotten);
+    producer
+        .send(retention_message())
+        .await
+        .expect("barrier receipt");
+    assert_eq!(producer.pending_count(), 0);
+    assert!(
+        tokio
+            .shared()
+            .inner
+            .lock()
+            .take_outcome(magnetar_proto::PendingOpKey::Send(handle, seq))
+            .is_none()
+    );
+    let receipt = tokio.shared().inner.lock().poll_event_if(|event| matches!(event,
+        magnetar_proto::ConnectionEvent::SendReceipt { handle: h, sequence_id, .. } if *h == handle && *sequence_id == seq));
+    let Some(magnetar_proto::ConnectionEvent::SendReceipt { message_id, .. }) = receipt else {
+        panic!("the abandoned publish must receive its own broker receipt");
+    };
+    let mut tokio_stream = magnetar_differential::EventStream::empty();
+    tokio_stream.push(Event::Sent { message_id });
+    producer.close().await.expect("producer close");
+    tokio.close().await;
+
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let moonpool =
+        MoonpoolClient::connect_plain(&engine, &broker.host_port(), ConnectionConfig::default())
+            .await
+            .expect("moonpool connect");
+    let consumer = moonpool
+        .subscribe(subscribe_request("retention-moonpool", None))
+        .await
+        .expect("subscribe");
+    let consumer_handle = consumer.handle();
+    let clone = consumer.clone();
+    consumer.close().await.expect("close");
+    assert!(
+        moonpool
+            .shared()
+            .inner
+            .lock()
+            .consumer(consumer_handle)
+            .is_some()
+    );
+    clone.close().await.expect("repeated close");
+    assert!(
+        moonpool
+            .shared()
+            .inner
+            .lock()
+            .consumer(consumer_handle)
+            .is_none()
+    );
+    let producer = moonpool
+        .open_producer(magnetar_proto::CreateProducerRequest {
+            topic: "persistent://public/default/retention-moonpool".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("producer");
+    let handle = producer.handle();
+    let forgotten = producer.send(retention_message());
+    let seq = moonpool
+        .shared()
+        .inner
+        .lock()
+        .producer(handle)
+        .expect("slot")
+        .state
+        .lock()
+        .pending
+        .back()
+        .expect("pending")
+        .sequence_id;
+    drop(forgotten);
+    producer
+        .send(retention_message())
+        .await
+        .expect("barrier receipt");
+    assert_eq!(producer.pending_count(), 0);
+    assert!(
+        moonpool
+            .shared()
+            .inner
+            .lock()
+            .take_outcome(magnetar_proto::PendingOpKey::Send(handle, seq))
+            .is_none()
+    );
+    let receipt = moonpool.shared().inner.lock().poll_event_if(|event| matches!(event,
+        magnetar_proto::ConnectionEvent::SendReceipt { handle: h, sequence_id, .. } if *h == handle && *sequence_id == seq));
+    let Some(magnetar_proto::ConnectionEvent::SendReceipt { message_id, .. }) = receipt else {
+        panic!("the abandoned publish must receive its own broker receipt");
+    };
+    let mut moonpool_stream = magnetar_differential::EventStream::empty();
+    moonpool_stream.push(Event::Sent { message_id });
+    producer.close().await.expect("producer close");
+    moonpool.close().await;
+    assert_eq!(tokio_stream, moonpool_stream);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ack_response_saturation_keeps_engine_streams_equivalent() {
+    let broker = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio = TokioClient::connect(&broker.pulsar_url(), ConnectionConfig::default())
+        .await
+        .expect("tokio connect");
+    let consumer = tokio
+        .subscribe(subscribe_request("cap-tokio", None))
+        .await
+        .expect("tokio subscribe");
+    let mut tokio_stream = magnetar_differential::EventStream::empty();
+    for entry in 0..(magnetar_proto::conn::EVENT_QUEUE_OBSERVATIONAL_CAP as u64 + 100) {
+        let mut id = grouped_ack_message_id();
+        id.entry_id = entry;
+        consumer.ack(id).await.expect("tokio ack");
+        tokio_stream.push(Event::Acked);
+    }
+    let tokio_dropped = tokio.shared().inner.lock().dropped_observational_events();
+    consumer.close().await.expect("tokio close");
+    tokio.close().await;
+
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let moonpool =
+        MoonpoolClient::connect_plain(&engine, &broker.host_port(), ConnectionConfig::default())
+            .await
+            .expect("moonpool connect");
+    let consumer = moonpool
+        .subscribe(subscribe_request("cap-moonpool", None))
+        .await
+        .expect("moonpool subscribe");
+    // Tokio's handshake consumes Connected; Moonpool's handshake leaves it queued.
+    assert!(
+        moonpool
+            .shared()
+            .inner
+            .lock()
+            .poll_event_if(|event| matches!(
+                event,
+                magnetar_proto::ConnectionEvent::Connected { .. }
+            ))
+            .is_some()
+    );
+    let mut moonpool_stream = magnetar_differential::EventStream::empty();
+    for entry in 0..(magnetar_proto::conn::EVENT_QUEUE_OBSERVATIONAL_CAP as u64 + 100) {
+        let mut id = grouped_ack_message_id();
+        id.entry_id = entry;
+        consumer.ack(id).await.expect("moonpool ack");
+        moonpool_stream.push(Event::Acked);
+    }
+    let moonpool_dropped = moonpool
+        .shared()
+        .inner
+        .lock()
+        .dropped_observational_events();
+    consumer.close().await.expect("moonpool close");
+    moonpool.close().await;
+    assert_eq!(tokio_stream, moonpool_stream);
+    // Each queue also holds the terminal lookup event after subscribe.
+    assert_eq!(tokio_dropped, 101);
+    assert_eq!(moonpool_dropped, 101);
+}
+
 async fn run_tokio_grouped_ack_drop(pulsar_url: &str) {
     let client = TokioClient::connect(pulsar_url, ConnectionConfig::default())
         .await
