@@ -596,7 +596,7 @@ A cross (`❌`) is a known-missing feature.
 | Feature                         | Java | Magnetar | Notes                                                                                                                                                                                  |
 | ------------------------------- | ---- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Regex topic subscription        | ✅   | ✅       | `PatternConsumerBuilder::pattern`.                                                                                                                                                     |
-| `TopicListChanged` delta stream | ✅   | ✅       | `Client::next_topic_list_change`.                                                                                                                                                      |
+| `TopicListChanged` delta stream | ✅   | ✅       | `Client::next_topic_list_change` (any watcher; each delta names its `watcher_id`).                                                                                                     |
 | Manual `update()` reconcile     | ✅   | ✅       | `PatternConsumer::update(&client)` returns a `ReconcileReport`.                                                                                                                        |
 | Auto-update background ticker   | ✅   | ✅       | `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval` loop that calls `update(&client)` on every tick; returns a `JoinHandle` for clean shutdown. |
 

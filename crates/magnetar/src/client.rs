@@ -1100,9 +1100,13 @@ where
 
     /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
     /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
-    /// this pattern right now" workflows. Live updates are emitted by the connection as
-    /// `TopicListChanged` events and surfaced through
-    /// [`crate::BrokerMetadataApi::poll_topic_list_change`].
+    /// this pattern right now" workflows. The watcher stays registered on the connection and the
+    /// broker keeps announcing its topic changes to it as `TopicListChanged` events; each is
+    /// addressed to the watcher it belongs to, and only that watcher's owner takes it from the
+    /// connection's buffer ([`crate::BrokerMetadataApi::poll_topic_list_change`], which a
+    /// [`crate::PatternConsumer`] does for its own watcher). This call returns the snapshot only
+    /// and keeps no id to take them with, so nothing consumes the deltas of the watcher it opens:
+    /// they are never taken from the buffer, and are not applied by any other consumer.
     ///
     /// # Errors
     ///
@@ -1111,14 +1115,17 @@ where
         let mut deadline = crate::BrokerMetadataApi::new_metadata_operation_deadline(&self.inner);
         self.topic_list_snapshot_with_deadline(namespace, pattern, &mut deadline)
             .await
+            .map(|(_, topics)| topics)
     }
 
+    /// The watcher id the connection allocated and the initial snapshot of a new topic-list
+    /// watcher; see [`Self::topic_list_snapshot`].
     pub(crate) async fn topic_list_snapshot_with_deadline(
         &self,
         namespace: &str,
         pattern: &str,
         deadline: &mut crate::OperationDeadline,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(u64, Vec<String>)> {
         crate::BrokerMetadataApi::watch_topic_list_with_deadline(
             &self.inner,
             namespace,

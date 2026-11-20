@@ -707,7 +707,7 @@ After the lock drops, the driver pulls semantic events via `poll_event()` and re
 
 - `ConnectionEvent::AuthChallenge { method, challenge }` — driver consults the configured `AuthProvider`, asks it for a fresh blob via `respond_to_challenge`, and submits it via `submit_auth_response` (PIP-30 / PIP-292).
   The same hook carries SASL Kerberos / GSSAPI continuation tokens: `magnetar_auth_sasl::SaslKerberos` forwards each challenge into its wrapped `GssapiClient` so the GSSAPI initiate loop runs naturally over the existing trait surface (no new `SaslMechanism` trait was needed; see [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
-- `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes the delta into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
+- `ConnectionEvent::TopicListChanged { watcher_id, added, removed }` — driver pushes the delta, still addressed to its watcher, into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
 - `ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker }` — driver pushes the observation into `ConnectionShared.replicated_subscription_markers` and wakes `replicated_subscription_marker_notify` (PIP-33 / ADR-0034).
   The marker is filtered off the user-visible message stream upstream in the `magnetar-proto` receive path so it never reaches `Consumer::receive`.
 - `ConnectionEvent::ChecksumMismatch { … }` and the **diagnostic** `ConnectionEvent::LookupResponse` carrying `LookupOutcome::Redirected` — events proto already logs at the point of detection ([ADR-0054](specs/adr/0054-logging-policy.md) single-owner rule); both engines admit them to the drain predicate and consume them **silently**, which stops them accumulating unbounded in the proto event queue.
@@ -923,7 +923,8 @@ The connection turns each action into an outbound `BaseCommand`.
 
 `magnetar-proto::topic_watcher::TopicWatcherRegistry` (85 lines) carries the PIP-145 broker-driven topic-discovery state.
 The connection handles `CommandWatchTopicListResponse` / `CommandTopicListUpdated` opcodes and emits `ConnectionEvent::TopicListChanged` on the event queue.
-The driver forwards those to `ConnectionShared.topic_list_changes`, where `PatternConsumer::update` reconciles them against its child consumers.
+Each event names the watcher the broker addressed it to (the id `Connection::watch_topic_list` allocated), and a delta for a watcher the connection does not hold is dropped.
+The driver forwards the rest to `ConnectionShared.topic_list_changes`, one buffer shared by every watcher of the connection, where `PatternConsumer::update` takes only the deltas of its own watcher (`ConnectionShared::take_topic_list_change`) and reconciles them against its child consumers ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
 
 ### Replicated-subscription markers (`magnetar-proto/src/markers.rs`)
 
@@ -1302,7 +1303,7 @@ Cancellation likewise stops future traversal while preserving completed children
 
 - `MultiTopicsConsumer::add_topic` / `remove_topic` subscribe and unsubscribe at runtime.
 - `PatternConsumer` reconciles topic list deltas on demand via `update(&client)`.
-  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`; `update()` moves them, in arrival order, into the consumer's own backlog and applies it step by step, spawning / closing child consumers.
+  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`, each addressed to the watcher that produced it; `update()` takes only the deltas of the watcher its builder opened (two pattern consumers on one client never apply or starve each other's), moves them, in arrival order, into the consumer's own backlog and applies it step by step, spawning / closing child consumers.
   A step leaves the backlog only once it has taken effect, so a refused subscribe (kept for the next call, while the steps behind it still run) or a dropped `update()` future loses no topic: discovery is delta-only after the first snapshot, and the broker announces a topic once.
   `start_auto_reconcile(client, interval)` does the same on a `tokio::time::interval` schedule.
 
@@ -1317,7 +1318,8 @@ Cancellation likewise stops future traversal while preserving completed children
                   Client::watch_topic_list(namespace, pattern)
                                             │
                                             ▼
-                  initial snapshot of matching topics
+                  initial snapshot of matching topics + the watcher id
+                  (kept by the PatternConsumer to take its own deltas)
                                             │
                                             ▼
                   open one child Consumer per matched topic
@@ -1328,15 +1330,16 @@ Cancellation likewise stops future traversal while preserving completed children
                                             │
                                             ▼
                   meanwhile, on the driver:
-                  every CommandTopicListUpdated →
-                    ConnectionShared.topic_list_changes.push_back(delta)
+                  every CommandWatchTopicUpdate for a watcher the connection holds →
+                    ConnectionShared.topic_list_changes.push_back(delta + its watcher_id)
                     topic_list_notify.notify_waiters()
                                             │
                                             ▼
                   caller does PatternConsumer::update(&client)
                                             │
                                             ▼
-                  move topic_list_changes into the consumer's backlog, in arrival order
+                  move the deltas addressed to this consumer's watcher out of
+                  topic_list_changes into its backlog, in arrival order
                   (a removal drops a still-waiting addition of the same topic)
                   walk the backlog, one step at a time:
                     open a new child for `added` (a refused subscribe stays in the backlog)

@@ -387,6 +387,7 @@ async fn next_topic_list_change_catches_delta_pushed_between_drain_and_park() {
         &client.shared().topic_list_notify,
         move || bounded_on_this_thread(waiter_client.next_topic_list_change()),
         TopicListChange {
+            watcher_id: 0,
             added: vec!["persistent://public/default/lost-wakeup".to_owned()],
             removed: Vec::new(),
         },

@@ -411,6 +411,19 @@ impl ConnectionShared {
         Self::with_auth(config, None)
     }
 
+    /// Remove and return the oldest buffered PIP-145 delta addressed to `watcher_id`, leaving
+    /// every other watcher's deltas, and their order, in the buffer. `None` when the watcher has
+    /// none pending. 1:1 mirror of the tokio engine.
+    ///
+    /// The buffer is shared by every watcher of the connection and the broker's deltas for one
+    /// watcher are applied in the order it sent them, so the scan stops at the first match
+    /// rather than reordering anything.
+    pub fn take_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {
+        let mut buffer = self.topic_list_changes.lock();
+        let at = buffer.iter().position(|c| c.watcher_id == watcher_id)?;
+        buffer.remove(at)
+    }
+
     /// Latch the [`Self::no_driver`] signal: this connection has reached a
     /// genuinely-terminal state and no driver task will recover it. Set by the
     /// plain driver's terminal-exit path and the supervisor give-up path,
@@ -744,6 +757,11 @@ impl ConnectionShared {
 /// callers don't pay for borrows across the await boundary.
 #[derive(Debug, Clone)]
 pub struct TopicListChange {
+    /// Watcher the broker addressed the delta to: the id the connection allocated when the
+    /// watcher was opened (the first element returned by
+    /// [`Client::watch_topic_list_with_operation_deadline`]). Several watchers share the buffer,
+    /// so [`Client::poll_topic_list_change`] takes only the deltas of one id.
+    pub watcher_id: u64,
     /// Topics that newly match the pattern.
     pub added: Vec<String>,
     /// Topics that no longer match the pattern.
@@ -1763,10 +1781,12 @@ mod tests {
     fn topic_list_changes_buffer_round_trip() {
         let s = ConnectionShared::new(ConnectionConfig::default());
         s.topic_list_changes.lock().push_back(TopicListChange {
+            watcher_id: 0,
             added: vec!["a".to_owned()],
             removed: vec![],
         });
         s.topic_list_changes.lock().push_back(TopicListChange {
+            watcher_id: 0,
             added: vec![],
             removed: vec!["b".to_owned()],
         });
@@ -1775,6 +1795,51 @@ mod tests {
         let second = s.topic_list_changes.lock().pop_front().unwrap();
         assert_eq!(second.removed, vec!["b".to_owned()]);
         assert!(s.topic_list_changes.lock().is_empty());
+    }
+
+    /// The buffer is shared by every watcher of the connection: taking a watcher's delta
+    /// leaves the other watchers' deltas, and each watcher's own order, untouched.
+    #[test]
+    fn take_topic_list_change_takes_only_the_addressed_watchers_deltas() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        for (watcher_id, topic) in [(1, "a1"), (2, "b1"), (1, "a2"), (2, "b2")] {
+            s.topic_list_changes.lock().push_back(TopicListChange {
+                watcher_id,
+                added: vec![topic.to_owned()],
+                removed: vec![],
+            });
+        }
+
+        let first = s.take_topic_list_change(2).expect("watcher 2 has a delta");
+        assert_eq!((first.watcher_id, first.added), (2, vec!["b1".to_owned()]));
+        let second = s
+            .take_topic_list_change(2)
+            .expect("watcher 2 has a second delta");
+        assert_eq!(
+            second.added,
+            vec!["b2".to_owned()],
+            "per-watcher order holds"
+        );
+        assert!(
+            s.take_topic_list_change(2).is_none(),
+            "watcher 2 has nothing left, and must not be handed watcher 1's delta"
+        );
+        assert!(
+            s.take_topic_list_change(7).is_none(),
+            "an unknown watcher has none"
+        );
+
+        let left: Vec<String> = s
+            .topic_list_changes
+            .lock()
+            .iter()
+            .flat_map(|c| c.added.clone())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["a1".to_owned(), "a2".to_owned()],
+            "watcher 1's deltas stayed buffered, in order"
+        );
     }
 
     /// Doc-test-style smoke: the engine's `connect_plain()` can be named
@@ -2005,6 +2070,7 @@ mod tests {
     #[test]
     fn topic_list_change_clone_preserves_payload() {
         let original = TopicListChange {
+            watcher_id: 0,
             added: vec!["a".to_owned(), "b".to_owned()],
             removed: vec!["c".to_owned()],
         };

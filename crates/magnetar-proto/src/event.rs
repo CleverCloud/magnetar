@@ -301,6 +301,11 @@ pub enum ConnectionEvent {
 
     /// Topic list watcher delta (PIP-145).
     TopicListChanged {
+        /// Watcher the broker addressed the delta to: the id this connection allocated in
+        /// [`Connection::watch_topic_list`](crate::conn::Connection::watch_topic_list). Several
+        /// watchers can share one connection, so a consumer of deltas applies only those that
+        /// carry its own id.
+        watcher_id: u64,
         /// Topics that newly match the pattern.
         added: Vec<String>,
         /// Topics that no longer match the pattern.

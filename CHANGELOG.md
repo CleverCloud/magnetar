@@ -15,8 +15,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
   `WrapperReceiver::is_terminal` has a default of `false`; an implementation whose `wrapper_receive` can fail for good must override it.
 
+### Changed
+
+- **PIP-145 topic-list deltas are addressed to their watcher: `Client::poll_topic_list_change` and `BrokerMetadataApi::poll_topic_list_change` take a `watcher_id`, `TopicListChange` (both runtimes) gains a `watcher_id` field, and the hidden deadline seam `watch_topic_list_with_operation_deadline` / `BrokerMetadataApi::watch_topic_list_with_deadline` resolve to `(watcher_id, topics)`** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
+  `ConnectionEvent::TopicListChanged` and `OpOutcome::TopicListSnapshot` carry the id too, and `watch_topic_list_with_deadline` no longer has a default body (a default cannot know the id), so an external `BrokerMetadataApi` implementor must add it.
+  `watch_topic_list`, `PulsarClient::topic_list_snapshot` and the any-watcher `Client::next_topic_list_change` are unchanged.
+
 ### Fixed
 
+- **Two `PatternConsumer`s on one client no longer apply each other's PIP-145 deltas** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
+  Every pattern consumer opens its own broker-side topic-list watcher, but the connection dropped the watcher id when it turned the broker's `CommandWatchTopicUpdate` into an event and the driver appended every event to one buffer per client, so whichever consumer called `update` first popped the other's deltas.
+  It then subscribed its own template to a topic outside its pattern, which is a durable subscription created on the broker, and the owner of the delta never saw it: discovery is delta-only after the first snapshot and the broker announces a topic once.
+  The event now carries the id, `update` takes only the deltas addressed to the watcher its builder opened, and a delta for a watcher the connection does not hold (a snapshot cancelled after its frame went out) is dropped instead of being queued for the life of the connection.
+  The deltas of a watcher nobody polls (a `topic_list_snapshot`, a dropped `PatternConsumer`) are now never taken from the buffer (nothing clears `topic_list_changes`) instead of being applied by another consumer; the broker keeps pushing them because no `CommandWatchTopicListClose` is sent, which this change does not address.
 - **`commit_transaction` and `abort_transaction` no longer hang when the last admitted acknowledgement settles just before the end waiter's first poll** ([ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md)).
   `prepare` read the gate's decision under the transaction entry's lock and released the lock before the end waiter's first poll took it again, and that first poll trusted the `Wait { pending }` it had been handed.
   On a multi-thread executor the acknowledging task can settle in that gap: it drains `waiters` while the end waiter is not yet registered, admission is closed so no later settle can happen, and the first poll then parked a waker nothing would ever wake, until the caller cancelled the commit.

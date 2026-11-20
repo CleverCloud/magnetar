@@ -1182,10 +1182,13 @@ impl<P: Providers> Client<P> {
             &mut last_broker_error,
         )
         .await
+        .map(|(_, topics)| topics)
     }
 
     /// Deadline-aware topic-list snapshot seam used by the engine-generic
-    /// pattern-consumer builder.
+    /// pattern-consumer builder. Resolves to the id the connection allocated to the new
+    /// watcher, which addresses every later delta ([`TopicListChange::watcher_id`]) to it, and
+    /// the initial topic snapshot.
     #[doc(hidden)]
     pub async fn watch_topic_list_with_operation_deadline(
         &self,
@@ -1193,7 +1196,7 @@ impl<P: Providers> Client<P> {
         pattern: &str,
         mut deadline: OperationDeadline<'_>,
         last_broker_error: &mut Option<(i32, String)>,
-    ) -> Result<Vec<String>, ClientError> {
+    ) -> Result<(u64, Vec<String>), ClientError> {
         if operation_deadline_expired(deadline.as_mut()) {
             return Err(operation_deadline_error(
                 "topic-list snapshot",
@@ -1218,7 +1221,9 @@ impl<P: Providers> Client<P> {
             outcome = request.as_mut() => outcome,
         };
         match outcome {
-            OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
+            OpOutcome::TopicListSnapshot {
+                watcher_id, topics, ..
+            } => Ok((watcher_id, topics)),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
             OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
@@ -1227,10 +1232,14 @@ impl<P: Providers> Client<P> {
         }
     }
 
-    /// Await the next PIP-145 topic-list delta. Resolves with the broker-
+    /// Await the next PIP-145 topic-list delta of any watcher. Resolves with the broker-
     /// reported added / removed topics when the next watcher delta arrives,
     /// or `None` if the connection has closed and no further deltas will
     /// ever arrive.
+    ///
+    /// The delta names its watcher ([`TopicListChange::watcher_id`]); with several watchers on
+    /// the client a caller that applies deltas must take only its own with
+    /// [`Self::poll_topic_list_change`], because this one hands out whichever arrived first.
     ///
     /// Pair with [`Self::watch_topic_list`] to first establish the watcher
     /// subscription. The future is cancel-safe: dropping it without polling
@@ -1258,12 +1267,13 @@ impl<P: Providers> Client<P> {
         }
     }
 
-    /// Non-blocking peek for the next PIP-145 topic-list delta. Returns
-    /// `None` when the queue is empty. Useful for tight loops that want to
-    /// drain pending deltas without yielding to the runtime.
+    /// Non-blocking take of the next PIP-145 topic-list delta addressed to `watcher_id` (the id
+    /// [`Self::watch_topic_list_with_operation_deadline`] returned). Returns `None` when that
+    /// watcher has none pending. The deltas of every other watcher stay in the buffer. Useful
+    /// for tight loops that want to drain pending deltas without yielding to the runtime.
     #[must_use]
-    pub fn poll_topic_list_change(&self) -> Option<TopicListChange> {
-        self.shared.topic_list_changes.lock().pop_front()
+    pub fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {
+        self.shared.take_topic_list_change(watcher_id)
     }
 
     // -------------------------------------------------------------------
@@ -2796,6 +2806,7 @@ mod tests {
     fn next_topic_list_change_drains_queue() {
         let shared = ConnectionShared::new(ConnectionConfig::default());
         shared.topic_list_changes.lock().push_back(TopicListChange {
+            watcher_id: 0,
             added: vec!["persistent://t/n/foo".to_owned()],
             removed: vec![],
         });

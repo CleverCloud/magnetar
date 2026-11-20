@@ -11,13 +11,15 @@
 //! Reconciliation model
 //! --------------------
 //! - Initial snapshot: `topic_list_snapshot(namespace, pattern)` returns the current matching topic
-//!   set; the builder subscribes to each.
-//! - Streaming deltas: each [`PatternConsumer::update`] call moves any pending `TopicListChanged`
-//!   deltas from the connection buffer into this consumer's own backlog, in arrival order, and
-//!   reconciles the consumer set from it: newly-added topics are subscribed, removed topics are
-//!   closed and dropped. A step leaves the backlog only once it has taken effect, so a subscribe
-//!   that fails or an `update` future that is dropped loses nothing: the next call resumes from
-//!   what is left.
+//!   set; the builder subscribes to each and keeps the id of the broker-side watcher it opened.
+//! - Streaming deltas: every `TopicListChanged` delta the broker pushes names its watcher, and the
+//!   connection buffers the deltas of all of its watchers together. Each
+//!   [`PatternConsumer::update`] call moves the pending deltas addressed to this consumer's own
+//!   watcher (and no other's) from the connection buffer into this consumer's own backlog, in
+//!   arrival order, and reconciles the consumer set from it: newly-added topics are subscribed,
+//!   removed topics are closed and dropped. A step leaves the backlog only once it has taken
+//!   effect, so a subscribe that fails or an `update` future that is dropped loses nothing: the
+//!   next call resumes from what is left.
 //! - Callers drive reconciliation explicitly (no spawned task) — call `update()` from a timer or
 //!   before/after blocking work.
 //!
@@ -90,6 +92,11 @@ struct Inner<C: ConsumerApi> {
     /// concurrent reconciles (they walk this queue in place) and is released when the future is
     /// dropped.
     pending: tokio::sync::Mutex<VecDeque<PendingOp>>,
+    /// The id the connection allocated to this consumer's topic-list watcher. The connection's
+    /// delta buffer is shared by every watcher on the client, and each delta is addressed to one
+    /// of them: [`PatternConsumer::update`] takes only the deltas carrying this id, so it never
+    /// applies another consumer's (a topic outside this pattern) and never starves their owner.
+    watcher_id: u64,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -195,9 +202,15 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
         self.inner.consumers.lock().is_empty()
     }
 
-    /// Move pending PIP-145 `TopicListChanged` deltas from the underlying connection into this
-    /// consumer's backlog and reconcile the consumer set from it: newly-added topics are
-    /// subscribed, removed topics are closed and dropped.
+    /// Move the pending PIP-145 `TopicListChanged` deltas addressed to this consumer's watcher from
+    /// the underlying connection into this consumer's backlog and reconcile the consumer set from
+    /// it: newly-added topics are subscribed, removed topics are closed and dropped.
+    ///
+    /// Only the deltas of the broker-side watcher this consumer's builder opened are taken. Other
+    /// watchers on the client (another pattern consumer, a `topic_list_snapshot`) keep theirs
+    /// buffered for their own owners, so a consumer never subscribes a topic the broker announced
+    /// for somebody else's pattern. `client` must be the client that built the consumer: a watcher
+    /// id is only meaningful on the connection that allocated it.
     ///
     /// Deltas are applied in the order the broker sent them, so a topic created and then deleted
     /// between two calls is never subscribed. Idempotent; returns the count of additions and
@@ -231,7 +244,9 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
         // Move every polled delta into the backlog before anything is applied. No await sits
         // between a delta leaving the connection and landing in the backlog, so a cancelled
         // call cannot lose one in between.
-        while let Some(change) = crate::BrokerMetadataApi::poll_topic_list_change(&client.inner) {
+        while let Some(change) =
+            crate::BrokerMetadataApi::poll_topic_list_change(&client.inner, self.inner.watcher_id)
+        {
             enqueue_change(&mut pending, change);
         }
         if pending.is_empty() {
@@ -1079,7 +1094,7 @@ where
             start_message_rollback_duration_sec: self.start_message_rollback_duration_sec,
         };
 
-        let topics = self
+        let (watcher_id, topics) = self
             .client
             .topic_list_snapshot_with_deadline(&namespace, &pattern, deadline)
             .await?;
@@ -1108,6 +1123,7 @@ where
                 membership_changed: Arc::new(Notify::new()),
                 cursor: AtomicUsize::new(0),
                 pending: tokio::sync::Mutex::new(VecDeque::new()),
+                watcher_id,
                 namespace,
                 pattern,
                 template,
@@ -1286,6 +1302,7 @@ mod tests {
                 membership_changed: Arc::new(tokio::sync::Notify::new()),
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 pending: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                watcher_id: 0,
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,

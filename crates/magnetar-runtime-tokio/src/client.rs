@@ -1395,10 +1395,13 @@ impl Client {
             &mut last_broker_error,
         )
         .await
+        .map(|(_, topics)| topics)
     }
 
     /// Deadline-aware topic-list snapshot seam used by the engine-generic
-    /// pattern-consumer builder.
+    /// pattern-consumer builder. Resolves to the id the connection allocated to the new
+    /// watcher, which addresses every later delta ([`crate::TopicListChange::watcher_id`]) to
+    /// it, and the initial topic snapshot.
     #[doc(hidden)]
     pub async fn watch_topic_list_with_operation_deadline(
         &self,
@@ -1406,7 +1409,7 @@ impl Client {
         pattern: &str,
         mut deadline: OperationDeadline<'_>,
         last_broker_error: &mut Option<(i32, String)>,
-    ) -> Result<Vec<String>, ClientError> {
+    ) -> Result<(u64, Vec<String>), ClientError> {
         if operation_deadline_expired(deadline.as_mut()) {
             return Err(operation_deadline_error(
                 "topic-list snapshot",
@@ -1431,7 +1434,9 @@ impl Client {
             outcome = request.as_mut() => outcome,
         };
         match outcome {
-            magnetar_proto::OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
+            magnetar_proto::OpOutcome::TopicListSnapshot {
+                watcher_id, topics, ..
+            } => Ok((watcher_id, topics)),
             magnetar_proto::OpOutcome::Error { code, message, .. } => {
                 Err(ClientError::Broker { code, message })
             }
@@ -1442,10 +1447,14 @@ impl Client {
         }
     }
 
-    /// Await the next PIP-145 `TopicListChanged` delta. Resolves with the broker-reported
-    /// added / removed topics when the next watcher delta arrives, or `None` if the
-    /// connection has closed and no further deltas will arrive. Pair with
+    /// Await the next PIP-145 `TopicListChanged` delta of any watcher. Resolves with the
+    /// broker-reported added / removed topics when the next watcher delta arrives, or `None` if
+    /// the connection has closed and no further deltas will arrive. Pair with
     /// [`Self::watch_topic_list`] to first establish the watcher subscription.
+    ///
+    /// The delta names its watcher ([`crate::TopicListChange::watcher_id`]); with several
+    /// watchers on the client a caller that applies deltas must take only its own with
+    /// [`Self::poll_topic_list_change`], because this one hands out whichever arrived first.
     ///
     /// The future is cancel-safe: dropping it without polling does not drop pending
     /// deltas, the next `next_topic_list_change` call still sees them.
@@ -1471,11 +1480,12 @@ impl Client {
         }
     }
 
-    /// Non-blocking peek for the next PIP-145 topic-list delta. Returns `None` when the
-    /// queue is empty.
+    /// Non-blocking take of the next PIP-145 topic-list delta addressed to `watcher_id` (the id
+    /// [`Self::watch_topic_list_with_operation_deadline`] returned). Returns `None` when that
+    /// watcher has none pending. The deltas of every other watcher stay in the buffer.
     #[must_use]
-    pub fn poll_topic_list_change(&self) -> Option<crate::TopicListChange> {
-        self.shared.topic_list_changes.lock().pop_front()
+    pub fn poll_topic_list_change(&self, watcher_id: u64) -> Option<crate::TopicListChange> {
+        self.shared.take_topic_list_change(watcher_id)
     }
 
     /// PIP-33: await the next replicated-subscription marker observed by any consumer on
