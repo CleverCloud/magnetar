@@ -63,6 +63,16 @@ fn validate_decompression_ceiling(
     Ok(())
 }
 
+/// Whether a failed replacement of the live DAG watch ends the aggregate.
+///
+/// Only the terminal set of [`control_plane_error_is_terminal`] does: a lookup timeout, a
+/// rejected replacement lookup, a replaced connection, a rejected assignment and a model
+/// error are transient, so they resynchronize and re-resolve through the reconnect loop
+/// like every other control-plane failure.
+fn reopen_error_is_terminal(error: &StreamConsumerError) -> bool {
+    matches!(error, StreamConsumerError::Client(client) if control_plane_error_is_terminal(client))
+}
+
 /// Complete runtime configuration for one assignment-driven aggregate.
 #[derive(Debug, Clone)]
 pub struct StreamConsumerOptions {
@@ -2998,10 +3008,11 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                             previous.close();
                             self.push_assignment_event(controller.assignment());
                         }
-                        Err(error) => {
+                        Err(error) if reopen_error_is_terminal(&error) => {
                             self.fail_closed(error.to_string());
                             break;
                         }
+                        Err(error) => self.request_resync(error.to_string()),
                     }
                 }
                 ControlUpdate::Wake | ControlUpdate::Dag(Ok(_)) => {}
@@ -7093,6 +7104,124 @@ mod tests {
             .await
             .expect("armed close notification releases control loop")
             .expect("control task");
+    }
+
+    fn staged_dag_lookup_session(shared: &Arc<ConnectionShared>) -> Option<u64> {
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let command = magnetar_proto::decode_one(&mut staged)
+                .expect("decode staged command")
+                .command;
+            if let Some(lookup) = command.scalable_topic_lookup {
+                return Some(lookup.session_id);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn control_loop_retries_a_non_terminal_dag_reopen_failure() {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let (snapshot, assignment) = control_plane_fixture();
+        let epoch = shared.inner.lock().session_epoch();
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 81),
+            session_id: 81,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot,
+            closed: true,
+        };
+        let controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
+            shared: shared.clone(),
+            route: shared.scalable_routes.claim_at_epoch(
+                shared.clone(),
+                ScalableRouteKey::consumer(42, magnetar_proto::ControllerIncarnation(1)),
+                epoch,
+            ),
+            consumer_id: 42,
+            incarnation: magnetar_proto::ControllerIncarnation(1),
+            assignment,
+            registration_topic: "topic://public/default/scaled".to_owned(),
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+        };
+        let task_inner = inner.clone();
+        let task = tokio::spawn(async move {
+            task_inner.control_loop(dag, controller).await;
+        });
+
+        // The broker closes the live DAG watch, so the runtime re-resolves it.
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::DagWatchClosed {
+                    session_id: 81,
+                    reason: Some("DAG watch moved".to_owned()),
+                })
+                .is_none()
+        );
+        let first_lookup = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(session_id) = staged_dag_lookup_session(&shared) {
+                    return session_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the closed DAG watch is re-resolved");
+
+        // The replacement lookup is rejected before its baseline: a transient
+        // failure that the reconnect path retries, not a terminal closure.
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::DagWatchClosed {
+                    session_id: first_lookup,
+                    reason: Some("service not ready".to_owned()),
+                })
+                .is_none()
+        );
+        let second_lookup = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(session_id) = staged_dag_lookup_session(&shared) {
+                    return Some(session_id);
+                }
+                if inner.state.lock().close_state.is_closing() {
+                    return None;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let (close_state, terminal_error) = {
+            let state = inner.state.lock();
+            (state.close_state, state.terminal_error.clone())
+        };
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            close_state,
+            AggregateCloseState::Open,
+            "a rejected replacement lookup must not fence the aggregate \
+             (terminal_error={terminal_error:?})"
+        );
+        assert_eq!(terminal_error, None);
+        assert!(
+            second_lookup.is_some_and(|session_id| session_id != first_lookup),
+            "the rejected replacement lookup is retried with a further lookup"
+        );
     }
 
     #[tokio::test]

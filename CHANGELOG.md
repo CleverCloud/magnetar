@@ -119,6 +119,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `StreamReceiveState` (`magnetar-proto`) now keeps one chain per `(child, uuid)`, up to `MAX_PENDING_CHUNK_CHAINS` (10, the ordinary consumer's `max_pending_chunked_message` default) and binds the child's permit to whichever chain, or none, the arriving entry belongs to.
   A child that holds a chain assembly is served first by the flow arbiter, so a sibling cannot take the frame its chain needs, and each chain counts against the structural budget limit of its child.
   An eleventh concurrent chain on one child is a malformed delivery and still requests resynchronization.
+- **A transient failure while a `StreamConsumer` re-resolves its closed DAG watch no longer fails the consumer for good.**
+  When the broker closed the retained DAG watch, the control loop of both runtimes (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) reopened it inline and answered every error with `fail_closed`: a lookup timeout, a replacement lookup the broker rejected before its baseline (`ServiceNotReady` for instance), a replaced connection, a rejected assignment and a model rejection all fenced the aggregate, which then only reported the terminal error.
+  Every other control-plane failure was already classified, and the reconnect loop retries all but the terminal set.
+  The failed reopen now fails the aggregate itself only for physical connection closure, explicit route closure and peer closure, the set ADR-0120 names as terminal, and requests resynchronization otherwise, after which the reconnect loop applies its existing rules to the replacement lookup and registration.
 
 ## [2.0.0] - 2026-11-19
 
