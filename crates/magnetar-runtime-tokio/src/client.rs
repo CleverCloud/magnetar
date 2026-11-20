@@ -26,7 +26,7 @@ use crate::driver::{
     spawn_supervised as spawn_supervised_driver,
 };
 use crate::error::ClientError;
-use crate::pool::{ConnectionFactory, ProxyConnectionPool};
+use crate::pool::{ConnectionFactory, PendingDriverGuard, ProxyConnectionPool};
 use crate::producer::Producer;
 use crate::transport::{Transport, default_tls_config};
 use crate::url_parse::{ParsedUrl, Scheme};
@@ -382,7 +382,9 @@ impl Client {
         // Wake the driver immediately so it flushes the CONNECT.
         shared.driver_waker.notify_one();
 
-        let driver = spawn_driver(shared.clone(), socket);
+        // The guard owns the task until the `Client` exists: cancelling this future while it
+        // waits for CONNECTED drops the guard, which aborts the driver and with it the socket.
+        let mut driver = PendingDriverGuard::new(spawn_driver(shared.clone(), socket));
 
         // Park until the state machine emits `ConnectionEvent::Connected`,
         // bounded by `operation_timeout`. A peer that accepts the socket but
@@ -408,7 +410,7 @@ impl Client {
                 );
                 Ok(Self {
                     shared,
-                    driver: Mutex::new(Some(driver)),
+                    driver: Mutex::new(driver.take()),
                     // `from_socket` has no URL to dial back through, so the proxy pool is
                     // disabled. A lookup that returns `proxy_through_service_url = true`
                     // surfaces `ClientError::ProxyUnsupportedOnSocketClient`. With no pool the
@@ -419,10 +421,8 @@ impl Client {
                     connection_rr: AtomicUsize::new(0),
                 })
             }
-            Err(e) => {
-                driver.abort();
-                Err(e)
-            }
+            // The guard aborts the driver on the way out.
+            Err(e) => Err(e),
         }
     }
 
@@ -472,7 +472,9 @@ impl Client {
             service_url_provider,
             dns_resolver,
         };
-        let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
+        // Owned by the guard until the `Client` exists, as in `start_handshake`.
+        let mut driver =
+            PendingDriverGuard::new(spawn_supervised_driver(shared.clone(), socket, ctx));
 
         // Bounded by `operation_timeout` — see `start_handshake` for the
         // rationale (ADR-0052, extended to the post-dial handshake).
@@ -488,16 +490,14 @@ impl Client {
                 tracing::info!(host = %host, port, tls, auth_method, "connection established");
                 Ok(Self {
                     shared,
-                    driver: Mutex::new(Some(driver)),
+                    driver: Mutex::new(driver.take()),
                     pool: Some(ProxyConnectionPool::new(factory)),
                     connections_per_broker: 1,
                     connection_rr: AtomicUsize::new(0),
                 })
             }
-            Err(e) => {
-                driver.abort();
-                Err(e)
-            }
+            // The guard aborts the driver on the way out.
+            Err(e) => Err(e),
         }
     }
 
@@ -2291,8 +2291,13 @@ impl Client {
     }
 
     /// Close the connection. Sends `CommandCloseConnection`-style state-machine close on the
-    /// bootstrap connection, joins its driver, then closes every entry in the proxy pool
-    /// (ADR-0039) and joins their drivers.
+    /// bootstrap connection and on every entry in the proxy pool (ADR-0039), then joins the
+    /// bootstrap driver and the pool's drivers in that order.
+    ///
+    /// Every connection is told to close before the first `.await`, so cancelling this future
+    /// (a `timeout`, a `select!`) loses only the joins: each driver observes its own
+    /// `is_user_closed()` and exits by itself. `close` consumes the client, so a connection it
+    /// had not yet reached would otherwise stay open with nothing able to close it.
     ///
     /// Idempotent: calling close more than once does nothing on the subsequent calls.
     pub async fn close(self) {
@@ -2301,16 +2306,18 @@ impl Client {
             conn.close();
         }
         self.shared.driver_waker.notify_one();
+        // Tear down the proxy pool (ADR-0039) now, not after the bootstrap join below. Pool
+        // entries are independent supervised driver loops; each one observes its own
+        // `is_user_closed()` once told to close, so only the joins wait for later.
+        let pool_drivers = self.pool.as_ref().map(|pool| pool.begin_close());
         let handle = self.driver.lock().take();
         if let Some(handle) = handle {
             // We deliberately discard the join result here — close() is best-effort; consumers
             // that want the terminal error should call `join_driver` instead.
             let _ = handle.join().await;
         }
-        // Tear down the proxy pool (ADR-0039). Pool entries are independent supervised
-        // driver loops; each one observes its own `is_user_closed()` after we call close().
-        if let Some(pool) = self.pool.as_ref() {
-            pool.close().await;
+        if let Some(pool_drivers) = pool_drivers {
+            pool_drivers.join().await;
         }
     }
 

@@ -240,3 +240,7 @@ ADR-0059's entry-point guard list (§ 3) and ADR-0080's operation-deadline scope
 ADR-0039's pool-entry lifecycle is amended in place on 2026-11-19: a pool entry whose driver has exited for good (no supervisor and the connection dropped, or a supervisor that exhausted `max_attempts`) is replaced by a fresh dial at the next open for its key instead of being handed out until `Client.close`; the rest of ADR-0039 is unchanged.
 
 ADR-0060's bounded `SessionLost` re-issue is extended in place on 2026-11-19 from `lookup_topic` to the partitioned-metadata request and the topic-list snapshot: both engines re-issue them on the fresh session under the same `MAX_LOOKUP_SESSION_REISSUES` bound and `operation_timeout`, and surface `PeerClosed` at the same two stops (supervisor gave up, bound spent), instead of `Other(SessionLost…)`; the rest of ADR-0060 is unchanged.
+
+ADR-0039's `Client.close` bullet is amended in place on 2026-11-20: `Client::close` tells the bootstrap and every pool entry to close, and every pending dial to cancel, before its first `.await`, so a `close` cancelled at one of its joins no longer leaves the later pool connections open; the rest of ADR-0039 is unchanged.
+
+ADR-0052's post-dial handshake bound is extended in place on 2026-11-20 to a handshake the caller abandons: a cancelled tokio `Client::connect*` or `Client::from_socket` aborts the driver it spawned instead of detaching it with its socket; moonpool already had no task at that point, and the rest of ADR-0052 is unchanged.

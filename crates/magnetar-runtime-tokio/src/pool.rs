@@ -150,19 +150,21 @@ impl Entry {
     }
 }
 
-/// Own a just-spawned driver until its pool entry becomes reachable.
+/// Own a just-spawned driver until its owner becomes reachable.
 ///
-/// Cancelling `build_entry` at any await point drops this guard and aborts the
-/// otherwise-detached Tokio task. Once the ready entry is assembled, `take`
-/// transfers lifecycle ownership to [`Entry`].
-struct PendingDriverGuard(Option<DriverHandle>);
+/// A [`DriverHandle`] dropped on its own detaches the Tokio task, which keeps the socket and
+/// the connection state alive with nothing able to reach them. Cancelling `build_entry` (the
+/// pool dial) or `Client::connect` / `Client::from_socket` (the bootstrap handshake) at any
+/// await point after the spawn drops this guard and aborts that task. Once the owner — the pool
+/// [`Entry`] or the [`crate::Client`] — is assembled, `take` transfers lifecycle ownership to it.
+pub(crate) struct PendingDriverGuard(Option<DriverHandle>);
 
 impl PendingDriverGuard {
-    fn new(driver: DriverHandle) -> Self {
+    pub(crate) fn new(driver: DriverHandle) -> Self {
         Self(Some(driver))
     }
 
-    fn take(&mut self) -> Option<DriverHandle> {
+    pub(crate) fn take(&mut self) -> Option<DriverHandle> {
         self.0.take()
     }
 }
@@ -171,6 +173,20 @@ impl Drop for PendingDriverGuard {
     fn drop(&mut self) {
         if let Some(driver) = self.0.as_ref() {
             driver.abort();
+        }
+    }
+}
+
+/// The drivers of the pool entries [`ProxyConnectionPool::begin_close`] has already told to
+/// close. Joining them is the only step left, and the only one that can be cancelled.
+pub(crate) struct ClosingEntries(Vec<DriverHandle>);
+
+impl ClosingEntries {
+    /// Wait for every closing entry's driver to exit. The join results are discarded: closing is
+    /// best-effort.
+    pub(crate) async fn join(self) {
+        for handle in self.0 {
+            let _ = handle.join().await;
         }
     }
 }
@@ -453,24 +469,28 @@ impl ProxyConnectionPool {
         }))
     }
 
-    /// Close every pool entry. Calls `Connection::close` on each shared
-    /// state-machine, wakes the supervisors, then joins their driver tasks.
-    /// Idempotent: a second call is a no-op (entries cleared after the
-    /// first).
-    pub(crate) async fn close(&self) {
-        // Snapshot under-lock so we don't hold the lock across `.await`.
+    /// First half of closing the pool, and the only half that must not be cancellable: drain the
+    /// map, call `Connection::close` on **every** entry's shared state-machine and wake its
+    /// supervisor, all before the first `.await`. Nothing here suspends, so a caller that is
+    /// cancelled afterwards (`Client::close` under a `timeout` or `select!`) has already told
+    /// every connection to shut down; the drivers exit by themselves, and only the joins are
+    /// lost. Hands the drivers to [`ClosingEntries::join`] for the second half.
+    ///
+    /// Idempotent: a second call finds the map drained and returns nothing to join.
+    pub(crate) fn begin_close(&self) -> ClosingEntries {
         let drained: Vec<Arc<Entry>> = self.entries.lock().drain().map(|(_, v)| v).collect();
+        let mut drivers = Vec::with_capacity(drained.len());
         for entry in drained {
             {
                 let mut conn = entry.shared.inner.lock();
                 conn.close();
             }
             entry.shared.driver_waker.notify_one();
-            let handle = entry.driver.lock().take();
-            if let Some(handle) = handle {
-                let _ = handle.join().await;
+            if let Some(handle) = entry.driver.lock().take() {
+                drivers.push(handle);
             }
         }
+        ClosingEntries(drivers)
     }
 
     /// Number of currently-tracked entries. Exposed for diagnostics + tests.

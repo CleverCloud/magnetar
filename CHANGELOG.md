@@ -151,6 +151,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   They now fail with `PeerClosed` on a terminal connection, and every one of them, the coordinator handshake included, fails within `operation_timeout` on both engines.
   An expired `end_txn` leaves its canonical request pending, so calling it again resumes it and an unknown commit outcome is never sent twice.
   `Connection` also ignores the late broker reply to a cancelled transaction request instead of parking an outcome nobody takes, the façade's Moonpool `TransactionApi` delegates to the runtime client instead of carrying its own copy, and the scalable-topic `add_subscription_to_txn` of both runtimes goes through the same bounded wait.
+- **Cancelling `Client::connect*` or `Client::from_socket` no longer leaks the connection's driver** ([ADR-0052](specs/adr/0052-initial-connect-timeout-retry.md), 2026-11-20 amendment).
+  The tokio client spawned the driver task, which owns the socket, and then waited for CONNECTED with the only abort on the error arm; a `DriverHandle` dropped by cancellation does not stop its task, so a connect abandoned by a `timeout`, a `select!` or a shutdown signal left a detached task and its socket behind, parked on the read against a silent broker and turning into a live unreachable connection if CONNECTED arrived late.
+  The spawned driver is now held by the pool's `PendingDriverGuard` until the `Client` exists, so dropping the future aborts it.
+  Moonpool already handshakes before it spawns and is unchanged.
+- **Cancelling `Client::close` no longer leaves the pool's connections open** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-20 amendment).
+  `close` consumes the client, and it closed the bootstrap connection but each pool connection only after the bootstrap driver's join and the joins of the entries before it, so a `close` bounded by a `timeout` or a `select!` and cancelled at one of those awaits left the remaining connections open with their supervised drivers running (on tokio already removed from the pool map) and nothing able to reach them.
+  Both engines now tell the bootstrap and every pool entry to close, and moonpool also every pending dial to cancel, before the first `.await`; a cancelled `close` loses only the joins.
 
 ## [2.0.0] - 2026-11-19
 

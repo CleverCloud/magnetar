@@ -524,6 +524,13 @@ impl<P: Providers> Client<P> {
     /// (ADR-0039), every pool entry is closed and its supervised driver
     /// joined as part of teardown.
     ///
+    /// Every connection — the bootstrap and each pool entry — is told to
+    /// close before the first `.await`, so cancelling this future (a
+    /// `timeout`, a `select!`) loses only the joins: each driver observes its
+    /// own `is_user_closed()` and exits by itself. `close` consumes the
+    /// client, so a connection it had not yet reached would otherwise stay
+    /// open with nothing able to close it.
+    ///
     /// Idempotent: calling close more than once is a no-op on subsequent
     /// calls (the driver handle is taken on the first call).
     pub async fn close(self)
@@ -535,16 +542,18 @@ impl<P: Providers> Client<P> {
             conn.close();
         }
         self.shared.driver_waker.notify_one();
+        // Tear down the proxy pool (ADR-0039) now, not after the bootstrap
+        // join below. Pool entries are independent supervised driver loops;
+        // each observes its own `is_user_closed()` once told to close and
+        // exits cleanly, so only the joins wait for later.
+        let pool_entries = self.pool.as_ref().map(|pool| pool.begin_close());
         let handle = self.driver.lock().take();
         if let Some(handle) = handle {
             // best-effort close — drop the driver's terminal error.
             let _ = handle.join().await;
         }
-        // Tear down the proxy pool (ADR-0039). Pool entries are independent
-        // supervised driver loops; each observes its own `is_user_closed()`
-        // after `close()` is called and exits cleanly.
-        if let Some(pool) = self.pool.as_ref() {
-            pool.close().await;
+        if let Some(pool_entries) = pool_entries {
+            pool_entries.join().await;
         }
     }
 
