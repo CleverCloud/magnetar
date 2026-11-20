@@ -39,6 +39,8 @@ use tokio::sync::Notify;
 
 const TOPIC_A: &str = "persistent://public/default/push-survival-a";
 const TOPIC_B: &str = "persistent://public/default/push-survival-b";
+const NAMESPACE: &str = "public/default";
+const PATTERN: &str = "persistent://public/default/push-survival-.*";
 const DEADLINE: Duration = Duration::from_secs(3);
 
 /// One message the broker will push to the consumer subscribed to a topic.
@@ -96,6 +98,8 @@ struct State {
     wake: HashMap<u64, Arc<Notify>>,
     /// Consumer ids the client has closed, in order.
     closed: Vec<(u64, u64)>,
+    /// The topics every `CommandWatchTopicList` is answered with.
+    watch_topics: Vec<String>,
 }
 
 impl State {
@@ -169,6 +173,11 @@ impl FakeBroker {
 
     fn closed_consumers(&self) -> usize {
         self.state.lock().closed.len()
+    }
+
+    /// Set the topic list every `CommandWatchTopicList` is answered with.
+    fn watch_topics(&self, topics: &[&str]) {
+        self.state.lock().watch_topics = topics.iter().map(|t| (*t).to_owned()).collect();
     }
 
     async fn client(&self) -> PulsarClient {
@@ -260,6 +269,18 @@ fn handle_command(cmd: &pb::BaseCommand, conn: u64, state: &Mutex<State>) {
                     ..Default::default()
                 }),
                 ..base(pb::base_command::Type::LookupResponse)
+            })
+        })
+    } else if ty == pb::base_command::Type::WatchTopicList as i32 {
+        cmd.watch_topic_list.as_ref().map(|watch| {
+            command_frame(&pb::BaseCommand {
+                watch_topic_list_success: Some(pb::CommandWatchTopicListSuccess {
+                    request_id: watch.request_id,
+                    watcher_id: watch.watcher_id,
+                    topic: guard.watch_topics.clone(),
+                    topics_hash: "push-survival".to_owned(),
+                }),
+                ..base(pb::base_command::Type::WatchTopicListSuccess)
             })
         })
     } else if ty == pb::base_command::Type::Subscribe as i32 {
@@ -360,6 +381,16 @@ async fn serve(mut stream: TcpStream, conn: u64, state: Arc<Mutex<State>>, notif
     }
 }
 
+/// Install, once per test binary, a subscriber that enables every event and discards the output,
+/// so the fields of the `debug!` event each skip logs are evaluated as they are in a deployment
+/// that records them.
+fn log_every_event() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with_writer(std::io::sink)
+        .try_init();
+}
+
 /// Poll `cond` every 10 ms until it holds or `DEADLINE` elapses; the final verdict is `cond()`.
 async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + DEADLINE;
@@ -457,6 +488,7 @@ async fn pull_receive_survives_a_per_message_receive_error() {
 /// must still be delivered; the poller must not have exited.
 #[tokio::test(flavor = "current_thread")]
 async fn single_topic_push_listener_survives_a_per_message_receive_error() {
+    log_every_event();
     let broker = FakeBroker::start().await;
     let client = broker.client().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -490,6 +522,7 @@ async fn single_topic_push_listener_survives_a_per_message_receive_error() {
 /// topic of a multi-topic consumer must neither end delivery for that topic nor for its sibling.
 #[tokio::test(flavor = "current_thread")]
 async fn multi_topic_push_listener_survives_a_per_message_receive_error() {
+    log_every_event();
     let broker = FakeBroker::start().await;
     let client = broker.client().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -533,6 +566,7 @@ async fn multi_topic_push_listener_survives_a_per_message_receive_error() {
 /// the view freezes at its pre-error content while `is_connected()` stays true.
 #[tokio::test(flavor = "current_thread")]
 async fn table_view_drain_survives_a_per_message_receive_error() {
+    log_every_event();
     let broker = FakeBroker::start().await;
     let client = broker.client().await;
 
@@ -617,4 +651,53 @@ async fn multi_topic_push_listener_survives_remove_topic() {
         seen.lock()
     );
     assert!(running, "the poller must outlive the removal of one child");
+}
+
+/// Pattern pull site (`PatternConsumer::receive` over several children): a per-message error on
+/// one child is returned naming that child's topic, and the sweep moves past it, so the following
+/// calls deliver the sibling's message and the failing child's next one.
+#[tokio::test(flavor = "current_thread")]
+async fn pattern_pull_receive_survives_a_per_message_receive_error() {
+    log_every_event();
+    let broker = FakeBroker::start().await;
+    let client = broker.client().await;
+    broker.watch_topics(&[TOPIC_A, TOPIC_B]);
+    let consumer = client
+        .pattern_consumer()
+        .namespace(NAMESPACE)
+        .pattern(PATTERN)
+        .subscription("push-survival")
+        .subscription_type(SubType::Exclusive)
+        .subscribe()
+        .await
+        .expect("subscribe pattern");
+    broker.publish(TOPIC_A, Scripted::encrypted(0));
+    broker.publish(TOPIC_A, Scripted::plain(1));
+    broker.publish(TOPIC_B, Scripted::plain(2));
+
+    let mut errors = Vec::new();
+    let mut delivered = Vec::new();
+    for _ in 0..4 {
+        match tokio::time::timeout(DEADLINE, consumer.receive())
+            .await
+            .expect("receive did not time out")
+        {
+            Ok(message) => delivered.push((message.topic, message.message.metadata.sequence_id)),
+            Err(err) => errors.push(err.to_string()),
+        }
+        if delivered.len() == 2 {
+            break;
+        }
+    }
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        vec![(TOPIC_A.to_owned(), 1), (TOPIC_B.to_owned(), 2)],
+        "both well-formed messages must be delivered after the undecryptable one (errors: \
+         {errors:?})"
+    );
+    assert!(
+        errors.len() == 1 && errors[0].contains(TOPIC_A),
+        "the undecryptable message must surface once, naming its topic, got {errors:?}"
+    );
 }

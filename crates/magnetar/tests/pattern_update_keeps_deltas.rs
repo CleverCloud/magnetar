@@ -321,6 +321,16 @@ async fn serve(mut stream: TcpStream, conn: u64, state: Arc<Mutex<State>>, notif
     }
 }
 
+/// Install, once per test binary, a subscriber that enables every event and discards the output,
+/// so the fields of the `warn!` a refused subscribe logs are evaluated as they are in a deployment
+/// that records them.
+fn log_every_event() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with_writer(std::io::sink)
+        .try_init();
+}
+
 /// Poll `cond` every 10 ms until it holds or `DEADLINE` elapses; the final verdict is `cond()`.
 async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + DEADLINE;
@@ -390,6 +400,7 @@ async fn update_subscribes_a_topic_the_broker_announced() {
 /// failed call short of `GOOD`.
 #[tokio::test(flavor = "current_thread")]
 async fn update_after_a_refused_subscribe_still_reaches_the_other_new_topics() {
+    log_every_event();
     let broker = FakeBroker::start().await;
     let client = broker.client().await;
     let consumer = seeded(&broker, &client).await;
@@ -495,6 +506,70 @@ async fn update_applies_create_then_delete_in_arrival_order() {
         !has_topic(&consumer, FLEETING),
         "FLEETING was created and then deleted by the broker, yet the consumer is subscribed to \
          it: the deltas were merged and the removal ran before the addition; topics: {:?}",
+        consumer.topics()
+    );
+}
+
+/// A delta that deletes a subscribed topic closes that topic's child: `update` reports it removed,
+/// the consumer no longer lists it, and the broker sees the child's consumer closed.
+#[tokio::test(flavor = "current_thread")]
+async fn update_closes_the_child_of_a_topic_the_broker_deleted() {
+    let broker = FakeBroker::start().await;
+    let client = broker.client().await;
+    let consumer = seeded(&broker, &client).await;
+
+    broker.push_update(&[], &[SEED]);
+    broker.client_has_processed_everything_pushed().await;
+    let report = tokio::time::timeout(DEADLINE, consumer.update(&client))
+        .await
+        .expect("update did not hang")
+        .expect("update ok");
+
+    assert_eq!(report.removed, 1, "the deleted topic's child is closed");
+    assert!(
+        !has_topic(&consumer, SEED),
+        "the broker deleted SEED, yet the consumer still lists it; topics: {:?}",
+        consumer.topics()
+    );
+    assert!(
+        eventually(|| broker.state.lock().subscribed.is_empty()).await,
+        "the deleted topic's consumer must be closed at the broker"
+    );
+}
+
+/// A topic the broker announces again while the subscribe of its first announcement is kept for
+/// a retry is subscribed once: the second announcement does not queue a second step for it.
+#[tokio::test(flavor = "current_thread")]
+async fn update_queues_a_topic_announced_again_while_its_subscribe_is_kept_once() {
+    log_every_event();
+    let broker = FakeBroker::start().await;
+    let client = broker.client().await;
+    let consumer = seeded(&broker, &client).await;
+
+    broker.deny_subscribe(BAD);
+    broker.push_update(&[BAD], &[]);
+    broker.client_has_processed_everything_pushed().await;
+    let refused = tokio::time::timeout(DEADLINE, consumer.update(&client))
+        .await
+        .expect("update did not hang");
+    assert!(
+        refused.is_err(),
+        "harness: the refused subscribe of BAD must fail the update, got {refused:?}"
+    );
+
+    broker.allow_subscribe(BAD);
+    broker.push_update(&[BAD], &[]);
+    broker.client_has_processed_everything_pushed().await;
+    let report = tokio::time::timeout(DEADLINE, consumer.update(&client))
+        .await
+        .expect("update did not hang")
+        .expect("update ok once the refusal passes");
+
+    assert_eq!(report.added, 1, "BAD is subscribed exactly once");
+    assert_eq!(
+        consumer.topics().iter().filter(|t| *t == BAD).count(),
+        1,
+        "BAD must be listed once; topics: {:?}",
         consumer.topics()
     );
 }

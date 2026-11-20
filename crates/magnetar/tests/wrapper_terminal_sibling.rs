@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -372,6 +373,16 @@ impl FakeBroker {
             }
         }
     }
+}
+
+/// Install, once per test binary, a subscriber that enables every event and discards the output,
+/// so the fields of the `debug!` event a skipped receive logs are evaluated as they are in a
+/// deployment that records them.
+fn log_every_event() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with_writer(std::io::sink)
+        .try_init();
 }
 
 /// Run `scenario` on a two-thread runtime, then drop the runtime without waiting for its tasks.
@@ -781,6 +792,115 @@ fn multi_topic_push_listener_survives_removing_its_last_topic() {
             delivered && running,
             "the push poller ended when its last topic was removed, so the topic added \
              afterwards was never delivered (poller running = {running}, saw {:?})",
+            seen.lock()
+        );
+    });
+}
+
+/// A pattern over one topic receives through its lone child directly; once that child is
+/// terminal, `receive()` fails and the error names the topic.
+#[tokio::test(flavor = "current_thread")]
+async fn pattern_receive_of_a_lone_terminal_child_names_its_topic() {
+    let broker = FakeBroker::start().await;
+    let client = broker.client(1).await;
+    broker.watch_topics(&[SOLO]);
+    let pattern = client
+        .pattern_consumer()
+        .namespace(NAMESPACE)
+        .pattern(PATTERN)
+        .subscription("wrap-term-solo")
+        .subscription_type(SubType::Exclusive)
+        .subscribe()
+        .await
+        .expect("subscribe pattern");
+    assert_eq!(pattern.topics(), [SOLO], "harness: one child");
+
+    broker.drop_every_connection();
+    assert!(
+        eventually(|| pattern.is_closed()).await,
+        "harness: the lone child must be closed once the only connection is lost"
+    );
+    let err = tokio::time::timeout(DEADLINE, pattern.receive())
+        .await
+        .expect("a terminal pattern must not park")
+        .expect_err("its only child is terminal");
+    assert!(
+        err.to_string().contains(SOLO),
+        "PatternConsumer::receive must name the topic its error concerns, got `{err}`"
+    );
+}
+
+/// A wrapper receiver written outside the crate that keeps `WrapperReceiver::is_terminal`'s
+/// default: its first receive fails, its second delivers, and it never receives again.
+#[derive(Clone, Default)]
+struct FailsOnceThenDelivers {
+    receives: Arc<AtomicUsize>,
+}
+
+impl magnetar::WrapperReceiver for FailsOnceThenDelivers {
+    async fn wrapper_receive(
+        &self,
+    ) -> Result<(String, magnetar_proto::IncomingMessage), magnetar::PulsarError> {
+        match self.receives.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(magnetar::PulsarError::Other(
+                "one message failed to decrypt".to_owned(),
+            )),
+            1 => Ok((
+                SOLO.to_owned(),
+                magnetar_proto::IncomingMessage {
+                    message_id: magnetar_proto::MessageId {
+                        ledger_id: 7,
+                        entry_id: 1,
+                        partition: -1,
+                        batch_index: -1,
+                        batch_size: 0,
+                    },
+                    metadata: Arc::new(pb::MessageMetadata {
+                        producer_name: "wrap-term-receiver".to_owned(),
+                        sequence_id: 1,
+                        publish_time: 0,
+                        ..Default::default()
+                    }),
+                    single_metadata: None,
+                    payload: Bytes::from_static(b"plain"),
+                    redelivery_count: 0,
+                    broker_entry_metadata: None,
+                    arrived_at: Instant::now(),
+                },
+            )),
+            _ => std::future::pending().await,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn membership_changed(&self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::pending()
+    }
+}
+
+/// The poller stops only when `is_terminal` says so, and the default says "never": a receiver
+/// that keeps it has a failed receive skipped, not taken for the end of delivery, and what it
+/// yields next is still delivered.
+#[test]
+fn a_receiver_keeping_the_default_is_terminal_is_retried_after_a_failed_receive() {
+    run(async {
+        log_every_event();
+        let receiver = FailsOnceThenDelivers::default();
+        assert!(
+            !magnetar::WrapperReceiver::is_terminal(&receiver),
+            "the default is never terminal"
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_wrapper_message_listener(receiver, wrapper_listener(&seen));
+        let delivered = eventually(|| seen.lock().contains(&(SOLO.to_owned(), 1))).await;
+        let running = handle.is_running();
+        assert!(
+            delivered && running,
+            "the poller must skip the failed receive and deliver the next message \
+             (poller running = {running}, saw {:?})",
             seen.lock()
         );
     });

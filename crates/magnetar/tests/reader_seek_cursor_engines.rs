@@ -57,6 +57,8 @@ struct State {
     seeks: Vec<u64>,
     /// Answer `CommandGetLastMessageId` with an error instead of the head.
     head_fails: bool,
+    /// Answer `CommandSeek` with an error instead of honouring it.
+    seek_fails: bool,
     /// Ledger id the head of an empty log is reported on.
     empty_head_ledger: u64,
     /// Frames ready to be written, per connection.
@@ -78,6 +80,7 @@ impl FakeBroker {
             next: 0,
             seeks: Vec::new(),
             head_fails: false,
+            seek_fails: false,
             empty_head_ledger: LEDGER,
             outbox: HashMap::new(),
         }));
@@ -114,6 +117,11 @@ impl FakeBroker {
     /// Make the broker answer `CommandGetLastMessageId` with an error, or stop doing so.
     fn set_head_failing(&self, failing: bool) {
         self.state.lock().head_fails = failing;
+    }
+
+    /// Make the broker answer `CommandSeek` with an error, or stop doing so.
+    fn set_seek_failing(&self, failing: bool) {
+        self.state.lock().seek_fails = failing;
     }
 }
 
@@ -186,6 +194,18 @@ fn success(request_id: u64) -> BytesMut {
             ..Default::default()
         }),
         ..base(pb::base_command::Type::Success)
+    })
+}
+
+/// The broker's refusal of the request `request_id`.
+fn refused(request_id: u64) -> BytesMut {
+    command_frame(&pb::BaseCommand {
+        error: Some(pb::CommandError {
+            request_id,
+            error: pb::ServerError::UnknownError as i32,
+            message: "seek refused by the fake broker".to_owned(),
+        }),
+        ..base(pb::base_command::Type::Error)
     })
 }
 
@@ -275,6 +295,8 @@ fn handle_command(cmd: &pb::BaseCommand, conn: u64, state: &Mutex<State>) {
                 ..base(pb::base_command::Type::GetLastMessageIdResponse)
             })
         })
+    } else if ty == pb::base_command::Type::Seek as i32 && guard.seek_fails {
+        cmd.seek.as_ref().map(|seek| refused(seek.request_id))
     } else if ty == pb::base_command::Type::Seek as i32 {
         let len = guard.len;
         cmd.seek.as_ref().map(|seek| {
@@ -699,6 +721,46 @@ mod scenario {
         seek_to_the_head_of_an_empty_topic(broker, reader, u64::MAX).await;
     }
 
+    /// A seek by message id that the broker refuses is an error, and the broker moved nothing.
+    pub(super) async fn a_refused_seek_to_a_message_is_an_error<R: SeekingReader>(
+        broker: &FakeBroker,
+        reader: &R,
+    ) {
+        assert_eq!(reader.read_entries(1).await, [0]);
+        broker.set_seek_failing(true);
+        let outcome = reader
+            .seek_to_message(MessageId {
+                ledger_id: LEDGER,
+                entry_id: 0,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+            })
+            .await;
+        broker.set_seek_failing(false);
+        assert!(
+            outcome.is_err(),
+            "a seek the broker refused must surface as an error, got {outcome:?}"
+        );
+        assert!(broker.seeks().is_empty(), "harness: no seek was honoured");
+    }
+
+    /// A seek by timestamp that the broker refuses is an error, and the broker moved nothing.
+    pub(super) async fn a_refused_seek_to_a_timestamp_is_an_error<R: SeekingReader>(
+        broker: &FakeBroker,
+        reader: &R,
+    ) {
+        assert_eq!(reader.read_entries(1).await, [0]);
+        broker.set_seek_failing(true);
+        let outcome = reader.seek_to_timestamp(0).await;
+        broker.set_seek_failing(false);
+        assert!(
+            outcome.is_err(),
+            "a seek the broker refused must surface as an error, got {outcome:?}"
+        );
+        assert!(broker.seeks().is_empty(), "harness: no seek was honoured");
+    }
+
     /// The seek succeeded but the head lookup behind `seek_to_latest` did not: the error says so,
     /// and the reader does not keep answering for the position it left.
     pub(super) async fn a_failed_head_lookup_is_an_error_and_clears_the_cursor<R: SeekingReader>(
@@ -773,4 +835,6 @@ scenarios! {
     seek_to_the_head_of_an_empty_topic_on_the_current_ledger;
     seek_to_the_head_of_an_empty_topic_on_the_earliest_ledger;
     a_failed_head_lookup_is_an_error_and_clears_the_cursor, len = LOG_LEN;
+    a_refused_seek_to_a_message_is_an_error, len = LOG_LEN;
+    a_refused_seek_to_a_timestamp_is_an_error, len = LOG_LEN;
 }
