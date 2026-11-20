@@ -3714,8 +3714,12 @@ impl ScalableRouteRegistry {
         let logical = (key.family, key.id);
         debug_assert!(!state.active.contains_key(&logical));
         let route = Arc::new(Route::default());
-        debug_assert!(state.active.insert(logical, key).is_none());
-        debug_assert!(state.routes.insert(key, route.clone()).is_none());
+        // The inserts are side effects, so they run in every build profile;
+        // only the "no previous owner" check is debug-only.
+        let previous_active = state.active.insert(logical, key);
+        debug_assert!(previous_active.is_none());
+        let previous_route = state.routes.insert(key, route.clone());
+        debug_assert!(previous_route.is_none());
         ScalableRoute {
             key,
             session_epoch,

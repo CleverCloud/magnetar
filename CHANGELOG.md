@@ -89,6 +89,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A local `close()` (the moonpool `DriverHandle::abort` is exactly that) ends the driver through an `Ok(())` exit that pulsed none of the per-client-buffer `Notify`s those waiters sleep on, so a waiter parked on a `&Client` stayed pending until its task was dropped.
   The terminal wrapper of every driver spawn, plain and supervised on both engines, now calls `wake_close_waiters` after latching the no-driver signal.
 
+### Fixed
+
+- **An owned scalable route is recorded in every build profile, so a build without debug assertions can open a `StreamConsumer`.**
+  `ScalableRouteRegistry::claim_at_epoch` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) performed its two registry inserts inside `debug_assert!`, whose operand is not evaluated when debug assertions are off, as in an ordinary `--release` build.
+  The claim then returned a route it never stored: `publish` found no owner, so every owned control-plane event fell through to the raw queue and the owner's waiter ran into `operation_timeout`; `notify_waiters` and `close_all` iterated an empty map as well.
+  No such build could open one since the assignment-driven `StreamConsumer` shipped in 1.8.0.
+  The inserts now run unconditionally and only the "no previous owner" checks stay debug-only.
+
 ## [2.0.0] - 2026-11-19
 
 ### Changed
