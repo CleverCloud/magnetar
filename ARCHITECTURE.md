@@ -1302,7 +1302,8 @@ Cancellation likewise stops future traversal while preserving completed children
 
 - `MultiTopicsConsumer::add_topic` / `remove_topic` subscribe and unsubscribe at runtime.
 - `PatternConsumer` reconciles topic list deltas on demand via `update(&client)`.
-  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`; `update()` drains the buffer, diffs against `topics()`, and spawns / closes child consumers.
+  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`; `update()` moves them, in arrival order, into the consumer's own backlog and applies it step by step, spawning / closing child consumers.
+  A step leaves the backlog only once it has taken effect, so a refused subscribe (kept for the next call, while the steps behind it still run) or a dropped `update()` future loses no topic: discovery is delta-only after the first snapshot, and the broker announces a topic once.
   `start_auto_reconcile(client, interval)` does the same on a `tokio::time::interval` schedule.
 
 ---
@@ -1335,11 +1336,12 @@ Cancellation likewise stops future traversal while preserving completed children
                   caller does PatternConsumer::update(&client)
                                             │
                                             ▼
-                  drain topic_list_changes
-                  diff against current children
-                  open new children for `added`
-                  close child consumers for `removed`
-                  emit a ReconcileReport
+                  move topic_list_changes into the consumer's backlog, in arrival order
+                  (a removal drops a still-waiting addition of the same topic)
+                  walk the backlog, one step at a time:
+                    open a new child for `added` (a refused subscribe stays in the backlog)
+                    close the child for `removed`
+                  emit a ReconcileReport (the first subscribe error, if any, instead)
 ```
 
 `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval` loop that calls `update(&client)` on every tick; the returned `JoinHandle` is used for clean shutdown.
