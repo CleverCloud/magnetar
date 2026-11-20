@@ -105,6 +105,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A cumulative acknowledgement (`acknowledge_cumulative`) or a position-vector acknowledgement (`acknowledge_positions`), plain or transactional, of a replayed message at or below that watermark admitted no component: it returned `Ok`, sent no acknowledgement to the broker and released no delivery lease.
   A cumulative-only application kept every replayed lease until the permit slack ran out and no FLOW could be granted, so the child could not reach an id above the old watermark, the only way the watermark cleared.
   A seek now clears the watermark of every seeking child and advances its acknowledgement generation, the pairing an observed redelivery already applies; individual, batch and negative acknowledgements were never affected.
+- **A `StreamConsumer` fails with the budget error, instead of resynchronizing forever, on a chunked message its receive budget cannot assemble.**
+  A chunk chain reserves `buffered bytes + announced size` for its assembly and then one `MAX_FRAME_SIZE` permit for the next chunk.
+  `StreamConsumerModel::chunk_frame_buffered` (`magnetar-proto`) reported a shortfall as `MessageTooLargeForBudget` for the assembly or as `Exhausted` for that permit, and both runtimes answered any `message_arrived` error with `request_resync`.
+  The broker redelivers the unacknowledged first chunk after every reconnect, so the same chain failed against the same budget forever and the consumer only ever emitted `ResyncRequired`.
+  At the default 16 MiB budget that is every chain whose first chunk plus announced size exceeds 3,080,056 bytes, which includes any message chunked at the broker's default 5 MiB `max_message_size`.
+  `chunk_frame_buffered` now returns `MessageTooLargeForBudget` whenever this child's chains plus the continuation frame cannot fit even with nothing else in the ledger, and `message_arrived` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) closes the consumer with it, so `receive` and `next_event` return `StreamConsumerError::Failed` naming the required bytes and the data budget.
+  The remedy is a larger `receiver_budget`.
+  A chain that fits alone but meets a budget held by siblings or retained messages still fails with `Exhausted` and resynchronizes, and decompression and batch-assembly budget failures keep their resynchronization.
+- **Chunks of one message no longer resynchronize a `StreamConsumer` forever when another entry arrives between them.**
+  The aggregate held one chunk chain per child and fenced the child's only permit to it, so an entry that belonged to no live chain, a complete message or the first chunk of another producer's message, failed with `FlowPurposeMismatch` or `InvalidChunkFrame`.
+  Both runtimes turned that into a resynchronization of the whole aggregate, and the broker replayed the same unacknowledged interleaving after every reconnect.
+  `StreamReceiveState` (`magnetar-proto`) now keeps one chain per `(child, uuid)`, up to `MAX_PENDING_CHUNK_CHAINS` (10, the ordinary consumer's `max_pending_chunked_message` default) and binds the child's permit to whichever chain, or none, the arriving entry belongs to.
+  A child that holds a chain assembly is served first by the flow arbiter, so a sibling cannot take the frame its chain needs, and each chain counts against the structural budget limit of its child.
+  An eleventh concurrent chain on one child is a malformed delivery and still requests resynchronization.
 
 ## [2.0.0] - 2026-11-19
 

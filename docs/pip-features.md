@@ -765,6 +765,17 @@ The guarantee covers allocations Magnetar controls or derives from the wire; arb
 Budget exhaustion stops new FLOW or returns a typed resource failure.
 It never marks an ordering predecessor complete, and cleanup retains its independent 64 KiB reserve.
 
+Chunked messages (PIP-37) are reassembled per child, with one chain per chunk `uuid`, because the chunks of several producers interleave on one segment.
+A child holds at most `MAX_PENDING_CHUNK_CHAINS` chains at once (10, the ordinary consumer's `max_pending_chunked_message` default); opening an eleventh is a malformed delivery and requests resynchronization.
+Each chain reserves `buffered bytes + announced size` from the aggregate budget before its first chunk is retained, together with one `MAX_FRAME_SIZE` permit for the next entry, so the budget bounds every open chain.
+An entry that is not part of a chain, a complete message, a batch, or the chunks of another chain, spends the child's permit as itself and leaves every chain open; the flow arbiter serves a child that holds a chain before any sibling, so a sibling cannot take the frame its chain needs to finish.
+
+A chain whose assemblies and continuation frame cannot fit the budget even when nothing else is retained, that is `buffered + announced size + MAX_FRAME_SIZE` above the data limit minus the authority headroom (8,322,936 bytes at the default 16 MiB budget), can never be assembled: the broker redelivers the unacknowledged first chunk after every resynchronization.
+It therefore fails the consumer with the typed `MessageTooLargeForBudget` text (`receive` and `next_event` return `StreamConsumerError::Failed`, naming the required bytes and the data budget) instead of requesting resynchronization, and the remedy is a larger `receiver_budget`.
+A message chunked because it exceeds the broker's default 5 MiB `max_message_size` is above that bound at the default budget; the bound holds for any `max_message_size` of about 1.54 MB or more.
+A chain that would fit alone but meets a budget held by sibling children or retained messages fails with `Exhausted` and still resynchronizes, because that pressure can clear.
+Decompression and batch-assembly budget failures keep their resynchronization disposition.
+
 ### Concurrent receive and batch ordering
 
 `receive(&self)` and `receive_batch(&self, policy)` allow concurrent callers.

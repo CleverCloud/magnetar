@@ -2207,7 +2207,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         consumer: &crate::Consumer<P>,
         message: magnetar_proto::DeferredIncomingMessage,
     ) -> Result<(), StreamConsumerError> {
-        let acceptance = {
+        let accepted = {
             let mut state = self.state.lock();
             let reservation = state
                 .flow_reservations
@@ -2224,7 +2224,25 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 generation,
                 reservation,
                 message,
-            )?
+            )
+        };
+        let acceptance = match accepted {
+            Ok(acceptance) => acceptance,
+            // Only a chunk chain reserves budget while an entry is accepted. A
+            // chain that cannot fit the budget even alone cannot be assembled
+            // after a resynchronization either: the broker replays the same
+            // unacknowledged first chunk against the same budget. Fail the
+            // consumer with the budget error instead of looping on resyncs; the
+            // caller's `request_resync` then finds the aggregate closing.
+            Err(
+                error @ magnetar_proto::StreamConsumerModelError::Budget(
+                    magnetar_proto::BudgetError::MessageTooLargeForBudget { .. },
+                ),
+            ) => {
+                self.fail_closed(error.to_string());
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
         };
         let mut complete = match acceptance {
             magnetar_proto::StreamEntryAcceptance::Buffered { actions } => {
@@ -7868,6 +7886,259 @@ mod tests {
                 .map(|first| first.entry_id),
             Some(10)
         );
+    }
+
+    #[tokio::test]
+    async fn complete_entry_between_chunks_is_delivered_without_breaking_the_chain() {
+        // Chunks of one logical message may be interleaved with entries of other
+        // producers on the same segment. The entry that is not part of the live
+        // chunk chain must be delivered as it is, and the chain must still
+        // complete. Before ADR-0131 the complete entry was rejected with
+        // `FlowPurposeMismatch` because the child held a chunk-continuation
+        // permit, `child_loop` turned that into `request_resync`, and nothing was
+        // acknowledged, so the broker replayed the same interleaving.
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        let chunk_metadata = |chunk_id| magnetar_proto::pb::MessageMetadata {
+            uuid: Some("interleaved-chunk".to_owned()),
+            num_chunks_from_msg: Some(2),
+            chunk_id: Some(chunk_id),
+            total_chunk_msg_size: Some(4),
+            ..Default::default()
+        };
+
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(10, chunk_metadata(0), bytes::Bytes::from_static(b"ab"), 1),
+            )
+            .await
+            .expect("buffer first chunk");
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        let plain = inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    11,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"plain"),
+                    1,
+                ),
+            )
+            .await;
+        assert!(
+            plain.is_ok(),
+            "a complete entry between two chunks must not be fatal to the aggregate: {plain:?}"
+        );
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(12, chunk_metadata(1), bytes::Bytes::from_static(b"cd"), 1),
+            )
+            .await
+            .expect("complete the chunk chain after the interleaved entry");
+        let messages = inner
+            .reserve_batch(2, usize::MAX)
+            .await
+            .expect("reserve both messages");
+        let mut payloads: Vec<_> = messages
+            .iter()
+            .map(|message| message.message.payload.to_vec())
+            .collect();
+        payloads.sort();
+        assert_eq!(payloads, vec![b"abcd".to_vec(), b"plain".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn first_chunk_of_another_message_between_chunks_keeps_both_chains() {
+        // Two producers may chunk at the same time on one segment, so the first
+        // chunk of a second message can arrive between two chunks of the first.
+        // Before ADR-0131 it was rejected with `InvalidChunkFrame("chunk
+        // continuation does not match its reserved chain")`, which resynchronized
+        // the aggregate and replayed the same interleaving after every reconnect.
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        let chunk_metadata = |uuid: &str, chunk_id| magnetar_proto::pb::MessageMetadata {
+            uuid: Some(uuid.to_owned()),
+            num_chunks_from_msg: Some(2),
+            chunk_id: Some(chunk_id),
+            total_chunk_msg_size: Some(4),
+            ..Default::default()
+        };
+
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    10,
+                    chunk_metadata("chain-a", 0),
+                    bytes::Bytes::from_static(b"ab"),
+                    1,
+                ),
+            )
+            .await
+            .expect("buffer first chunk of the first message");
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        let other = inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    11,
+                    chunk_metadata("chain-b", 0),
+                    bytes::Bytes::from_static(b"wx"),
+                    1,
+                ),
+            )
+            .await;
+        assert!(
+            other.is_ok(),
+            "the first chunk of another message must not be fatal to the aggregate: {other:?}"
+        );
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        for (entry_id, uuid, payload) in [
+            (12, "chain-a", b"cd".as_slice()),
+            (13, "chain-b", b"yz".as_slice()),
+        ] {
+            let session_epoch = child_shared.inner.lock().session_epoch();
+            inner
+                .message_arrived(
+                    child.source.clone(),
+                    child.generation,
+                    session_epoch,
+                    &child.consumer,
+                    deferred_message(
+                        entry_id,
+                        chunk_metadata(uuid, 1),
+                        bytes::Bytes::copy_from_slice(payload),
+                        1,
+                    ),
+                )
+                .await
+                .expect("complete one of the interleaved chunk chains");
+            let _ = child_shared.inner.lock().poll_transmit();
+        }
+        let messages = inner
+            .reserve_batch(2, usize::MAX)
+            .await
+            .expect("reserve both reassembled messages");
+        let mut payloads: Vec<_> = messages
+            .iter()
+            .map(|message| message.message.payload.to_vec())
+            .collect();
+        payloads.sort();
+        assert_eq!(payloads, vec![b"abcd".to_vec(), b"wxyz".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn chunk_chain_beyond_the_budget_fails_the_consumer_instead_of_resynchronizing() {
+        // A 3.5 MiB announced message needs its assembly and one more frame
+        // permit at once. At the default 16 MiB budget that is 8.5 MiB against
+        // the 8,322,936 bytes any single retained object may hold, so no
+        // resynchronization can ever assemble it: the broker replays the same
+        // unacknowledged first chunk against the same budget. The consumer must
+        // fail with the budget error instead of requesting that resync forever.
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        let error = inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    10,
+                    magnetar_proto::pb::MessageMetadata {
+                        uuid: Some("unassemblable".to_owned()),
+                        num_chunks_from_msg: Some(2),
+                        chunk_id: Some(0),
+                        total_chunk_msg_size: Some(3_670_016),
+                        ..Default::default()
+                    },
+                    bytes::Bytes::from_static(b"ab"),
+                    1,
+                ),
+            )
+            .await
+            .expect_err("the chain cannot be assembled within the budget");
+        assert!(matches!(
+            error,
+            StreamConsumerError::Model(magnetar_proto::StreamConsumerModelError::Budget(
+                magnetar_proto::BudgetError::MessageTooLargeForBudget { .. }
+            ))
+        ));
+
+        // `child_loop` answers a `message_arrived` error with `request_resync`;
+        // the failed aggregate is already closing, so it schedules nothing.
+        inner.request_resync(error.to_string());
+        {
+            let state = inner.state.lock();
+            assert!(state.close_state.is_closing());
+            assert!(
+                !state.reconnect_requested,
+                "a structural budget failure must not schedule a reconnect"
+            );
+            assert!(
+                state
+                    .terminal_error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("data budget is")),
+                "unexpected terminal error: {:?}",
+                state.terminal_error
+            );
+        }
+        match inner.reserve_batch(1, usize::MAX).await {
+            Err(StreamConsumerError::Failed(reason)) => {
+                assert!(reason.contains("data budget is"), "{reason}");
+            }
+            other => panic!("receive must report the budget failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]
