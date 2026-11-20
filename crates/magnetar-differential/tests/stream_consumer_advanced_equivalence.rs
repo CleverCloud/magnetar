@@ -4543,6 +4543,229 @@ async fn run_moonpool_delivery_shapes() -> DeliveryShapeTrace {
     trace
 }
 
+/// Resyncs caused by the receive budget that one unassemblable chunk chain may
+/// trigger before the failure is expected to be terminal.
+const BUDGET_RESYNC_LIMIT: usize = 2;
+
+/// A normally chunked 6 MiB message (two 3 MiB chunks, the shape a producer
+/// emits once a payload exceeds the broker's `max_message_size`) under the
+/// default 16 MiB receive budget.
+///
+/// The first chunk needs `chunk0 + total_size` (9 MiB) for its assembly plus one
+/// more frame permit for the continuation, while the default budget leaves
+/// 8,322,936 bytes for any single retained object. The aggregate must report the
+/// message as too large for its budget (or assemble it) once; it must not answer
+/// the budget failure with a resynchronization, because nothing was acknowledged
+/// and the broker replays the same first chunk after every reconnect.
+///
+/// The default budget holds a single maximum-frame permit besides the authority
+/// headroom, so only one of the two children flows at a time and the one that
+/// flows first is not fixed. One chain is therefore queued on each segment,
+/// followed by a small complete entry: a consumer that skips the chain must
+/// still deliver it, so going quiet is a failure and not a pass.
+async fn observe_unassemblable_chunk_chain<E>(client: &PulsarClient<E>, cluster: &M1SocketCluster)
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    const CHUNK_PAYLOAD: usize = 3 * 1024 * 1024;
+    const AFTER_CHAIN: &[u8] = b"after-the-chain";
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("unassemblable-chunk-sub")
+        .consumer_name("unassemblable-chunk-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await
+        .expect("subscribe aggregate with the default receive budget");
+    cluster
+        .wait_for("unassemblable-chunk children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+
+    let chunk_metadata = |segment: u64, chunk_id| magnetar::proto::pb::MessageMetadata {
+        uuid: Some(format!("unassemblable-chunk-{segment}")),
+        num_chunks_from_msg: Some(2),
+        chunk_id: Some(chunk_id),
+        total_chunk_msg_size: Some(i32::try_from(2 * CHUNK_PAYLOAD).expect("total fits i32")),
+        ..Default::default()
+    };
+    cluster
+        .update(|fake| {
+            for segment in [1, 2] {
+                for chunk_id in [0, 1] {
+                    fake.enqueue_message_with_metadata(
+                        segment,
+                        chunk_metadata(segment, chunk_id),
+                        Bytes::from(vec![0xAA; CHUNK_PAYLOAD]),
+                        Vec::new(),
+                    )?;
+                }
+                fake.enqueue_message(segment, Bytes::from_static(AFTER_CHAIN))?;
+            }
+            Ok(())
+        })
+        .expect("enqueue one two-chunk message and one complete entry per segment");
+
+    let outcome = {
+        let receive = consumer.receive();
+        tokio::pin!(receive);
+        let mut budget_resyncs = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                outcome = &mut receive => break Some(outcome),
+                event = tokio::time::timeout(
+                    magnetar_differential::HANG_GUARD,
+                    consumer.next_event(),
+                ) => match event {
+                    Err(_quiet) => break None,
+                    Ok(Ok(Some(StreamConsumerEvent::ResyncRequired { reason })))
+                        if reason.to_lowercase().contains("budget") =>
+                    {
+                        budget_resyncs += 1;
+                        assert!(
+                            budget_resyncs <= BUDGET_RESYNC_LIMIT,
+                            "the budget failure of one chunk chain resynchronized the aggregate \
+                             {budget_resyncs} times without progress; last reason: {reason}"
+                        );
+                    }
+                    Ok(Ok(Some(_other))) => {}
+                    Ok(Ok(None)) => break None,
+                    // A terminal failure is also reported by the event stream once its queue
+                    // is empty; it is judged exactly like the failure `receive` returns.
+                    Ok(Err(error)) => break Some(Err(error)),
+                },
+            }
+        }
+    };
+    match outcome {
+        Some(Ok(message)) => assert!(
+            message.payload().len() == 2 * CHUNK_PAYLOAD || message.payload() == AFTER_CHAIN,
+            "receive returned neither the assembled message nor the entry after it: {} bytes",
+            message.payload().len()
+        ),
+        Some(Err(error)) => assert!(
+            error.to_string().to_lowercase().contains("budget"),
+            "the receive failure must name the budget: {error}"
+        ),
+        None => panic!(
+            "the aggregate went quiet without delivering the chunked message, the entry after \
+             it, or a typed budget failure"
+        ),
+    }
+    let _ = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.close()).await;
+}
+
+async fn run_tokio_unassemblable_chunk_chain() {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    observe_unassemblable_chunk_chain(&client, &cluster).await;
+    client.close().await;
+}
+
+async fn run_moonpool_unassemblable_chunk_chain() {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    observe_unassemblable_chunk_chain(&client, &cluster).await;
+    client.close().await;
+}
+
+/// Two producers write to one segment: the first chunk of one message, a
+/// complete message of the other producer, then the last chunk of the first.
+///
+/// Both messages must be delivered. Before ADR-0131 the aggregate kept one chunk
+/// chain per child and treated the complete entry between the chunks as fatal;
+/// the resynchronization acknowledged nothing, so the broker replayed the same
+/// interleaving after every reconnect and the aggregate never made progress.
+async fn observe_interleaved_chunk_chain<E>(client: &PulsarClient<E>, cluster: &M1SocketCluster)
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("interleaved-chunk-sub")
+        .consumer_name("interleaved-chunk-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe interleaved-chunk aggregate");
+    cluster
+        .wait_for("interleaved-chunk children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+
+    let chunk_metadata = |chunk_id| magnetar::proto::pb::MessageMetadata {
+        uuid: Some("interleaved-chunk".to_owned()),
+        num_chunks_from_msg: Some(2),
+        chunk_id: Some(chunk_id),
+        total_chunk_msg_size: Some(4),
+        ..Default::default()
+    };
+    cluster
+        .update(|fake| {
+            fake.enqueue_message_with_metadata(
+                1,
+                chunk_metadata(0),
+                Bytes::from_static(b"ab"),
+                Vec::new(),
+            )?;
+            fake.enqueue_message(1, Bytes::from_static(b"plain"))?;
+            fake.enqueue_message_with_metadata(
+                1,
+                chunk_metadata(1),
+                Bytes::from_static(b"cd"),
+                Vec::new(),
+            )
+        })
+        .expect("enqueue the interleaved entries");
+
+    let mut payloads = Vec::new();
+    let mut resyncs = 0usize;
+    while payloads.len() < 2 {
+        let receive = consumer.receive();
+        tokio::pin!(receive);
+        let message = loop {
+            tokio::select! {
+                message = &mut receive => break message.expect("receive an interleaved message"),
+                event = next_event(&consumer) => {
+                    if let StreamConsumerEvent::ResyncRequired { reason } = event {
+                        resyncs += 1;
+                        assert!(
+                            resyncs <= BUDGET_RESYNC_LIMIT,
+                            "an entry between two chunks resynchronized the aggregate {resyncs} \
+                             times without progress; last reason: {reason}"
+                        );
+                    }
+                }
+            }
+        };
+        payloads.push(message.payload().to_vec());
+    }
+    payloads.sort();
+    assert_eq!(payloads, vec![b"abcd".to_vec(), b"plain".to_vec()]);
+    let _ = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.close()).await;
+}
+
+async fn run_tokio_interleaved_chunk_chain() {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    observe_interleaved_chunk_chain(&client, &cluster).await;
+    client.close().await;
+}
+
+async fn run_moonpool_interleaved_chunk_chain() {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    observe_interleaved_chunk_chain(&client, &cluster).await;
+    client.close().await;
+}
+
 async fn observe_child_open_lifecycle<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -6612,6 +6835,30 @@ async fn partial_and_closing_acknowledgement_failures_are_equivalent() {
     let tokio_trace = run_tokio_acknowledgement_failures().await;
     let moonpool_trace = run_moonpool_acknowledgement_failures().await;
     assert_eq!(tokio_trace, moonpool_trace);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unassemblable_chunk_chain_does_not_resynchronize_forever_on_tokio() {
+    let _serial = advanced_socket_test_guard();
+    run_tokio_unassemblable_chunk_chain().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unassemblable_chunk_chain_does_not_resynchronize_forever_on_moonpool() {
+    let _serial = advanced_socket_test_guard();
+    run_moonpool_unassemblable_chunk_chain().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_tokio() {
+    let _serial = advanced_socket_test_guard();
+    run_tokio_interleaved_chunk_chain().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_moonpool() {
+    let _serial = advanced_socket_test_guard();
+    run_moonpool_interleaved_chunk_chain().await;
 }
 
 async fn observe_withdrawn_open_finishing_during_close<E>(

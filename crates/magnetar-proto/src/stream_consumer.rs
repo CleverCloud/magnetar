@@ -294,6 +294,15 @@ impl ReceiverBudgetState {
         self.control_used
     }
 
+    /// Most that every non-authority reservation of one kind may hold together,
+    /// even when the ledger is otherwise empty: the data limit minus the
+    /// authority headroom that must stay free.
+    const fn non_authority_limit(&self) -> usize {
+        self.budget
+            .data_limit()
+            .saturating_sub(RECEIVER_BUDGET_AUTHORITY_HEADROOM)
+    }
+
     fn authority_used(&self) -> usize {
         self.reservations
             .values()
@@ -990,6 +999,10 @@ struct ChildState {
     phase: SegmentPhase,
     flow_reservation: Option<BudgetReservationId>,
     flow_purpose: Option<FlowPurpose>,
+    /// Chunk assemblies this child holds, one per live chain. A child that
+    /// holds one is first in line for its next permit, so a sibling cannot take
+    /// the frame its chain needs to finish.
+    chunk_assemblies: BTreeSet<BudgetReservationId>,
     completion: CompletionBarrier,
     wait_for_flow_drain: bool,
     bucket_shared: bool,
@@ -1478,7 +1491,6 @@ pub struct StreamEntryTransition {
 
 #[derive(Debug)]
 struct PendingStreamChunk {
-    uuid: String,
     expected_chunks: i32,
     total_size: usize,
     payloads: BTreeMap<i32, Bytes>,
@@ -1498,17 +1510,52 @@ impl PendingStreamChunk {
     }
 }
 
-/// Aggregate-owned chunk state. One purpose-fenced chain may be live per child.
+/// Chunk chains one child may hold open at once, the Java client's and the
+/// ordinary consumer's `max_pending_chunked_message` default. A chain's
+/// assembly can be a few bytes, so the receive budget alone does not bound how
+/// many a broker may open.
+pub const MAX_PENDING_CHUNK_CHAINS: usize = crate::consumer::DEFAULT_MAX_PENDING_CHUNKED_MESSAGE;
+
+/// Aggregate-owned chunk state. A child may hold up to
+/// [`MAX_PENDING_CHUNK_CHAINS`] chains at once, one per chunk uuid, because the
+/// chunks of several producers interleave on one segment. Every chain owns its
+/// own budget assembly, and the child's one permit is bound, entry by entry, to
+/// the chain that the arriving entry belongs to.
 #[derive(Debug, Default)]
 pub struct StreamReceiveState {
-    chunks: BTreeMap<BudgetReservationOwner, PendingStreamChunk>,
+    chunks: BTreeMap<(BudgetReservationOwner, String), PendingStreamChunk>,
 }
 
 impl StreamReceiveState {
     /// Forget receive work for a child after confirmation-bearing close.
     pub fn remove_child(&mut self, segment_id: SegmentId, generation: ChildGeneration) {
+        let owner = BudgetReservationOwner::new(segment_id, generation);
         self.chunks
-            .remove(&BudgetReservationOwner::new(segment_id, generation));
+            .retain(|(chain_owner, _), _| *chain_owner != owner);
+    }
+
+    fn live_chains(&self, owner: BudgetReservationOwner) -> usize {
+        self.chunks
+            .range((owner, String::new())..)
+            .take_while(|((chain_owner, _), _)| *chain_owner == owner)
+            .count()
+    }
+
+    /// A complete entry that arrives while the child holds a chain is not part of
+    /// that chain: it spends the permit as an ordinary message and the chain
+    /// stays open.
+    fn bind_complete_entry(
+        &self,
+        model: &mut StreamConsumerModel,
+        segment_id: SegmentId,
+        generation: ChildGeneration,
+        flow: BudgetReservationId,
+    ) -> Result<(), StreamConsumerModelError> {
+        let owner = BudgetReservationOwner::new(segment_id, generation);
+        if self.live_chains(owner) == 0 {
+            return Ok(());
+        }
+        model.bind_flow_purpose(segment_id, generation, flow, FlowPurpose::Message)
     }
 
     /// Accept one raw broker entry before any chunk retention.
@@ -1521,6 +1568,7 @@ impl StreamReceiveState {
         entry: DeferredIncomingMessage,
     ) -> Result<StreamEntryAcceptance, StreamConsumerModelError> {
         let Some(total_chunks) = entry.message.metadata.num_chunks_from_msg else {
+            self.bind_complete_entry(model, segment_id, generation, flow)?;
             return Ok(StreamEntryAcceptance::Complete(StreamCompleteEntry {
                 message: entry.message,
                 message_id_data: entry.message_id_data,
@@ -1530,6 +1578,7 @@ impl StreamReceiveState {
             }));
         };
         if total_chunks <= 1 {
+            self.bind_complete_entry(model, segment_id, generation, flow)?;
             return Ok(StreamEntryAcceptance::Complete(StreamCompleteEntry {
                 message: entry.message,
                 message_id_data: entry.message_id_data,
@@ -1574,17 +1623,15 @@ impl StreamReceiveState {
             StreamConsumerModelError::InvalidChunkFrame("chunk uuid is absent"),
         )?;
         let owner = BudgetReservationOwner::new(segment_id, generation);
-        let existing = self.chunks.get(&owner);
+        let key = (owner, uuid);
+        let existing = self.chunks.get(&key);
         if existing.is_none() && chunk_id != 0 {
             return Err(StreamConsumerModelError::InvalidChunkFrame(
                 "a chunk chain must begin with chunk zero",
             ));
         }
         if let Some(existing) = existing {
-            if existing.uuid != uuid
-                || existing.expected_chunks != total_chunks
-                || existing.total_size != total_size
-            {
+            if existing.expected_chunks != total_chunks || existing.total_size != total_size {
                 return Err(StreamConsumerModelError::InvalidChunkFrame(
                     "chunk continuation does not match its reserved chain",
                 ));
@@ -1594,7 +1641,19 @@ impl StreamReceiveState {
                     "duplicate chunk id",
                 ));
             }
+        } else if self.live_chains(owner) >= MAX_PENDING_CHUNK_CHAINS {
+            return Err(StreamConsumerModelError::InvalidChunkFrame(
+                "too many concurrent chunk chains on one child",
+            ));
         }
+        // The permit was granted for whichever chain the child held open when it
+        // was issued; this entry decides which chain, or none, spends it.
+        let purpose = existing.map_or(FlowPurpose::Message, |chain| {
+            FlowPurpose::ChunkContinuation {
+                assembly: chain.assembly,
+            }
+        });
+        model.bind_flow_purpose(segment_id, generation, flow, purpose)?;
         let received = existing.map_or(0, |chunk| chunk.payloads.len());
         let complete = received.saturating_add(1)
             == usize::try_from(total_chunks)
@@ -1620,16 +1679,15 @@ impl StreamReceiveState {
                 current_assembly,
                 allocation_bytes,
             )?;
-            if let Some(chunk) = self.chunks.get_mut(&owner) {
+            if let Some(chunk) = self.chunks.get_mut(&key) {
                 chunk.payloads.insert(chunk_id, entry.message.payload);
                 chunk.assembly = transition.assembly;
             } else {
                 let mut payloads = BTreeMap::new();
                 payloads.insert(chunk_id, entry.message.payload);
                 self.chunks.insert(
-                    owner,
+                    key,
                     PendingStreamChunk {
-                        uuid,
                         expected_chunks: total_chunks,
                         total_size,
                         payloads,
@@ -1649,7 +1707,7 @@ impl StreamReceiveState {
 
         let chunk = self
             .chunks
-            .get(&owner)
+            .get(&key)
             .ok_or(StreamConsumerModelError::InvalidChunkFrame(
                 "final chunk has no reserved assembly",
             ))?;
@@ -1664,7 +1722,7 @@ impl StreamReceiveState {
         }
         let mut chunk =
             self.chunks
-                .remove(&owner)
+                .remove(&key)
                 .ok_or(StreamConsumerModelError::InvalidChunkFrame(
                     "final chunk assembly disappeared",
                 ))?;
@@ -2642,6 +2700,17 @@ impl StreamConsumerModel {
                 .children
                 .get_mut(&segment_id)
                 .ok_or(StreamConsumerModelError::SeekSourceMismatch)?;
+            // The seek rewinds the broker cursor, so a cumulative watermark
+            // confirmed before it no longer describes the cursor. Keeping it
+            // would make every replayed acknowledgement at or below it admit
+            // no component: `Ok` with no wire acknowledgement and no lease
+            // release. The reset is paired with a generation advance exactly
+            // where `issue_delivery` pairs them on an observed redelivery.
+            child.acknowledgement_generation = child
+                .acknowledgement_generation
+                .checked_add(1)
+                .ok_or(StreamConsumerModelError::GenerationExhausted)?;
+            child.confirmed_cumulative = None;
             child.flow_reservation = None;
             child.flow_purpose = None;
             child.completion = CompletionBarrier::default();
@@ -2974,6 +3043,7 @@ impl StreamConsumerModel {
                     phase: SegmentPhase::Opening,
                     flow_reservation: None,
                     flow_purpose: None,
+                    chunk_assemblies: BTreeSet::new(),
                     completion: CompletionBarrier::default(),
                     wait_for_flow_drain: false,
                     bucket_shared: !bucket_ranges.is_empty(),
@@ -3130,6 +3200,7 @@ impl StreamConsumerModel {
                     phase: SegmentPhase::Opening,
                     flow_reservation: None,
                     flow_purpose: None,
+                    chunk_assemblies: BTreeSet::new(),
                     completion: CompletionBarrier::default(),
                     wait_for_flow_drain: false,
                     bucket_shared,
@@ -3265,12 +3336,46 @@ impl StreamConsumerModel {
                     kind: "pre-terminal reservation",
                 })?;
         self.budget.release(reservation)?;
-        self.child_mut(segment_id, generation)?
-            .completion
-            .pre_terminal_reservations = pre_terminal_reservations;
+        let child = self.child_mut(segment_id, generation)?;
+        child.completion.pre_terminal_reservations = pre_terminal_reservations;
+        child.chunk_assemblies.remove(&reservation);
         let mut actions = self.close_if_drained(segment_id, generation)?;
         actions.extend(self.arbitrate_flow()?);
         Ok(actions)
+    }
+
+    /// Name what the entry that arrived under the child's one live permit is,
+    /// before it spends the permit: an ordinary message, or the next chunk of a
+    /// chain whose assembly the child holds. The permit's budget is the same
+    /// either way; only the check each completion applies to it differs, and the
+    /// permit may have been granted for another chain than the one the broker
+    /// sent a chunk of. The binding changes no reservation.
+    fn bind_flow_purpose(
+        &mut self,
+        segment_id: SegmentId,
+        generation: ChildGeneration,
+        flow_reservation: BudgetReservationId,
+        purpose: FlowPurpose,
+    ) -> Result<(), StreamConsumerModelError> {
+        self.require_open()?;
+        let child = self.child(segment_id, generation)?;
+        if !matches!(child.phase, SegmentPhase::Flowing | SegmentPhase::Draining)
+            || child.flow_reservation != Some(flow_reservation)
+        {
+            return Err(StreamConsumerModelError::InvalidChildTransition {
+                segment_id,
+                phase: child.phase.clone(),
+            });
+        }
+        let owner = child.owner();
+        self.budget
+            .owned(flow_reservation, owner, BudgetUse::FlowPermit)?;
+        if let FlowPurpose::ChunkContinuation { assembly } = purpose {
+            self.budget
+                .owned(assembly, owner, BudgetUse::ChunkAssembly)?;
+        }
+        self.child_mut(segment_id, generation)?.flow_purpose = Some(purpose);
+        Ok(())
     }
 
     /// Convert one consumed frame into a bounded chunk assembly and grant only
@@ -3311,6 +3416,33 @@ impl StreamConsumerModel {
         }
         self.budget
             .owned(flow_reservation, owner, BudgetUse::FlowPermit)?;
+
+        // A chain the budget cannot hold even when this child's chains and the
+        // continuation frame are the only data in the ledger fails the same way
+        // after every resynchronization. Report it as the typed structural
+        // failure instead of the `Exhausted` that the continuation permit would
+        // raise below, which a retry may cure.
+        let current_assembly_bytes = assembly
+            .map(|assembly| {
+                self.budget
+                    .owned(assembly, owner, BudgetUse::ChunkAssembly)
+                    .map(|state| state.bytes)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let other_chain_bytes = child
+            .chunk_assemblies
+            .iter()
+            .filter(|held| Some(**held) != assembly)
+            .filter_map(|held| self.budget.reservations.get(held))
+            .fold(0usize, |total, held| total.saturating_add(held.bytes));
+        let required = other_chain_bytes
+            .saturating_add(allocation_bytes.max(current_assembly_bytes))
+            .saturating_add(MAX_FRAME_SIZE);
+        let limit = self.budget.non_authority_limit();
+        if required > limit {
+            return Err(BudgetError::MessageTooLargeForBudget { required, limit }.into());
+        }
 
         let mut staged = self.clone();
         let (assembly, pre_terminal_reservations) = if let Some(assembly) = assembly {
@@ -3357,6 +3489,7 @@ impl StreamConsumerModel {
         let child = staged.child_mut(segment_id, generation)?;
         child.flow_reservation = Some(next_flow);
         child.flow_purpose = Some(FlowPurpose::ChunkContinuation { assembly });
+        child.chunk_assemblies.insert(assembly);
         child.completion.pre_terminal_reservations = pre_terminal_reservations;
         let action = StreamConsumerAction::GrantFlow {
             source: child.source.clone(),
@@ -3589,6 +3722,9 @@ impl StreamConsumerModel {
                 let child = staged.child_mut(segment_id, generation)?;
                 child.flow_reservation = None;
                 child.flow_purpose = None;
+                for released in work {
+                    child.chunk_assemblies.remove(released);
+                }
                 child.completion.pre_terminal_reservations = pre_terminal_reservations;
                 if child.phase == SegmentPhase::Flowing {
                     child.phase = SegmentPhase::OpenBlocked(FlowBlock::Budget);
@@ -4965,7 +5101,7 @@ impl StreamConsumerModel {
         });
         let ordered = ids[start..].iter().chain(ids[..start].iter()).copied();
         let mut actions = Vec::new();
-        let candidates: Vec<_> = ordered
+        let mut candidates: Vec<_> = ordered
             .filter(|id| eligible.contains(id))
             .filter_map(|segment_id| {
                 self.children.get(&segment_id).map(|child| {
@@ -4973,11 +5109,16 @@ impl StreamConsumerModel {
                         segment_id,
                         child.owner(),
                         child.completion.pre_terminal_reservations,
+                        child.chunk_assemblies.first().copied(),
                     )
                 })
             })
             .collect();
-        for (segment_id, owner, current_pre_terminal_reservations) in candidates {
+        // A child holding a chunk assembly needs one more frame to finish its
+        // chain, so it is served before any sibling that could take that frame.
+        // The sort is stable, so the round-robin order holds within each group.
+        candidates.sort_by_key(|(_, _, _, assembly)| assembly.is_none());
+        for (segment_id, owner, current_pre_terminal_reservations, assembly) in candidates {
             let exhausted = StreamConsumerModelError::CompletionCounterExhausted {
                 segment_id,
                 kind: "pre-terminal reservation",
@@ -4993,13 +5134,16 @@ impl StreamConsumerModel {
                     Ok(reservation) => reservation,
                     Err(_) => break,
                 };
+            let purpose = assembly.map_or(FlowPurpose::Message, |assembly| {
+                FlowPurpose::ChunkContinuation { assembly }
+            });
             self.children
                 .get_mut(&segment_id)
                 .into_iter()
                 .for_each(|child| {
                     child.phase = SegmentPhase::Flowing;
                     child.flow_reservation = Some(reservation);
-                    child.flow_purpose = Some(FlowPurpose::Message);
+                    child.flow_purpose = Some(purpose);
                     child.completion.pre_terminal_reservations = pre_terminal_reservations;
                     self.flow_cursor = Some(segment_id);
                     actions.push(StreamConsumerAction::GrantFlow {
@@ -5007,7 +5151,7 @@ impl StreamConsumerModel {
                         controller_incarnation: child.controller_incarnation,
                         child_generation: child.generation,
                         reservation,
-                        purpose: FlowPurpose::Message,
+                        purpose,
                     });
                 });
         }
@@ -6291,6 +6435,97 @@ mod tests {
         assert_eq!(model.children[&SegmentId(1)].confirmed_cumulative, None);
     }
 
+    /// One child that confirmed a cumulative acknowledgement at entry 5, then
+    /// seeks back to entry 1 and receives a replayed delivery at entry 3.
+    fn replayed_delivery_below_pre_seek_watermark() -> (StreamConsumerModel, DeliveryToken) {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (confirmed, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let source = confirmed.stream_message_id().source().clone();
+        let ack = model
+            .admit_cumulative_acknowledgement(&confirmed)
+            .expect("ack");
+        model
+            .settle_acknowledgement(&ack.authority, &BTreeSet::from([source.clone()]))
+            .expect("confirm the pre-seek watermark");
+        assert_eq!(
+            model.children[&SegmentId(1)].confirmed_cumulative,
+            Some(message_id(5))
+        );
+        assert!(model.live_deliveries.is_empty());
+
+        let rewind = PositionVector::new(1, [(source, message_id(1))]).expect("rewind vector");
+        model.begin_seek(&rewind).expect("seek back");
+        let flow = model
+            .seek_completed(SegmentId(1), generation)
+            .expect("seek confirmed");
+        let (replayed, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            3,
+        );
+        assert_eq!(
+            replayed.stream_message_id().ordinary_message_id(),
+            message_id(3)
+        );
+        (model, replayed)
+    }
+
+    #[test]
+    fn cumulative_acknowledgement_below_pre_seek_watermark_still_admits_a_component() {
+        let (mut model, replayed) = replayed_delivery_below_pre_seek_watermark();
+
+        let ack = model
+            .admit_cumulative_acknowledgement(&replayed)
+            .expect("replayed delivery is live in the new delivery epoch");
+        assert_eq!(
+            ack.components.len(),
+            1,
+            "a seek must discard the pre-seek cumulative watermark so the replayed \
+             cumulative ack reaches the broker instead of returning Ok with no component"
+        );
+        let source = replayed.stream_message_id().source().clone();
+        model
+            .settle_acknowledgement(&ack.authority, &BTreeSet::from([source]))
+            .expect("settle");
+        assert!(
+            model.live_deliveries.is_empty(),
+            "the cumulative ack must release the replayed delivery lease"
+        );
+    }
+
+    #[test]
+    fn position_acknowledgement_below_pre_seek_watermark_still_admits_a_component() {
+        let (mut model, replayed) = replayed_delivery_below_pre_seek_watermark();
+        let position = PositionVector::new(
+            1,
+            [(replayed.stream_message_id().source().clone(), message_id(3))],
+        )
+        .expect("position");
+
+        let ack = model
+            .admit_position_acknowledgement(&position)
+            .expect("position ack");
+        assert_eq!(
+            ack.components.len(),
+            1,
+            "a seek must discard the pre-seek cumulative watermark so the replayed \
+             position ack reaches the broker instead of returning Ok with no component"
+        );
+    }
+
     #[test]
     fn cumulative_acknowledgement_resolves_every_covered_delivery() {
         let mut model = model(OrderingMode::BrokerManaged);
@@ -6782,6 +7017,478 @@ mod tests {
             2,
             "one retained message and one ordinary refill remain"
         );
+    }
+
+    fn chunk_entry(
+        entry_id: u64,
+        uuid: &str,
+        chunk_id: i32,
+        total_chunks: i32,
+        total_size: i32,
+        payload: &'static [u8],
+    ) -> DeferredIncomingMessage {
+        deferred_entry(
+            entry_id,
+            Bytes::from_static(payload),
+            pb::MessageMetadata {
+                uuid: Some(uuid.to_owned()),
+                num_chunks_from_msg: Some(total_chunks),
+                chunk_id: Some(chunk_id),
+                total_chunk_msg_size: Some(total_size),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn deferred_entry(
+        entry_id: u64,
+        payload: Bytes,
+        metadata: pb::MessageMetadata,
+    ) -> DeferredIncomingMessage {
+        let message_id_data = pb::MessageIdData {
+            ledger_id: 1,
+            entry_id,
+            partition: Some(0),
+            batch_index: Some(-1),
+            ack_set: Vec::new(),
+            batch_size: None,
+            first_chunk_message_id: None,
+        };
+        DeferredIncomingMessage {
+            message: IncomingMessage {
+                message_id: MessageId::from_pb(&message_id_data),
+                metadata: Arc::new(metadata),
+                single_metadata: None,
+                payload,
+                redelivery_count: 0,
+                broker_entry_metadata: None,
+                arrived_at: std::time::Instant::now(),
+            },
+            message_id_data,
+            ack_set: Vec::new(),
+            dispatch_permits: 1,
+        }
+    }
+
+    fn plain_entry(entry_id: u64, payload: &'static [u8]) -> DeferredIncomingMessage {
+        deferred_entry(
+            entry_id,
+            Bytes::from_static(payload),
+            pb::MessageMetadata::default(),
+        )
+    }
+
+    /// The permit that `actions` grant to `segment_id`, with its purpose.
+    fn granted_to(
+        actions: &[StreamConsumerAction],
+        segment_id: SegmentId,
+    ) -> Option<(BudgetReservationId, FlowPurpose)> {
+        actions.iter().find_map(|action| match action {
+            StreamConsumerAction::GrantFlow {
+                source,
+                reservation,
+                purpose,
+                ..
+            } if source.segment_id() == segment_id => Some((*reservation, *purpose)),
+            _ => None,
+        })
+    }
+
+    fn continuation_assembly(purpose: FlowPurpose) -> BudgetReservationId {
+        match purpose {
+            FlowPurpose::ChunkContinuation { assembly } => assembly,
+            FlowPurpose::Message => panic!("expected a chunk continuation permit"),
+        }
+    }
+
+    /// One child under a budget whose data capacity is `data_capacity`.
+    fn one_child_model(
+        data_capacity: usize,
+    ) -> (StreamConsumerModel, ChildGeneration, BudgetReservationId) {
+        let mut model = model_with_data_capacity(OrderingMode::BrokerManaged, data_capacity);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        (model, generation, flow_reservation(&flow))
+    }
+
+    /// Two children, each holding its initial permit.
+    fn two_child_model(
+        data_capacity: usize,
+    ) -> (
+        StreamConsumerModel,
+        [(ChildGeneration, BudgetReservationId); 2],
+    ) {
+        let mut model = model_with_data_capacity(OrderingMode::BrokerManaged, data_capacity);
+        let open = model
+            .apply_assignment(assignment(1, &[1, 2]))
+            .expect("assignment");
+        let first = opened_generation(&open[0]);
+        let second = opened_generation(&open[1]);
+        let first_flow = model.child_opened(SegmentId(1), first).expect("open one");
+        let second_flow = model.child_opened(SegmentId(2), second).expect("open two");
+        (
+            model,
+            [
+                (first, flow_reservation(&first_flow)),
+                (second, flow_reservation(&second_flow)),
+            ],
+        )
+    }
+
+    #[test]
+    fn chunk_chain_that_cannot_fit_alone_is_a_typed_structural_failure() {
+        let (mut model, generation, flow) = one_child_model(2 * MAX_FRAME_SIZE);
+        let limit = model.budget.non_authority_limit();
+        assert_eq!(limit, 2 * MAX_FRAME_SIZE);
+        let used = model.budget.data_used();
+
+        // One byte past the limit: the assembly and the frame that continues it
+        // cannot both be held, whatever else the ledger holds.
+        let over = limit - MAX_FRAME_SIZE + 1;
+        assert!(matches!(
+            model.chunk_frame_buffered(SegmentId(1), generation, flow, None, over),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::MessageTooLargeForBudget { required, limit: reported }
+            )) if required == limit + 1 && reported == limit
+        ));
+        assert_eq!(model.budget.data_used(), used, "a refusal reserves nothing");
+        let child = &model.children[&SegmentId(1)];
+        assert_eq!(child.flow_reservation, Some(flow));
+        assert_eq!(child.flow_purpose, Some(FlowPurpose::Message));
+        assert!(child.chunk_assemblies.is_empty());
+
+        // Exactly at the limit the chain is accepted.
+        let first = model
+            .chunk_frame_buffered(SegmentId(1), generation, flow, None, limit - MAX_FRAME_SIZE)
+            .expect("a chain that exactly fits");
+        assert!(
+            model.children[&SegmentId(1)]
+                .chunk_assemblies
+                .contains(&first.assembly)
+        );
+
+        // A later chunk may not grow the same chain past the limit either.
+        let continuation = flow_reservation(&first.actions);
+        let used = model.budget.data_used();
+        assert!(matches!(
+            model.chunk_frame_buffered(
+                SegmentId(1),
+                generation,
+                continuation,
+                Some(first.assembly),
+                limit - MAX_FRAME_SIZE + 1,
+            ),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::MessageTooLargeForBudget { .. }
+            ))
+        ));
+        assert_eq!(model.budget.data_used(), used);
+    }
+
+    #[test]
+    fn chunk_chain_that_fits_alone_but_not_beside_a_sibling_stays_retryable() {
+        let (mut model, [(first, first_flow), (second, second_flow)]) =
+            two_child_model(2 * MAX_FRAME_SIZE + 64 * 1024);
+        // The first child retains four MiB, so the second cannot also get a
+        // continuation frame beside a two MiB assembly.
+        model
+            .message_arrived(SegmentId(1), first, first_flow, 4 * 1024 * 1024)
+            .expect("retain a large message");
+        let used = model.budget.data_used();
+        assert!(matches!(
+            model.chunk_frame_buffered(SegmentId(2), second, second_flow, None, 2 * 1024 * 1024,),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::Exhausted { .. }
+            ))
+        ));
+        assert_eq!(model.budget.data_used(), used);
+    }
+
+    #[test]
+    fn child_holding_a_chunk_assembly_is_served_before_a_sibling() {
+        let (mut model, [(first, first_flow), (second, second_flow)]) =
+            two_child_model(2 * MAX_FRAME_SIZE + 64 * 1024);
+        // The first child retains four MiB and is left without a permit.
+        model
+            .message_arrived(SegmentId(1), first, first_flow, 4 * 1024 * 1024)
+            .expect("retain a large message");
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::OpenBlocked(FlowBlock::Budget))
+        );
+        // The second child opens a chunk chain, then receives an entry that is
+        // not part of it. Its permit is released with room for one frame only.
+        let chain = model
+            .chunk_frame_buffered(SegmentId(2), second, second_flow, None, 1024)
+            .expect("open a chain");
+        let continuation = flow_reservation(&chain.actions);
+        model
+            .bind_flow_purpose(SegmentId(2), second, continuation, FlowPurpose::Message)
+            .expect("the entry is not part of the chain");
+        let arrival = model
+            .message_arrived_preallocated(SegmentId(2), second, continuation, &[], 128)
+            .expect("retain the entry between chunks");
+
+        assert_eq!(
+            granted_to(&arrival.actions, SegmentId(2)),
+            Some((
+                flow_reservation(&arrival.actions),
+                FlowPurpose::ChunkContinuation {
+                    assembly: chain.assembly
+                }
+            )),
+            "the only frame the budget can grant goes to the child whose chain needs it"
+        );
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::OpenBlocked(FlowBlock::Budget))
+        );
+    }
+
+    #[test]
+    fn binding_a_permit_rejects_stale_flows_and_foreign_assemblies() {
+        let (mut model, [(first, first_flow), (second, second_flow)]) =
+            two_child_model(3 * MAX_FRAME_SIZE);
+        let chain = model
+            .chunk_frame_buffered(SegmentId(2), second, second_flow, None, 1024)
+            .expect("open a chain on the second child");
+
+        assert!(matches!(
+            model.bind_flow_purpose(SegmentId(1), first, second_flow, FlowPurpose::Message),
+            Err(StreamConsumerModelError::InvalidChildTransition { .. })
+        ));
+        assert!(matches!(
+            model.bind_flow_purpose(
+                SegmentId(1),
+                first,
+                first_flow,
+                FlowPurpose::ChunkContinuation {
+                    assembly: chain.assembly
+                },
+            ),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::ReservationOwnerMismatch { .. }
+            ))
+        ));
+        assert_eq!(
+            model.children[&SegmentId(1)].flow_purpose,
+            Some(FlowPurpose::Message)
+        );
+    }
+
+    #[test]
+    fn complete_entry_between_chunks_keeps_the_chain_and_its_next_frame() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let first = receive
+            .accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                flow,
+                chunk_entry(10, "chain", 0, 2, 4, b"ab"),
+            )
+            .expect("buffer the first chunk");
+        let StreamEntryAcceptance::Buffered { actions } = first else {
+            panic!("expected a buffered chunk, got {first:?}");
+        };
+        let (continuation, purpose) = granted_to(&actions, SegmentId(1)).expect("continuation");
+        let assembly = continuation_assembly(purpose);
+
+        let plain = match receive
+            .accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                continuation,
+                plain_entry(11, b"plain"),
+            )
+            .expect("a complete entry between two chunks is not fatal")
+        {
+            StreamEntryAcceptance::Complete(entry) => entry,
+            other => panic!("expected a complete entry, got {other:?}"),
+        };
+        let transition = receive
+            .finalize_entry(&mut model, SegmentId(1), generation, plain, &[])
+            .expect("retain the entry");
+        assert_eq!(transition.messages.len(), 1);
+        assert_eq!(
+            transition.messages[0].message.payload,
+            Bytes::from_static(b"plain")
+        );
+        let (continuation, purpose) =
+            granted_to(&transition.actions, SegmentId(1)).expect("the chain's next frame");
+        assert_eq!(purpose, FlowPurpose::ChunkContinuation { assembly });
+        assert!(
+            model.children[&SegmentId(1)]
+                .chunk_assemblies
+                .contains(&assembly)
+        );
+
+        let complete = match receive
+            .accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                continuation,
+                chunk_entry(12, "chain", 1, 2, 4, b"cd"),
+            )
+            .expect("complete the chain")
+        {
+            StreamEntryAcceptance::Complete(entry) => entry,
+            other => panic!("expected the completed chain, got {other:?}"),
+        };
+        let transition = receive
+            .finalize_entry(&mut model, SegmentId(1), generation, complete, &[])
+            .expect("retain the assembled message");
+        assert_eq!(
+            transition.messages[0].message.payload,
+            Bytes::from_static(b"abcd")
+        );
+        assert!(model.children[&SegmentId(1)].chunk_assemblies.is_empty());
+        assert_eq!(model.budget.use_of(assembly), None);
+        assert!(receive.chunks.is_empty());
+    }
+
+    #[test]
+    fn interleaved_chains_on_one_child_complete_independently() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let mut permit = flow;
+        let mut assemblies = Vec::new();
+        for (entry_id, uuid, payload) in [(10, "chain-a", b"ab"), (11, "chain-b", b"wx")] {
+            let buffered = receive
+                .accept_entry(
+                    &mut model,
+                    SegmentId(1),
+                    generation,
+                    permit,
+                    chunk_entry(entry_id, uuid, 0, 2, 4, payload),
+                )
+                .expect("buffer the first chunk of a chain");
+            let StreamEntryAcceptance::Buffered { actions } = buffered else {
+                panic!("expected a buffered chunk, got {buffered:?}");
+            };
+            let (next, purpose) = granted_to(&actions, SegmentId(1)).expect("continuation");
+            assemblies.push(continuation_assembly(purpose));
+            permit = next;
+        }
+        assert_ne!(assemblies[0], assemblies[1]);
+        assert_eq!(model.children[&SegmentId(1)].chunk_assemblies.len(), 2);
+
+        let mut payloads = Vec::new();
+        for (entry_id, uuid, payload) in [(12, "chain-a", b"cd"), (13, "chain-b", b"yz")] {
+            let complete = match receive
+                .accept_entry(
+                    &mut model,
+                    SegmentId(1),
+                    generation,
+                    permit,
+                    chunk_entry(entry_id, uuid, 1, 2, 4, payload),
+                )
+                .expect("complete one of the interleaved chains")
+            {
+                StreamEntryAcceptance::Complete(entry) => entry,
+                other => panic!("expected a completed chain, got {other:?}"),
+            };
+            let transition = receive
+                .finalize_entry(&mut model, SegmentId(1), generation, complete, &[])
+                .expect("retain the assembled message");
+            payloads.push(transition.messages[0].message.payload.clone());
+            permit = flow_reservation(&transition.actions);
+        }
+        assert_eq!(
+            payloads,
+            vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"wxyz")]
+        );
+        let child = &model.children[&SegmentId(1)];
+        assert!(child.chunk_assemblies.is_empty());
+        assert_eq!(
+            child.completion.pre_terminal_reservations, 3,
+            "two retained messages and one ordinary permit remain"
+        );
+        assert!(receive.chunks.is_empty());
+    }
+
+    #[test]
+    fn second_chain_over_the_structural_limit_is_a_typed_failure_and_keeps_the_first() {
+        let (mut model, generation, flow) = one_child_model(2 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let size = 3 * 1024 * 1024;
+        let first = receive
+            .accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                flow,
+                chunk_entry(10, "chain-a", 0, 2, size, b"a"),
+            )
+            .expect("the first chain fits alone");
+        let StreamEntryAcceptance::Buffered { actions } = first else {
+            panic!("expected a buffered chunk, got {first:?}");
+        };
+        let (continuation, _) = granted_to(&actions, SegmentId(1)).expect("continuation");
+
+        let chain = usize::try_from(size).expect("size") + 1;
+        assert!(matches!(
+            receive.accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                continuation,
+                chunk_entry(11, "chain-b", 0, 2, size, b"b"),
+            ),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::MessageTooLargeForBudget { required, .. }
+            )) if required == 2 * chain + MAX_FRAME_SIZE
+        ));
+        assert_eq!(model.children[&SegmentId(1)].chunk_assemblies.len(), 1);
+        assert_eq!(
+            receive.live_chains(BudgetReservationOwner::new(SegmentId(1), generation)),
+            1
+        );
+    }
+
+    #[test]
+    fn chunk_chains_per_child_are_capped() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let mut permit = flow;
+        for chain in 0..MAX_PENDING_CHUNK_CHAINS {
+            let uuid = format!("chain-{chain}");
+            let buffered = receive
+                .accept_entry(
+                    &mut model,
+                    SegmentId(1),
+                    generation,
+                    permit,
+                    chunk_entry(chain as u64, &uuid, 0, 2, 4, b"a"),
+                )
+                .expect("open a chain under the cap");
+            let StreamEntryAcceptance::Buffered { actions } = buffered else {
+                panic!("expected a buffered chunk, got {buffered:?}");
+            };
+            permit = flow_reservation(&actions);
+        }
+        assert!(matches!(
+            receive.accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                permit,
+                chunk_entry(99, "one-too-many", 0, 2, 4, b"a"),
+            ),
+            Err(StreamConsumerModelError::InvalidChunkFrame(
+                "too many concurrent chunk chains on one child"
+            ))
+        ));
+
+        // Closing the child forgets every chain it held, not one.
+        receive.remove_child(SegmentId(1), generation);
+        assert!(receive.chunks.is_empty());
     }
 
     #[test]

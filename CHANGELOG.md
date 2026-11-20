@@ -89,6 +89,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A local `close()` (the moonpool `DriverHandle::abort` is exactly that) ends the driver through an `Ok(())` exit that pulsed none of the per-client-buffer `Notify`s those waiters sleep on, so a waiter parked on a `&Client` stayed pending until its task was dropped.
   The terminal wrapper of every driver spawn, plain and supervised on both engines, now calls `wake_close_waiters` after latching the no-driver signal.
 
+### Fixed
+
+- **An owned scalable route is recorded in every build profile, so a build without debug assertions can open a `StreamConsumer`.**
+  `ScalableRouteRegistry::claim_at_epoch` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) performed its two registry inserts inside `debug_assert!`, whose operand is not evaluated when debug assertions are off, as in an ordinary `--release` build.
+  The claim then returned a route it never stored: `publish` found no owner, so every owned control-plane event fell through to the raw queue and the owner's waiter ran into `operation_timeout`; `notify_waiters` and `close_all` iterated an empty map as well.
+  No such build could open one since the assignment-driven `StreamConsumer` shipped in 1.8.0.
+  The inserts now run unconditionally and only the "no previous owner" checks stay debug-only.
+- **A `StreamConsumer` whose transaction outcome is unknown can receive again after it resynchronizes.**
+  The unknown-outcome path of `propagate_transaction_outcome` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) fenced the model and closed every child but left the messages already queued for `receive` in place, still bound to the closed child generations.
+  `receive` and `receive_batch` then failed on the first queued message (`InvalidAggregatePhase`, and `StaleChildGeneration` or `UnknownChild` once the children reconnected), without requesting a resynchronization, and every newer message queued behind it was unreachable until the consumer was closed or an unrelated resynchronization cleared the queue.
+  The unknown outcome now resets the receive queue, the chunk-reassembly state and the permit debt exactly as `request_resync` does, so `receive` waits for the resynchronized children; redelivery of the discarded messages is the broker's, as for any resynchronization.
+- **A cumulative or vector acknowledgement after a `StreamConsumer` seek is no longer a silent no-op below the pre-seek watermark.**
+  `StreamConsumerModel::begin_seek` (`magnetar-proto`) rewound the broker cursor but kept each child's confirmed cumulative-acknowledgement watermark from before the seek.
+  A cumulative acknowledgement (`acknowledge_cumulative`) or a position-vector acknowledgement (`acknowledge_positions`), plain or transactional, of a replayed message at or below that watermark admitted no component: it returned `Ok`, sent no acknowledgement to the broker and released no delivery lease.
+  A cumulative-only application kept every replayed lease until the permit slack ran out and no FLOW could be granted, so the child could not reach an id above the old watermark, the only way the watermark cleared.
+  A seek now clears the watermark of every seeking child and advances its acknowledgement generation, the pairing an observed redelivery already applies; individual, batch and negative acknowledgements were never affected.
+- **A `StreamConsumer` fails with the budget error, instead of resynchronizing forever, on a chunked message its receive budget cannot assemble.**
+  A chunk chain reserves `buffered bytes + announced size` for its assembly and then one `MAX_FRAME_SIZE` permit for the next chunk.
+  `StreamConsumerModel::chunk_frame_buffered` (`magnetar-proto`) reported a shortfall as `MessageTooLargeForBudget` for the assembly or as `Exhausted` for that permit, and both runtimes answered any `message_arrived` error with `request_resync`.
+  The broker redelivers the unacknowledged first chunk after every reconnect, so the same chain failed against the same budget forever and the consumer only ever emitted `ResyncRequired`.
+  At the default 16 MiB budget that is every chain whose first chunk plus announced size exceeds 3,080,056 bytes, which includes any message chunked at the broker's default 5 MiB `max_message_size`.
+  `chunk_frame_buffered` now returns `MessageTooLargeForBudget` whenever this child's chains plus the continuation frame cannot fit even with nothing else in the ledger, and `message_arrived` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) closes the consumer with it, so `receive` and `next_event` return `StreamConsumerError::Failed` naming the required bytes and the data budget.
+  The remedy is a larger `receiver_budget`.
+  A chain that fits alone but meets a budget held by siblings or retained messages still fails with `Exhausted` and resynchronizes, and decompression and batch-assembly budget failures keep their resynchronization.
+- **Chunks of one message no longer resynchronize a `StreamConsumer` forever when another entry arrives between them.**
+  The aggregate held one chunk chain per child and fenced the child's only permit to it, so an entry that belonged to no live chain, a complete message or the first chunk of another producer's message, failed with `FlowPurposeMismatch` or `InvalidChunkFrame`.
+  Both runtimes turned that into a resynchronization of the whole aggregate, and the broker replayed the same unacknowledged interleaving after every reconnect.
+  `StreamReceiveState` (`magnetar-proto`) now keeps one chain per `(child, uuid)`, up to `MAX_PENDING_CHUNK_CHAINS` (10, the ordinary consumer's `max_pending_chunked_message` default) and binds the child's permit to whichever chain, or none, the arriving entry belongs to.
+  A child that holds a chain assembly is served first by the flow arbiter, so a sibling cannot take the frame its chain needs, and each chain counts against the structural budget limit of its child.
+  An eleventh concurrent chain on one child is a malformed delivery and still requests resynchronization.
+- **A transient failure while a `StreamConsumer` re-resolves its closed DAG watch no longer fails the consumer for good.**
+  When the broker closed the retained DAG watch, the control loop of both runtimes (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) reopened it inline and answered every error with `fail_closed`: a lookup timeout, a replacement lookup the broker rejected before its baseline (`ServiceNotReady` for instance), a replaced connection, a rejected assignment and a model rejection all fenced the aggregate, which then only reported the terminal error.
+  Every other control-plane failure was already classified, and the reconnect loop retries all but the terminal set.
+  The failed reopen now fails the aggregate itself only for physical connection closure, explicit route closure and peer closure, the set ADR-0120 names as terminal, and requests resynchronization otherwise, after which the reconnect loop applies its existing rules to the replacement lookup and registration.
+
 ## [2.0.0] - 2026-11-19
 
 ### Changed

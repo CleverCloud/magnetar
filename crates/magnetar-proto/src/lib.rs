@@ -202,12 +202,13 @@ pub use crate::stream_consumer::{
     BatchArrivalTransition, BudgetError, BudgetReservationId, BudgetReservationOwner, BudgetUse,
     CONTROL_PLANE_CLEANUP_RESERVE, ChildGeneration, ChunkAssemblyTransition, ConsumerInstanceId,
     DELIVERY_AUTHORITY_OVERHEAD, DeliveryEpoch, DeliveryToken, DequeueSequence, FlowBlock,
-    FlowPurpose, MIN_RETAINED_MESSAGE_RESERVATION, POSITION_COMPONENT_NODE_OVERHEAD,
-    ReceiverBudget, ReceiverBudgetState, SegmentPhase, StreamCompleteEntry, StreamConsumerAction,
-    StreamConsumerModel, StreamConsumerModelError, StreamConsumerStatusSnapshot,
-    StreamEntryAcceptance, StreamEntryTransition, StreamQueuedMessage, StreamReceiveState,
-    TransactionAcknowledgementAuthority, TransactionAcknowledgementOutcome,
-    TransactionAcknowledgementTransition, TransactionDecision, TransactionOperationId,
+    FlowPurpose, MAX_PENDING_CHUNK_CHAINS, MIN_RETAINED_MESSAGE_RESERVATION,
+    POSITION_COMPONENT_NODE_OVERHEAD, ReceiverBudget, ReceiverBudgetState, SegmentPhase,
+    StreamCompleteEntry, StreamConsumerAction, StreamConsumerModel, StreamConsumerModelError,
+    StreamConsumerStatusSnapshot, StreamEntryAcceptance, StreamEntryTransition,
+    StreamQueuedMessage, StreamReceiveState, TransactionAcknowledgementAuthority,
+    TransactionAcknowledgementOutcome, TransactionAcknowledgementTransition, TransactionDecision,
+    TransactionOperationId,
 };
 #[cfg(feature = "scalable-topics")]
 pub use crate::stream_position::{

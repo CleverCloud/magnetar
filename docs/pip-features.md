@@ -765,6 +765,17 @@ The guarantee covers allocations Magnetar controls or derives from the wire; arb
 Budget exhaustion stops new FLOW or returns a typed resource failure.
 It never marks an ordering predecessor complete, and cleanup retains its independent 64 KiB reserve.
 
+Chunked messages (PIP-37) are reassembled per child, with one chain per chunk `uuid`, because the chunks of several producers interleave on one segment.
+A child holds at most `MAX_PENDING_CHUNK_CHAINS` chains at once (10, the ordinary consumer's `max_pending_chunked_message` default); opening an eleventh is a malformed delivery and requests resynchronization.
+Each chain reserves `buffered bytes + announced size` from the aggregate budget before its first chunk is retained, together with one `MAX_FRAME_SIZE` permit for the next entry, so the budget bounds every open chain.
+An entry that is not part of a chain, a complete message, a batch, or the chunks of another chain, spends the child's permit as itself and leaves every chain open; the flow arbiter serves a child that holds a chain before any sibling, so a sibling cannot take the frame its chain needs to finish.
+
+A chain whose assemblies and continuation frame cannot fit the budget even when nothing else is retained, that is `buffered + announced size + MAX_FRAME_SIZE` above the data limit minus the authority headroom (8,322,936 bytes at the default 16 MiB budget), can never be assembled: the broker redelivers the unacknowledged first chunk after every resynchronization.
+It therefore fails the consumer with the typed `MessageTooLargeForBudget` text (`receive` and `next_event` return `StreamConsumerError::Failed`, naming the required bytes and the data budget) instead of requesting resynchronization, and the remedy is a larger `receiver_budget`.
+A message chunked because it exceeds the broker's default 5 MiB `max_message_size` is above that bound at the default budget; the bound holds for any `max_message_size` of about 1.54 MB or more.
+A chain that would fit alone but meets a budget held by sibling children or retained messages fails with `Exhausted` and still resynchronizes, because that pressure can clear.
+Decompression and batch-assembly budget failures keep their resynchronization disposition.
+
 ### Concurrent receive and batch ordering
 
 `receive(&self)` and `receive_batch(&self, policy)` allow concurrent callers.
@@ -796,6 +807,7 @@ Transactional acknowledgement registers every represented `(segment topic, subsc
 Commit waits for all admitted operations.
 Any failed admitted registration or ack permanently poisons commit: `commit_transaction` returns `TransactionPoisoned` and sends no `EndTxn(Commit)`; abort remains available.
 Commit advances participating positions only after confirmation, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails every participant closed and requires resynchronization. The first installation of an unknown outcome emits `ResyncRequired` as well as the transaction outcome; retries of retained cleanup do not repeat that resynchronization event.
+The first installation also discards every message the consumer had received but not yet handed out, because each is bound to a child generation the fence has closed; `receive` then waits for the resynchronized children instead of failing on that stale queue head.
 Once the coordinator confirms commit or abort, an owned completion task records that terminal state and checkpoints each completed local participant action, so cancellation causes neither a second `EndTxn` nor replay of an already-issued FLOW prefix.
 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.
@@ -804,6 +816,7 @@ It cannot cross a layout transition, rewind a sealed or remote ancestor, or infe
 A chunk position is projected to its first chunk, while a batch position is projected to the residual suffix in `ack_set`; The wire handler ignores the richer batch/chunk fields on `CommandSeek`, so they are not transmitted as authority.
 Both runtimes stage every child SEEK before awaiting any child response.
 A successful seek clears pre-seek buffers and invalidates old tokens; any child failure leaves the aggregate resynchronization-required.
+It also discards each child's confirmed cumulative-acknowledgement watermark, because the broker cursor no longer sits where that watermark was confirmed: a cumulative or vector acknowledgement of a replayed position at or below the pre-seek watermark admits a component and reaches the broker, instead of returning success with no wire acknowledgement and no lease release.
 
 ### Ownership handoff, routing, and close
 
@@ -858,6 +871,9 @@ The `scalable` routing bit PIP-473 adds to the PIP-31 transaction commands is se
 
 The assignment-driven aggregate does not drop on a split, merge, add, or removal. It validates the replacement DAG atomically, reconciles the authoritative assignment, opens gained children, drains lost children, and applies the selected ancestry barrier before granting FLOW.
 Controller loss starts an incarnation-fenced replacement lookup/registration flow; an invalid regression or unrouteable replacement moves the aggregate to observable resynchronization-required state rather than accepting stale authority.
+When the broker closes the retained DAG watch, the aggregate re-resolves it in place.
+A failed reopen is classified like every other control-plane failure: only physical connection closure, explicit route closure and peer closure fail the aggregate on the spot.
+A lookup timeout, a lookup the broker rejected before its baseline, a replaced connection, a rejected assignment or a model rejection of the aligned replacement instead requests resynchronization, and the reconnect loop then applies its own rules to the replacement lookup and registration.
 Resynchronization marks reconnect intent before old-child teardown and waits for confirmed children and in-flight opens to finish. It registers the same logical consumer id with a newer local incarnation without logical unsubscribe, then synchronously retires the old local authority after success. Aggregate retries retain terminal cleanup capabilities for admitted attempts, deduplicated by physical connection and latest local incarnation; a rejected or timed-out attempt loses its assignment authority without logical unsubscribe. Successful handoff carries outstanding cleanup capabilities forward. Terminal close and failed or cancelled publicly owned replacements perform logical-leave cleanup after tracked subscribe responses settle. These control-plane capabilities and pending request records are outside the receiver byte budget; their cardinality follows the physical connections encountered, without a fixed connection cap. A late server registration can still reattach an older connection because the GA protocol has no broker-side incarnation term; local late responses and pushes cannot restore rejected authority. Direct `Connection` callers retain responsibility for explicit terminal registration removal after a rejection.
 
 A successful ordinary SEEK response from a retired child generation is rejected before it can restore aggregate FLOW. The adapter releases the aggregate state lock after checking the generation and before invoking resynchronization recovery; that recovery acquires the same lock independently.
