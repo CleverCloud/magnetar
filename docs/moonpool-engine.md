@@ -147,6 +147,7 @@ Specifics for the moonpool engine:
 - DNS is re-resolved on every attempt through the injected `DnsResolver`.
   The crate ships `StaticDnsResolver` and an `arc_dns_resolver` helper.
 - The `ServiceUrlProvider` is consulted on every attempt before `Transport::connect`, so `ControlledClusterFailover` plugs straight in (see PIP-121 below).
+  Only a connection that dials the service address consults it — the bootstrap, its `connections_per_broker` siblings and the proxy pool entries; a multi-broker DIRECT pool entry re-dials its own broker ([ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-19 amendment).
 - Every dial of the attempt, the supervisor's redial included, runs each blocking step under `ConnectionConfig::connect_timeout` on the injected `TimeProvider`: the `DnsResolver` call, each candidate's TCP connect and, for TLS, the rustls handshake.
   A step that outlives it fails the attempt as `Io(TimedOut)` (ADR-0052), so a TLS peer that accepts TCP and then stays silent cannot park the dial, nor `Client::close()` behind it.
   The tokio engine bounds the same steps with one `tokio::time::timeout` around the whole dial; the moonpool engine keeps a budget per step so that a candidate that never answers does not stop the next candidate from being tried, and a plaintext dial without a resolver still arms exactly one timer.
@@ -178,7 +179,7 @@ See [ADR-0006](../specs/adr/0006-moonpool-tls-byte-pipe.md) for the binding deci
 
 ## ServiceUrlProvider plumbing (PIP-121)
 
-The supervised reconnect path consults the configured `ServiceUrlProvider` on every attempt.
+The supervised reconnect path consults the configured `ServiceUrlProvider` on every attempt of a connection that dials the service address; a multi-broker DIRECT pool entry re-dials its own broker instead (see [Supervised reconnect](#supervised-reconnect)).
 Two implementations live in `magnetar-proto` (and are therefore usable by both engines):
 
 - `StaticServiceUrlProvider` — single URL, never changes.

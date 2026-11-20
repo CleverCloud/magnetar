@@ -1643,6 +1643,9 @@ Three implementations ship:
 +----------------------------------------------------------------------+
 ```
 
+The provider answers with the **service URL**, so it is consulted by the supervisors of the connections that dial the service address: the bootstrap, its `connections_per_broker` siblings and the proxy pool entries.
+A multi-broker DIRECT pool entry is pinned to the broker its lookup resolved and re-dials that broker, never the provider's URL ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-19 amendment).
+
 Java-parity API:
 
 ```rust

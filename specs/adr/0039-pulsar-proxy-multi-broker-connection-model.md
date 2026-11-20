@@ -1,6 +1,6 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation; amended 2026-11-19 — a pool entry whose driver exited is replaced)
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation; amended 2026-11-19 — a pool entry whose driver exited is replaced; amended 2026-11-19 — a DIRECT entry never consults `service_url_provider`)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
@@ -44,6 +44,16 @@ instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
 > Moonpool replaces the dead `Ready` entry with a `Pending` generation, so the existing `Arc::ptr_eq` generation check still guards the promotion.
 > A redial that fails leaves the key without a live entry (tokio keeps the dead one until a dial succeeds, moonpool removes its `Pending` generation, as for any failed first dial), and the next open dials again.
 > `crates/magnetar-runtime-tokio/tests/pool_dead_entry.rs` and its moonpool twin pin the behaviour, each for an unsupervised entry and for a supervisor give-up.
+
+> **Amendment (2026-11-19, DIRECT entries and the service-URL provider).** "Supervised reconnect" below says the supervisor does not consult `service_url_provider` on a DIRECT entry.
+> The pool broke that: it copied the factory's provider into the `ReconnectContext` of every entry, so a DIRECT entry pinned to broker B that lost its socket dialled the provider's URL — the service URL — instead of B.
+> The redial landed on the bootstrap broker while the pool still filed the entry under B, and B's producers and consumers were replayed on a broker that does not own their topics.
+>
+> A pool entry now follows the provider only when it dials the service address (the factory's own `host:port`): a proxy entry, which dials the proxy, and a `connections_per_broker` sibling, which is a replica of the bootstrap connection and so follows the provider exactly as the bootstrap does.
+> An entry that dials any other address is pinned to the broker its lookup resolved and re-dials that broker.
+> The test is the dialled address and not `CommandConnect.proxy_to_broker_url`, because a sibling of a direct client carries `None` there like a DIRECT entry does.
+> It is the complement of the bootstrap-equality bypass of `resolve_direct_broker`, which already sends a lookup that resolves to the service address to the bootstrap or a sibling and never to a DIRECT entry.
+> `crates/magnetar-runtime-tokio/tests/lookup_direct_multi_broker.rs` and its moonpool twin pin the DIRECT redial, and `connections_per_broker.rs` of each engine pins that a sibling still follows a provider switched to another cluster.
 
 ## Context
 

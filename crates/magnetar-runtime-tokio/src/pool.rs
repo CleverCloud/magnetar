@@ -83,8 +83,10 @@ pub(crate) struct ConnectionFactory {
     /// entry shares the same provider, so a refreshed token propagates
     /// naturally across every pinned broker connection.
     pub(crate) auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
-    /// PIP-121 `ServiceUrlProvider` — when set, every pool entry's supervisor
-    /// re-resolves the broker URL via the provider on every reconnect attempt.
+    /// PIP-121 `ServiceUrlProvider` — when set, the supervisor of every pool entry that dials the
+    /// service address (a proxy entry or a bootstrap sibling) re-resolves the service URL via the
+    /// provider on every reconnect attempt. An entry pinned to another broker (multi-broker
+    /// DIRECT) never consults it and re-dials its own broker (ADR-0039).
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     /// Pluggable DNS resolver (Java `ClientBuilder#dnsResolver`).
     pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
@@ -376,10 +378,25 @@ impl ProxyConnectionPool {
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();
 
+        // A PIP-121 provider answers with the *service* URL, so only an entry that dials the
+        // service address follows it: a proxy entry (it dials the proxy) and a bootstrap sibling
+        // (a replica of the bootstrap connection, which follows the provider itself). An entry
+        // pinned to another broker — the multi-broker DIRECT path, whose `physical` is what the
+        // lookup resolved — re-dials that broker on a drop, so its supervisor must not consult
+        // the provider: the redial would land on the service URL while the pool still files the
+        // entry under its own broker (ADR-0039, DIRECT amendment). This is the complement of the
+        // bootstrap-equality bypass of `Client::resolve_direct_broker`, which sends a lookup that
+        // resolves to the service address to the bootstrap instead of to a DIRECT entry.
+        let dials_service_url =
+            physical.host == self.factory.url.host && physical.port == self.factory.url.port;
         let ctx = ReconnectContext {
             url: physical.clone(),
             tls_config: self.factory.tls_config.clone(),
-            service_url_provider: self.factory.service_url_provider.clone(),
+            service_url_provider: self
+                .factory
+                .service_url_provider
+                .clone()
+                .filter(|_| dials_service_url),
             dns_resolver: self.factory.dns_resolver.clone(),
         };
         let mut driver =
