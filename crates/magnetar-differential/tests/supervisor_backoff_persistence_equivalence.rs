@@ -30,8 +30,10 @@ use magnetar_proto::{
     AntiThrashThreshold, Backoff, ConnectionConfig, CreateProducerRequest, FrameError,
     SupervisorConfig, decode_one, encode_command, pb,
 };
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 /// Helper — drive the supervisor's per-cycle decision through a fixed
 /// scenario and collect the resulting backoff delays. The engine never
@@ -431,5 +433,271 @@ async fn tokio_and_moonpool_drivers_give_up_an_attach_then_drop_storm_within_max
          {STORM_MAX_ATTEMPTS}: (terminated, sessions accepted) must be (true, <= \
          {STORM_SESSION_BUDGET}) on both engines, got tokio = {tokio_leg:?}, moonpool = \
          {moonpool_leg:?}; the cooldown sleep was counted as socket lifetime"
+    );
+}
+
+// -- A socket the client abandons is closed before the redial delay (both real drivers) --
+
+/// Backoff before the first redial. The schedule subtracts up to 20 % of it as jitter, so the
+/// redial cannot start earlier than 2.4 s after the socket was abandoned.
+const ABANDON_REDIAL_BACKOFF: Duration = Duration::from_secs(3);
+
+/// How soon after the client abandons a socket the broker must see it closed: far below the
+/// redial delay, far above any loopback scheduling latency.
+const ABANDON_CLOSE_BOUND: Duration = Duration::from_secs(1);
+
+/// What the broker saw of the bootstrap session.
+#[derive(Debug, Default)]
+struct AbandonWatch {
+    /// The scenario releases the broker's `CommandTopicMigrated` push.
+    push: Notify,
+    /// The instant the broker pushed it.
+    pushed_at: Mutex<Option<Instant>>,
+    /// Time from the push to the broker reading EOF (or an error) on that same socket.
+    closed_after_push: Mutex<Option<Duration>>,
+    /// Notified (permit kept) once `closed_after_push` is set.
+    closed: Notify,
+}
+
+/// A broker that answers CONNECT / PING / LOOKUP / PRODUCER and, on the FIRST accepted connection
+/// only, waits for [`AbandonWatch::push`] after acking the producer, then pushes
+/// `CommandTopicMigrated` for it (no allow-list is configured, so the client abandons the socket
+/// and redials locally) and watches that socket until the client closes it. Local to this
+/// scenario, like the loopback gate of `driver_write_deadline_equivalence.rs`.
+async fn spawn_migrating_broker() -> (SocketAddr, Arc<AbandonWatch>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let watch = Arc::new(AbandonWatch::default());
+    let shared = watch.clone();
+    tokio::spawn(async move {
+        let mut first = true;
+        while let Ok((stream, _peer)) = listener.accept().await {
+            let watched = std::mem::take(&mut first);
+            let watch = shared.clone();
+            tokio::spawn(async move {
+                let _ = migrating_session(stream, watched, watch).await;
+            });
+        }
+    });
+    (addr, watch)
+}
+
+/// `CommandTopicMigrated` for `producer_id`, advertising a URL no allow-list rejects.
+fn topic_migrated_command(producer_id: u64) -> pb::BaseCommand {
+    pb::BaseCommand {
+        r#type: pb::base_command::Type::TopicMigrated as i32,
+        topic_migrated: Some(pb::CommandTopicMigrated {
+            resource_id: producer_id,
+            resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+            broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+            broker_service_url_tls: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// `LookupResponse::Connect` answering `request_id`, with no proxying.
+fn lookup_connect_reply(request_id: u64) -> pb::BaseCommand {
+    pb::BaseCommand {
+        r#type: pb::base_command::Type::LookupResponse as i32,
+        lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+            broker_service_url: None,
+            broker_service_url_tls: None,
+            response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+            request_id,
+            authoritative: Some(true),
+            error: None,
+            message: None,
+            proxy_through_service_url: Some(false),
+        }),
+        ..Default::default()
+    }
+}
+
+async fn migrating_session(
+    mut stream: TcpStream,
+    watched: bool,
+    watch: Arc<AbandonWatch>,
+) -> std::io::Result<()> {
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    let mut producer_id: Option<u64> = None;
+    let mut pushed = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let _ = read_buf.split_to(before - framed.len());
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            let reply = match kind {
+                pb::base_command::Type::Connect => Some(pb::BaseCommand {
+                    r#type: pb::base_command::Type::Connected as i32,
+                    connected: Some(pb::CommandConnected {
+                        server_version: "magnetar-diff".to_owned(),
+                        protocol_version: Some(21),
+                        max_message_size: Some(5 * 1024 * 1024),
+                        feature_flags: Some(pb::FeatureFlags::default()),
+                    }),
+                    ..Default::default()
+                }),
+                pb::base_command::Type::Ping => Some(pb::BaseCommand {
+                    r#type: pb::base_command::Type::Pong as i32,
+                    pong: Some(pb::CommandPong {}),
+                    ..Default::default()
+                }),
+                pb::base_command::Type::Lookup => frame
+                    .command
+                    .lookup_topic
+                    .as_ref()
+                    .map(|l| lookup_connect_reply(l.request_id)),
+                pb::base_command::Type::Producer => frame.command.producer.as_ref().map(|p| {
+                    producer_id = Some(p.producer_id);
+                    pb::BaseCommand {
+                        r#type: pb::base_command::Type::ProducerSuccess as i32,
+                        producer_success: Some(pb::CommandProducerSuccess {
+                            request_id: p.request_id,
+                            producer_name: "diff-abandon".to_owned(),
+                            last_sequence_id: Some(-1),
+                            schema_version: None,
+                            topic_epoch: Some(0),
+                            producer_ready: Some(true),
+                        }),
+                        ..Default::default()
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(cmd) = reply {
+                let _ = encode_command(&mut out_buf, &cmd);
+            }
+        }
+        if !out_buf.is_empty() {
+            stream.write_all(&out_buf).await?;
+            stream.flush().await?;
+            out_buf.clear();
+        }
+        if watched && !pushed {
+            if let Some(producer_id) = producer_id {
+                watch.push.notified().await;
+                let _ = encode_command(&mut out_buf, &topic_migrated_command(producer_id));
+                stream.write_all(&out_buf).await?;
+                stream.flush().await?;
+                out_buf.clear();
+                *watch.pushed_at.lock() = Some(Instant::now());
+                pushed = true;
+            }
+        }
+        if stream.read_buf(&mut read_buf).await.unwrap_or(0) == 0 {
+            if watched {
+                let pushed_at = *watch.pushed_at.lock();
+                if let Some(pushed_at) = pushed_at {
+                    *watch.closed_after_push.lock() = Some(pushed_at.elapsed());
+                    watch.closed.notify_one();
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// A supervisor whose first redial is [`ABANDON_REDIAL_BACKOFF`] away.
+fn abandon_connection_config() -> ConnectionConfig {
+    ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: ABANDON_REDIAL_BACKOFF,
+            max_backoff: ABANDON_REDIAL_BACKOFF,
+            ..SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    }
+}
+
+/// Release the broker's migration push and report `(closed within the bound, time from the push
+/// to the broker seeing the socket closed)`.
+async fn judge_abandon(watch: &AbandonWatch) -> (bool, Option<Duration>) {
+    watch.push.notify_one();
+    let closed = tokio::time::timeout(ABANDON_CLOSE_BOUND, watch.closed.notified())
+        .await
+        .is_ok();
+    (closed, *watch.closed_after_push.lock())
+}
+
+async fn tokio_abandon_leg() -> (bool, Option<Duration>) {
+    let (addr, watch) = spawn_migrating_broker().await;
+    let client = magnetar_runtime_tokio::Client::connect(
+        &format!("pulsar://{addr}"),
+        abandon_connection_config(),
+    )
+    .await
+    .expect("tokio connect");
+    let _producer = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/diff-abandon".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("tokio producer opens on the bootstrap session");
+    let verdict = judge_abandon(&watch).await;
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    verdict
+}
+
+async fn moonpool_abandon_leg() -> (bool, Option<Duration>) {
+    let (addr, watch) = spawn_migrating_broker().await;
+    let engine =
+        magnetar_runtime_moonpool::MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        abandon_connection_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("moonpool connect");
+    let _producer = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/diff-abandon".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("moonpool producer opens on the bootstrap session");
+    let verdict = judge_abandon(&watch).await;
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    verdict
+}
+
+/// The supervised driver loops of both engines must close a transport the moment they abandon it
+/// on their own decision (a `CommandTopicMigrated` with no allow-list), not when the supervisor
+/// replaces it after the redial backoff: the peer is still alive after such an exit, so an open
+/// socket keeps the broker's connection, producers and consumers registered to a client that no
+/// longer reads. Both real drivers face the same migration and the broker must see the socket
+/// closed well inside the backoff on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_and_moonpool_drivers_close_an_abandoned_socket_before_the_redial_backoff() {
+    let (tokio_leg, moonpool_leg) = tokio::join!(tokio_abandon_leg(), moonpool_abandon_leg());
+    assert_eq!(
+        tokio_leg.0, moonpool_leg.0,
+        "engines disagree on whether the abandoned socket was closed within \
+         {ABANDON_CLOSE_BOUND:?}: tokio = {tokio_leg:?}, moonpool = {moonpool_leg:?} (closed in \
+         time, time from the push to the close)"
+    );
+    assert!(
+        tokio_leg.0 && moonpool_leg.0,
+        "a driver kept the socket it abandoned on CommandTopicMigrated open through its redial \
+         backoff of {ABANDON_REDIAL_BACKOFF:?}: the broker must see it closed within \
+         {ABANDON_CLOSE_BOUND:?} of the push on both engines, got tokio = {tokio_leg:?}, \
+         moonpool = {moonpool_leg:?} (closed in time, time from the push to the close)"
     );
 }

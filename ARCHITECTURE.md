@@ -750,6 +750,7 @@ Until [ADR-0125](specs/adr/0125-deadline-on-a-pending-producer-open.md) every ge
 ### Supervised reconnect
 
 When `driver_loop_inner` returns (the socket errored or the peer closed), the outer `supervised_driver_loop` decides whether to retry.
+`driver_loop_inner` owns the transport (it takes it by value on both engines), so the socket is closed the moment it returns, before the supervisor's cooldown, backoff or dial: after an exit the client decided on its own (`TopicMigrated`, an unanswerable `AuthChallenge`, an undecodable frame, a write or handshake deadline) the peer is still alive, and a transport held in a local of the supervisor would keep the broker's connection, producers and consumers registered to a client that no longer reads for the whole redial delay.
 The supervisor:
 
 1. **Records the disconnect** via `Connection::mark_disconnected(now, wall_now)` so `Producer::last_disconnected_timestamp` and the consumer stats are correct.

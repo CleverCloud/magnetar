@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **The tokio supervisor closes a socket it abandoned instead of holding it open through the redial delay.**
+  `supervised_driver_loop` lent its transport to `driver_loop_inner` as `&mut` and kept it in a local, so after an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable auth challenge, an undecodable frame, a write or handshake deadline) the peer was still alive and the stream stayed open, unread, through the anti-thrash cooldown, the backoff sleep and the dial, and was dropped only when the replacement was assigned.
+  For that whole delay (up to `max_backoff` plus `connect_timeout`, 60 s plus the dial budget by default) the broker kept the connection and its producers and consumers registered, and kept dispatching to a client that no longer read.
+  `driver_loop_inner` now takes the socket by value, as the moonpool engine's does, so the transport is closed the moment the loop returns.
 - **The anti-thrash cooldown sleep is no longer counted as the dead socket's lifetime.**
   Both supervisors read the previous socket's lifetime after the ADR-0028 cooldown had slept, so with a cooldown longer than `drop_grace` (30 s against 500 ms by default) a socket that died milliseconds after its re-attach read as stable and the loop reset both the backoff schedule and the ADR-0061 give-up budget on every cooldown.
   An attach-then-drop storm therefore never reached `max_attempts` for a client that opts into the detector and a finite budget.
