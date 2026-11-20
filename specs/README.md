@@ -238,3 +238,5 @@ ADR-0066's stability promise is amended by ADR-0117 in one respect: `AvroSchema`
 ADR-0059's entry-point guard list (§ 3) and ADR-0080's operation-deadline scope are amended by ADR-0129, which extends both to the PIP-31 transaction requests (`new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn` and the coordinator handshake); the rest of both ADRs is unchanged.
 
 ADR-0039's pool-entry lifecycle is amended in place on 2026-11-19: a pool entry whose driver has exited for good (no supervisor and the connection dropped, or a supervisor that exhausted `max_attempts`) is replaced by a fresh dial at the next open for its key instead of being handed out until `Client.close`; the rest of ADR-0039 is unchanged.
+
+ADR-0060's bounded `SessionLost` re-issue is extended in place on 2026-11-19 from `lookup_topic` to the partitioned-metadata request and the topic-list snapshot: both engines re-issue them on the fresh session under the same `MAX_LOOKUP_SESSION_REISSUES` bound and `operation_timeout`, and surface `PeerClosed` at the same two stops (supervisor gave up, bound spent), instead of `Other(SessionLost…)`; the rest of ADR-0060 is unchanged.

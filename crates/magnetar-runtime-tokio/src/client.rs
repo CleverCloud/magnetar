@@ -1479,6 +1479,12 @@ impl Client {
     /// pattern-consumer builder. Resolves to the id the connection allocated to the new
     /// watcher, which addresses every later delta ([`crate::TopicListChange::watcher_id`]) to
     /// it, and the initial topic snapshot.
+    ///
+    /// A snapshot request severed by a supervised reconnect
+    /// ([`OpOutcome::SessionLost`]) is re-issued on the fresh session, bounded by
+    /// [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] and by the operation deadline
+    /// (ADR-0060, 2026-11-19 amendment). Each re-issue allocates a new watcher id: `reset()`
+    /// already discarded the severed watcher, so none is registered twice.
     #[doc(hidden)]
     pub async fn watch_topic_list_with_operation_deadline(
         &self,
@@ -1487,40 +1493,54 @@ impl Client {
         mut deadline: OperationDeadline<'_>,
         last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<(u64, Vec<String>), ClientError> {
-        if operation_deadline_expired(deadline.as_mut()) {
-            return Err(operation_deadline_error(
-                "topic-list snapshot",
-                last_broker_error.clone(),
-            ));
-        }
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.watch_topic_list(namespace, pattern)
-        };
-        self.shared.driver_waker.notify_one();
-        let request = RequestFut::cancellable(self.shared.clone(), request_id);
-        tokio::pin!(request);
-        let outcome = tokio::select! {
-            biased;
-            () = deadline.as_mut() => {
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        loop {
+            if operation_deadline_expired(deadline.as_mut()) {
                 return Err(operation_deadline_error(
                     "topic-list snapshot",
                     last_broker_error.clone(),
                 ));
             }
-            outcome = request.as_mut() => outcome,
-        };
-        match outcome {
-            magnetar_proto::OpOutcome::TopicListSnapshot {
-                watcher_id, topics, ..
-            } => Ok((watcher_id, topics)),
-            magnetar_proto::OpOutcome::Error { code, message, .. } => {
-                Err(ClientError::Broker { code, message })
+            let request_id = {
+                let mut conn = self.shared.inner.lock();
+                conn.watch_topic_list(namespace, pattern)
+            };
+            self.shared.driver_waker.notify_one();
+            let request = RequestFut::cancellable(self.shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "topic-list snapshot",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
+            match outcome {
+                magnetar_proto::OpOutcome::TopicListSnapshot {
+                    watcher_id, topics, ..
+                } => return Ok((watcher_id, topics)),
+                magnetar_proto::OpOutcome::SessionLost { .. } => {
+                    self.await_session_reissue(
+                        deadline.as_mut(),
+                        &mut reissues_remaining,
+                        "topic-list snapshot",
+                        last_broker_error.as_ref(),
+                    )
+                    .await?;
+                }
+                magnetar_proto::OpOutcome::Error { code, message, .. } => {
+                    return Err(ClientError::Broker { code, message });
+                }
+                magnetar_proto::OpOutcome::Terminal { .. } => return Err(ClientError::PeerClosed),
+                other => {
+                    return Err(ClientError::Other(format!(
+                        "unexpected topic-list snapshot outcome: {other:?}"
+                    )));
+                }
             }
-            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected topic-list snapshot outcome: {other:?}"
-            ))),
         }
     }
 
@@ -1633,6 +1653,12 @@ impl Client {
     }
 
     /// Deadline-aware partition-metadata seam used by the engine-generic façade.
+    ///
+    /// A request severed by a supervised reconnect ([`OpOutcome::SessionLost`]) is re-issued on
+    /// the fresh session, bounded by [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] and
+    /// by the operation deadline, so `producer().create()` issued mid-reconnect resolves
+    /// transparently like a lookup does (ADR-0060, 2026-11-19 amendment). The reissue budget is
+    /// independent of the broker-failure retry budget.
     #[doc(hidden)]
     pub async fn partitioned_topic_metadata_with_operation_deadline(
         &self,
@@ -1642,6 +1668,7 @@ impl Client {
     ) -> Result<u32, ClientError> {
         let retry_config = self.shared.inner.lock().operation_retry_config().clone();
         let mut broker_failures = 0_u32;
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
         loop {
             let request_id = {
                 if operation_deadline_expired(deadline.as_mut()) {
@@ -1705,6 +1732,15 @@ impl Client {
                     error: None,
                     ..
                 } => return Ok(partitions),
+                magnetar_proto::OpOutcome::SessionLost { .. } => {
+                    self.await_session_reissue(
+                        deadline.as_mut(),
+                        &mut reissues_remaining,
+                        "partitioned topic metadata",
+                        last_broker_error.as_ref(),
+                    )
+                    .await?;
+                }
                 magnetar_proto::OpOutcome::Terminal { .. } => return Err(ClientError::PeerClosed),
                 other => {
                     return Err(ClientError::Other(format!(
@@ -1712,6 +1748,56 @@ impl Client {
                     )));
                 }
             }
+        }
+    }
+
+    /// Park after a registry request (partitioned metadata, topic-list snapshot) was severed by a
+    /// supervised reconnect, and return `Ok(())` once the caller may re-issue it on the fresh
+    /// session. The twin of the `SessionLost` arm of [`Self::issue_lookup_on`] (ADR-0060).
+    ///
+    /// Parks on [`ConnectionShared::await_reconnect_or_terminal`] raced against the operation
+    /// deadline, biased deadline-first, reading no clock. `reissues_remaining` is the caller's
+    /// per-call budget: it is spent here, one per re-issue, and an exhausted budget surfaces
+    /// `PeerClosed` instead of spinning on a flapping connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    /// it, or when the reissue budget is spent. The operation-deadline error (`operation`, or the
+    /// last broker error) when `operation_timeout` expires first.
+    async fn await_session_reissue(
+        &self,
+        mut deadline: OperationDeadline<'_>,
+        reissues_remaining: &mut u8,
+        operation: &'static str,
+        last_broker_error: Option<&(i32, String)>,
+    ) -> Result<(), ClientError> {
+        let readiness = tokio::select! {
+            biased;
+            () = deadline.as_mut() => {
+                return Err(operation_deadline_error(operation, last_broker_error.cloned()));
+            }
+            readiness = self.shared.await_reconnect_or_terminal() => readiness,
+        };
+        match readiness {
+            crate::LookupReissueReadiness::Reconnected => {
+                if *reissues_remaining == 0 {
+                    tracing::warn!(
+                        operation,
+                        max_reissues = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES,
+                        "session-reissue cap exceeded; surfacing PeerClosed"
+                    );
+                    return Err(ClientError::PeerClosed);
+                }
+                *reissues_remaining -= 1;
+                tracing::debug!(
+                    operation,
+                    reissues_remaining = *reissues_remaining,
+                    "request severed by reconnect; re-issuing against fresh session"
+                );
+                Ok(())
+            }
+            crate::LookupReissueReadiness::Terminal => Err(ClientError::PeerClosed),
         }
     }
 
