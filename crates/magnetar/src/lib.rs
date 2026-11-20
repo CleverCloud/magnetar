@@ -66,14 +66,17 @@ pub use engine::MoonpoolEngine;
 pub use engine::TokioEngine;
 #[cfg(feature = "tokio")]
 pub use engine::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, OperationDeadline,
-    ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange,
-    WatchTopicListFut, WatchTopicListWithIdFut,
+    BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
+    CreateProducerApi, OpenProducerFut, OperationDeadline, ProducerApi, ReceiveBatchFut,
+    ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange, WatchTopicListFut,
+    WatchTopicListWithIdFut,
 };
 pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 
 #[cfg(feature = "tokio")]
 mod auto_update_task;
+#[cfg(feature = "tokio")]
+mod background_task;
 #[cfg(feature = "tokio")]
 mod builders;
 #[cfg(feature = "tokio")]

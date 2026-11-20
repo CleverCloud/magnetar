@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `Consumer::is_terminal()` evaluates the gate `receive()` itself resolves `Err(Closed)` on, which is broader than `is_closed()`: a per-handle terminal subscribe failure never sets `closed`.
   `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
   `WrapperReceiver::is_terminal` has a default of `false`; an implementation whose `wrapper_receive` can fail for good must override it.
+- **`BackgroundApi`, a supertrait of `SubscribeApi` and `CreateProducerApi`** ([ADR-0139](specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)).
+  It gives each runtime client the two `#[doc(hidden)]` methods the façade starts its helper tasks with, `spawn_background` and `background_sleeper`, and is implemented for the Tokio client and for the Moonpool `Client<P>` for every `P`.
+  It is a required supertrait, so an external implementor of `SubscribeApi` or `CreateProducerApi` must add it.
 
 ### Changed
 
@@ -23,6 +26,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A `TableView`, or a `PartitionedProducer`, `MultiTopicsConsumer` or `TableView` with `auto_update_partitions_interval`, no longer needs a Tokio runtime under `MoonpoolEngine<SimProviders>`** ([ADR-0139](specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)).
+  The `TableView` drain and the auto-update partition ticker were started with `tokio::spawn` and paced with `tokio::time::interval`, which panic ("there is no reactor running") on the seeded simulation executor and would read the host clock if a runtime were present, outside ADR-0078's provider boundary.
+  They are now spawned on the client's own `TaskProvider` and wait on its `TimeProvider` (Tokio's for `TokioEngine`), so the ticker fires on virtual time and replays from the seed.
+  Teardown is a cooperative stop on both engines instead of `JoinHandle::abort`: dropping the surface stops its tasks at the next poll, as before, and `TableView::close` still waits for both to end.
+  Not changed: the push-delivery pollers and `PatternConsumer::start_auto_reconcile` still spawn with `tokio::spawn`.
 - **A session reset no longer leaves the `TxnClient` entries of the ended session's transaction requests behind** ([ADR-0138](specs/adr/0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)).
   `Connection::reset` resolved every pending request with `SessionLost` but never touched the embedded `TxnClient`, whose per-request maps and waker slots are emptied only by the matching response, which a dead session never sends.
   Every reconnect therefore left, for the life of the connection, one entry for each `new_txn`, `add_partition_to_txn`, `add_subscription_to_txn` or `end_txn` pending at the reset, and one for each request cancelled earlier on that session, such as one whose operation deadline fired during the outage before the supervisor redialled.

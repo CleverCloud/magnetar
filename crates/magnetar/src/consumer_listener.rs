@@ -15,10 +15,11 @@
 //!
 //! `MessageListener` is a runtime concept. `magnetar-proto` cannot spawn tasks
 //! or invoke callbacks, so nothing here touches the sans-io state machine. The
-//! poller is a [`tokio::spawn`]ed task — exactly the pattern
-//! [`crate::TableView`]'s `spawn_drain` uses (ADR-0025: both engines schedule
-//! on tokio; determinism for the moonpool engine comes from substituting the
-//! `moonpool_core::Providers`, not from replacing the executor). It is
+//! poller is a [`tokio::spawn`]ed task, so it needs an ambient Tokio runtime on
+//! either engine, `MoonpoolEngine<SimProviders>` included (ADR-0078). The
+//! [`crate::TableView`] drain, which used the same pattern, is spawned through
+//! the client's `BackgroundApi` instead; ADR-0139 leaves these pollers on
+//! `tokio::spawn`. It is
 //! engine-generic over `C: ConsumerApi + Clone`, so the same poller serves the
 //! tokio and moonpool consumers without a per-engine carve-out.
 //!
