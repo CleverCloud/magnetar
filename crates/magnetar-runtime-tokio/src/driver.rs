@@ -998,6 +998,14 @@ async fn supervised_driver_loop(
     let mut last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
 
     loop {
+        // The previous socket's lifetime ends HERE, when `driver_loop_inner` returned. Read it
+        // before the anti-thrash cooldown below sleeps: that sleep (30 s by default, against a
+        // 500 ms `drop_grace`) is time the dead socket was not alive, and a lifetime measured
+        // after it would make a socket that died milliseconds after its re-attach read as
+        // stable, resetting the backoff schedule and the ADR-0061 give-up budget on every
+        // cooldown of an attach-then-drop storm.
+        let socket_lifetime = socket_alive_since.elapsed();
+
         // User-requested close beats reconnect — the state machine is in `Closing` /
         // `Closed`, so we propagate the inner result (Ok or Err) as-is. `Failed`
         // (transport drop, `mark_disconnected`) deliberately does NOT count: the
@@ -1081,7 +1089,7 @@ async fn supervised_driver_loop(
         if !shared
             .pending_rebuild
             .load(std::sync::atomic::Ordering::SeqCst)
-            && cfg.should_reset_backoff(socket_alive_since.elapsed())
+            && cfg.should_reset_backoff(socket_lifetime)
         {
             backoff.reset();
             give_up_attempts = 0;

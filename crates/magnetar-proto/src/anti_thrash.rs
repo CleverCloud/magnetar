@@ -22,15 +22,16 @@ use crate::types::{ConsumerHandle, ProducerHandle};
 
 /// Kind of re-attach outcome the driver feeds into the anti-thrash detector.
 ///
-/// The driver calls
 /// [`Connection::record_reattach_outcome`](crate::Connection::record_reattach_outcome)
-/// twice per attach attempt: once on success
+/// is called once per re-attached handle on success
 /// ([`ConnectionEvent::ProducerReady`](crate::ConnectionEvent::ProducerReady) /
 /// [`ConnectionEvent::SubscribeAcked`](crate::ConnectionEvent::SubscribeAcked))
-/// with [`ReAttachOutcomeKind::ReAttachOk`], and again with
-/// [`ReAttachOutcomeKind::TcpDropAfterReAttach`] if the TCP socket is observed
-/// to close within
-/// [`SupervisorConfig::drop_grace`](crate::supervisor::SupervisorConfig::drop_grace).
+/// with [`ReAttachOutcomeKind::ReAttachOk`], and once per socket loss by the
+/// engine driver with [`ReAttachOutcomeKind::TcpDropAfterReAttach`] if the TCP
+/// socket is observed to close within
+/// [`SupervisorConfig::drop_grace`](crate::supervisor::SupervisorConfig::drop_grace)
+/// of the most recent attach. That one drop is paired with every handle the
+/// lost socket re-attached (see [`AntiThrashState::record`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReAttachOutcomeKind {
     /// Broker acked the `CommandProducer` / `CommandSubscribe`. Recorded on
@@ -91,7 +92,9 @@ impl AttachOutcome {
 pub struct AntiThrashThreshold {
     /// Number of consecutive successful-attach-then-drop pairs that must
     /// happen inside `window` to trip the cooldown. Recommended starting
-    /// value: `5`.
+    /// value: `5`. A pair is one re-attached handle (producer or consumer)
+    /// and the socket loss that followed it, so a socket that carried
+    /// several handles contributes one pair per handle.
     pub successful_attaches: u32,
     /// Wall-clock window inside which the `successful_attaches` pairs must
     /// happen. Recommended starting value: `Duration::from_secs(2)`.
@@ -222,13 +225,15 @@ impl AntiThrashState {
 
     /// Record a re-attach outcome.
     ///
-    /// `ReAttachOk` appends a fresh `AttachOutcome` with `dropped_at = None`.
-    /// `TcpDropAfterReAttach` stamps `dropped_at` on the most recent entry
-    /// whose `dropped_at` is still `None` — the canonical "drop after attach"
-    /// pairing — *if* that pairing is within `drop_within`. If the most-recent
-    /// open attach is older than `drop_within`, the drop is treated as
-    /// unrelated and ignored for thresholding purposes (it neither trips nor
-    /// resets the detector).
+    /// `ReAttachOk` appends a fresh `AttachOutcome` with `dropped_at = None`
+    /// (one per re-attached handle).
+    /// `TcpDropAfterReAttach` is connection-wide — a socket loss, not a
+    /// per-handle signal — so it stamps `dropped_at` on EVERY entry whose
+    /// `dropped_at` is still `None` and whose attach is within `drop_within`
+    /// of the drop: the canonical "drop after attach" pairing for each handle
+    /// the lost socket had re-attached. If the most-recent open attach is
+    /// older than `drop_within`, the drop is treated as unrelated and ignored
+    /// for thresholding purposes (it neither trips nor resets the detector).
     ///
     /// After recording, the detector evaluates the ring; if the trip
     /// conditions are met it arms a cooldown until `now + cooldown`.
@@ -253,17 +258,25 @@ impl AntiThrashState {
                 self.pending_first_op = true;
             }
             ReAttachOutcomeKind::TcpDropAfterReAttach => {
-                // Find the most recent open attach.
+                // The drop is connection-wide (the engine drivers record ONE per socket loss, with
+                // a placeholder handle), while the ring holds one entry per handle the socket
+                // re-attached. Pair it with every open attach inside `drop_within`, walking from
+                // the newest and stopping at the first one outside it (everything older is
+                // outside too): stamping only the newest would leave the other handles of the
+                // same socket open, and `evaluate` would never see `successful_attaches`
+                // dropped entries for a connection that re-attaches two or more handles.
                 let mut paired = false;
-                for entry in self.ring.iter_mut().rev() {
-                    if entry.dropped_at.is_none() {
-                        let delta = now.saturating_duration_since(entry.attached_at);
-                        if delta <= th.drop_within {
-                            entry.dropped_at = Some(now);
-                            paired = true;
-                        }
-                        break;
-                    }
+                for entry in self
+                    .ring
+                    .iter_mut()
+                    .rev()
+                    .filter(|entry| entry.dropped_at.is_none())
+                    .take_while(|entry| {
+                        now.saturating_duration_since(entry.attached_at) <= th.drop_within
+                    })
+                {
+                    entry.dropped_at = Some(now);
+                    paired = true;
                 }
                 if !paired {
                     // No recent attach to pair with — ignore.
@@ -419,6 +432,43 @@ mod tests {
                 panic!("threshold met but tick() returned Normal");
             }
         }
+    }
+
+    /// ADR-0028 §"Detector mechanics": the cooldown trips once `successful_attaches` ring entries
+    /// all carry a drop within `drop_within`. A session that re-attaches two handles and then
+    /// loses its socket owes BOTH ring entries a drop stamp, but the engine drivers feed exactly
+    /// ONE connection-wide `TcpDropAfterReAttach` per socket loss. With
+    /// `successful_attaches = 2` and two handles per session the detector must therefore trip, not
+    /// stay `Normal` because the older handle's entry was never stamped.
+    #[test]
+    fn one_socket_drop_pairs_every_handle_attached_on_that_socket() {
+        let mut s = AntiThrashState::disabled();
+        s.set_threshold(
+            Some(AntiThrashThreshold {
+                successful_attaches: 2,
+                window: Duration::from_secs(5),
+                drop_within: Duration::from_millis(50),
+            }),
+            Duration::from_secs(30),
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            // Two handles are acked on the same socket...
+            s.record(now, ReAttachOutcomeKind::ReAttachOk, handle(1));
+            now += Duration::from_millis(1);
+            s.record(now, ReAttachOutcomeKind::ReAttachOk, handle(2));
+            now += Duration::from_millis(9);
+            // ...which then dies: the driver records ONE socket-wide drop (it carries a
+            // placeholder handle, the close signal is not per-handle).
+            s.record(now, ReAttachOutcomeKind::TcpDropAfterReAttach, handle(0));
+            now += Duration::from_millis(20);
+        }
+        assert!(
+            matches!(s.tick(now), AntiThrashDisposition::Cooldown { .. }),
+            "two sockets each acked two handles and dropped within drop_within, yet the \
+             detector stayed Normal (successful_attaches = 2); ring = {:?}",
+            s.ring()
+        );
     }
 
     #[test]

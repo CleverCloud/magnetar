@@ -1,6 +1,6 @@
 # ADR-0028 — Supervised-reconnect anti-thrash policy
 
-- **Status**: Accepted
+- **Status**: Accepted (amended 2026-11-20 — a socket loss is paired with every attach it followed)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: supervisor, reconnect, ha, e2e, broker-quirks, follow-up-74
@@ -160,3 +160,17 @@ Sim coverage on the diff must remain 100 % (`cargo xtask check-sim-coverage`) an
 - Apache Pulsar PR [#12846](https://github.com/apache/pulsar/pull/12846) — producer incorrectly removed from topic's producer map after unload race.
 - `crates/magnetar-runtime-tokio/src/supervisor.rs` — supervisor surface this extends.
 - `crates/magnetar-proto/src/conn.rs` — `Connection` state hosting `AntiThrashState`.
+
+## Amendment (2026-11-20): a socket loss is paired with every attach it followed
+
+The detector mechanics above say the ring records every successful attach and that the cooldown trips when `successful_attaches` ring entries all carry a drop within `drop_within`.
+The ring does hold one entry per re-attached handle (`CommandProducerSuccess` / `CommandSubscribeAcked` each push their own `AttachOutcome`), but the drop that follows is not per-handle: both engine drivers record exactly ONE connection-wide `TcpDropAfterReAttach` per socket loss, with a placeholder handle, and left the pairing to `AntiThrashState::record`.
+`record` stamped only the newest still-open entry and stopped, so a connection that re-attached two or more handles per socket left every older handle's entry unstamped; `evaluate` returns at the first unstamped entry among the newest `successful_attaches`, so the detector could never reach `Cooldown` for such a connection and the opt-in mitigation silently did nothing.
+Only a connection with a single handle, the one shape the original tests exercised, could trip it.
+
+`record` now pairs one drop with EVERY open entry whose attach is within `drop_within` of the drop, walking from the newest entry and stopping at the first open one outside it (everything older is outside too).
+A drop with no open attach inside `drop_within` is still ignored, and entries that were already stamped are skipped, as before.
+The consequence is that `successful_attaches` counts handle attaches, as the mechanics always said, not sockets: a connection that re-attaches `h` handles per socket reaches the threshold after about `successful_attaches / h` sockets lost inside `drop_within`.
+Choose `successful_attaches` for the number of handles the client holds, not for the number of reconnects to tolerate.
+
+Layers (ADR-0024): a `magnetar-proto` unit test (`one_socket_drop_pairs_every_handle_attached_on_that_socket`), a tokio and a moonpool integration twin (`opt_in_threshold_trips_cooldown_when_each_socket_reattaches_two_handles`) and a `magnetar-differential` parity scenario (`tokio_and_moonpool_trip_cooldown_when_each_socket_reattaches_two_handles`) each re-attach two handles per socket and drop once per socket.

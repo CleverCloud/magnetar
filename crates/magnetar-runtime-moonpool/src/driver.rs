@@ -1314,6 +1314,18 @@ where
         driver_loop_inner::<P>(shared.clone(), transport, time.clone(), task.clone()).await;
 
     loop {
+        // The previous socket's lifetime ends HERE, when `driver_loop_inner` returned. Read it
+        // before the anti-thrash cooldown below sleeps: that sleep (30 s by default, against a
+        // 500 ms `drop_grace`) is time the dead socket was not alive, and a lifetime measured
+        // after it would make a socket that died milliseconds after its re-attach read as
+        // stable, resetting the backoff schedule and the ADR-0061 give-up budget on every
+        // cooldown of an attach-then-drop storm. Routed through the engine-supplied clock
+        // (ADR-0011) rather than `Instant::elapsed()`, so `SimProviders` keeps the gate on
+        // virtual time. Mirror of the tokio runtime.
+        let socket_lifetime = shared
+            .now_instant()
+            .saturating_duration_since(socket_alive_since);
+
         // User-requested close beats reconnect. `Failed` (transport drop, from
         // `mark_disconnected`) deliberately does NOT count here — the supervisor exists
         // precisely to retry after that, so the gate is `is_user_closed()` (Closing /
@@ -1403,13 +1415,9 @@ where
             b.install_buggify(shared.inner.lock().buggify().clone());
             b
         });
-        // ADR-0011: route the elapsed-duration computation through the
-        // engine-supplied clock instead of `Instant::elapsed()` (which
-        // implicitly reads the host `Instant::now`). Under `SimProviders`
-        // this keeps the reset gate honoring virtual time.
-        let socket_lifetime = shared
-            .now_instant()
-            .saturating_duration_since(socket_alive_since);
+        // `socket_lifetime` was read at the top of the loop, before the cooldown sleep
+        // (ADR-0011: through the engine-supplied clock, so the reset gate honours virtual
+        // time under `SimProviders`).
         if !shared
             .pending_rebuild
             .load(std::sync::atomic::Ordering::SeqCst)

@@ -821,6 +821,181 @@ fn close_during_redial_dial_is_not_erased_by_reset() {
     );
 }
 
+// -- The anti-thrash cooldown sleep is not socket lifetime -------------------
+
+/// Reconnect budget of the storm test below (`SupervisorConfig::max_attempts`).
+const STORM_MAX_ATTEMPTS: u32 = 3;
+
+/// The bootstrap session plus one session per redial the budget allows.
+const STORM_SESSION_BUDGET: u32 = STORM_MAX_ATTEMPTS + 1;
+
+/// Virtual-time bound on the driver giving up. The correct behaviour needs a
+/// few simulated seconds (one cooldown per redial); the bug never gives up.
+const GIVE_UP_BOUND: Duration = Duration::from_mins(2);
+
+/// How far the storm client got.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StormStage {
+    /// Nothing observed yet.
+    #[default]
+    Started,
+    /// The producer opened on the bootstrap session and the driver handle was taken.
+    ProducerOpened,
+    /// The workload reached its verdict: whether the supervised driver
+    /// terminated (gave up) before the broker saw more sessions than the
+    /// budget allows, and how many sessions the broker had accepted by then.
+    Judged { terminated: bool, accepted: u32 },
+}
+
+/// Client paired with [`DropAcceptCycleBroker`]: a supervisor that bounds its
+/// reconnect budget and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`. Holds one producer open so every redial
+/// re-attaches it and the broker drops the socket a few ms later.
+struct CooldownLifetimeClientWorkload {
+    /// Broker-side count of accepted connections.
+    sessions_accepted: Arc<Mutex<u32>>,
+    stage: Arc<Mutex<StormStage>>,
+}
+
+impl CooldownLifetimeClientWorkload {
+    fn new(sessions_accepted: Arc<Mutex<u32>>) -> Self {
+        Self {
+            sessions_accepted,
+            stage: Arc::new(Mutex::new(StormStage::default())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for CooldownLifetimeClientWorkload {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let broker_ip = ctx
+            .peer("broker")
+            .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
+        let addr = format!("{broker_ip}:{BROKER_PORT}");
+        let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(SupervisorConfig {
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(40),
+                mandatory_stop: Duration::from_mins(1),
+                max_attempts: Some(STORM_MAX_ATTEMPTS),
+                anti_thrash_threshold: Some(AntiThrashThreshold {
+                    successful_attaches: 2,
+                    window: Duration::from_mins(1),
+                    drop_within: Duration::from_millis(200),
+                }),
+                // A socket that dies within a few ms is far inside this grace;
+                // the cooldown below is far outside it.
+                drop_grace: Duration::from_millis(400),
+                max_backoff_after_thrash: Duration::from_secs(1),
+            }),
+            ..ConnectionConfig::default()
+        };
+
+        let Ok(Ok(client)) = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        // The producer the supervisor re-attaches on every redial: it has to
+        // stay open for the storm to continue.
+        let producer = time
+            .timeout(
+                Duration::from_secs(20),
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/sim-cooldown-is-not-lifetime".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let Ok(Ok(_producer)) = producer else {
+            return Ok(());
+        };
+        let Some(driver) = client.take_driver() else {
+            return Ok(());
+        };
+        *self.stage.lock() = StormStage::ProducerOpened;
+
+        // Wait for the driver to give up. Bail out as soon as the broker has
+        // seen more sessions than the budget allows: the supervisor is then
+        // redialling past `max_attempts` and waiting longer proves nothing.
+        let mut join = Box::pin(driver.join());
+        let mut terminated = false;
+        let mut waited = Duration::ZERO;
+        let slice = Duration::from_millis(100);
+        while waited < GIVE_UP_BOUND && *self.sessions_accepted.lock() <= STORM_SESSION_BUDGET {
+            if time.timeout(slice, &mut join).await.is_ok() {
+                terminated = true;
+                break;
+            }
+            waited += slice;
+        }
+        *self.stage.lock() = StormStage::Judged {
+            terminated,
+            accepted: *self.sessions_accepted.lock(),
+        };
+        Ok(())
+    }
+}
+
+/// An attach-then-drop storm against a supervisor that bounds its reconnect
+/// budget (`max_attempts`) and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`.
+///
+/// Every socket here dies a few milliseconds after its producer is acked, so
+/// none of them is "stable" (`should_reset_backoff` is false for a socket that
+/// lived less than `drop_grace`): the ADR-0061 give-up budget must keep
+/// counting across cycles and the driver must stop after `max_attempts`
+/// redials. The cooldown the detector arms sleeps for longer than
+/// `drop_grace`, though, and a supervisor that measures the dead socket's
+/// lifetime AFTER that sleep reads the cooldown as socket lifetime: it resets
+/// the backoff schedule and the give-up counter every cycle and redials for
+/// ever.
+#[test]
+fn anti_thrash_cooldown_sleep_is_not_counted_as_socket_lifetime() {
+    let broker = DropAcceptCycleBroker::new(5);
+    let client = CooldownLifetimeClientWorkload::new(broker.sessions_accepted.clone());
+    let stage = client.stage.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1])
+        .set_iterations(1)
+        .run();
+
+    let stage = *stage.lock();
+    let StormStage::Judged {
+        terminated,
+        accepted,
+    } = stage
+    else {
+        panic!(
+            "precondition: the producer opened on the bootstrap session and the storm was judged \
+             (stage={stage:?}, report={report:?})"
+        );
+    };
+    assert!(
+        terminated && accepted <= STORM_SESSION_BUDGET,
+        "the supervisor kept redialling an attach-then-drop storm past max_attempts = \
+         {STORM_MAX_ATTEMPTS}: driver terminated = {terminated} (must be true), broker sessions \
+         accepted = {accepted} (must be <= {STORM_SESSION_BUDGET}); the anti-thrash cooldown \
+         sleep was counted as socket lifetime and reset the give-up budget (report={report:?})"
+    );
+}
+
 // Confirm the trait bounds compose — `MoonpoolEngine<SimProviders>` must be a
 // valid construction site. Compile-time-only.
 #[allow(dead_code)]

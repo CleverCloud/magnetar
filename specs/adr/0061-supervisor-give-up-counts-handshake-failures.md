@@ -1,6 +1,6 @@
 # ADR-0061 — Supervisor give-up budget counts post-dial handshake failures
 
-- **Status**: Accepted (amended 2026-10-14 — handshake-confirmed stability)
+- **Status**: Accepted (amended 2026-10-14 — handshake-confirmed stability; amended 2026-11-20 — socket lifetime is read before the cooldown sleep)
 - **Date**: 2026-06-09
 - **Decider**: Florentin Dubois
 - **Tags**: reconnect, resilience, runtime, supervisor, sans-io
@@ -79,3 +79,18 @@ That site fires even with zero handles to replay (`producers = 0, consumers = 0`
 - [ADR-0052](0052-initial-connect-timeout-retry.md) — the per-attempt `connect_timeout` that still bounds each dial (amended, not superseded).
 - [ADR-0054](0054-logging-policy.md) — the structured-field policy the relabelled + new reconnect logs satisfy.
 - [ADR-0059](0056-terminal-fast-fail-new-ops.md) — the `no_driver` latch + `fail_all_pending` the give-up path triggers, so exhausted-budget ops fast-fail instead of hanging.
+
+## Amendment (2026-11-20): the socket lifetime is read before the anti-thrash cooldown sleeps
+
+Decision 3 defines stability as a socket lifetime greater than `drop_grace`, and `SupervisorConfig::should_reset_backoff` documents its argument as the time between the previous socket coming up and `driver_loop_inner` returning.
+Both supervisors computed that duration late: after the ADR-0028 anti-thrash cooldown had slept, not when the inner loop returned.
+The cooldown (`max_backoff_after_thrash`, 30 s by default) is far longer than `drop_grace` (500 ms by default), so in an attach-then-drop storm the dead socket's lifetime read as the cooldown plus its real lifetime, the stability gate opened, and both the backoff schedule and the give-up budget reset on every cooldown.
+`max_attempts` therefore never fired against exactly the storm class this ADR and ADR-0028 exist for, for any client that opts into both the detector and a finite budget.
+
+Both engines now read the lifetime as the first statement of the supervisor loop, immediately after `driver_loop_inner` returns, and feed that value to the gate after the cooldown and the drop record.
+The cooldown sleep, the redial backoff and the dial itself are time the previous socket was not alive, and none of them counts towards its lifetime.
+The moonpool engine keeps measuring it through the injected clock (ADR-0011).
+Nothing else changes: the gate, the `pending_rebuild` exclusion and the strict-`>` boundary are as in Decision 3.
+
+Layers (ADR-0024): a tokio and a moonpool integration twin (`anti_thrash_cooldown_sleep_is_not_counted_as_socket_lifetime`, cooldown 1 s against a `drop_grace` of 400 ms, `max_attempts = 3`, which must end the driver within the budget) and a `magnetar-differential` scenario (`tokio_and_moonpool_drivers_give_up_an_attach_then_drop_storm_within_max_attempts`).
+The sans-io policy is unchanged, so no `magnetar-proto` test is added for this half: the defect was the value the drivers passed to it, and `should_reset_backoff_gates_on_drop_grace` already pins the policy itself.

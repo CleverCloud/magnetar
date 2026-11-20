@@ -23,6 +23,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **The anti-thrash cooldown sleep is no longer counted as the dead socket's lifetime.**
+  Both supervisors read the previous socket's lifetime after the ADR-0028 cooldown had slept, so with a cooldown longer than `drop_grace` (30 s against 500 ms by default) a socket that died milliseconds after its re-attach read as stable and the loop reset both the backoff schedule and the ADR-0061 give-up budget on every cooldown.
+  An attach-then-drop storm therefore never reached `max_attempts` for a client that opts into the detector and a finite budget.
+  The lifetime is now read as soon as `driver_loop_inner` returns, before the drop record and the cooldown, on both engines.
+- **The anti-thrash detector trips for a connection that re-attaches two or more handles per socket.**
+  The ring holds one entry per re-attached handle but the drivers record one connection-wide drop per socket loss, and `AntiThrashState::record` stamped only the newest open entry, so every older handle's entry stayed unstamped and `evaluate` never saw `successful_attaches` dropped entries: the opt-in cooldown silently did nothing unless the connection held a single handle.
+  A drop is now paired with every open entry attached within `drop_within` of it, so `successful_attaches` counts handle attaches, as ADR-0028 describes.
 - **`Reader::has_message_available` answers for the position a seek leaves the reader at, and a moonpool `Reader` has seek wrappers that can move it.**
   `Reader` answered by comparing the broker's last message id with the id of the last message `read_next` returned, and `seek_to_earliest`, `seek_to_latest`, `seek_to_message` and `seek_to_timestamp` forwarded to the consumer without touching that cursor.
   After a seek it kept answering for the position the reader had left: `false` after rewinding a topic read to its end, so a `while has_message_available { read_next }` replay loop exited at once and skipped the replay, and `true` after `seek_to_latest` from the middle of a topic, so the same loop called `read_next` and waited for a message that might never come.

@@ -19,9 +19,19 @@
 //! `magnetar-runtime-moonpool/tests/sim_chaos.rs` `DropsTcpAfterCreate`
 //! workload covers the end-to-end cadence assertion deterministically.
 
-use std::time::Duration;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
-use magnetar_proto::{Backoff, SupervisorConfig};
+use bytes::BytesMut;
+use magnetar_proto::{
+    AntiThrashThreshold, Backoff, ConnectionConfig, CreateProducerRequest, FrameError,
+    SupervisorConfig, decode_one, encode_command, pb,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 /// Helper — drive the supervisor's per-cycle decision through a fixed
 /// scenario and collect the resulting backoff delays. The engine never
@@ -181,5 +191,245 @@ fn drop_grace_boundary_is_strict_greater_than_across_engines() {
         answers,
         vec![false, false, true],
         "drop_grace boundary must be strict-greater-than in both engines",
+    );
+}
+
+// -- The anti-thrash cooldown sleep is not socket lifetime (both real drivers) --
+
+/// Redial budget of the storm below.
+const STORM_MAX_ATTEMPTS: u32 = 3;
+
+/// The bootstrap session plus one session per redial the budget allows.
+const STORM_SESSION_BUDGET: u32 = STORM_MAX_ATTEMPTS + 1;
+
+/// Wall-clock bound on the driver giving up. The correct behaviour needs one cooldown per redial
+/// (a few seconds); the defect never gives up.
+const STORM_GIVE_UP_BOUND: Duration = Duration::from_secs(20);
+
+/// A broker that, on every accepted connection, answers CONNECT / PING / LOOKUP, acks the first
+/// `CommandProducer`, and drops the socket 5 ms later: the attach-then-drop storm
+/// `ScriptedBroker` cannot produce (its drop is a one-shot latch). Kept local to this test, like
+/// the loopback gate of `driver_write_deadline_equivalence.rs`, rather than widening the broker
+/// every other scenario shares. Returns the bound address and the accepted-session counter.
+async fn spawn_attach_then_drop_broker() -> (SocketAddr, Arc<AtomicU32>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let sessions = Arc::new(AtomicU32::new(0));
+    let accepted = sessions.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _peer)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = attach_then_drop_session(stream).await;
+            });
+        }
+    });
+    (addr, sessions)
+}
+
+async fn attach_then_drop_session(mut stream: TcpStream) -> std::io::Result<()> {
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    let mut producer_acked = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let _ = read_buf.split_to(before - framed.len());
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            let reply = match kind {
+                pb::base_command::Type::Connect => Some(pb::BaseCommand {
+                    r#type: pb::base_command::Type::Connected as i32,
+                    connected: Some(pb::CommandConnected {
+                        server_version: "magnetar-diff".to_owned(),
+                        protocol_version: Some(21),
+                        max_message_size: Some(5 * 1024 * 1024),
+                        feature_flags: Some(pb::FeatureFlags::default()),
+                    }),
+                    ..Default::default()
+                }),
+                pb::base_command::Type::Ping => Some(pb::BaseCommand {
+                    r#type: pb::base_command::Type::Pong as i32,
+                    pong: Some(pb::CommandPong {}),
+                    ..Default::default()
+                }),
+                pb::base_command::Type::Lookup => {
+                    frame
+                        .command
+                        .lookup_topic
+                        .as_ref()
+                        .map(|l| pb::BaseCommand {
+                            r#type: pb::base_command::Type::LookupResponse as i32,
+                            lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                                broker_service_url: None,
+                                broker_service_url_tls: None,
+                                response: Some(
+                                    pb::command_lookup_topic_response::LookupType::Connect as i32,
+                                ),
+                                request_id: l.request_id,
+                                authoritative: Some(true),
+                                error: None,
+                                message: None,
+                                proxy_through_service_url: Some(false),
+                            }),
+                            ..Default::default()
+                        })
+                }
+                pb::base_command::Type::Producer => frame.command.producer.as_ref().map(|p| {
+                    producer_acked = true;
+                    pb::BaseCommand {
+                        r#type: pb::base_command::Type::ProducerSuccess as i32,
+                        producer_success: Some(pb::CommandProducerSuccess {
+                            request_id: p.request_id,
+                            producer_name: "diff-storm".to_owned(),
+                            last_sequence_id: Some(-1),
+                            schema_version: None,
+                            topic_epoch: Some(0),
+                            producer_ready: Some(true),
+                        }),
+                        ..Default::default()
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(cmd) = reply {
+                let _ = encode_command(&mut out_buf, &cmd);
+            }
+        }
+        if !out_buf.is_empty() {
+            stream.write_all(&out_buf).await?;
+            stream.flush().await?;
+            out_buf.clear();
+        }
+        if producer_acked {
+            // Well inside the supervisor's `drop_grace` and `drop_within`.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            return Ok(());
+        }
+        if stream.read_buf(&mut read_buf).await? == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// A supervisor that bounds its reconnect budget and has the anti-thrash cooldown opted in, with
+/// a cooldown (1 s) far above `drop_grace` (400 ms). Every socket of the storm dies a few
+/// milliseconds after its producer is acked, so none is "stable".
+fn storm_connection_config() -> ConnectionConfig {
+    ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            mandatory_stop: Duration::from_mins(1),
+            max_attempts: Some(STORM_MAX_ATTEMPTS),
+            anti_thrash_threshold: Some(AntiThrashThreshold {
+                successful_attaches: 2,
+                window: Duration::from_mins(1),
+                drop_within: Duration::from_millis(200),
+            }),
+            drop_grace: Duration::from_millis(400),
+            max_backoff_after_thrash: Duration::from_secs(1),
+        }),
+        ..ConnectionConfig::default()
+    }
+}
+
+/// Wait for the driver (`join`) to give up, bailing out as soon as the broker has accepted more
+/// sessions than the budget allows. Returns `(driver terminated, sessions accepted)`.
+async fn judge_storm<F>(join: F, sessions: &AtomicU32) -> (bool, u32)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut joined = tokio::spawn(join);
+    let started = Instant::now();
+    let terminated = loop {
+        if tokio::time::timeout(Duration::from_millis(20), &mut joined)
+            .await
+            .is_ok()
+        {
+            break true;
+        }
+        if sessions.load(Ordering::SeqCst) > STORM_SESSION_BUDGET
+            || started.elapsed() >= STORM_GIVE_UP_BOUND
+        {
+            break false;
+        }
+    };
+    joined.abort();
+    (terminated, sessions.load(Ordering::SeqCst))
+}
+
+async fn tokio_storm_leg() -> (bool, u32) {
+    let (addr, sessions) = spawn_attach_then_drop_broker().await;
+    let client = magnetar_runtime_tokio::Client::connect(
+        &format!("pulsar://{addr}"),
+        storm_connection_config(),
+    )
+    .await
+    .expect("tokio connect");
+    let _producer = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/diff-storm".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("tokio producer opens on the bootstrap session");
+    let driver = client.take_driver().expect("tokio driver handle");
+    judge_storm(driver.join(), &sessions).await
+}
+
+async fn moonpool_storm_leg() -> (bool, u32) {
+    let (addr, sessions) = spawn_attach_then_drop_broker().await;
+    let engine =
+        magnetar_runtime_moonpool::MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        storm_connection_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("moonpool connect");
+    let _producer = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/diff-storm".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("moonpool producer opens on the bootstrap session");
+    let driver = client.take_driver().expect("moonpool driver handle");
+    judge_storm(driver.join(), &sessions).await
+}
+
+/// The supervised driver loops of both engines must measure the dead socket's lifetime BEFORE the
+/// anti-thrash cooldown sleep: that sleep is not time the socket was alive. Counting it makes a
+/// socket that died milliseconds after its attach read as stable once the cooldown exceeds
+/// `drop_grace`, which resets the backoff schedule and the ADR-0061 give-up budget every cycle,
+/// so `max_attempts` never fires. Both real drivers face the same attach-then-drop storm and must
+/// give up within the budget (`max_attempts` redials after the bootstrap session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_and_moonpool_drivers_give_up_an_attach_then_drop_storm_within_max_attempts() {
+    let (tokio_leg, moonpool_leg) = tokio::join!(tokio_storm_leg(), moonpool_storm_leg());
+    assert_eq!(
+        tokio_leg.0, moonpool_leg.0,
+        "engines disagree on whether the driver gave up: tokio = {tokio_leg:?}, \
+         moonpool = {moonpool_leg:?} (terminated, sessions accepted)"
+    );
+    let gave_up_within_budget = |leg: (bool, u32)| leg.0 && leg.1 <= STORM_SESSION_BUDGET;
+    assert!(
+        gave_up_within_budget(tokio_leg) && gave_up_within_budget(moonpool_leg),
+        "a driver kept redialling an attach-then-drop storm past max_attempts = \
+         {STORM_MAX_ATTEMPTS}: (terminated, sessions accepted) must be (true, <= \
+         {STORM_SESSION_BUDGET}) on both engines, got tokio = {tokio_leg:?}, moonpool = \
+         {moonpool_leg:?}; the cooldown sleep was counted as socket lifetime"
     );
 }

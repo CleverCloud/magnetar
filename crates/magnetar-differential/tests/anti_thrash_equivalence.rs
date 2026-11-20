@@ -92,7 +92,11 @@ fn producer_success_bytes(request_id: u64) -> BytesMut {
     buf
 }
 
-fn drive_scripted_thrash<F>(make_shared: F, start: Instant) -> Vec<EventKind>
+fn drive_scripted_thrash<F>(
+    make_shared: F,
+    start: Instant,
+    handles_per_socket: u32,
+) -> Vec<EventKind>
 where
     F: FnOnce(ConnectionConfig) -> Arc<dyn SharedConn>,
 {
@@ -111,16 +115,21 @@ where
         conn.begin_handshake().expect("begin_handshake");
         conn.handle_bytes(now, &handshake_response_bytes())
             .expect("handshake");
-        let req = CreateProducerRequest {
-            topic: "persistent://public/default/diff-anti-thrash".to_owned(),
-            ..Default::default()
-        };
-        let request_id = conn.peek_next_request_id_for_test();
-        let _h = conn.create_producer(req);
-        let _ = conn.poll_transmit();
-        let attach_now = now + Duration::from_millis(1);
-        conn.handle_bytes(attach_now, &producer_success_bytes(request_id))
-            .expect("producer success");
+        // Every handle the socket re-attaches is acked on it; the drop that follows is ONE
+        // connection-wide record, whatever number of handles the socket carried.
+        let mut attach_now = now;
+        for _ in 0..handles_per_socket {
+            let req = CreateProducerRequest {
+                topic: "persistent://public/default/diff-anti-thrash".to_owned(),
+                ..Default::default()
+            };
+            let request_id = conn.peek_next_request_id_for_test();
+            let _h = conn.create_producer(req);
+            let _ = conn.poll_transmit();
+            attach_now += Duration::from_millis(1);
+            conn.handle_bytes(attach_now, &producer_success_bytes(request_id))
+                .expect("producer success");
+        }
         let drop_now = attach_now + Duration::from_millis(10);
         conn.mark_disconnected();
         conn.record_reattach_outcome_producer_drop(drop_now);
@@ -189,6 +198,7 @@ fn tokio_and_moonpool_emit_the_same_anti_thrash_event_stream() {
             )))
         },
         start,
+        1,
     );
     let moonpool_events = drive_scripted_thrash(
         |cfg| {
@@ -197,6 +207,7 @@ fn tokio_and_moonpool_emit_the_same_anti_thrash_event_stream() {
             ))
         },
         start,
+        1,
     );
     assert_eq!(
         tokio_events, moonpool_events,
@@ -216,6 +227,45 @@ fn tokio_and_moonpool_emit_the_same_anti_thrash_event_stream() {
     assert!(
         cooldown_idx < cleared_idx,
         "AntiThrashCleared must follow AntiThrashCooldown; got {tokio_events:?}",
+    );
+}
+
+/// ADR-0028 §"Detector mechanics": a socket that re-attaches TWO handles and then dies inside
+/// `drop_within` owes BOTH ring entries a drop stamp, although the driver records one
+/// connection-wide drop per socket loss. Both engines feed the detector through the same
+/// `Connection`, so both must reach `AntiThrashCooldown` after three such sockets
+/// (`successful_attaches = 3`) and then clear on a first-op success; the event streams must stay
+/// equal.
+#[test]
+fn tokio_and_moonpool_trip_cooldown_when_each_socket_reattaches_two_handles() {
+    let start = Instant::now();
+    let tokio_events = drive_scripted_thrash(
+        |cfg| {
+            Arc::new(TokioShared(magnetar_runtime_tokio::ConnectionShared::new(
+                cfg,
+            )))
+        },
+        start,
+        2,
+    );
+    let moonpool_events = drive_scripted_thrash(
+        |cfg| {
+            Arc::new(MoonpoolShared(
+                magnetar_runtime_moonpool::ConnectionShared::new(cfg),
+            ))
+        },
+        start,
+        2,
+    );
+    assert_eq!(
+        tokio_events, moonpool_events,
+        "tokio and moonpool anti-thrash event streams diverged:\n\
+         tokio = {tokio_events:?}\nmoonpool = {moonpool_events:?}"
+    );
+    assert!(
+        tokio_events.contains(&EventKind::AntiThrashCooldown),
+        "three sockets each re-attached two handles and dropped inside drop_within \
+         (successful_attaches = 3), yet neither engine armed the cooldown: {tokio_events:?}"
     );
 }
 

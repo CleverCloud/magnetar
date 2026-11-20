@@ -509,3 +509,91 @@ async fn close_during_redial_dial_is_not_erased_by_reset() {
          re-attached on the replacement socket = {replayed_producers} (must be 0)"
     );
 }
+
+// -- The anti-thrash cooldown sleep is not socket lifetime -------------------
+
+/// An attach-then-drop storm against a supervisor that bounds its reconnect
+/// budget (`max_attempts`) and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`.
+///
+/// Every socket here dies a few milliseconds after its producer is acked, so
+/// none of them is "stable" (`should_reset_backoff` is false for a socket that
+/// lived less than `drop_grace`): the ADR-0061 give-up budget must keep
+/// counting across cycles and the driver must stop after `max_attempts`
+/// redials. The cooldown the detector arms sleeps for longer than
+/// `drop_grace`, though, and a supervisor that measures the dead socket's
+/// lifetime AFTER that sleep reads the cooldown as socket lifetime: it resets
+/// the backoff schedule and the give-up counter every cycle and redials for
+/// ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anti_thrash_cooldown_sleep_is_not_counted_as_socket_lifetime() {
+    const MAX_ATTEMPTS: u32 = 3;
+    // The bootstrap session plus one session per redial the budget allows.
+    const SESSION_BUDGET: u32 = MAX_ATTEMPTS + 1;
+
+    let (url, sessions_accepted, _drops_performed) = spawn_drop_accept_cycle_broker().await;
+
+    let cfg = ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            mandatory_stop: Duration::from_mins(1),
+            max_attempts: Some(MAX_ATTEMPTS),
+            anti_thrash_threshold: Some(AntiThrashThreshold {
+                successful_attaches: 2,
+                window: Duration::from_mins(1),
+                drop_within: Duration::from_millis(200),
+            }),
+            // A socket that dies within a few ms is far inside this grace; the
+            // cooldown below is far outside it.
+            drop_grace: Duration::from_millis(400),
+            max_backoff_after_thrash: Duration::from_secs(1),
+        }),
+        ..ConnectionConfig::default()
+    };
+
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok");
+
+    // The producer the supervisor re-attaches on every redial: it has to stay
+    // open for the storm to continue.
+    let _producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cooldown-is-not-lifetime".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("producer opens on the bootstrap session");
+
+    let driver = client
+        .take_driver()
+        .expect("a supervised client keeps its driver handle");
+    let joined = tokio::spawn(driver.join());
+
+    // Wait for the driver to give up. Bail out as soon as the broker has seen
+    // more sessions than the budget allows: the supervisor is then redialling
+    // past `max_attempts` and waiting longer proves nothing.
+    let started = tokio::time::Instant::now();
+    while !joined.is_finished()
+        && sessions_accepted.load(Ordering::SeqCst) <= SESSION_BUDGET
+        && started.elapsed() < HANG_GUARD
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let terminated = joined.is_finished();
+    let accepted = sessions_accepted.load(Ordering::SeqCst);
+    joined.abort();
+
+    assert!(
+        terminated && accepted <= SESSION_BUDGET,
+        "the supervisor kept redialling an attach-then-drop storm past max_attempts = \
+         {MAX_ATTEMPTS}: driver terminated = {terminated} (must be true), broker sessions \
+         accepted = {accepted} (must be <= {SESSION_BUDGET}); the anti-thrash cooldown sleep \
+         was counted as socket lifetime and reset the give-up budget"
+    );
+}
