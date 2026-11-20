@@ -21,9 +21,10 @@
 //! 2. **Reuse.** A second producer to the same advertised broker URL reuses the existing pinned
 //!    pool entry — no third TCP session.
 //! 3. **Clean teardown of pooled dials.** `Client::close()` drains the pool
-//!    (`ProxyConnectionPool::close`), closing every entry's connection and joining its supervised
-//!    driver. The test asserts `close()` returns within a bound — a wedged pool teardown (e.g. a
-//!    driver join that never resolves) would blow the timeout.
+//!    (`ProxyConnectionPool::begin_close`, then `ClosingEntries::join`), closing every entry's
+//!    connection and joining its supervised driver. The test asserts `close()` returns within a
+//!    bound — a wedged pool teardown (e.g. a driver join that never resolves) would blow the
+//!    timeout.
 //!
 //! Sibling moonpool simulation coverage lives in
 //! `crates/magnetar-runtime-moonpool/tests/pool_lifecycle.rs`.

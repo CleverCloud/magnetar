@@ -22,10 +22,11 @@
 //!    succeeds if that pinned connection handshaked and the `CommandProducer` round-trip completed
 //!    on it — a non-vacuous proof that the pooled connection works.
 //! 2. **Clean teardown of pooled dials.** `Client::close()` drains the pool
-//!    (`ProxyConnectionPool::close`) — closing every `EntryState::Ready` connection and joining its
-//!    supervised driver. The workload records that `close()` returned at all; combined with the run
-//!    terminating (the `SimulationBuilder::run` handing control back), that is the proof the
-//!    teardown ran to completion without a panic or a wedged driver join.
+//!    (`ProxyConnectionPool::begin_close`, then `ClosingEntries::join`) — closing every
+//!    `EntryState::Ready` connection and joining its supervised driver. The workload records that
+//!    `close()` returned at all; combined with the run terminating (the `SimulationBuilder::run`
+//!    handing control back), that is the proof the teardown ran to completion without a panic or a
+//!    wedged driver join.
 //!
 //! ## Determinism under the default sim fault config
 //!

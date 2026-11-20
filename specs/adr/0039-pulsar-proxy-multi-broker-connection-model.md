@@ -1,6 +1,6 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation; amended 2026-11-19 — a pool entry whose driver exited is replaced; amended 2026-11-19 — a DIRECT entry never consults `service_url_provider`)
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation; amended 2026-11-19 — a pool entry whose driver exited is replaced; amended 2026-11-19 — a DIRECT entry never consults `service_url_provider`; amended 2026-11-20 — `Client::close` closes the pool before it awaits anything)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
@@ -54,6 +54,16 @@ instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
 > The test is the dialled address and not `CommandConnect.proxy_to_broker_url`, because a sibling of a direct client carries `None` there like a DIRECT entry does.
 > It is the complement of the bootstrap-equality bypass of `resolve_direct_broker`, which already sends a lookup that resolves to the service address to the bootstrap or a sibling and never to a DIRECT entry.
 > `crates/magnetar-runtime-tokio/tests/lookup_direct_multi_broker.rs` and its moonpool twin pin the DIRECT redial, and `connections_per_broker.rs` of each engine pins that a sibling still follows a provider switched to another cluster.
+
+> **Amendment (2026-11-20, `Client::close` is cancel-safe).** The "`Client.close`" bullet below says it closes the bootstrap and every pool entry, and "Pool teardown" under "Deviations from tokio" says a `Pending` entry is dropped without an explicit abort.
+> Both described what `close` does when it is awaited to the end.
+> `close(self)` consumes the client, so a caller that bounds it with a `timeout` or a `select!` and is cancelled at one of its awaits leaves nothing able to close what it had not yet reached.
+> It used to close the bootstrap connection, then await the bootstrap driver's join, then drain the pool and close and join one entry at a time, so a cancellation at any of those joins left every later pool connection open, with its supervised driver running and, on tokio, already removed from the pool map.
+>
+> `Client::close` now tells **every** connection to close before its first `.await`: the bootstrap, then the pool through `ProxyConnectionPool::begin_close` (both engines), which latches `closed` (moonpool), drains the map, calls `Connection::close` and wakes the supervisor of each ready entry, and, on moonpool, publishes `PeerClosed` to the waiters of each pending dial and requests its cancellation.
+> Only the joins remain behind awaits — the bootstrap driver, then `ClosingEntries::join` for the pool's drivers and, on moonpool, the cancelled dials' completion — so a cancelled `close` loses the joins and nothing else: each driver observes its own `is_user_closed()` and exits by itself.
+> Each entry is closed exactly once: the drain empties the map, so a second `close` finds nothing, and the driver handle is taken once.
+> `crates/magnetar-runtime-tokio/tests/client_close_cancel.rs` and its moonpool twin pin it, cancelling `close` at the bootstrap join and at a pool join.
 
 ## Context
 

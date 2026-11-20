@@ -88,6 +88,7 @@ The [`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs
 `Client::close` drains every `Ready` pool entry's supervised driver in addition to the bootstrap.
 `Pending` entries resolve their waiters with `EngineError::PeerClosed`.
 Close signals the pending dial's cancellation notification and awaits its completion notification before returning.
+Every connection — the bootstrap and each drained entry — is told to close, and every pending dial to cancel, before `close` first awaits (`ProxyConnectionPool::begin_close`); only the driver joins and the dials' completion waits come after, so a `close` cancelled by a `timeout` or `select!` loses the joins and no connection stays open.
 The latched closed state and generation check prevent any detached dial from resurrecting the entry; a late successful connection is closed and its driver is joined by the dial task.
 
 Per-broker `ConnectionConfig.proxy_to_broker_url` is set on the **cloned** config inside `build_entry_async`; the bootstrap config itself stays untouched, so the bootstrap connection's `CommandConnect` omits the field (matching the Java client + Pulsar Proxy contract).

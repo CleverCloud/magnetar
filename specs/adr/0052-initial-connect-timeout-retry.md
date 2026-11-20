@@ -1,6 +1,6 @@
 # ADR-0052 — Initial-connect timeout + bounded retry
 
-- **Status**: Accepted (amended 2026-10-14 — supervised handshake bound; amended 2026-11-19 — resolver and TLS handshake under `connect_timeout`)
+- **Status**: Accepted (amended 2026-10-14 — supervised handshake bound; amended 2026-11-19 — resolver and TLS handshake under `connect_timeout`; amended 2026-11-20 — a cancelled tokio connect aborts its driver)
 - **Date**: 2026-06-03
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, connection, resilience, moonpool, java-parity, determinism
@@ -181,3 +181,15 @@ The same fix covers every dial site, so it needs no per-site bound: `MoonpoolEng
 The bound is what keeps a close from waiting on a parked redial: the dial now returns within a bounded time, and the supervisor loop checks the close request before the next attempt.
 It does not make a dial that _succeeds_ after the close landed harmless, and the supervisor therefore re-checks `is_user_closed()` under the same lock acquisition as the `Connection::reset()` that follows the dial, on both engines: `reset()` snaps `Closing` back to `Uninitialized`, which would erase the close.
 A close seen there drops the freshly dialled transport and returns, like the checks before the dial.
+
+### Amendment (2026-11-20): cancelling the tokio bootstrap connect aborts its driver
+
+The post-dial handshake bound above ends a handshake that the broker never answers; it does not end one the **caller** abandons.
+`Client::connect*` and `Client::from_socket` (tokio) spawn the driver task, which owns the socket, and then park on `wait_connected`.
+The only abort sat on the `Err` arm, and a `DriverHandle` dropped by cancellation does not stop its task, so a caller that cancelled the call (a `timeout`, a `select!`, a shutdown signal) inside `operation_timeout` left a detached driver holding the socket.
+The task armed no handshake deadline on its first pass and no keepalive before the first frame, so against a silent broker it parked on the read for as long as the peer kept the socket open, and a late `CONNECTED` produced a live, keepalive-maintained connection that nothing could reach.
+
+The spawned driver is now owned by the pool's `PendingDriverGuard` until the `Client` that owns it exists: dropping the future drops the guard, which aborts the task and with it the socket, and the success arm takes the handle out of the guard without an await in between.
+The `Err` arm needs no separate abort; the guard is the single release.
+Moonpool is unchanged: it completes `handshake_plain` on the transport **before** `spawn_supervised`, so no task exists while the handshake is pending and cancellation drops the transport itself.
+`crates/magnetar-runtime-tokio/tests/connect_resilience.rs` pins both entries (`tokio_cancelled_connect_does_not_leak_its_driver`, `tokio_cancelled_from_socket_does_not_leak_its_driver`); the loopback broker must see its connection close.

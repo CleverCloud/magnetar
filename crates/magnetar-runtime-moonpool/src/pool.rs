@@ -177,11 +177,20 @@ impl PendingDial {
         self.completed.notify_waiters();
     }
 
-    async fn cancel_and_wait(&self) {
+    /// Ask the dial task to stop. `cancel` stores a permit, so the request is not lost when the
+    /// task has not reached its `cancel.notified()` yet. Synchronous: it is the half of the
+    /// cancel-and-wait handshake that must happen before the caller can be cancelled.
+    fn request_cancel(&self) {
+        self.cancel.notify_one();
+    }
+
+    /// Wait until the dial task has finished. Enables the `completed` notification before it
+    /// reads `is_complete`, so a completion that lands in between is not missed
+    /// ([`Self::mark_complete`] stores the flag before it notifies).
+    async fn wait_completed(&self) {
         let completed = self.completed.notified();
         let mut completed = std::pin::pin!(completed);
         completed.as_mut().enable();
-        self.cancel.notify_one();
         if !self.is_complete.load(Ordering::Acquire) {
             completed.await;
         }
@@ -303,12 +312,48 @@ impl<P: Providers> ProxyConnectionPool<P> {
     }
 }
 
+/// What [`ProxyConnectionPool::begin_close`] has already told to stop and
+/// [`ClosingEntries::join`] still has to wait for.
+enum Closing {
+    /// A ready entry whose connection was closed; its supervised driver exits on its own.
+    Driver(DriverHandle),
+    /// An in-flight dial that was told to cancel.
+    Dial(PendingDial),
+}
+
+/// The pool entries [`ProxyConnectionPool::begin_close`] has already told to close. Waiting for
+/// them is the only step left, and the only one that can be cancelled.
+pub(crate) struct ClosingEntries(Vec<Closing>);
+
+impl ClosingEntries {
+    /// Wait for every closing driver to exit and every cancelled dial to finish. The join results
+    /// are discarded: closing is best-effort.
+    pub(crate) async fn join(self) {
+        for closing in self.0 {
+            match closing {
+                Closing::Driver(handle) => {
+                    let _ = handle.join().await;
+                }
+                Closing::Dial(pending) => pending.wait_completed().await,
+            }
+        }
+    }
+}
+
 impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
-    /// Close every pool entry. Idempotent.
-    pub(crate) async fn close(&self) {
+    /// First half of closing the pool, and the only half that must not be cancellable: latch
+    /// `closed`, drain the map, and tell **every** entry to stop — `Connection::close` plus a
+    /// supervisor wake for a ready one, a terminal `PeerClosed` for the waiters plus a cancel
+    /// request for an in-flight dial — all before the first `.await`. Nothing here suspends, so a
+    /// caller that is cancelled afterwards (`Client::close` under a `timeout` or `select!`) has
+    /// already told every connection to shut down; the drivers exit by themselves, and only the
+    /// joins are lost. Hands what is left to wait for to [`ClosingEntries::join`].
+    ///
+    /// Idempotent: a second call finds the map drained and returns nothing to wait for.
+    pub(crate) fn begin_close(&self) -> ClosingEntries {
         self.closed.store(true, Ordering::Release);
-        // Snapshot under-lock so we don't hold the lock across `.await`.
         let drained: Vec<Arc<EntryState>> = self.entries.lock().drain().map(|(_, v)| v).collect();
+        let mut closing = Vec::with_capacity(drained.len());
         for state in drained {
             match &*state {
                 EntryState::Ready { shared, driver } => {
@@ -317,9 +362,8 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
                         conn.close();
                     }
                     shared.driver_waker.notify_one();
-                    let handle = driver.lock().take();
-                    if let Some(handle) = handle {
-                        let _ = handle.join().await;
+                    if let Some(handle) = driver.lock().take() {
+                        closing.push(Closing::Driver(handle));
                     }
                 }
                 EntryState::Pending(pending) => {
@@ -330,10 +374,12 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
                         }
                     }
                     pending.notify.notify_waiters();
-                    pending.cancel_and_wait().await;
+                    pending.request_cancel();
+                    closing.push(Closing::Dial(pending.handles()));
                 }
             }
         }
+        ClosingEntries(closing)
     }
 }
 
@@ -774,7 +820,7 @@ mod tests {
             ("logical".to_owned(), "physical".to_owned(), 0),
             Arc::new(EntryState::Pending(pending)),
         );
-        pool.close().await;
+        pool.begin_close().join().await;
         worker_task.await.expect("pending worker exits on cancel");
         let outcome = result
             .lock()

@@ -48,10 +48,15 @@
 //!
 //! ## Runtime-test-parity
 //!
-//! Four simulated initial-connect tests and two loopback redial tests live
-//! here; `magnetar-runtime-tokio/tests/connect_resilience.rs` carries six
-//! mirrors so `check-runtime-test-parity` stays 1:1
-//! (ADR-0024).
+//! Four simulated initial-connect tests, two loopback redial tests, two
+//! loopback connect-cancellation tests and one loopback failed-handshake test
+//! live here; `magnetar-runtime-tokio/tests/connect_resilience.rs` carries
+//! nine mirrors so `check-runtime-test-parity` stays 1:1
+//! (ADR-0024). The cancellation pair mirrors the tokio `Client::connect` /
+//! `Client::from_socket` pair; moonpool has no `from_socket`, so its second
+//! test cancels the unsupervised `connect_plain` entry beside the supervised
+//! one, and its failed-handshake test runs `connect_plain` where the tokio
+//! twin runs `from_socket`.
 
 #![allow(clippy::expect_used)]
 
@@ -787,4 +792,137 @@ async fn supervised_silent_handshakes_exhaust_attempt_budget() {
     );
     assert_eq!(observed, 2, "only the configured redials are permitted");
     assert!(closed.is_ok(), "client close must finish");
+}
+
+/// How long the peer of a cancelled connect may take to see the socket close. A healthy run
+/// answers in milliseconds: this bound firing IS the defect (a leaked driver keeps the socket
+/// open), it is not a timing assertion.
+const PEER_EOF_BOUND: Duration = Duration::from_secs(5);
+
+/// Cancel a connect that is parked on a handshake the broker never answers, and require the broker
+/// to see the connection close. The moonpool engine handshakes on the transport before it spawns
+/// the driver, so cancelling the connect drops the transport itself. Twin of the tokio
+/// `tokio_cancelled_connect_does_not_leak_its_driver`, where the driver is spawned first.
+async fn cancelled_connect_closes_the_socket(supervised: bool) {
+    let engine = MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address").to_string();
+    let connect_seen = Arc::new(tokio::sync::Notify::new());
+
+    let broker = {
+        let connect_seen = ToOwned::to_owned(&connect_seen);
+        tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.expect("accept");
+            let mut tmp = vec![0u8; 8 * 1024];
+            let mut announced = false;
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stream, &mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if !announced {
+                            announced = true;
+                            connect_seen.notify_one();
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // Default `operation_timeout`: the handshake bound must not be what ends the connect.
+    let config = ConnectionConfig::default();
+    assert!(
+        config.operation_timeout > PEER_EOF_BOUND,
+        "the handshake bound must outlast the EOF bound, or it could mask the leak",
+    );
+    let connect = async {
+        if supervised {
+            Client::connect_plain_supervised(&engine, &addr, config, None, None).await
+        } else {
+            Client::connect_plain(&engine, &addr, config).await
+        }
+    };
+    tokio::select! {
+        biased;
+        () = connect_seen.notified() => {}
+        outcome = connect => {
+            panic!("the broker never answers CONNECT, yet connect returned {:?}", outcome.map(|_| ()));
+        }
+    }
+    // The `connect` future was dropped by `select!` while parked on the handshake.
+
+    let closed = tokio::time::timeout(PEER_EOF_BOUND, broker).await;
+    assert!(
+        closed.is_ok(),
+        "the broker never saw the connection close within {PEER_EOF_BOUND:?} of the caller \
+         cancelling the connect",
+    );
+}
+
+/// Supervised entry (`Client::connect_plain_supervised`), the façade's bootstrap path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moonpool_cancelled_connect_does_not_leak_its_driver() {
+    cancelled_connect_closes_the_socket(true).await;
+}
+
+/// Unsupervised entry (`Client::connect_plain`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moonpool_cancelled_connect_plain_does_not_leak_its_driver() {
+    cancelled_connect_closes_the_socket(false).await;
+}
+
+/// Twin of the tokio `tokio_failed_from_socket_handshake_releases_its_driver`. The broker reads
+/// the CONNECT and never answers, a short `operation_timeout` fails `connect_plain` with the
+/// handshake bound's `TimedOut`, and the broker must then see the connection close. Moonpool
+/// handshakes on the transport before it spawns the driver, so the failed handshake drops the
+/// transport itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moonpool_failed_connect_plain_handshake_releases_its_socket() {
+    let engine = MoonpoolEngine::new(moonpool_core::TokioProviders::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address").to_string();
+    let broker = tokio::spawn(async move {
+        let (mut stream, _peer) = listener.accept().await.expect("accept");
+        let mut tmp = vec![0u8; 8 * 1024];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stream, &mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(200),
+        ..ConnectionConfig::default()
+    };
+    let outcome = tokio::time::timeout(
+        PEER_EOF_BOUND,
+        Client::connect_plain(&engine, &addr, config),
+    )
+    .await
+    .expect("the handshake bound must fail `connect_plain` well inside the test bound");
+    match outcome {
+        Ok(_) => panic!("the broker never answers CONNECT, yet connect_plain returned a client"),
+        Err(ClientError::Engine(EngineError::Io(io))) => assert_eq!(
+            io.kind(),
+            std::io::ErrorKind::TimedOut,
+            "a silent broker must fail the handshake with ErrorKind::TimedOut, got: {io}",
+        ),
+        Err(other) => panic!(
+            "expected the handshake bound's TimedOut ClientError::Engine(EngineError::Io), got: \
+             {other:?}"
+        ),
+    }
+
+    let closed = tokio::time::timeout(PEER_EOF_BOUND, broker).await;
+    assert!(
+        closed.is_ok(),
+        "the broker never saw the connection close within {PEER_EOF_BOUND:?} of `connect_plain` \
+         failing its handshake",
+    );
 }
