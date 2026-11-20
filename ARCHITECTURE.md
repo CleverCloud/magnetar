@@ -750,6 +750,7 @@ Until [ADR-0125](specs/adr/0125-deadline-on-a-pending-producer-open.md) every ge
 ### Supervised reconnect
 
 When `driver_loop_inner` returns (the socket errored or the peer closed), the outer `supervised_driver_loop` decides whether to retry.
+`driver_loop_inner` owns the transport (it takes it by value on both engines), so the socket is closed the moment it returns, before the supervisor's cooldown, backoff or dial: after an exit the client decided on its own (`TopicMigrated`, an unanswerable `AuthChallenge`, an undecodable frame, a write or handshake deadline) the peer is still alive, and a transport held in a local of the supervisor would keep the broker's connection, producers and consumers registered to a client that no longer reads for the whole redial delay.
 The supervisor:
 
 1. **Records the disconnect** via `Connection::mark_disconnected(now, wall_now)` so `Producer::last_disconnected_timestamp` and the consumer stats are correct.
@@ -774,6 +775,7 @@ The supervisor:
 The supervisor never retries past `ReconnectConfig::max_attempts`; on exhaustion it propagates the last `EngineError::Io` upward and the `Client` is closed.
 The give-up budget counts the FULL dial+handshake cycle, not just TCP-dial failures ([ADR-0061](specs/adr/0061-supervisor-give-up-counts-handshake-failures.md)): the `give_up_attempts` counter is hoisted OUTSIDE the outer supervisor loop and gated by the sans-io `SupervisorConfig::should_give_up(attempts)` helper, so a connection that dials successfully (TCP accept) but then fails the Pulsar handshake — the docker-proxy / LB storm where the backend is down — counts against `max_attempts` instead of resetting it.
 The counter resets to 0 only when `should_reset_backoff(socket_alive)` is true (a socket that survived `drop_grace`), the SAME stability gate the `Backoff` schedule resets on — so give-up-reset and backoff-reset share one definition of a stable reconnect.
+That socket lifetime is read the moment `driver_loop_inner` returns, before the anti-thrash cooldown sleeps: the cooldown is time the dead socket was not alive, and counting it would let every cooldown reset the schedule and the budget of an attach-then-drop storm.
 The default `max_attempts = None` keeps retrying forever (Java parity).
 On a successful dial the supervisor logs `"supervisor: TCP connected; handshaking"` at `info!`; the TRUE reconnect-success `info!` (`"supervisor: reconnected to broker; handshake complete, …"`) fires only after the handshake completes, so a TCP accept behind a down backend is never mislabelled as a reconnect.
 
@@ -813,6 +815,7 @@ Some broker conditions cause a different pathology: the broker **accepts** `Comm
 The observed trigger is post-restart bundle-ownership churn on `apachepulsar/pulsar:4.0.4` (Pulsar PR #14467 + #13428 + #12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer` race, amplified by the standalone-mode ZK session timeout).
 
 [`magnetar-proto::AntiThrashState`](crates/magnetar-proto/src/anti_thrash.rs) is a per-`Connection` bounded ring that records each re-attach outcome (`ReAttachOk { handle }`) and the TCP-drop deltas that follow within `drop_grace`.
+The ring holds one entry per re-attached handle, while the drop is connection-wide (one per socket loss), so a drop is paired with every open entry attached within `drop_within` of it; `N` therefore counts handle attaches, not sockets.
 When `N` re-attaches inside a sliding window of `M` are all followed by `TcpDropAfterReAttach`, the state emits `ConnectionEvent::AntiThrashCooldown { until }`; the supervisor honours it by sleeping until `until` before the next `Transport::connect`.
 The detector resets on any re-attach that survives `drop_grace`.
 

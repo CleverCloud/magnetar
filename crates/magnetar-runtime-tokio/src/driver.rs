@@ -993,11 +993,28 @@ async fn supervised_driver_loop(
     // syscall on plaintext TCP (the kernel buffer already pushes bytes onto the wire);
     // TLS keeps the flush because `tokio_rustls` buffers plaintext until `flush()` actually
     // emits an encrypted record.
+    //
+    // `driver_loop_inner` takes the socket BY VALUE (the moonpool twin does too), so the
+    // transport is closed at the instant the inner loop returns. An error exit the client
+    // decided on its own (`TopicMigrated`, an unanswerable `AuthChallenge`, a decode error, a
+    // write or handshake deadline) leaves the peer alive: a socket lent as `&mut` and kept in a
+    // local here would stay open, unread, through the anti-thrash cooldown, the backoff sleep
+    // and the dial below, and the broker would keep the connection, its producers and its
+    // consumers registered (and dispatching) to a client that no longer reads until
+    // `socket = new_socket` finally dropped the old one.
     let mut socket_alive_since = Instant::now();
     let mut flush_after_write = transport_needs_flush(&socket);
-    let mut last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
+    let mut last_inner_result = driver_loop_inner(&shared, socket, flush_after_write).await;
 
     loop {
+        // The previous socket's lifetime ends HERE, when `driver_loop_inner` returned. Read it
+        // before the anti-thrash cooldown below sleeps: that sleep (30 s by default, against a
+        // 500 ms `drop_grace`) is time the dead socket was not alive, and a lifetime measured
+        // after it would make a socket that died milliseconds after its re-attach read as
+        // stable, resetting the backoff schedule and the ADR-0061 give-up budget on every
+        // cooldown of an attach-then-drop storm.
+        let socket_lifetime = socket_alive_since.elapsed();
+
         // User-requested close beats reconnect — the state machine is in `Closing` /
         // `Closed`, so we propagate the inner result (Ok or Err) as-is. `Failed`
         // (transport drop, `mark_disconnected`) deliberately does NOT count: the
@@ -1081,7 +1098,7 @@ async fn supervised_driver_loop(
         if !shared
             .pending_rebuild
             .load(std::sync::atomic::Ordering::SeqCst)
-            && cfg.should_reset_backoff(socket_alive_since.elapsed())
+            && cfg.should_reset_backoff(socket_lifetime)
         {
             backoff.reset();
             give_up_attempts = 0;
@@ -1221,7 +1238,7 @@ async fn supervised_driver_loop(
         socket = new_socket;
         socket_alive_since = Instant::now();
         flush_after_write = transport_needs_flush(&socket);
-        last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
+        last_inner_result = driver_loop_inner(&shared, socket, flush_after_write).await;
     }
 }
 
@@ -1431,10 +1448,14 @@ impl PendingDriverWrite {
 /// - **Lock discipline**: every interaction with `magnetar_proto::Connection` happens inside a
 ///   `parking_lot::Mutex::lock()` critical section. Critical sections are short — they never
 ///   `.await`.
-/// - **Read/write split (ADR-0083)**: `socket: &mut S` is split ONCE, right at loop entry, via
-///   `tokio::io::split` — `&mut S` is itself `AsyncRead + AsyncWrite` when `S` is (tokio's own
-///   `impl<T: AsyncRead + Unpin + ?Sized> AsyncRead for &mut T`, ditto `AsyncWrite`), so this needs
-///   no restructuring the way the moonpool engine's `Transport` enum does (see
+/// - **Socket ownership**: `socket: S` is taken BY VALUE, as the moonpool engine's
+///   `driver_loop_inner` takes its `Transport<P>`, so the transport is dropped (the connection
+///   closed) the moment the loop returns, on every exit, not when the caller next replaces it. A
+///   caller that wants to keep the socket passes `&mut socket` — `&mut S` is itself `AsyncRead +
+///   AsyncWrite + Unpin` when `S` is — as the unit tests do.
+/// - **Read/write split (ADR-0083)**: `socket` is split ONCE, right at loop entry, via
+///   `tokio::io::split` — `S` is a single opaque `AsyncRead + AsyncWrite` value, so this needs no
+///   restructuring the way the moonpool engine's `Transport` enum does (see
 ///   `crate::transport::Transport::into_split` there for why TLS needs a shared adapter on that
 ///   side and not this one — `tokio_rustls::TlsStream` is already a single opaque `AsyncRead +
 ///   AsyncWrite` value here, with no user-visible internal buffer this driver needs to share across
@@ -1450,7 +1471,7 @@ impl PendingDriverWrite {
 ///   against `tokio::time::sleep_until(deadline)`. If no deadline is set, that arm is disabled.
 pub(crate) async fn driver_loop_inner<S>(
     shared: &Arc<ConnectionShared>,
-    socket: &mut S,
+    socket: S,
     flush_after_write: bool,
 ) -> Result<(), ClientError>
 where

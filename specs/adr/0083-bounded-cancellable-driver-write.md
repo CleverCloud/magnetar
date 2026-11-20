@@ -1,6 +1,6 @@
 # ADR-0083 — Bounded, cancellable, deadline-guarded driver write as a `select!` arm
 
-- **Status**: Accepted
+- **Status**: Accepted (amended 2026-11-20 — the tokio inner loop owns its socket)
 - **Date**: 2026-07-27
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, driver-loop, reliability, determinism
@@ -160,3 +160,17 @@ The other four layers ship in full: (b) `magnetar-runtime-tokio/src/driver.rs::t
 - [ADR-0003](0003-no-channels-rule.md) — the deadline signals expiry via `Result`/`Err`, not a new channel; `driver_waker` (`Notify`) is unchanged.
 - [ADR-0038](0038-split-connection-mutex.md) — the `parking_lot::Mutex` lock-ordering discipline `TlsShared`'s mutex follows (never held across `.await`).
 - Issue #370 — original report.
+
+## Amendment (2026-11-20): the tokio inner loop owns its socket
+
+Decision 2 describes the tokio `driver_loop_inner<S>` as taking `socket: &mut S` and splitting that borrow.
+It now takes `socket: S` by value, as the moonpool engine's takes its `Transport<P>`, and `tokio::io::split(socket)` at loop entry splits the owned socket.
+The split itself is unchanged: one split at loop entry, no wrapper type, no `Arc`, no lock, and TLS needs nothing extra on this engine.
+
+The borrow kept the transport alive in a local of `supervised_driver_loop` after the inner loop returned.
+After an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable `AuthChallenge`, an undecodable frame, a write or handshake deadline) the peer is still alive, so the abandoned socket stayed open and unread through the anti-thrash cooldown, the redial backoff and the dial, and the broker kept its connection, producers and consumers registered to a client that no longer read.
+Owning the socket closes it the moment the inner loop returns, on both engines.
+A caller that must keep the socket still passes `&mut socket`, which is `AsyncRead + AsyncWrite + Unpin` when the socket is, as the driver unit tests do.
+
+Layers (ADR-0024): a tokio and a moonpool integration twin (`abandoned_socket_is_closed_before_the_redial_backoff`) and a `magnetar-differential` scenario (`tokio_and_moonpool_drivers_close_an_abandoned_socket_before_the_redial_backoff`).
+No `magnetar-proto` state machine changed, so layer (a) is absent for the same reason as above.

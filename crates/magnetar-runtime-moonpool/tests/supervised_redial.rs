@@ -821,6 +821,476 @@ fn close_during_redial_dial_is_not_erased_by_reset() {
     );
 }
 
+// -- The anti-thrash cooldown sleep is not socket lifetime -------------------
+
+/// Reconnect budget of the storm test below (`SupervisorConfig::max_attempts`).
+const STORM_MAX_ATTEMPTS: u32 = 3;
+
+/// The bootstrap session plus one session per redial the budget allows.
+const STORM_SESSION_BUDGET: u32 = STORM_MAX_ATTEMPTS + 1;
+
+/// Virtual-time bound on the driver giving up. The correct behaviour needs a
+/// few simulated seconds (one cooldown per redial); the bug never gives up.
+const GIVE_UP_BOUND: Duration = Duration::from_mins(2);
+
+/// How far the storm client got.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StormStage {
+    /// Nothing observed yet.
+    #[default]
+    Started,
+    /// The producer opened on the bootstrap session and the driver handle was taken.
+    ProducerOpened,
+    /// The workload reached its verdict: whether the supervised driver
+    /// terminated (gave up) before the broker saw more sessions than the
+    /// budget allows, and how many sessions the broker had accepted by then.
+    Judged { terminated: bool, accepted: u32 },
+}
+
+/// Client paired with [`DropAcceptCycleBroker`]: a supervisor that bounds its
+/// reconnect budget and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`. Holds one producer open so every redial
+/// re-attaches it and the broker drops the socket a few ms later.
+struct CooldownLifetimeClientWorkload {
+    /// Broker-side count of accepted connections.
+    sessions_accepted: Arc<Mutex<u32>>,
+    stage: Arc<Mutex<StormStage>>,
+}
+
+impl CooldownLifetimeClientWorkload {
+    fn new(sessions_accepted: Arc<Mutex<u32>>) -> Self {
+        Self {
+            sessions_accepted,
+            stage: Arc::new(Mutex::new(StormStage::default())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for CooldownLifetimeClientWorkload {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let broker_ip = ctx
+            .peer("broker")
+            .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
+        let addr = format!("{broker_ip}:{BROKER_PORT}");
+        let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(SupervisorConfig {
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(40),
+                mandatory_stop: Duration::from_mins(1),
+                max_attempts: Some(STORM_MAX_ATTEMPTS),
+                anti_thrash_threshold: Some(AntiThrashThreshold {
+                    successful_attaches: 2,
+                    window: Duration::from_mins(1),
+                    drop_within: Duration::from_millis(200),
+                }),
+                // A socket that dies within a few ms is far inside this grace;
+                // the cooldown below is far outside it.
+                drop_grace: Duration::from_millis(400),
+                max_backoff_after_thrash: Duration::from_secs(1),
+            }),
+            ..ConnectionConfig::default()
+        };
+
+        let Ok(Ok(client)) = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        // The producer the supervisor re-attaches on every redial: it has to
+        // stay open for the storm to continue.
+        let producer = time
+            .timeout(
+                Duration::from_secs(20),
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/sim-cooldown-is-not-lifetime".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let Ok(Ok(_producer)) = producer else {
+            return Ok(());
+        };
+        let Some(driver) = client.take_driver() else {
+            return Ok(());
+        };
+        *self.stage.lock() = StormStage::ProducerOpened;
+
+        // Wait for the driver to give up. Bail out as soon as the broker has
+        // seen more sessions than the budget allows: the supervisor is then
+        // redialling past `max_attempts` and waiting longer proves nothing.
+        let mut join = Box::pin(driver.join());
+        let mut terminated = false;
+        let mut waited = Duration::ZERO;
+        let slice = Duration::from_millis(100);
+        while waited < GIVE_UP_BOUND && *self.sessions_accepted.lock() <= STORM_SESSION_BUDGET {
+            if time.timeout(slice, &mut join).await.is_ok() {
+                terminated = true;
+                break;
+            }
+            waited += slice;
+        }
+        *self.stage.lock() = StormStage::Judged {
+            terminated,
+            accepted: *self.sessions_accepted.lock(),
+        };
+        Ok(())
+    }
+}
+
+/// An attach-then-drop storm against a supervisor that bounds its reconnect
+/// budget (`max_attempts`) and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`.
+///
+/// Every socket here dies a few milliseconds after its producer is acked, so
+/// none of them is "stable" (`should_reset_backoff` is false for a socket that
+/// lived less than `drop_grace`): the ADR-0061 give-up budget must keep
+/// counting across cycles and the driver must stop after `max_attempts`
+/// redials. The cooldown the detector arms sleeps for longer than
+/// `drop_grace`, though, and a supervisor that measures the dead socket's
+/// lifetime AFTER that sleep reads the cooldown as socket lifetime: it resets
+/// the backoff schedule and the give-up counter every cycle and redials for
+/// ever.
+#[test]
+fn anti_thrash_cooldown_sleep_is_not_counted_as_socket_lifetime() {
+    let broker = DropAcceptCycleBroker::new(5);
+    let client = CooldownLifetimeClientWorkload::new(broker.sessions_accepted.clone());
+    let stage = client.stage.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1])
+        .set_iterations(1)
+        .run();
+
+    let stage = *stage.lock();
+    let StormStage::Judged {
+        terminated,
+        accepted,
+    } = stage
+    else {
+        panic!(
+            "precondition: the producer opened on the bootstrap session and the storm was judged \
+             (stage={stage:?}, report={report:?})"
+        );
+    };
+    assert!(
+        terminated && accepted <= STORM_SESSION_BUDGET,
+        "the supervisor kept redialling an attach-then-drop storm past max_attempts = \
+         {STORM_MAX_ATTEMPTS}: driver terminated = {terminated} (must be true), broker sessions \
+         accepted = {accepted} (must be <= {STORM_SESSION_BUDGET}); the anti-thrash cooldown \
+         sleep was counted as socket lifetime and reset the give-up budget (report={report:?})"
+    );
+}
+
+// -- A socket the client abandons is closed before the redial delay ----------
+
+/// Backoff before the first redial. The schedule subtracts up to 20 % of it as jitter, so the
+/// redial cannot start earlier than 2.4 s after the socket was abandoned.
+const REDIAL_BACKOFF: Duration = Duration::from_secs(3);
+
+/// How soon after the client abandons a socket the broker must see it closed. Far below the
+/// redial delay: the socket has no reason to outlive the decision to abandon it.
+const ABANDONED_SOCKET_CLOSE_BOUND: Duration = Duration::from_secs(1);
+
+/// Virtual time the client workload stays alive after the producer opened: past the redial
+/// delay, so the red path (socket closed only when the redial replaces it) is observed too.
+const ABANDONED_SOCKET_OBSERVE: Duration = Duration::from_secs(10);
+
+/// What the broker saw of the bootstrap session, in virtual time since the simulation started.
+#[derive(Debug, Default, Clone, Copy)]
+struct AbandonedSocketWatch {
+    /// When the broker pushed `CommandTopicMigrated`.
+    pushed_at: Option<Duration>,
+    /// Time from the push to the broker reading EOF (or an error) on that same socket.
+    closed_after_push: Option<Duration>,
+    /// Connections accepted so far (the bootstrap socket plus every redial).
+    sessions: u32,
+}
+
+/// One broker session. Answers CONNECT / PING / LOOKUP / PRODUCER. On the bootstrap session
+/// (index 0) it pushes `CommandTopicMigrated` for the producer `push_delay` after acking it (no
+/// allow-list is configured, so the client abandons the socket and redials locally) and watches
+/// that socket until the client closes it.
+async fn handle_migrating_session<S, T>(
+    mut stream: S,
+    session: u32,
+    watch: Arc<Mutex<AbandonedSocketWatch>>,
+    push_delay: Duration,
+    time: T,
+) -> SimulationResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    T: TimeProvider,
+{
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    let mut producer_id: Option<u64> = None;
+    let mut pushed = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            match kind {
+                pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                pb::base_command::Type::Ping => emit_pong(&mut out_buf),
+                pb::base_command::Type::Lookup => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(&mut out_buf, l.request_id);
+                    }
+                }
+                pb::base_command::Type::Producer => {
+                    if let Some(p) = &frame.command.producer {
+                        emit_producer_success(&mut out_buf, p.request_id);
+                        producer_id = Some(p.producer_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out_buf.is_empty() {
+            if stream.write_all(&out_buf).await.is_err() {
+                return Ok(());
+            }
+            if stream.flush().await.is_err() {
+                return Ok(());
+            }
+            out_buf.clear();
+        }
+
+        if session == 0 && !pushed {
+            if let Some(producer_id) = producer_id {
+                let _ = time.sleep(push_delay).await;
+                let migrated = pb::BaseCommand {
+                    r#type: pb::base_command::Type::TopicMigrated as i32,
+                    topic_migrated: Some(pb::CommandTopicMigrated {
+                        resource_id: producer_id,
+                        resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+                        broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+                        broker_service_url_tls: None,
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(&mut out_buf, &migrated);
+                if stream.write_all(&out_buf).await.is_err() || stream.flush().await.is_err() {
+                    return Ok(());
+                }
+                out_buf.clear();
+                watch.lock().pushed_at = Some(time.now());
+                pushed = true;
+            }
+        }
+
+        match read_into(&mut stream, &mut read_buf).await {
+            Ok(0) | Err(_) => {
+                if session == 0 {
+                    let mut watch = watch.lock();
+                    if let Some(pushed_at) = watch.pushed_at {
+                        watch.closed_after_push = Some(time.now().saturating_sub(pushed_at));
+                    }
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Broker workload that numbers its sessions in accept order and watches the bootstrap one.
+struct MigratingSessionBroker {
+    watch: Arc<Mutex<AbandonedSocketWatch>>,
+}
+
+impl MigratingSessionBroker {
+    fn new() -> Self {
+        Self {
+            watch: Arc::new(Mutex::new(AbandonedSocketWatch::default())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for MigratingSessionBroker {
+    fn name(&self) -> &str {
+        "broker"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let network = ctx.network().clone();
+        let bind_addr = format!("{}:{BROKER_PORT}", ctx.my_ip());
+        let listener = network
+            .bind(&bind_addr)
+            .await
+            .map_err(|e| SimulationError::InvalidState(format!("broker bind: {e}")))?;
+
+        let shutdown = ctx.shutdown().clone();
+        let providers = ctx.providers().clone();
+        let task = ctx.providers().task().clone();
+        let mut next_session: u32 = 0;
+        loop {
+            moonpool_sim::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                inbound = listener.accept() => {
+                    match inbound {
+                        Ok((stream, _peer)) => {
+                            let session = next_session;
+                            next_session += 1;
+                            self.watch.lock().sessions = next_session;
+                            let watch = self.watch.clone();
+                            let time = providers.time().clone();
+                            let _handle = task.spawn_task("migrating-session", async move {
+                                let _ = handle_migrating_session(
+                                    stream,
+                                    session,
+                                    watch,
+                                    Duration::from_millis(50),
+                                    time,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Client paired with [`MigratingSessionBroker`]: a supervised client whose first redial is
+/// [`REDIAL_BACKOFF`] away, holding one producer open until the broker pushes the migration.
+struct AbandonedSocketClientWorkload {
+    /// Set once the workload stayed alive for [`ABANDONED_SOCKET_OBSERVE`] after the producer
+    /// opened.
+    observed: Arc<Mutex<bool>>,
+}
+
+impl AbandonedSocketClientWorkload {
+    fn new() -> Self {
+        Self {
+            observed: Arc::new(Mutex::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for AbandonedSocketClientWorkload {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let broker_ip = ctx
+            .peer("broker")
+            .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
+        let addr = format!("{broker_ip}:{BROKER_PORT}");
+        let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(SupervisorConfig {
+                initial_backoff: REDIAL_BACKOFF,
+                max_backoff: REDIAL_BACKOFF,
+                ..SupervisorConfig::default()
+            }),
+            ..ConnectionConfig::default()
+        };
+
+        let Ok(Ok(client)) = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        let producer = time
+            .timeout(
+                Duration::from_secs(20),
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/sim-abandoned-socket".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let Ok(Ok(_producer)) = producer else {
+            return Ok(());
+        };
+
+        // The broker pushes the migration a few virtual milliseconds from now; stay alive past
+        // the redial delay so the socket's fate is decided either way.
+        let _ = time.sleep(ABANDONED_SOCKET_OBSERVE).await;
+        *self.observed.lock() = true;
+        Ok(())
+    }
+}
+
+/// A transport the driver abandoned on its own decision (here a `CommandTopicMigrated` with no
+/// allow-list) must be closed when the driver abandons it, not when the supervisor finally
+/// replaces it. The peer is still alive after such an exit, so a socket kept open through the
+/// redial delay leaves the broker's connection, producers and consumers registered, and
+/// dispatching, to a client that no longer reads.
+#[test]
+fn abandoned_socket_is_closed_before_the_redial_backoff() {
+    let broker = MigratingSessionBroker::new();
+    let watch = broker.watch.clone();
+    let client = AbandonedSocketClientWorkload::new();
+    let observed = client.observed.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1])
+        .set_iterations(1)
+        .run();
+
+    let observed = *observed.lock();
+    let watch = *watch.lock();
+    assert!(
+        observed && watch.pushed_at.is_some(),
+        "precondition: the producer opened, the broker pushed CommandTopicMigrated and the client \
+         stayed alive past the redial delay (observed={observed}, watch={watch:?}, \
+         report={report:?})"
+    );
+    assert!(
+        watch
+            .closed_after_push
+            .is_some_and(|d| d <= ABANDONED_SOCKET_CLOSE_BOUND),
+        "the driver abandoned the bootstrap socket on CommandTopicMigrated but the broker saw it \
+         closed after {:?} (must be within {ABANDONED_SOCKET_CLOSE_BOUND:?}; broker sessions \
+         accepted = {}): the supervisor holds the abandoned socket through its redial backoff of \
+         {REDIAL_BACKOFF:?} instead of closing it (report={report:?})",
+        watch.closed_after_push,
+        watch.sessions,
+    );
+}
+
 // Confirm the trait bounds compose — `MoonpoolEngine<SimProviders>` must be a
 // valid construction site. Compile-time-only.
 #[allow(dead_code)]

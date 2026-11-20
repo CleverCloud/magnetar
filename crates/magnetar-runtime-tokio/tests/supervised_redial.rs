@@ -509,3 +509,287 @@ async fn close_during_redial_dial_is_not_erased_by_reset() {
          re-attached on the replacement socket = {replayed_producers} (must be 0)"
     );
 }
+
+// -- The anti-thrash cooldown sleep is not socket lifetime -------------------
+
+/// An attach-then-drop storm against a supervisor that bounds its reconnect
+/// budget (`max_attempts`) and has the anti-thrash cooldown opted in, with a
+/// cooldown longer than `drop_grace`.
+///
+/// Every socket here dies a few milliseconds after its producer is acked, so
+/// none of them is "stable" (`should_reset_backoff` is false for a socket that
+/// lived less than `drop_grace`): the ADR-0061 give-up budget must keep
+/// counting across cycles and the driver must stop after `max_attempts`
+/// redials. The cooldown the detector arms sleeps for longer than
+/// `drop_grace`, though, and a supervisor that measures the dead socket's
+/// lifetime AFTER that sleep reads the cooldown as socket lifetime: it resets
+/// the backoff schedule and the give-up counter every cycle and redials for
+/// ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anti_thrash_cooldown_sleep_is_not_counted_as_socket_lifetime() {
+    const MAX_ATTEMPTS: u32 = 3;
+    // The bootstrap session plus one session per redial the budget allows.
+    const SESSION_BUDGET: u32 = MAX_ATTEMPTS + 1;
+
+    let (url, sessions_accepted, _drops_performed) = spawn_drop_accept_cycle_broker().await;
+
+    let cfg = ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            mandatory_stop: Duration::from_mins(1),
+            max_attempts: Some(MAX_ATTEMPTS),
+            anti_thrash_threshold: Some(AntiThrashThreshold {
+                successful_attaches: 2,
+                window: Duration::from_mins(1),
+                drop_within: Duration::from_millis(200),
+            }),
+            // A socket that dies within a few ms is far inside this grace; the
+            // cooldown below is far outside it.
+            drop_grace: Duration::from_millis(400),
+            max_backoff_after_thrash: Duration::from_secs(1),
+        }),
+        ..ConnectionConfig::default()
+    };
+
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok");
+
+    // The producer the supervisor re-attaches on every redial: it has to stay
+    // open for the storm to continue.
+    let _producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cooldown-is-not-lifetime".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("producer opens on the bootstrap session");
+
+    let driver = client
+        .take_driver()
+        .expect("a supervised client keeps its driver handle");
+    let joined = tokio::spawn(driver.join());
+
+    // Wait for the driver to give up. Bail out as soon as the broker has seen
+    // more sessions than the budget allows: the supervisor is then redialling
+    // past `max_attempts` and waiting longer proves nothing.
+    let started = tokio::time::Instant::now();
+    while !joined.is_finished()
+        && sessions_accepted.load(Ordering::SeqCst) <= SESSION_BUDGET
+        && started.elapsed() < HANG_GUARD
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let terminated = joined.is_finished();
+    let accepted = sessions_accepted.load(Ordering::SeqCst);
+    joined.abort();
+
+    assert!(
+        terminated && accepted <= SESSION_BUDGET,
+        "the supervisor kept redialling an attach-then-drop storm past max_attempts = \
+         {MAX_ATTEMPTS}: driver terminated = {terminated} (must be true), broker sessions \
+         accepted = {accepted} (must be <= {SESSION_BUDGET}); the anti-thrash cooldown sleep \
+         was counted as socket lifetime and reset the give-up budget"
+    );
+}
+
+// -- A socket the client abandons is closed before the redial delay -----------
+
+/// Backoff before the first redial. The schedule subtracts up to 20 % of it as jitter, so the
+/// redial cannot start earlier than 2.4 s after the socket was abandoned.
+const REDIAL_BACKOFF: Duration = Duration::from_secs(3);
+
+/// How soon after the client abandons a socket the broker must see it closed. Far below the
+/// redial delay, far above any loopback scheduling latency: the socket has no reason to outlive
+/// the decision to abandon it.
+const ABANDONED_SOCKET_CLOSE_BOUND: Duration = Duration::from_secs(1);
+
+/// What the broker saw of the bootstrap session, shared with the test.
+#[derive(Debug, Default)]
+struct AbandonedSocketWatch {
+    /// The test releases the broker's `CommandTopicMigrated` push.
+    push: Notify,
+    /// The instant the broker pushed it.
+    pushed_at: Mutex<Option<std::time::Instant>>,
+    /// Time from the push to the broker reading EOF (or an error) on that same socket.
+    closed_after_push: Mutex<Option<Duration>>,
+    /// Notified (permit kept) once `closed_after_push` is set.
+    closed: Notify,
+    /// Connections accepted so far (the bootstrap socket plus every redial).
+    sessions: AtomicU32,
+}
+
+/// One broker session. Answers CONNECT / PING / LOOKUP / PRODUCER. On the bootstrap session
+/// (index 0) it waits for the test to release the push after acking the producer, then sends
+/// `CommandTopicMigrated` for that producer (no allow-list is configured, so the client abandons
+/// the socket and redials locally) and watches that socket until the client closes it.
+async fn handle_migrating_session(
+    mut stream: tokio::net::TcpStream,
+    session: u32,
+    watch: Arc<AbandonedSocketWatch>,
+) -> std::io::Result<()> {
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    let mut producer_id: Option<u64> = None;
+    let mut pushed = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            match kind {
+                pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                pb::base_command::Type::Ping => emit_pong(&mut out_buf),
+                pb::base_command::Type::Lookup => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(&mut out_buf, l.request_id);
+                    }
+                }
+                pb::base_command::Type::Producer => {
+                    if let Some(p) = &frame.command.producer {
+                        emit_producer_success(&mut out_buf, p.request_id);
+                        producer_id = Some(p.producer_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out_buf.is_empty() {
+            stream.write_all(&out_buf).await?;
+            stream.flush().await?;
+            out_buf.clear();
+        }
+
+        if session == 0 && !pushed {
+            if let Some(producer_id) = producer_id {
+                watch.push.notified().await;
+                let migrated = pb::BaseCommand {
+                    r#type: pb::base_command::Type::TopicMigrated as i32,
+                    topic_migrated: Some(pb::CommandTopicMigrated {
+                        resource_id: producer_id,
+                        resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+                        broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+                        broker_service_url_tls: None,
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(&mut out_buf, &migrated);
+                stream.write_all(&out_buf).await?;
+                stream.flush().await?;
+                out_buf.clear();
+                let now = std::time::Instant::now();
+                *watch.pushed_at.lock() = Some(now);
+                pushed = true;
+            }
+        }
+
+        match stream.read_buf(&mut read_buf).await {
+            Ok(0) | Err(_) => {
+                let pushed_at = *watch.pushed_at.lock();
+                if session == 0 {
+                    if let Some(pushed_at) = pushed_at {
+                        *watch.closed_after_push.lock() = Some(pushed_at.elapsed());
+                        watch.closed.notify_one();
+                    }
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Broker that numbers its sessions in accept order and watches the bootstrap one.
+async fn spawn_migrating_broker(watch: Arc<AbandonedSocketWatch>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let session = watch.sessions.fetch_add(1, Ordering::SeqCst);
+            let watch = watch.clone();
+            tokio::spawn(async move {
+                let _ = handle_migrating_session(stream, session, watch).await;
+            });
+        }
+    });
+    format!("pulsar://{addr}")
+}
+
+/// A transport the driver abandoned on its own decision (here a `CommandTopicMigrated` with no
+/// allow-list) must be closed when the driver abandons it, not when the supervisor finally
+/// replaces it. The peer is still alive after such an exit, so a socket kept open through the
+/// redial delay leaves the broker's connection, producers and consumers registered, and
+/// dispatching, to a client that no longer reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_socket_is_closed_before_the_redial_backoff() {
+    let watch = Arc::new(AbandonedSocketWatch::default());
+    let url = spawn_migrating_broker(watch.clone()).await;
+
+    let cfg = ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: REDIAL_BACKOFF,
+            max_backoff: REDIAL_BACKOFF,
+            ..SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    };
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok");
+    let _producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/abandoned-socket".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("producer opens on the bootstrap session");
+
+    // The broker tells the client the topic migrated: the client abandons this socket.
+    watch.push.notify_one();
+    let closed_in_time =
+        tokio::time::timeout(ABANDONED_SOCKET_CLOSE_BOUND, watch.closed.notified())
+            .await
+            .is_ok();
+    let closed_after_push = *watch.closed_after_push.lock();
+    let sessions = watch.sessions.load(Ordering::SeqCst);
+    let pushed = watch.pushed_at.lock().is_some();
+
+    if let Some(driver) = client.take_driver() {
+        driver.abort();
+    }
+    drop(client);
+
+    assert!(
+        pushed,
+        "precondition: the broker pushed CommandTopicMigrated on the bootstrap session"
+    );
+    assert!(
+        closed_in_time,
+        "the driver abandoned the bootstrap socket on CommandTopicMigrated but the broker still \
+         saw it open {ABANDONED_SOCKET_CLOSE_BOUND:?} later (closed after {closed_after_push:?}, \
+         broker sessions accepted = {sessions}): the supervisor holds the abandoned socket \
+         through its redial backoff of {REDIAL_BACKOFF:?} instead of closing it"
+    );
+}
