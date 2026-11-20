@@ -977,6 +977,8 @@ Owns the transaction-coordinator client.
 Pulsar transactions use four opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SUBSCRIPTION_TO_TXN`, `END_TXN_*`) routed to the TC.
 `TxnClient` carries the `TxnId` registry and surfaces a Rust `Transaction` handle.
 The producer attaches `txn_id` to its publish via `OutgoingMessage::txn`, and the consumer attaches it to acks via `ack_with_txn` / `ack_cumulative_with_txn` / `ack_batch_with_txn`.
+A `new_txn`, `add_partition_to_txn` or `add_subscription_to_txn` request is correlated by its request id like a lookup: the runtimes await it through the cancellable request future, and the response arms record an outcome only for a request still pending, so a caller that gives up leaves nothing for the broker's late reply to land in; that reply still reaches `TxnClient`, which records a registration the broker performed ([ADR-0129](specs/adr/0129-bound-and-fast-fail-pip-31-transaction-requests.md)).
+`Connection::reset` retires the client's per-request entries of every transaction request of the ended session, pending at the reset or cancelled before it (`TxnClient::forget_all_requests`), since the dead session answers none of them; an `EndTxn` outcome is still retained across a reset so a retried commit or abort resumes the canonical request, and that resume never reads the `TxnClient` entry ([ADR-0138](specs/adr/0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)).
 
 [`crates/magnetar-proto/src/conn.rs`]: crates/magnetar-proto/src/conn.rs
 

@@ -1,6 +1,6 @@
 # ADR-0129 — Bound and fast-fail the PIP-31 transaction requests
 
-- **Status**: Accepted (extends [ADR-0059](0059-terminal-fast-fail-new-ops.md)'s entry-point guard list and [ADR-0080](0080-configurable-operation-retry-policy.md)'s operation-deadline scope to the transaction request family)
+- **Status**: Accepted (extends [ADR-0059](0059-terminal-fast-fail-new-ops.md)'s entry-point guard list and [ADR-0080](0080-configurable-operation-retry-policy.md)'s operation-deadline scope to the transaction request family) — the per-request `TxnClient` record of a request cancelled and never answered now lasts until its session ends, because `Connection::reset` retires it ([ADR-0138](0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)); everything else below remains binding.
 - **Date**: 2026-11-19
 - **Decider**: Florentin Dubois
 - **Tags**: transactions, resilience, timeouts, runtime, sans-io
