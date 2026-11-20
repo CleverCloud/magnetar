@@ -17,6 +17,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`commit_transaction` and `abort_transaction` no longer hang when the last admitted acknowledgement settles just before the end waiter's first poll** ([ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md)).
+  `prepare` read the gate's decision under the transaction entry's lock and released the lock before the end waiter's first poll took it again, and that first poll trusted the `Wait { pending }` it had been handed.
+  On a multi-thread executor the acknowledging task can settle in that gap: it drains `waiters` while the end waiter is not yet registered, admission is closed so no later settle can happen, and the first poll then parked a waker nothing would ever wake, until the caller cancelled the commit.
+  The first poll now asks the gate again under the lock it registers the waker under whenever the carried decision is a `Wait`; an `IssueCommit`, `IssueAbort` or `TransactionPoisoned` already reached under the lock is still taken as final.
 - **A push listener or a `TableView` no longer stops for good on one message that fails to decrypt or decompress** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
   `subscribe_with_listener`, the multi-topic, partitioned and pattern listeners, and the `TableView` drain read any `receive()` error as "the consumer is closed" and exited.
   `receive()` also resolves `Err` for a single message the consumer could not decrypt or decompress under the default `CryptoFailureAction::Fail`, while it stays open, so one such message closed a builder push consumer, left the healthy topics of a wrapper undrained, or froze a `TableView` while `is_connected()` stayed `true`.

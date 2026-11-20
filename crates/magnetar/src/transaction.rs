@@ -432,9 +432,24 @@ impl Future for EndWait {
     type Output = Result<EndPreparation, crate::scalable::StreamConsumerError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let initial_decision = self.decision.take();
+        let carried_decision = self.decision.take();
         let mut state = self.entry.state.lock();
-        let decision = initial_decision.unwrap_or_else(|| state.gate.decision());
+        let decision = match carried_decision {
+            // `prepare` already moved the gate to its `*Issued` state (or found it poisoned with
+            // nothing pending): the decision is final, and asking the gate again would not
+            // repeat it.
+            Some(
+                decision @ (magnetar_proto::TransactionDecision::IssueCommit
+                | magnetar_proto::TransactionDecision::IssueAbort
+                | magnetar_proto::TransactionDecision::TransactionPoisoned),
+            ) => decision,
+            // A `Wait` was computed under a hold of the entry lock that `prepare` released before
+            // this first poll, so an admitted acknowledgement may have settled since. It drained
+            // `waiters` while this future was not yet registered, admission is closed, and no
+            // later settle can happen: trusting the snapshot would park on a wake-up nobody
+            // sends. Re-evaluate under the lock the waker is registered under.
+            Some(magnetar_proto::TransactionDecision::Wait { .. }) | None => state.gate.decision(),
+        };
         match decision {
             magnetar_proto::TransactionDecision::Wait { pending } => {
                 debug_assert!(pending > 0, "a transaction wait must retain admitted work");
@@ -642,5 +657,121 @@ where
         }
         #[cfg(not(feature = "scalable-topics"))]
         result.map_err(|err| PulsarError::Other(format!("abort_transaction: {err}")))
+    }
+}
+
+#[cfg(all(test, feature = "scalable-topics"))]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Wake;
+
+    use super::*;
+
+    /// Participant that is never asked to finalize anything in this module's tests.
+    struct IdleParticipant;
+
+    impl TransactionParticipant for IdleParticipant {
+        fn transaction_outcome(
+            &self,
+            _txn_id: magnetar_proto::TxnId,
+            _outcome: crate::scalable::TransactionOutcome,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Waker that counts how often it is woken.
+    #[derive(Default)]
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `prepare` computes the gate decision under one hold of the entry lock and releases it
+    /// before the end waiter's first poll takes the lock again. An admitted acknowledgement may
+    /// settle in that gap (the acknowledging task runs on another worker of a multi-thread
+    /// executor), so the `Wait` carried into the first poll can already be stale: no admission is
+    /// left, none can be admitted any more, and nothing will ever wake the waker the first poll
+    /// registers. The first poll must therefore re-evaluate the gate under the lock instead of
+    /// trusting the carried `Wait`.
+    ///
+    /// The race is reproduced deterministically by performing, in order, the three steps the
+    /// threads would interleave: the decision under the lock, the settle, the first poll.
+    #[test]
+    fn end_wait_first_poll_does_not_trust_a_wait_a_settle_has_made_stale() {
+        let txn_id = magnetar_proto::TxnId::new(1, 1);
+        let coordinator = TransactionCoordinator::default();
+        coordinator.open(txn_id);
+        let participant: Arc<dyn TransactionParticipant> = Arc::new(IdleParticipant);
+        let admission = coordinator
+            .admit(
+                txn_id,
+                coordinator.next_participant_id(),
+                Arc::downgrade(&participant),
+            )
+            .expect("an open transaction admits an acknowledgement");
+        let entry = coordinator
+            .entry(txn_id)
+            .expect("the transaction was opened above");
+
+        // What `prepare` does under the entry lock before it releases it.
+        let carried = {
+            let mut state = entry.state.lock();
+            state.end_claimed = true;
+            state
+                .gate
+                .begin_commit()
+                .expect("an open transaction begins its commit")
+        };
+        assert_eq!(
+            carried,
+            magnetar_proto::TransactionDecision::Wait { pending: 1 },
+            "the decision carried out of the critical section waits for the one admitted ack",
+        );
+
+        // The acknowledgement settles in the gap: nobody is registered yet, so nobody is woken.
+        admission
+            .finish(true)
+            .expect("the admitted acknowledgement settles");
+        assert!(
+            coordinator
+                .admit(
+                    txn_id,
+                    coordinator.next_participant_id(),
+                    Arc::downgrade(&participant),
+                )
+                .is_err(),
+            "admission is closed, so no later settle can ever wake the waiter",
+        );
+
+        // The end waiter's first poll, with the decision `prepare` carried.
+        let wake_counter = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        let mut end_wait = Box::pin(EndWait {
+            entry: Arc::clone(&entry),
+            txn_id,
+            decision: Some(carried),
+            completed: false,
+        });
+        let polled = end_wait.as_mut().poll(&mut context);
+
+        assert!(
+            matches!(polled, Poll::Ready(Ok(_))),
+            "no admitted work is left, so the commit must be issuable on the first poll; got {} \
+             (gate state {:?}, {} wake-up(s) delivered, and none can follow)",
+            if polled.is_pending() {
+                "Pending"
+            } else {
+                "an error"
+            },
+            entry.state.lock().gate.state(),
+            wake_counter.0.load(Ordering::SeqCst),
+        );
     }
 }
