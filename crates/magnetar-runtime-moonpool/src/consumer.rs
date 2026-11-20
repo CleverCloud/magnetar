@@ -4340,6 +4340,39 @@ mod tests {
         );
     }
 
+    /// A `seek_*` future dropped after the connection processed the broker's rejection, but
+    /// before the future observed it, hands nothing over: the rejection already restored the
+    /// consumer, so no `CommandSubscribe` follows and the consumer keeps receiving.
+    #[tokio::test(flavor = "current_thread")]
+    async fn seek_future_dropped_after_its_rejection_hands_nothing_over() {
+        let (shared, handle, consumer) = established_seekable_consumer(
+            "persistent://public/default/seek-rejected-then-dropped",
+            3,
+        );
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let seek_request_id = staged_seek_request_id(&shared);
+
+        // The connection handles the rejection; the caller gives up before its future runs again.
+        feed_seek_reply(&shared, seek_request_id, true);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before it observes the rejection"
+        );
+        let (_, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            !subscribed,
+            "a seek the broker rejected leaves no re-attach for its dropped future to hand over"
+        );
+
+        feed_entries(&shared, handle, 1..2);
+        assert_eq!(receive_payloads(&consumer, 1).await, ["m1"]);
+    }
+
     fn handshake_complete_supervised_shared() -> Arc<ConnectionShared> {
         handshake_complete_shared_with_config(ConnectionConfig {
             supervisor: Some(magnetar_proto::SupervisorConfig::default()),
