@@ -34,6 +34,7 @@
 //! completion leaves un-popped messages in their per-topic consumer queues.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
@@ -71,6 +72,11 @@ struct Inner<C: ConsumerApi> {
     /// keeps ADR-0003 intact; it stores one permit so an add that races a wait is
     /// not lost.
     membership_changed: Arc<Notify>,
+    /// Round-robin cursor used by `receive`: the index, in the snapshot, of the child
+    /// to start the next sweep at (the one after the child that answered last). Mirrors
+    /// the cursor of [`crate::MultiTopicsConsumer`]; without it `select_all` always favours
+    /// child 0 and a child that keeps a backlog starves every later one.
+    cursor: AtomicUsize,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -237,10 +243,24 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// cancel-safe: dropping it leaves un-popped messages in their respective per-consumer
     /// queues.
     ///
+    /// The sweep is fair, with the same round-robin cursor as
+    /// [`crate::MultiTopicsConsumer::receive`]: it starts after the topic served last, so a
+    /// topic that keeps a backlog cannot starve the others. It does not stall on a dead
+    /// child either: a child that is terminal (closed, a terminal subscribe failure, or its
+    /// connection lost for good) resolves `Err` at once and forever, so it leaves the sweep and
+    /// the wait goes on over the remaining topics. Messages still queued on such a child are
+    /// delivered first. The failure is therefore invisible to this call as long as one topic
+    /// is live; poll [`PatternConsumer::is_connected`] to observe it. The terminal child stays
+    /// in the set, unserved, until the broker removes its topic ([`PatternConsumer::update`]
+    /// applies only the broker's topic-list deltas and does not re-create it).
+    ///
     /// # Errors
     ///
-    /// Returns [`PulsarError::Config`] if the consumer set is empty. Otherwise propagates the
-    /// first per-topic receive error.
+    /// Returns [`PulsarError::Config`] if the consumer set is empty. A child that fails on one
+    /// message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`) while it stays open returns that error, naming its topic;
+    /// the next call can succeed. Returns an error once every child of the snapshot is
+    /// terminal, naming the last one.
     pub async fn receive(&self) -> Result<PatternMessage, PulsarError> {
         // Snapshot the consumer set under the lock, then release before awaiting — holding the
         // mutex across an await would serialise receive against update.
@@ -256,17 +276,69 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 .consumer
                 .receive()
                 .await
-                .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
+                .map_err(|e| PulsarError::Other(format!("receive: {}: {e}", nc.topic)))?;
             return Ok(PatternMessage {
                 topic: nc.topic.clone(),
                 message: msg,
             });
         }
-        let futures: Vec<_> = snapshot.iter().map(|nc| nc.consumer.receive()).collect();
-        let (result, idx, _rest) = select_all(futures).await;
-        let topic = snapshot[idx].topic.clone();
-        let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
-        Ok(PatternMessage { topic, message })
+        // Rotate the snapshot by the round-robin cursor BEFORE building the futures: `select_all`
+        // returns the first ready future in input order, so without the rotation a child that
+        // always has a message ready starves every later child.
+        let len = snapshot.len();
+        let start = self.inner.cursor.load(Ordering::Relaxed) % len;
+        // Children whose `receive()` resolved `Err` while terminal. Such a child resolves `Err`
+        // on its first poll, forever, so left in the sweep it would win every round and hide
+        // every sibling behind it. Only an `Err` is ever discarded here: an `Ok` has already
+        // popped its message and returns in the iteration that produced it.
+        let mut terminal = vec![false; len];
+        loop {
+            // `rotated_indices[i]` is the snapshot index of the i-th future `select_all` sees,
+            // in sweep order, so a winning result maps back to the right topic. It is rebuilt
+            // each round rather than patched after `select_all`, which documents no order for
+            // the futures it hands back.
+            let rotated_indices: Vec<usize> = (0..len)
+                .map(|i| (start + i) % len)
+                .filter(|&i| !terminal[i])
+                .collect();
+            let futures: Vec<_> = rotated_indices
+                .iter()
+                .map(|&i| snapshot[i].consumer.receive())
+                .collect();
+            let (result, rotated_idx, _rest) = select_all(futures).await;
+            let original_idx = rotated_indices[rotated_idx];
+            let nc = &snapshot[original_idx];
+            let err = match result {
+                Ok(message) => {
+                    // Advance the cursor past the child we just served so the next `receive()`
+                    // starts the sweep at the child *after* this one.
+                    self.inner
+                        .cursor
+                        .store((original_idx + 1) % len, Ordering::Relaxed);
+                    return Ok(PatternMessage {
+                        topic: nc.topic.clone(),
+                        message,
+                    });
+                }
+                Err(err) => err,
+            };
+            if !ConsumerApi::is_terminal(&nc.consumer) {
+                // An error about one message: the child is still open and its next `receive()`
+                // can succeed. Move the cursor past it as for a message, so a child that keeps
+                // failing cannot hold the sweep either.
+                self.inner
+                    .cursor
+                    .store((original_idx + 1) % len, Ordering::Relaxed);
+                return Err(PulsarError::Other(format!("receive: {}: {err}", nc.topic)));
+            }
+            terminal[original_idx] = true;
+            if terminal.iter().all(|&done| done) {
+                return Err(PulsarError::Other(format!(
+                    "receive: every matched topic is terminal, last error on {}: {err}",
+                    nc.topic
+                )));
+            }
+        }
     }
 
     /// Acknowledge a message. The caller supplies the topic the message came from
@@ -510,11 +582,14 @@ where
         // Clone the snapshot and release the set's mutex before asking the children: each
         // `ConsumerApi::is_terminal` takes the global Connection mutex (ADR-0038 order), and a
         // child the wrapper has already removed is not in the snapshot, so closing it on
-        // purpose never reads as a terminal wrapper.
+        // purpose never reads as a terminal wrapper. `receive()` skips a terminal child and
+        // keeps serving the live ones, so the wrapper can fail for good only once every child is
+        // terminal; an empty set is not terminal (the poller parks on `membership_changed`).
         let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
-        snapshot
-            .iter()
-            .any(|nc| ConsumerApi::is_terminal(&nc.consumer))
+        !snapshot.is_empty()
+            && snapshot
+                .iter()
+                .all(|nc| ConsumerApi::is_terminal(&nc.consumer))
     }
 
     async fn membership_changed(&self) {
@@ -946,6 +1021,7 @@ where
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(opened)),
                 membership_changed: Arc::new(Notify::new()),
+                cursor: AtomicUsize::new(0),
                 namespace,
                 pattern,
                 template,
@@ -967,8 +1043,9 @@ where
     ///
     /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
     /// sequential, in-order delivery, no auto-ack (the callback acks via
-    /// [`PatternConsumer::ack`]), clean shutdown once a child is terminal / on handle
-    /// drop (an error on one message, or on a child `update()` removed, is skipped). **Pattern
+    /// [`PatternConsumer::ack`]), clean shutdown once every child is terminal / on handle
+    /// drop (a terminal child among live ones is skipped, see [`PatternConsumer::receive`],
+    /// and so is an error on one message). **Pattern
     /// children discovered after subscribe inherit the listener** —
     /// call [`PatternConsumer::update`] (or
     /// [`PatternConsumer::start_auto_reconcile`]) to subscribe newly-matched
@@ -1060,6 +1137,7 @@ mod tests {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(Vec::new())),
                 membership_changed: Arc::new(tokio::sync::Notify::new()),
+                cursor: std::sync::atomic::AtomicUsize::new(0),
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,

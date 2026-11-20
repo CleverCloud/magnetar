@@ -140,7 +140,7 @@ The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` backgr
 It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
 Delivery is sequential and in order, and the callback acks explicitly (the poller never auto-acks).
 An explicit or terminal remote close ends the task when `receive()` returns an error.
-An error about one message (a decrypt or decompress failure under the default `CryptoFailureAction::Fail`) does not: the poller, the wrapper poller and the `TableView` drain key their exit on `ConsumerApi::is_terminal` / `WrapperReceiver::is_terminal`, the gate `receive()` itself uses, and otherwise log the error at `debug!`, leave the message unacked and read the next one ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+An error about one message (a decrypt or decompress failure under the default `CryptoFailureAction::Fail`) does not: the poller, the wrapper poller and the `TableView` drain key their exit on `ConsumerApi::is_terminal` / `WrapperReceiver::is_terminal` (for a wrapper, true once every child is terminal), the gate `receive()` itself uses, and otherwise log the error at `debug!`, leave the message unacked and read the next one ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
 Dropping the returned `MessageListenerHandle` instead aborts the poller and drops its owned consumer clone; only the final clone stages the best-effort close.
 
 The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
@@ -1285,6 +1285,12 @@ The receive race is _not_ a channel — it is a `futures_util::future::select_al
             └─────────────────────────┘         on their Connection's Waker slab.
 ```
 
+The sweep is fair and survives a dead child, in both wrappers.
+It starts after the child that answered last (a round-robin cursor per wrapper), because `select_all` returns the first ready future in input order and a child that keeps a backlog would otherwise starve every later one.
+A child that is terminal (closed, a terminal subscribe failure, or its connection lost for good) resolves `receive()` with `Err(Closed)` on its first poll, forever, so it would win every round in which no earlier child is ready and hide the live ones.
+`receive()` therefore asks `ConsumerApi::is_terminal` about a child only when that child's future resolves `Err`: a terminal child leaves the sweep, after its queued messages were delivered, and the wait goes on over the rest; a failure on one message of a child that stays open is returned instead, naming its topic, and the cursor moves past it.
+Only when every child of the snapshot is terminal does `receive()` fail, naming the last one.
+A terminal child among live ones is thus invisible to a pull caller; `is_connected()` reports it.
 Per-topic ack / nack / seek dispatch via the topic name attached to the incoming message.
 Aggregate DLQ republish is the deliberate exception to per-topic routing: the caller supplies one producer destination shared by all children.
 The coordinator clones the `Arc<Vec<NamedConsumer<C>>>` membership snapshot under the collection mutex and releases the guard before awaiting, so the traversed list and order are fixed and no collection lock spans child I/O.

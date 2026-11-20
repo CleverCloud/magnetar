@@ -23,7 +23,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The loops now end only when the consumer is terminal, and otherwise log the error at `debug!`, leave the message unacked and read the next one.
 - **`remove_topic` and a pattern removal no longer end push delivery for the topics that remain.**
   The child the wrapper had just closed resolved `Err(Closed)` under the parked poller, and the poller read it as the whole consumer closing.
-  A child that becomes terminal while it stays in the wrapper's set still ends the wrapper push consumer, as before; skipping it belongs to the wedge in the pull `receive()`.
+- **`MultiTopicsConsumer::receive` and `PatternConsumer::receive` no longer get stuck on one terminal child** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  A child that is terminal (closed, a terminal subscribe failure, or its connection lost for good) resolves `receive()` with an error on its first poll, forever, so it won every round in which no earlier child had a message.
+  `MultiTopicsConsumer` advanced its cursor only on success, so once a sweep started at that child every call returned its nameless error and the live topics were unreachable; `PatternConsumer` had no cursor, so a terminal child hid every child after it.
+  The sweep now leaves a terminal child out once its queued messages are delivered and keeps waiting on the live ones, so a terminal child among live ones is invisible to a pull caller (`is_connected()` still reports it) and a topic removed under a parked `receive()` no longer surfaces as an error.
+  `receive()` fails only once every child is terminal, and an error from a wrapper now names its topic (`receive: {topic}: {error}`, `PulsarError::Other`).
+  `WrapperReceiver::is_terminal` of both wrappers is therefore "every child", not "some child", so a push listener keeps delivering the live topics when a sibling dies.
+- **`PatternConsumer::receive` no longer starves its later children behind a busy first one.**
+  It handed `select_all` the children in snapshot order, which returns the first ready future in input order, so while child 0 had a backlog children 1..n were never polled: their receiver queues filled, no refill credit went out, and their topics stalled until child 0 ran dry, and so did its push poller.
+  `MultiTopicsConsumer::receive` has had the round-robin cursor that fixes this since `9347c39`; the pattern consumer now carries it too.
 
 ## [2.0.0] - 2026-11-19
 

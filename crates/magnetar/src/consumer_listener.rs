@@ -290,12 +290,12 @@ pub type WrapperMessageListener = Arc<dyn Fn(&str, &IncomingMessage) + Send + Sy
 /// [`tokio::spawn`]ed task (the wrapper consumers are cheap `Arc`-clones).
 pub trait WrapperReceiver: Clone + Send + Sync + 'static {
     /// Receive the next message across the wrapper's current child set, returning
-    /// the originating topic and the message. An `Err` is the first failing child's
-    /// error, so by itself it says nothing about the wrapper: it can concern one
-    /// message, a child the wrapper has just removed, or a child that is terminal. The
-    /// poller breaks for a clean shutdown only when [`Self::is_terminal`] also holds. On an
-    /// empty set the wrapper `receive()` errors immediately; the poller does not treat
-    /// that as terminal (see [`Self::is_empty`]) — it parks on [`Self::membership_changed`].
+    /// the originating topic and the message. An `Err` names a topic and says nothing about the
+    /// wrapper as a whole: it can concern one message of one child, or (once no child is left to
+    /// wait on) the last terminal child. The poller breaks for a clean shutdown only when
+    /// [`Self::is_terminal`] also holds. On an empty set the wrapper `receive()` errors
+    /// immediately; the poller does not treat that as terminal (see [`Self::is_empty`]) — it
+    /// parks on [`Self::membership_changed`].
     fn wrapper_receive(
         &self,
     ) -> impl Future<Output = Result<(String, magnetar_proto::IncomingMessage), PulsarError>> + Send;
@@ -305,13 +305,15 @@ pub trait WrapperReceiver: Clone + Send + Sync + 'static {
     /// [`Self::membership_changed`] rather than spinning on the empty-set error.
     fn is_empty(&self) -> bool;
 
-    /// `true` when a child consumer of the *current* set can no longer deliver, so a
+    /// `true` when every child consumer of the *current* set can no longer deliver, so a
     /// failed [`Self::wrapper_receive`] will fail the same way again instead of
     /// moving on to the next message. The poller breaks only on this; any other
     /// `Err` is skipped and the poller re-snapshots the children and keeps
-    /// receiving. A child the wrapper has already removed from the set does not
-    /// count, which is what keeps `remove_topic` (or a pattern removal) from ending
-    /// delivery for the surviving children, and an empty set is not terminal.
+    /// receiving. One terminal child among live ones is not terminal: `wrapper_receive` leaves
+    /// it out of its sweep and keeps serving the live ones. A child the wrapper has already
+    /// removed from the set does not count either, which is what keeps `remove_topic` (or a
+    /// pattern removal) from ending delivery for the surviving children, and an empty set is
+    /// not terminal.
     ///
     /// The default is `false` ("never terminal"): an implementation whose
     /// `wrapper_receive` can fail for good must override it, or the poller retries
@@ -457,8 +459,9 @@ pub fn spawn_consumer_event_listener<C: crate::ConsumerApi + Clone>(
 /// extra lock (ADR-0038), no host-clock read (ADR-0011) — and breaks the first
 /// time `wrapper_receive()` errors while [`WrapperReceiver::is_terminal`] holds for
 /// clean, panic-free shutdown. Any other error (one message that failed to
-/// decrypt or decompress, or a child the wrapper has just removed) is logged and
-/// skipped: the poller re-snapshots the child set and keeps receiving.
+/// decrypt or decompress, or a snapshot whose children the wrapper has all just removed) is
+/// logged and skipped: the poller re-snapshots the child set and keeps receiving. A terminal
+/// child among live ones raises no error at all: `wrapper_receive` leaves it out of its sweep.
 ///
 /// Children discovered after subscribe (pattern `TopicListChanged` deltas,
 /// partition growth) inherit the listener: each iteration the poller races its
@@ -490,12 +493,12 @@ pub fn spawn_wrapper_message_listener<R: WrapperReceiver>(
             };
             let (topic, msg) = match outcome {
                 Ok(delivery) => delivery,
-                // A child of the current set is terminal: stop cleanly. (An
+                // Every child of the current set is terminal: stop cleanly. (An
                 // empty-set error is handled above and never reaches here.)
                 Err(_) if receiver.is_terminal() => break,
-                // One message failed, or a child the wrapper itself removed
-                // closed under the parked receive: the set is still live, so
-                // re-snapshot it and receive again.
+                // One message failed, or every child of the snapshot was removed
+                // by the wrapper itself and closed under the parked receive: the
+                // set is still live, so re-snapshot it and receive again.
                 Err(err) => {
                     tracing::debug!(
                         target: "magnetar::consumer_listener",

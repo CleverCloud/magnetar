@@ -406,6 +406,22 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Receive the next message across any subscribed topic. The future is cancel-safe:
     /// dropping it without polling to completion leaves all unpopped messages in their
     /// respective per-consumer queues.
+    ///
+    /// The sweep is fair (it starts after the topic served last, so a topic that is always
+    /// ready cannot starve the others) and it does not stall on a dead child: a child that
+    /// is terminal (closed, a terminal subscribe failure, or its connection lost for good)
+    /// resolves `Err` at once and forever, so it leaves the sweep and the wait goes on over
+    /// the remaining topics. Messages still queued on such a child are delivered first. The
+    /// failure is therefore invisible to this call as long as one topic is live; poll
+    /// [`MultiTopicsConsumer::is_connected`] to observe it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Config`] if the consumer set is empty. A child that fails on one
+    /// message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`) while it stays open returns that error, naming its topic;
+    /// the next call can succeed. Returns an error once every child of the snapshot is
+    /// terminal, naming the last one.
     pub async fn receive(&self) -> Result<MultiTopicsMessage, PulsarError> {
         // Snapshot the consumer set under the lock and release before awaiting — holding
         // the mutex across an await would serialise receive against add_topic /
@@ -422,7 +438,7 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
                 .consumer
                 .receive()
                 .await
-                .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
+                .map_err(|e| PulsarError::Other(format!("receive: {}: {e}", nc.topic)))?;
             self.inner.cursor.store(0, Ordering::Relaxed);
             return Ok(MultiTopicsMessage {
                 topic: nc.topic.clone(),
@@ -440,25 +456,58 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         // `MultiTopicsConsumerImpl#internalReceiveAsync` round-robin.
         let len = snapshot.len();
         let start = self.inner.cursor.load(Ordering::Relaxed) % len;
-        // `rotated_indices[i] = (start + i) % len` — the order in which
-        // `select_all` sees the per-topic futures. We track both the
-        // futures and the original snapshot indices so a winning result
-        // maps back to the right topic in `snapshot`.
-        let rotated_indices: Vec<usize> = (0..len).map(|i| (start + i) % len).collect();
-        let futures: Vec<_> = rotated_indices
-            .iter()
-            .map(|&i| snapshot[i].consumer.receive())
-            .collect();
-        let (result, rotated_idx, _rest) = select_all(futures).await;
-        let original_idx = rotated_indices[rotated_idx];
-        let topic = snapshot[original_idx].topic.clone();
-        let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
-        // Advance the cursor past the topic we just served so the next
-        // `receive()` starts the sweep at the topic *after* this one.
-        self.inner
-            .cursor
-            .store((original_idx + 1) % len, Ordering::Relaxed);
-        Ok(MultiTopicsMessage { topic, message })
+        // Children whose `receive()` resolved `Err` while terminal. Such a child resolves
+        // `Err` on its first poll, forever, so left in the sweep it would win every round and
+        // hide every sibling behind it. Only an `Err` is ever discarded here: an `Ok` has
+        // already popped its message and returns in the iteration that produced it.
+        let mut terminal = vec![false; len];
+        loop {
+            // `rotated_indices[i]` is the snapshot index of the i-th future `select_all` sees,
+            // in sweep order, so a winning result maps back to the right topic. It is rebuilt
+            // each round rather than patched after `select_all`, which documents no order
+            // for the futures it hands back.
+            let rotated_indices: Vec<usize> = (0..len)
+                .map(|i| (start + i) % len)
+                .filter(|&i| !terminal[i])
+                .collect();
+            let futures: Vec<_> = rotated_indices
+                .iter()
+                .map(|&i| snapshot[i].consumer.receive())
+                .collect();
+            let (result, rotated_idx, _rest) = select_all(futures).await;
+            let original_idx = rotated_indices[rotated_idx];
+            let nc = &snapshot[original_idx];
+            let err = match result {
+                Ok(message) => {
+                    // Advance the cursor past the topic we just served so the next
+                    // `receive()` starts the sweep at the topic *after* this one.
+                    self.inner
+                        .cursor
+                        .store((original_idx + 1) % len, Ordering::Relaxed);
+                    return Ok(MultiTopicsMessage {
+                        topic: nc.topic.clone(),
+                        message,
+                    });
+                }
+                Err(err) => err,
+            };
+            if !ConsumerApi::is_terminal(&nc.consumer) {
+                // An error about one message: the child is still open and its next
+                // `receive()` can succeed. Move the cursor past it as for a message, so a
+                // child that keeps failing cannot hold the sweep either.
+                self.inner
+                    .cursor
+                    .store((original_idx + 1) % len, Ordering::Relaxed);
+                return Err(PulsarError::Other(format!("receive: {}: {err}", nc.topic)));
+            }
+            terminal[original_idx] = true;
+            if terminal.iter().all(|&done| done) {
+                return Err(PulsarError::Other(format!(
+                    "receive: every subscribed topic is terminal, last error on {}: {err}",
+                    nc.topic
+                )));
+            }
+        }
     }
 
     /// Acknowledge a message. The caller supplies the topic the message came from (returned
@@ -876,11 +925,14 @@ where
         // Clone the snapshot and release the set's mutex before asking the children: each
         // `ConsumerApi::is_terminal` takes the global Connection mutex (ADR-0038 order), and a
         // child the wrapper has already removed is not in the snapshot, so closing it on
-        // purpose never reads as a terminal wrapper.
+        // purpose never reads as a terminal wrapper. `receive()` skips a terminal child and
+        // keeps serving the live ones, so the wrapper can fail for good only once every child is
+        // terminal; an empty set is not terminal (the poller parks on `membership_changed`).
         let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
-        snapshot
-            .iter()
-            .any(|nc| ConsumerApi::is_terminal(&nc.consumer))
+        !snapshot.is_empty()
+            && snapshot
+                .iter()
+                .all(|nc| ConsumerApi::is_terminal(&nc.consumer))
     }
 
     async fn membership_changed(&self) {
@@ -1422,10 +1474,11 @@ where
     /// The poller delivers messages sequentially and in order across every
     /// subscribed topic, handing the callback the originating topic and message,
     /// and does **not** auto-ack (the callback acks explicitly via
-    /// [`MultiTopicsConsumer::ack`]). It stops cleanly when a child consumer is
+    /// [`MultiTopicsConsumer::ack`]). It stops cleanly once every child consumer is
     /// terminal (closed, or its connection lost for good) or the returned handle is
-    /// dropped; an error on one message, or on a child `remove_topic` just removed, is
-    /// skipped. Topics added later (via
+    /// dropped; a terminal child among live ones is skipped (see
+    /// [`MultiTopicsConsumer::receive`]), and so is an error on one message. Topics added
+    /// later (via
     /// [`MultiTopicsConsumer::add_topic`]) are picked up automatically.
     ///
     /// Because the consumer is moved into the poller, there is no handle left to
