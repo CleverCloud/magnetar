@@ -602,6 +602,13 @@ enum PendingRequestKind {
     ConsumerSeek {
         handle: ConsumerHandle,
     },
+    /// A seek whose awaiting future was dropped before the reply
+    /// ([`Connection::abandon_consumer_seek_waiter`]): nobody will drain an outcome, and
+    /// nobody is left to run the post-seek re-attach, so the reply arms consume it in
+    /// place, like [`Self::ConsumerCloseForgotten`].
+    ConsumerSeekForgotten {
+        handle: ConsumerHandle,
+    },
     ConsumerUnsubscribe {
         handle: ConsumerHandle,
     },
@@ -1075,7 +1082,8 @@ impl Connection {
     ///
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
-    ///    round-trip, …). The corresponding user futures are woken with that outcome.
+    ///    round-trip, …). The corresponding user futures are woken with that outcome. A forgotten
+    ///    seek ([`Self::abandon_consumer_seek_waiter`]) has no future and is dropped without one.
     /// 3. Snapshot every replayable in-flight producer publish into `in_flight_publish_snapshots`
     ///    (key = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
     ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
@@ -1134,6 +1142,7 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
+                    | PendingRequestKind::ConsumerSeekForgotten { .. }
                     | PendingRequestKind::Ack {
                         has_waiter: false,
                         ..
@@ -1246,6 +1255,8 @@ impl Connection {
                 consumer.canonical_nack_ids.clear();
             }
             consumer.pending_seek = None;
+            consumer.seek_rollback = None;
+            consumer.seek_reattach_owed = None;
             consumer.granted_permits = 0;
             consumer.permit_balance = 0;
             consumer.consumed_since_flow = 0;
@@ -1405,6 +1416,7 @@ impl Connection {
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
                     | PendingRequestKind::ConsumerCloseForReattach { .. }
+                    | PendingRequestKind::ConsumerSeekForgotten { .. }
                     | PendingRequestKind::Ack {
                         has_waiter: false,
                         ..
@@ -2272,6 +2284,23 @@ impl Connection {
     /// messages are post-seek and the user wants them. `begin_seek`
     /// already cleared pre-seek messages at seek-issue time.
     pub fn resubscribe_consumer_after_seek(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        self.emit_post_seek_resubscribe(handle, SubscribeAckAction::NotifyWaiter)
+    }
+
+    /// The shared emit half of the post-seek re-attach: the awaiting seek future's
+    /// ([`Self::resubscribe_consumer_after_seek`], `NotifyWaiter`) and the connection's own
+    /// ([`Self::reattach_after_unowned_seek`], `ReleaseFlow`) differ only in who releases the
+    /// initial flow on the re-subscribe's `Success`.
+    fn emit_post_seek_resubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        ack_action: SubscribeAckAction,
+    ) -> Option<RequestId> {
+        // The re-attach is being emitted — or refused for good below — either way nobody
+        // is owed it any more (`ConsumerState::seek_reattach_owed`).
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().seek_reattach_owed = None;
+        }
         let req = self.consumer_subscribe_requests.get(&handle)?.clone();
         // `consumer.closed` is no longer flipped by `handle_close_consumer`
         // (see the comment block in `CloseConsumer` branch above), so we
@@ -2306,9 +2335,160 @@ impl Connection {
         // post-seek backlog. This was #67's root cause — the broker
         // confirmed `backlog 10` after the cursor reset, but no message ever
         // arrived because the permits were dropped on the floor.
-        let request_id =
-            self.emit_command_subscribe(handle, &req, None, SubscribeAckAction::NotifyWaiter);
+        let request_id = self.emit_command_subscribe(handle, &req, None, ack_action);
         Some(request_id)
+    }
+
+    /// Re-attach a consumer after a seek reply nobody is left to act on, and defer its
+    /// initial `CommandFlow` to the re-subscribe's `Success` (`ReleaseFlow`).
+    ///
+    /// `rejected == false` is a seek the broker applied: it dropped the consumer on the way
+    /// ([`Self::resubscribe_consumer_after_seek`] documents why), so the consumer re-subscribes
+    /// from the cursor the seek just set. `rejected == true` is a consumer
+    /// [`crate::consumer::ConsumerState::seek_rejected`] found torn down mid-seek: the cursor is
+    /// unchanged, so it re-attaches exactly like the same-broker `CommandCloseConsumer` arm.
+    ///
+    /// Unlike the awaiting future's continuation this does not follow the `Success` with
+    /// `redeliver_unacked_all`, the same shape the phase-2 hand-off
+    /// ([`Self::abandon_consumer_subscribe_waiter`]) and issue #307's in-place re-attach already
+    /// have: the re-subscribed consumer starts from the cursor.
+    ///
+    /// A zero-queue consumer is credited by its owner through [`Self::flow`], and the engines'
+    /// own post-seek path never grants for one either, so the flow release is withdrawn for it:
+    /// `CommandFlow` for zero permits is a protocol error.
+    fn reattach_after_unowned_seek(
+        &mut self,
+        handle: ConsumerHandle,
+        rejected: bool,
+    ) -> Option<RequestId> {
+        // Both re-attach helpers return `None` without a side effect when the slot is gone, and
+        // neither replaces it, so the slot is taken once, before them.
+        let slot = std::sync::Arc::clone(self.consumers.get(&handle)?);
+        let request_id = if rejected {
+            self.emit_in_place_consumer_resubscribe(handle)?
+        } else {
+            self.emit_post_seek_resubscribe(handle, SubscribeAckAction::ReleaseFlow)?
+        };
+        {
+            let mut consumer = slot.state.lock();
+            if consumer.receiver_queue_size == 0 {
+                consumer.flow_on_subscribe_ack = false;
+                consumer.flow_on_subscribe_ack_request = None;
+            }
+        }
+        tracing::debug!(
+            target: "magnetar_proto::conn",
+            handle = ?handle,
+            request_id = ?request_id,
+            rejected,
+            "seek reply with no awaiting future; consumer re-attached by the connection"
+        );
+        Some(request_id)
+    }
+
+    /// Answer a seek the broker rejected (`CommandError`), for an awaited and for a forgotten
+    /// seek alike ([`crate::consumer::ConsumerState::seek_rejected`] decides what that means
+    /// for the consumer).
+    ///
+    /// A rejected seek used to leave the consumer frozen forever: `begin_seek` froze it when the
+    /// seek was issued, only the `Success` arm thawed it, and the broker still holding the
+    /// consumer gives no other reason to re-attach it — every delivery was dropped as a stale
+    /// pre-seek message, no flow was ever re-granted, and neither the stall watchdog nor the
+    /// in-place recovery would take it (both refuse a consumer with a pending seek).
+    fn recover_consumer_after_rejected_seek(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+    ) {
+        use crate::consumer::SeekRejection;
+        let Some(rejection) = self
+            .consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().seek_rejected(request_id))
+        else {
+            return;
+        };
+        match rejection {
+            SeekRejection::Superseded => {}
+            SeekRejection::RolledBack { flow, wakers, held } => {
+                if let Some(flow) = flow {
+                    self.stage_flow(flow);
+                }
+                // The slot lock is released: user wakers run outside it.
+                for waker in wakers {
+                    waker.wake();
+                }
+                // What the broker sent while the seek was in flight is the consumer's next
+                // messages, not stale ones: deliver it in arrival order behind the restored
+                // queue, through the path a live dispatch takes, so the units it spent are
+                // accounted for and its events emitted exactly once. `pending_seek` is clear,
+                // so none of it is held again.
+                for frame in held {
+                    self.deliver_to_consumer(
+                        handle,
+                        &frame.cmd,
+                        frame.metadata,
+                        frame.broker_entry_metadata,
+                        frame.body,
+                        frame.arrived_at,
+                    );
+                }
+            }
+            SeekRejection::ConsumerLost => {
+                let _ = self.reattach_after_unowned_seek(handle, true);
+            }
+        }
+    }
+
+    /// Hand a seek whose awaiting future was dropped over to the connection.
+    ///
+    /// The runtimes' seek future owns the post-seek re-attach: it waits for the `Success`,
+    /// re-subscribes, waits for that acknowledgement and then grants flow. A future dropped
+    /// before the reply (a `timeout`, a `select!`, an aborted task) therefore left the consumer
+    /// with its queue and credit cleared, the broker's consumer gone, and nobody to re-attach it.
+    /// This is the explicit hand-off, in the family of [`Self::ack_forget`] and
+    /// [`Self::abandon_consumer_subscribe_waiter`]: the future's drop guard calls it, and it is
+    /// idempotent and keyed by the seek's own request id.
+    ///
+    /// - **The reply has not arrived:** the request is retagged
+    ///   `PendingRequestKind::ConsumerSeekForgotten`, whose `Success` re-attaches the consumer and
+    ///   whose `Error` runs the rejected-seek recovery, neither recording an outcome nobody would
+    ///   take.
+    /// - **The `Success` arrived but the continuation never ran** (the future was woken, then
+    ///   dropped before it was polled): `ConsumerState::seek_reattach_owed` still names this
+    ///   request, so the re-attach is emitted now.
+    /// - **Anything else** — the continuation already took the reply — is the phase-2 hand-off's
+    ///   ([`Self::abandon_consumer_subscribe_waiter`]), and this is a no-op.
+    ///
+    /// Waker presence is deliberately not the signal: a seek can be staged before its future's
+    /// first poll, and a future with no waker yet is alive. The corollary is that a seek an
+    /// aggregate consumer staged and dropped before `complete_staged_seek` first polled it has
+    /// no guard to call this, and none is needed: the aggregate's own resynchronization closes
+    /// and rebuilds its children on that cancellation.
+    ///
+    /// Returns `true` when this call left the consumer owned by the connection.
+    pub fn abandon_consumer_seek_waiter(
+        &mut self,
+        handle: ConsumerHandle,
+        request_id: RequestId,
+    ) -> bool {
+        if let Some(kind) = self.pending_requests.get_mut(&request_id) {
+            if matches!(kind, PendingRequestKind::ConsumerSeek { handle: h } if *h == handle) {
+                *kind = PendingRequestKind::ConsumerSeekForgotten { handle };
+                return true;
+            }
+            return false;
+        }
+        let owed = self.consumers.get(&handle).is_some_and(|slot| {
+            let mut consumer = slot.state.lock();
+            if consumer.seek_reattach_owed == Some(request_id) {
+                consumer.seek_reattach_owed = None;
+                true
+            } else {
+                false
+            }
+        });
+        owed && self.reattach_after_unowned_seek(handle, false).is_some()
     }
 
     /// Returns the feature flags negotiated with the broker (empty until `Connected`).
@@ -2737,65 +2917,14 @@ impl Connection {
                         }
                     }
                 }
-                let (staged_events, flow_command): (Vec<ConnectionEvent>, Option<pb::CommandFlow>) =
-                    if let Some(slot) = self.consumers.get(&handle) {
-                        let mut consumer = slot.state.lock();
-                        let outcome = consumer.deliver(
-                            &msg,
-                            payload.metadata.clone(),
-                            payload.broker_entry_metadata.clone(),
-                            payload.body.clone(),
-                            now,
-                        );
-                        let mut events = Vec::new();
-                        if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
-                            // Emit one observational event per newly delivered payload by
-                            // *cloning* the tail of the queue — the runtime drains the actual
-                            // payloads via `Connection::pop_message`, so the queue must remain
-                            // intact for `ReceiveFut::poll`. The newly delivered messages are the
-                            // last `count` entries (`deliver` appends in order).
-                            //
-                            // PIP-180 / ADR-0033: when the consumer is shadow-attached AND the
-                            // inbound entry carries `MessageMetadata.replicated_from`, the
-                            // classifier emits `MessageReceivedFromShadow` so callers see the
-                            // source-topic context without an out-of-band lookup. Regular
-                            // (non-shadow) topics keep emitting `Message` — receive-path
-                            // wire byte-identical.
-                            let queue_len = consumer.queue.len();
-                            let start = queue_len.saturating_sub(count);
-                            for idx in start..queue_len {
-                                if let Some(im) = consumer.queue.get(idx) {
-                                    if let Some((source_topic, source_message_id)) =
-                                        consumer.classify_for_shadow(im)
-                                    {
-                                        let shadow_message_id = im.message_id;
-                                        events.push(ConnectionEvent::MessageReceivedFromShadow {
-                                            handle,
-                                            source_topic,
-                                            source_message_id,
-                                            shadow_message_id,
-                                            message: im.clone(),
-                                        });
-                                    } else {
-                                        events.push(ConnectionEvent::Message {
-                                            handle,
-                                            message: im.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        let flow_command = consumer.maybe_flow();
-                        (events, flow_command)
-                    } else {
-                        (Vec::new(), None)
-                    };
-                for ev in staged_events {
-                    self.push_observational_event(ev);
-                }
-                if let Some(flow_command) = flow_command {
-                    self.stage_flow(flow_command);
-                }
+                self.deliver_to_consumer(
+                    handle,
+                    &msg,
+                    payload.metadata,
+                    payload.broker_entry_metadata,
+                    payload.body,
+                    now,
+                );
             }
             pb::base_command::Type::ProducerSuccess => {
                 let ok = command
@@ -2942,6 +3071,9 @@ impl Connection {
                     Some(PendingRequestKind::Ack {
                         has_waiter: false, ..
                     }) => {}
+                    // The awaiting future is gone: no outcome to record, and the post-seek
+                    // re-attach it would have run is emitted below.
+                    Some(PendingRequestKind::ConsumerSeekForgotten { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -3016,8 +3148,20 @@ impl Connection {
                 }
                 if let Some(PendingRequestKind::ConsumerSeek { handle }) = kind {
                     if let Some(slot) = self.consumers.get(&handle) {
+                        let mut consumer = slot.state.lock();
+                        let _ = consumer.seek_acked();
+                        // The broker dropped this consumer applying the seek and the
+                        // awaiting future re-subscribes it. Until it does, a future
+                        // dropped in between hands the re-attach back
+                        // (`abandon_consumer_seek_waiter`).
+                        consumer.seek_reattach_owed = Some(request_id);
+                    }
+                }
+                if let Some(PendingRequestKind::ConsumerSeekForgotten { handle }) = kind {
+                    if let Some(slot) = self.consumers.get(&handle) {
                         let _ = slot.state.lock().seek_acked();
                     }
+                    let _ = self.reattach_after_unowned_seek(handle, false);
                 }
                 // Issue #414 phase 2: the broker has confirmed it dropped this consumer's
                 // dispatcher slot, so the re-attach may now land on a genuinely empty one.
@@ -3172,6 +3316,9 @@ impl Connection {
                     Some(PendingRequestKind::Ack {
                         has_waiter: false, ..
                     }) => {}
+                    // The awaiting future is gone, so no outcome is recorded; the recovery
+                    // below is owned by the connection either way.
+                    Some(PendingRequestKind::ConsumerSeekForgotten { .. }) => {}
                     Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
@@ -3191,6 +3338,17 @@ impl Connection {
                 ) = kind
                 {
                     self.fail_sends_of_closed_producer(handle, request_id);
+                }
+                // A rejected seek has no continuation to thaw the consumer: `begin_seek`
+                // froze it when the seek was issued and only a reply can lift that. The
+                // recovery is the connection's, so it is the same whether a future still
+                // awaits the reply or was dropped.
+                if let Some(
+                    PendingRequestKind::ConsumerSeek { handle }
+                    | PendingRequestKind::ConsumerSeekForgotten { handle },
+                ) = kind
+                {
+                    self.recover_consumer_after_rejected_seek(handle, request_id);
                 }
                 // When a request id correlates with producer-open or subscribe, surface a
                 // typed event so the runtime waiter cannot hang.
@@ -3727,6 +3885,12 @@ impl Connection {
                     consumer.granted_permits = 0;
                     consumer.permit_balance = 0;
                     consumer.consumed_since_flow = 0;
+                    // Mid-seek, the broker has dropped this consumer (it disconnects it
+                    // before it resets the cursor, and a reset that then fails answers the
+                    // seek with `CommandError`): the snapshot `begin_seek` set aside
+                    // describes a consumer that no longer exists, so a later rejection must
+                    // re-attach instead of restoring it.
+                    consumer.seek_rollback = None;
                 }
                 // Issue #307 ROOT CAUSE: a broker-initiated `CommandCloseConsumer`
                 // with `assigned_broker_service_url = None` is a *same-broker*
@@ -6859,6 +7023,73 @@ impl Connection {
         });
     }
 
+    /// Feed one inbound `CommandMessage` to its consumer, surface the observational event of
+    /// every message it queued, and stage the refill `CommandFlow` the delivery owes.
+    ///
+    /// The one body behind the `CommandMessage` arm and the replay of the dispatches a rejected
+    /// seek held back ([`Self::recover_consumer_after_rejected_seek`]): both must emit the
+    /// events from the queue tail as `deliver` appended it, once per frame.
+    fn deliver_to_consumer(
+        &mut self,
+        handle: ConsumerHandle,
+        msg: &pb::CommandMessage,
+        metadata: pb::MessageMetadata,
+        broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+        body: Bytes,
+        now: Instant,
+    ) {
+        let (staged_events, flow_command): (Vec<ConnectionEvent>, Option<pb::CommandFlow>) =
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
+                let outcome = consumer.deliver(msg, metadata, broker_entry_metadata, body, now);
+                let mut events = Vec::new();
+                if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
+                    // Emit one observational event per newly delivered payload by
+                    // *cloning* the tail of the queue — the runtime drains the actual
+                    // payloads via `Connection::pop_message`, so the queue must remain
+                    // intact for `ReceiveFut::poll`. The newly delivered messages are the
+                    // last `count` entries (`deliver` appends in order).
+                    //
+                    // PIP-180 / ADR-0033: when the consumer is shadow-attached AND the
+                    // inbound entry carries `MessageMetadata.replicated_from`, the
+                    // classifier emits `MessageReceivedFromShadow` so callers see the
+                    // source-topic context without an out-of-band lookup. Regular
+                    // (non-shadow) topics keep emitting `Message` — receive-path
+                    // wire byte-identical.
+                    let start = consumer.queue.len().saturating_sub(count);
+                    for im in consumer.queue.iter().skip(start) {
+                        if let Some((source_topic, source_message_id)) =
+                            consumer.classify_for_shadow(im)
+                        {
+                            let shadow_message_id = im.message_id;
+                            events.push(ConnectionEvent::MessageReceivedFromShadow {
+                                handle,
+                                source_topic,
+                                source_message_id,
+                                shadow_message_id,
+                                message: im.clone(),
+                            });
+                        } else {
+                            events.push(ConnectionEvent::Message {
+                                handle,
+                                message: im.clone(),
+                            });
+                        }
+                    }
+                }
+                let flow_command = consumer.maybe_flow();
+                (events, flow_command)
+            } else {
+                (Vec::new(), None)
+            };
+        for ev in staged_events {
+            self.push_observational_event(ev);
+        }
+        if let Some(flow_command) = flow_command {
+            self.stage_flow(flow_command);
+        }
+    }
+
     fn stage_flow(&mut self, flow: pb::CommandFlow) {
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
@@ -9410,6 +9641,11 @@ impl Connection {
             consumer.granted_permits = 0;
             consumer.permit_balance = 0;
             consumer.consumed_since_flow = 0;
+            // A seek issued while the close was in flight: the broker has now removed the
+            // consumer, so the snapshot `begin_seek` set aside describes one that no longer
+            // exists, and the seek's rejection must re-attach it rather than restore it —
+            // the same edge as a `CommandCloseConsumer` mid-seek.
+            consumer.seek_rollback = None;
             consumer.clear_stall_watch();
         }
         self.fail_acks_orphaned_by_consumer_reattach(handle);
@@ -20323,6 +20559,661 @@ mod consumer_stall_and_recovery_tests {
         let _ = conn.initial_flow(handle, t0);
         let _ = drain_outbound(&mut conn, handle);
         (conn, handle)
+    }
+
+    /// A seek the broker REJECTS with `CommandError` changed nothing broker-side, so the
+    /// consumer must keep delivering. `begin_seek` freezes the queue (`pending_seek`) at
+    /// seek-issue time and only the `Success` arm thaws it; the `CommandError` arm for a
+    /// `ConsumerSeek` request records an `OpOutcome::Error` and nothing else, so every later
+    /// dispatch is dropped as a stale pre-seek message and no flow is ever re-granted.
+    #[test]
+    fn a_seek_the_broker_rejects_leaves_the_consumer_delivering() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+        // The precondition: the rejection reached the caller as an error outcome.
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(seek_rid)),
+                Some(OpOutcome::Error { .. })
+            ),
+            "the broker's CommandError must surface as the seek's error outcome"
+        );
+
+        // The broker still holds the consumer exactly as before the rejected seek and
+        // dispatches the next entry.
+        conn.handle_bytes(t0, &message_frame(handle.0, 1, b"after-rejected-seek"))
+            .expect("deliver after the rejected seek");
+        let queued = conn
+            .consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock()
+            .queue
+            .len();
+        assert_eq!(
+            queued, 1,
+            "a message dispatched after a REJECTED seek must be queued for receive(), not \
+             dropped as a stale pre-seek message"
+        );
+    }
+
+    /// A broker-initiated same-broker `CommandCloseConsumer` for `handle`.
+    fn feed_broker_close(conn: &mut Connection, handle: ConsumerHandle, at: Instant) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseConsumer");
+        conn.handle_bytes(at, &buf).expect("handle CloseConsumer");
+    }
+
+    /// `(queued, permit_balance, consumed_since_flow, granted_permits)` of `handle`.
+    fn flow_ledger(conn: &Connection, handle: ConsumerHandle) -> (usize, u32, u32, u32) {
+        let state = conn
+            .consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock();
+        (
+            state.queue.len(),
+            state.permit_balance,
+            state.consumed_since_flow,
+            state.granted_permits,
+        )
+    }
+
+    /// Deliver `count` messages whose entry ids start at `first_entry`.
+    fn deliver_messages(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        first_entry: u64,
+        count: u64,
+        at: Instant,
+    ) {
+        for entry in first_entry..first_entry + count {
+            conn.handle_bytes(at, &message_frame(handle.0, entry, b"x"))
+                .expect("deliver");
+        }
+    }
+
+    /// The entry ids of the `Message` events `conn` has queued, in order.
+    fn drain_message_event_entries(conn: &mut Connection) -> Vec<u64> {
+        let mut entries = Vec::new();
+        while let Some(event) = conn.poll_event() {
+            if let ConnectionEvent::Message { message, .. } = event {
+                entries.push(message.message_id.entry_id);
+            }
+        }
+        entries
+    }
+
+    /// Pop every queued message of `handle`, returning the entry ids in receive order and the
+    /// `CommandFlow` grants the pops staged.
+    fn pop_all_entries(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        at: Instant,
+    ) -> (Vec<u64>, Vec<u32>) {
+        let mut entries = Vec::new();
+        while let Some(message) = conn.pop_message(handle, at) {
+            entries.push(message.message_id.entry_id);
+        }
+        let (_, grants) = drain_outbound(conn, handle);
+        (entries, grants)
+    }
+
+    /// A PIP-33 marker frame (`MarkerType` 10), which the connection filters off the
+    /// user-visible stream after charging the permit the broker spent on it.
+    fn marker_frame(consumer_id: u64, entry_id: u64) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "broker-marker".to_owned(),
+            sequence_id: 0,
+            publish_time: 1_700_000_000_000,
+            marker_type: Some(10),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, &meta, b"").expect("encode marker");
+        buf.to_vec()
+    }
+
+    /// A seek the broker rejects changed nothing broker-side, so the consumer must deliver
+    /// every message the broker sent, in order: the queue it had, the dispatches that arrived
+    /// while the seek was in flight (the broker still held the consumer when it sent them), and
+    /// the next one. On an Exclusive or Failover subscription skipping any of them would let a
+    /// later cumulative acknowledgement cover messages the application never saw.
+    ///
+    /// The flow ledger stays whole: the window the broker holds is `permit_balance` (still to
+    /// dispatch) + `consumed_since_flow` (spent and owed back) + the queued units, and no
+    /// `CommandFlow` exceeds what was spent (issue #427).
+    #[test]
+    fn a_seek_the_broker_rejects_skips_no_dispatch_and_keeps_the_flow_ledger_whole() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 3, t0);
+        assert_eq!(flow_ledger(&conn, handle), (3, RQ as u32 - 3, 0, RQ as u32));
+
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (0, 0, 0, 0),
+            "the freeze still clears the queue and the mirrors while the seek is in flight"
+        );
+        // Two dispatches the broker made before it saw the seek: held, not dropped.
+        deliver_messages(&mut conn, handle, 3, 2, t0);
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (0, 0, 0, 0),
+            "frozen: nothing is receivable until the broker answers the seek"
+        );
+
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (5, RQ as u32 - 5, 0, RQ as u32),
+            "the queue is back with the two held dispatches behind it, each charged once"
+        );
+        deliver_messages(&mut conn, handle, 5, 1, t0);
+        assert_eq!(flow_ledger(&conn, handle), (6, RQ as u32 - 6, 0, RQ as u32));
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "the broker still holds the consumer: a re-subscribe would repair nothing"
+        );
+        assert!(
+            grants.is_empty(),
+            "nothing is owed back yet, so nothing is granted on top of the window it holds: {grants:?}"
+        );
+        assert_eq!(
+            drain_message_event_entries(&mut conn),
+            vec![0, 1, 2, 3, 4, 5],
+            "one Message event per delivered message, replayed ones included, none twice"
+        );
+
+        let (entries, grants) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(
+            entries,
+            vec![0, 1, 2, 3, 4, 5],
+            "in arrival order, none skipped"
+        );
+        assert!(
+            grants.iter().map(|g| u64::from(*g)).sum::<u64>() <= 6,
+            "no CommandFlow may exceed the six units the broker spent: {grants:?}"
+        );
+        let (queued, balance, consumed, granted) = flow_ledger(&conn, handle);
+        assert_eq!(
+            balance + consumed + queued as u32,
+            RQ as u32,
+            "window = permit_balance + consumed_since_flow + queued units"
+        );
+        assert_eq!(
+            granted - 6,
+            balance,
+            "what the broker still holds is what it was granted minus what it dispatched"
+        );
+    }
+
+    /// The seek future was dropped before the reply (`abandon_consumer_seek_waiter`), so the
+    /// connection owns the rejection: it must take the same recovery as an awaited seek — nothing
+    /// skipped — and still record no outcome nobody would take.
+    #[test]
+    fn an_abandoned_seek_the_broker_rejects_skips_no_dispatch_and_records_no_outcome() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 2, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        deliver_messages(&mut conn, handle, 2, 3, t0);
+
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none(),
+            "a forgotten seek records no outcome"
+        );
+        assert_eq!(flow_ledger(&conn, handle), (5, RQ as u32 - 5, 0, RQ as u32));
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "a rejection the broker answered with the consumer held re-subscribes nothing"
+        );
+        assert!(grants.is_empty(), "nothing is owed back yet: {grants:?}");
+        let (entries, _) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(entries, vec![0, 1, 2, 3, 4], "nothing skipped");
+        assert!(conn.pending_requests.is_empty());
+    }
+
+    /// A `CommandFlow` the application issues while the seek is in flight reaches the broker
+    /// whatever becomes of the seek, so the rollback must add it to the window it restores
+    /// instead of overwriting it with the snapshot.
+    #[test]
+    fn a_rejected_seek_keeps_the_flow_granted_while_it_was_in_flight() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 3, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+
+        conn.flow(handle, 4);
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(grants, vec![4], "the grant went out on the wire");
+
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (3, RQ as u32 - 3 + 4, 0, RQ as u32 + 4),
+            "the broker holds the snapshot's window plus the four it was granted mid-seek"
+        );
+    }
+
+    /// A PIP-33 marker the broker dispatches while the seek is in flight spends a permit and
+    /// is refunded like any other unit, in either order against a grant made in the same window:
+    /// the debit must not be taken from a live balance that is still zero (it would saturate and
+    /// vanish) nor lost when the rollback restores the snapshot.
+    #[test]
+    fn a_rejected_seek_keeps_the_markers_dispatched_while_it_was_in_flight() {
+        for flow_first in [false, true] {
+            let t0 = Instant::now();
+            let (mut conn, handle) = shared_consumer(None, t0);
+            deliver_messages(&mut conn, handle, 0, 3, t0);
+            let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+            let _ = drain_outbound(&mut conn, handle);
+
+            if flow_first {
+                conn.flow(handle, 4);
+            }
+            conn.handle_bytes(t0, &marker_frame(handle.0, 3))
+                .expect("deliver marker mid-seek");
+            if !flow_first {
+                conn.flow(handle, 4);
+            }
+            let _ = drain_outbound(&mut conn, handle);
+
+            feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+            assert_eq!(
+                flow_ledger(&conn, handle),
+                (3, RQ as u32 - 3 - 1 + 4, 1, RQ as u32 + 4),
+                "flow_first={flow_first}: the marker spent one permit of the snapshot's window \
+                 and is owed back; the grant is on top"
+            );
+        }
+    }
+
+    /// The broker holds at most the window it was granted, so a consumer holds back at most
+    /// that many dispatches while a seek is in flight; the units past it are charged on both sides
+    /// of the ledger at the rollback (the broker spent them, the client owes them back) so they
+    /// are repaid, not re-granted.
+    #[test]
+    fn a_rejected_seek_holds_at_most_the_window_and_charges_the_overflow() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 6, t0);
+        assert_eq!(flow_ledger(&conn, handle), (6, 2, 0, RQ as u32));
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+
+        // Two units are all the broker holds; the third and fourth frames are a protocol
+        // violation (or a mirror under-reporting the window) and are not held.
+        deliver_messages(&mut conn, handle, 6, 4, t0);
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+        let (entries, grants) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(
+            entries,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "the six queued messages and the two the window allows, in order"
+        );
+        let (queued, _, consumed, _) = flow_ledger(&conn, handle);
+        assert_eq!(queued, 0);
+        assert_eq!(
+            u64::from(consumed) + grants.iter().map(|g| u64::from(*g)).sum::<u64>(),
+            10,
+            "every unit the broker spent (six before the seek, two held, two overflowed) is \
+             repaid exactly once"
+        );
+    }
+
+    /// `begin_seek` while one is in flight must not replace the snapshot with the
+    /// already-zeroed mirrors, and the reply to the older seek must not thaw the newer one.
+    #[test]
+    fn a_second_seek_keeps_the_first_snapshot_and_the_older_rejection_thaws_nothing() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 3, t0);
+        let first = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        // A grant made between the two seeks belongs to the window too.
+        conn.flow(handle, 2);
+        let second = conn.seek(handle, SeekTarget::MessageId(MessageId::LATEST));
+        let _ = drain_outbound(&mut conn, handle);
+
+        feed_error(&mut conn, first.0, pb::ServerError::UnknownError, t0);
+        assert_eq!(
+            conn.consumers
+                .get(&handle)
+                .expect("registered")
+                .state
+                .lock()
+                .pending_seek,
+            Some(second),
+            "the older seek's rejection must not thaw the newer seek"
+        );
+        deliver_messages(&mut conn, handle, 3, 1, t0);
+        assert_eq!(
+            flow_ledger(&conn, handle).0,
+            0,
+            "still frozen for the newer seek"
+        );
+
+        feed_error(&mut conn, second.0, pb::ServerError::UnknownError, t0);
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (4, RQ as u32 - 3 - 1 + 2, 0, RQ as u32 + 2),
+            "the first seek's snapshot, the grant between the seeks, and the held dispatch"
+        );
+        let (entries, _) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(entries, vec![0, 1, 2, 3]);
+    }
+
+    /// The broker disconnects a consumer before it resets the cursor, and a reset that then
+    /// fails answers the seek with `CommandError`: the consumer is gone, there is nothing to
+    /// restore, and the close arm refused to re-attach it because the seek owned that.
+    #[test]
+    fn a_seek_rejected_after_the_broker_closed_the_consumer_re_attaches_it() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        deliver_messages(&mut conn, handle, 0, 2, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        feed_broker_close(&mut conn, handle, t0);
+        let (subs, _) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "mid-seek the close arm leaves the re-attach to the seek"
+        );
+
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            subs.len(),
+            1,
+            "the rejected seek must re-attach the lost consumer"
+        );
+        assert!(
+            grants.is_empty(),
+            "flow waits for the re-subscribe's Success"
+        );
+        feed_success(&mut conn, subs[0], t0);
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            grants,
+            vec![RQ as u32],
+            "a fresh dispatcher slot gets one full window"
+        );
+        assert!(
+            conn.consumers
+                .get(&handle)
+                .expect("registered")
+                .state
+                .lock()
+                .pending_seek
+                .is_none()
+        );
+    }
+
+    /// A recovery close (ADR-0108) in flight when the application seeks: the broker removes the
+    /// consumer on the close, so the snapshot the seek set aside describes a consumer that no
+    /// longer exists. The seek the broker then rejects ("Consumer not found") must re-attach it
+    /// instead of restoring a window nobody holds.
+    #[test]
+    fn a_seek_rejected_after_a_recovery_close_removed_the_consumer_re_attaches_it() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(Some(WINDOW), t0);
+        deliver_messages(&mut conn, handle, 0, 2, t0);
+        let close_rid = conn
+            .resubscribe_consumer_in_place(handle)
+            .expect("eligible");
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound_all(&mut conn, handle);
+
+        feed_success(&mut conn, close_rid.0, t0);
+        let (subs, _) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "mid-seek the recovery's own re-attach is refused: the seek owns it"
+        );
+        feed_error(&mut conn, seek_rid.0, pb::ServerError::UnknownError, t0);
+
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            subs.len(),
+            1,
+            "the consumer is gone broker-side: the rejection re-attaches it"
+        );
+        assert!(
+            grants.is_empty(),
+            "flow waits for the re-subscribe's Success"
+        );
+        feed_success(&mut conn, subs[0], t0);
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(grants, vec![RQ as u32]);
+    }
+
+    /// The order a real broker produces for a seek whose future was dropped: it closes the
+    /// consumer (`CommandCloseConsumer`, no migration URL) before it answers the seek. The
+    /// close arm cannot re-attach mid-seek, so exactly one `CommandSubscribe` follows the seek's
+    /// `Success`, and the flow it owes waits for that subscribe's own `Success`.
+    #[test]
+    fn an_abandoned_seek_the_broker_closed_the_consumer_for_is_re_attached_exactly_once() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+
+        feed_broker_close(&mut conn, handle, t0);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "the close arm refuses to re-attach mid-seek"
+        );
+        assert!(
+            grants.is_empty(),
+            "no flow for a consumer the broker closed"
+        );
+
+        feed_success(&mut conn, seek_rid.0, t0);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(subs.len(), 1, "exactly one CommandSubscribe: {subs:?}");
+        assert!(
+            grants.is_empty(),
+            "no grant until the re-subscribe is acknowledged: {grants:?}"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none(),
+            "a forgotten seek records no outcome"
+        );
+
+        feed_success(&mut conn, subs[0], t0);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(subs.is_empty(), "no second CommandSubscribe: {subs:?}");
+        assert_eq!(grants, vec![RQ as u32], "exactly one full window");
+        assert!(conn.pending_requests.is_empty());
+    }
+
+    /// A seek future dropped before the reply hands the seek to the connection: its `Success`
+    /// then re-attaches the consumer by itself and records no outcome nobody would take.
+    #[test]
+    fn an_abandoned_seek_is_re_attached_by_the_connection_when_the_broker_acks() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        assert!(
+            !conn.abandon_consumer_seek_waiter(handle, seek_rid),
+            "the hand-off is idempotent: a forgotten seek is not forgotten twice"
+        );
+        feed_success(&mut conn, seek_rid.0, t0);
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none(),
+            "a forgotten seek records no outcome"
+        );
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            subs.len(),
+            1,
+            "the broker dropped the consumer: re-subscribe it"
+        );
+        assert!(
+            grants.is_empty(),
+            "flow waits for the re-subscribe's Success (issue #67)"
+        );
+        feed_success(&mut conn, subs[0], t0);
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(grants, vec![RQ as u32]);
+        assert!(conn.pending_requests.is_empty());
+    }
+
+    /// A zero-queue consumer is credited by its owner; a `CommandFlow` for zero permits is a
+    /// protocol error, so the connection-owned re-attach must not release one.
+    #[test]
+    fn an_abandoned_seek_of_a_zero_queue_consumer_releases_no_empty_flow() {
+        let t0 = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        while conn.poll_event().is_some() {}
+        let subscribe_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/zero-queue-seek".to_owned(),
+            subscription: "zero-queue-seek".to_owned(),
+            receiver_queue_size: 0,
+            ..Default::default()
+        });
+        feed_success(&mut conn, subscribe_rid, t0);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound(&mut conn, handle);
+
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        feed_success(&mut conn, seek_rid.0, t0);
+        let (subs, _) = drain_outbound(&mut conn, handle);
+        assert_eq!(subs.len(), 1);
+        feed_success(&mut conn, subs[0], t0);
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert!(grants.is_empty(), "no zero-permit CommandFlow: {grants:?}");
+    }
+
+    /// The `Success` landed, the future was woken, and then it was dropped before it was
+    /// polled: its continuation never ran, so the hand-off is what re-attaches the consumer. A
+    /// continuation that did run (`resubscribe_consumer_after_seek`) leaves nothing to hand off.
+    #[test]
+    fn a_seek_future_dropped_after_the_reply_but_before_its_continuation_hands_the_re_attach_over()
+    {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        feed_success(&mut conn, seek_rid.0, t0);
+        let (subs, _) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "the awaiting future owns the re-attach while it lives"
+        );
+
+        assert!(
+            !conn.abandon_consumer_seek_waiter(handle, RequestId(seek_rid.0 + 1000)),
+            "another request's id is not this seek's hand-off"
+        );
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        let (subs, _) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            subs.len(),
+            1,
+            "the dropped future's re-attach is emitted by the connection"
+        );
+        assert!(
+            !conn.abandon_consumer_seek_waiter(handle, seek_rid),
+            "idempotent: one re-attach per seek"
+        );
+
+        // The other branch: the continuation ran, so there is nothing to hand off.
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        feed_success(&mut conn, seek_rid.0, t0);
+        assert!(conn.resubscribe_consumer_after_seek(handle).is_some());
+        assert!(
+            !conn.abandon_consumer_seek_waiter(handle, seek_rid),
+            "the continuation already re-subscribed"
+        );
+    }
+
+    /// A reset ends the session the seek rode on: the snapshot, the owed re-attach and the
+    /// forgotten request all go with it, and no outcome is parked for the forgotten seek.
+    #[test]
+    fn a_reset_discards_the_seek_snapshot_and_a_forgotten_seek_without_an_outcome() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+
+        conn.reset();
+
+        assert!(conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none());
+        let state = conn
+            .consumers
+            .get(&handle)
+            .expect("registered")
+            .state
+            .lock();
+        assert!(state.pending_seek.is_none());
+        assert!(state.seek_rollback.is_none());
+        assert!(state.seek_reattach_owed.is_none());
     }
 
     #[test]

@@ -1567,11 +1567,22 @@ impl<P: Providers> Consumer<P> {
             seek_message_id,
             seek_timestamp,
         } = staged;
+        // The re-attach below belongs to this future; if the caller drops it first (a
+        // `timeout`, a `select!`, an aborted task) the connection takes it over.
+        let mut abandon = SeekAbandonGuard {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            request_id,
+            armed: true,
+        };
         let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
         .await;
+        // The reply is in hand and the continuation below runs without an await before it
+        // re-subscribes, so nothing can cancel it in between.
+        abandon.armed = false;
         match outcome {
             OpOutcome::Success { .. } => {
                 let resub_request_id = {
@@ -1684,6 +1695,39 @@ fn map_terminal_admission_error(
         }
         .to_owned(),
     )
+}
+
+/// Hands a seek whose awaiting future is dropped before the broker's reply to the connection
+/// ([`magnetar_proto::Connection::abandon_consumer_seek_waiter`]), which then re-attaches the
+/// consumer itself. Without it the future's continuation is the only code that re-subscribes a
+/// consumer the broker dropped while applying the seek, and a cancelled `seek_*` left it
+/// attached to nothing, holding no permits.
+///
+/// Armed from the moment the seek is awaited and disarmed once the reply has been taken, so a
+/// completed seek (whatever its outcome) is never handed off. The hand-off is idempotent and
+/// keyed by request id, so the field drop order against [`RequestFut`] does not matter.
+/// Mirrors the tokio engine's guard of the same name.
+struct SeekAbandonGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    request_id: RequestId,
+    armed: bool,
+}
+
+impl Drop for SeekAbandonGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let handed_off = self
+            .shared
+            .inner
+            .lock()
+            .abandon_consumer_seek_waiter(self.handle, self.request_id);
+        if handed_off {
+            crate::driver::notify_retry_generation_replaced(&self.shared);
+        }
+    }
 }
 
 /// Cancellation-safe waiter for the slot-owned ordinary consumer close.
@@ -3892,6 +3936,441 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `seek_*` future dropped before the broker's reply must not strand the consumer.
+    ///
+    /// The broker tears the consumer down while it applies the seek (the fake broker models
+    /// this as `Success` alone, with no `CommandCloseConsumer`), so the consumer only becomes
+    /// receivable again once the client re-subscribes. Fails if the awaiting seek future's
+    /// continuation is the only caller of `resubscribe_consumer_after_seek`: aborting that
+    /// future then leaves `Success` to clear `pending_seek` while nobody re-attaches, and the
+    /// consumer holds zero permits and no broker-side registration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_seek_future_still_resubscribes_after_the_broker_acks() {
+        let shared = handshake_complete_shared();
+        let (handle, slot) = {
+            let mut conn = shared.inner.lock();
+            let _ = conn.poll_transmit();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/seek-cancelled".to_owned(),
+                subscription: "seek-cancelled".to_owned(),
+                receiver_queue_size: 3,
+                ..Default::default()
+            });
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let _ = conn.poll_transmit();
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode initial subscribe success");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish consumer");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+            (handle, slot)
+        };
+        let consumer = Consumer::<TokioProviders>::assemble(
+            shared.clone(),
+            handle,
+            slot,
+            None,
+            crate::tokio_sleep_provider(),
+        );
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move {
+            task_consumer
+                .seek_to_message(magnetar_proto::MessageId {
+                    ledger_id: 7,
+                    entry_id: 11,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let seek_request_id = {
+            let mut staged = shared.inner.lock().poll_transmit();
+            let mut request_id = None;
+            while !staged.is_empty() {
+                let command = decode_one(&mut staged).expect("decode seek frame").command;
+                if let Some(seek) = command.seek {
+                    request_id = Some(seek.request_id);
+                }
+            }
+            request_id.expect("seek command")
+        };
+
+        // The caller gives up (a `timeout` / `select!` / task abort) before the broker replies.
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+
+        let seek_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: seek_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &seek_success).expect("encode seek success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle seek success");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut saw_subscribe = false;
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged)
+                .expect("decode post-seek frame")
+                .command;
+            if command.subscribe.is_some() {
+                saw_subscribe = true;
+            }
+        }
+        assert!(
+            saw_subscribe,
+            "the broker dropped the consumer while applying the seek: a CommandSubscribe must \
+             follow the seek Success even though the seek future was cancelled"
+        );
+    }
+
+    /// An established single-consumer connection ready for a seek.
+    fn established_seekable_consumer(
+        topic: &str,
+        receiver_queue_size: usize,
+    ) -> (
+        std::sync::Arc<ConnectionShared>,
+        magnetar_proto::ConsumerHandle,
+        Consumer<TokioProviders>,
+    ) {
+        let shared = handshake_complete_shared();
+        let (handle, slot) = {
+            let mut conn = shared.inner.lock();
+            let _ = conn.poll_transmit();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: topic.to_owned(),
+                subscription: "seek-reply".to_owned(),
+                receiver_queue_size,
+                ..Default::default()
+            });
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let _ = conn.poll_transmit();
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode initial subscribe success");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish consumer");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+            // The initial grant a real attach makes: what a seek's rejection must leave whole.
+            let _ = conn.initial_flow(handle, Instant::now());
+            let _ = conn.poll_transmit();
+            (handle, slot)
+        };
+        let consumer = Consumer::<TokioProviders>::assemble(
+            shared.clone(),
+            handle,
+            slot,
+            None,
+            crate::tokio_sleep_provider(),
+        );
+        (shared, handle, consumer)
+    }
+
+    /// The request id of the `CommandSeek` staged on `shared`'s outbound buffer.
+    fn staged_seek_request_id(shared: &ConnectionShared) -> u64 {
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut request_id = None;
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged).expect("decode seek frame").command;
+            if let Some(seek) = command.seek {
+                request_id = Some(seek.request_id);
+            }
+        }
+        request_id.expect("seek command")
+    }
+
+    /// Feed the broker's reply to the seek: `CommandSuccess`, or `CommandError` when `rejected`.
+    fn feed_seek_reply(shared: &ConnectionShared, request_id: u64, rejected: bool) {
+        let reply = if rejected {
+            pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id,
+                    error: pb::ServerError::UnknownError as i32,
+                    message: "seek rejected".to_owned(),
+                }),
+                ..Default::default()
+            }
+        } else {
+            pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            }
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &reply).expect("encode seek reply");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle seek reply");
+    }
+
+    /// A `seek_*` the broker REJECTS must leave the consumer exactly as receivable as before.
+    /// `begin_seek` froze it when the seek was issued and nothing lifted that on `CommandError`,
+    /// so every later dispatch was dropped as a stale pre-seek message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_seek_future_leaves_the_consumer_receiving() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-rejected", 3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let seek_request_id = staged_seek_request_id(&shared);
+
+        feed_seek_reply(&shared, seek_request_id, true);
+        let result = task.await.expect("seek task");
+        assert!(
+            matches!(result, Err(ClientError::Broker { .. })),
+            "the broker's rejection must surface to the caller, got {result:?}"
+        );
+
+        shared
+            .inner
+            .lock()
+            .handle_bytes(
+                Instant::now(),
+                &command_message_bytes(handle.0, 1, b"after"),
+            )
+            .expect("deliver after the rejected seek");
+        let received = consumer
+            .receive_with_timeout(std::time::Duration::from_millis(200))
+            .await
+            .expect("receive after the rejected seek")
+            .expect("a message dispatched after a REJECTED seek must be receivable");
+        assert_eq!(received.payload.as_ref(), b"after");
+    }
+
+    /// Deliver the `CommandMessage` of every entry in `entries` to `handle`, each carrying the
+    /// payload `m<entry>`.
+    fn feed_entries(
+        shared: &ConnectionShared,
+        handle: magnetar_proto::ConsumerHandle,
+        entries: std::ops::Range<u64>,
+    ) {
+        for entry in entries {
+            shared
+                .inner
+                .lock()
+                .handle_bytes(
+                    Instant::now(),
+                    &command_message_bytes(handle.0, entry, format!("m{entry}").as_bytes()),
+                )
+                .expect("deliver");
+        }
+    }
+
+    /// Receive `count` messages and return their payloads as text, in receive order.
+    async fn receive_payloads(consumer: &Consumer<TokioProviders>, count: usize) -> Vec<String> {
+        let mut payloads = Vec::new();
+        for _ in 0..count {
+            let message = consumer
+                .receive_with_timeout(std::time::Duration::from_millis(200))
+                .await
+                .expect("receive")
+                .expect("a message the broker dispatched must be receivable");
+            payloads.push(String::from_utf8(message.payload.to_vec()).expect("utf8 payload"));
+        }
+        payloads
+    }
+
+    /// The total `CommandFlow` permits staged on `shared`'s outbound buffer, and whether a
+    /// `CommandSubscribe` is among them.
+    fn staged_flow_permits_and_subscribe(shared: &ConnectionShared) -> (u64, bool) {
+        let mut staged = shared.inner.lock().poll_transmit();
+        let (mut permits, mut subscribed) = (0, false);
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged)
+                .expect("decode staged frame")
+                .command;
+            if let Some(flow) = command.flow {
+                permits += u64::from(flow.message_permits);
+            }
+            subscribed |= command.subscribe.is_some();
+        }
+        (permits, subscribed)
+    }
+
+    /// A seek the broker rejects changed nothing broker-side, so the consumer must still
+    /// receive every message the broker sent, in order — the ones it had, the ones dispatched
+    /// while the seek was in flight, and the next one — and no flow beyond what the broker
+    /// spent. Skipping the middle ones would let a later cumulative acknowledgement cover
+    /// messages the application never saw.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_seek_the_broker_rejects_skips_no_dispatch() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-rejected-held", 8);
+        feed_entries(&shared, handle, 0..3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let seek_request_id = staged_seek_request_id(&shared);
+        // Dispatched before the broker saw the seek.
+        feed_entries(&shared, handle, 3..5);
+
+        feed_seek_reply(&shared, seek_request_id, true);
+        let result = task.await.expect("seek task");
+        assert!(
+            matches!(result, Err(ClientError::Broker { .. })),
+            "the broker's rejection must surface to the caller, got {result:?}"
+        );
+        feed_entries(&shared, handle, 5..6);
+
+        assert_eq!(
+            receive_payloads(&consumer, 6).await,
+            ["m0", "m1", "m2", "m3", "m4", "m5"],
+            "in arrival order, none skipped"
+        );
+        let (permits, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            permits <= 6,
+            "no CommandFlow may exceed the six units the broker spent, got {permits}"
+        );
+        assert!(!subscribed, "the broker still holds the consumer");
+    }
+
+    /// The same, for a seek whose future was dropped before the reply: the drop guard hands it
+    /// to the connection, which must take the rejection exactly like an awaited one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_seek_the_broker_rejects_skips_no_dispatch() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-abandoned-held", 8);
+        feed_entries(&shared, handle, 0..2);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let seek_request_id = staged_seek_request_id(&shared);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+        feed_entries(&shared, handle, 2..5);
+
+        feed_seek_reply(&shared, seek_request_id, true);
+
+        assert_eq!(
+            receive_payloads(&consumer, 5).await,
+            ["m0", "m1", "m2", "m3", "m4"],
+            "in arrival order, none skipped"
+        );
+        let (permits, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            permits <= 5,
+            "no CommandFlow may exceed the five units the broker spent, got {permits}"
+        );
+        assert!(!subscribed, "the broker still holds the consumer");
+    }
+
+    /// The seek `Success` lands, wakes the awaiting future, and the future is dropped before it
+    /// is polled again: its continuation never runs, and `RequestFut::drop` discards the
+    /// recorded outcome. The connection must still re-subscribe the consumer the broker dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn seek_future_dropped_after_the_reply_still_resubscribes() {
+        let (shared, _handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-reply-dropped", 3);
+        let mut seek = Box::pin(consumer.seek_to_earliest());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(seek.as_mut().poll(&mut context).is_pending());
+        let seek_request_id = staged_seek_request_id(&shared);
+
+        feed_seek_reply(&shared, seek_request_id, false);
+        drop(seek);
+
+        let mut saw_subscribe = false;
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let command = decode_one(&mut staged)
+                .expect("decode post-seek frame")
+                .command;
+            if command.subscribe.is_some() {
+                saw_subscribe = true;
+            }
+        }
+        assert!(
+            saw_subscribe,
+            "a seek future dropped after the broker's reply but before its continuation ran \
+             must still leave a CommandSubscribe for the consumer the broker dropped"
+        );
+    }
+
+    /// A `seek_*` future dropped after the connection processed the broker's rejection, but
+    /// before the future observed it, hands nothing over: the rejection already restored the
+    /// consumer, so no `CommandSubscribe` follows and the consumer keeps receiving.
+    #[tokio::test(flavor = "current_thread")]
+    async fn seek_future_dropped_after_its_rejection_hands_nothing_over() {
+        let (shared, handle, consumer) = established_seekable_consumer(
+            "persistent://public/default/seek-rejected-then-dropped",
+            3,
+        );
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let seek_request_id = staged_seek_request_id(&shared);
+
+        // The connection handles the rejection; the caller gives up before its future runs again.
+        feed_seek_reply(&shared, seek_request_id, true);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before it observes the rejection"
+        );
+        let (_, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            !subscribed,
+            "a seek the broker rejected leaves no re-attach for its dropped future to hand over"
+        );
+
+        feed_entries(&shared, handle, 1..2);
+        assert_eq!(receive_payloads(&consumer, 1).await, ["m1"]);
     }
 
     fn handshake_complete_supervised_shared() -> Arc<ConnectionShared> {

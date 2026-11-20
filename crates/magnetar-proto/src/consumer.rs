@@ -244,6 +244,71 @@ impl ConsumerSlot {
     }
 }
 
+/// The state [`ConsumerState::begin_seek`] sets aside so a seek the broker rejects can be
+/// undone ([`ConsumerState::seek_rejected`]).
+///
+/// Moved out of the consumer rather than copied, so taking the snapshot costs no copy. A frozen
+/// consumer holds that memory plus the dispatches that arrive while the seek is in flight
+/// ([`Self::held`]), bounded by the window the broker holds.
+#[derive(Debug)]
+pub(crate) struct SeekRollback {
+    queue: VecDeque<IncomingMessage>,
+    queued_bytes: u64,
+    #[cfg(feature = "scalable-topics")]
+    deferred_queue: VecDeque<DeferredIncomingMessage>,
+    #[cfg(feature = "scalable-topics")]
+    canonical_nack_ids: rustc_hash::FxHashMap<MessageId, crate::pb::MessageIdData>,
+    manual_flow_permits: u32,
+    granted_permits: u32,
+    permit_balance: u32,
+    consumed_since_flow: u32,
+    /// The dispatches [`ConsumerState::deliver`] held back while the seek was in flight, in
+    /// arrival order: the broker still held this consumer when it sent them, so a rejection
+    /// replays them ([`ConsumerState::seek_rejected`]) and a success discards them with the rest
+    /// of the snapshot.
+    held: Vec<HeldDispatch>,
+    /// Sum of the weight (dispatch units, at least one per frame) of [`Self::held`]: what
+    /// bounds the hold.
+    held_weight: u64,
+    /// Broker dispatch units [`ConsumerState::deliver`] could not hold because they exceeded
+    /// the window the broker holds (a protocol violation, or a mirror that under-reports it).
+    /// The rejection charges them on both sides of the flow ledger, so they are repaid and
+    /// never re-granted.
+    dropped_units: u32,
+}
+
+/// One `CommandMessage` [`ConsumerState::deliver`] held back while a seek was in flight, with
+/// everything `deliver` takes, so replaying it is an ordinary delivery (batches, chunks,
+/// dead-letter routing and the scalable deferred path included).
+#[derive(Debug)]
+pub(crate) struct HeldDispatch {
+    pub(crate) cmd: pb::CommandMessage,
+    pub(crate) metadata: pb::MessageMetadata,
+    pub(crate) broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+    pub(crate) body: Bytes,
+    /// When the frame arrived, so the replayed message keeps its receive-latency origin.
+    pub(crate) arrived_at: std::time::Instant,
+}
+
+/// How a consumer answered a rejected seek ([`ConsumerState::seek_rejected`]).
+#[derive(Debug)]
+pub(crate) enum SeekRejection {
+    /// The rejected seek is not the one in flight; nothing was touched.
+    Superseded,
+    /// The broker still holds the consumer: its queue and flow-control mirrors are back.
+    RolledBack {
+        /// The refund [`ConsumerState::maybe_flow`] owes the broker, if one is due.
+        flow: Option<pb::CommandFlow>,
+        /// Receive wakers to fire once the slot lock is released (restored messages).
+        wakers: Vec<Waker>,
+        /// The dispatches held back while the seek was in flight, to be delivered now, in
+        /// order, behind the restored queue.
+        held: Vec<HeldDispatch>,
+    },
+    /// The consumer was torn down broker-side mid-seek and must be re-attached.
+    ConsumerLost,
+}
+
 /// PIP-180 / ADR-0033 shadow-topic metadata cached on a [`ConsumerState`].
 ///
 /// Populated at subscribe time by the runtime engine via
@@ -468,6 +533,20 @@ pub struct ConsumerState {
     pub chunk_auto_ack_pending: Vec<MessageId>,
     /// In-flight `CommandSeek` request id, if any. While `Some`, the queue is frozen.
     pub pending_seek: Option<RequestId>,
+    /// What [`Self::begin_seek`] set aside so a seek the broker REJECTS can be undone: the
+    /// receiver queue and the four flow-control mirrors, plus the dispatches that arrive
+    /// while frozen (held, not dropped). `Some` exactly while [`Self::pending_seek`] is `Some`
+    /// **and** the broker still holds this consumer; `None` while a seek is pending means the
+    /// consumer was torn down broker-side mid-seek (a `CommandCloseConsumer`, an in-place
+    /// recovery close, or a session reset), so a rejection has nothing to restore and must
+    /// re-attach instead (`seek_rejected`).
+    pub(crate) seek_rollback: Option<SeekRollback>,
+    /// The request id of a seek whose `Success` landed but whose post-seek re-subscribe
+    /// has not been emitted yet (the awaiting future owns it, see
+    /// [`crate::Connection::resubscribe_consumer_after_seek`]). It is what lets a seek
+    /// future dropped between the reply and its continuation hand the re-attach to the
+    /// connection ([`crate::Connection::abandon_consumer_seek_waiter`]).
+    pub(crate) seek_reattach_owed: Option<RequestId>,
     /// Per-consumer waker slab. Each in-flight `receive()` future registers a
     /// `Waker` here via [`Self::register_receive_waker`] and evicts it on `Drop`
     /// via [`Self::cancel_receive_waker`]. When a new message arrives (or the
@@ -1115,7 +1194,8 @@ pub enum DeliverOutcome {
         /// Number of [`IncomingMessage`]s now in the queue.
         count: usize,
     },
-    /// The message was buffered as a chunk; no user-visible message yet.
+    /// The message was buffered, as a chunk or held back until an in-flight seek is answered;
+    /// no user-visible message yet.
     Buffered,
     /// The message was dropped (e.g. duplicate chunk).
     Dropped,
@@ -1188,6 +1268,8 @@ impl ConsumerState {
             ),
             chunk_auto_ack_pending: Vec::new(),
             pending_seek: None,
+            seek_rollback: None,
+            seek_reattach_owed: None,
             receive_wakers: Slab::new(),
             terminal_operation: ConsumerTerminalOperation::Open,
             release_after_close: false,
@@ -1475,9 +1557,10 @@ impl ConsumerState {
     /// because neither will ever reach a pop; [`Self::record_marker_consumed`] refunds a
     /// PIP-33 marker the conn-level filter drops; and [`Self::deliver`] refunds every charged
     /// position of a batched entry no layout could decode (issue #860, ADR-0112). Nothing else may
-    /// call it — a `DeliverOutcome::Dropped` frame moves neither side of the mirror, and
-    /// neither does an ADR-0105 `ack_set`-cleared batch position, which the broker never
-    /// charged.
+    /// call it — a `DeliverOutcome::Dropped` frame moves neither side of the mirror when it is
+    /// dropped (a seek the broker rejects charges once, at the rollback, the units that
+    /// overflowed what it could hold: `seek_rejected`), and neither does an ADR-0105
+    /// `ack_set`-cleared batch position, which the broker never charged.
     ///
     /// Deliberately does NOT touch [`Self::permit_balance`]: that is the live arrival mirror
     /// and belongs to [`Self::record_dispatch_unit`]. A site that owes both calls both.
@@ -1504,8 +1587,18 @@ impl ConsumerState {
     ///
     /// Carries no clock (ADR-0011): the mark is a counter, so the three call sites keep
     /// their existing signatures.
+    ///
+    /// While a seek is in flight the unit spends a permit of the window `begin_seek` set aside
+    /// (only a PIP-33 marker reaches here then: `deliver` holds every other dispatch back), so
+    /// it is debited there. The live mirror describes only what was granted since the freeze,
+    /// and a debit against it would saturate at zero and be lost when a rejection folds the two
+    /// back together.
     fn record_dispatch_unit(&mut self) {
-        self.permit_balance = self.permit_balance.saturating_sub(1);
+        let balance = match self.seek_rollback.as_mut() {
+            Some(rollback) => &mut rollback.permit_balance,
+            None => &mut self.permit_balance,
+        };
+        *balance = balance.saturating_sub(1);
         self.dispatch_units_received = self.dispatch_units_received.saturating_add(1);
         self.stall_recovery_attempts = 0;
     }
@@ -2050,6 +2143,40 @@ impl ConsumerState {
         // here so they never reach the user-facing receive() and the
         // post-seek backlog is the only content the consumer sees.
         if self.pending_seek.is_some() {
+            // Whether these frames are stale is the broker's answer to the seek, and it has not
+            // come. A seek it applies makes them stale (`seek_acked` discards what is held); a
+            // seek it rejects leaves them the next messages of a consumer it still holds, so
+            // they are held in arrival order and replayed (`seek_rejected`) rather than
+            // skipped: on an Exclusive or Failover subscription a later cumulative ack would
+            // acknowledge messages the application never saw.
+            if let Some(rollback) = self.seek_rollback.as_mut() {
+                let batch_size = metadata.num_messages_in_batch.unwrap_or(1);
+                let units = if batch_size > 1 {
+                    BatchAckEntry::from_ack_set(batch_size, &cmd.ack_set).unacked_count()
+                } else {
+                    1
+                };
+                // The hold is a memory guard: the broker cannot dispatch more than the window
+                // it holds (the snapshot's balance plus what was granted since the freeze), so
+                // a well-behaved one never reaches it. The frame that crosses the bound is
+                // still admitted, because the broker's dispatcher may overshoot its permits by
+                // the tail of one batch entry; what comes after is not held, and its units are
+                // charged on both sides of the ledger at the rollback instead.
+                let window = u64::from(rollback.permit_balance) + u64::from(self.permit_balance);
+                if rollback.held_weight < window {
+                    rollback.held_weight =
+                        rollback.held_weight.saturating_add(u64::from(units.max(1)));
+                    rollback.held.push(HeldDispatch {
+                        cmd: cmd.clone(),
+                        metadata,
+                        broker_entry_metadata,
+                        body,
+                        arrived_at: now,
+                    });
+                    return Ok(DeliverOutcome::Buffered);
+                }
+                rollback.dropped_units = rollback.dropped_units.saturating_add(units);
+            }
             return Ok(DeliverOutcome::Dropped);
         }
         let redelivery = cmd.redelivery_count.unwrap_or(0);
@@ -2538,8 +2665,48 @@ impl ConsumerState {
         }
     }
 
-    /// Begin a seek operation. Freezes the receiver queue until [`Self::seek_acked`].
+    /// Begin a seek operation. Freezes the receiver queue until [`Self::seek_acked`] (the
+    /// broker applied the seek) or `seek_rejected` (it did not).
+    ///
+    /// The freeze is destructive on purpose — a successful seek replaces the broker-side
+    /// consumer, so the buffered messages and the old credit belong to a position the caller
+    /// has left — but the broker has not said yes yet. What a REJECTED seek needs back is set
+    /// aside in `seek_rollback` instead of being thrown away: the broker still holds this
+    /// consumer exactly as before, so the queue and the four flow-control mirrors must again
+    /// describe it, and the dispatches that arrive meanwhile ([`Self::deliver`] holds them) are
+    /// still the next messages it owes the application. Only the first seek of a chain takes
+    /// that snapshot; a second `begin_seek` while one is in flight would otherwise capture the
+    /// already-zeroed mirrors, so it folds what they recorded since the freeze into the
+    /// snapshot instead.
     pub fn begin_seek(&mut self, request_id: RequestId) {
+        if self.pending_seek.is_none() {
+            self.seek_rollback = Some(SeekRollback {
+                queue: std::mem::take(&mut self.queue),
+                queued_bytes: self.queued_bytes,
+                #[cfg(feature = "scalable-topics")]
+                deferred_queue: std::mem::take(&mut self.deferred_queue),
+                #[cfg(feature = "scalable-topics")]
+                canonical_nack_ids: std::mem::take(&mut self.canonical_nack_ids),
+                manual_flow_permits: self.manual_flow_permits,
+                granted_permits: self.granted_permits,
+                permit_balance: self.permit_balance,
+                consumed_since_flow: self.consumed_since_flow,
+                held: Vec::new(),
+                held_weight: 0,
+                dropped_units: 0,
+            });
+        } else if let Some(rollback) = self.seek_rollback.as_mut() {
+            rollback.manual_flow_permits = rollback
+                .manual_flow_permits
+                .saturating_add(self.manual_flow_permits);
+            rollback.granted_permits = rollback
+                .granted_permits
+                .saturating_add(self.granted_permits);
+            rollback.permit_balance = rollback.permit_balance.saturating_add(self.permit_balance);
+            rollback.consumed_since_flow = rollback
+                .consumed_since_flow
+                .saturating_add(self.consumed_since_flow);
+        }
         self.pending_seek = Some(request_id);
         // Drop buffered messages — the broker will resend from the new position.
         self.queue.clear();
@@ -2558,8 +2725,78 @@ impl ConsumerState {
     }
 
     /// Acknowledge a previously-issued seek. Returns the request id, if one was pending.
+    ///
+    /// The broker applied the seek, so the snapshot [`Self::begin_seek`] set aside — and the
+    /// dispatches held behind it, which the old cursor sent — describe a position the consumer
+    /// has left and are discarded.
     pub fn seek_acked(&mut self) -> Option<RequestId> {
+        self.seek_rollback = None;
         self.pending_seek.take()
+    }
+
+    /// The broker REJECTED the seek `request_id` (`CommandError`).
+    ///
+    /// Thaws the consumer only when `request_id` is the seek currently in flight: the reply to
+    /// an older seek that a newer one superseded must not thaw the newer one.
+    ///
+    /// - With a snapshot the broker still holds this consumer unchanged, so the queue and the
+    ///   mirrors are restored, and the writes the mirrors took since the freeze (a manual `flow`,
+    ///   an aggregate's, a PIP-33 marker's refund) are added onto them: the broker received those
+    ///   grants and spent those permits whatever happened to the seek. The dispatches held back
+    ///   meanwhile are returned for the connection to deliver in arrival order, behind the restored
+    ///   queue and through the ordinary delivery path, which accounts for each of their units.
+    ///   Nothing the consumer had been sent is skipped, so a later cumulative acknowledgement never
+    ///   covers a message the application did not see. Units the hold could not take
+    ///   (`SeekRollback::dropped_units`) are charged on both sides of the ledger like any other
+    ///   unit the client decides never to hold: the broker spent the permit (`permit_balance`) and
+    ///   the client owes it back (`consumed_since_flow`), so the window the broker holds is repaid
+    ///   by [`Self::maybe_flow`] instead of being re-granted on top of it (issue #427's double
+    ///   grant).
+    /// - Without one the consumer was torn down broker-side mid-seek and there is nothing to
+    ///   restore: the caller must re-attach it ([`SeekRejection::ConsumerLost`]).
+    pub(crate) fn seek_rejected(&mut self, request_id: RequestId) -> SeekRejection {
+        if self.pending_seek != Some(request_id) {
+            return SeekRejection::Superseded;
+        }
+        self.pending_seek = None;
+        let Some(rollback) = self.seek_rollback.take() else {
+            return SeekRejection::ConsumerLost;
+        };
+        self.queue = rollback.queue;
+        self.queued_bytes = rollback.queued_bytes;
+        #[cfg(feature = "scalable-topics")]
+        {
+            self.deferred_queue = rollback.deferred_queue;
+            self.canonical_nack_ids = rollback.canonical_nack_ids;
+        }
+        // The live mirrors hold exactly what was written since the freeze (`begin_seek` zeroed
+        // them): add it to the window the snapshot describes.
+        self.manual_flow_permits = rollback
+            .manual_flow_permits
+            .saturating_add(self.manual_flow_permits);
+        self.granted_permits = rollback
+            .granted_permits
+            .saturating_add(self.granted_permits);
+        self.permit_balance = rollback
+            .permit_balance
+            .saturating_sub(rollback.dropped_units)
+            .saturating_add(self.permit_balance);
+        self.consumed_since_flow = rollback
+            .consumed_since_flow
+            .saturating_add(rollback.dropped_units)
+            .saturating_add(self.consumed_since_flow);
+        // The restored messages are receivable again; a `receive()` parked while the queue
+        // was frozen empty must observe them.
+        let wakers: Vec<Waker> = if self.queue_len() > 0 {
+            self.receive_wakers.drain().collect()
+        } else {
+            Vec::new()
+        };
+        SeekRejection::RolledBack {
+            flow: self.maybe_flow(),
+            wakers,
+            held: rollback.held,
+        }
     }
 
     /// Register a waker that fires when a new message arrives, the consumer is
@@ -4955,6 +5192,138 @@ mod tests {
         assert_eq!(consumer.queue_len(), 0);
         assert_eq!(consumer.queued_bytes, 0);
         assert_eq!(consumer.pending_seek, Some(RequestId(7)));
+    }
+
+    /// A consumer with `delivered` of its eight permits spent and its queue full of them, then
+    /// frozen by a seek: the window the broker still holds is `8 - delivered`.
+    fn frozen_consumer(delivered: u32) -> ConsumerState {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 8);
+        let _ = c.initial_flow();
+        for _ in 0..delivered {
+            c.deliver(
+                &message_cmd(0),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"x"),
+                std::time::Instant::now(),
+            )
+            .expect("deliver before the seek");
+        }
+        c.begin_seek(RequestId(7));
+        c
+    }
+
+    fn held(c: &ConsumerState) -> usize {
+        c.seek_rollback
+            .as_ref()
+            .map_or(0, |rollback| rollback.held.len())
+    }
+
+    /// A dispatch that arrives while a seek is in flight is held, not dropped, and what the
+    /// seek's reply does with it is the whole point: a success discards it with the snapshot (the
+    /// old cursor sent it), a rejection hands it back for replay.
+    #[test]
+    fn a_dispatch_during_a_seek_is_held_until_the_broker_answers() {
+        let mut c = frozen_consumer(6);
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                single_metadata(),
+                None,
+                Bytes::from_static(b"y"),
+                std::time::Instant::now(),
+            )
+            .expect("deliver mid-seek");
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        assert_eq!(c.queue_len(), 0, "nothing is receivable while frozen");
+        assert_eq!(held(&c), 1);
+
+        assert_eq!(c.seek_acked(), Some(RequestId(7)));
+        assert!(
+            c.seek_rollback.is_none(),
+            "a successful seek discards the hold"
+        );
+        assert_eq!(c.queue_len(), 0);
+
+        let mut c = frozen_consumer(6);
+        let _ = c.deliver(
+            &message_cmd(0),
+            single_metadata(),
+            None,
+            Bytes::from_static(b"y"),
+            std::time::Instant::now(),
+        );
+        let SeekRejection::RolledBack { held, .. } = c.seek_rejected(RequestId(7)) else {
+            panic!("the broker still held the consumer");
+        };
+        assert_eq!(held.len(), 1, "a rejected seek hands the dispatch back");
+        assert_eq!(
+            c.queue_len(),
+            6,
+            "the queue it had is back; the replay is the caller's"
+        );
+    }
+
+    /// The hold is a memory guard sized by the window the broker holds (two permits here). A
+    /// batch entry that crosses it is still held — the broker's dispatcher may overshoot its
+    /// permits by the tail of one batch — and what follows is not: its units are charged on both
+    /// sides of the ledger at the rollback.
+    #[test]
+    fn the_hold_is_bounded_by_the_window_and_admits_the_frame_that_crosses_it() {
+        let mut c = frozen_consumer(6);
+        let deliver = |c: &mut ConsumerState, metadata: pb::MessageMetadata| {
+            c.deliver(
+                &message_cmd(0),
+                metadata,
+                None,
+                Bytes::from_static(b"z"),
+                std::time::Instant::now(),
+            )
+            .expect("deliver mid-seek")
+        };
+        assert!(matches!(
+            deliver(&mut c, single_metadata()),
+            DeliverOutcome::Buffered
+        ));
+        assert!(
+            matches!(deliver(&mut c, metadata(4)), DeliverOutcome::Buffered),
+            "the batch crossing the two-permit window is still admitted"
+        );
+        assert!(
+            matches!(deliver(&mut c, single_metadata()), DeliverOutcome::Dropped),
+            "past the window nothing more is held"
+        );
+        assert_eq!(held(&c), 2);
+
+        let SeekRejection::RolledBack { held, .. } = c.seek_rejected(RequestId(7)) else {
+            panic!("the broker still held the consumer");
+        };
+        assert_eq!(held.len(), 2);
+        assert_eq!(
+            (c.permit_balance, c.consumed_since_flow),
+            (1, 1),
+            "the one overflowed unit is charged on both sides of the ledger"
+        );
+    }
+
+    /// The reply to an older seek must not thaw, nor empty the hold of, a newer one.
+    #[test]
+    fn a_superseded_rejection_leaves_the_hold_for_the_newer_seek() {
+        let mut c = frozen_consumer(6);
+        c.begin_seek(RequestId(8));
+        let _ = c.deliver(
+            &message_cmd(0),
+            single_metadata(),
+            None,
+            Bytes::from_static(b"y"),
+            std::time::Instant::now(),
+        );
+        assert!(matches!(
+            c.seek_rejected(RequestId(7)),
+            SeekRejection::Superseded
+        ));
+        assert_eq!(c.pending_seek, Some(RequestId(8)));
+        assert_eq!(held(&c), 1);
     }
 
     /// Counter-backed `Wake` implementation used by the

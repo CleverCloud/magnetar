@@ -588,6 +588,30 @@ Both used to grant, and the broker held `2 × receiver_queue_size` for a consume
 Whichever caller now arrives first issues the grant; the other is a no-op, so the order is unobservable on the wire.
 `initial_grant_due` is not the same question as `granted_permits == 0`: a post-seek resubscribe re-attaches without zeroing the additive mirror, so only the flag can tell that attach apart from a consumer that is already fed.
 
+### Seek lifecycle ([ADR-0133](specs/adr/0133-connection-owned-seek-reply-handling.md))
+
+`Connection::seek` freezes the consumer when the request is issued: `begin_seek` sets `pending_seek`, `maybe_flow` stays silent, and `ConsumerState::deliver` queues nothing for the application until the broker answers.
+The freeze is destructive only on the success path.
+`begin_seek` moves the receiver queue and the four flow-control mirrors (`manual_flow_permits`, `granted_permits`, `permit_balance`, `consumed_since_flow`) into `ConsumerState::seek_rollback` rather than discarding them, and `deliver` holds every dispatch that arrives meanwhile in that snapshot, in arrival order, instead of dropping it.
+Only the first seek of a chain takes the snapshot; a second `begin_seek` folds what the live mirrors recorded since the freeze into it, so a grant made between the two seeks is not lost.
+The hold is bounded by the window the broker holds (the snapshot's `permit_balance` plus what was granted since the freeze); the frame that crosses the bound is still admitted, because a broker's dispatcher may overshoot its permits by the tail of one batch entry, and the units past it are counted and charged on both sides of the ledger at the rollback.
+
+- **`CommandSuccess`** discards the snapshot and the hold (`seek_acked`): the broker dropped this consumer applying the seek, the cursor moved, and what the old cursor sent is stale.
+  The awaiting runtime future re-subscribes it (`resubscribe_consumer_after_seek`), waits for the acknowledgement, then grants flow and asks for redelivery.
+  Until it does, `seek_reattach_owed` names the seek whose re-attach is outstanding.
+- **`CommandError`** runs `ConsumerState::seek_rejected`, for an awaited and a forgotten seek alike, and only for the seek currently in flight.
+  With a snapshot the broker still holds the consumer unchanged, so the queue and the mirrors come back with the writes the mirrors took since the freeze added on (a manual `flow`, an aggregate's, the refund of a PIP-33 marker; a marker's debit lands on the snapshot's balance while frozen, because the live balance holds only later grants and a debit against it could saturate at zero and vanish), and the held dispatches are delivered in order behind the restored queue through the same `Connection::deliver_to_consumer` a live `CommandMessage` takes, so each unit is accounted by the ordinary path and each `Message` event is emitted once.
+  Nothing the broker sent is skipped, which matters on an Exclusive or Failover subscription: a later cumulative acknowledgement would otherwise cover messages the application never saw.
+  Java's `ConsumerImpl` takes the same view: its `messageReceived` has no seek check, it clears the incoming queue only when the seek succeeds, and a failure only completes the seek future exceptionally (apache/pulsar `c1aaf96108`).
+  The window the broker holds is repaid by the ordinary refund, never granted twice (issue #427).
+- **The broker removes the consumer mid-seek** — a `CommandCloseConsumer` (same-broker or migration; the broker disconnects a consumer before it resets the cursor, and a reset that then fails answers the seek with `CommandError`), or the acknowledgement of an in-place recovery close (ADR-0108) — drops the snapshot and the hold, because they describe a consumer that no longer exists.
+  With no snapshot the rejection re-attaches the consumer in place on the current socket, the re-attach the close arm deferred to the seek, and drains the `ConsumerClosedByBroker` event as the awaited `Success` path already does.
+- **A seek future dropped before its reply** is handed to the connection by a drop guard in both runtimes (`abandon_consumer_seek_waiter`): the request is retagged `PendingRequestKind::ConsumerSeekForgotten`, whose `Success` re-subscribes with `SubscribeAckAction::ReleaseFlow` and whose `Error` runs the recovery above, neither recording an outcome.
+  A future dropped after the `Success` landed, before it was polled, is caught by `seek_reattach_owed`.
+  The signal is explicit, never waker presence: a seek can be staged before its future's first poll, as the aggregate consumer does for every child.
+  The corollary is that a staged aggregate seek dropped before `complete_staged_seek` is first polled has no guard, and needs none: the aggregate's own resynchronization covers it (`cancelled_aggregate_seek_requests_resynchronization`).
+  `reset` clears the snapshot, the hold, the marker and the forgotten request.
+
 ### Per-consumer stall watchdog (issue #414, ADR-0101, ADR-0103)
 
 The connection keepalive of [ADR-0058](specs/adr/0058-keepalive-watchdog-progress-based.md) refreshes ONE connection-wide `last_activity` baseline off every decoded inbound frame, so a broker whose dispatcher has wedged for a single subscription — still answering `PING` with `PONG`, still serving every other subscription — never ages it.
