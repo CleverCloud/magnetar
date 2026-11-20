@@ -457,10 +457,11 @@ fn assert_quiet_topic_served(collected: &[Outcome], quiet: &str, who: &str) {
     );
 }
 
-/// Control for the busy-sibling case (passes today): `MultiTopicsConsumer::receive` carries the
-/// rotation, so with the same broker script and the same ready-everywhere precondition the quiet
-/// topic is served inside the window. A red `pattern_*` twin is therefore attributable to the
-/// pattern wrapper's missing rotation and not to the publish, flow or arrival logic.
+/// Control for the busy-sibling case (passes with and without the fix):
+/// `MultiTopicsConsumer::receive` carries the rotation, so with the same broker script and the same
+/// ready-everywhere precondition the quiet topic is served inside the window. A red `pattern_*`
+/// twin is therefore attributable to the pattern wrapper's missing rotation and not to the publish,
+/// flow or arrival logic.
 #[tokio::test(flavor = "current_thread")]
 async fn multi_topics_receive_serves_the_quiet_topic_while_the_busy_topic_has_a_backlog() {
     let broker = FakeBroker::start().await;
@@ -551,11 +552,11 @@ async fn pattern_receive_serves_the_quiet_topic_while_the_busy_topic_has_a_backl
     assert_quiet_topic_served(&collected, QUIET, "PatternConsumer");
 }
 
-/// Control for the terminal-child scenarios (passes today): two plain consumers on the two
-/// connections of a `connections_per_broker(2)` client. Dropping the connection of the first one
-/// makes only that consumer terminal; the other, on its own connection, stays live and still
-/// delivers. This is the premise the wrapper scenarios build on: one terminal child, one healthy
-/// child, no shared connection between them.
+/// Control for the terminal-child scenarios (passes with and without the fix): two plain consumers
+/// on the two connections of a `connections_per_broker(2)` client. Dropping the connection of the
+/// first one makes only that consumer terminal; the other, on its own connection, stays live and
+/// still delivers. This is the premise the wrapper scenarios build on: one terminal child, one
+/// healthy child, no shared connection between them.
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_one_connection_terminates_only_the_consumer_on_it() {
     let broker = FakeBroker::start().await;
