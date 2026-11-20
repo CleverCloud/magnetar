@@ -280,13 +280,21 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     .submit_auth_response(refreshed, Some(method));
                 shared.driver_waker.notify_one();
             }
-            ConnectionEvent::TopicListChanged { added, removed } => {
-                // PIP-145 topic-list watcher delta. Push into the per-client buffer + wake
-                // any `Client::next_topic_list_change` future.
+            ConnectionEvent::TopicListChanged {
+                watcher_id,
+                added,
+                removed,
+            } => {
+                // PIP-145 topic-list watcher delta. Push into the per-client buffer, still
+                // addressed to its watcher, + wake any `Client::next_topic_list_change` future.
                 shared
                     .topic_list_changes
                     .lock()
-                    .push_back(crate::TopicListChange { added, removed });
+                    .push_back(crate::TopicListChange {
+                        watcher_id,
+                        added,
+                        removed,
+                    });
                 shared.topic_list_notify.notify_waiters();
             }
             ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker } => {

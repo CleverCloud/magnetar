@@ -140,6 +140,7 @@ The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` backgr
 It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
 Delivery is sequential and in order, and the callback acks explicitly (the poller never auto-acks).
 An explicit or terminal remote close ends the task when `receive()` returns an error.
+An error about one message (a decrypt or decompress failure under the default `CryptoFailureAction::Fail`) does not: the poller, the wrapper poller and the `TableView` drain key their exit on `ConsumerApi::is_terminal` / `WrapperReceiver::is_terminal` (for a wrapper, true once every child is terminal), the gate `receive()` itself uses, and otherwise log the error at `debug!`, leave the message unacked and read the next one ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
 Dropping the returned `MessageListenerHandle` instead aborts the poller and drops its owned consumer clone; only the final clone stages the best-effort close.
 
 The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
@@ -709,7 +710,7 @@ After the lock drops, the driver pulls semantic events via `poll_event()` and re
 
 - `ConnectionEvent::AuthChallenge { method, challenge }` — driver consults the configured `AuthProvider`, asks it for a fresh blob via `respond_to_challenge`, and submits it via `submit_auth_response` (PIP-30 / PIP-292).
   The same hook carries SASL Kerberos / GSSAPI continuation tokens: `magnetar_auth_sasl::SaslKerberos` forwards each challenge into its wrapped `GssapiClient` so the GSSAPI initiate loop runs naturally over the existing trait surface (no new `SaslMechanism` trait was needed; see [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
-- `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes the delta into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
+- `ConnectionEvent::TopicListChanged { watcher_id, added, removed }` — driver pushes the delta, still addressed to its watcher, into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
 - `ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker }` — driver pushes the observation into `ConnectionShared.replicated_subscription_markers` and wakes `replicated_subscription_marker_notify` (PIP-33 / ADR-0034).
   The marker is filtered off the user-visible message stream upstream in the `magnetar-proto` receive path so it never reaches `Consumer::receive`.
 - `ConnectionEvent::ChecksumMismatch { … }` and the **diagnostic** `ConnectionEvent::LookupResponse` carrying `LookupOutcome::Redirected` — events proto already logs at the point of detection ([ADR-0054](specs/adr/0054-logging-policy.md) single-owner rule); both engines admit them to the drain predicate and consume them **silently**, which stops them accumulating unbounded in the proto event queue.
@@ -929,7 +930,8 @@ The connection turns each action into an outbound `BaseCommand`.
 
 `magnetar-proto::topic_watcher::TopicWatcherRegistry` (85 lines) carries the PIP-145 broker-driven topic-discovery state.
 The connection handles `CommandWatchTopicListResponse` / `CommandTopicListUpdated` opcodes and emits `ConnectionEvent::TopicListChanged` on the event queue.
-The driver forwards those to `ConnectionShared.topic_list_changes`, where `PatternConsumer::update` reconciles them against its child consumers.
+Each event names the watcher the broker addressed it to (the id `Connection::watch_topic_list` allocated), and a delta for a watcher the connection does not hold is dropped.
+The driver forwards the rest to `ConnectionShared.topic_list_changes`, one buffer shared by every watcher of the connection, where `PatternConsumer::update` takes only the deltas of its own watcher (`ConnectionShared::take_topic_list_change`) and reconciles them against its child consumers ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
 
 ### Replicated-subscription markers (`magnetar-proto/src/markers.rs`)
 
@@ -1291,6 +1293,12 @@ The receive race is _not_ a channel — it is a `futures_util::future::select_al
             └─────────────────────────┘         on their Connection's Waker slab.
 ```
 
+The sweep is fair and survives a dead child, in both wrappers.
+It starts after the child that answered last (a round-robin cursor per wrapper), because `select_all` returns the first ready future in input order and a child that keeps a backlog would otherwise starve every later one.
+A child that is terminal (closed, a terminal subscribe failure, or its connection lost for good) resolves `receive()` with `Err(Closed)` on its first poll, forever, so it would win every round in which no earlier child is ready and hide the live ones.
+`receive()` therefore asks `ConsumerApi::is_terminal` about a child only when that child's future resolves `Err`: a terminal child leaves the sweep, after its queued messages were delivered, and the wait goes on over the rest; a failure on one message of a child that stays open is returned instead, naming its topic, and the cursor moves past it.
+Only when every child of the snapshot is terminal does `receive()` fail, naming the last one.
+A terminal child among live ones is thus invisible to a pull caller; `is_connected()` reports it.
 Per-topic ack / nack / seek dispatch via the topic name attached to the incoming message.
 Aggregate DLQ republish is the deliberate exception to per-topic routing: the caller supplies one producer destination shared by all children.
 The coordinator clones the `Arc<Vec<NamedConsumer<C>>>` membership snapshot under the collection mutex and releases the guard before awaiting, so the traversed list and order are fixed and no collection lock spans child I/O.
@@ -1302,7 +1310,8 @@ Cancellation likewise stops future traversal while preserving completed children
 
 - `MultiTopicsConsumer::add_topic` / `remove_topic` subscribe and unsubscribe at runtime.
 - `PatternConsumer` reconciles topic list deltas on demand via `update(&client)`.
-  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`; `update()` drains the buffer, diffs against `topics()`, and spawns / closes child consumers.
+  The driver pushes `TopicListChanged` deltas into `ConnectionShared.topic_list_changes`, each addressed to the watcher that produced it; `update()` takes only the deltas of the watcher its builder opened (two pattern consumers on one client never apply or starve each other's), moves them, in arrival order, into the consumer's own backlog and applies it step by step, spawning / closing child consumers.
+  A step leaves the backlog only once it has taken effect, so a refused subscribe (kept for the next call, while the steps behind it still run) or a dropped `update()` future loses no topic: discovery is delta-only after the first snapshot, and the broker announces a topic once.
   `start_auto_reconcile(client, interval)` does the same on a `tokio::time::interval` schedule.
 
 ---
@@ -1316,7 +1325,8 @@ Cancellation likewise stops future traversal while preserving completed children
                   Client::watch_topic_list(namespace, pattern)
                                             │
                                             ▼
-                  initial snapshot of matching topics
+                  initial snapshot of matching topics + the watcher id
+                  (kept by the PatternConsumer to take its own deltas)
                                             │
                                             ▼
                   open one child Consumer per matched topic
@@ -1327,19 +1337,21 @@ Cancellation likewise stops future traversal while preserving completed children
                                             │
                                             ▼
                   meanwhile, on the driver:
-                  every CommandTopicListUpdated →
-                    ConnectionShared.topic_list_changes.push_back(delta)
+                  every CommandWatchTopicUpdate for a watcher the connection holds →
+                    ConnectionShared.topic_list_changes.push_back(delta + its watcher_id)
                     topic_list_notify.notify_waiters()
                                             │
                                             ▼
                   caller does PatternConsumer::update(&client)
                                             │
                                             ▼
-                  drain topic_list_changes
-                  diff against current children
-                  open new children for `added`
-                  close child consumers for `removed`
-                  emit a ReconcileReport
+                  move the deltas addressed to this consumer's watcher out of
+                  topic_list_changes into its backlog, in arrival order
+                  (a removal drops a still-waiting addition of the same topic)
+                  walk the backlog, one step at a time:
+                    open a new child for `added` (a refused subscribe stays in the backlog)
+                    close the child for `removed`
+                  emit a ReconcileReport (the first subscribe error, if any, instead)
 ```
 
 `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval` loop that calls `update(&client)` on every tick; the returned `JoinHandle` is used for clean shutdown.

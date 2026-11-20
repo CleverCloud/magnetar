@@ -19,7 +19,7 @@ use std::time::Duration;
 use super::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, Engine, MessageDecryptorApi,
     MessageEncryptorApi, OperationDeadline, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
-    SubscribeApi, TopicListChange, TransactionApi, WatchTopicListFut,
+    SubscribeApi, TopicListChange, TransactionApi, WatchTopicListFut, WatchTopicListWithIdFut,
 };
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -171,7 +171,7 @@ impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
         namespace: &'a str,
         pattern: &'a str,
         deadline: &'a mut OperationDeadline,
-    ) -> WatchTopicListFut<'a, Self> {
+    ) -> WatchTopicListWithIdFut<'a, Self> {
         let (timer, last_broker_error) = deadline.parts();
         Box::pin(
             magnetar_runtime_tokio::Client::watch_topic_list_with_operation_deadline(
@@ -184,10 +184,12 @@ impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
         )
     }
 
-    fn poll_topic_list_change(&self) -> Option<TopicListChange> {
-        magnetar_runtime_tokio::Client::poll_topic_list_change(self).map(|c| TopicListChange {
-            added: c.added,
-            removed: c.removed,
+    fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {
+        magnetar_runtime_tokio::Client::poll_topic_list_change(self, watcher_id).map(|c| {
+            TopicListChange {
+                added: c.added,
+                removed: c.removed,
+            }
         })
     }
 }
@@ -1020,6 +1022,10 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn is_closed(&self) -> bool {
         magnetar_runtime_tokio::Consumer::is_closed(self)
+    }
+
+    fn is_terminal(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_terminal(self)
     }
 
     fn is_connected(&self) -> bool {

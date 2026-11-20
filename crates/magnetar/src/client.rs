@@ -1100,9 +1100,13 @@ where
 
     /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
     /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
-    /// this pattern right now" workflows. Live updates are emitted by the connection as
-    /// `TopicListChanged` events and surfaced through
-    /// [`crate::BrokerMetadataApi::poll_topic_list_change`].
+    /// this pattern right now" workflows. The watcher stays registered on the connection and the
+    /// broker keeps announcing its topic changes to it as `TopicListChanged` events; each is
+    /// addressed to the watcher it belongs to, and only that watcher's owner takes it from the
+    /// connection's buffer ([`crate::BrokerMetadataApi::poll_topic_list_change`], which a
+    /// [`crate::PatternConsumer`] does for its own watcher). This call returns the snapshot only
+    /// and keeps no id to take them with, so nothing consumes the deltas of the watcher it opens:
+    /// they are never taken from the buffer, and are not applied by any other consumer.
     ///
     /// # Errors
     ///
@@ -1111,14 +1115,17 @@ where
         let mut deadline = crate::BrokerMetadataApi::new_metadata_operation_deadline(&self.inner);
         self.topic_list_snapshot_with_deadline(namespace, pattern, &mut deadline)
             .await
+            .map(|(_, topics)| topics)
     }
 
+    /// The watcher id the connection allocated and the initial snapshot of a new topic-list
+    /// watcher; see [`Self::topic_list_snapshot`].
     pub(crate) async fn topic_list_snapshot_with_deadline(
         &self,
         namespace: &str,
         pattern: &str,
         deadline: &mut crate::OperationDeadline,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(u64, Vec<String>)> {
         crate::BrokerMetadataApi::watch_topic_list_with_deadline(
             &self.inner,
             namespace,
@@ -1177,10 +1184,32 @@ pub struct MemoryLimit {
 #[derive(Debug)]
 pub struct Reader<C: crate::ConsumerApi = magnetar_runtime_tokio::Consumer> {
     pub(crate) consumer: C,
-    /// Last message id returned via [`Self::read_next`]. Used by
-    /// [`Self::has_message_available`] to ask the broker "is there anything past
-    /// what I last handed you?" without the caller having to track the cursor.
+    /// Position [`Self::has_message_available`] asks the broker about: "is there anything past
+    /// this id?", without the caller having to track the cursor. `None` means "nothing named
+    /// yet", and the answer is then whether the topic holds any message at all.
+    ///
+    /// [`Self::read_next`] stamps the id of the message it returns. A seek moves the reader, so
+    /// every seek wrapper rewrites it as well (see [`Self::has_message_available`]): an id left
+    /// over from before the seek describes a position the reader no longer has.
     pub(crate) last_received: parking_lot::Mutex<Option<magnetar_proto::MessageId>>,
+}
+
+/// `true` when `id` asks for the head ([`magnetar_proto::MessageId::LATEST`]). Only the ledger
+/// and entry ids say so: a sentinel read off the wire carries whatever partition and batch fields
+/// the sender chose, so whole-value equality would miss it.
+fn is_latest(id: &magnetar_proto::MessageId) -> bool {
+    let latest = magnetar_proto::MessageId::LATEST;
+    id.ledger_id == latest.ledger_id && id.entry_id == latest.entry_id
+}
+
+/// `true` when the topic head `head` says the topic holds no message: an entry id of `-1`, which
+/// read as unsigned is `u64::MAX` (what [`magnetar_proto::MessageId::EARLIEST`] carries too).
+/// The ledger id beside it is not tested, because nothing read here says which ledger a broker
+/// reports for an empty topic, and neither are the partition and batch fields, which whole-value
+/// equality with `EARLIEST` would test and a head read off the wire need not match. A real
+/// message never has this entry id, and as an unsigned value it compares above every real one.
+fn holds_no_message(head: &magnetar_proto::MessageId) -> bool {
+    head.entry_id == u64::MAX
 }
 
 impl<C: crate::ConsumerApi> Reader<C> {
@@ -1206,10 +1235,57 @@ impl<C: crate::ConsumerApi> Reader<C> {
         *self.last_received.lock() = Some(message_id);
     }
 
-    /// `true` if the broker has at least one message strictly past the most-recently
-    /// returned message id. Mirrors Java `Reader#hasMessageAvailable` (no argument —
-    /// the reader tracks its own cursor). Returns `true` for fresh readers (no
-    /// `read_next` yet) if the broker reports any non-empty topic.
+    /// A seek moved the reader to a position it cannot name from here: forget the message id
+    /// the old position left in the cursor, so [`Self::has_message_available`] answers for the
+    /// new position instead of the one the reader left. With no id, the answer is whether the
+    /// topic holds any message, which is what a fresh reader answers.
+    fn forget_position(&self) {
+        *self.last_received.lock() = None;
+    }
+
+    /// The broker accepted a seek to `target`; point the cursor at where that left the reader.
+    ///
+    /// The old cursor is dropped first, whatever happens next. A seek to the head
+    /// ([`magnetar_proto::MessageId::LATEST`]) then asks the broker for the head and makes it
+    /// the cursor, because "nothing is past the head" is the position the reader now holds and
+    /// no cursor-less answer can say it. Any other target replays from the sought message, and
+    /// the cursor-less answer is the right one for it.
+    ///
+    /// Not atomic with the seek: a message published between the broker accepting the seek and
+    /// the head answering is counted as already passed, until the next publish or the next
+    /// `read_next`, whichever comes first.
+    async fn settle_cursor_after_seek(
+        &self,
+        target: magnetar_proto::MessageId,
+    ) -> Result<(), PulsarError> {
+        self.forget_position();
+        if !is_latest(&target) {
+            return Ok(());
+        }
+        let head = crate::ConsumerApi::last_message_id(&self.consumer)
+            .await
+            .map_err(|err| PulsarError::Other(format!("seek: reading the head: {err}")))?;
+        // An empty topic's head compares above every real id: as a cursor it would answer
+        // "nothing" for ever. No cursor answers it correctly.
+        if !holds_no_message(&head) {
+            *self.last_received.lock() = Some(head);
+        }
+        Ok(())
+    }
+
+    /// `true` if the broker has at least one message strictly past the position the reader is
+    /// at. Mirrors Java `Reader#hasMessageAvailable` (no argument — the reader tracks its own
+    /// cursor).
+    ///
+    /// The position is the last message [`Self::read_next`] returned, or, after a seek, where
+    /// the seek left the reader: a topic read to its end and rewound with
+    /// [`Self::seek_to_earliest`] has a message available, and one fast-forwarded with
+    /// [`Self::seek_to_latest`] has none. Returns `true` for a reader at no named position
+    /// (fresh, or sought to a message id or a timestamp) if the broker reports a topic that holds
+    /// a message, and `false` for an empty one (a head with entry id `-1`). That over-reports
+    /// after `seek_to_message` to an id past the head, and after `seek_to_timestamp` to a time
+    /// later than the newest message, because the broker does not say which message the timestamp
+    /// resolved to.
     ///
     /// # Errors
     /// - [`PulsarError::Other`] on broker rejection or wire failure.
@@ -1223,11 +1299,13 @@ impl<C: crate::ConsumerApi> Reader<C> {
         let last = crate::ConsumerApi::last_message_id(&self.consumer)
             .await
             .map_err(|err| PulsarError::Other(format!("has_message_available: {err}")))?;
-        Ok(last != magnetar_proto::MessageId::EARLIEST)
+        Ok(!holds_no_message(&last))
     }
 
     /// Borrow the underlying consumer for advanced operations not covered by
-    /// [`crate::ConsumerApi`] (close, seek, flow, etc.).
+    /// [`crate::ConsumerApi`] (close, flow, etc.). Seek through the reader's own `seek_to_*`
+    /// methods, not through this borrow: the consumer cannot reach the reader's cursor, so
+    /// [`Self::has_message_available`] would keep answering for the position the reader left.
     #[must_use]
     pub fn consumer(&self) -> &C {
         &self.consumer
@@ -1308,25 +1386,35 @@ impl Reader<magnetar_runtime_tokio::Consumer> {
     }
 
     /// Seek the reader to the earliest available message. Mirrors Java
-    /// `Reader#seek(MessageId.earliest)`.
+    /// `Reader#seek(MessageId.earliest)`. [`Self::has_message_available`] answers for the new
+    /// position from here on.
     pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
-        self.consumer
-            .seek_to_earliest()
+        self.seek_to_message(magnetar_proto::MessageId::EARLIEST)
             .await
-            .map_err(PulsarError::Client)
     }
 
     /// Seek the reader to the latest (head) position. Mirrors Java
-    /// `Reader#seek(MessageId.latest)`.
+    /// `Reader#seek(MessageId.latest)`. [`Self::has_message_available`] answers for the new
+    /// position from here on.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Client`] when the seek fails.
+    /// - [`PulsarError::Other`] when the seek succeeds but the broker then fails to report the
+    ///   head. The reader is at the head either way; the cursor is left cleared, so
+    ///   [`Self::has_message_available`] answers whether the topic holds any message until the next
+    ///   `read_next`.
     pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
-        self.consumer
-            .seek_to_latest()
+        self.seek_to_message(magnetar_proto::MessageId::LATEST)
             .await
-            .map_err(PulsarError::Client)
     }
 
     /// Seek the reader to a specific message id. Mirrors Java
-    /// `Reader#seek(MessageId)`.
+    /// `Reader#seek(MessageId)`. [`Self::has_message_available`] answers for the new position
+    /// from here on.
+    ///
+    /// # Errors
+    /// As [`Self::seek_to_latest`], which this is when `message_id` is
+    /// [`magnetar_proto::MessageId::LATEST`].
     pub async fn seek_to_message(
         &self,
         message_id: magnetar_proto::MessageId,
@@ -1334,16 +1422,21 @@ impl Reader<magnetar_runtime_tokio::Consumer> {
         self.consumer
             .seek_to_message(message_id)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(PulsarError::Client)?;
+        self.settle_cursor_after_seek(message_id).await
     }
 
     /// Seek the reader to a publish-time deadline (millis since UNIX epoch). Mirrors Java
-    /// `Reader#seek(long)`.
+    /// `Reader#seek(long)`. The broker does not say which message the timestamp resolved to, so
+    /// afterwards [`Self::has_message_available`] answers whether the topic holds any message,
+    /// until the next `read_next`.
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
         self.consumer
             .seek_to_timestamp(publish_time_ms)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(PulsarError::Client)?;
+        self.forget_position();
+        Ok(())
     }
 
     /// Mirrors `org.apache.pulsar.client.api.Reader#isConnected`.
@@ -1422,6 +1515,69 @@ impl Reader<magnetar_runtime_tokio::Consumer> {
     #[must_use]
     pub fn has_received_any_message(&self) -> bool {
         self.consumer.has_received_any_message()
+    }
+}
+
+/// Moonpool-engine seek wrappers: the twin of the tokio ones above, with the same cursor
+/// behaviour. A moonpool reader used to seek through [`Reader::consumer`], which cannot reach the
+/// cursor, so [`Reader::has_message_available`] kept answering for the position it left; seek
+/// through these instead. Errors are stringified into [`PulsarError::Other`], as every
+/// engine-generic `Reader` method does.
+#[cfg(feature = "moonpool")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static>
+    Reader<magnetar_runtime_moonpool::Consumer<P>>
+{
+    /// Seek the reader to the earliest available message. Mirrors Java
+    /// `Reader#seek(MessageId.earliest)`. [`Self::has_message_available`] answers for the new
+    /// position from here on.
+    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
+        self.seek_to_message(magnetar_proto::MessageId::EARLIEST)
+            .await
+    }
+
+    /// Seek the reader to the latest (head) position. Mirrors Java
+    /// `Reader#seek(MessageId.latest)`. [`Self::has_message_available`] answers for the new
+    /// position from here on.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] when the seek fails, or when it succeeds but the broker then fails
+    ///   to report the head. The reader is at the head either way; the cursor is left cleared, so
+    ///   [`Self::has_message_available`] answers whether the topic holds any message until the next
+    ///   `read_next`.
+    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
+        self.seek_to_message(magnetar_proto::MessageId::LATEST)
+            .await
+    }
+
+    /// Seek the reader to a specific message id. Mirrors Java
+    /// `Reader#seek(MessageId)`. [`Self::has_message_available`] answers for the new position
+    /// from here on.
+    ///
+    /// # Errors
+    /// As [`Self::seek_to_latest`], which this is when `message_id` is
+    /// [`magnetar_proto::MessageId::LATEST`].
+    pub async fn seek_to_message(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_message(message_id)
+            .await
+            .map_err(|err| PulsarError::Other(format!("seek_to_message: {err}")))?;
+        self.settle_cursor_after_seek(message_id).await
+    }
+
+    /// Seek the reader to a publish-time deadline (millis since UNIX epoch). Mirrors Java
+    /// `Reader#seek(long)`. The broker does not say which message the timestamp resolved to, so
+    /// afterwards [`Self::has_message_available`] answers whether the topic holds any message,
+    /// until the next `read_next`.
+    pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_timestamp(publish_time_ms)
+            .await
+            .map_err(|err| PulsarError::Other(format!("seek_to_timestamp: {err}")))?;
+        self.forget_position();
+        Ok(())
     }
 }
 

@@ -68,7 +68,7 @@ pub use engine::TokioEngine;
 pub use engine::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, OperationDeadline,
     ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange,
-    WatchTopicListFut,
+    WatchTopicListFut, WatchTopicListWithIdFut,
 };
 pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 

@@ -31,8 +31,8 @@
 //! - `mod.rs` (this file) — the [`Engine`] trait, the per-surface extension traits
 //!   (`TransactionApi`, `ProducerApi`, `ConsumerApi`, `BrokerMetadataApi`, `SubscribeApi`,
 //!   `CreateProducerApi`), the shared type aliases (`SubscribeFut`, `ReceiveOptFut`,
-//!   `ReceiveBatchFut`, `WatchTopicListFut`, `OpenProducerFut`), and the [`TopicListChange`] data
-//!   struct.
+//!   `ReceiveBatchFut`, `WatchTopicListFut`, `WatchTopicListWithIdFut`, `OpenProducerFut`), and the
+//!   [`TopicListChange`] data struct.
 //! - [`tokio`] — the [`TokioEngine`] marker + every `impl … for magnetar_runtime_tokio::*` block.
 //! - [`moonpool`] — the [`MoonpoolEngine`] marker + every `impl<P> … for
 //!   magnetar_runtime_moonpool::*` block.
@@ -486,6 +486,18 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `true` once the consumer has entered a terminal state.
     fn is_closed(&self) -> bool;
 
+    /// `true` once [`Self::receive`] can only resolve `Err` on an empty queue: the runtime's own
+    /// receive gate (a closed consumer, a per-handle terminal subscribe failure, a connection
+    /// closed for good or left with no driver). A recoverable supervised reconnect window is not
+    /// terminal, and the state is permanent.
+    ///
+    /// Broader than [`Self::is_closed`], which only reports the consumer's own `closed` flag (a
+    /// per-handle terminal subscribe failure never sets it). A `receive()` that fails while this
+    /// is `false` concerns one message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`): the consumer is still open and the next `receive()` can
+    /// succeed. The push-delivery loops key their exit on this, not on the error alone.
+    fn is_terminal(&self) -> bool;
+
     /// `true` while the broker connection is up. Mirrors Java
     /// `Consumer#isConnected`.
     fn is_connected(&self) -> bool;
@@ -841,22 +853,23 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
         pattern: &'a str,
     ) -> WatchTopicListFut<'a, Self>;
 
-    /// Deadline-aware topic-list snapshot used by built-in composite builders.
+    /// Deadline-aware topic-list snapshot used by built-in composite builders. Resolves to the
+    /// id the connection allocated to the new watcher and the initial snapshot; the id is what
+    /// addresses the watcher's later deltas to its owner through
+    /// [`Self::poll_topic_list_change`].
     #[doc(hidden)]
     fn watch_topic_list_with_deadline<'a>(
         &'a self,
         namespace: &'a str,
         pattern: &'a str,
-        _deadline: &'a mut OperationDeadline,
-    ) -> WatchTopicListFut<'a, Self> {
-        self.watch_topic_list(namespace, pattern)
-    }
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListWithIdFut<'a, Self>;
 
-    /// Drain the next pending `TopicListChanged` delta from the
-    /// connection's PIP-145 buffer, if any. Returns `None` when no
-    /// deltas are pending. Used by `PatternConsumer::update` to
-    /// reconcile its child set.
-    fn poll_topic_list_change(&self) -> Option<TopicListChange>;
+    /// Drain the next pending `TopicListChanged` delta addressed to the watcher `watcher_id`
+    /// from the connection's PIP-145 buffer, if any. Returns `None` when that watcher has no
+    /// deltas pending; the deltas of every other watcher on the connection stay buffered for
+    /// their own owners. Used by `PatternConsumer::update` to reconcile its child set.
+    fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange>;
 }
 
 /// Engine-side subscribe surface used by `ConsumerBuilder<E>` and the
@@ -939,6 +952,17 @@ pub type ReceiveBatchFut<'a, C> = Pin<
 #[cfg(feature = "tokio")]
 pub type WatchTopicListFut<'a, B> =
     Pin<Box<dyn Future<Output = Result<Vec<String>, <B as BrokerMetadataApi>::Error>> + Send + 'a>>;
+
+/// Helper alias: `BrokerMetadataApi::watch_topic_list_with_deadline` future return type — the
+/// id of the new watcher and its initial snapshot.
+#[cfg(feature = "tokio")]
+pub type WatchTopicListWithIdFut<'a, B> = Pin<
+    Box<
+        dyn Future<Output = Result<(u64, Vec<String>), <B as BrokerMetadataApi>::Error>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Engine-side producer-creation surface used by `ProducerBuilder<E>`
 /// and `PartitionedProducer<E>`. Same shape as [`SubscribeApi`] for

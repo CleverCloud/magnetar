@@ -3964,12 +3964,19 @@ impl Connection {
                     watcher.topics_hash = Some(ok.topics_hash.clone());
                     watcher.initialised = true;
                 }
-                self.pending_requests.remove(&rid);
+                // The id this connection allocated, which is the one every later delta for the
+                // watcher is keyed on. A request cancelled before its response (its pending
+                // entry is gone) has no reader, so the id the broker echoed stands in.
+                let watcher_id = match self.pending_requests.remove(&rid) {
+                    Some(PendingRequestKind::TopicWatcher { watcher_id }) => watcher_id,
+                    _ => ok.watcher_id,
+                };
                 let topics = ok.topic.clone();
                 self.outcomes.insert(
                     PendingOpKey::Request(rid),
                     OpOutcome::TopicListSnapshot {
                         request_id: rid,
+                        watcher_id,
                         topics: topics.clone(),
                     },
                 );
@@ -3985,13 +3992,18 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation(
                         "missing CommandWatchTopicUpdate",
                     ))?;
+                // A delta is addressed to one watcher and only that watcher's owner may apply it.
+                // One for an id this connection holds no watcher for (a snapshot cancelled after
+                // its frame went out, or a stale id) has no owner that could ever claim it, so it
+                // is dropped here instead of queueing for the life of the connection.
                 if let Some(watcher) = self.topic_watchers.lookup_by_watcher_id(upd.watcher_id) {
                     watcher.topics_hash = Some(upd.topics_hash.clone());
+                    self.events.push_back(ConnectionEvent::TopicListChanged {
+                        watcher_id: upd.watcher_id,
+                        added: upd.new_topics,
+                        removed: upd.deleted_topics,
+                    });
                 }
-                self.events.push_back(ConnectionEvent::TopicListChanged {
-                    added: upd.new_topics,
-                    removed: upd.deleted_topics,
-                });
             }
             pb::base_command::Type::NewTxnResponse => {
                 let resp = command
@@ -15079,6 +15091,152 @@ mod conn_state_tests {
         assert!(
             conn.topic_watchers.lookup_by_request(request_id).is_none(),
             "cancelling the initial snapshot must remove the watcher registry entry"
+        );
+    }
+
+    /// Feed one `CommandWatchTopicListSuccess` echoing `watcher_id` for `request_id`.
+    fn feed_watch_topic_list_success(conn: &mut Connection, request_id: u64, watcher_id: u64) {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTopicListSuccess as i32,
+            watch_topic_list_success: Some(pb::CommandWatchTopicListSuccess {
+                request_id,
+                watcher_id,
+                topic: vec![format!("persistent://public/default/seed-{watcher_id}")],
+                topics_hash: "seed".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode WatchTopicListSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle WatchTopicListSuccess");
+    }
+
+    /// Feed one `CommandWatchTopicUpdate` addressed to `watcher_id`.
+    fn feed_watch_topic_update(conn: &mut Connection, watcher_id: u64, new_topic: &str) {
+        let update = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTopicUpdate as i32,
+            watch_topic_update: Some(pb::CommandWatchTopicUpdate {
+                watcher_id,
+                new_topics: vec![new_topic.to_owned()],
+                deleted_topics: Vec::new(),
+                topics_hash: "update".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &update).expect("encode WatchTopicUpdate");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle WatchTopicUpdate");
+    }
+
+    /// Every `TopicListChanged` event queued on `conn`, as `(watcher_id, added)`.
+    fn topic_list_changes(conn: &mut Connection) -> Vec<(u64, Vec<String>)> {
+        let mut changes = Vec::new();
+        while let Some(event) = conn.poll_event() {
+            if let ConnectionEvent::TopicListChanged {
+                watcher_id, added, ..
+            } = event
+            {
+                changes.push((watcher_id, added));
+            }
+        }
+        changes
+    }
+
+    /// Every PIP-145 delta names the watcher the broker addressed it to, and the snapshot
+    /// outcome of each watcher request names the id that request allocated. Two watchers share
+    /// one connection, so without the id their deltas are indistinguishable downstream and
+    /// whichever consumer polls first applies the other's.
+    #[test]
+    fn topic_list_deltas_and_snapshots_carry_their_watcher_id() {
+        let mut conn = handshaked_connection();
+        let request_a = conn.watch_topic_list("public/default", "a-.*");
+        let request_b = conn.watch_topic_list("public/default", "b-.*");
+        let sent = decode_transmitted(&conn.poll_transmit());
+        let watcher_ids: Vec<u64> = sent
+            .iter()
+            .filter_map(|command| command.watch_topic_list.as_ref())
+            .map(|watch| watch.watcher_id)
+            .collect();
+        assert_eq!(watcher_ids.len(), 2, "two watch requests went out");
+        assert_ne!(
+            watcher_ids[0], watcher_ids[1],
+            "each watcher has its own id"
+        );
+        let (watcher_a, watcher_b) = (watcher_ids[0], watcher_ids[1]);
+
+        // Answer the second watcher first: the outcome must follow the request, not the order.
+        feed_watch_topic_list_success(&mut conn, request_b.0, watcher_b);
+        feed_watch_topic_list_success(&mut conn, request_a.0, watcher_a);
+        for (request, watcher_id) in [(request_a, watcher_a), (request_b, watcher_b)] {
+            match conn.take_outcome(PendingOpKey::Request(request)) {
+                Some(OpOutcome::TopicListSnapshot {
+                    watcher_id: carried,
+                    ..
+                }) => assert_eq!(carried, watcher_id, "snapshot of {request:?}"),
+                other => panic!("expected a topic-list snapshot for {request:?}, got {other:?}"),
+            }
+        }
+        topic_list_changes(&mut conn);
+
+        feed_watch_topic_update(&mut conn, watcher_b, "persistent://public/default/b-new");
+        feed_watch_topic_update(&mut conn, watcher_a, "persistent://public/default/a-new");
+
+        assert_eq!(
+            topic_list_changes(&mut conn),
+            vec![
+                (
+                    watcher_b,
+                    vec!["persistent://public/default/b-new".to_owned()]
+                ),
+                (
+                    watcher_a,
+                    vec!["persistent://public/default/a-new".to_owned()]
+                ),
+            ],
+            "each delta names the watcher the broker addressed it to, in arrival order"
+        );
+    }
+
+    /// A delta for an id this connection holds no watcher for can never be claimed by an owner:
+    /// the watcher of a snapshot that was cancelled after its frame went out, or an id the
+    /// broker invented. It is dropped, not queued behind the live watchers' deltas for good.
+    #[test]
+    fn topic_list_delta_for_a_watcher_this_connection_does_not_hold_is_dropped() {
+        let mut conn = handshaked_connection();
+        let live = conn.watch_topic_list("public/default", "live-.*");
+        let cancelled = conn.watch_topic_list("public/default", "cancelled-.*");
+        let sent = decode_transmitted(&conn.poll_transmit());
+        let watcher_ids: Vec<u64> = sent
+            .iter()
+            .filter_map(|command| command.watch_topic_list.as_ref())
+            .map(|watch| watch.watcher_id)
+            .collect();
+        let (live_watcher, cancelled_watcher) = (watcher_ids[0], watcher_ids[1]);
+        feed_watch_topic_list_success(&mut conn, live.0, live_watcher);
+        conn.cancel_request(cancelled);
+        while conn.poll_event().is_some() {}
+
+        feed_watch_topic_update(
+            &mut conn,
+            cancelled_watcher,
+            "persistent://public/default/c-1",
+        );
+        feed_watch_topic_update(&mut conn, u64::MAX, "persistent://public/default/unknown");
+        feed_watch_topic_update(
+            &mut conn,
+            live_watcher,
+            "persistent://public/default/live-1",
+        );
+
+        assert_eq!(
+            topic_list_changes(&mut conn),
+            vec![(
+                live_watcher,
+                vec!["persistent://public/default/live-1".to_owned()]
+            )],
+            "only the delta of the watcher this connection holds is surfaced"
         );
     }
 

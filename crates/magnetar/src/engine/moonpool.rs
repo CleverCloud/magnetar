@@ -22,6 +22,7 @@ use std::time::Duration;
 use super::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, OperationDeadline, ProducerApi,
     ReceiveBatchFut, ReceiveOptFut, SubscribeApi, TopicListChange, WatchTopicListFut,
+    WatchTopicListWithIdFut,
 };
 use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, TransactionApi};
 
@@ -971,7 +972,7 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
         namespace: &'a str,
         pattern: &'a str,
         deadline: &'a mut OperationDeadline,
-    ) -> WatchTopicListFut<'a, Self> {
+    ) -> WatchTopicListWithIdFut<'a, Self> {
         let (timer, last_broker_error) = deadline.parts();
         Box::pin(
             magnetar_runtime_moonpool::Client::watch_topic_list_with_operation_deadline(
@@ -984,10 +985,12 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
         )
     }
 
-    fn poll_topic_list_change(&self) -> Option<TopicListChange> {
-        magnetar_runtime_moonpool::Client::poll_topic_list_change(self).map(|c| TopicListChange {
-            added: c.added,
-            removed: c.removed,
+    fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {
+        magnetar_runtime_moonpool::Client::poll_topic_list_change(self, watcher_id).map(|c| {
+            TopicListChange {
+                added: c.added,
+                removed: c.removed,
+            }
         })
     }
 }
@@ -1234,6 +1237,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn is_closed(&self) -> bool {
         magnetar_runtime_moonpool::Consumer::is_closed(self)
+    }
+
+    fn is_terminal(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_terminal(self)
     }
 
     fn is_connected(&self) -> bool {

@@ -385,7 +385,8 @@ impl<'a, E: Engine> TableViewBuilder<'a, E> {
     }
 
     /// PIP-4 decryption failure handling, forwarded to the underlying consumer.
-    /// Default `Fail` (propagate the error). `Discard` silently drops the message;
+    /// Default `Fail` (the receive errors; the drain task logs it, leaves that message out of the
+    /// view and keeps draining). `Discard` silently drops the message;
     /// `Consume` delivers the ciphertext to the listener as-is. Mirrors Java
     /// `TableViewBuilder#cryptoFailureAction` (which itself delegates to
     /// `ConsumerBuilder#cryptoFailureAction`).
@@ -594,8 +595,23 @@ fn spawn_drain<C: crate::ConsumerApi + Clone>(
     let listeners_drain = listeners.clone();
     let join = tokio::spawn(async move {
         loop {
-            let Ok(msg) = crate::ConsumerApi::receive(&consumer).await else {
-                break;
+            let msg = match crate::ConsumerApi::receive(&consumer).await {
+                Ok(msg) => msg,
+                // Consumer closed / connection terminally lost: stop cleanly.
+                Err(_) if crate::ConsumerApi::is_terminal(&consumer) => break,
+                // One message failed to decrypt or decompress (the default
+                // `CryptoFailureAction::Fail`) and the consumer is still open: leave
+                // it out of the view and read the next one, instead of freezing the
+                // view while `is_connected()` stays true.
+                Err(err) => {
+                    tracing::debug!(
+                        target: "magnetar::table_view",
+                        topic = %crate::ConsumerApi::topic(&consumer),
+                        error = %err,
+                        "table view skipped a message that failed to receive",
+                    );
+                    continue;
+                }
             };
             let key = table_key(&msg);
             let Some(key) = key else {

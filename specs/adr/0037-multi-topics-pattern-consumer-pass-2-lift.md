@@ -1,6 +1,6 @@
 # ADR-0037 — MultiTopicsConsumer / PatternConsumer pass-2 lift: extend `ConsumerApi`, introduce `BrokerMetadataApi`
 
-- **Status**: Accepted
+- **Status**: Accepted — the single-buffer delta surface (`BrokerMetadataApi::poll_topic_list_change` handing the next delta of any watcher to whoever asks) is amended by [ADR-0132](0132-address-pip-145-topic-list-deltas-to-their-watcher.md): every delta carries its watcher id and `poll_topic_list_change` takes that id. Everything else below remains binding.
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: engine, facade, consumer-api, broker-metadata, surface-lift, ADR-0026-D1

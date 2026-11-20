@@ -11,10 +11,15 @@
 //! Reconciliation model
 //! --------------------
 //! - Initial snapshot: `topic_list_snapshot(namespace, pattern)` returns the current matching topic
-//!   set; the builder subscribes to each.
-//! - Streaming deltas: each [`PatternConsumer::update`] call drains any pending `TopicListChanged`
-//!   deltas from the connection buffer and reconciles the consumer set: newly-added topics are
-//!   subscribed, removed topics are closed and dropped.
+//!   set; the builder subscribes to each and keeps the id of the broker-side watcher it opened.
+//! - Streaming deltas: every `TopicListChanged` delta the broker pushes names its watcher, and the
+//!   connection buffers the deltas of all of its watchers together. Each
+//!   [`PatternConsumer::update`] call moves the pending deltas addressed to this consumer's own
+//!   watcher (and no other's) from the connection buffer into this consumer's own backlog, in
+//!   arrival order, and reconciles the consumer set from it: newly-added topics are subscribed,
+//!   removed topics are closed and dropped. A step leaves the backlog only once it has taken
+//!   effect, so a subscribe that fails or an `update` future that is dropped loses nothing: the
+//!   next call resumes from what is left.
 //! - Callers drive reconciliation explicitly (no spawned task) — call `update()` from a timer or
 //!   before/after blocking work.
 //!
@@ -33,7 +38,9 @@
 //! [`crate::MultiTopicsConsumer::receive`]: dropping the future without polling it to
 //! completion leaves un-popped messages in their per-topic consumer queues.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
@@ -42,7 +49,7 @@ use tokio::sync::Notify;
 
 use crate::client::PulsarError;
 use crate::consumer_template::ConsumerTemplate;
-use crate::{BrokerMetadataApi, ConsumerApi, Engine, PulsarClient, SubscribeApi};
+use crate::{BrokerMetadataApi, ConsumerApi, Engine, PulsarClient, SubscribeApi, TopicListChange};
 
 /// Regex-pattern consumer. Holds one consumer per matching topic and reconciles the set
 /// against PIP-145 deltas on `update()`.
@@ -71,6 +78,25 @@ struct Inner<C: ConsumerApi> {
     /// keeps ADR-0003 intact; it stores one permit so an add that races a wait is
     /// not lost.
     membership_changed: Arc<Notify>,
+    /// Round-robin cursor used by `receive`: the index, in the snapshot, of the child
+    /// to start the next sweep at (the one after the child that answered last). Mirrors
+    /// the cursor of [`crate::MultiTopicsConsumer`]; without it `select_all` always favours
+    /// child 0 and a child that keeps a backlog starves every later one.
+    cursor: AtomicUsize,
+    /// Reconcile steps the broker announced and that have not taken effect yet, in arrival
+    /// order. [`PatternConsumer::update`] moves every delta it polls from the connection into
+    /// this queue before it applies anything, and removes a step only once it has taken effect,
+    /// so a failed subscribe or a dropped `update` future leaves the rest for the next call:
+    /// discovery is delta-only after the first snapshot, so a delta lost here is never
+    /// announced again. The async mutex is held for the whole of an `update`, which serialises
+    /// concurrent reconciles (they walk this queue in place) and is released when the future is
+    /// dropped.
+    pending: tokio::sync::Mutex<VecDeque<PendingOp>>,
+    /// The id the connection allocated to this consumer's topic-list watcher. The connection's
+    /// delta buffer is shared by every watcher on the client, and each delta is addressed to one
+    /// of them: [`PatternConsumer::update`] takes only the deltas carrying this id, so it never
+    /// applies another consumer's (a topic outside this pattern) and never starves their owner.
+    watcher_id: u64,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -84,6 +110,36 @@ struct Inner<C: ConsumerApi> {
 struct NamedConsumer<C: ConsumerApi> {
     topic: String,
     consumer: C,
+}
+
+/// One reconcile step announced by the broker that has not taken effect yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingOp {
+    /// A topic that newly matches the pattern: subscribe a child for it.
+    Add(String),
+    /// A topic that no longer matches the pattern: close its child and drop it.
+    Remove(String),
+}
+
+/// Append one `TopicListChanged` delta to the backlog, keeping the order the broker sent it in.
+///
+/// Within a delta the removals come first, then the additions, as before. Across deltas the
+/// order is the arrival order: merging them into one added list and one removed list, with the
+/// removals applied first, would subscribe a topic the broker created and then deleted. A removal
+/// also supersedes an addition of the same topic that is still waiting (it never took effect, or
+/// it failed and was kept for a retry): applied in order, the pair leaves the topic out of the
+/// set, and keeping the addition would retry a subscribe for a topic that no longer exists
+/// behind the removal. The removal itself is kept, because the topic may have been subscribed
+/// by an earlier step. An addition already waiting is not queued twice.
+fn enqueue_change(pending: &mut VecDeque<PendingOp>, change: TopicListChange) {
+    pending.retain(|op| !matches!(op, PendingOp::Add(topic) if change.removed.contains(topic)));
+    pending.extend(change.removed.into_iter().map(PendingOp::Remove));
+    for topic in change.added {
+        let op = PendingOp::Add(topic);
+        if !pending.contains(&op) {
+            pending.push_back(op);
+        }
+    }
 }
 
 /// A message yielded by [`PatternConsumer::receive`], carrying the topic it came from.
@@ -146,12 +202,28 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
         self.inner.consumers.lock().is_empty()
     }
 
-    /// Drain pending PIP-145 `TopicListChanged` deltas from the underlying connection and
-    /// reconcile the consumer set: newly-added topics are subscribed, removed topics are
-    /// closed and dropped.
+    /// Move the pending PIP-145 `TopicListChanged` deltas addressed to this consumer's watcher from
+    /// the underlying connection into this consumer's backlog and reconcile the consumer set from
+    /// it: newly-added topics are subscribed, removed topics are closed and dropped.
     ///
-    /// Idempotent; returns the count of additions and removals applied during this call.
-    /// Mirrors Java's internal `PatternMultiTopicsConsumerImpl#recheckTopics` cycle.
+    /// Only the deltas of the broker-side watcher this consumer's builder opened are taken. Other
+    /// watchers on the client (another pattern consumer, a `topic_list_snapshot`) keep theirs
+    /// buffered for their own owners, so a consumer never subscribes a topic the broker announced
+    /// for somebody else's pattern. `client` must be the client that built the consumer: a watcher
+    /// id is only meaningful on the connection that allocated it.
+    ///
+    /// Deltas are applied in the order the broker sent them, so a topic created and then deleted
+    /// between two calls is never subscribed. Idempotent; returns the count of additions and
+    /// removals applied during this call. Mirrors Java's internal
+    /// `PatternMultiTopicsConsumerImpl#recheckTopics` cycle.
+    ///
+    /// A step leaves the backlog only once it has taken effect. A subscribe that fails keeps its
+    /// topic waiting (the broker announces a topic once, so dropping it would lose it for the
+    /// life of the consumer) and the walk goes on with the steps behind it, so one refused topic
+    /// does not hold up the others; the next call retries it, until the broker reports the topic
+    /// deleted. Dropping the returned future between two steps likewise leaves every step that has
+    /// not completed for the next call. One `update` runs at a time: a concurrent call waits for
+    /// the running one.
     ///
     /// PIP-145 child-subscribe routes through the engine-generic
     /// [`crate::ConsumerBuilder`] which dispatches via
@@ -159,69 +231,100 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     ///
     /// # Errors
     ///
-    /// Returns the first [`PulsarError`] encountered while subscribing a new topic; topics
-    /// successfully reconciled before the error remain subscribed.
+    /// Returns the first [`PulsarError`] encountered while subscribing a new topic, after the
+    /// walk has reached the end of the backlog; every other step is applied, and the topics that
+    /// failed are retried by the next call.
     pub async fn update<E>(&self, client: &PulsarClient<E>) -> Result<ReconcileReport, PulsarError>
     where
         E: Engine,
         E::ClientState: SubscribeApi<Consumer = C> + BrokerMetadataApi,
     {
         let mut report = ReconcileReport::default();
-        // Drain every pending delta synchronously, then apply the reconciliation.
-        let mut added: Vec<String> = Vec::new();
-        let mut removed: Vec<String> = Vec::new();
-        while let Some(change) = crate::BrokerMetadataApi::poll_topic_list_change(&client.inner) {
-            added.extend(change.added);
-            removed.extend(change.removed);
+        let mut pending = self.inner.pending.lock().await;
+        // Move every polled delta into the backlog before anything is applied. No await sits
+        // between a delta leaving the connection and landing in the backlog, so a cancelled
+        // call cannot lose one in between.
+        while let Some(change) =
+            crate::BrokerMetadataApi::poll_topic_list_change(&client.inner, self.inner.watcher_id)
+        {
+            enqueue_change(&mut pending, change);
         }
-        if added.is_empty() && removed.is_empty() {
+        if pending.is_empty() {
             return Ok(report);
         }
-        // Removals first — close the consumer, drop from the set.
-        if !removed.is_empty() {
-            let drained: Vec<NamedConsumer<C>> = {
-                let mut guard = self.inner.consumers.lock();
-                let mut drained = Vec::new();
-                Arc::make_mut(&mut guard).retain(|nc| {
-                    if removed.iter().any(|t| t == &nc.topic) {
-                        drained.push(nc.clone());
-                        false
-                    } else {
-                        true
+        let mut first_error: Option<PulsarError> = None;
+        // Walk the backlog in order. A step that takes effect is removed at the position being
+        // read; a subscribe that fails stays, and the walk moves on past it.
+        let mut next = 0;
+        while let Some(op) = pending.get(next).cloned() {
+            match op {
+                PendingOp::Remove(topic) => {
+                    // Leave the backlog before the close is awaited: the child is already out of
+                    // the set, so a dropped close must not be repeated against a topic that is
+                    // gone.
+                    pending.remove(next);
+                    let drained: Vec<NamedConsumer<C>> = {
+                        let mut guard = self.inner.consumers.lock();
+                        let mut drained = Vec::new();
+                        Arc::make_mut(&mut guard).retain(|nc| {
+                            if nc.topic == topic {
+                                drained.push(nc.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        drained
+                    };
+                    for nc in drained {
+                        let _ = ConsumerApi::close_owned(nc.consumer).await;
+                        report.removed += 1;
                     }
-                });
-                drained
-            };
-            for nc in drained {
-                let _ = ConsumerApi::close_owned(nc.consumer).await;
-                report.removed += 1;
-            }
-        }
-        // Additions — subscribe each, skipping topics already in the set (the broker can
-        // resend a topic if multiple watch responses overlap during reconnects).
-        if !added.is_empty() {
-            for topic in added {
-                let already_subscribed = self
-                    .inner
-                    .consumers
-                    .lock()
-                    .iter()
-                    .any(|nc| nc.topic == topic);
-                if already_subscribed {
-                    continue;
                 }
-                let builder = self.inner.template.apply(client.consumer(topic.clone()));
-                let consumer = builder.subscribe().await?;
-                Arc::make_mut(&mut self.inner.consumers.lock())
-                    .push(NamedConsumer { topic, consumer });
-                report.added += 1;
-                // A new child joined the set — wake any parked wrapper-listener
-                // poller so it re-snapshots and starts draining the new child.
-                self.inner.membership_changed.notify_one();
+                PendingOp::Add(topic) => {
+                    // Skip a topic already in the set (the broker can resend a topic if multiple
+                    // watch responses overlap during reconnects).
+                    let already_subscribed = self
+                        .inner
+                        .consumers
+                        .lock()
+                        .iter()
+                        .any(|nc| nc.topic == topic);
+                    if already_subscribed {
+                        pending.remove(next);
+                        continue;
+                    }
+                    let builder = self.inner.template.apply(client.consumer(topic.clone()));
+                    match builder.subscribe().await {
+                        Ok(consumer) => {
+                            // No await between the subscribe completing and the child joining
+                            // the set, or a dropped call would leave a live child outside it.
+                            Arc::make_mut(&mut self.inner.consumers.lock())
+                                .push(NamedConsumer { topic, consumer });
+                            pending.remove(next);
+                            report.added += 1;
+                            // A new child joined the set — wake any parked wrapper-listener
+                            // poller so it re-snapshots and starts draining the new child.
+                            self.inner.membership_changed.notify_one();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "magnetar::pattern_consumer",
+                                namespace = %self.namespace(),
+                                pattern = %self.pattern(),
+                                topic = %topic,
+                                error = %err,
+                                "pattern child subscribe failed; kept for the next update",
+                            );
+                            first_error.get_or_insert(err);
+                            next += 1;
+                        }
+                    }
+                }
             }
         }
         // Discovery-update record (ADR-0054) — only reached when at least
-        // one delta was drained, so this never fires on quiescent ticks.
+        // one step was waiting, so this never fires on quiescent ticks.
         tracing::debug!(
             target: "magnetar::pattern_consumer",
             namespace = %self.namespace(),
@@ -230,17 +333,34 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
             removed = report.removed,
             "pattern discovery delta"
         );
-        Ok(report)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(report),
+        }
     }
 
     /// Receive the next message across any currently-subscribed topic. The future is
     /// cancel-safe: dropping it leaves un-popped messages in their respective per-consumer
     /// queues.
     ///
+    /// The sweep is fair, with the same round-robin cursor as
+    /// [`crate::MultiTopicsConsumer::receive`]: it starts after the topic served last, so a
+    /// topic that keeps a backlog cannot starve the others. It does not stall on a dead
+    /// child either: a child that is terminal (closed, a terminal subscribe failure, or its
+    /// connection lost for good) resolves `Err` at once and forever, so it leaves the sweep and
+    /// the wait goes on over the remaining topics. Messages still queued on such a child are
+    /// delivered first. The failure is therefore invisible to this call as long as one topic
+    /// is live; poll [`PatternConsumer::is_connected`] to observe it. The terminal child stays
+    /// in the set, unserved, until the broker removes its topic ([`PatternConsumer::update`]
+    /// applies only the broker's topic-list deltas and does not re-create it).
+    ///
     /// # Errors
     ///
-    /// Returns [`PulsarError::Config`] if the consumer set is empty. Otherwise propagates the
-    /// first per-topic receive error.
+    /// Returns [`PulsarError::Config`] if the consumer set is empty. A child that fails on one
+    /// message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`) while it stays open returns that error, naming its topic;
+    /// the next call can succeed. Returns an error once every child of the snapshot is
+    /// terminal, naming the last one.
     pub async fn receive(&self) -> Result<PatternMessage, PulsarError> {
         // Snapshot the consumer set under the lock, then release before awaiting — holding the
         // mutex across an await would serialise receive against update.
@@ -256,17 +376,69 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 .consumer
                 .receive()
                 .await
-                .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
+                .map_err(|e| PulsarError::Other(format!("receive: {}: {e}", nc.topic)))?;
             return Ok(PatternMessage {
                 topic: nc.topic.clone(),
                 message: msg,
             });
         }
-        let futures: Vec<_> = snapshot.iter().map(|nc| nc.consumer.receive()).collect();
-        let (result, idx, _rest) = select_all(futures).await;
-        let topic = snapshot[idx].topic.clone();
-        let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
-        Ok(PatternMessage { topic, message })
+        // Rotate the snapshot by the round-robin cursor BEFORE building the futures: `select_all`
+        // returns the first ready future in input order, so without the rotation a child that
+        // always has a message ready starves every later child.
+        let len = snapshot.len();
+        let start = self.inner.cursor.load(Ordering::Relaxed) % len;
+        // Children whose `receive()` resolved `Err` while terminal. Such a child resolves `Err`
+        // on its first poll, forever, so left in the sweep it would win every round and hide
+        // every sibling behind it. Only an `Err` is ever discarded here: an `Ok` has already
+        // popped its message and returns in the iteration that produced it.
+        let mut terminal = vec![false; len];
+        loop {
+            // `rotated_indices[i]` is the snapshot index of the i-th future `select_all` sees,
+            // in sweep order, so a winning result maps back to the right topic. It is rebuilt
+            // each round rather than patched after `select_all`, which documents no order for
+            // the futures it hands back.
+            let rotated_indices: Vec<usize> = (0..len)
+                .map(|i| (start + i) % len)
+                .filter(|&i| !terminal[i])
+                .collect();
+            let futures: Vec<_> = rotated_indices
+                .iter()
+                .map(|&i| snapshot[i].consumer.receive())
+                .collect();
+            let (result, rotated_idx, _rest) = select_all(futures).await;
+            let original_idx = rotated_indices[rotated_idx];
+            let nc = &snapshot[original_idx];
+            let err = match result {
+                Ok(message) => {
+                    // Advance the cursor past the child we just served so the next `receive()`
+                    // starts the sweep at the child *after* this one.
+                    self.inner
+                        .cursor
+                        .store((original_idx + 1) % len, Ordering::Relaxed);
+                    return Ok(PatternMessage {
+                        topic: nc.topic.clone(),
+                        message,
+                    });
+                }
+                Err(err) => err,
+            };
+            if !ConsumerApi::is_terminal(&nc.consumer) {
+                // An error about one message: the child is still open and its next `receive()`
+                // can succeed. Move the cursor past it as for a message, so a child that keeps
+                // failing cannot hold the sweep either.
+                self.inner
+                    .cursor
+                    .store((original_idx + 1) % len, Ordering::Relaxed);
+                return Err(PulsarError::Other(format!("receive: {}: {err}", nc.topic)));
+            }
+            terminal[original_idx] = true;
+            if terminal.iter().all(|&done| done) {
+                return Err(PulsarError::Other(format!(
+                    "receive: every matched topic is terminal, last error on {}: {err}",
+                    nc.topic
+                )));
+            }
+        }
     }
 
     /// Acknowledge a message. The caller supplies the topic the message came from
@@ -504,6 +676,20 @@ where
 
     fn is_empty(&self) -> bool {
         PatternConsumer::is_empty(self)
+    }
+
+    fn is_terminal(&self) -> bool {
+        // Clone the snapshot and release the set's mutex before asking the children: each
+        // `ConsumerApi::is_terminal` takes the global Connection mutex (ADR-0038 order), and a
+        // child the wrapper has already removed is not in the snapshot, so closing it on
+        // purpose never reads as a terminal wrapper. `receive()` skips a terminal child and
+        // keeps serving the live ones, so the wrapper can fail for good only once every child is
+        // terminal; an empty set is not terminal (the poller parks on `membership_changed`).
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
+        !snapshot.is_empty()
+            && snapshot
+                .iter()
+                .all(|nc| ConsumerApi::is_terminal(&nc.consumer))
     }
 
     async fn membership_changed(&self) {
@@ -908,7 +1094,7 @@ where
             start_message_rollback_duration_sec: self.start_message_rollback_duration_sec,
         };
 
-        let topics = self
+        let (watcher_id, topics) = self
             .client
             .topic_list_snapshot_with_deadline(&namespace, &pattern, deadline)
             .await?;
@@ -935,6 +1121,9 @@ where
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(opened)),
                 membership_changed: Arc::new(Notify::new()),
+                cursor: AtomicUsize::new(0),
+                pending: tokio::sync::Mutex::new(VecDeque::new()),
+                watcher_id,
                 namespace,
                 pattern,
                 template,
@@ -956,8 +1145,10 @@ where
     ///
     /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
     /// sequential, in-order delivery, no auto-ack (the callback acks via
-    /// [`PatternConsumer::ack`]), clean shutdown on consumer-set drain / handle
-    /// drop. **Pattern children discovered after subscribe inherit the listener** —
+    /// [`PatternConsumer::ack`]), clean shutdown once every child is terminal / on handle
+    /// drop (a terminal child among live ones is skipped, see [`PatternConsumer::receive`],
+    /// and so is an error on one message). **Pattern
+    /// children discovered after subscribe inherit the listener** —
     /// call [`PatternConsumer::update`] (or
     /// [`PatternConsumer::start_auto_reconcile`]) to subscribe newly-matched
     /// topics; the running poller picks them up on its next `receive()` sweep, since
@@ -988,11 +1179,72 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
     use parking_lot::Mutex;
 
-    use super::{ConsumerTemplate, Inner, PatternConsumer, ReconcileReport};
+    use super::{
+        ConsumerTemplate, Inner, PatternConsumer, PendingOp, ReconcileReport, enqueue_change,
+    };
+    use crate::TopicListChange;
+
+    fn change(added: &[&str], removed: &[&str]) -> TopicListChange {
+        TopicListChange {
+            added: added.iter().map(|t| (*t).to_owned()).collect(),
+            removed: removed.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    fn add(topic: &str) -> PendingOp {
+        PendingOp::Add(topic.to_owned())
+    }
+
+    fn remove(topic: &str) -> PendingOp {
+        PendingOp::Remove(topic.to_owned())
+    }
+
+    /// Deltas keep the order the broker sent them in, and within one delta the removals come
+    /// before the additions.
+    #[test]
+    fn enqueue_keeps_arrival_order_across_and_within_deltas() {
+        let mut pending = VecDeque::new();
+        enqueue_change(&mut pending, change(&["a", "b"], &["x"]));
+        enqueue_change(&mut pending, change(&["c"], &["y"]));
+        assert_eq!(
+            Vec::from(pending),
+            [remove("x"), add("a"), add("b"), remove("y"), add("c")]
+        );
+    }
+
+    /// A removal supersedes a still-waiting addition of the same topic (a topic created then
+    /// deleted, or an addition kept for a retry after a refused subscribe), and is itself kept.
+    /// The addition of another topic is untouched.
+    #[test]
+    fn enqueue_removal_drops_the_waiting_addition_of_that_topic_only() {
+        let mut pending = VecDeque::from([add("fleeting"), add("kept")]);
+        enqueue_change(&mut pending, change(&[], &["fleeting"]));
+        assert_eq!(Vec::from(pending), [add("kept"), remove("fleeting")]);
+    }
+
+    /// A delta that removes and adds the same topic (deleted then re-created within the delta)
+    /// ends with the topic added: the removal of the delta does not take its own addition with it.
+    #[test]
+    fn enqueue_same_delta_removal_does_not_drop_its_own_addition() {
+        let mut pending = VecDeque::from([add("t")]);
+        enqueue_change(&mut pending, change(&["t"], &["t"]));
+        assert_eq!(Vec::from(pending), [remove("t"), add("t")]);
+    }
+
+    /// An addition already waiting (kept after a refused subscribe) is not queued a second time
+    /// when the broker announces the topic again, and the same topic twice in one delta is queued
+    /// once.
+    #[test]
+    fn enqueue_does_not_queue_a_waiting_addition_twice() {
+        let mut pending = VecDeque::from([add("t")]);
+        enqueue_change(&mut pending, change(&["t", "u", "u"], &[]));
+        assert_eq!(Vec::from(pending), [add("t"), add("u")]);
+    }
 
     #[test]
     fn reconcile_report_default_is_zero() {
@@ -1048,6 +1300,9 @@ mod tests {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(Vec::new())),
                 membership_changed: Arc::new(tokio::sync::Notify::new()),
+                cursor: std::sync::atomic::AtomicUsize::new(0),
+                pending: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                watcher_id: 0,
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,

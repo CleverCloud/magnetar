@@ -10,6 +10,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit. The option is also available on reader and V5 consumer builders; bounded codec output and the aggregate batch-memory budget still apply. Raw `None` payloads are not decompressed and retain the normal wire-frame limit.
 - Adding `max_uncompressed_message_size` to public `SubscribeRequest`, `StreamConsumerOptions`, and `SegmentConsumerOptions` requires downstream struct-literal initializers to provide the field; callers using `Default` or builders remain source-compatible.
+- **`Consumer::is_terminal()` on both runtime consumers, surfaced as `ConsumerApi::is_terminal()`, and `WrapperReceiver::is_terminal()`** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  `Consumer::is_terminal()` evaluates the gate `receive()` itself resolves `Err(Closed)` on, which is broader than `is_closed()`: a per-handle terminal subscribe failure never sets `closed`.
+  `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
+  `WrapperReceiver::is_terminal` has a default of `false`; an implementation whose `wrapper_receive` can fail for good must override it.
+
+### Changed
+
+- **PIP-145 topic-list deltas are addressed to their watcher: `Client::poll_topic_list_change` and `BrokerMetadataApi::poll_topic_list_change` take a `watcher_id`, `TopicListChange` (both runtimes) gains a `watcher_id` field, and the hidden deadline seam `watch_topic_list_with_operation_deadline` / `BrokerMetadataApi::watch_topic_list_with_deadline` resolve to `(watcher_id, topics)`** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
+  `ConnectionEvent::TopicListChanged` and `OpOutcome::TopicListSnapshot` carry the id too, and `watch_topic_list_with_deadline` no longer has a default body (a default cannot know the id), so an external `BrokerMetadataApi` implementor must add it.
+  `watch_topic_list`, `PulsarClient::topic_list_snapshot` and the any-watcher `Client::next_topic_list_change` are unchanged.
+
+### Fixed
+
+- **`Reader::has_message_available` answers for the position a seek leaves the reader at, and a moonpool `Reader` has seek wrappers that can move it.**
+  `Reader` answered by comparing the broker's last message id with the id of the last message `read_next` returned, and `seek_to_earliest`, `seek_to_latest`, `seek_to_message` and `seek_to_timestamp` forwarded to the consumer without touching that cursor.
+  After a seek it kept answering for the position the reader had left: `false` after rewinding a topic read to its end, so a `while has_message_available { read_next }` replay loop exited at once and skipped the replay, and `true` after `seek_to_latest` from the middle of a topic, so the same loop called `read_next` and waited for a message that might never come.
+  Each wrapper now rewrites the cursor once the broker has accepted the seek.
+  `seek_to_earliest`, `seek_to_message` with a real id and `seek_to_timestamp` clear it, so the answer is whether the topic holds any message: exact after `seek_to_earliest`, exact after `seek_to_message` whenever the sought message is on the topic and the broker replays from it, and an over-report after `seek_to_timestamp` to a time later than the newest message, because the broker does not say which message the timestamp resolved to.
+  A seek to the head (`seek_to_latest`, `seek_to_message(MessageId::LATEST)`) asks the broker for the head and makes it the cursor, and never stores the empty-topic head (entry id `-1`), which compares above every real id and would answer `false` for ever.
+  That answer for a reader with no cursor, which every seek except a seek to the head leaves it with, also changes for an empty topic: it compared the head with `MessageId::EARLIEST` as a whole value, which a head decoded from a frame that carries no batch size never equals (the decoder fills `-1` where `EARLIEST` holds `0`), so it read `true`; it now tests the entry id `-1` alone, so an empty topic reads `false` whatever ledger id the broker reports beside it.
+  That costs `seek_to_latest` one more request, and it returns `PulsarError::Other` with the cursor cleared when that request fails after the seek took effect.
+  A message published between the broker accepting the seek and the head answering counts as already passed, until the next publish or the next `read_next`.
+  A moonpool reader had no seek wrapper at all, so its callers seeked through `Reader::consumer()`, which cannot reach the cursor; `Reader<magnetar_runtime_moonpool::Consumer<P>>` now has the same four methods, with errors stringified into `PulsarError::Other` like its other generic methods.
+- **Two `PatternConsumer`s on one client no longer apply each other's PIP-145 deltas** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
+  Every pattern consumer opens its own broker-side topic-list watcher, but the connection dropped the watcher id when it turned the broker's `CommandWatchTopicUpdate` into an event and the driver appended every event to one buffer per client, so whichever consumer called `update` first popped the other's deltas.
+  It then subscribed its own template to a topic outside its pattern, which is a durable subscription created on the broker, and the owner of the delta never saw it: discovery is delta-only after the first snapshot and the broker announces a topic once.
+  The event now carries the id, `update` takes only the deltas addressed to the watcher its builder opened, and a delta for a watcher the connection does not hold (a snapshot cancelled after its frame went out) is dropped instead of being queued for the life of the connection.
+  The deltas of a watcher nobody polls (a `topic_list_snapshot`, a dropped `PatternConsumer`) are now never taken from the buffer (nothing clears `topic_list_changes`) instead of being applied by another consumer; the broker keeps pushing them because no `CommandWatchTopicListClose` is sent, which this change does not address.
+- **`commit_transaction` and `abort_transaction` no longer hang when the last admitted acknowledgement settles just before the end waiter's first poll** ([ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md)).
+  `prepare` read the gate's decision under the transaction entry's lock and released the lock before the end waiter's first poll took it again, and that first poll trusted the `Wait { pending }` it had been handed.
+  On a multi-thread executor the acknowledging task can settle in that gap: it drains `waiters` while the end waiter is not yet registered, admission is closed so no later settle can happen, and the first poll then parked a waker nothing would ever wake, until the caller cancelled the commit.
+  The first poll now asks the gate again under the lock it registers the waker under whenever the carried decision is a `Wait`; an `IssueCommit`, `IssueAbort` or `TransactionPoisoned` already reached under the lock is still taken as final.
+- **A push listener or a `TableView` no longer stops for good on one message that fails to decrypt or decompress** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  `subscribe_with_listener`, the multi-topic, partitioned and pattern listeners, and the `TableView` drain read any `receive()` error as "the consumer is closed" and exited.
+  `receive()` also resolves `Err` for a single message the consumer could not decrypt or decompress under the default `CryptoFailureAction::Fail`, while it stays open, so one such message closed a builder push consumer, left the healthy topics of a wrapper undrained, or froze a `TableView` while `is_connected()` stayed `true`.
+  The loops now end only when the consumer is terminal, and otherwise log the error at `debug!`, leave the message unacked and read the next one.
+- **`remove_topic` and a pattern removal no longer end push delivery for the topics that remain.**
+  The child the wrapper had just closed resolved `Err(Closed)` under the parked poller, and the poller read it as the whole consumer closing.
+- **`MultiTopicsConsumer::receive` and `PatternConsumer::receive` no longer get stuck on one terminal child** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  A child that is terminal (closed, a terminal subscribe failure, or its connection lost for good) resolves `receive()` with an error on its first poll, forever, so it won every round in which no earlier child had a message.
+  `MultiTopicsConsumer` advanced its cursor only on success, so once a sweep started at that child every call returned its nameless error and the live topics were unreachable; `PatternConsumer` had no cursor, so a terminal child hid every child after it.
+  The sweep now leaves a terminal child out once its queued messages are delivered and keeps waiting on the live ones, so a terminal child among live ones is invisible to a pull caller (`is_connected()` still reports it) and a topic removed under a parked `receive()` no longer surfaces as an error.
+  `receive()` fails only once every child is terminal, and an error from a wrapper now names its topic (`receive: {topic}: {error}`, `PulsarError::Other`).
+  `WrapperReceiver::is_terminal` of both wrappers is therefore "every child", not "some child", so a push listener keeps delivering the live topics when a sibling dies.
+- **`PatternConsumer::update` no longer loses topics when a subscribe fails or the call is dropped, and applies the broker's deltas in the order it sent them.**
+  `update` moved every pending topic-list delta out of the connection into locals before it applied any, then stopped at the first failed subscribe (`?`) or at cancellation, so every topic not yet subscribed was gone: the next call found the queue empty, and discovery is delta-only after the first snapshot, so nothing announced it again.
+  It also merged the deltas into one added list and one removed list and applied the removals first, so a topic the broker created and then deleted between two calls was subscribed after its deletion.
+  The consumer now keeps its own backlog of steps in arrival order and a step leaves it only once it has taken effect: a refused subscribe keeps its topic for the next call while the steps behind it still run (one refused topic does not hold up the others, and `update` returns the first error once the walk is done), a dropped call leaves every unfinished step, and a removal drops a still-waiting addition of the same topic, so a deleted topic is never retried.
+  Calls to `update` are serialised, because they walk the backlog in place.
+- **`PatternConsumer::receive` no longer starves its later children behind a busy first one.**
+  It handed `select_all` the children in snapshot order, which returns the first ready future in input order, so while child 0 had a backlog children 1..n were never polled: their receiver queues filled, no refill credit went out, and their topics stalled until child 0 ran dry, and so did its push poller.
+  `MultiTopicsConsumer::receive` has had the round-robin cursor that fixes this since `9347c39`; the pattern consumer now carries it too.
 
 ### Fixed
 

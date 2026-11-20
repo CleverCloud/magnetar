@@ -903,6 +903,10 @@ pub enum OpOutcome {
     TopicListSnapshot {
         /// Request id of the originating request.
         request_id: RequestId,
+        /// Id this connection allocated to the watcher. Every later
+        /// [`ConnectionEvent::TopicListChanged`](crate::event::ConnectionEvent::TopicListChanged)
+        /// the broker addresses to the watcher carries it.
+        watcher_id: u64,
         /// Topics currently matching the watcher's namespace + pattern.
         topics: Vec<String>,
     },
