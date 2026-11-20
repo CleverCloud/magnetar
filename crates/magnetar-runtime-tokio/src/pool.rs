@@ -438,8 +438,8 @@ impl ProxyConnectionPool {
     }
 
     /// Scheme of the bootstrap dial address — used by
-    /// [`crate::Client::lookup_topic`] to pick between `broker_service_url` and
-    /// `broker_service_url_tls` returned by the proxy.
+    /// [`crate::Client::lookup_topic_with_operation_deadline`] to pick between `broker_service_url`
+    /// and `broker_service_url_tls` returned by the proxy.
     #[must_use]
     pub(crate) fn bootstrap_scheme(&self) -> Scheme {
         self.factory.url.scheme

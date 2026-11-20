@@ -39,12 +39,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, Frame, FrameError, SubscribeRequest, decode_one,
-    encode_command, pb,
+    ConnectionConfig, CreateProducerRequest, Frame, FrameError, SubscribeRequest, TxnAction, TxnId,
+    decode_one, encode_command, pb,
 };
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -366,5 +367,224 @@ async fn new_ops_after_terminal_drop_fail_fast() {
     assert!(
         matches!(close_after, Err(ClientError::PeerClosed)),
         "post-terminal producer.close() must fast-fail with PeerClosed, got {close_after:?}",
+    );
+}
+
+fn emit_tc_client_connect_response(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::TcClientConnectResponse as i32,
+        tc_client_connect_response: Some(pb::CommandTcClientConnectResponse {
+            request_id,
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_new_txn_response(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::NewTxnResponse as i32,
+        new_txn_response: Some(pb::CommandNewTxnResponse {
+            request_id,
+            txnid_most_bits: Some(0x11),
+            txnid_least_bits: Some(0x22),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Scripted broker for the PIP-31 terminal-drop scenario: completes the
+/// handshake, the transaction-coordinator bootstrap (`Lookup` +
+/// `TcClientConnectRequest`) and one `NewTxn`, then DROPS the socket on the
+/// first `CommandAddPartitionToTxn` it sees — a terminal peer close with no ack.
+/// `txn_op_seen` flips so the test can assert the drop fired on an in-flight
+/// transaction request.
+async fn run_txn_terminal_broker(listener: TcpListener, txn_op_seen: Arc<AtomicBool>) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    loop {
+        let mut drop_now = false;
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame: Frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return,
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            match pb::base_command::Type::try_from(frame.command.r#type) {
+                Ok(pb::base_command::Type::Connect) => emit_connected(&mut out_buf),
+                Ok(pb::base_command::Type::Lookup) => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(&mut out_buf, l.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::TcClientConnectRequest) => {
+                    if let Some(c) = &frame.command.tc_client_connect_request {
+                        emit_tc_client_connect_response(&mut out_buf, c.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::NewTxn) => {
+                    if let Some(n) = &frame.command.new_txn {
+                        emit_new_txn_response(&mut out_buf, n.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Ping) => emit_pong(&mut out_buf),
+                Ok(pb::base_command::Type::AddPartitionToTxn) => {
+                    // Terminal peer close on the first in-flight transaction
+                    // request: drop the socket WITHOUT acking.
+                    txn_op_seen.store(true, Ordering::SeqCst);
+                    drop_now = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if drop_now {
+            return;
+        }
+
+        if !out_buf.is_empty() {
+            if stream.write_all(&out_buf).await.is_err() {
+                return;
+            }
+            let _ = stream.flush().await;
+            out_buf.clear();
+        }
+
+        match stream.read_buf(&mut read_buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Fast-fail bound for the post-terminal transaction requests. Deliberately
+/// tight and NOT a backstop: a guarded entry point answers synchronously, so
+/// the bound firing IS the defect (an unguarded request parks forever). It
+/// stays well clear of the `HANG_GUARD` backstop so a red run fails in seconds.
+const FAST_FAIL_BOUND: Duration = Duration::from_secs(2);
+
+/// `None` when the request fast-failed with `PeerClosed`, otherwise a line
+/// naming the entry point and what it did instead.
+fn not_fast_failed<T: std::fmt::Debug>(
+    entry_point: &str,
+    res: Result<Result<T, ClientError>, tokio::time::error::Elapsed>,
+) -> Option<String> {
+    match res {
+        Ok(Err(ClientError::PeerClosed)) => None,
+        Ok(other) => Some(format!(
+            "{entry_point}: expected Err(PeerClosed), got {other:?}"
+        )),
+        Err(_) => Some(format!(
+            "{entry_point}: no answer within {FAST_FAIL_BOUND:?} (parked on a request no driver will resolve)"
+        )),
+    }
+}
+
+/// ADR-0059 for the PIP-31 request family: once the plain connection has gone
+/// terminal, a NEW `new_txn` / `add_partition_to_txn` /
+/// `add_subscription_to_txn` / `end_txn` must fast-fail with `PeerClosed`
+/// exactly like `send` / `subscribe` / `lookup` / `producer.close()` do, not
+/// register a pending request that no driver is left to resolve.
+///
+/// Script: a healthy `new_txn` first (the real lazy coordinator bootstrap, so
+/// `txn_bootstrapped` is latched and the bootstrap-time lookup guard can no
+/// longer cover `new_txn`), then one in-flight `add_partition_to_txn` the
+/// broker drops on. Once the plain driver has latched `no_driver`, each of the
+/// four requests is issued afresh under a tight bound. Collect-then-assert so
+/// a red run names every entry point that hung. 1:1 twin of the moonpool
+/// engine's same-named test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn txn_ops_after_terminal_drop_fail_fast() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("pulsar://{addr}");
+    let txn_op_seen = Arc::new(AtomicBool::new(false));
+    tokio::spawn(run_txn_terminal_broker(listener, Arc::clone(&txn_op_seen)));
+
+    let config = ConnectionConfig::default();
+    assert!(
+        config.supervisor.is_none(),
+        "this test pins the UNSUPERVISED plain path",
+    );
+
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect must succeed");
+
+    // Healthy warm-up: the first `new_txn` runs the coordinator bootstrap
+    // (lookup + TcClientConnect) and latches `txn_bootstrapped` for real.
+    let txn = tokio::time::timeout(HANG_GUARD, client.new_txn(Duration::from_mins(1)))
+        .await
+        .expect("the healthy new_txn did not time out")
+        .expect("the healthy new_txn must succeed");
+
+    // One in-flight transaction request drives the terminal drop.
+    let drop_res = tokio::time::timeout(
+        HANG_GUARD,
+        client.add_partition_to_txn(txn, "persistent://public/default/terminal-exit-txn"),
+    )
+    .await
+    .expect("the in-flight add_partition_to_txn must resolve promptly on the terminal drop");
+    assert!(
+        txn_op_seen.load(Ordering::SeqCst),
+        "the broker must have dropped on the in-flight transaction request",
+    );
+    assert!(
+        matches!(drop_res, Err(ClientError::PeerClosed)),
+        "the in-flight add_partition_to_txn surfaces the terminal PeerClosed, got {drop_res:?}",
+    );
+    assert!(
+        !client.is_connected(),
+        "connection must be terminal before the new-request assertions",
+    );
+    // `fail_all_pending` resolves the in-flight request just before the driver
+    // task latches `no_driver`; wait for the latch so the fresh requests below
+    // observe a genuinely terminal connection.
+    tokio::time::timeout(HANG_GUARD, async {
+        while !client.shared().is_no_driver() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the plain driver must latch no_driver after its terminal exit");
+
+    let other = TxnId::new(0xAA, 0xBB);
+    let topic = "persistent://public/default/terminal-exit-txn";
+    let (new_txn_res, add_partition_res, add_subscription_res, end_txn_res) = tokio::join!(
+        tokio::time::timeout(FAST_FAIL_BOUND, client.new_txn(Duration::from_mins(1))),
+        tokio::time::timeout(FAST_FAIL_BOUND, client.add_partition_to_txn(other, topic)),
+        tokio::time::timeout(
+            FAST_FAIL_BOUND,
+            client.add_subscription_to_txn(other, topic, "sub-after-terminal"),
+        ),
+        tokio::time::timeout(FAST_FAIL_BOUND, client.end_txn(other, TxnAction::Commit)),
+    );
+    let failures: Vec<String> = [
+        not_fast_failed("new_txn (bootstrapped)", new_txn_res),
+        not_fast_failed("add_partition_to_txn", add_partition_res),
+        not_fast_failed("add_subscription_to_txn", add_subscription_res),
+        not_fast_failed("end_txn", end_txn_res),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    assert!(
+        failures.is_empty(),
+        "every transaction request issued after the terminal drop must fast-fail with \
+         PeerClosed (ADR-0059), but: {failures:#?}",
     );
 }

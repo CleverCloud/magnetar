@@ -4176,7 +4176,10 @@ impl Connection {
                         "missing CommandNewTxnResponse",
                     ))?;
                 let request_id = RequestId(resp.request_id);
-                self.pending_requests.remove(&request_id);
+                // A request its caller cancelled (`cancel_request`) is no longer pending: the
+                // reply still reaches the TC client, but no outcome is parked for a future
+                // nobody holds.
+                let was_pending = self.pending_requests.remove(&request_id).is_some();
                 let result = match self.txn_client.handle_new_txn_response(resp) {
                     Ok(Some(id)) => Ok(id),
                     Ok(None) => {
@@ -4186,14 +4189,16 @@ impl Connection {
                     }
                     Err(err) => Err(err),
                 };
-                self.outcomes.insert(
-                    PendingOpKey::Request(request_id),
-                    OpOutcome::NewTxn {
-                        request_id,
-                        result: result.clone(),
-                    },
-                );
-                self.wake_for_request(request_id);
+                if was_pending {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::NewTxn {
+                            request_id,
+                            result: result.clone(),
+                        },
+                    );
+                    self.wake_for_request(request_id);
+                }
                 self.events.push_back(ConnectionEvent::TxnResponse {
                     request_id,
                     outcome: TxnRoundTrip::NewTxn(result),
@@ -4204,16 +4209,18 @@ impl Connection {
                     ProtocolError::InvariantViolation("missing CommandAddPartitionToTxnResponse"),
                 )?;
                 let request_id = RequestId(resp.request_id);
-                self.pending_requests.remove(&request_id);
+                let was_pending = self.pending_requests.remove(&request_id).is_some();
                 let result = self.txn_client.handle_add_partition_response(resp);
-                self.outcomes.insert(
-                    PendingOpKey::Request(request_id),
-                    OpOutcome::AddPartitionToTxn {
-                        request_id,
-                        result: result.clone(),
-                    },
-                );
-                self.wake_for_request(request_id);
+                if was_pending {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::AddPartitionToTxn {
+                            request_id,
+                            result: result.clone(),
+                        },
+                    );
+                    self.wake_for_request(request_id);
+                }
                 self.events.push_back(ConnectionEvent::TxnResponse {
                     request_id,
                     outcome: TxnRoundTrip::AddPartition(result),
@@ -4226,16 +4233,18 @@ impl Connection {
                     ),
                 )?;
                 let request_id = RequestId(resp.request_id);
-                self.pending_requests.remove(&request_id);
+                let was_pending = self.pending_requests.remove(&request_id).is_some();
                 let result = self.txn_client.handle_add_subscription_response(resp);
-                self.outcomes.insert(
-                    PendingOpKey::Request(request_id),
-                    OpOutcome::AddSubscriptionToTxn {
-                        request_id,
-                        result: result.clone(),
-                    },
-                );
-                self.wake_for_request(request_id);
+                if was_pending {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::AddSubscriptionToTxn {
+                            request_id,
+                            result: result.clone(),
+                        },
+                    );
+                    self.wake_for_request(request_id);
+                }
                 self.events.push_back(ConnectionEvent::TxnResponse {
                     request_id,
                     outcome: TxnRoundTrip::AddSubscription(result),
@@ -4271,7 +4280,10 @@ impl Connection {
                             "missing CommandTcClientConnectResponse",
                         ))?;
                 let request_id = RequestId(resp.request_id);
-                self.pending_requests.remove(&request_id);
+                if self.pending_requests.remove(&request_id).is_none() {
+                    // Cancelled by its caller: nobody is left to take the outcome.
+                    return Ok(());
+                }
                 // Broker reports success by omitting `error` (`ServerError::None`); any other
                 // code maps to a generic `OpOutcome::Error` so the driver-side future can
                 // surface the broker message verbatim.
@@ -5644,6 +5656,11 @@ impl Connection {
     /// pending-request discriminator, and lookup/partition registry capacity.
     /// The already-encoded wire frame cannot be recalled; a late broker reply
     /// is ignored because its registry and request-kind entries are gone.
+    /// That holds for the PIP-31 kinds (`TcClientConnect`, `NewTxn`, `AddPartitionToTxn`,
+    /// `AddSubscriptionToTxn`) too: their reply still reaches the transaction-coordinator
+    /// client's own bookkeeping, but parks no outcome.
+    /// An `EndTxn` request is the exception on purpose: its canonical request outlives a
+    /// released waiter so that a retry resumes it ([`Self::release_end_txn_waiter`]).
     /// Idempotent so response-vs-drop races are harmless.
     pub fn cancel_request(&mut self, request_id: RequestId) {
         let key = PendingOpKey::Request(request_id);
@@ -11819,6 +11836,103 @@ mod conn_state_tests {
                 .expect("completed waiter releases lease"),
             first
         );
+    }
+
+    /// A PIP-31 request cancelled by its operation deadline must stay cancelled: the broker's
+    /// late reply is ignored, not parked in `outcomes` for a future nobody holds. Covers every
+    /// request kind a runtime cancels on expiry (`end_txn` is excluded on purpose: its
+    /// canonical request survives a released waiter so that a retry resumes it).
+    #[test]
+    fn late_reply_to_a_cancelled_txn_request_leaves_no_outcome() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let txn = TxnId::new(7, 11);
+        let ok = |request_id: RequestId| -> Vec<pb::BaseCommand> {
+            let id = request_id.0;
+            vec![
+                pb::BaseCommand {
+                    r#type: pb::base_command::Type::TcClientConnectResponse as i32,
+                    tc_client_connect_response: Some(pb::CommandTcClientConnectResponse {
+                        request_id: id,
+                        error: None,
+                        message: None,
+                    }),
+                    ..Default::default()
+                },
+                pb::BaseCommand {
+                    r#type: pb::base_command::Type::NewTxnResponse as i32,
+                    new_txn_response: Some(pb::CommandNewTxnResponse {
+                        request_id: id,
+                        txnid_most_bits: Some(txn.most_sig_bits),
+                        txnid_least_bits: Some(txn.least_sig_bits),
+                        error: None,
+                        message: None,
+                    }),
+                    ..Default::default()
+                },
+                pb::BaseCommand {
+                    r#type: pb::base_command::Type::AddPartitionToTxnResponse as i32,
+                    add_partition_to_txn_response: Some(pb::CommandAddPartitionToTxnResponse {
+                        request_id: id,
+                        txnid_most_bits: Some(txn.most_sig_bits),
+                        txnid_least_bits: Some(txn.least_sig_bits),
+                        error: None,
+                        message: None,
+                    }),
+                    ..Default::default()
+                },
+                pb::BaseCommand {
+                    r#type: pb::base_command::Type::AddSubscriptionToTxnResponse as i32,
+                    add_subscription_to_txn_response: Some(
+                        pb::CommandAddSubscriptionToTxnResponse {
+                            request_id: id,
+                            txnid_most_bits: Some(txn.most_sig_bits),
+                            txnid_least_bits: Some(txn.least_sig_bits),
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                },
+            ]
+        };
+
+        let requests = [
+            ("tc_client_connect", conn.tc_client_connect(0), 0_usize),
+            (
+                "new_txn",
+                conn.new_txn(std::time::Duration::from_secs(30)),
+                1,
+            ),
+            (
+                "add_partition_to_txn",
+                conn.add_partition_to_txn(txn, "persistent://public/default/late".to_owned()),
+                2,
+            ),
+            (
+                "add_subscription_to_txn",
+                conn.add_subscription_to_txn(
+                    txn,
+                    "late-sub".to_owned(),
+                    "persistent://public/default/late".to_owned(),
+                ),
+                3,
+            ),
+        ];
+        for (name, request_id, reply) in requests {
+            conn.cancel_request(request_id);
+            let mut encoded = BytesMut::new();
+            encode_command(&mut encoded, &ok(request_id)[reply]).expect("encode late reply");
+            conn.handle_bytes(Instant::now(), &encoded)
+                .expect("handle late reply");
+            assert!(
+                conn.take_outcome(PendingOpKey::Request(request_id))
+                    .is_none(),
+                "{name}: a late reply to a cancelled request must not park an outcome",
+            );
+        }
     }
 
     #[test]

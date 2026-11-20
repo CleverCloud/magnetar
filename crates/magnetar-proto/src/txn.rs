@@ -141,7 +141,8 @@ pub enum TxnError {
     #[error("transaction not found")]
     NotFound,
     /// Driver-side timeout — the broker did not respond within the configured operation timeout.
-    /// The TC itself does not return this; the driver layer surfaces it.
+    /// The TC itself does not return this, and the runtimes do not construct it either: an
+    /// expired PIP-31 request surfaces through their own operation-deadline error (ADR-0129).
     #[error("transaction timed out")]
     Timeout,
     /// The transaction has already been aborted (locally or remotely).
