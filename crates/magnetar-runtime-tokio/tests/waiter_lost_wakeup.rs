@@ -46,6 +46,22 @@
 //! proven, not timed), hangs the broker up, and requires `None` within `HANG_GUARD`: it fails if
 //! the driver's end-of-stream path does not pulse that waiter's `Notify`.
 //!
+//! The third family is the driver exits that skip the teardown the I/O-error exits run. Two are
+//! covered, one test each, and both park the waiters first and then read the verdict with a
+//! second hand poll once `DriverHandle::join` has returned (the wrapper has finished by then, so
+//! there is no clock in the assertion):
+//!
+//! - `CommandTopicMigrated` (PIP-188) ends an unsupervised driver through
+//!   `handle_pending_events(..)?`. Every other error exit of the loop marks the connection
+//!   disconnected and pulses the close waiters first; this one runs neither, so the dead connection
+//!   keeps reporting `Connected`.
+//! - A cooperative close (`close()` plus a `driver_waker` pulse) ends the driver through its
+//!   graceful `Ok(())` exit, which pulses nothing a parked waiter sleeps on. The moonpool twin
+//!   drives it with `DriverHandle::abort`, which is cooperative there. Here `abort` cancels the
+//!   task and runs no cleanup at all, so the test performs the same two statements through the
+//!   public `shared()` accessor instead: tokio reaches this exit only that way, because
+//!   `Client::close` consumes the client and cannot run while a `&Client` waiter is parked.
+//!
 //! ADR-0024: this is the tokio integration twin; the moonpool twin is
 //! `waiter_lost_wakeup.rs` (1:1, `check-runtime-test-parity`).
 
@@ -57,7 +73,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -66,7 +82,7 @@ use magnetar_proto::ScalableConsumerType;
 use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
 #[cfg(feature = "scalable-topics")]
 use magnetar_runtime_tokio::ScalableEvent;
-use magnetar_runtime_tokio::{Client, ConnectionShared, TopicListChange};
+use magnetar_runtime_tokio::{Client, ClientError, ConnectionShared, TopicListChange};
 use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -465,4 +481,189 @@ async fn next_replicated_subscription_marker_returns_none_when_the_connection_di
     }
 
     close_client(client).await;
+}
+
+/// Broker for the driver-exit test: `CONNECT` -> `CONNECTED`, then silence until `push` fires,
+/// at which point it writes `frame` once and keeps the socket open (draining reads). Holding the
+/// socket open matters: a hang-up would route the driver down its I/O-error exit, which already
+/// marks the connection disconnected, and hide the exit under test.
+async fn serve_connected_then_push(mut stream: TcpStream, frame: BytesMut, push: Arc<Notify>) {
+    let mut read_buf = BytesMut::with_capacity(8 * 1024);
+    let mut pushed = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let decoded = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return,
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            if matches!(
+                pb::base_command::Type::try_from(decoded.command.r#type),
+                Ok(pb::base_command::Type::Connect)
+            ) && stream
+                .write_all(&common::handshake_response_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        tokio::select! {
+            read = stream.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => return,
+                Ok(n) => read_buf.extend_from_slice(&chunk[..n]),
+            },
+            () = push.notified(), if !pushed => {
+                pushed = true;
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// A handshaked, UNSUPERVISED client (`Client::from_socket` never wires the supervisor in) whose
+/// broker writes `frame` once the returned `Notify` fires.
+async fn connect_to_pushing_broker(frame: BytesMut) -> (Client, Arc<Notify>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
+    let port = listener.local_addr().expect("local_addr").port();
+    let push = Arc::new(Notify::new());
+    let broker_push = Arc::clone(&push);
+    tokio::spawn(async move {
+        if let Ok((stream, _peer)) = listener.accept().await {
+            serve_connected_then_push(stream, frame, broker_push).await;
+        }
+    });
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("client connect");
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::from_socket(stream, ConnectionConfig::default()),
+    )
+    .await
+    .expect("handshake did not time out")
+    .expect("handshake");
+    (client, push)
+}
+
+/// A `CommandTopicMigrated` (PIP-188) with the default permissive allow-list. The proto layer
+/// raises `TopicMigrated` for any resource id, so no producer has to exist.
+fn topic_migrated_frame() -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::TopicMigrated as i32,
+        topic_migrated: Some(pb::CommandTopicMigrated {
+            resource_id: 1,
+            resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+            broker_service_url: Some("pulsar://migrated-broker:6650".to_owned()),
+            broker_service_url_tls: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandTopicMigrated");
+    buf
+}
+
+/// The broker's `CommandTopicMigrated` ends an unsupervised driver: `handle_pending_events`
+/// returns `Err` and the read arm propagates it with `?`. Every other error exit of the driver
+/// loop first marks the connection disconnected and pulses the close waiters, so this one must
+/// leave the same state behind: not connected, closed (which arms the ADR-0059 fast-fail, because
+/// the terminal wrapper latches `no_driver`), and a parked `next_topic_list_change` resolved to
+/// `None`.
+///
+/// The waiter is parked by a hand poll before the broker pushes, and judged by a second hand
+/// poll after `DriverHandle::join` returned, by which point the wrapper has finished: there is no
+/// clock in the verdict, and a missing wake shows as `Pending` instead of a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topic_migrated_driver_exit_marks_connection_closed_and_wakes_waiters() {
+    let (client, push) = connect_to_pushing_broker(topic_migrated_frame()).await;
+    let driver = client.take_driver().expect("driver handle");
+
+    let mut next = std::pin::pin!(client.next_topic_list_change());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        next.as_mut().poll(&mut cx).is_pending(),
+        "an open connection with an empty buffer parks the waiter"
+    );
+
+    push.notify_one();
+
+    let terminal = tokio::time::timeout(HANG_GUARD, driver.join())
+        .await
+        .expect("the driver must terminate on CommandTopicMigrated");
+    match terminal {
+        Err(ClientError::Other(reason)) if reason.contains("PIP-188") => {}
+        other => panic!("the driver must exit through the PIP-188 error, got {other:?}"),
+    }
+
+    let woken = next.as_mut().poll(&mut cx);
+    assert_eq!(
+        (
+            client.is_connected(),
+            client.is_closed(),
+            client.shared().fail_if_no_driver().is_err(),
+            matches!(woken, Poll::Ready(None)),
+        ),
+        (false, true, true, true),
+        "after the driver exited: (is_connected, is_closed, fail_if_no_driver is an error, \
+         the parked next_topic_list_change resolved to None); waiter poll was {woken:?}"
+    );
+}
+
+/// A cooperative driver stop must resolve parked `next_topic_list_change` and
+/// `next_replicated_subscription_marker` waiters to `None`. The driver takes its graceful
+/// `Ok(())` exit, which pulses neither `topic_list_notify` nor
+/// `replicated_subscription_marker_notify`, and a parked waiter only re-checks `is_closed()`
+/// when it is woken.
+///
+/// The moonpool twin stops the driver with `DriverHandle::abort`. Here `abort` cancels the task
+/// and runs no cleanup, so the test performs the cooperative close itself, the same two
+/// statements `Client::close` and the moonpool `abort` run, through `shared()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_abort_wakes_parked_topic_list_and_marker_waiters() {
+    let (client, _hang_up) = connect_to_hangup_broker().await;
+    let driver = client.take_driver().expect("driver handle");
+
+    let mut topics = std::pin::pin!(client.next_topic_list_change());
+    let mut markers = std::pin::pin!(client.next_replicated_subscription_marker());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        topics.as_mut().poll(&mut cx).is_pending(),
+        "an open connection with an empty buffer parks the topic-list waiter"
+    );
+    assert!(
+        markers.as_mut().poll(&mut cx).is_pending(),
+        "an open connection with an empty buffer parks the marker waiter"
+    );
+
+    client.shared().inner.lock().close();
+    client.shared().driver_waker.notify_one();
+
+    let terminal = tokio::time::timeout(HANG_GUARD, driver.join())
+        .await
+        .expect("the driver must terminate after a cooperative close");
+    assert!(
+        terminal.is_ok(),
+        "a cooperative close is a graceful exit: {terminal:?}"
+    );
+
+    let topics_woken = topics.as_mut().poll(&mut cx);
+    let markers_woken = markers.as_mut().poll(&mut cx);
+    assert_eq!(
+        (
+            matches!(topics_woken, Poll::Ready(None)),
+            matches!(markers_woken, Poll::Ready(None)),
+        ),
+        (true, true),
+        "after the driver exited: (next_topic_list_change resolved to None, \
+         next_replicated_subscription_marker resolved to None); polls were \
+         {topics_woken:?} and {markers_woken:?}"
+    );
 }

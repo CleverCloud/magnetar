@@ -11,6 +11,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit. The option is also available on reader and V5 consumer builders; bounded codec output and the aggregate batch-memory budget still apply. Raw `None` payloads are not decompressed and retain the normal wire-frame limit.
 - Adding `max_uncompressed_message_size` to public `SubscribeRequest`, `StreamConsumerOptions`, and `SegmentConsumerOptions` requires downstream struct-literal initializers to provide the field; callers using `Default` or builders remain source-compatible.
 
+### Fixed
+
+- **A `Client::close()` that lands while a supervisor redial is dialling is no longer erased when that dial succeeds.**
+  The supervisor checked `is_user_closed()` before the dial but not after it, so a dial that succeeded afterwards ran `Connection::reset()`, which snaps `Closing` back to `Uninitialized` and drops the queued `Closed` event; the supervised client then reconnected, re-attached every producer and consumer on the replacement socket, and `Client::close().await`, which joins the driver, never returned while the broker stayed reachable.
+  Both engines now re-check `is_user_closed()` under the same lock acquisition as the `reset()`, and a close seen there drops the freshly dialled transport and ends the driver like the checks before the dial.
+- **The moonpool engine's `connect_timeout` bounds the caller's DNS resolver and the TLS handshake, not only the TCP connect.**
+  A TLS peer that accepted the TCP connection and then never answered the ClientHello (a black-holed backend behind an L4 pass-through, a partition right after accept) parked the rustls handshake forever, and a caller-supplied `DnsResolver` that never answered parked the dial the same way.
+  The initial `connect_tls` / `connect_tls_supervised` therefore never returned, and the supervisor's redial sat inside the same unbounded dial, so `Client::close().await`, which joins the driver, waited on it for good; the tokio engine already abandoned both after `connect_timeout`.
+  Each blocking step of a dial attempt (the resolver, every candidate's TCP connect, the handshake) now runs under its own `connect_timeout` and fails as `Io(TimedOut)`, which `connect_max_retries` re-dials and the supervisor backs off from.
+  A plaintext dial without a resolver is unchanged, and a resolver that answers at once arms no timer.
+- **A TLS-supervised moonpool redial verifies the PIP-121 failover target's certificate against that target's own hostname.**
+  `connect_tls_supervised` kept the bootstrap hostname as the rustls server name for every redial, so once a `ServiceUrlProvider` switched the client to a cluster with another name, the backup's certificate was rejected on every attempt and, with the default unbounded `max_attempts`, the failover never completed; the tokio supervisor already verified against the provider URL's host.
+  The retained name now applies only while the redial target is the bootstrap `host:port` (no provider, an unparseable provider URL, or a provider still returning the bootstrap address), so a caller that dials a physical address under a logical name keeps working.
+  A failover cluster must present a certificate for the host its URL carries.
+- **`AutoClusterFailover` fails over from a primary that drops packets.**
+  The prober computed one absolute deadline per tick and handed it to every URL probed in turn, so a blackholed primary (SYN dropped, the connect ends only at the deadline) spent the whole budget and every standby was probed with an already-past deadline, read unhealthy without a real attempt, and left the active URL on the dead primary on every tick.
+  A fast refusal or a DNS failure left budget and worked, which is why the failure only showed in a region outage.
+  Each URL's probe now gets its own deadline of one `interval` counted from its own start, on both engines; a tick over `n` URLs that all blackhole lasts up to `n * interval`.
+- **A driver that ends on `CommandTopicMigrated` or an unanswerable auth challenge no longer leaves the connection reporting `Connected`.**
+  The two `handle_pending_events(..)?` exits of the driver loop (the inbound-bytes arm and the timer arm) ran neither `mark_disconnected()` nor `wake_close_waiters`, unlike every other error exit, and the terminal wrapper's `fail_all_pending` does not touch the handshake state.
+  An unsupervised connection (the façade default) therefore kept `is_connected()` true and `is_closed()` false after its driver was gone, so the ADR-0059 fast-fail never armed, lookups and opens waited out `operation_timeout`, and a parked `next_topic_list_change` / `next_replicated_subscription_marker` was never woken.
+  Both engines now take the same teardown as a transport drop before the error propagates.
+- **The graceful driver exit wakes parked `next_topic_list_change`, `next_replicated_subscription_marker` and scalable-topic waiters.**
+  A local `close()` (the moonpool `DriverHandle::abort` is exactly that) ends the driver through an `Ok(())` exit that pulsed none of the per-client-buffer `Notify`s those waiters sleep on, so a waiter parked on a `&Client` stayed pending until its task was dropped.
+  The terminal wrapper of every driver spawn, plain and supervised on both engines, now calls `wake_close_waiters` after latching the no-driver signal.
+
 ## [2.0.0] - 2026-11-19
 
 ### Changed

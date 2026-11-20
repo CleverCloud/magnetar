@@ -242,12 +242,43 @@ impl<P: Providers> Transport<P> {
         }
     }
 
+    /// Run one blocking step of a dial — the caller's DNS resolution, a TCP connect, or the
+    /// TLS handshake — under `connect_timeout`, driven by the engine `TimeProvider`.
+    ///
+    /// This is the single place a dial step is bounded, so the three steps share one shape
+    /// and one error: a step that outlives `connect_timeout` is dropped and surfaces as
+    /// `Io(TimedOut)` for the caller's retry / backoff to act on. The deadline is a
+    /// `TimeProvider::sleep` raced against the step with `biased;` (the step is polled
+    /// first), so it fires under virtual time, and a step that is ready on its first poll
+    /// (an in-memory resolver, say) never reaches the `sleep` and schedules no timer.
+    ///
+    /// `step_name` and `addr` only build the error message
+    /// (`"<step_name> <addr> exceeded connect_timeout (..)"`).
+    async fn bound_dial_step<T>(
+        time: &P::Time,
+        connect_timeout: Duration,
+        step_name: &str,
+        addr: &str,
+        step: impl std::future::Future<Output = Result<T, EngineError>>,
+    ) -> Result<T, EngineError> {
+        let mut step = std::pin::pin!(step);
+        moonpool_core::select! {
+            biased;
+            res = &mut step => res,
+            _ = time.sleep(connect_timeout) => Err(EngineError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{step_name} {addr} exceeded connect_timeout ({connect_timeout:?})"),
+            ))),
+        }
+    }
+
     /// Establish a plaintext connection to `addr` (a moonpool-format
     /// `host:port` string, NOT a `pulsar://` URL).
     ///
     /// # Errors
     /// Surfaces the underlying [`NetworkProvider::connect`] failure as
-    /// [`EngineError::Io`].
+    /// [`EngineError::Io`], and a connect that outlives `connect_timeout` as
+    /// `Io(TimedOut)`.
     pub(crate) async fn connect(
         network: &P::Network,
         addr: &str,
@@ -264,24 +295,19 @@ impl<P: Providers> Transport<P> {
             connect_timeout_ms = u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
             "dialling broker"
         );
-        // Single chokepoint for every dial site (initial connect, the proxy /
-        // multi-broker pool, and the supervisor reconnect): bound
+        // Every dial site (initial connect, the proxy / multi-broker pool, and the
+        // supervisor reconnect) reaches this through `connect_selected`: bound
         // `NetworkProvider::connect` with the engine `TimeProvider` so a hung
         // dial — moonpool-sim's `ConnectFailureMode` connect-hang, or a real
         // broker that stalls mid-establish — is abandoned under virtual time
         // instead of parking forever, surfacing as `Io(TimedOut)` for the
-        // caller's retry/backoff to act on. (ADR-0052)
-        let connect_fut = network.connect(addr);
-        let mut connect_fut = std::pin::pin!(connect_fut);
-        let stream = moonpool_core::select! {
-            biased;
-            res = &mut connect_fut => res,
-            _ = time.sleep(connect_timeout) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("connect dial to {addr} exceeded connect_timeout ({connect_timeout:?})"),
-            )),
-        }
-        .map_err(EngineError::Io)?;
+        // caller's retry/backoff to act on. The DNS resolution before this
+        // connect and the TLS handshake after it are bounded by the same
+        // budget through `bound_dial_step`. (ADR-0052)
+        let stream = Self::bound_dial_step(time, connect_timeout, "connect dial to", addr, async {
+            network.connect(addr).await.map_err(EngineError::Io)
+        })
+        .await?;
         Ok(Self::Plain {
             stream,
             read_scratch: new_read_scratch(),
@@ -299,9 +325,14 @@ impl<P: Providers> Transport<P> {
     /// back to [`Self::connect`] (which routes through the moonpool
     /// [`NetworkProvider`] directly).
     ///
+    /// `connect_timeout` bounds each blocking step on its own: the resolver call, and every
+    /// candidate's TCP connect (one candidate that never answers does not stop the next one
+    /// from being tried).
+    ///
     /// # Errors
     /// - [`EngineError::Config`] when `addr` does not parse as `host:port`.
-    /// - [`EngineError::Io`] when every resolved candidate fails to connect.
+    /// - [`EngineError::Io`] when every resolved candidate fails to connect, or with `TimedOut`
+    ///   when the resolver outlives `connect_timeout`.
     pub(crate) async fn connect_with_resolver(
         network: &P::Network,
         addr: &str,
@@ -313,7 +344,17 @@ impl<P: Providers> Transport<P> {
             return Self::connect(network, addr, time, connect_timeout).await;
         };
         let (host, port) = split_host_port(addr)?;
-        let addrs = resolver.resolve(host, port).await?;
+        // The resolver is caller code (a custom `DnsResolver` can block on a stub resolver or
+        // a service-discovery call that never answers), so it gets the same budget as the
+        // connect that follows it instead of parking the dial.
+        let addrs = Self::bound_dial_step(
+            time,
+            connect_timeout,
+            "dns resolution of",
+            addr,
+            resolver.resolve(host, port),
+        )
+        .await?;
         if addrs.is_empty() {
             return Err(EngineError::Config(format!(
                 "dns resolver returned no addresses for {host}:{port}"
@@ -357,10 +398,15 @@ impl<P: Providers> Transport<P> {
     /// [`rustls::ClientConfig`] — there is no `native-tls` or `openssl`
     /// shim ([ADR-0005](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
     ///
+    /// `connect_timeout` bounds each blocking step of the dial on its own — the resolver
+    /// call, each candidate's TCP connect, and the rustls handshake — so a peer that
+    /// completes TCP and then stays silent fails the dial instead of parking it.
+    ///
     /// # Errors
     /// - [`EngineError::Config`] when `host` is not a valid `ServerName`.
     /// - [`EngineError::Tls`] for any rustls handshake failure (bad cert, version mismatch, …).
-    /// - [`EngineError::Io`] for socket failures during the handshake.
+    /// - [`EngineError::Io`] for socket failures during the handshake, and with `TimedOut` when the
+    ///   resolver, a connect or the handshake outlives `connect_timeout`.
     /// - [`EngineError::PeerClosed`] if the peer closes the byte pipe mid-handshake.
     pub(crate) async fn connect_tls(
         network: &P::Network,
@@ -398,8 +444,22 @@ impl<P: Providers> Transport<P> {
         };
         // Drive the handshake to completion. The adapter is stateful: pump
         // outbound ciphertext, pull inbound, repeat until rustls reports
-        // `!is_handshaking()`.
-        transport.tls_handshake().await?;
+        // `!is_handshaking()`. A peer that accepted the TCP connection and then
+        // never answers the ClientHello (a black-holed backend behind an L4
+        // pass-through, a partition right after accept) would park this read
+        // loop for good, and with it the initial connect or the supervisor's
+        // redial: the TCP connect above already returned, so the handshake gets
+        // its own `connect_timeout` and a silent peer fails as `Io(TimedOut)`.
+        // One deadline armed around the whole loop, not one per read, so a
+        // handshake that makes progress schedules exactly one timer (ADR-0052).
+        Self::bound_dial_step(
+            time,
+            connect_timeout,
+            "TLS handshake with",
+            addr,
+            transport.tls_handshake(),
+        )
+        .await?;
         Ok(transport)
     }
 

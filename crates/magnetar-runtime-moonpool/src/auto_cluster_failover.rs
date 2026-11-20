@@ -197,11 +197,14 @@ impl<P: Providers> AutoClusterFailover<P> {
     /// URL in priority order and snaps the active index to the first
     /// healthy one (failback to the primary as soon as it recovers).
     ///
-    /// Each [`HealthProbe::poll_probe`] call is given a deadline of
-    /// `interval` from the tick start (computed against the host
-    /// [`Instant`] clock; under `moonpool-sim` the *waiting* between ticks
-    /// is virtual, but the deadline plumbing still serves as an upper
-    /// bound for cooperatively-honoured probes).
+    /// Each URL's [`HealthProbe::poll_probe`] is given its own deadline of
+    /// `interval` from the moment that probe starts, not one deadline shared
+    /// by the tick: a primary that drops packets and consumes its whole
+    /// budget must not leave the standbys with none, so a tick over `n` URLs
+    /// that all blackhole lasts up to `n * interval`. The deadline is computed
+    /// against the host [`Instant`] clock; under `moonpool-sim` the *waiting*
+    /// between ticks is virtual, but the deadline plumbing still serves as an
+    /// upper bound for cooperatively-honoured probes.
     ///
     /// `providers` is consumed by reference; the task provider's
     /// `spawn_task` clones the bits it needs.
@@ -211,7 +214,7 @@ impl<P: Providers> AutoClusterFailover<P> {
         let active = self.active.clone();
         let time = providers.time().clone();
         // ADR-0011 sans-io clock injection. Anchor a host `Instant` once at
-        // `start()` so the per-tick deadline read flows through
+        // `start()` so the per-probe deadline read flows through
         // `providers.time().now()` (a `Duration` since the provider's base).
         // Under `TokioProviders` `time.now()` tracks the host monotonic clock
         // so behaviour is unchanged; under `SimProviders` it advances only as
@@ -251,9 +254,16 @@ impl<P: Providers> AutoClusterFailover<P> {
                             }
                         }
                     }
-                    let deadline = now_instant() + interval;
                     let mut new_active: Option<usize> = None;
                     for (idx, url) in urls.iter().enumerate() {
+                        // One deadline per URL, measured from the moment *its*
+                        // probe starts. A deadline shared by the whole tick would
+                        // let a blackholed primary (SYN dropped, so the connect
+                        // ends only at the deadline) spend the entire budget and
+                        // hand every standby an already-past deadline: each would
+                        // read unhealthy without a real attempt and failover would
+                        // never happen in exactly the outage shape it exists for.
+                        let deadline = now_instant() + interval;
                         // Adapt the sans-io `poll_probe` into an async wait via
                         // `poll_fn` — the probe parks `cx.waker()` while pending
                         // and we get re-polled on completion. No channels.

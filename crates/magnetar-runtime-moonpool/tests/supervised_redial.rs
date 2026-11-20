@@ -34,7 +34,10 @@
 
 #![allow(clippy::expect_used)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,7 +47,7 @@ use magnetar_proto::{
     AntiThrashThreshold, ConnectionConfig, CreateProducerRequest, FrameError, SupervisorConfig,
     decode_one, encode_command, pb,
 };
-use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
+use magnetar_runtime_moonpool::{Client, DnsResolveFuture, DnsResolver, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
 use moonpool_sim::providers::SimProviders;
 use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
@@ -443,6 +446,378 @@ fn supervised_loop_redials_under_drop_accept_cycle_sweep_8_seeds() {
     assert!(
         drops >= 2,
         "multi-cycle drop pattern must fire (drops={drops}, report={report:?})"
+    );
+}
+
+// -- A user close() that lands while a supervisor redial is dialling ---------
+
+/// Every frame the broker decoded, tagged with the accept-order index of the
+/// session it arrived on (0 = the bootstrap socket, 1.. = supervisor redials).
+type SessionFrames = Arc<Mutex<Vec<(u32, pb::base_command::Type)>>>;
+
+/// Virtual-time bound on `Client::close()` once the redial dial is released.
+/// The correct behaviour resolves it in a few simulated milliseconds.
+const CLOSE_BOUND: Duration = Duration::from_secs(30);
+
+/// Virtual-time budget of one run (a safety net: the red path leaves the
+/// supervisor re-attached and alive).
+const RUN_TIME_BUDGET: Duration = Duration::from_mins(10);
+
+#[derive(Debug, Default)]
+struct GateState {
+    released: bool,
+    waker: Option<Waker>,
+}
+
+/// Resolver whose first lookup (the bootstrap dial) answers at once and whose
+/// every later lookup (a supervisor redial) parks until [`Self::release`], so
+/// the workload can land `Client::close()` while the redial is in flight and
+/// then let that dial succeed.
+#[derive(Debug)]
+struct GatedRedialResolver {
+    addr: SocketAddr,
+    lookups: AtomicU32,
+    /// Set the moment a redial lookup parks.
+    redial_parked: AtomicBool,
+    gate: Mutex<GateState>,
+}
+
+impl GatedRedialResolver {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            lookups: AtomicU32::new(0),
+            redial_parked: AtomicBool::new(false),
+            gate: Mutex::new(GateState::default()),
+        }
+    }
+
+    fn release(&self) {
+        let waker = {
+            let mut gate = self.gate.lock();
+            gate.released = true;
+            gate.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl DnsResolver for GatedRedialResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, _port: u16) -> DnsResolveFuture<'a> {
+        Box::pin(async move {
+            if self.lookups.fetch_add(1, Ordering::SeqCst) > 0 {
+                self.redial_parked.store(true, Ordering::SeqCst);
+                std::future::poll_fn(|cx| {
+                    let mut gate = self.gate.lock();
+                    if gate.released {
+                        Poll::Ready(())
+                    } else {
+                        gate.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            Ok(vec![self.addr])
+        })
+    }
+}
+
+/// One broker session. Answers CONNECT / PING / LOOKUP / PRODUCER and records
+/// every decoded frame under `session`. Session 0 drops its socket `delay`
+/// after acking the producer, so the supervisor redials; every other session
+/// stays open until the client hangs up.
+async fn handle_recorded_session<S, T>(
+    mut stream: S,
+    session: u32,
+    seen: SessionFrames,
+    delay: Duration,
+    time: T,
+) -> SimulationResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    T: TimeProvider,
+{
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    let mut sent_producer_success = false;
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            seen.lock().push((session, kind));
+            match kind {
+                pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                pb::base_command::Type::Ping => emit_pong(&mut out_buf),
+                pb::base_command::Type::Lookup => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(&mut out_buf, l.request_id);
+                    }
+                }
+                pb::base_command::Type::Producer => {
+                    if let Some(p) = &frame.command.producer {
+                        emit_producer_success(&mut out_buf, p.request_id);
+                        sent_producer_success = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out_buf.is_empty() {
+            if stream.write_all(&out_buf).await.is_err() {
+                return Ok(());
+            }
+            if stream.flush().await.is_err() {
+                return Ok(());
+            }
+            out_buf.clear();
+        }
+
+        if session == 0 && sent_producer_success {
+            let _ = time.sleep(delay).await;
+            return Ok(());
+        }
+
+        match read_into(&mut stream, &mut read_buf).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Broker workload that numbers its sessions in accept order and records
+/// their frames.
+struct RecordedSessionBroker {
+    /// Milliseconds between `ProducerSuccess` and the drop of session 0.
+    delay_ms: u64,
+    frames: SessionFrames,
+}
+
+impl RecordedSessionBroker {
+    fn new(delay_ms: u64) -> Self {
+        Self {
+            delay_ms,
+            frames: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for RecordedSessionBroker {
+    fn name(&self) -> &str {
+        "broker"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let network = ctx.network().clone();
+        let bind_addr = format!("{}:{BROKER_PORT}", ctx.my_ip());
+        let listener = network
+            .bind(&bind_addr)
+            .await
+            .map_err(|e| SimulationError::InvalidState(format!("broker bind: {e}")))?;
+
+        let shutdown = ctx.shutdown().clone();
+        let delay = Duration::from_millis(self.delay_ms);
+        let providers = ctx.providers().clone();
+        let task = ctx.providers().task().clone();
+        let mut next_session: u32 = 0;
+        loop {
+            moonpool_sim::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                inbound = listener.accept() => {
+                    match inbound {
+                        Ok((stream, _peer)) => {
+                            let session = next_session;
+                            next_session += 1;
+                            let frames = self.frames.clone();
+                            let time = providers.time().clone();
+                            let _handle = task.spawn_task("recorded-session", async move {
+                                let _ = handle_recorded_session(
+                                    stream, session, frames, delay, time,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How far the client workload got.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum CloseStage {
+    /// Nothing observed yet.
+    #[default]
+    Started,
+    /// The producer opened on the bootstrap session.
+    ProducerOpened,
+    /// The supervisor parked inside the redial's lookup (the dial in flight).
+    RedialParked,
+    /// The workload reached its verdict on `Client::close()`: `closed` is
+    /// whether it resolved within `CLOSE_BOUND` of the dial's release.
+    Judged { closed: bool },
+}
+
+/// Client paired with [`RecordedSessionBroker`]: opens a producer, waits for
+/// the supervisor to park inside its redial dial, lands `Client::close()`,
+/// then lets the dial succeed.
+struct CloseDuringRedialClientWorkload {
+    stage: Arc<Mutex<CloseStage>>,
+}
+
+impl CloseDuringRedialClientWorkload {
+    fn new() -> Self {
+        Self {
+            stage: Arc::new(Mutex::new(CloseStage::default())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for CloseDuringRedialClientWorkload {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let broker_ip = ctx
+            .peer("broker")
+            .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
+        let addr = format!("{broker_ip}:{BROKER_PORT}");
+        let broker_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| SimulationError::InvalidState(format!("broker address {addr}: {e}")))?;
+        let resolver = Arc::new(GatedRedialResolver::new(broker_addr));
+        let dns: Arc<dyn DnsResolver> = resolver.clone();
+        let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(SupervisorConfig {
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(40),
+                mandatory_stop: Duration::from_mins(1),
+                max_attempts: Some(64),
+                ..SupervisorConfig::default()
+            }),
+            // The parked redial lookup is inside this bound: it must outlast
+            // the (virtual) time the workload needs to land the close.
+            connect_timeout: Duration::from_mins(5),
+            ..ConnectionConfig::default()
+        };
+
+        let Ok(Ok(client)) = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, Some(dns)),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        // A producer the application has open on the bootstrap session.
+        let producer = time
+            .timeout(
+                Duration::from_secs(20),
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/sim-close-during-redial".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let Ok(Ok(_producer)) = producer else {
+            return Ok(());
+        };
+        *self.stage.lock() = CloseStage::ProducerOpened;
+
+        // The broker drops the bootstrap socket a few ms after acking the
+        // producer; wait for the supervisor to park inside the redial lookup.
+        let mut parked = false;
+        for _ in 0..5_000u32 {
+            if resolver.redial_parked.load(Ordering::SeqCst) {
+                parked = true;
+                break;
+            }
+            let _ = time.sleep(Duration::from_millis(1)).await;
+        }
+        if !parked {
+            return Ok(());
+        }
+        *self.stage.lock() = CloseStage::RedialParked;
+
+        // `Client::close()` runs its synchronous prefix on the first poll: the
+        // connection is `Closing` from here on, whatever the future does next.
+        let mut close = Box::pin(client.close());
+        let mut closed =
+            std::future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(close.as_mut(), cx)))
+                .await
+                .is_ready();
+
+        // The redial dial now succeeds.
+        resolver.release();
+        if !closed {
+            closed = time.timeout(CLOSE_BOUND, close).await.is_ok();
+        }
+        *self.stage.lock() = CloseStage::Judged { closed };
+        Ok(())
+    }
+}
+
+/// A user `close()` that lands while the supervisor is inside a redial dial
+/// must survive that dial succeeding: `Client::close()` has to resolve, and
+/// the producer the application had open must not be re-attached on the
+/// replacement socket. A supervisor that re-checks `is_user_closed()` only
+/// before the dial runs `reset()` once a dial succeeds afterwards, which
+/// snaps `Closing` back to `Uninitialized` and erases the close.
+#[test]
+fn close_during_redial_dial_is_not_erased_by_reset() {
+    let broker = RecordedSessionBroker::new(5);
+    let frames = broker.frames.clone();
+    let client = CloseDuringRedialClientWorkload::new();
+    let stage = client.stage.clone();
+    let report = SimulationBuilder::new()
+        .run_time_budget(RUN_TIME_BUDGET)
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1])
+        .set_iterations(1)
+        .run();
+
+    let stage = *stage.lock();
+    let CloseStage::Judged { closed } = stage else {
+        panic!(
+            "precondition: the producer opened, the supervisor parked inside its redial dial and \
+             the close was judged (stage={stage:?}, report={report:?})"
+        );
+    };
+    let replayed_producers = frames
+        .lock()
+        .iter()
+        .filter(|(session, kind)| *session >= 1 && *kind == pb::base_command::Type::Producer)
+        .count();
+    assert!(
+        closed && replayed_producers == 0,
+        "a user close() issued while a supervisor redial was dialling was erased by the \
+         redial's reset(): Client::close() resolved = {closed} (must be true), producers \
+         re-attached on the replacement socket = {replayed_producers} (must be 0) \
+         (report={report:?})"
     );
 }
 

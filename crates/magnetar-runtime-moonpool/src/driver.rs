@@ -156,6 +156,27 @@ fn wake_close_waiters(shared: &ConnectionShared) {
         .notify_waiters();
 }
 
+/// [`handle_pending_events`] for the two arms of [`driver_loop_inner`] that drain the
+/// driver-actionable events (inbound bytes and the timer tick).
+///
+/// An `Err` from the drain ends the loop: `TopicMigrated` (PIP-188), an `AuthChallenge` with no
+/// provider, or a failed credential refresh. Unlike every other error exit of the loop, a bare `?`
+/// there leaves the state machine untouched, and the terminal wrapper's `fail_all_pending` does
+/// not change the handshake state either, so the dead connection would keep reporting
+/// `Connected`: `is_connected()` stays true, the ADR-0059 fast-fail (`is_closed()`) never arms and
+/// parked per-client-buffer waiters are never woken. Run the same `mark_disconnected()` +
+/// [`wake_close_waiters`] pair the other error exits run before the error propagates. 1:1 with the
+/// tokio engine.
+fn drain_driver_events_or_disconnect(
+    shared: &Arc<ConnectionShared>,
+    retries: &mut Vec<RetryRequest>,
+) -> Result<(), EngineError> {
+    handle_pending_events(shared, retries).inspect_err(|_| {
+        shared.inner.lock().mark_disconnected();
+        wake_close_waiters(shared);
+    })
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (`Connected`, `SendReceipt`,
 /// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
@@ -1045,7 +1066,11 @@ pub(crate) struct ReconnectContext {
     /// rustls configuration retained for a TLS-supervised reconnect.
     pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Explicit rustls server name retained when the initial TLS dial used a
-    /// logical hostname different from its physical address.
+    /// logical hostname different from its physical address. It names the
+    /// bootstrap `host_port` and is used only while the redial target equals it
+    /// (no provider, an unparseable provider URL, or a provider that still
+    /// returns the bootstrap address); a provider that switches to another
+    /// address is verified against that address's own host.
     pub(crate) tls_server_name: Option<String>,
     /// Optional PIP-121 provider polled on every reconnect attempt. When
     /// `None`, the cached `host_port` is reused (matches the pre-PIP-121
@@ -1122,6 +1147,14 @@ where
         driver_shared.mark_no_driver();
         #[cfg(feature = "scalable-topics")]
         driver_shared.scalable_routes.close_all();
+        // The graceful `Ok(())` exits of `driver_loop_inner` (a local `close()` or
+        // `DriverHandle::abort`, plus the flush) pulse nothing, and a waiter parked on a
+        // per-client buffer's `Notify` (`next_topic_list_change`,
+        // `next_replicated_subscription_marker`, `next_scalable_event`, ...) only re-checks
+        // `is_closed()` when it is woken. `close()` already snapped the state and the
+        // connection is terminal now, so wake them. Idempotent after an Err exit that
+        // already pulsed: `notify_waiters` stores no permit. 1:1 with the tokio engine.
+        wake_close_waiters(&driver_shared);
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab, so they
         // observe the terminal connection state and stop waiting.
@@ -1193,6 +1226,9 @@ where
         driver_shared.mark_no_driver();
         #[cfg(feature = "scalable-topics")]
         driver_shared.scalable_routes.close_all();
+        // Same terminal wake as the plain `spawn` above: the graceful exit pulses nothing a
+        // parked per-client-buffer waiter sleeps on.
+        wake_close_waiters(&driver_shared);
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on the dedicated event waker, not the proto waker slab.
         driver_shared.event_waker.notify_waiters();
@@ -1283,8 +1319,10 @@ where
 
         let supervisor_cfg = shared.inner.lock().supervisor_config().cloned();
         // Per-attempt dial budget for each reconnect (ADR-0052): the supervisor
-        // loop already retries, so the chokepoint timeout on `Transport::connect`
-        // is all the reconnect dial needs to avoid parking on a connect-hang.
+        // loop already retries, so the `connect_timeout` that `Transport::connect_selected`
+        // puts on each blocking step of the dial (the caller's DNS resolver, the TCP
+        // connect, the TLS handshake) is all the reconnect dial needs to avoid parking on a
+        // connect-hang or a peer that accepts TCP and then stays silent.
         let connect_timeout = shared.inner.lock().connect_timeout();
         let Some(cfg) = supervisor_cfg else {
             return last_inner_result;
@@ -1425,10 +1463,18 @@ where
                 };
 
             let resolver = reconnect_ctx.dns_resolver.as_deref();
-            let tls_host = reconnect_ctx.tls_server_name.as_deref().unwrap_or_else(|| {
-                crate::transport::split_host_port(&target_host_port)
-                    .map_or(target_host_port.as_str(), |(host, _)| host)
-            });
+            // The certificate is verified against the name of the broker being dialled. The
+            // retained `tls_server_name` is the logical name of the *bootstrap* address (the
+            // initial dial may have used a physical one), so it speaks only for a target that
+            // is that address; a PIP-121 provider that has switched to another cluster is
+            // verified against its own host, as the tokio supervisor does. Reusing the
+            // bootstrap name there fails every handshake with a name mismatch and the
+            // failover never completes.
+            let tls_host = match reconnect_ctx.tls_server_name.as_deref() {
+                Some(name) if target_host_port == reconnect_ctx.host_port => name,
+                _ => crate::transport::split_host_port(&target_host_port)
+                    .map_or(target_host_port.as_str(), |(host, _)| host),
+            };
             let dial = Transport::<P>::connect_selected(
                 providers.network(),
                 &target_host_port,
@@ -1475,6 +1521,19 @@ where
         // / consumer once the new socket's handshake completes.
         {
             let mut conn = shared.inner.lock();
+            // A user `close()` can land while the dial above is in flight: the
+            // `is_user_closed()` gates before the dial cannot see it, and `reset()`
+            // would snap `Closing` back to `Uninitialized` and drop the queued `Closed`
+            // event, so the supervisor would rebuild every producer and consumer on the
+            // fresh socket and `Client::close()` (which joins this task) would never
+            // return. The check and the `reset()` share one lock acquisition, so a
+            // `close()` either precedes both (and is honoured here) or follows `reset()`
+            // and is handled by the inner loop like any in-session close. Dropping
+            // `new_transport` on return closes the freshly dialled connection. Mirror of
+            // the tokio runtime.
+            if conn.is_user_closed() {
+                return last_inner_result;
+            }
             conn.reset();
             if let Err(err) = conn.begin_handshake() {
                 tracing::error!(error = %err, "supervisor: begin_handshake after reset failed");
@@ -1876,7 +1935,7 @@ where
                     }
                 }
                 let mut retries: Vec<RetryRequest> = Vec::new();
-                handle_pending_events(&shared, &mut retries)?;
+                drain_driver_events_or_disconnect(&shared, &mut retries)?;
                 // Dispatch any transient producer-open / subscribe retries as
                 // detached tasks on the engine providers — the delayed lookup +
                 // re-attach sleeps on the INJECTED clock (`time`), so the leg
@@ -1955,7 +2014,7 @@ where
                 // out here parks the expiry's retry leg until the next inbound frame, a
                 // whole keepalive interval away on the silent broker that caused it.
                 let mut retries: Vec<RetryRequest> = Vec::new();
-                handle_pending_events(&shared, &mut retries)?;
+                drain_driver_events_or_disconnect(&shared, &mut retries)?;
                 for req in retries {
                     spawn_retry_leg::<P>(&shared, &time, &task, req);
                 }

@@ -19,6 +19,8 @@
 //! `SimProviders` therefore drives it on Moonpool 0.8's native deterministic executor and virtual
 //! clock, while this focused policy test uses `TokioProviders` on the production-shaped path.
 
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -191,6 +193,91 @@ async fn probe_loop_flips_active_url_in_sync_with_scripted_verdicts() {
             // prober is now a plain drop (the `LocalSet` tears the spawned
             // task down when this future returns).
             drop(handle);
+        })
+        .await;
+}
+
+/// Smallest remaining budget a connect to a *healthy* standby needs in order to
+/// succeed. A real connect cannot complete inside a deadline that is already
+/// behind us, so a probe handed an expired deadline reads unhealthy without a
+/// real attempt.
+const CONNECT_NEEDS: Duration = Duration::from_millis(5);
+
+/// Deadline-honouring probe whose primary blackholes (SYN dropped) while the
+/// standby is healthy and answers as soon as it is given a usable budget.
+///
+/// - Primary: the connect never completes on its own, it ends only when the deadline it was handed
+///   elapses, then reads unhealthy — exactly what `MoonpoolHealthProbe` does with
+///   `TimeProvider::timeout(deadline - now, connect)`.
+/// - Standby: healthy, but only if `deadline` still leaves [`CONNECT_NEEDS`] of budget; an expired
+///   deadline reads unhealthy without a real attempt.
+#[derive(Debug, Default)]
+struct BlackholedPrimaryProbe {
+    primary_connect: Mutex<Option<Pin<Box<tokio::time::Sleep>>>>,
+}
+
+impl HealthProbe for BlackholedPrimaryProbe {
+    fn poll_probe(&self, endpoint: &str, deadline: Instant, cx: &mut Context<'_>) -> Poll<bool> {
+        if endpoint.contains("primary") {
+            let mut slot = self
+                .primary_connect
+                .lock()
+                .expect("primary connect mutex poisoned");
+            let connect = slot.get_or_insert_with(|| {
+                Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline,
+                )))
+            });
+            match connect.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    *slot = None;
+                    Poll::Ready(false)
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(deadline.saturating_duration_since(Instant::now()) >= CONNECT_NEEDS)
+        }
+    }
+}
+
+/// A primary that drops packets instead of refusing consumes its whole probe
+/// budget; the standby must still get a real attempt and take over. Fails if every
+/// URL of a tick shares the one absolute `now + interval` deadline: the
+/// standby is then probed with an expired deadline, reads unhealthy, no candidate is
+/// elected and the dead primary stays active on every tick. 1:1 twin of the
+/// tokio engine's identically-named test.
+#[tokio::test(flavor = "current_thread")]
+async fn blackholed_primary_does_not_starve_standby_of_probe_budget() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let providers = TokioProviders::new();
+            let failover = AutoClusterFailover::<TokioProviders>::new(
+                vec![PRIMARY.to_owned(), STANDBY.to_owned()],
+                Arc::new(BlackholedPrimaryProbe::default()),
+            );
+            let handle = failover.start(&providers, TICK);
+
+            // Bounded wait: many ticks' worth of real time for the standby to
+            // be elected. The failing outcome is "never", so the bound only caps
+            // the failure duration; it is not part of the success condition.
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while failover.active_index() != 1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            handle.abort();
+
+            assert_eq!(
+                failover.active_index(),
+                1,
+                "a primary that blackholes for the whole probe interval must not leave the \
+                 healthy standby without probe budget: the active URL is still {}",
+                failover.get_service_url(),
+            );
+            assert_eq!(failover.get_service_url(), STANDBY);
         })
         .await;
 }
