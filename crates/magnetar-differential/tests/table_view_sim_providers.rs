@@ -212,6 +212,9 @@ struct TableViewClient {
     /// `Some` arms `auto_update_partitions_interval` on the `TableView`, which spawns the shared
     /// `AutoUpdateTask` ticker before the drain.
     auto_update: Option<Duration>,
+    /// Close a clone of the created view, then the view itself. The clones share one drain and
+    /// one ticker, so the second close finds both already shut down.
+    close_every_clone: bool,
 }
 
 #[async_trait]
@@ -248,7 +251,15 @@ impl Workload for TableViewClient {
                 if let Some(interval) = self.auto_update {
                     builder = builder.auto_update_partitions_interval(interval);
                 }
-                builder.create().await.map(|_view| ())
+                let view = match builder.create().await {
+                    Ok(view) => view,
+                    Err(error) => return Err(error),
+                };
+                if self.close_every_clone {
+                    view.clone().close().await;
+                    view.close().await;
+                }
+                Ok(())
             })
             .catch_unwind()
             .await
@@ -283,7 +294,11 @@ impl Workload for TableViewClient {
 
 /// Run one seeded simulation of the broker and the client; return the outcome of the call the
 /// client made.
-fn run_sim(table_view: bool, auto_update: Option<Duration>) -> Option<String> {
+fn run_sim(
+    table_view: bool,
+    auto_update: Option<Duration>,
+    close_every_clone: bool,
+) -> Option<String> {
     let sessions = Arc::new(Mutex::new(0));
     let obs = Arc::new(Mutex::new(Observation::default()));
     let _report = SimulationBuilder::new()
@@ -294,6 +309,7 @@ fn run_sim(table_view: bool, auto_update: Option<Duration>) -> Option<String> {
             obs: obs.clone(),
             table_view,
             auto_update,
+            close_every_clone,
         })
         .set_debug_seeds(vec![1_234_567_890_u64])
         .set_iterations(1)
@@ -311,7 +327,7 @@ fn run_sim(table_view: bool, auto_update: Option<Duration>) -> Option<String> {
 #[test]
 fn table_view_create_runs_on_sim_providers_without_a_tokio_runtime() {
     assert_eq!(
-        run_sim(true, None).as_deref(),
+        run_sim(true, None, false).as_deref(),
         Some("ok"),
         "TableViewBuilder::create over MoonpoolEngine<SimProviders> must complete; a panic here \
          means the drain task bypasses the provider boundary of ADR-0078"
@@ -324,7 +340,7 @@ fn table_view_create_runs_on_sim_providers_without_a_tokio_runtime() {
 #[test]
 fn table_view_auto_update_runs_on_sim_providers_without_a_tokio_runtime() {
     assert_eq!(
-        run_sim(true, Some(Duration::from_secs(1))).as_deref(),
+        run_sim(true, Some(Duration::from_secs(1)), false).as_deref(),
         Some("ok"),
         "TableViewBuilder::create with auto_update_partitions_interval over \
          MoonpoolEngine<SimProviders> must complete; a panic here means the AutoUpdateTask ticker \
@@ -338,8 +354,21 @@ fn table_view_auto_update_runs_on_sim_providers_without_a_tokio_runtime() {
 #[test]
 fn plain_consumer_subscribe_runs_on_sim_providers() {
     assert_eq!(
-        run_sim(false, None).as_deref(),
+        run_sim(false, None, false).as_deref(),
         Some("ok"),
         "a plain consumer subscribe over MoonpoolEngine<SimProviders> must complete"
+    );
+}
+
+/// Closing every clone of a `TableView` is allowed: the clones share one drain and one ticker,
+/// the first `close` stops both and waits for them, and a later `close` of another clone finds
+/// them already shut down and returns. The test requires both closes to return; it does not
+/// measure how long the second one takes.
+#[test]
+fn closing_every_clone_of_a_table_view_on_sim_providers_returns() {
+    assert_eq!(
+        run_sim(true, Some(Duration::from_secs(1)), true).as_deref(),
+        Some("ok"),
+        "closing a TableView and then a clone of it over MoonpoolEngine<SimProviders> must return"
     );
 }
