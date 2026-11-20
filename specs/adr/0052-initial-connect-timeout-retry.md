@@ -1,6 +1,6 @@
 # ADR-0052 — Initial-connect timeout + bounded retry
 
-- **Status**: Accepted (amended 2026-10-14 — supervised handshake bound)
+- **Status**: Accepted (amended 2026-10-14 — supervised handshake bound; amended 2026-11-19 — resolver and TLS handshake under `connect_timeout`)
 - **Date**: 2026-06-03
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, connection, resilience, moonpool, java-parity, determinism
@@ -160,3 +160,22 @@ This preserves the Java client's liveness property, rather than equating its tim
 Magnetar uses the operation budget already applied to initial handshakes.
 A controlled healthy → silent-handshake → healthy server regression exercises both engines; a finite-attempt variant checks that silent sessions cannot renew the budget.
 The assertions cover transport abandonment, successful recovery and terminal exit at a finite attempt budget.
+
+### Amendment (2026-11-19): `connect_timeout` bounds every blocking step of the moonpool dial
+
+The Decision above routes the moonpool dial through `Transport::connect` and bounds only `NetworkProvider::connect` there.
+Two steps of the dial sat outside that bound: the caller-supplied `DnsResolver::resolve` call that precedes the connect, and the rustls handshake that follows it on a TLS dial (`tls_handshake`, a read loop with no timer).
+A peer that completes TCP and never answers the ClientHello, or a resolver that never answers, therefore parked the initial `connect_tls` / `connect_tls_supervised` and the supervisor's redial inside `connect_selected`, and `Client::close()`, which joins the driver, waited on that redial for good.
+The tokio engine never had the gap: `Transport::connect_with_resolver` puts the resolver, the connect and the TLS handshake under one `tokio::time::timeout(connect_timeout, …)`.
+
+Every moonpool dial site still goes through `Transport::connect_selected`, and the single helper `Transport::bound_dial_step` now bounds each blocking step there: the resolver call, each candidate's TCP connect, and the TLS handshake.
+Each step gets its own `connect_timeout`, raced against the step on the injected `TimeProvider` with `biased;` (the step first), and a step that outlives it fails as `Io(TimedOut)`, which `dial_with_retry` re-dials and the supervisor backs off from like any other transient dial failure.
+No new configuration is introduced.
+
+The budget is per step and not one budget for the sum, which is where the two engines still differ: tokio abandons a dial whose steps add up past `connect_timeout`, moonpool a step that alone exceeds it.
+That is deliberate.
+The per-candidate bound already existed, and a resolver that returns several addresses depends on it: a candidate that never answers must not stop the next candidate from being tried, which one deadline around the whole dial would do.
+It also keeps the determinism rule of this ADR: a plaintext dial without a resolver arms exactly the one timer it armed before, a resolver that answers on its first poll arms none (the `sleep` is never polled), and the TLS handshake arms one timer for the whole loop, never one per read.
+
+The same fix covers every dial site, so it needs no per-site bound: `MoonpoolEngine::connect_tls`, `connect_tls_supervised`, `connect_plain*`, the multi-broker pool dial and the supervisor redial all call `connect_selected`.
+The redial in the supervisor needs no `is_user_closed` check of its own either: the dial now returns within a bounded time, and the supervisor loop checks the close request before the next attempt.

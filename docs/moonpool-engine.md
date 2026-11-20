@@ -147,6 +147,9 @@ Specifics for the moonpool engine:
 - DNS is re-resolved on every attempt through the injected `DnsResolver`.
   The crate ships `StaticDnsResolver` and an `arc_dns_resolver` helper.
 - The `ServiceUrlProvider` is consulted on every attempt before `Transport::connect`, so `ControlledClusterFailover` plugs straight in (see PIP-121 below).
+- Every dial of the attempt, the supervisor's redial included, runs each blocking step under `ConnectionConfig::connect_timeout` on the injected `TimeProvider`: the `DnsResolver` call, each candidate's TCP connect and, for TLS, the rustls handshake.
+  A step that outlives it fails the attempt as `Io(TimedOut)` (ADR-0052), so a TLS peer that accepts TCP and then stays silent cannot park the dial, nor `Client::close()` behind it.
+  The tokio engine bounds the same steps with one `tokio::time::timeout` around the whole dial; the moonpool engine keeps a budget per step so that a candidate that never answers does not stop the next candidate from being tried, and a plaintext dial without a resolver still arms exactly one timer.
 - After re-handshake the engine calls `Connection::rebuild_producers(now)` and `Connection::rebuild_consumers(now)` to re-issue `CommandProducer` / `CommandSubscribe` for every still-open handle.
 
 ## TLS adapter
@@ -181,6 +184,10 @@ Two implementations live in `magnetar-proto` (and are therefore usable by both e
 - `StaticServiceUrlProvider` — single URL, never changes.
 - `ControlledClusterFailover` — `Arc<Mutex<String>>` swappable at runtime via `set_url(...)`.
   Tests or sidecars drive failover by swapping the URL between reconnects.
+
+On a TLS-supervised client (`Client::connect_tls_supervised`) the redial verifies the certificate against the host of the address it dials.
+The `host` passed at connect time is kept as the rustls server name only while the redial target is the bootstrap `host:port` itself (no provider, an unparseable provider URL, or a provider that still returns that address), which is what lets a client dial a physical address under a logical name.
+Once a provider returns another address, that address's own host is the server name, exactly as on the tokio engine, so a failover cluster has to present a certificate for the hostname in its URL (and a `DnsResolver` can map that hostname to the cluster's address).
 
 `AutoClusterFailover<P>` (PIP-121 health-probe-driven) ships on the moonpool engine as well — the probe loop runs on `P::TaskProvider`, so the simulator drives the schedule deterministically with no real DNS or TCP.
 Source: [`crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs`](../crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs).

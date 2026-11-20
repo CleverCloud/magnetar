@@ -86,3 +86,8 @@ serde_json = { workspace = true }
 # (tests/logging_no_secrets.rs). Dev-only — the library itself never
 # installs a subscriber.
 tracing-subscriber = { workspace = true }
+# In-process TLS server fixture for the dial-bound and failover-hostname tests of
+# `tests/tls_transport_coverage.rs` (the tokio mirror of the moonpool fixture, ADR-0024):
+# `rcgen` mints self-signed certs at fixture build time, so there is no on-disk PEM.
+# Dev-only — it never leaks into the published crate's surface.
+rcgen = { version = "^0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }

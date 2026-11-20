@@ -113,3 +113,13 @@ Each reconnect attempt calls `provider.current()` to get the URL — that's the 
 - [ADR-0003 no-channels-rule](0003-no-channels-rule.md)
 - [ADR-0004 sans-io-protocol-core](0004-sans-io-protocol-core.md)
 - [ADR-0018 pip-188-reconnect-on-migrate](0018-pip-188-reconnect-on-migrate.md) (shares the supervised reconnect path)
+
+## Amendment (2026-11-19): a failover target is verified against its own hostname
+
+The decision above says what URL a redial dials and is silent on which name its TLS certificate is checked against.
+The tokio supervisor parses the provider's URL and verifies against that URL's host, so a failover to a cluster with a different DNS name works as long as that cluster's certificate names it.
+The moonpool supervisor kept the `host` given to `connect_tls_supervised` as the rustls server name for every redial, so the same failover verified the backup's certificate against the primary's hostname, failed every handshake with a name mismatch, and, with the default unbounded `max_attempts`, retried forever.
+
+The rule is now the same on both engines: a redial verifies the certificate against the host of the address it dials.
+The one exception is a retained logical name, which exists so that a client can dial a physical address (for example a resolved IP) under the hostname its certificate carries: it is kept as the server name only while the redial target is the bootstrap `host:port` itself, that is when there is no provider, when the provider's URL is unparseable and the supervisor falls back to the cached address, or when the provider still returns the bootstrap address.
+A failover cluster therefore has to present a certificate for the hostname in its provider URL, and a `DnsResolver` can map that hostname to the cluster's address.

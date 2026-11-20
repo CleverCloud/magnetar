@@ -1630,6 +1630,7 @@ dependencies = [
  "magnetar-proto",
  "parking_lot 0.13.0",
  "prost",
+ "rcgen",
  "rustls",
  "rustls-native-certs",
  "rustls-openssl",

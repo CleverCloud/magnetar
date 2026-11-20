@@ -339,6 +339,11 @@ impl<P: Providers> Client<P> {
 
     /// Connect through the TLS-capable supervised pool. Controller and segment
     /// entries reuse this rustls configuration and never downgrade to plaintext.
+    ///
+    /// `host` is the rustls server name for `addr`. The supervised redial keeps it only
+    /// while it dials `addr` itself; once `service_url_provider` returns another address,
+    /// that address's own host is verified instead (see
+    /// [`MoonpoolEngine::connect_tls_supervised`]).
     pub async fn connect_tls_supervised(
         engine: &MoonpoolEngine<P>,
         addr: &str,

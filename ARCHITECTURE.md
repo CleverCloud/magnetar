@@ -736,7 +736,9 @@ The supervisor:
    The transport-drop state (`Failed`, set by `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls into the backoff / redial path instead of returning.
    This is the difference between "broker went away" and "user called `.close()`".
 4. **Backs off** with a small exponential schedule capped by `ReconnectConfig::max_backoff` (jittered by the engine clock — under moonpool-sim this is deterministic per seed).
-5. **Reconnects** through the same `Transport::connect` path used at client init (re-resolving the broker URL via the configured `ServiceUrlProvider` on every attempt — this is where PIP-121 plugs in).
+5. **Reconnects** through the same dial path used at client init (re-resolving the broker URL via the configured `ServiceUrlProvider` on every attempt — this is where PIP-121 plugs in).
+   Every blocking step of that dial (the caller's `DnsResolver`, the TCP connect, the TLS handshake) is bounded by `connect_timeout` and fails as `Io(TimedOut)` ([ADR-0052](specs/adr/0052-initial-connect-timeout-retry.md)), so a peer that accepts TCP and goes silent cannot park the supervisor or the `Client::close()` that joins it.
+   A TLS redial verifies the certificate against the host of the address it dials: the logical name retained from the initial dial applies only while that address is the bootstrap one, so a PIP-121 failover cluster is checked against its own hostname.
 6. **Rebuilds producers and consumers** via `Connection::rebuild_producers(now)` and `Connection::rebuild_consumers(now)`.
    Each helper re-emits `CommandProducer` / `CommandSubscribe` for every still-open handle, stamps the new `session_epoch`, and replays the in-flight `OpSend` cached wire frames once the broker acks the producer.
    Consumers replay `initial_flow` followed by an explicit `CommandRedeliverUnacknowledgedMessages` after `SubscribeAcked` (the broker silently drops `CommandFlow` for an unknown `consumer_id`, so the Java `ConsumerImpl#reconnectLater` ordering is mandatory).

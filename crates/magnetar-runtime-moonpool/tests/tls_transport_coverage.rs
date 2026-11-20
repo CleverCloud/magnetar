@@ -41,13 +41,18 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
-use magnetar_runtime_moonpool::{EngineError, MoonpoolEngine};
+use magnetar_proto::{
+    ConnectionConfig, ControlledClusterFailover, FrameError, decode_one, encode_command, pb,
+};
+use magnetar_runtime_moonpool::{
+    Client, DnsResolveFuture, DnsResolver, EngineError, MoonpoolEngine,
+};
 use moonpool_core::TokioProviders;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -642,6 +647,404 @@ async fn connect_tls_clean_shutdown_releases_resources() {
 
             drop(shared);
             drop(fixture);
+        })
+        .await;
+}
+
+// -- connect_timeout must bound the TLS handshake and the redial -------------
+
+/// `connect_timeout` is documented (ADR-0052, and the tokio engine's whole-dial
+/// bound) as the budget for establishing the connection, TLS handshake included.
+/// A peer that accepts TCP and then never answers the `ClientHello` must therefore
+/// fail the dial with `Io(TimedOut)` after about `connect_timeout`. Fails if only
+/// the TCP `connect` is under that timer: `tls_handshake` then parks on the silent
+/// socket forever and the outer guard fires instead.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_tls_bounds_a_silent_tls_peer_by_connect_timeout() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr").to_string();
+            // Accept the TCP connection and hold it open without ever answering.
+            let silent_peer = tokio::spawn(async move {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                std::future::pending::<()>().await;
+                drop(tcp);
+            });
+
+            let (_server_cfg, client_cfg) = build_tls_material();
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let config = ConnectionConfig {
+                connect_timeout: Duration::from_millis(200),
+                connect_max_retries: 0,
+                ..ConnectionConfig::default()
+            };
+
+            // The guard is a fail-fast bound for the defect, not the behaviour
+            // asserted: the correct dial gives up after ~200 ms.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.connect_tls(&addr, FIXTURE_HOSTNAME, client_cfg, config, None),
+            )
+            .await;
+            silent_peer.abort();
+
+            let Ok(outcome) = outcome else {
+                panic!(
+                    "connect_tls parked for 5s on a TLS peer that accepted TCP and never \
+                     answered the ClientHello: connect_timeout (200ms) must bound the TLS \
+                     handshake too"
+                );
+            };
+            match outcome {
+                Err(EngineError::Io(err)) => assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut,
+                    "a dial that exceeds connect_timeout surfaces as Io(TimedOut), got {err:?}"
+                ),
+                Err(other) => {
+                    panic!("expected Io(TimedOut) from the bounded dial, got {other:?}")
+                }
+                Ok(_) => panic!("connect_tls must not succeed against a silent peer"),
+            }
+        })
+        .await;
+}
+
+/// Answer one inbound Pulsar `CommandConnect` with `CommandConnected` over an
+/// already-handshaken TLS stream. Returns `false` when the peer went away first.
+async fn reply_connected(tls: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> bool {
+    let mut read_buf = BytesMut::with_capacity(8 * 1024);
+    loop {
+        let mut framed = read_buf.clone().freeze();
+        match decode_one(&mut framed) {
+            Ok(_) => break,
+            Err(FrameError::Incomplete { .. }) => {}
+            Err(_) => return false,
+        }
+        match tls.read_buf(&mut read_buf).await {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+    }
+    let command = pb::BaseCommand {
+        r#type: pb::base_command::Type::Connected as i32,
+        connected: Some(pb::CommandConnected {
+            server_version: "magnetar-tls-fixture".to_owned(),
+            protocol_version: Some(21),
+            max_message_size: Some(5 * 1024 * 1024),
+            feature_flags: Some(pb::FeatureFlags::default()),
+        }),
+        ..Default::default()
+    };
+    let mut output = BytesMut::new();
+    encode_command(&mut output, &command).expect("encode CONNECTED");
+    tls.write_all(&output).await.is_ok() && tls.flush().await.is_ok()
+}
+
+/// The supervisor's redial goes through the same dial, so a TLS peer that accepts
+/// the replacement TCP connection and stays silent parks the driver inside
+/// `connect_selected` with no `is_user_closed` check, and `Client::close` joins
+/// that driver. With `connect_timeout` covering the handshake the redial is
+/// abandoned after ~200 ms, the supervisor observes the close request and
+/// `close()` returns.
+#[tokio::test(flavor = "current_thread")]
+async fn supervised_tls_redial_to_a_silent_peer_does_not_block_close() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (server_config, client_config) = build_tls_material();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr").to_string();
+            let acceptor = TlsAcceptor::from(server_config);
+            let drop_first = Arc::new(Notify::new());
+            let silent_accepts = Arc::new(AtomicUsize::new(0));
+            let silent_changed = Arc::new(Notify::new());
+            let server = {
+                let drop_first = drop_first.clone();
+                let silent_accepts = silent_accepts.clone();
+                let silent_changed = silent_changed.clone();
+                tokio::spawn(async move {
+                    // First connection: a real TLS + Pulsar handshake, then dropped on cue.
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    if !reply_connected(&mut tls).await {
+                        return;
+                    }
+                    drop_first.notified().await;
+                    drop(tls);
+                    // Every later connection: accept TCP, never answer the ClientHello.
+                    let mut held = Vec::new();
+                    while let Ok((tcp, _)) = listener.accept().await {
+                        held.push(tcp);
+                        silent_accepts.fetch_add(1, Ordering::Release);
+                        silent_changed.notify_waiters();
+                    }
+                })
+            };
+
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let config = ConnectionConfig {
+                connect_timeout: Duration::from_millis(200),
+                supervisor: Some(magnetar_proto::SupervisorConfig {
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(10),
+                    mandatory_stop: Duration::from_secs(1),
+                    max_attempts: None,
+                    ..magnetar_proto::SupervisorConfig::default()
+                }),
+                ..ConnectionConfig::default()
+            };
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_tls_supervised(
+                    &engine,
+                    &addr,
+                    FIXTURE_HOSTNAME,
+                    client_config,
+                    config,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("supervised TLS client did not complete its initial handshake")
+            .expect("supervised TLS client initial handshake succeeds");
+
+            drop_first.notify_one();
+            // Wait until the supervisor's redial has reached the silent peer.
+            tokio::time::timeout(HANG_GUARD, async {
+                loop {
+                    let changed = silent_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if silent_accepts.load(Ordering::Acquire) >= 1 {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("the supervisor never redialled the silent peer");
+
+            // `close()` is a fail-fast bound for the defect: the correct redial is
+            // abandoned after ~200 ms and the supervisor then exits on the close request.
+            let closed = tokio::time::timeout(Duration::from_secs(5), client.close()).await;
+            server.abort();
+            assert!(
+                closed.is_ok(),
+                "Client::close parked for 5s behind a supervised TLS redial whose peer accepted \
+                 TCP and never answered the ClientHello: connect_timeout (200ms) must bound the \
+                 handshake of a redial too"
+            );
+        })
+        .await;
+}
+
+// -- a failover redial verifies the target's own hostname -------------------
+
+/// Mint a self-signed cert naming exactly `name`, and return the server config
+/// that presents it plus the cert (to be added to the client's trust anchors).
+fn build_named_server(name: &str) -> (Arc<ServerConfig>, CertificateDer<'static>) {
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec![name.to_owned()]).expect("rcgen self-signed cert");
+    let cert_der: CertificateDer<'static> = cert.der().clone();
+    let key_der: PrivateKeyDer<'static> =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let server_config = ServerConfig::builder_with_provider(
+        magnetar_runtime_moonpool::tls_crypto::active_provider(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("rustls default protocol versions are valid")
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der.clone()], key_der)
+    .expect("rustls server config");
+    (Arc::new(server_config), cert_der)
+}
+
+/// Resolves the two cluster hostnames of the failover scenario to their listeners.
+#[derive(Debug)]
+struct ClusterResolver {
+    cluster_a: SocketAddr,
+    cluster_b: SocketAddr,
+}
+
+impl DnsResolver for ClusterResolver {
+    fn resolve<'a>(&'a self, host: &'a str, _port: u16) -> DnsResolveFuture<'a> {
+        let resolved = match host {
+            "a.test" => Ok(vec![self.cluster_a]),
+            "b.test" => Ok(vec![self.cluster_b]),
+            other => Err(EngineError::Config(format!(
+                "test resolver only knows a.test and b.test, got {other}"
+            ))),
+        };
+        Box::pin(async move { resolved })
+    }
+}
+
+/// PIP-121: the supervisor takes the redial target from the `ServiceUrlProvider`.
+/// After the provider switches to a differently named cluster, the redial must
+/// verify that cluster's certificate against the target's own hostname
+/// (`b.test`), as the tokio supervisor does. Fails if the moonpool supervisor
+/// keeps verifying against the bootstrap name (`a.test`): cluster B's certificate
+/// is then rejected on every attempt and the failover never completes.
+#[tokio::test(flavor = "current_thread")]
+async fn supervised_tls_redial_verifies_the_failover_target_hostname() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (server_a, cert_a) = build_named_server("a.test");
+            let (server_b, cert_b) = build_named_server("b.test");
+            let mut roots = RootCertStore::empty();
+            roots.add(cert_a).expect("trust anchor a.test");
+            roots.add(cert_b).expect("trust anchor b.test");
+            let client_config = Arc::new(
+                ClientConfig::builder_with_provider(
+                    magnetar_runtime_moonpool::tls_crypto::active_provider(),
+                )
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions are valid")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+
+            let listener_a = TcpListener::bind("127.0.0.1:0").await.expect("bind a");
+            let listener_b = TcpListener::bind("127.0.0.1:0").await.expect("bind b");
+            let addr_a = listener_a.local_addr().expect("local_addr a");
+            let addr_b = listener_b.local_addr().expect("local_addr b");
+
+            // Cluster A: one full TLS + Pulsar session, dropped on cue.
+            let drop_a = Arc::new(Notify::new());
+            let old_cluster_task = {
+                let drop_a = drop_a.clone();
+                let acceptor = TlsAcceptor::from(server_a);
+                tokio::spawn(async move {
+                    let Ok((tcp, _)) = listener_a.accept().await else {
+                        return;
+                    };
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    if !reply_connected(&mut tls).await {
+                        return;
+                    }
+                    drop_a.notified().await;
+                    drop(tls);
+                })
+            };
+
+            // Cluster B: counts the TLS handshakes it completes and the ones the
+            // client aborted (a certificate-name rejection surfaces here).
+            let b_sessions = Arc::new(AtomicUsize::new(0));
+            let b_rejected = Arc::new(AtomicUsize::new(0));
+            let b_changed = Arc::new(Notify::new());
+            let new_cluster_task = {
+                let b_sessions = b_sessions.clone();
+                let b_rejected = b_rejected.clone();
+                let b_changed = b_changed.clone();
+                let acceptor = TlsAcceptor::from(server_b);
+                tokio::spawn(async move {
+                    while let Ok((tcp, _)) = listener_b.accept().await {
+                        match acceptor.accept(tcp).await {
+                            Ok(mut tls) => {
+                                if reply_connected(&mut tls).await {
+                                    b_sessions.fetch_add(1, Ordering::Release);
+                                    b_changed.notify_waiters();
+                                    let mut sink = [0_u8; 64];
+                                    let _ = tls.read(&mut sink).await;
+                                }
+                            }
+                            Err(_) => {
+                                b_rejected.fetch_add(1, Ordering::Release);
+                            }
+                        }
+                    }
+                })
+            };
+
+            let failover = Arc::new(ControlledClusterFailover::new(format!(
+                "pulsar+ssl://a.test:{}",
+                addr_a.port()
+            )));
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let config = ConnectionConfig {
+                supervisor: Some(magnetar_proto::SupervisorConfig {
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(10),
+                    mandatory_stop: Duration::from_secs(1),
+                    max_attempts: None,
+                    ..magnetar_proto::SupervisorConfig::default()
+                }),
+                ..ConnectionConfig::default()
+            };
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_tls_supervised(
+                    &engine,
+                    &format!("a.test:{}", addr_a.port()),
+                    "a.test",
+                    client_config,
+                    config,
+                    Some(failover.clone()),
+                    Some(Arc::new(ClusterResolver {
+                        cluster_a: addr_a,
+                        cluster_b: addr_b,
+                    })),
+                ),
+            )
+            .await
+            .expect("supervised TLS client did not complete its initial handshake")
+            .expect("supervised TLS client initial handshake succeeds");
+
+            // Fail over: point the provider at cluster B, then lose cluster A's session.
+            failover.set_url(format!("pulsar+ssl://b.test:{}", addr_b.port()));
+            drop_a.notify_one();
+
+            // The bound is fail-fast for the defect (every attempt is rejected, so
+            // the supervisor would retry forever); a correct redial lands within
+            // milliseconds.
+            let landed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let changed = b_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if b_sessions.load(Ordering::Acquire) >= 1 {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await;
+            let rejected = b_rejected.load(Ordering::Acquire);
+            let landed_ok = landed.is_ok();
+            if landed_ok {
+                // Let the replacement session finish its own handshake before closing:
+                // the redial has reset the connection by now, so `is_connected()` is
+                // true only for cluster B's session.
+                tokio::time::timeout(HANG_GUARD, async {
+                    while !client.is_connected() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the client never reported connected on cluster B's session");
+            }
+            old_cluster_task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(10), client.close()).await;
+            new_cluster_task.abort();
+            assert!(
+                landed_ok,
+                "the redial after failing over to b.test never completed a TLS session with \
+                 cluster B: {rejected} handshake(s) were aborted by the client, which verified \
+                 B's certificate against the bootstrap hostname a.test instead of b.test"
+            );
         })
         .await;
 }

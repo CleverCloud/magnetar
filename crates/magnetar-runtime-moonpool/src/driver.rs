@@ -1066,7 +1066,11 @@ pub(crate) struct ReconnectContext {
     /// rustls configuration retained for a TLS-supervised reconnect.
     pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Explicit rustls server name retained when the initial TLS dial used a
-    /// logical hostname different from its physical address.
+    /// logical hostname different from its physical address. It names the
+    /// bootstrap `host_port` and is used only while the redial target equals it
+    /// (no provider, an unparseable provider URL, or a provider that still
+    /// returns the bootstrap address); a provider that switches to another
+    /// address is verified against that address's own host.
     pub(crate) tls_server_name: Option<String>,
     /// Optional PIP-121 provider polled on every reconnect attempt. When
     /// `None`, the cached `host_port` is reused (matches the pre-PIP-121
@@ -1315,8 +1319,10 @@ where
 
         let supervisor_cfg = shared.inner.lock().supervisor_config().cloned();
         // Per-attempt dial budget for each reconnect (ADR-0052): the supervisor
-        // loop already retries, so the chokepoint timeout on `Transport::connect`
-        // is all the reconnect dial needs to avoid parking on a connect-hang.
+        // loop already retries, so the `connect_timeout` that `Transport::connect_selected`
+        // puts on each blocking step of the dial (the caller's DNS resolver, the TCP
+        // connect, the TLS handshake) is all the reconnect dial needs to avoid parking on a
+        // connect-hang or a peer that accepts TCP and then stays silent.
         let connect_timeout = shared.inner.lock().connect_timeout();
         let Some(cfg) = supervisor_cfg else {
             return last_inner_result;
@@ -1457,10 +1463,18 @@ where
                 };
 
             let resolver = reconnect_ctx.dns_resolver.as_deref();
-            let tls_host = reconnect_ctx.tls_server_name.as_deref().unwrap_or_else(|| {
-                crate::transport::split_host_port(&target_host_port)
-                    .map_or(target_host_port.as_str(), |(host, _)| host)
-            });
+            // The certificate is verified against the name of the broker being dialled. The
+            // retained `tls_server_name` is the logical name of the *bootstrap* address (the
+            // initial dial may have used a physical one), so it speaks only for a target that
+            // is that address; a PIP-121 provider that has switched to another cluster is
+            // verified against its own host, as the tokio supervisor does. Reusing the
+            // bootstrap name there fails every handshake with a name mismatch and the
+            // failover never completes.
+            let tls_host = match reconnect_ctx.tls_server_name.as_deref() {
+                Some(name) if target_host_port == reconnect_ctx.host_port => name,
+                _ => crate::transport::split_host_port(&target_host_port)
+                    .map_or(target_host_port.as_str(), |(host, _)| host),
+            };
             let dial = Transport::<P>::connect_selected(
                 providers.network(),
                 &target_host_port,

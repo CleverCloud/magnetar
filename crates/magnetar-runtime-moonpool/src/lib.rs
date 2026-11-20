@@ -1224,6 +1224,12 @@ impl<P: Providers> MoonpoolEngine<P> {
     /// Connect over TLS and retain the rustls configuration in the supervised
     /// reconnect context. Provider-native timers and network operations are
     /// used for the initial dial and every replacement transport.
+    ///
+    /// `host` is the rustls server name for `addr`. Every redial to `addr` (no
+    /// `service_url_provider`, or one that returns `addr` again) verifies the
+    /// certificate against `host`; once the provider returns another address,
+    /// the redial verifies against that address's own host, so a failover
+    /// cluster must present a certificate for the name its URL carries.
     pub async fn connect_tls_supervised(
         &self,
         addr: &str,
@@ -1280,8 +1286,10 @@ impl<P: Providers> MoonpoolEngine<P> {
 /// recover from: there is no connection yet for the supervisor to rebuild, so
 /// a dial that never resolves — moonpool-sim's `ConnectFailureMode`
 /// connect-hang fault, or a real broker that accepts the SYN but never
-/// finishes establishing — would park the caller forever. Each attempt is
-/// bounded by the chokepoint connect-timeout inside [`Transport::connect`]
+/// finishes establishing, or a TLS peer that completes TCP and never answers
+/// the ClientHello — would park the caller forever. Each blocking step of an
+/// attempt (the caller's DNS resolver, the TCP connect, the TLS handshake) is
+/// bounded by `connect_timeout` inside [`Transport::connect_selected`]
 /// (driven by the engine [`TimeProvider`] so it fires under moonpool virtual
 /// time, not wall time — a `tokio::time` timeout would never advance the
 /// simulated clock). This helper re-dials the transient `Io` outcomes up to
@@ -1320,8 +1328,8 @@ where
     let started = time.now();
     let mut attempt: u32 = 0;
     loop {
-        // The dial closure funnels through `Transport::connect`, which already
-        // bounds the dial with the chokepoint connect-timeout; here we only
+        // The dial closure funnels through `Transport::connect_selected`, which already
+        // bounds every blocking step of the dial with `connect_timeout`; here we only
         // retry the transient outcomes it surfaces. Only `Io` failures (the
         // timeout lands as `Io(TimedOut)`, a refusal as `Io(ConnectionRefused)`)
         // are worth re-dialling — a permanent error (bad TLS name/cert,
