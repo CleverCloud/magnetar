@@ -2622,6 +2622,12 @@ impl StreamConsumerInner {
                         state.pending_transactions.clear();
                         state.transaction_registrations.clear();
                         state.reconnect_requested = true;
+                        // The fence closes every child, so the queued
+                        // deliveries are bound to generations that can never
+                        // be issued again: reset them as `request_resync` does.
+                        state.queue.clear();
+                        state.receive = magnetar_proto::StreamReceiveState::default();
+                        state.dispatch_permit_debt.clear();
                         state.model.require_resync()?
                     } else {
                         let mut actions = Vec::new();
@@ -8170,6 +8176,49 @@ mod tests {
                 .filter(|event| matches!(event, StreamConsumerEvent::TransactionOutcome { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_transaction_outcome_discards_stale_queued_deliveries() {
+        // An unknown outcome fences the model and closes every child, so each
+        // delivery still queued for those children is bound to a generation
+        // that can never be issued again. The queue must be reset exactly as
+        // `request_resync` resets it; otherwise the first stale `Fresh` entry
+        // makes every `receive` fail and hides the deliveries queued behind it.
+        let inner = aggregate_inner_with_two_messages();
+        assert_eq!(inner.state.lock().queue.len(), 2);
+
+        inner
+            .transaction_outcome(
+                magnetar_proto::TxnId::new(7, 11),
+                magnetar_proto::TransactionAcknowledgementOutcome::Unknown,
+            )
+            .await
+            .expect("unknown outcome propagation");
+
+        // After the reset a receive waits for the resynchronized children; it
+        // must not complete with an error raised by the stale queue head.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            inner.reserve_batch(1, usize::MAX),
+        )
+        .await
+        {
+            Err(_elapsed) => {}
+            Ok(Err(error)) => panic!(
+                "receive must wait for the resynchronized children, but it failed on a stale \
+                 queued delivery: {error:?}"
+            ),
+            Ok(Ok(messages)) => panic!(
+                "receive must not hand out {} delivery(ies) bound to a closed child generation",
+                messages.len()
+            ),
+        }
+        assert_eq!(
+            inner.state.lock().queue.len(),
+            0,
+            "an unknown outcome must discard the deliveries queued for the closed children"
         );
     }
 

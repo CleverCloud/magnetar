@@ -796,6 +796,7 @@ Transactional acknowledgement registers every represented `(segment topic, subsc
 Commit waits for all admitted operations.
 Any failed admitted registration or ack permanently poisons commit: `commit_transaction` returns `TransactionPoisoned` and sends no `EndTxn(Commit)`; abort remains available.
 Commit advances participating positions only after confirmation, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails every participant closed and requires resynchronization. The first installation of an unknown outcome emits `ResyncRequired` as well as the transaction outcome; retries of retained cleanup do not repeat that resynchronization event.
+The first installation also discards every message the consumer had received but not yet handed out, because each is bound to a child generation the fence has closed; `receive` then waits for the resynchronized children instead of failing on that stale queue head.
 Once the coordinator confirms commit or abort, an owned completion task records that terminal state and checkpoints each completed local participant action, so cancellation causes neither a second `EndTxn` nor replay of an already-issued FLOW prefix.
 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.

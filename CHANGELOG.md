@@ -96,6 +96,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The claim then returned a route it never stored: `publish` found no owner, so every owned control-plane event fell through to the raw queue and the owner's waiter ran into `operation_timeout`; `notify_waiters` and `close_all` iterated an empty map as well.
   No such build could open one since the assignment-driven `StreamConsumer` shipped in 1.8.0.
   The inserts now run unconditionally and only the "no previous owner" checks stay debug-only.
+- **A `StreamConsumer` whose transaction outcome is unknown can receive again after it resynchronizes.**
+  The unknown-outcome path of `propagate_transaction_outcome` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) fenced the model and closed every child but left the messages already queued for `receive` in place, still bound to the closed child generations.
+  `receive` and `receive_batch` then failed on the first queued message (`InvalidAggregatePhase`, and `StaleChildGeneration` or `UnknownChild` once the children reconnected), without requesting a resynchronization, and every newer message queued behind it was unreachable until the consumer was closed or an unrelated resynchronization cleared the queue.
+  The unknown outcome now resets the receive queue, the chunk-reassembly state and the permit debt exactly as `request_resync` does, so `receive` waits for the resynchronized children; redelivery of the discarded messages is the broker's, as for any resynchronization.
 
 ## [2.0.0] - 2026-11-19
 
