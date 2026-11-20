@@ -17,11 +17,11 @@ use magnetar_proto::{
     ArrivalFailureDisposition, BudgetError, BudgetReservationId, BudgetUse,
     CONTROL_PLANE_CLEANUP_RESERVE, ChildGeneration, ConsumerAssignment, ConsumerInstanceId,
     ControllerIncarnation, DECOMPRESSION_VALIDATION_SLACK, DagSnapshot, DeferredIncomingMessage,
-    DeliveryEpoch, DeliveryToken, FlowBlock, IncomingMessage, KeyRange, MAX_FRAME_SIZE, MessageId,
-    OrderingMode, PositionVector, ReceiverBudget, ReceiverBudgetState, SegmentId, SegmentPhase,
-    StreamConsumerAction, StreamConsumerModel, StreamConsumerModelError, StreamEntryAcceptance,
-    StreamMessageId, StreamReceiveState, TransactionAcknowledgementOutcome, TransactionDecision,
-    TxnId, canonical_segment_topic, pb,
+    DeliveryEpoch, DeliveryToken, FlowBlock, IncomingMessage, KeyRange, MAX_FRAME_SIZE,
+    MAX_PENDING_CHUNK_CHAINS, MessageId, OrderingMode, PositionVector, ReceiverBudget,
+    ReceiverBudgetState, SegmentId, SegmentPhase, StreamConsumerAction, StreamConsumerModel,
+    StreamConsumerModelError, StreamEntryAcceptance, StreamMessageId, StreamReceiveState,
+    TransactionAcknowledgementOutcome, TransactionDecision, TxnId, canonical_segment_topic, pb,
 };
 use prost::Message as _;
 
@@ -2714,4 +2714,160 @@ fn bucket_position_before_remaining_deliveries_emits_no_acknowledgement() {
         .child_closed(SegmentId(1), generation)
         .expect("close child");
     assert_eq!(aggregate.budget().data_used(), 0);
+}
+
+/// Chunk `chunk_id` of `total_chunks` of the chain `uuid`, announcing `total_size`
+/// assembled bytes.
+fn chunk_entry(
+    entry_id: u64,
+    uuid: &str,
+    chunk_id: i32,
+    total_chunks: i32,
+    total_size: i32,
+    payload: &'static [u8],
+) -> DeferredIncomingMessage {
+    deferred_entry(
+        entry_id,
+        Bytes::from_static(payload),
+        pb::MessageMetadata {
+            uuid: Some(uuid.to_owned()),
+            num_chunks_from_msg: Some(total_chunks),
+            chunk_id: Some(chunk_id),
+            total_chunk_msg_size: Some(total_size),
+            ..Default::default()
+        },
+        Vec::new(),
+        1,
+    )
+}
+
+/// The permit a buffered chunk hands its child for the next entry.
+fn buffered_flow(acceptance: StreamEntryAcceptance) -> BudgetReservationId {
+    match acceptance {
+        StreamEntryAcceptance::Buffered { actions } => flow_reservation(&actions),
+        other => panic!("expected a buffered chunk, got {other:?}"),
+    }
+}
+
+#[test]
+fn receive_state_caps_the_chunk_chains_of_one_child_and_forgets_them_on_close() {
+    let (mut model, generation, flow) = opened_one_child();
+    let mut receive = StreamReceiveState::default();
+    let mut permit = flow;
+    for chain in 0..MAX_PENDING_CHUNK_CHAINS {
+        let entry_id = u64::try_from(chain).expect("chain index fits u64");
+        permit = buffered_flow(
+            receive
+                .accept_entry(
+                    &mut model,
+                    SegmentId(1),
+                    generation,
+                    permit,
+                    chunk_entry(entry_id, &format!("chain-{chain}"), 0, 2, 4, b"a"),
+                )
+                .expect("open a chain under the cap"),
+        );
+    }
+    assert!(matches!(
+        receive.accept_entry(
+            &mut model,
+            SegmentId(1),
+            generation,
+            permit,
+            chunk_entry(99, "one-too-many", 0, 2, 4, b"a"),
+        ),
+        Err(StreamConsumerModelError::InvalidChunkFrame(
+            "too many concurrent chunk chains on one child"
+        ))
+    ));
+
+    // Closing the child forgets every chain it held: the next chunk of one of them now
+    // reads as a chain that never began.
+    receive.remove_child(SegmentId(1), generation);
+    assert!(matches!(
+        receive.accept_entry(
+            &mut model,
+            SegmentId(1),
+            generation,
+            permit,
+            chunk_entry(100, "chain-0", 1, 2, 4, b"b"),
+        ),
+        Err(StreamConsumerModelError::InvalidChunkFrame(
+            "a chunk chain must begin with chunk zero"
+        ))
+    ));
+}
+
+#[test]
+fn receive_state_rejects_an_entry_under_a_permit_its_child_does_not_hold() {
+    let mut model = model();
+    let open = model
+        .apply_assignment(assignment(&[1, 2]))
+        .expect("assignment");
+    let first = opened_generation(&open[0]);
+    let second = opened_generation(&open[1]);
+    let first_flow = flow_reservation(
+        &model
+            .child_opened(SegmentId(1), first)
+            .expect("open the first child"),
+    );
+    let second_flow = flow_reservation(
+        &model
+            .child_opened(SegmentId(2), second)
+            .expect("open the second child"),
+    );
+    let mut receive = StreamReceiveState::default();
+    receive
+        .accept_entry(
+            &mut model,
+            SegmentId(2),
+            second,
+            second_flow,
+            chunk_entry(1, "second-chain", 0, 2, 4, b"a"),
+        )
+        .expect("open a chain on the second child");
+
+    // A complete entry on the child holding the chain, presented under the other
+    // child's permit: binding it to that child is refused.
+    assert!(matches!(
+        receive.accept_entry(
+            &mut model,
+            SegmentId(2),
+            second,
+            first_flow,
+            deferred_entry(
+                2,
+                Bytes::from_static(b"plain"),
+                pb::MessageMetadata::default(),
+                Vec::new(),
+                1,
+            ),
+        ),
+        Err(StreamConsumerModelError::InvalidChildTransition { .. })
+    ));
+}
+
+#[test]
+fn chunk_continuation_for_a_cancelled_chain_assembly_is_a_budget_error() {
+    let (mut model, generation, flow) = opened_one_child();
+    let chain = model
+        .chunk_frame_buffered(SegmentId(1), generation, flow, None, 1024)
+        .expect("open a chain");
+    let continuation = flow_reservation(&chain.actions);
+    model
+        .cancel_receive_work(SegmentId(1), generation, chain.assembly)
+        .expect("cancel the chain's assembly");
+
+    // The next chunk arrives under the continuation permit, naming an assembly the
+    // ledger no longer holds.
+    assert!(matches!(
+        model.chunk_frame_buffered(
+            SegmentId(1),
+            generation,
+            continuation,
+            Some(chain.assembly),
+            1024,
+        ),
+        Err(StreamConsumerModelError::Budget(_))
+    ));
 }
