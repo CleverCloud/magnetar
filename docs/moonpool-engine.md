@@ -76,8 +76,8 @@ The pool lives at [`crates/magnetar-runtime-moonpool/src/pool.rs`](../crates/mag
 The pool is populated only when the client is built via [`Client::connect_plain_supervised`](../crates/magnetar-runtime-moonpool/src/client.rs) — that constructor wraps the bootstrap connect inputs (proxy address, `ConnectionConfig` template, `Providers` bundle, optional `ServiceUrlProvider` + `DnsResolver`) into a `ConnectionFactory<P>` and hands it to a fresh `ProxyConnectionPool<P>`.
 The [`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs) hook then routes any `LookupOutcome::Connect { proxy_through_service_url = true, .. }` to the pool via the `pool::get_or_open(Arc<Self>, logical_broker_url)` async free function, which:
 
-1. Probes the entries map; on a hit, returns the cached `Ready` entry.
-2. On a miss, installs a `Pending(PendingDial)` slot and spawns one dial through [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task).
+1. Probes the entries map; on a hit, returns the cached `Ready` entry — unless its driver has exited for good (no supervisor and the connection dropped, or the supervisor gave up after `max_attempts`; `ConnectionShared::is_no_driver`), in which case it is treated as a miss and replaced by step 2.
+2. On a miss (or over a dead `Ready` entry), installs a `Pending(PendingDial)` slot and spawns one dial through [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task).
    This keeps the single-flight ownership model identical under `TokioProviders` and `SimProviders` while racing callers await the same result.
 3. The spawned dial task runs `network.connect` → `handshake_plain` → `spawn_supervised`, then publishes the `Arc<Result<Arc<ConnectionShared>, EngineError>>` into the `PendingDial::result` slot and fans the result out via `Notify::notify_waiters`.
    Racing waiters all `Arc::clone` the same outcome.

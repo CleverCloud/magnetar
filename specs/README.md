@@ -236,3 +236,5 @@ ADR-0098's decision that four e2e cells run once per pull request, and that `e2e
 ADR-0066's stability promise is amended by ADR-0117 in one respect: `AvroSchema` remains a stable ✅ surface, but a default build no longer compiles it; it needs the `schema-avro` feature of `magnetar-proto` or `magnetar-driver`. ADR-0066's rule that a post-1.0.0 breaking change requires a major-version bump is unchanged, and the next release's version is not decided by ADR-0117.
 
 ADR-0059's entry-point guard list (§ 3) and ADR-0080's operation-deadline scope are amended by ADR-0129, which extends both to the PIP-31 transaction requests (`new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn` and the coordinator handshake); the rest of both ADRs is unchanged.
+
+ADR-0039's pool-entry lifecycle is amended in place on 2026-11-19: a pool entry whose driver has exited for good (no supervisor and the connection dropped, or a supervisor that exhausted `max_attempts`) is replaced by a fresh dial at the next open for its key instead of being handed out until `Client.close`; the rest of ADR-0039 is unchanged.

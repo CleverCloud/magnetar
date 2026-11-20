@@ -1,6 +1,6 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation)
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation; amended 2026-11-19 — a pool entry whose driver exited is replaced)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
@@ -32,6 +32,18 @@ instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
 > **Amendment (2026-07-16, [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).** The proxy connection model, pool key, and single-flight ownership remain unchanged.
 > The Moonpool-specific implementation described in "Send propagation — the load-bearing detail" is historical: Moonpool 0.8 makes provider futures `Send`, runs `SimProviders` tasks on its seeded executor, and requires provider-native task, time, and `moonpool_core::select!` boundaries.
 > Current pool dials also own a provider-native connect-plus-handshake deadline and a cancellation/completion handshake so `Client::close` waits for pending work to terminate.
+
+> **Amendment (2026-11-19, dead pool entries).** The "Pool entry lifecycle" and `Producer.close` bullets say an entry lives until `Client.close`, and the "Consequences" section promises that a broker rolling restart only churns its own entry.
+> Both held only while the entry's driver could redial.
+> Once that driver exits for good — a client without a supervisor (the façade default) on its first connection drop, or a supervisor that gave up after `max_attempts` — the entry's [ADR-0059](0059-terminal-fast-fail-new-ops.md) `no_driver` latch is set and nothing will ever serve its connection again.
+> The pool used to keep it and hand it out, so every later open or subscribe routed to that `(logical, physical, index)` key failed with `PeerClosed` for the rest of the client's life, although the broker was reachable again and the bootstrap connection was healthy.
+>
+> `get_or_open` (both engines) now treats an entry whose `no_driver` latch is set as absent: the caller dials, handshakes and registers a fresh entry under the same key, and a concurrent caller that already registered a live entry wins as before.
+> Eviction is lazy, at the next open for that key; the dead entry's `ConnectionShared` stays alive for the producers and consumers that still hold it, which the driver's exit already failed, so the replaced entry is only dropped — it is not closed, aborted or joined a second time.
+> The check reads the latch alone, never the connection mutex, because it runs under the pool's `entries` lock.
+> Moonpool replaces the dead `Ready` entry with a `Pending` generation, so the existing `Arc::ptr_eq` generation check still guards the promotion.
+> A redial that fails leaves the key without a live entry (tokio keeps the dead one until a dial succeeds, moonpool removes its `Pending` generation, as for any failed first dial), and the next open dials again.
+> `crates/magnetar-runtime-tokio/tests/pool_dead_entry.rs` and its moonpool twin pin the behaviour, each for an unsupervised entry and for a supervisor give-up.
 
 ## Context
 
