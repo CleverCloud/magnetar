@@ -56,6 +56,8 @@ struct Broker {
     crash_on_send: bool,
     /// Number of `CommandConnected` answers written, i.e. completed handshakes.
     handshakes: Arc<AtomicUsize>,
+    /// How long the broker holds its `CommandConnected` answer, so a dial stays in its handshake.
+    handshake_delay: Duration,
 }
 
 impl Broker {
@@ -65,6 +67,7 @@ impl Broker {
             up: Arc::new(AtomicBool::new(true)),
             crash_on_send,
             handshakes: Arc::new(AtomicUsize::new(0)),
+            handshake_delay: Duration::ZERO,
         }
     }
 }
@@ -89,6 +92,7 @@ async fn spawn_broker(broker: Broker) -> String {
 async fn serve(mut stream: TcpStream, broker: &Broker) -> std::io::Result<()> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
     let mut out_buf = BytesMut::with_capacity(8 * 1024);
+    let mut handshake = false;
     loop {
         loop {
             let mut framed = read_buf.clone().freeze();
@@ -100,11 +104,16 @@ async fn serve(mut stream: TcpStream, broker: &Broker) -> std::io::Result<()> {
             };
             let _ = read_buf.split_to(before - framed.len());
 
+            handshake |= frame.command.r#type == pb::base_command::Type::Connect as i32;
             if matches!(answer(&frame, broker, &mut out_buf), Flow::Close) {
                 return Ok(());
             }
         }
 
+        if handshake && !broker.handshake_delay.is_zero() {
+            tokio::time::sleep(broker.handshake_delay).await;
+        }
+        handshake = false;
         if !out_buf.is_empty() {
             stream.write_all(&out_buf).await?;
             stream.flush().await?;
@@ -339,4 +348,46 @@ async fn open_after_entry_death_redials_the_broker() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Two opens that the lookup routes to broker B while the pool's first dial of B is still in its
+/// handshake. Both succeed on a live connection to B. The handshake count is a range because of an
+/// engine difference: the moonpool pool joins the dial in flight (its twin asserts exactly one),
+/// while this pool does not share a dial between concurrent callers. `get_or_open` dials outside
+/// its lock and keeps whichever entry is registered first, so the second caller dials B too unless
+/// the first entry is already registered when it looks, and B completes one or two handshakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_opens_routed_to_one_broker_during_its_dial() {
+    let mut broker_b = Broker::new(None, false);
+    broker_b.handshake_delay = Duration::from_millis(200);
+    let b_handshakes = broker_b.handshakes.clone();
+    let b_url = spawn_broker(broker_b).await;
+    let a_url = spawn_broker(Broker::new(Some(b_url), false)).await;
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect(&a_url, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect to broker A");
+
+    let (first, second) = tokio::time::timeout(HANG_GUARD, async {
+        tokio::join!(
+            client.open_producer(producer_request("persistent://public/default/pool-join-a")),
+            client.open_producer(producer_request("persistent://public/default/pool-join-b")),
+        )
+    })
+    .await
+    .expect("both opens must resolve");
+    first.expect("the first open on broker B");
+    second.expect("the second open on broker B");
+    let handshakes = b_handshakes.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&handshakes),
+        "two concurrent opens dial B at most twice, observed {handshakes} handshakes"
+    );
+
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
 }

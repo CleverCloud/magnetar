@@ -51,7 +51,8 @@ Each PIP-31 request is guarded by ADR-0059's check and bounded by one operation 
 - The check in front of the lock is the same two-condition gate as everywhere else; a request registered in the instant between the check and a terminal exit is bounded by the deadline instead.
 - Residual, not changed here: the transaction-coordinator client keeps a small per-request record for a request that is cancelled and never answered (also after `Connection::reset`), and a late `EndTxn` reply with no retry stays parked, which is the resume design.
 - ADR-0024 layers: a `magnetar-proto` unit test for the late reply, and a Tokio and a Moonpool integration test for the terminal fast-fail and one for the deadline (1:1).
-  No new `magnetar-differential` or `e2e_*.rs` test: the transaction traces of the former and `e2e_transactions.rs` drive the changed methods on their success path and are unchanged, and neither can script a dead client or a silent coordinator.
+  `magnetar-differential` runs the late-reply contract against the shared `Connection`, the façade's transaction registration calls on both engines, and a stream consumer's transaction registration that the coordinator never answers, which times out the same way on both engines.
+  No `e2e_*.rs` test was added: `e2e_transactions.rs` drives the changed methods on their success path and cannot script a dead client or a silent coordinator.
 
 ## References
 
@@ -61,3 +62,6 @@ Each PIP-31 request is guarded by ADR-0059's check and bounded by one operation 
 - `crates/magnetar-runtime-tokio/tests/terminal_exit.rs`, `crates/magnetar-runtime-moonpool/tests/terminal_exit.rs` — `txn_ops_after_terminal_drop_fail_fast`.
 - `crates/magnetar-runtime-tokio/tests/txn_operation_deadline.rs`, `crates/magnetar-runtime-moonpool/tests/txn_operation_deadline.rs` — `txn_requests_honour_operation_timeout`.
 - `crates/magnetar-proto/src/conn.rs` — `late_reply_to_a_cancelled_txn_request_leaves_no_outcome`.
+- `crates/magnetar-differential/tests/txn_late_reply_contract.rs` — `late_reply_to_a_cancelled_txn_request_leaves_no_outcome`.
+- `crates/magnetar-differential/tests/facade_transaction_registration_equivalence.rs` — `transaction_registration_is_equivalent_on_both_facades`.
+- `crates/magnetar-differential/tests/scalable_runtime_surface_equivalence.rs` — `unanswered_transaction_registration_times_out_equivalently`.
