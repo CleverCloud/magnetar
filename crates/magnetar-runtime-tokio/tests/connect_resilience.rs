@@ -5,9 +5,10 @@
 //! `magnetar-runtime-moonpool/tests/connect_resilience.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): eight tests here mirror the moonpool
-//! file's four simulated initial-connect tests, two loopback redial tests and
-//! two loopback connect-cancellation tests.
+//! (`check-runtime-test-parity`): nine tests here mirror the moonpool
+//! file's four simulated initial-connect tests, two loopback redial tests,
+//! two loopback connect-cancellation tests and one loopback failed-handshake
+//! test.
 //!
 //! ## What this pins
 //!
@@ -576,5 +577,51 @@ async fn tokio_cancelled_from_socket_does_not_leak_its_driver() {
         "the broker never saw the connection close within {PEER_EOF_BOUND:?} of the caller \
          cancelling `Client::from_socket`: the driver task spawned for the handshake is detached \
          and still owns the socket",
+    );
+}
+
+/// A `from_socket` whose handshake fails must release its driver as well. `start_handshake`
+/// spawns the driver before it waits for CONNECTED, and on the error arm the guard that owns the
+/// spawned task is what aborts it. The broker reads the CONNECT and never answers, a short
+/// `operation_timeout` fails the call with the handshake bound's `TimedOut`, and the broker must
+/// then see the connection close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_failed_from_socket_handshake_releases_its_driver() {
+    let (client_end, mut broker_end) = tokio::io::duplex(64 * 1024);
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(200),
+        ..ConnectionConfig::default()
+    };
+
+    let outcome = tokio::time::timeout(PEER_EOF_BOUND, Client::from_socket(client_end, config))
+        .await
+        .expect("the handshake bound must fail `from_socket` well inside the test bound");
+    match outcome {
+        Ok(_) => panic!("the broker never answers CONNECT, yet from_socket returned a client"),
+        Err(ClientError::Io(io)) => assert_eq!(
+            io.kind(),
+            std::io::ErrorKind::TimedOut,
+            "a silent broker must fail the handshake with ErrorKind::TimedOut, got: {io}",
+        ),
+        Err(other) => {
+            panic!("expected the handshake bound's TimedOut ClientError::Io, got: {other:?}")
+        }
+    }
+
+    let mut tmp = vec![0u8; 8 * 1024];
+    let closed = tokio::time::timeout(PEER_EOF_BOUND, async {
+        loop {
+            match broker_end.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the broker never saw the connection close within {PEER_EOF_BOUND:?} of \
+         `Client::from_socket` failing its handshake: the driver task spawned for the handshake \
+         is detached and still owns the socket",
     );
 }
