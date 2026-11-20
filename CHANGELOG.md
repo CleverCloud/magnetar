@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`AutoClusterFailover` fails over from a primary that drops packets.**
+  The prober computed one absolute deadline per tick and handed it to every URL probed in turn, so a blackholed primary (SYN dropped, the connect ends only at the deadline) spent the whole budget and every standby was probed with an already-past deadline, read unhealthy without a real attempt, and left the active URL on the dead primary on every tick.
+  A fast refusal or a DNS failure left budget and worked, which is why the failure only showed in a region outage.
+  Each URL's probe now gets its own deadline of one `interval` counted from its own start, on both engines; a tick over `n` URLs that all blackhole lasts up to `n * interval`.
 - **A driver that ends on `CommandTopicMigrated` or an unanswerable auth challenge no longer leaves the connection reporting `Connected`.**
   The two `handle_pending_events(..)?` exits of the driver loop (the inbound-bytes arm and the timer arm) ran neither `mark_disconnected()` nor `wake_close_waiters`, unlike every other error exit, and the terminal wrapper's `fail_all_pending` does not touch the handshake state.
   An unsupervised connection (the façade default) therefore kept `is_connected()` true and `is_closed()` false after its driver was gone, so the ADR-0059 fast-fail never armed, lookups and opens waited out `operation_timeout`, and a parked `next_topic_list_change` / `next_replicated_subscription_marker` was never woken.

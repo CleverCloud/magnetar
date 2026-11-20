@@ -1580,6 +1580,7 @@ Three implementations ship:
 | start(interval) -> tokio::spawn(prober) -> JoinHandle                 |
 |                                                                      |
 |   on every tick: for each url -> probe -> first-healthy-wins         |
+|     (each probe gets its own `interval` deadline, from its start)    |
 |     if active_index changes -> tracing::info!(...) + atomic swap     |
 +----------------------------------------------------------------------+
 

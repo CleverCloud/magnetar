@@ -152,11 +152,14 @@ impl AutoClusterFailover {
     /// order, and snaps the active index to the first healthy one (i.e.
     /// failback to the primary as soon as it recovers).
     ///
-    /// Each `poll_probe` call is given a deadline of `interval` from
-    /// the tick start. Implementors that honour the deadline get an
-    /// upper bound on probe latency; those that ignore it still benefit
-    /// from `MissedTickBehavior::Skip` keeping the cycle from queueing
-    /// up backlog.
+    /// Each URL's probe is given its own deadline of `interval` from the
+    /// moment that probe starts, not one deadline shared by the tick: a
+    /// primary that drops packets and consumes its whole budget must not
+    /// leave the standbys with none. Implementors that honour the deadline
+    /// get an upper bound of `interval` per probe, so a tick over `n` URLs
+    /// that all blackhole lasts up to `n * interval`; those that ignore it
+    /// still benefit from `MissedTickBehavior::Skip` keeping the cycle from
+    /// queueing up backlog.
     pub fn start(&self, interval: Duration) -> JoinHandle<()> {
         let urls = self.urls.clone();
         let probe = self.probe.clone();
@@ -168,9 +171,16 @@ impl AutoClusterFailover {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let deadline = Instant::now() + interval;
                 let mut new_active: Option<usize> = None;
                 for (idx, url) in urls.iter().enumerate() {
+                    // One deadline per URL, measured from the moment *its* probe
+                    // starts. A deadline shared by the whole tick would let a
+                    // blackholed primary (SYN dropped, so the connect ends only
+                    // at the deadline) spend the entire budget and hand every
+                    // standby an already-past deadline: each would read
+                    // unhealthy without a real attempt and failover would never
+                    // happen in exactly the outage shape it exists for.
+                    let deadline = Instant::now() + interval;
                     // Adapt the sans-io `poll_probe` into an async wait via
                     // `poll_fn` — the probe parks `cx.waker()` while pending
                     // and we get re-polled on completion. No channels.

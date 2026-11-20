@@ -78,7 +78,10 @@ pub trait HealthProbe: Send + Sync + Debug {
     /// `deadline` is the absolute instant by which the probe should have
     /// resolved. Implementors that cannot honour it inline may still rely on
     /// the policy's outer timeout, but probes that overshoot the check
-    /// interval will skew the failover bookkeeping.
+    /// interval will skew the failover bookkeeping. The policy hands each
+    /// endpoint its own `deadline`, counted from the moment that endpoint's
+    /// probe starts, so a probe that spends its whole budget on a blackholed
+    /// endpoint does not shorten the budget of the endpoints probed after it.
     ///
     /// # Re-entrancy
     ///

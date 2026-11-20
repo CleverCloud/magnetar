@@ -184,6 +184,7 @@ Two implementations live in `magnetar-proto` (and are therefore usable by both e
 
 `AutoClusterFailover<P>` (PIP-121 health-probe-driven) ships on the moonpool engine as well — the probe loop runs on `P::TaskProvider`, so the simulator drives the schedule deterministically with no real DNS or TCP.
 Source: [`crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs`](../crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs).
+Each URL's probe gets its own deadline of one `interval`, counted from the moment that probe starts, so a primary that blackholes (SYN dropped) cannot leave the standbys probed with an already-expired deadline; a tick over `n` URLs that all blackhole therefore lasts up to `n * interval`.
 
 ## PIP-188 TOPIC_MIGRATED
 
