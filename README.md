@@ -609,7 +609,7 @@ A cross (`❌`) is a known-missing feature.
 | `startMessageIdInclusive` rollback duration     | ✅   | ✅       | `ReaderBuilder::start_message_rollback_duration`.               |
 | `readCompacted`                                 | ✅   | ✅       | `ReaderBuilder::read_compacted`.                                |
 | `cryptoKeyReader` (PIP-4 decryptor)             | ✅   | ✅       | `ReaderBuilder::encryption`.                                    |
-| `hasMessageAvailable` / `seek`                  | ✅   | ✅       | Via the underlying consumer surface.                            |
+| `hasMessageAvailable` / `seek`                  | ✅   | ✅       | `Reader::has_message_available`; `seek_to_*` move its cursor.   |
 | Stats / closure getters (`isClosed`, etc.)      | ✅   | ✅       | `Reader::is_closed`, `available_in_queue`, `available_permits`. |
 
 ### Table view
