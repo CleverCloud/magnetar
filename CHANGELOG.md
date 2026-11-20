@@ -100,6 +100,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The unknown-outcome path of `propagate_transaction_outcome` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) fenced the model and closed every child but left the messages already queued for `receive` in place, still bound to the closed child generations.
   `receive` and `receive_batch` then failed on the first queued message (`InvalidAggregatePhase`, and `StaleChildGeneration` or `UnknownChild` once the children reconnected), without requesting a resynchronization, and every newer message queued behind it was unreachable until the consumer was closed or an unrelated resynchronization cleared the queue.
   The unknown outcome now resets the receive queue, the chunk-reassembly state and the permit debt exactly as `request_resync` does, so `receive` waits for the resynchronized children; redelivery of the discarded messages is the broker's, as for any resynchronization.
+- **A cumulative or vector acknowledgement after a `StreamConsumer` seek is no longer a silent no-op below the pre-seek watermark.**
+  `StreamConsumerModel::begin_seek` (`magnetar-proto`) rewound the broker cursor but kept each child's confirmed cumulative-acknowledgement watermark from before the seek.
+  A cumulative acknowledgement (`acknowledge_cumulative`) or a position-vector acknowledgement (`acknowledge_positions`), plain or transactional, of a replayed message at or below that watermark admitted no component: it returned `Ok`, sent no acknowledgement to the broker and released no delivery lease.
+  A cumulative-only application kept every replayed lease until the permit slack ran out and no FLOW could be granted, so the child could not reach an id above the old watermark, the only way the watermark cleared.
+  A seek now clears the watermark of every seeking child and advances its acknowledgement generation, the pairing an observed redelivery already applies; individual, batch and negative acknowledgements were never affected.
 
 ## [2.0.0] - 2026-11-19
 

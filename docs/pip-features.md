@@ -805,6 +805,7 @@ It cannot cross a layout transition, rewind a sealed or remote ancestor, or infe
 A chunk position is projected to its first chunk, while a batch position is projected to the residual suffix in `ack_set`; The wire handler ignores the richer batch/chunk fields on `CommandSeek`, so they are not transmitted as authority.
 Both runtimes stage every child SEEK before awaiting any child response.
 A successful seek clears pre-seek buffers and invalidates old tokens; any child failure leaves the aggregate resynchronization-required.
+It also discards each child's confirmed cumulative-acknowledgement watermark, because the broker cursor no longer sits where that watermark was confirmed: a cumulative or vector acknowledgement of a replayed position at or below the pre-seek watermark admits a component and reaches the broker, instead of returning success with no wire acknowledgement and no lease release.
 
 ### Ownership handoff, routing, and close
 

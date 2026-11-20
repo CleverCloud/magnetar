@@ -2642,6 +2642,17 @@ impl StreamConsumerModel {
                 .children
                 .get_mut(&segment_id)
                 .ok_or(StreamConsumerModelError::SeekSourceMismatch)?;
+            // The seek rewinds the broker cursor, so a cumulative watermark
+            // confirmed before it no longer describes the cursor. Keeping it
+            // would make every replayed acknowledgement at or below it admit
+            // no component: `Ok` with no wire acknowledgement and no lease
+            // release. The reset is paired with a generation advance exactly
+            // where `issue_delivery` pairs them on an observed redelivery.
+            child.acknowledgement_generation = child
+                .acknowledgement_generation
+                .checked_add(1)
+                .ok_or(StreamConsumerModelError::GenerationExhausted)?;
+            child.confirmed_cumulative = None;
             child.flow_reservation = None;
             child.flow_purpose = None;
             child.completion = CompletionBarrier::default();
@@ -6289,6 +6300,97 @@ mod tests {
             .settle_acknowledgement(&pending.authority, &BTreeSet::from([source.clone()]))
             .expect("old completion cannot restore watermark");
         assert_eq!(model.children[&SegmentId(1)].confirmed_cumulative, None);
+    }
+
+    /// One child that confirmed a cumulative acknowledgement at entry 5, then
+    /// seeks back to entry 1 and receives a replayed delivery at entry 3.
+    fn replayed_delivery_below_pre_seek_watermark() -> (StreamConsumerModel, DeliveryToken) {
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (confirmed, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let source = confirmed.stream_message_id().source().clone();
+        let ack = model
+            .admit_cumulative_acknowledgement(&confirmed)
+            .expect("ack");
+        model
+            .settle_acknowledgement(&ack.authority, &BTreeSet::from([source.clone()]))
+            .expect("confirm the pre-seek watermark");
+        assert_eq!(
+            model.children[&SegmentId(1)].confirmed_cumulative,
+            Some(message_id(5))
+        );
+        assert!(model.live_deliveries.is_empty());
+
+        let rewind = PositionVector::new(1, [(source, message_id(1))]).expect("rewind vector");
+        model.begin_seek(&rewind).expect("seek back");
+        let flow = model
+            .seek_completed(SegmentId(1), generation)
+            .expect("seek confirmed");
+        let (replayed, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            3,
+        );
+        assert_eq!(
+            replayed.stream_message_id().ordinary_message_id(),
+            message_id(3)
+        );
+        (model, replayed)
+    }
+
+    #[test]
+    fn cumulative_acknowledgement_below_pre_seek_watermark_still_admits_a_component() {
+        let (mut model, replayed) = replayed_delivery_below_pre_seek_watermark();
+
+        let ack = model
+            .admit_cumulative_acknowledgement(&replayed)
+            .expect("replayed delivery is live in the new delivery epoch");
+        assert_eq!(
+            ack.components.len(),
+            1,
+            "a seek must discard the pre-seek cumulative watermark so the replayed \
+             cumulative ack reaches the broker instead of returning Ok with no component"
+        );
+        let source = replayed.stream_message_id().source().clone();
+        model
+            .settle_acknowledgement(&ack.authority, &BTreeSet::from([source]))
+            .expect("settle");
+        assert!(
+            model.live_deliveries.is_empty(),
+            "the cumulative ack must release the replayed delivery lease"
+        );
+    }
+
+    #[test]
+    fn position_acknowledgement_below_pre_seek_watermark_still_admits_a_component() {
+        let (mut model, replayed) = replayed_delivery_below_pre_seek_watermark();
+        let position = PositionVector::new(
+            1,
+            [(replayed.stream_message_id().source().clone(), message_id(3))],
+        )
+        .expect("position");
+
+        let ack = model
+            .admit_position_acknowledgement(&position)
+            .expect("position ack");
+        assert_eq!(
+            ack.components.len(),
+            1,
+            "a seek must discard the pre-seek cumulative watermark so the replayed \
+             position ack reaches the broker instead of returning Ok with no component"
+        );
     }
 
     #[test]
