@@ -50,7 +50,8 @@ A delta is addressed to the watcher it belongs to from the wire to the consumer 
 - A caller that passes `update` a different client than the one that built the consumer polls a connection its id does not belong to; ids are per connection and start at 0, so the call can read another watcher's deltas there.
   `PatternConsumer::update` now documents that `client` must be the one that built the consumer.
 - ADR-0024 layers, stated as they are rather than as the policy would have them: (a) `topic_list_deltas_and_snapshots_carry_their_watcher_id` and `topic_list_delta_for_a_watcher_this_connection_does_not_hold_is_dropped` in `magnetar-proto`; (b) and (c) are unit tests, not integration tests: `take_topic_list_change_takes_only_the_addressed_watchers_deltas` in each runtime's `lib.rs` (which `check-runtime-test-parity` keeps 1:1) exercises the filtered take on `ConnectionShared` without a driver or a broker, and the changed driver arm of each runtime is reached only through the façade scenarios of `crates/magnetar/tests/pattern_watcher_delta_isolation.rs`, which `check-sim-coverage` does not run.
-  No layer (d) differential test and no `e2e_*.rs` test was added, so that gate would report the two driver arms and the proto `WatchTopicListSuccess` and `WatchTopicUpdate` arms as uncovered; `check-sim-coverage` needs `--all-features` and was not run for this change.
+  In `magnetar-differential`, `facade_pattern_watcher_delta_isolation.rs` and `facade_pattern_concurrent_update_single_child.rs`, the same scenarios as the two façade files named in the References without their feature gates, reach the two driver arms and the proto `WatchTopicListSuccess` and `WatchTopicUpdate` arms on both engines, and `topic_list_watcher_contract.rs` drives `Connection` directly for the snapshot of a live and of a cancelled watch; with them `check-sim-coverage` covers every added line in both coverage domains.
+  No `e2e_*.rs` test was added.
 
 ## References
 
@@ -59,4 +60,7 @@ A delta is addressed to the watcher it belongs to from the wire to the consumer 
 - `crates/magnetar-runtime-tokio/src/{lib,driver,client}.rs`, `crates/magnetar-runtime-moonpool/src/{lib,driver,client}.rs` — `TopicListChange`, `take_topic_list_change`, `poll_topic_list_change`.
 - `crates/magnetar/src/engine/{mod,tokio,moonpool}.rs`, `crates/magnetar/src/client.rs`, `crates/magnetar/src/pattern_consumer.rs` — façade surface and `PatternConsumer::update`.
 - `crates/magnetar/tests/pattern_watcher_delta_isolation.rs`, `crates/magnetar/tests/pattern_concurrent_update_single_child.rs`.
+- `crates/magnetar-differential/tests/facade_pattern_watcher_delta_isolation.rs` — `a_lone_consumer_applies_the_delta_of_its_own_watcher`, `update_does_not_apply_a_delta_addressed_to_another_watcher`, `the_owner_of_a_delta_still_receives_it_after_another_consumer_updated`, on the tokio and the moonpool engine.
+- `crates/magnetar-differential/tests/facade_pattern_concurrent_update_single_child.rs` — `overlapping_updates_register_a_duplicate_announcement_once`, on the tokio and the moonpool engine.
+- `crates/magnetar-differential/tests/topic_list_watcher_contract.rs` — `a_snapshot_names_the_watcher_its_request_allocated`, `a_snapshot_answering_a_cancelled_watch_names_the_watcher_the_broker_echoed`.
 - [ADR-0037](0037-multi-topics-pattern-consumer-pass-2-lift.md), [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md).
