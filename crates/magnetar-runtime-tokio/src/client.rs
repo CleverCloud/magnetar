@@ -1247,9 +1247,6 @@ impl Client {
         let mut deadline = self.operation_timer();
         self.ensure_txn_bootstrapped(deadline.as_mut()).await?;
         self.shared.fail_if_no_driver()?;
-        if operation_deadline_expired(deadline.as_mut()) {
-            return Err(operation_deadline_error("new_txn", None));
-        }
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.new_txn(timeout)
@@ -1311,12 +1308,6 @@ impl Client {
         // Step 2: explicit TC handshake — broker only responds once the TC metadata store is
         // loaded, eliminating the race between bundle-ownership-acquire and the first newTxn.
         self.shared.fail_if_no_driver()?;
-        if operation_deadline_expired(deadline.as_mut()) {
-            return Err(operation_deadline_error(
-                "transaction coordinator connect",
-                None,
-            ));
-        }
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.tc_client_connect(0)

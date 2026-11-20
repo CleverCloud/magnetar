@@ -29,7 +29,8 @@ Each PIP-31 request is guarded by ADR-0059's check and bounded by one operation 
 - **Guard.** `new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`, the coordinator handshake (`TcClientConnect`) and the scalable `add_subscription_to_txn` call `fail_if_no_driver()` before they register anything.
   In `end_txn` it precedes `Connection::end_txn`, so no waiter lease and no canonical record is created for a request that cannot be answered.
 - **Deadline.** Each public call takes one `operation_timer()` and races its reply against it, deadline arm first.
-  `new_txn` shares that one deadline between the coordinator bootstrap (lookup and `TcClientConnect`) and the `NewTxn` request, and checks it before it registers `NewTxn`, so an expired operation enqueues no further command.
+  `new_txn` shares that one deadline between the coordinator bootstrap (lookup and `TcClientConnect`) and the `NewTxn` request; each step races it deadline arm first, so an operation that expires during one step fails there and enqueues no further command.
+  A deadline that elapses between two steps is reported by the next step's race, after that step's command has been written; that request is then cancelled, as when the deadline elapses just after a send.
   Expiry is the engine's ordinary operation-deadline error (`ClientError::Timeout` on Tokio, the `Other` timeout message on Moonpool, which has no `Timeout` variant).
   `TxnError::Timeout` stays unconstructed: the engines return `ClientError`, and the façade stringifies it, so the structured variant had no reader.
   Its documentation now says so instead of promising a producer.
