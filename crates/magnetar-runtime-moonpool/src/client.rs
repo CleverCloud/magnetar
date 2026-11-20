@@ -68,6 +68,24 @@ pub(crate) fn operation_deadline_expired(mut deadline: OperationDeadline<'_>) ->
     deadline.as_mut().poll(&mut cx).is_ready()
 }
 
+/// Wait for the reply to one PIP-31 request, bounded by the caller's operation deadline
+/// (ADR-0129). The deadline arm is biased first, as for every other setup operation.
+///
+/// Expiry drops `request`: a [`RequestFut::cancellable`] one retires its correlation state, an
+/// `end_txn` one deliberately keeps its canonical wire request so that a retry resumes it.
+pub(crate) async fn await_txn_outcome(
+    request: RequestFut,
+    mut deadline: OperationDeadline<'_>,
+    operation: &str,
+) -> Result<OpOutcome, ClientError> {
+    tokio::pin!(request);
+    moonpool_core::select! {
+        biased;
+        () = deadline.as_mut() => Err(operation_deadline_error(operation, None)),
+        outcome = request.as_mut() => Ok(outcome),
+    }
+}
+
 /// Engine-layer error surfaced by [`Client`]. Wraps [`EngineError`] with a
 /// dedicated `Broker` variant for request-correlated server errors so the
 /// surface matches the tokio engine's `ClientError`.
@@ -1072,6 +1090,9 @@ impl<P: Providers> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the broker rejects the request.
+    /// - [`ClientError::PeerClosed`] when the connection is terminal, the supervisor gave up, or
+    ///   reconnects severed the request more than
+    ///   [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] times.
     /// - [`ClientError::Other`] when an unexpected outcome arrives on this request id.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {
         let mut deadline = self.operation_timer();
@@ -1085,6 +1106,13 @@ impl<P: Providers> Client<P> {
     }
 
     /// Deadline-aware partition-metadata seam used by the engine-generic façade.
+    ///
+    /// A request severed by a supervised reconnect ([`OpOutcome::SessionLost`]) is re-issued on
+    /// the fresh session, bounded by [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] and
+    /// by the operation deadline, so `producer().create()` issued mid-reconnect resolves
+    /// transparently like a lookup does (ADR-0060, 2026-11-19 amendment). The reissue budget is
+    /// independent of the broker-failure retry budget. 1:1 with the tokio engine's
+    /// identically-named method (ADR-0024).
     #[doc(hidden)]
     pub async fn partitioned_topic_metadata_with_operation_deadline(
         &self,
@@ -1094,6 +1122,7 @@ impl<P: Providers> Client<P> {
     ) -> Result<u32, ClientError> {
         let retry_config = self.shared.inner.lock().operation_retry_config().clone();
         let mut broker_failures = 0_u32;
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
         loop {
             let request_id = {
                 if operation_deadline_expired(deadline.as_mut()) {
@@ -1118,6 +1147,16 @@ impl<P: Providers> Client<P> {
                 }
                 outcome = request.as_mut() => outcome,
             };
+            if matches!(outcome, OpOutcome::SessionLost { .. }) {
+                self.await_session_reissue(
+                    deadline.as_mut(),
+                    &mut reissues_remaining,
+                    "partitioned topic metadata",
+                    last_broker_error.as_ref(),
+                )
+                .await?;
+                continue;
+            }
             if let OpOutcome::PartitionedMetadata {
                 error: Some((code, message)),
                 ..
@@ -1166,12 +1205,66 @@ impl<P: Providers> Client<P> {
         }
     }
 
+    /// Park after a registry request (partitioned metadata, topic-list snapshot) was severed by a
+    /// supervised reconnect, and return `Ok(())` once the caller may re-issue it on the fresh
+    /// session. The twin of the `SessionLost` arm of [`Self::issue_lookup_on`] (ADR-0060), and
+    /// 1:1 with the tokio engine's helper (ADR-0024).
+    ///
+    /// Parks on [`ConnectionShared::await_reconnect_or_terminal`] raced against the operation
+    /// deadline, biased deadline-first, reading no clock. `reissues_remaining` is the caller's
+    /// per-call budget: it is spent here, one per re-issue, and an exhausted budget surfaces
+    /// `PeerClosed` instead of spinning on a flapping connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    /// it, or when the reissue budget is spent. The operation-deadline error (`operation`, or the
+    /// last broker error) when `operation_timeout` expires first.
+    async fn await_session_reissue(
+        &self,
+        mut deadline: OperationDeadline<'_>,
+        reissues_remaining: &mut u8,
+        operation: &'static str,
+        last_broker_error: Option<&(i32, String)>,
+    ) -> Result<(), ClientError> {
+        let readiness = moonpool_core::select! {
+            biased;
+            () = deadline.as_mut() => {
+                return Err(operation_deadline_error(operation, last_broker_error.cloned()));
+            }
+            readiness = self.shared.await_reconnect_or_terminal() => readiness,
+        };
+        match readiness {
+            crate::LookupReissueReadiness::Reconnected => {
+                if *reissues_remaining == 0 {
+                    tracing::warn!(
+                        operation,
+                        max_reissues = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES,
+                        "session-reissue cap exceeded; surfacing PeerClosed"
+                    );
+                    return Err(ClientError::PeerClosed);
+                }
+                *reissues_remaining -= 1;
+                tracing::debug!(
+                    operation,
+                    reissues_remaining = *reissues_remaining,
+                    "request severed by reconnect; re-issuing against fresh session"
+                );
+                Ok(())
+            }
+            crate::LookupReissueReadiness::Terminal => Err(ClientError::PeerClosed),
+        }
+    }
+
     /// Subscribe to a PIP-145 topic-list watcher and return the *initial*
     /// snapshot. Subsequent watcher deltas land on
     /// [`Self::next_topic_list_change`].
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the broker rejects the subscribe.
+    /// - [`ClientError::PeerClosed`] when the connection is terminal, the supervisor gave up, or
+    ///   reconnects severed the request more than
+    ///   [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] times.
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn watch_topic_list(
         &self,
@@ -1194,6 +1287,13 @@ impl<P: Providers> Client<P> {
     /// pattern-consumer builder. Resolves to the id the connection allocated to the new
     /// watcher, which addresses every later delta ([`TopicListChange::watcher_id`]) to it, and
     /// the initial topic snapshot.
+    ///
+    /// A snapshot request severed by a supervised reconnect
+    /// ([`OpOutcome::SessionLost`]) is re-issued on the fresh session, bounded by
+    /// [`magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES`] and by the operation deadline
+    /// (ADR-0060, 2026-11-19 amendment). Each re-issue allocates a new watcher id: `reset()`
+    /// already discarded the severed watcher, so none is registered twice. 1:1 with the tokio
+    /// engine's identically-named method (ADR-0024).
     #[doc(hidden)]
     pub async fn watch_topic_list_with_operation_deadline(
         &self,
@@ -1202,38 +1302,54 @@ impl<P: Providers> Client<P> {
         mut deadline: OperationDeadline<'_>,
         last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<(u64, Vec<String>), ClientError> {
-        if operation_deadline_expired(deadline.as_mut()) {
-            return Err(operation_deadline_error(
-                "topic-list snapshot",
-                last_broker_error.clone(),
-            ));
-        }
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.watch_topic_list(namespace, pattern)
-        };
-        self.shared.driver_waker.notify_one();
-        let request = RequestFut::cancellable(self.shared.clone(), request_id);
-        tokio::pin!(request);
-        let outcome = moonpool_core::select! {
-            biased;
-            () = deadline.as_mut() => {
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        loop {
+            if operation_deadline_expired(deadline.as_mut()) {
                 return Err(operation_deadline_error(
                     "topic-list snapshot",
                     last_broker_error.clone(),
                 ));
             }
-            outcome = request.as_mut() => outcome,
-        };
-        match outcome {
-            OpOutcome::TopicListSnapshot {
-                watcher_id, topics, ..
-            } => Ok((watcher_id, topics)),
-            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
-            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected topic-list snapshot outcome: {other:?}"
-            ))),
+            let request_id = {
+                let mut conn = self.shared.inner.lock();
+                conn.watch_topic_list(namespace, pattern)
+            };
+            self.shared.driver_waker.notify_one();
+            let request = RequestFut::cancellable(self.shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "topic-list snapshot",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
+            match outcome {
+                OpOutcome::TopicListSnapshot {
+                    watcher_id, topics, ..
+                } => return Ok((watcher_id, topics)),
+                OpOutcome::SessionLost { .. } => {
+                    self.await_session_reissue(
+                        deadline.as_mut(),
+                        &mut reissues_remaining,
+                        "topic-list snapshot",
+                        last_broker_error.as_ref(),
+                    )
+                    .await?;
+                }
+                OpOutcome::Error { code, message, .. } => {
+                    return Err(ClientError::Broker { code, message });
+                }
+                OpOutcome::Terminal { .. } => return Err(ClientError::PeerClosed),
+                other => {
+                    return Err(ClientError::Other(format!(
+                        "unexpected topic-list snapshot outcome: {other:?}"
+                    )));
+                }
+            }
         }
     }
 
@@ -1676,20 +1792,30 @@ impl<P: Providers> Client<P> {
     /// `PulsarClient#newTransaction()`. Returns the broker-assigned
     /// [`magnetar_proto::TxnId`] once the TC acknowledges.
     ///
+    /// The whole call — the lazy coordinator bootstrap included — runs under
+    /// one `operation_timeout` deadline and fast-fails once the connection is
+    /// terminal (ADR-0129).
+    ///
     /// # Errors
     /// - [`ClientError::Broker`] when the TC rejects the request.
-    /// - [`ClientError::Other`] on an unexpected outcome (state-machine bug).
+    /// - [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    ///   it.
+    /// - [`ClientError::Other`] when the coordinator does not answer within `operation_timeout`, or
+    ///   on an unexpected outcome (state-machine bug).
     pub async fn new_txn(
         &self,
         timeout: std::time::Duration,
     ) -> Result<magnetar_proto::TxnId, ClientError> {
-        self.ensure_txn_bootstrapped().await?;
+        let mut deadline = self.operation_timer();
+        self.ensure_txn_bootstrapped(deadline.as_mut()).await?;
+        self.shared.fail_if_no_driver()?;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.new_txn(timeout)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        let outcome = await_txn_outcome(request, deadline.as_mut(), "new_txn").await?;
         match outcome {
             OpOutcome::NewTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
@@ -1707,22 +1833,36 @@ impl<P: Providers> Client<P> {
     /// Java's `TransactionMetaStoreHandler.connectionOpened` waits for this handshake
     /// before issuing transaction requests. The existing transaction client pins id `0`
     /// and sends these requests on the bootstrap connection in both engines.
-    async fn ensure_txn_bootstrapped(&self) -> Result<(), ClientError> {
+    async fn ensure_txn_bootstrapped(
+        &self,
+        mut deadline: OperationDeadline<'_>,
+    ) -> Result<(), ClientError> {
         if self.shared.txn_bootstrapped.load(Ordering::Acquire) {
             return Ok(());
         }
+        let mut last_broker_error = None;
         let _ = self
-            .lookup_topic(
+            .lookup_topic_with_operation_deadline(
                 "persistent://pulsar/system/transaction_coordinator_assign-partition-0",
                 false,
+                deadline.as_mut(),
+                &mut last_broker_error,
             )
             .await?;
+        self.shared.fail_if_no_driver()?;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.tc_client_connect(0)
         };
         self.shared.driver_waker.notify_one();
-        match RequestFut::new(self.shared.clone(), request_id).await {
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        let outcome = await_txn_outcome(
+            request,
+            deadline.as_mut(),
+            "transaction coordinator connect",
+        )
+        .await?;
+        match outcome {
             OpOutcome::Success { .. } => {}
             OpOutcome::Error { code, message, .. } => {
                 return Err(ClientError::Broker { code, message });
@@ -1743,18 +1883,24 @@ impl<P: Providers> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the TC rejects the request.
-    /// - [`ClientError::Other`] on an unexpected outcome.
+    /// - [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    ///   it.
+    /// - [`ClientError::Other`] when the coordinator does not answer within `operation_timeout`
+    ///   (ADR-0129), or on an unexpected outcome.
     pub async fn add_partition_to_txn(
         &self,
         txn: magnetar_proto::TxnId,
         topic: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.shared.fail_if_no_driver()?;
+        let mut deadline = self.operation_timer();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.add_partition_to_txn(txn, topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        let outcome = await_txn_outcome(request, deadline.as_mut(), "add_partition_to_txn").await?;
         match outcome {
             OpOutcome::AddPartitionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
@@ -1777,19 +1923,26 @@ impl<P: Providers> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the TC rejects the request.
-    /// - [`ClientError::Other`] on an unexpected outcome.
+    /// - [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    ///   it.
+    /// - [`ClientError::Other`] when the coordinator does not answer within `operation_timeout`
+    ///   (ADR-0129), or on an unexpected outcome.
     pub async fn add_subscription_to_txn(
         &self,
         txn: magnetar_proto::TxnId,
         topic: impl Into<String>,
         subscription: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.shared.fail_if_no_driver()?;
+        let mut deadline = self.operation_timer();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        let outcome =
+            await_txn_outcome(request, deadline.as_mut(), "add_subscription_to_txn").await?;
         match outcome {
             OpOutcome::AddSubscriptionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
@@ -1808,12 +1961,19 @@ impl<P: Providers> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the TC rejects the request.
-    /// - [`ClientError::Other`] on an unexpected outcome.
+    /// - [`ClientError::PeerClosed`] when the connection is terminal with no driver left to recover
+    ///   it.
+    /// - [`ClientError::Other`] when the coordinator does not answer within `operation_timeout`
+    ///   (ADR-0129), or on an unexpected outcome. After a timeout the outcome of the commit or
+    ///   abort is unknown and the canonical `EndTxn` request stays pending: calling `end_txn` again
+    ///   with the same arguments resumes it instead of sending a second command.
     pub async fn end_txn(
         &self,
         txn: magnetar_proto::TxnId,
         action: magnetar_proto::TxnAction,
     ) -> Result<magnetar_proto::TxnState, ClientError> {
+        self.shared.fail_if_no_driver()?;
+        let mut deadline = self.operation_timer();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.end_txn(txn, action)
@@ -1821,7 +1981,11 @@ impl<P: Providers> Client<P> {
         };
         let _waiter = EndTxnWaiterGuard::new(self.shared.clone(), txn, action);
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
+        // Deliberately not `cancellable`: the canonical `EndTxn` request must
+        // survive a released waiter so that a retry resumes it
+        // (`Connection::release_end_txn_waiter`).
+        let request = RequestFut::new(self.shared.clone(), request_id);
+        let outcome = await_txn_outcome(request, deadline.as_mut(), "end_txn").await?;
         match outcome {
             OpOutcome::EndTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
@@ -1884,7 +2048,7 @@ impl RequestFut {
         }
     }
 
-    fn cancellable(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
+    pub(crate) fn cancellable(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
         Self {
             shared,
             request_id,

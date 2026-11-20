@@ -2477,3 +2477,226 @@ async fn controller_handoff_avoids_delayed_delete_and_keeps_terminal_leave_equiv
     observe_tokio_controller_handoff_with_held_leave().await;
     observe_moonpool_controller_handoff_with_held_leave().await;
 }
+
+/// What one engine reported for a transaction registration its coordinator never answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnansweredRegistrationTrace {
+    timed_out: bool,
+    aborted: bool,
+    cleaned_up: bool,
+}
+
+/// Whether a failed acknowledgement is the engine's operation-deadline error.
+fn is_operation_deadline_failure(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("exceeded operation_timeout")
+}
+
+async fn run_tokio_unanswered_registration(
+    cluster: &M1SocketCluster,
+) -> UnansweredRegistrationTrace {
+    let client =
+        magnetar_runtime_tokio::Client::connect(cluster.controller_url(), supervised_config())
+            .await
+            .expect("connect Tokio unanswered-registration client");
+    let aggregate = client
+        .segment_subscriber()
+        .expect("Tokio unanswered-registration subscriber")
+        .subscribe_stream_consumer(magnetar_runtime_tokio::StreamConsumerOptions {
+            topic: TOPIC.to_owned(),
+            subscription: "unanswered-registration-sub".to_owned(),
+            consumer_name: "unanswered-registration-member".to_owned(),
+            schema: magnetar_proto::pb::Schema::default(),
+            receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
+                .expect("valid Tokio unanswered-registration budget"),
+            ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
+        })
+        .await
+        .expect("open Tokio unanswered-registration aggregate");
+    cluster
+        .wait_for("Tokio unanswered-registration children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, bytes::Bytes::from_static(b"unanswered")))
+        .expect("enqueue Tokio unanswered-registration delivery");
+    let message = aggregate
+        .receive()
+        .await
+        .expect("receive Tokio unanswered-registration delivery");
+    let txn = client
+        .new_txn(Duration::from_secs(30))
+        .await
+        .expect("open Tokio unanswered-registration transaction");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::TransactionRegistration,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold the Tokio transaction registration");
+    let acknowledged = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        aggregate.acknowledge_in_transaction(&message.token, txn),
+    )
+    .await
+    .expect("an unanswered Tokio registration must be bounded by operation_timeout");
+    let timed_out = matches!(&acknowledged, Err(error) if is_operation_deadline_failure(error));
+    assert!(
+        timed_out,
+        "unexpected Tokio unanswered-registration result: {acknowledged:?}"
+    );
+    let pending = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::TransactionRegistration)
+                .map(|pending| pending.id)
+        })
+        .expect("the held Tokio registration is still pending at the broker");
+    cluster
+        .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+        .expect("release the held Tokio registration");
+    let aborted = client
+        .end_txn(txn, magnetar_proto::TxnAction::Abort)
+        .await
+        .expect("abort the Tokio unanswered-registration transaction")
+        == magnetar_proto::TxnState::Aborted;
+    client.close().await;
+    cluster
+        .wait_for("Tokio unanswered-registration cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.connections == 0 && counts.child_consumers == 0 && counts.pending_operations == 0
+        })
+        .await;
+    UnansweredRegistrationTrace {
+        timed_out,
+        aborted,
+        cleaned_up: true,
+    }
+}
+
+async fn run_moonpool_unanswered_registration(
+    cluster: &M1SocketCluster,
+) -> UnansweredRegistrationTrace {
+    let engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let address = cluster
+        .controller_url()
+        .strip_prefix("pulsar://")
+        .expect("plaintext Moonpool unanswered-registration URL");
+    let client = magnetar_runtime_moonpool::Client::connect_plain_supervised(
+        &engine,
+        address,
+        supervised_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect Moonpool unanswered-registration client");
+    let aggregate = client
+        .segment_subscriber()
+        .expect("Moonpool unanswered-registration subscriber")
+        .subscribe_stream_consumer(magnetar_runtime_moonpool::StreamConsumerOptions {
+            topic: TOPIC.to_owned(),
+            subscription: "unanswered-registration-sub".to_owned(),
+            consumer_name: "unanswered-registration-member".to_owned(),
+            schema: magnetar_proto::pb::Schema::default(),
+            receiver_budget: magnetar_proto::ReceiverBudget::bytes(32 * 1024 * 1024)
+                .expect("valid Moonpool unanswered-registration budget"),
+            ordering_mode: magnetar_proto::OrderingMode::BrokerManaged,
+            max_uncompressed_message_size: magnetar_proto::MAX_FRAME_SIZE,
+        })
+        .await
+        .expect("open Moonpool unanswered-registration aggregate");
+    cluster
+        .wait_for("Moonpool unanswered-registration children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, bytes::Bytes::from_static(b"unanswered")))
+        .expect("enqueue Moonpool unanswered-registration delivery");
+    let message = aggregate
+        .receive()
+        .await
+        .expect("receive Moonpool unanswered-registration delivery");
+    let txn = client
+        .new_txn(Duration::from_secs(30))
+        .await
+        .expect("open Moonpool unanswered-registration transaction");
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Controller,
+                OperationKind::TransactionRegistration,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("hold the Moonpool transaction registration");
+    let acknowledged = tokio::time::timeout(
+        magnetar_differential::HANG_GUARD,
+        aggregate.acknowledge_in_transaction(&message.token, txn),
+    )
+    .await
+    .expect("an unanswered Moonpool registration must be bounded by operation_timeout");
+    let timed_out = matches!(&acknowledged, Err(error) if is_operation_deadline_failure(error));
+    assert!(
+        timed_out,
+        "unexpected Moonpool unanswered-registration result: {acknowledged:?}"
+    );
+    let pending = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| pending.kind == OperationKind::TransactionRegistration)
+                .map(|pending| pending.id)
+        })
+        .expect("the held Moonpool registration is still pending at the broker");
+    cluster
+        .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+        .expect("release the held Moonpool registration");
+    let aborted = client
+        .end_txn(txn, magnetar_proto::TxnAction::Abort)
+        .await
+        .expect("abort the Moonpool unanswered-registration transaction")
+        == magnetar_proto::TxnState::Aborted;
+    client.close().await;
+    cluster
+        .wait_for("Moonpool unanswered-registration cleanup", |fake| {
+            let counts = fake.resource_counts();
+            counts.connections == 0 && counts.child_consumers == 0 && counts.pending_operations == 0
+        })
+        .await;
+    UnansweredRegistrationTrace {
+        timed_out,
+        aborted,
+        cleaned_up: true,
+    }
+}
+
+/// A transaction registration the coordinator never answers fails a stream consumer's
+/// `acknowledge_in_transaction` once the subscriber's `operation_timeout` elapses, on both
+/// engines, instead of waiting for an answer that never comes (ADR-0129).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unanswered_transaction_registration_times_out_equivalently() {
+    let tokio_cluster = M1SocketCluster::bind().await;
+    let tokio_trace = run_tokio_unanswered_registration(&tokio_cluster).await;
+    tokio_cluster.assert_healthy();
+
+    let moonpool_cluster = M1SocketCluster::bind().await;
+    let moonpool_trace = run_moonpool_unanswered_registration(&moonpool_cluster).await;
+    moonpool_cluster.assert_healthy();
+
+    assert_eq!(tokio_trace, moonpool_trace);
+    assert_eq!(
+        tokio_trace,
+        UnansweredRegistrationTrace {
+            timed_out: true,
+            aborted: true,
+            cleaned_up: true,
+        }
+    );
+}

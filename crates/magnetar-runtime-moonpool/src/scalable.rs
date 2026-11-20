@@ -285,12 +285,21 @@ impl<P: Providers + Send + Sync> SegmentSubscriber<P> {
         topic: String,
         subscription: String,
     ) -> Result<(), ClientError> {
+        self.bootstrap.fail_if_no_driver()?;
+        let sleep = (self.sleep_provider)(self.operation_timeout);
+        let mut deadline = Box::pin(async move {
+            let _ = sleep.await;
+        });
         let request_id = {
             let mut conn = self.bootstrap.inner.lock();
             conn.add_subscription_to_txn(txn_id, subscription, topic)
         };
         self.bootstrap.driver_waker.notify_one();
-        match crate::client::RequestFut::new(self.bootstrap.clone(), request_id).await {
+        let request = crate::client::RequestFut::cancellable(self.bootstrap.clone(), request_id);
+        let outcome =
+            crate::client::await_txn_outcome(request, deadline.as_mut(), "add_subscription_to_txn")
+                .await?;
+        match outcome {
             magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => result
                 .map_err(|error| ClientError::Other(format!("add_subscription_to_txn: {error}"))),
             magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),

@@ -33,17 +33,19 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, FrameError, SubscribeRequest, SupervisorConfig,
-    decode_one, encode_command, pb,
+    ConnectionConfig, CreateProducerRequest, FrameError, StaticServiceUrlProvider,
+    SubscribeRequest, SupervisorConfig, decode_one, encode_command, pb,
 };
 use magnetar_runtime_moonpool::{Client, DnsResolveFuture, DnsResolver, MoonpoolEngine};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::task::AbortHandle;
 mod common;
 use common::HANG_GUARD;
 
@@ -127,10 +129,27 @@ async fn spawn_broker(role: BrokerRole) -> (String, Arc<Mutex<Vec<SessionRecord>
 async fn spawn_broker_advertising(
     role: BrokerRole,
 ) -> (String, String, Arc<Mutex<Vec<SessionRecord>>>) {
+    let (host_port, url, sessions, _session_tasks) = spawn_abortable_broker_advertising(role).await;
+    (host_port, url, sessions)
+}
+
+/// [`spawn_broker_advertising`] that also hands back one [`AbortHandle`] per accepted session, in
+/// accept order: aborting a session's task drops its socket, which is how a test makes the broker
+/// drop a single connection while the listener keeps accepting.
+async fn spawn_abortable_broker_advertising(
+    role: BrokerRole,
+) -> (
+    String,
+    String,
+    Arc<Mutex<Vec<SessionRecord>>>,
+    Arc<Mutex<Vec<AbortHandle>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
     let sessions: Arc<Mutex<Vec<SessionRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let session_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let sessions_for_task = sessions.clone();
+    let session_tasks_for_task = session_tasks.clone();
     let url = format!("pulsar://{addr}");
     let host_port = addr.to_string();
     tokio::spawn(async move {
@@ -145,12 +164,13 @@ async fn spawn_broker_advertising(
             };
             let sessions = sessions_for_task.clone();
             let role = role.clone();
-            tokio::spawn(async move {
+            let session = tokio::spawn(async move {
                 let _ = handle_session(stream, &sessions, session_idx, &role).await;
             });
+            session_tasks_for_task.lock().push(session.abort_handle());
         }
     });
-    (host_port, url, sessions)
+    (host_port, url, sessions, session_tasks)
 }
 
 async fn handle_session(
@@ -620,6 +640,99 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             assert_eq!(
                 producer_count, 2,
                 "pinned session must have served both producers; saw {producer_count}",
+            );
+        })
+        .await;
+}
+
+/// ADR-0039 (DIRECT amendment): a DIRECT pool entry that loses its socket re-dials **its own
+/// broker** — "the supervisor does not consult `service_url_provider` on the per-broker entry".
+///
+/// A PIP-121 [`magnetar_proto::ServiceUrlProvider`] answers with the *service* URL (broker A, the
+/// bootstrap). Every pool entry is built with `service_url_provider = factory.service_url_provider`
+/// whatever its routing, so the supervisor of the entry pinned to broker B dials the provider's
+/// URL after a drop: the redial lands on A while the pool still files the entry under B, and B's
+/// producers would be replayed on a broker that does not own their topics.
+///
+/// The assertion is on where the third TCP session lands: A already served the bootstrap and B
+/// the pinned entry, so the redial must be accepted by B. The wait is bounded, and it ends as soon
+/// as the redial has been accepted *anywhere*, so a redial that lands on A fails the assertion
+/// instead of timing out.
+///
+/// Mirrors the tokio integration test of the same name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_direct_entry_redials_its_own_broker_not_the_provider_url() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_host_b, url_b, sessions_b, session_tasks_b) =
+                spawn_abortable_broker_advertising(BrokerRole { redirect_to: None }).await;
+            let (host_a, url_a, sessions_a) = spawn_broker_advertising(BrokerRole {
+                redirect_to: Some(url_b.clone()),
+            })
+            .await;
+
+            // The provider names the service URL (A) — what a cluster-failover policy would answer.
+            let provider = Arc::new(StaticServiceUrlProvider::new(url_a));
+            let cfg = ConnectionConfig {
+                supervisor: Some(SupervisorConfig {
+                    initial_backoff: Duration::from_millis(5),
+                    max_backoff: Duration::from_millis(40),
+                    ..SupervisorConfig::default()
+                }),
+                ..ConnectionConfig::default()
+            };
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_plain_supervised(&engine, &host_a, cfg, Some(provider), None),
+            )
+            .await
+            .expect("connect did not time out")
+            .expect("connect succeeds");
+
+            let _producer = tokio::time::timeout(
+                HANG_GUARD,
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/moonpool-direct-entry-redial".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("open_producer did not time out")
+            .expect("open_producer succeeds");
+
+            // Precondition: one bootstrap session on A, one pinned DIRECT session on B.
+            assert_eq!(sessions_a.lock().len(), 1, "A serves only the bootstrap");
+            assert_eq!(
+                sessions_b.lock().len(),
+                1,
+                "B serves the pinned DIRECT entry"
+            );
+
+            // B drops the pinned connection; its listener keeps accepting.
+            session_tasks_b.lock()[0].abort();
+
+            // Wait, bounded, for the supervisor's redial to be accepted by either broker.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while sessions_a.lock().len() + sessions_b.lock().len() < 3
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let accepted_by_a = sessions_a.lock().len();
+            let accepted_by_b = sessions_b.lock().len();
+            if let Some(d) = client.take_driver() {
+                d.abort();
+            }
+            drop(client);
+
+            assert_eq!(
+                (accepted_by_a, accepted_by_b),
+                (1, 2),
+                "the DIRECT entry pinned to B must re-dial B after its socket drops; the provider \
+                 URL (A) is the service URL, not this entry's broker (sessions accepted: \
+                 A={accepted_by_a}, B={accepted_by_b})",
             );
         })
         .await;

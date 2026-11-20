@@ -23,7 +23,10 @@
 //! [`ConnectionPool`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java)
 //! key `(logical_address, physical_address)`. Each entry owns its own
 //! supervised driver loop (ADR-0028 anti-thrash + ADR-0024 per-handle backoff
-//! still apply unchanged) and stays alive for the lifetime of the `Client`.
+//! still apply unchanged) and stays in the pool until the `Client` closes — or until
+//! its driver exits for good (a client without a supervisor, or a supervisor that gave up after
+//! `max_attempts`), in which case the next open for that key replaces it with a fresh dial
+//! instead of handing out the dead connection (ADR-0039, 2026-11-19 amendment).
 //!
 //! The pool is opt-in by topology: when every lookup answer reports
 //! `proxy_through_service_url = false` and either omits the broker URL or
@@ -80,8 +83,10 @@ pub(crate) struct ConnectionFactory {
     /// entry shares the same provider, so a refreshed token propagates
     /// naturally across every pinned broker connection.
     pub(crate) auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
-    /// PIP-121 `ServiceUrlProvider` — when set, every pool entry's supervisor
-    /// re-resolves the broker URL via the provider on every reconnect attempt.
+    /// PIP-121 `ServiceUrlProvider` — when set, the supervisor of every pool entry that dials the
+    /// service address (a proxy entry or a bootstrap sibling) re-resolves the service URL via the
+    /// provider on every reconnect attempt. An entry pinned to another broker (multi-broker
+    /// DIRECT) never consults it and re-dials its own broker (ADR-0039).
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     /// Pluggable DNS resolver (Java `ClientBuilder#dnsResolver`).
     pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
@@ -130,6 +135,19 @@ struct Entry {
     /// it. The handle is taken out under `entries_lock` + `driver` field's own
     /// `Mutex` discipline.
     driver: Mutex<Option<DriverHandle>>,
+}
+
+impl Entry {
+    /// `true` once this entry's driver has exited for good (ADR-0059's `no_driver` latch: the plain
+    /// driver's terminal exit, a user close, or the supervisor giving up after `max_attempts`).
+    /// Nothing will ever serve the connection again, so the pool must not hand it out: any later
+    /// open routed to it fails with `PeerClosed` for the rest of the client's life.
+    ///
+    /// Reads the latch alone, never `fail_if_no_driver`: that takes the connection mutex, and the
+    /// pool consults this under its `entries` lock.
+    fn is_dead(&self) -> bool {
+        self.shared.is_no_driver()
+    }
 }
 
 /// Own a just-spawned driver until its pool entry becomes reachable.
@@ -237,8 +255,14 @@ impl ProxyConnectionPool {
             index,
         );
 
-        // Fast path — already open.
-        if let Some(entry) = self.entries.lock().get(&key) {
+        // Fast path — already open. An entry whose driver has exited is not "open": it falls
+        // through to the slow path, which replaces it with a fresh dial.
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .get(&key)
+            .filter(|entry| !entry.is_dead())
+        {
             return Ok(entry.shared.clone());
         }
 
@@ -248,10 +272,11 @@ impl ProxyConnectionPool {
         let entry = self.build_entry(physical, proxy_to_broker_url).await?;
 
         // Race resolution: another caller may have populated the key while we
-        // were dialling. The winner stays; we drop ours.
-        {
+        // were dialling. A live winner stays; we drop ours. A dead entry (its driver
+        // exited) is not a winner: ours replaces it.
+        let replaced = {
             let mut entries = self.entries.lock();
-            if let Some(existing) = entries.get(&key) {
+            if let Some(existing) = entries.get(&key).filter(|existing| !existing.is_dead()) {
                 let shared = existing.shared.clone();
                 drop(entries);
                 // Best-effort tear-down of the loser entry. The driver future
@@ -266,20 +291,23 @@ impl ProxyConnectionPool {
                 }
                 return Ok(shared);
             }
-            // State-consistency: we reach this arm only after the `get(&key)`
-            // miss above, and the entries-lock has been held continuously
-            // since — so `key` is provably absent and the insert must not
-            // clobber a live entry. A `Some` here would mean a second
-            // registration races the same key (a pool-bookkeeping bug), which
-            // would silently orphan a handshaked `ConnectionShared` + its
-            // supervised driver. Cannot fire on legitimate broker/wire input —
-            // it is pure map bookkeeping checked under the same lock.
-            let clobbered = entries.insert(key, entry.clone());
-            debug_assert!(
-                clobbered.is_none(),
-                "pool entry insert clobbered a live entry — double registration for one key"
-            );
-        }
+            // State-consistency: we reach this arm only when `key` is absent or holds a dead
+            // entry, and the entries-lock has been held continuously since that `get`. Anything
+            // else would mean a second registration races the same key (a pool-bookkeeping bug),
+            // which would silently orphan a handshaked `ConnectionShared` + its supervised
+            // driver. Cannot fire on legitimate broker/wire input — it is pure map bookkeeping
+            // checked under the same lock.
+            entries.insert(key, entry.clone())
+        };
+        // The replaced entry, if any, was dead: its driver already exited and failed every op
+        // still pending on its `ConnectionShared`. There is nothing left to close or join, and
+        // aborting the task could cut off the wake-ups it is still sending, so dropping the
+        // handle is the whole teardown. It is dropped here, outside the entries-lock.
+        debug_assert!(
+            replaced.as_ref().is_none_or(|dead| dead.is_dead()),
+            "pool entry insert clobbered a live entry — double registration for one key"
+        );
+        drop(replaced);
         Ok(entry.shared.clone())
     }
 
@@ -350,10 +378,25 @@ impl ProxyConnectionPool {
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();
 
+        // A PIP-121 provider answers with the *service* URL, so only an entry that dials the
+        // service address follows it: a proxy entry (it dials the proxy) and a bootstrap sibling
+        // (a replica of the bootstrap connection, which follows the provider itself). An entry
+        // pinned to another broker — the multi-broker DIRECT path, whose `physical` is what the
+        // lookup resolved — re-dials that broker on a drop, so its supervisor must not consult
+        // the provider: the redial would land on the service URL while the pool still files the
+        // entry under its own broker (ADR-0039, DIRECT amendment). This is the complement of the
+        // bootstrap-equality bypass of `Client::resolve_direct_broker`, which sends a lookup that
+        // resolves to the service address to the bootstrap instead of to a DIRECT entry.
+        let dials_service_url =
+            physical.host == self.factory.url.host && physical.port == self.factory.url.port;
         let ctx = ReconnectContext {
             url: physical.clone(),
             tls_config: self.factory.tls_config.clone(),
-            service_url_provider: self.factory.service_url_provider.clone(),
+            service_url_provider: self
+                .factory
+                .service_url_provider
+                .clone()
+                .filter(|_| dials_service_url),
             dns_resolver: self.factory.dns_resolver.clone(),
         };
         let mut driver =
@@ -438,8 +481,8 @@ impl ProxyConnectionPool {
     }
 
     /// Scheme of the bootstrap dial address — used by
-    /// [`crate::Client::lookup_topic`] to pick between `broker_service_url` and
-    /// `broker_service_url_tls` returned by the proxy.
+    /// [`crate::Client::lookup_topic_with_operation_deadline`] to pick between `broker_service_url`
+    /// and `broker_service_url_tls` returned by the proxy.
     #[must_use]
     pub(crate) fn bootstrap_scheme(&self) -> Scheme {
         self.factory.url.scheme

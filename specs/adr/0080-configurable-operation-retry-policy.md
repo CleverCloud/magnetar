@@ -1,6 +1,6 @@
 # ADR-0080 — Configurable broker-operation retry policy
 
-- **Status**: Accepted (amended by [ADR-0100](0100-close-cancelled-producer-open-before-retry.md), producer-open cancellation portion)
+- **Status**: Accepted (amended by [ADR-0100](0100-close-cancelled-producer-open-before-retry.md), producer-open cancellation portion, and by [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md), operation-deadline scope)
 - **Date**: 2026-07-16
 - **Decider**: Florentin Dubois
 - **Tags**: resilience, retry, timeout, runtime, sans-io
@@ -10,6 +10,10 @@
 > Local-only cancellation was what stranded the broker-side `(topic, producer_name)` registration behind a timed-out open, and `ProducerBusy` being retryable here — the classification this ADR defines — then made the retry loop re-hit that zombie with a fresh producer id (issue #406).
 > Cancelling an opening CONSUMER is unchanged.
 > Everything else in this ADR stays in force: the retry policy and its defaults, the busy classification, the single per-operation deadline, per-generation request ownership, cancellation still owning all local correlation state, cancellation still being idempotent, and late broker replies still being ignored.
+
+> **Amendment (2026-11-19, [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md)).** The operation deadline listed in § One operation context per public setup operation also bounds the PIP-31 transaction requests: `new_txn` (its coordinator bootstrap included, under one timer), `add_partition_to_txn`, `add_subscription_to_txn` and `end_txn` race their reply against `operation_timer()` and fail with the engine's operation-deadline error.
+> The expired `TcClientConnect`, `NewTxn`, `AddPartitionToTxn` and `AddSubscriptionToTxn` requests are cancelled, and a late broker reply to them is ignored; an expired `end_txn` keeps its canonical request so that a retry resumes it.
+> Everything else in this ADR stays in force.
 
 ## Context
 

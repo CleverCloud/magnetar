@@ -1,9 +1,19 @@
 # ADR-0060 — Bounded lookup-retry on `SessionLost`
 
-- **Status**: Accepted
+- **Status**: Accepted (amended 2026-11-19 — partitioned-metadata and topic-list-snapshot requests recover the same way)
 - **Date**: 2026-06-09
 - **Decider**: Florentin Dubois
 - **Tags**: reconnect, resilience, runtime, lookup, sans-io
+
+> **Amendment (2026-11-19, the other registry requests).** The decision below fixed `lookup_topic` alone.
+> `Connection::reset` fails the other two registry requests a user call issues in exactly the same way: a `CommandPartitionedTopicMetadata`, which `ProducerBuilder::create` runs before its lookup, and the `CommandWatchTopicList` behind `PatternConsumerBuilder::subscribe` and `topic_list_snapshot`.
+> Their engine loops had no `SessionLost` arm, so the outcome fell into the `other =>` catch-all and a call issued during a supervised reconnect failed with `ClientError::Other("unexpected partitioned metadata outcome: SessionLost…")` or `…("unexpected topic-list snapshot outcome: SessionLost…")`, the asymmetry this ADR removed for lookups.
+>
+> Both engines' `partitioned_topic_metadata_with_operation_deadline` and `watch_topic_list_with_operation_deadline` now carry the same bounded loop as `issue_lookup_on`: on `OpOutcome::SessionLost` they park on `await_reconnect_or_terminal` raced against the operation deadline (deadline first), re-issue on `Reconnected`, return `PeerClosed` on `Terminal`, and return `PeerClosed` when `MAX_LOOKUP_SESSION_REISSUES` is spent.
+> The park-and-budget step is one private helper per engine, `Client::await_session_reissue`, 1:1 across tokio and moonpool.
+> Each call has its own budget, independent of the broker-failure retry budget of ADR-0080, and the park reads no clock (ADR-0011).
+> A re-issue is safe because `reset()` rebuilds the lookup registry and the topic-watcher registry, so the severed request and its watcher are already gone and the re-issue registers a new watcher id; request ids are never reused, so the cancel-on-drop of the severed request future is a no-op against the fresh session.
+> Everything else in this ADR stays in force.
 
 ## Context
 

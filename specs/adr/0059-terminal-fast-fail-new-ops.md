@@ -1,9 +1,13 @@
 # ADR-0059 — Terminal-state fast-fail for NEW operations + no-driver signal
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md), entry-point guard list)
 - **Date**: 2026-06-09
 - **Decider**: Florentin Dubois
 - **Tags**: reconnect, resilience, runtime, sans-io
+
+> **Amendment (2026-11-19, [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md)).** The entry-point guard of § 3 also runs in front of the PIP-31 requests: `new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`, the coordinator `TcClientConnect` handshake and the scalable-topic `add_subscription_to_txn` return `ClientError::PeerClosed` before they register a pending request.
+> Those requests registered pending ops with no check, so a commit on a terminal connection waited forever.
+> Everything else in this ADR stays in force.
 
 ## Context
 

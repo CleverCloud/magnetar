@@ -18,6 +18,7 @@
 //!   connection — byte-identical to the pre-#314 client.
 //! - `connections_per_broker(2)` spreads consumers too, not just producers.
 //! - Sibling CONNECTs replicate the bootstrap CONNECT (no `proxy_to_broker_url`).
+//! - A dropped sibling re-dials the `ServiceUrlProvider` URL, as the bootstrap does (ADR-0039).
 //!
 //! Sibling moonpool simulation coverage lives in
 //! `crates/magnetar-runtime-moonpool/tests/connections_per_broker.rs` (ADR-0024
@@ -31,14 +32,15 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, FrameError, SubscribeRequest, decode_one,
-    encode_command, pb,
+    ConnectionConfig, ControlledClusterFailover, CreateProducerRequest, FrameError,
+    SubscribeRequest, SupervisorConfig, decode_one, encode_command, pb,
 };
-use magnetar_runtime_tokio::Client;
+use magnetar_runtime_tokio::{Client, ParsedUrl};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::AbortHandle;
 
 /// Outer wrapper timeout — the runtime operation owns the bounded-failure
 /// contract; this only keeps a broken test from hanging forever.
@@ -60,10 +62,24 @@ struct SessionRecord {
 /// Spawn a fake single-broker Pulsar on `127.0.0.1:0`. Returns the bound address
 /// (as a `pulsar://...` URL) and the per-session record log.
 async fn spawn_broker() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
+    let (url, sessions, _session_tasks) = spawn_abortable_broker().await;
+    (url, sessions)
+}
+
+/// [`spawn_broker`] that also hands back one [`AbortHandle`] per accepted session, in accept
+/// order: aborting a session's task drops its socket, which is how a test makes the broker drop
+/// a single connection while the listener keeps accepting.
+async fn spawn_abortable_broker() -> (
+    String,
+    Arc<Mutex<Vec<SessionRecord>>>,
+    Arc<Mutex<Vec<AbortHandle>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
     let sessions: Arc<Mutex<Vec<SessionRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let session_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let sessions_for_task = sessions.clone();
+    let session_tasks_for_task = session_tasks.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
@@ -75,12 +91,13 @@ async fn spawn_broker() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
                 s.len() - 1
             };
             let sessions = sessions_for_task.clone();
-            tokio::spawn(async move {
+            let session = tokio::spawn(async move {
                 let _ = handle_session(stream, &sessions, session_idx).await;
             });
+            session_tasks_for_task.lock().push(session.abort_handle());
         }
     });
-    (format!("pulsar://{addr}"), sessions)
+    (format!("pulsar://{addr}"), sessions, session_tasks)
 }
 
 async fn handle_session(
@@ -391,5 +408,98 @@ async fn connections_per_broker_fans_consumers_across_connections() {
         sessions_serving(&snapshot, pb::base_command::Type::Subscribe),
         2,
         "each consumer must land on a distinct connection: {snapshot:?}"
+    );
+}
+
+/// A `connections_per_broker` sibling is a replica of the bootstrap connection, so — like the
+/// bootstrap — it follows the PIP-121 `ServiceUrlProvider` when its socket drops (ADR-0039,
+/// ADR-0073). Only an entry pinned to another broker (multi-broker DIRECT) stops consulting the
+/// provider; a sibling carries the same `proxy_to_broker_url = None` as such an entry, so this
+/// pins that the distinction is the dialled address and not that field.
+///
+/// Broker A is the bootstrap and serves the sibling; the provider is then switched to broker C and
+/// A drops the sibling's session. The supervisor's redial must be accepted by C.
+///
+/// Moonpool twin: `crates/magnetar-runtime-moonpool/tests/connections_per_broker.rs`'s test of
+/// the same name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_bootstrap_sibling_follows_the_service_url_provider() {
+    let _guard = TEST_LOCK.lock().await;
+    let (url_a, sessions_a, session_tasks_a) = spawn_abortable_broker().await;
+    let (url_c, sessions_c, _session_tasks_c) = spawn_abortable_broker().await;
+
+    let provider = Arc::new(ControlledClusterFailover::new(url_a.clone()));
+    let cfg = ConnectionConfig {
+        supervisor: Some(SupervisorConfig {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            ..SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    };
+    let client = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        Client::connect_with_provider(
+            ParsedUrl::parse(&url_a).expect("broker A URL parses"),
+            None,
+            cfg,
+            None,
+            Some(provider.clone()),
+        ),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok")
+    .with_connections_per_broker(2);
+
+    // Two producers round-robin over index 0 (the bootstrap) and index 1 (the pool sibling).
+    let mut producers = Vec::new();
+    for i in 0..2 {
+        let p = tokio::time::timeout(
+            TEST_OPERATION_TIMEOUT,
+            client.open_producer(CreateProducerRequest {
+                topic: format!("persistent://public/default/cpb-sibling-redial-{i}"),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("open_producer did not time out")
+        .expect("open_producer ok");
+        producers.push(p);
+    }
+
+    // Precondition: the bootstrap (session 0) and the sibling (session 1) are both on A.
+    assert_eq!(
+        sessions_a.lock().len(),
+        2,
+        "A serves the bootstrap and the sibling"
+    );
+    assert_eq!(sessions_c.lock().len(), 0, "C has not been dialled yet");
+
+    // The cluster fails over to C, then A drops the sibling's connection. The bootstrap session
+    // stays up, so only the sibling's supervisor redials.
+    provider.set_url(url_c);
+    session_tasks_a.lock()[1].abort();
+
+    // Wait, bounded, for the sibling's redial to be accepted by either broker.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while sessions_a.lock().len() + sessions_c.lock().len() < 3
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let accepted_by_a = sessions_a.lock().len();
+    let accepted_by_c = sessions_c.lock().len();
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+    drop(producers);
+    drop(client);
+
+    assert_eq!(
+        (accepted_by_a, accepted_by_c),
+        (2, 1),
+        "a bootstrap sibling must re-dial the provider's current service URL (C) after its socket \
+         drops (sessions accepted: A={accepted_by_a}, C={accepted_by_c})",
     );
 }

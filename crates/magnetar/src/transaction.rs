@@ -507,8 +507,9 @@ where
     /// Mirrors Java `PulsarClient#newTransaction()`.
     ///
     /// # Errors
-    /// - [`PulsarError::Other`] (with the runtime's error stringified) on broker rejection or wire
-    ///   failure.
+    /// - [`PulsarError::Other`] (with the runtime's error stringified) on broker rejection, wire
+    ///   failure, a terminal connection, or a coordinator that does not answer within
+    ///   `operation_timeout` (ADR-0129).
     pub async fn new_transaction(
         &self,
         timeout: std::time::Duration,
@@ -525,7 +526,8 @@ where
     /// Mirrors Java `Transaction#registerProducedTopic`.
     ///
     /// # Errors
-    /// - [`PulsarError::Other`] on broker rejection or wire failure.
+    /// - [`PulsarError::Other`] on broker rejection, wire failure, a terminal connection, or a
+    ///   coordinator that does not answer within `operation_timeout` (ADR-0129).
     pub async fn register_partition_to_transaction(
         &self,
         txn: Transaction,
@@ -540,7 +542,8 @@ where
     /// Mirrors Java `Transaction#registerSubscriptionToTxn`.
     ///
     /// # Errors
-    /// - [`PulsarError::Other`] on broker rejection or wire failure.
+    /// - [`PulsarError::Other`] on broker rejection, wire failure, a terminal connection, or a
+    ///   coordinator that does not answer within `operation_timeout` (ADR-0129).
     pub async fn register_subscription_to_transaction(
         &self,
         txn: Transaction,
@@ -561,7 +564,8 @@ where
     /// Mirrors Java `Transaction#commit`.
     ///
     /// # Errors
-    /// - [`PulsarError::Other`] on broker rejection or wire failure.
+    /// - [`PulsarError::Other`] on broker rejection, wire failure, a terminal connection, or a
+    ///   coordinator that does not answer within `operation_timeout` (ADR-0129).
     pub async fn commit_transaction(&self, txn: Transaction) -> Result<TxnState, PulsarError> {
         #[cfg(feature = "scalable-topics")]
         let preparation = self.transactions.prepare_commit(txn.id()).await?;
@@ -612,7 +616,8 @@ where
     /// Java `Transaction#abort`.
     ///
     /// # Errors
-    /// - [`PulsarError::Other`] on broker rejection or wire failure.
+    /// - [`PulsarError::Other`] on broker rejection, wire failure, a terminal connection, or a
+    ///   coordinator that does not answer within `operation_timeout` (ADR-0129).
     pub async fn abort_transaction(&self, txn: Transaction) -> Result<TxnState, PulsarError> {
         #[cfg(feature = "scalable-topics")]
         let preparation = self.transactions.prepare_abort(txn.id()).await?;

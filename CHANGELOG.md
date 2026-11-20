@@ -63,8 +63,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   It handed `select_all` the children in snapshot order, which returns the first ready future in input order, so while child 0 had a backlog children 1..n were never polled: their receiver queues filled, no refill credit went out, and their topics stalled until child 0 ran dry, and so did its push poller.
   `MultiTopicsConsumer::receive` has had the round-robin cursor that fixes this since `9347c39`; the pattern consumer now carries it too.
 
-### Fixed
-
 - **A `Client::close()` that lands while a supervisor redial is dialling is no longer erased when that dial succeeds.**
   The supervisor checked `is_user_closed()` before the dial but not after it, so a dial that succeeded afterwards ran `Connection::reset()`, which snaps `Closing` back to `Uninitialized` and drops the queued `Closed` event; the supervised client then reconnected, re-attached every producer and consumer on the replacement socket, and `Client::close().await`, which joins the driver, never returned while the broker stayed reachable.
   Both engines now re-check `is_user_closed()` under the same lock acquisition as the `reset()`, and a close seen there drops the freshly dialled transport and ends the driver like the checks before the dial.
@@ -88,8 +86,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The graceful driver exit wakes parked `next_topic_list_change`, `next_replicated_subscription_marker` and scalable-topic waiters.**
   A local `close()` (the moonpool `DriverHandle::abort` is exactly that) ends the driver through an `Ok(())` exit that pulsed none of the per-client-buffer `Notify`s those waiters sleep on, so a waiter parked on a `&Client` stayed pending until its task was dropped.
   The terminal wrapper of every driver spawn, plain and supervised on both engines, now calls `wake_close_waiters` after latching the no-driver signal.
-
-### Fixed
 
 - **An owned scalable route is recorded in every build profile, so a build without debug assertions can open a `StreamConsumer`.**
   `ScalableRouteRegistry::claim_at_epoch` (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) performed its two registry inserts inside `debug_assert!`, whose operand is not evaluated when debug assertions are off, as in an ordinary `--release` build.
@@ -124,8 +120,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Every other control-plane failure was already classified, and the reconnect loop retries all but the terminal set.
   The failed reopen now fails the aggregate itself only for physical connection closure, explicit route closure and peer closure, the set ADR-0120 names as terminal, and requests resynchronization otherwise, after which the reconnect loop applies its existing rules to the replacement lookup and registration.
 
-### Fixed
-
 - **A seek the broker rejects no longer leaves the consumer frozen.**
   `Connection::seek` freezes the consumer when the seek is issued (`begin_seek` clears the receiver queue and zeroes the four flow-control mirrors, and `deliver` queued nothing for the application meanwhile), and only the `CommandSuccess` arm lifted that.
   A `CommandError` — the broker's `resetCursor` failure, a fenced subscription, "Consumer not found" — recorded an error outcome and nothing else, so the consumer silently discarded every later delivery, never re-granted flow, and was invisible to the stall watchdog and to the in-place recovery, both of which refuse a consumer with a pending seek, until a later successful seek or a reconnect.
@@ -141,6 +135,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The seek future now carries a drop guard that hands the seek to the connection (`Connection::abandon_consumer_seek_waiter`), in both runtimes: a seek still awaiting its reply becomes a `ConsumerSeekForgotten` request whose `Success` re-subscribes the consumer and releases its initial flow on the re-subscribe's acknowledgement and whose `Error` runs the rejected-seek recovery above, neither recording an outcome nobody would take; a future dropped after the `Success` landed but before it was polled is covered through `ConsumerState::seek_reattach_owed`.
   Unlike the awaiting continuation, the hand-off does not follow the acknowledgement with `redeliver_unacked_all`, the same shape as the existing subscribe-waiter hand-off.
   A seek an aggregate consumer staged and dropped before its first poll has no guard and needs none: the aggregate's own resynchronization covers it.
+- **A partitioned-metadata request or topic-list snapshot cut by a reconnect is re-issued instead of failing** ([ADR-0060](specs/adr/0060-lookup-retry-on-session-lost.md), 2026-11-19 amendment).
+  `Connection::reset` fails every pending request with `SessionLost`, and only the lookup loop re-issued it on the fresh session.
+  The partitioned-metadata loop, which `producer().create()` runs before its lookup, and the topic-list snapshot behind `PatternConsumerBuilder::subscribe` had no such arm, so a call issued during a supervised reconnect failed with `Other("unexpected partitioned metadata outcome: SessionLost…")` or `Other("unexpected topic-list snapshot outcome: SessionLost…")`.
+  Both engines now park on `await_reconnect_or_terminal` and re-issue, bounded by `MAX_LOOKUP_SESSION_REISSUES` and by `operation_timeout`, with the same results as a lookup: `PeerClosed` once the supervisor gives up or the bound is spent.
+- **A DIRECT pool entry that loses its socket re-dials its own broker, not the `ServiceUrlProvider` URL** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-19 amendment).
+  The pool copied the client's PIP-121 provider into the supervisor of every entry, so a multi-broker DIRECT entry pinned to broker B redialled the provider's service URL after a drop while the pool still filed it under B, and B's producers and consumers were replayed on the wrong broker.
+  Only an entry that dials the service address — a proxy entry or a `connections_per_broker` sibling of the bootstrap — now follows the provider; an entry pinned to another broker never consults it.
+- **A pool entry whose driver has exited is no longer handed out again** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-19 amendment).
+  `ProxyConnectionPool::get_or_open` returned an existing entry without asking whether its driver was still running, and removed entries only at `Client::close`.
+  Once a non-bootstrap broker's connection was terminal — the façade default has no supervisor, so the first drop is terminal, and a supervised entry is terminal once it exhausts `max_attempts` — every later open or subscribe routed to that broker or `connections_per_broker` slot failed with `PeerClosed` until the whole client was rebuilt, although the broker was reachable again and the bootstrap connection was healthy.
+  Both engines now treat an entry whose [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md) `no_driver` latch is set as absent and dial a fresh one under the same key.
+- **PIP-31 transaction requests no longer wait forever on a dead client or a silent coordinator** ([ADR-0129](specs/adr/0129-bound-and-fast-fail-pip-31-transaction-requests.md)).
+  `new_txn` (once the coordinator was bootstrapped), `add_partition_to_txn`, `add_subscription_to_txn` and `end_txn` ran neither [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md)'s terminal check nor any deadline, so `Transaction::commit` and `abort` hung after the driver exited, and a commit issued during a supervised outage waited the whole outage.
+  They now fail with `PeerClosed` on a terminal connection, and every one of them, the coordinator handshake included, fails within `operation_timeout` on both engines.
+  An expired `end_txn` leaves its canonical request pending, so calling it again resumes it and an unknown commit outcome is never sent twice.
+  `Connection` also ignores the late broker reply to a cancelled transaction request instead of parking an outcome nobody takes, the façade's Moonpool `TransactionApi` delegates to the runtime client instead of carrying its own copy, and the scalable-topic `add_subscription_to_txn` of both runtimes goes through the same bounded wait.
 
 ## [2.0.0] - 2026-11-19
 

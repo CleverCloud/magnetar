@@ -83,8 +83,10 @@ pub(crate) struct ConnectionFactory<P: Providers> {
     /// Reused rustls configuration for TLS bootstrap, controller, and segment
     /// entries. `None` means every pool transport is plaintext.
     pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
-    /// PIP-121 service-URL provider (cluster failover). Shared across pool
-    /// entries — every supervised loop polls it on reconnect.
+    /// PIP-121 service-URL provider (cluster failover). Polled on reconnect by the supervised
+    /// loop of every pool entry that dials the service address (a proxy entry or a bootstrap
+    /// sibling). An entry pinned to another broker (multi-broker DIRECT) never consults it and
+    /// re-dials its own broker (ADR-0039).
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     /// Pluggable DNS resolver.
     pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
@@ -390,30 +392,45 @@ where
         if pool.closed.load(Ordering::Acquire) {
             return Err(pool_closed_error());
         }
-        if let Some(state) = entries.get(&key).cloned() {
-            match &*state {
-                EntryState::Ready { shared, .. } => return Ok(shared.clone()),
-                EntryState::Pending(pending) => pending.handles(),
+        let existing = entries.get(&key).cloned();
+        let joined = match existing.as_deref() {
+            Some(EntryState::Ready { shared, .. }) if !shared.is_no_driver() => {
+                return Ok(shared.clone());
             }
+            Some(EntryState::Pending(pending)) => Some(pending.handles()),
+            // No entry, or a `Ready` one whose driver has exited for good (no supervisor and the
+            // connection dropped, or the supervisor gave up after `max_attempts`). Nothing will
+            // ever serve that connection again, so it is not handed out: a fresh dial replaces it
+            // below.
+            Some(EntryState::Ready { .. }) | None => None,
+        };
+        if let Some(pending) = joined {
+            pending
         } else {
             let pending = PendingDial::new();
             let handles = pending.handles();
             let entry = Arc::new(EntryState::Pending(pending));
             // State-consistency mirror of the tokio pool's insert site
             // (`magnetar_runtime_tokio::pool::ProxyConnectionPool::get_or_open`):
-            // we reach this arm only inside the `else` of the `get(&key)` miss,
-            // with the entries-lock held continuously — so `key` is provably
-            // absent and inserting the fresh `Pending` must not clobber an
-            // existing entry. A `Some` here would mean a second dial races the
-            // same key (a pool-bookkeeping bug) and would orphan the clobbered
-            // entry's `PendingDial`/`Ready` state. Cannot fire on legitimate
-            // broker/wire input — pure map bookkeeping under the same lock.
-            let clobbered = entries.insert(key.clone(), entry.clone());
+            // we reach this arm only when `key` is absent or holds a dead `Ready` entry, with
+            // the entries-lock held continuously — so inserting the fresh `Pending` must not
+            // clobber a live entry. Anything else would mean a second dial races the same key
+            // (a pool-bookkeeping bug) and would orphan the clobbered entry's
+            // `PendingDial`/`Ready` state. Cannot fire on legitimate broker/wire input — pure
+            // map bookkeeping under the same lock.
+            let replaced = entries.insert(key.clone(), entry.clone());
+            drop(entries);
+            // A replaced entry was dead: its driver already exited and failed every op still
+            // pending on its connection, so dropping it is the whole teardown. Closing or joining
+            // it would be a second release of what the exit already released.
             debug_assert!(
-                clobbered.is_none(),
+                replaced.as_deref().is_none_or(|old| matches!(
+                    old,
+                    EntryState::Ready { shared, .. } if shared.is_no_driver()
+                )),
                 "pool entry insert clobbered a live entry — double registration for one key"
             );
-            drop(entries);
+            drop(replaced);
             spawn_dial(
                 pool.clone(),
                 physical.to_owned(),
@@ -650,11 +667,24 @@ async fn build_entry_async<P: Providers>(
     )
     .await?;
 
+    // A PIP-121 provider answers with the *service* URL, so only an entry that dials the service
+    // address follows it: a proxy entry (it dials the proxy) and a bootstrap sibling (a replica
+    // of the bootstrap connection, which follows the provider itself). An entry pinned to another
+    // broker — the multi-broker DIRECT path, whose `physical` is what the lookup resolved —
+    // re-dials that broker on a drop, so its supervisor must not consult the provider: the redial
+    // would land on the service URL while the pool still files the entry under its own broker
+    // (ADR-0039, DIRECT amendment). This is the complement of the bootstrap-equality bypass of
+    // `Client::resolve_direct_broker`, which sends a lookup that resolves to the service address
+    // to the bootstrap instead of to a DIRECT entry. Mirrors the tokio pool's `build_entry`.
+    let dials_service_url = physical == factory.addr;
     let ctx = ReconnectContext {
         host_port: physical.to_owned(),
         tls_config: factory.tls_config.clone(),
         tls_server_name: None,
-        service_url_provider: factory.service_url_provider.clone(),
+        service_url_provider: factory
+            .service_url_provider
+            .clone()
+            .filter(|_| dials_service_url),
         dns_resolver: factory.dns_resolver.clone(),
     };
     let driver =

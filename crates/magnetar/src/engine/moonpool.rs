@@ -775,30 +775,9 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
         txn: magnetar_proto::TxnId,
         topic: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        let shared = self.shared().clone();
-        Box::pin(async move {
-            let request_id = {
-                let mut conn = shared.inner.lock();
-                conn.add_partition_to_txn(txn, topic)
-            };
-            shared.driver_waker.notify_one();
-            let outcome = moonpool_request_fut(shared.clone(), request_id).await;
-            match outcome {
-                magnetar_proto::OpOutcome::AddPartitionToTxn { result, .. } => {
-                    result.map_err(|err| {
-                        magnetar_runtime_moonpool::ClientError::Other(format!(
-                            "add_partition_to_txn: {err}"
-                        ))
-                    })
-                }
-                magnetar_proto::OpOutcome::Error { code, message, .. } => {
-                    Err(magnetar_runtime_moonpool::ClientError::Broker { code, message })
-                }
-                other => Err(magnetar_runtime_moonpool::ClientError::Other(format!(
-                    "unexpected add_partition_to_txn outcome: {other:?}"
-                ))),
-            }
-        })
+        Box::pin(magnetar_runtime_moonpool::Client::add_partition_to_txn(
+            self, txn, topic,
+        ))
     }
 
     fn add_subscription_to_txn(
@@ -807,31 +786,12 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
         topic: String,
         subscription: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        let shared = self.shared().clone();
-        Box::pin(async move {
-            let request_id = {
-                let mut conn = shared.inner.lock();
-                // Proto layer wants (subscription, topic); façade exposes (topic, subscription).
-                conn.add_subscription_to_txn(txn, subscription, topic)
-            };
-            shared.driver_waker.notify_one();
-            let outcome = moonpool_request_fut(shared.clone(), request_id).await;
-            match outcome {
-                magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => {
-                    result.map_err(|err| {
-                        magnetar_runtime_moonpool::ClientError::Other(format!(
-                            "add_subscription_to_txn: {err}"
-                        ))
-                    })
-                }
-                magnetar_proto::OpOutcome::Error { code, message, .. } => {
-                    Err(magnetar_runtime_moonpool::ClientError::Broker { code, message })
-                }
-                other => Err(magnetar_runtime_moonpool::ClientError::Other(format!(
-                    "unexpected add_subscription_to_txn outcome: {other:?}"
-                ))),
-            }
-        })
+        Box::pin(magnetar_runtime_moonpool::Client::add_subscription_to_txn(
+            self,
+            txn,
+            topic,
+            subscription,
+        ))
     }
 
     fn end_txn(
@@ -840,88 +800,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
         action: magnetar_proto::TxnAction,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnState, Self::Error>> + Send + '_>>
     {
-        let shared = self.shared().clone();
-        Box::pin(async move {
-            let request_id = {
-                let mut conn = shared.inner.lock();
-                conn.end_txn(txn, action).map_err(|err| {
-                    magnetar_runtime_moonpool::ClientError::Other(format!("end_txn: {err}"))
-                })?
-            };
-            let _waiter = MoonpoolEndTxnWaiterGuard::new(shared.clone(), txn, action);
-            shared.driver_waker.notify_one();
-            let outcome = moonpool_request_fut(shared.clone(), request_id).await;
-            match outcome {
-                magnetar_proto::OpOutcome::EndTxn { result, .. } => result.map_err(|err| {
-                    magnetar_runtime_moonpool::ClientError::Other(format!("end_txn: {err}"))
-                }),
-                magnetar_proto::OpOutcome::Error { code, message, .. } => {
-                    Err(magnetar_runtime_moonpool::ClientError::Broker { code, message })
-                }
-                other => Err(magnetar_runtime_moonpool::ClientError::Other(format!(
-                    "unexpected end_txn outcome: {other:?}"
-                ))),
-            }
-        })
+        Box::pin(magnetar_runtime_moonpool::Client::end_txn(
+            self, txn, action,
+        ))
     }
-}
-
-struct MoonpoolEndTxnWaiterGuard {
-    shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
-    txn: magnetar_proto::TxnId,
-    action: magnetar_proto::TxnAction,
-}
-
-impl MoonpoolEndTxnWaiterGuard {
-    fn new(
-        shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
-        txn: magnetar_proto::TxnId,
-        action: magnetar_proto::TxnAction,
-    ) -> Self {
-        Self {
-            shared,
-            txn,
-            action,
-        }
-    }
-}
-
-impl Drop for MoonpoolEndTxnWaiterGuard {
-    fn drop(&mut self) {
-        self.shared
-            .inner
-            .lock()
-            .release_end_txn_waiter(self.txn, self.action);
-    }
-}
-
-/// Park on a request-id-correlated outcome from the moonpool engine's
-/// shared connection state. Mirrors `magnetar_runtime_moonpool`'s
-/// internal `RequestFut`; reproduced here because that type is
-/// `pub(crate)` to the moonpool runtime.
-fn moonpool_request_fut(
-    shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
-    request_id: magnetar_proto::RequestId,
-) -> Pin<Box<dyn Future<Output = magnetar_proto::OpOutcome> + Send>> {
-    use std::task::{Context, Poll};
-
-    struct Fut {
-        shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
-        request_id: magnetar_proto::RequestId,
-    }
-    impl Future for Fut {
-        type Output = magnetar_proto::OpOutcome;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let key = magnetar_proto::PendingOpKey::Request(self.request_id);
-            let mut conn = self.shared.inner.lock();
-            if let Some(outcome) = conn.take_outcome(key) {
-                return Poll::Ready(outcome);
-            }
-            conn.register_waker(key, cx.waker().clone());
-            Poll::Pending
-        }
-    }
-    Box::pin(Fut { shared, request_id })
 }
 
 #[cfg(feature = "tokio")]
