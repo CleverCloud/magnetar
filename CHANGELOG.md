@@ -124,6 +124,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Every other control-plane failure was already classified, and the reconnect loop retries all but the terminal set.
   The failed reopen now fails the aggregate itself only for physical connection closure, explicit route closure and peer closure, the set ADR-0120 names as terminal, and requests resynchronization otherwise, after which the reconnect loop applies its existing rules to the replacement lookup and registration.
 
+### Fixed
+
+- **A seek the broker rejects no longer leaves the consumer frozen.**
+  `Connection::seek` freezes the consumer when the seek is issued (`begin_seek` clears the receiver queue and zeroes the four flow-control mirrors, and `deliver` queued nothing for the application meanwhile), and only the `CommandSuccess` arm lifted that.
+  A `CommandError` — the broker's `resetCursor` failure, a fenced subscription, "Consumer not found" — recorded an error outcome and nothing else, so the consumer silently discarded every later delivery, never re-granted flow, and was invisible to the stall watchdog and to the in-place recovery, both of which refuse a consumer with a pending seek, until a later successful seek or a reconnect.
+  `begin_seek` now moves the queue and the mirrors into a `SeekRollback` instead of discarding them, and `deliver` holds the dispatches that arrive while the seek is in flight in it, in arrival order, instead of dropping them.
+  The `CommandError` arm restores the snapshot, adds onto it what the mirrors recorded since the freeze (a manual `flow`, an aggregate's, the refund of a PIP-33 marker), and delivers the held dispatches in order behind the restored queue through the path a live `CommandMessage` takes: nothing the broker sent is skipped, so a later cumulative acknowledgement on an Exclusive or Failover subscription never covers a message the application did not see, and the window the broker still holds is repaid by the ordinary refund rather than granted a second time (issue #427).
+  The hold is bounded by the window the broker holds; the units past it are charged on both sides of the ledger at the rollback.
+  A consumer the broker removed mid-seek (a `CommandCloseConsumer`, same-broker or migration, before a `resetCursor` that then fails, or the acknowledgement of an in-place recovery close) has nothing to restore and is re-attached in place, which the close arm had deferred to a seek that was never going to finish.
+  The reply to an older seek no longer thaws a newer one still in flight.
+  A successful seek still discards the snapshot and what was held: the old cursor sent it.
+
+- **A cancelled `seek_*` future no longer strands the consumer.**
+  The broker drops the consumer while it applies a seek, and the only code that re-subscribed it and granted flow was the awaiting seek future's continuation, so a `seek_*` dropped by a `timeout`, a `select!` or an aborted task before the reply left the consumer attached to nothing, holding no permits, and — with its permit balance at zero — outside every stall candidacy.
+  The seek future now carries a drop guard that hands the seek to the connection (`Connection::abandon_consumer_seek_waiter`), in both runtimes: a seek still awaiting its reply becomes a `ConsumerSeekForgotten` request whose `Success` re-subscribes the consumer and releases its initial flow on the re-subscribe's acknowledgement and whose `Error` runs the rejected-seek recovery above, neither recording an outcome nobody would take; a future dropped after the `Success` landed but before it was polled is covered through `ConsumerState::seek_reattach_owed`.
+  Unlike the awaiting continuation, the hand-off does not follow the acknowledgement with `redeliver_unacked_all`, the same shape as the existing subscribe-waiter hand-off.
+  A seek an aggregate consumer staged and dropped before its first poll has no guard and needs none: the aggregate's own resynchronization covers it.
+
 ## [2.0.0] - 2026-11-19
 
 ### Changed
