@@ -735,6 +735,8 @@ The supervisor:
 3. **Gates on `is_user_closed()`** — only the explicit `Closing` / `Closed` states stop the supervisor.
    The transport-drop state (`Failed`, set by `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls into the backoff / redial path instead of returning.
    This is the difference between "broker went away" and "user called `.close()`".
+   The gate is checked at the top of every cycle, after every backoff sleep, and once more, under the same lock acquisition as the `Connection::reset()` it guards, after a dial succeeds: a `close()` that lands while the dial is in flight is otherwise erased, because `reset()` snaps `Closing` back to `Uninitialized` and drops the queued `Closed` event, so the supervisor would re-attach every producer and consumer on the fresh socket and `Client::close()`, which joins the driver, would never return.
+   A close observed there drops the freshly dialled transport and returns the previous inner result.
 4. **Backs off** with a small exponential schedule capped by `ReconnectConfig::max_backoff` (jittered by the engine clock — under moonpool-sim this is deterministic per seed).
 5. **Reconnects** through the same dial path used at client init (re-resolving the broker URL via the configured `ServiceUrlProvider` on every attempt — this is where PIP-121 plugs in).
    Every blocking step of that dial (the caller's `DnsResolver`, the TCP connect, the TLS handshake) is bounded by `connect_timeout` and fails as `Io(TimedOut)` ([ADR-0052](specs/adr/0052-initial-connect-timeout-retry.md)), so a peer that accepts TCP and goes silent cannot park the supervisor or the `Client::close()` that joins it.

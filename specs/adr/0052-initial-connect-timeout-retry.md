@@ -178,4 +178,6 @@ The per-candidate bound already existed, and a resolver that returns several add
 It also keeps the determinism rule of this ADR: a plaintext dial without a resolver arms exactly the one timer it armed before, a resolver that answers on its first poll arms none (the `sleep` is never polled), and the TLS handshake arms one timer for the whole loop, never one per read.
 
 The same fix covers every dial site, so it needs no per-site bound: `MoonpoolEngine::connect_tls`, `connect_tls_supervised`, `connect_plain*`, the multi-broker pool dial and the supervisor redial all call `connect_selected`.
-The redial in the supervisor needs no `is_user_closed` check of its own either: the dial now returns within a bounded time, and the supervisor loop checks the close request before the next attempt.
+The bound is what keeps a close from waiting on a parked redial: the dial now returns within a bounded time, and the supervisor loop checks the close request before the next attempt.
+It does not make a dial that _succeeds_ after the close landed harmless, and the supervisor therefore re-checks `is_user_closed()` under the same lock acquisition as the `Connection::reset()` that follows the dial, on both engines: `reset()` snaps `Closing` back to `Uninitialized`, which would erase the close.
+A close seen there drops the freshly dialled transport and returns, like the checks before the dial.

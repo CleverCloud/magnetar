@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A `Client::close()` that lands while a supervisor redial is dialling is no longer erased when that dial succeeds.**
+  The supervisor checked `is_user_closed()` before the dial but not after it, so a dial that succeeded afterwards ran `Connection::reset()`, which snaps `Closing` back to `Uninitialized` and drops the queued `Closed` event; the supervised client then reconnected, re-attached every producer and consumer on the replacement socket, and `Client::close().await`, which joins the driver, never returned while the broker stayed reachable.
+  Both engines now re-check `is_user_closed()` under the same lock acquisition as the `reset()`, and a close seen there drops the freshly dialled transport and ends the driver like the checks before the dial.
 - **The moonpool engine's `connect_timeout` bounds the caller's DNS resolver and the TLS handshake, not only the TCP connect.**
   A TLS peer that accepted the TCP connection and then never answered the ClientHello (a black-holed backend behind an L4 pass-through, a partition right after accept) parked the rustls handshake forever, and a caller-supplied `DnsResolver` that never answered parked the dial the same way.
   The initial `connect_tls` / `connect_tls_supervised` therefore never returned, and the supervisor's redial sat inside the same unbounded dial, so `Client::close().await`, which joins the driver, waited on it for good; the tokio engine already abandoned both after `connect_timeout`.

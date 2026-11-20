@@ -1183,6 +1183,18 @@ async fn supervised_driver_loop(
         // new socket's handshake completes.
         {
             let mut conn = shared.inner.lock();
+            // A user `close()` can land while the dial above is in flight: the
+            // `is_user_closed()` gates before the dial cannot see it, and `reset()`
+            // would snap `Closing` back to `Uninitialized` and drop the queued `Closed`
+            // event, so the supervisor would rebuild every producer and consumer on the
+            // fresh socket and `Client::close()` (which joins this task) would never
+            // return. The check and the `reset()` share one lock acquisition, so a
+            // `close()` either precedes both (and is honoured here) or follows `reset()`
+            // and is handled by the inner loop like any in-session close. Dropping
+            // `new_socket` on return closes the freshly dialled connection.
+            if conn.is_user_closed() {
+                return last_inner_result;
+            }
             conn.reset();
             if let Err(err) = conn.begin_handshake() {
                 // Should never happen — reset() snaps state back to Uninitialized — but if it
