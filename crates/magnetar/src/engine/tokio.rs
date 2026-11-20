@@ -1022,6 +1022,10 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
         magnetar_runtime_tokio::Consumer::is_closed(self)
     }
 
+    fn is_terminal(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_terminal(self)
+    }
+
     fn is_connected(&self) -> bool {
         magnetar_runtime_tokio::Consumer::is_connected(self)
     }

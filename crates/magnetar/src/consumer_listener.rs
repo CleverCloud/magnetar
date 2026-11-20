@@ -34,10 +34,15 @@
 //!   nack) — same contract as Java's `MessageListener`, which hands you the `Consumer` so you ack
 //!   explicitly. The poller never acks on the callback's behalf.
 //! - **Clean shutdown.** An explicit or terminal remote consumer close makes `receive()` resolve
-//!   with an error, so the poller loop ends without a panic. Dropping the returned
-//!   [`MessageListenerHandle`] (or calling [`MessageListenerHandle::close`]) aborts the poller;
-//!   task unwinding then drops its owned consumer clone. That clone triggers a best-effort close
-//!   only if it is the final clone. Dropping an intermediate consumer clone does nothing.
+//!   with an error, so the poller loop ends without a panic. The poller tells that terminal error
+//!   from a failure on a single message through [`crate::ConsumerApi::is_terminal`], never from the
+//!   error alone: `receive()` also resolves `Err` for one message it could not decrypt or
+//!   decompress (the default `CryptoFailureAction::Fail`) while the consumer stays open, and the
+//!   poller then logs the error at `debug!`, leaves that message unacked, and reads the next one.
+//!   Dropping the returned [`MessageListenerHandle`] (or calling [`MessageListenerHandle::close`])
+//!   aborts the poller; task unwinding then drops its owned consumer clone. That clone triggers a
+//!   best-effort close only if it is the final clone. Dropping an intermediate consumer clone does
+//!   nothing.
 //!
 //! ## Pull / push are mutually exclusive
 //!
@@ -59,7 +64,7 @@
 //! ack against). They get a second poller, [`spawn_wrapper_message_listener`],
 //! generic over the [`WrapperReceiver`] trait (an `async fn receive()` yielding a
 //! topic + message). It preserves the exact same ADR-0064 semantics —
-//! sequential, in order, no auto-ack, clean shutdown on `receive()` error / handle
+//! sequential, in order, no auto-ack, clean shutdown once the receiver is terminal / on handle
 //! drop — and its callback shape is [`WrapperMessageListener`] = `Fn(&str,
 //! &IncomingMessage)` (the topic is the extra argument, mirroring Java
 //! `Message#getTopicName()`).
@@ -129,7 +134,8 @@ pub type MessageListener = Arc<dyn Fn(&IncomingMessage) + Send + Sync>;
 /// aborts the poller; [`Self::close`] awaits a clean stop.
 ///
 /// The poller terminates on its own when an explicit or terminal remote close
-/// makes `receive()` return an error. Dropping this handle aborts the poller,
+/// makes `receive()` return an error (a failure on a single message does not: the
+/// poller skips it and keeps running). Dropping this handle aborts the poller,
 /// then task unwinding drops its owned consumer clone. That clone triggers a
 /// best-effort close only when it is the final clone; if other consumer clones
 /// remain, this drop stages no close.
@@ -161,7 +167,7 @@ impl Drop for MessageListenerHandle {
 
 impl MessageListenerHandle {
     /// `true` while the poller task is still running. Flips to `false` once the
-    /// consumer is closed (the loop broke) or the handle has been
+    /// consumer reaches a terminal state (the loop broke) or the handle has been
     /// [`Self::close`]d / dropped.
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -202,10 +208,11 @@ impl MessageListenerHandle {
 /// `magnetar_runtime_moonpool::Consumer<P>`. The task is a bare
 /// `loop { receive(); callback }` — no channel, no extra lock, no host-clock
 /// read (ADR-0003 / ADR-0011 / ADR-0038 all preserved). The loop breaks the
-/// first time an explicit or terminal remote close makes `receive()` return an
-/// error. Dropping the returned handle instead aborts the poller and drops this
-/// task's owned consumer clone; only a final clone triggers the best-effort
-/// consumer close.
+/// first time `receive()` returns an error while
+/// [`crate::ConsumerApi::is_terminal`] holds (an explicit or terminal remote close);
+/// an error on a single message does not end it. Dropping the returned handle
+/// instead aborts the poller and drops this task's owned consumer clone; only a
+/// final clone triggers the best-effort consumer close.
 pub fn spawn_message_listener<C: crate::ConsumerApi + Clone>(
     consumer: C,
     listener: MessageListener,
@@ -224,7 +231,10 @@ pub fn spawn_message_listener<C: crate::ConsumerApi + Clone>(
 /// invocations. `on_message` receives the runtime's
 /// `magnetar_proto::IncomingMessage`; the raw / typed wrappers adapt it to
 /// their own callback shape. The loop breaks the first time `receive()` errors
-/// (closed / terminally-disconnected consumer) for clean, panic-free shutdown.
+/// while the consumer is terminal (closed / terminally-disconnected) for clean,
+/// panic-free shutdown. An error while it is not terminal concerns one message
+/// (a decrypt or decompress failure that already popped it): log it, leave the
+/// message unacked and read the next one.
 pub(crate) fn spawn_listener_loop<C, F>(consumer: C, on_message: F) -> MessageListenerHandle
 where
     C: crate::ConsumerApi + Clone,
@@ -232,11 +242,17 @@ where
 {
     let join = tokio::spawn(async move {
         loop {
-            let Ok(msg) = crate::ConsumerApi::receive(&consumer).await else {
+            match crate::ConsumerApi::receive(&consumer).await {
+                Ok(msg) => on_message(msg),
                 // Consumer closed / connection terminally lost: stop cleanly.
-                break;
-            };
-            on_message(msg);
+                Err(_) if crate::ConsumerApi::is_terminal(&consumer) => break,
+                Err(err) => tracing::debug!(
+                    target: "magnetar::consumer_listener",
+                    topic = %crate::ConsumerApi::topic(&consumer),
+                    error = %err,
+                    "push delivery skipped a message that failed to receive",
+                ),
+            }
         }
     });
     MessageListenerHandle {
@@ -274,11 +290,12 @@ pub type WrapperMessageListener = Arc<dyn Fn(&str, &IncomingMessage) + Send + Sy
 /// [`tokio::spawn`]ed task (the wrapper consumers are cheap `Arc`-clones).
 pub trait WrapperReceiver: Clone + Send + Sync + 'static {
     /// Receive the next message across the wrapper's current child set, returning
-    /// the originating topic and the message. A terminal error (every child closed
-    /// / disconnected) breaks the poller loop for a clean shutdown — the same
-    /// signal `ConsumerApi::receive` gives the single-topic poller. On an empty set
-    /// the wrapper `receive()` errors immediately; the poller does not treat that
-    /// as terminal (see [`Self::is_empty`]) — it parks on [`Self::membership_changed`].
+    /// the originating topic and the message. An `Err` is the first failing child's
+    /// error, so by itself it says nothing about the wrapper: it can concern one
+    /// message, a child the wrapper has just removed, or a child that is terminal. The
+    /// poller breaks for a clean shutdown only when [`Self::is_terminal`] also holds. On an
+    /// empty set the wrapper `receive()` errors immediately; the poller does not treat
+    /// that as terminal (see [`Self::is_empty`]) — it parks on [`Self::membership_changed`].
     fn wrapper_receive(
         &self,
     ) -> impl Future<Output = Result<(String, magnetar_proto::IncomingMessage), PulsarError>> + Send;
@@ -287,6 +304,21 @@ pub trait WrapperReceiver: Clone + Send + Sync + 'static {
     /// consumer whose pattern matched nothing yet). The poller parks on
     /// [`Self::membership_changed`] rather than spinning on the empty-set error.
     fn is_empty(&self) -> bool;
+
+    /// `true` when a child consumer of the *current* set can no longer deliver, so a
+    /// failed [`Self::wrapper_receive`] will fail the same way again instead of
+    /// moving on to the next message. The poller breaks only on this; any other
+    /// `Err` is skipped and the poller re-snapshots the children and keeps
+    /// receiving. A child the wrapper has already removed from the set does not
+    /// count, which is what keeps `remove_topic` (or a pattern removal) from ending
+    /// delivery for the surviving children, and an empty set is not terminal.
+    ///
+    /// The default is `false` ("never terminal"): an implementation whose
+    /// `wrapper_receive` can fail for good must override it, or the poller retries
+    /// that failure without ever stopping.
+    fn is_terminal(&self) -> bool {
+        false
+    }
 
     /// Resolves when a child consumer is added to the set after this future was
     /// created. The poller races its in-flight [`Self::wrapper_receive`] against
@@ -423,8 +455,10 @@ pub fn spawn_consumer_event_listener<C: crate::ConsumerApi + Clone>(
 /// This is the wrapper-surface sibling of [`spawn_message_listener`]. The loop is
 /// the same bare `loop { receive(); callback }` shape — no channel (ADR-0003), no
 /// extra lock (ADR-0038), no host-clock read (ADR-0011) — and breaks the first
-/// time `wrapper_receive()` errors (closed / empty consumer set) for clean,
-/// panic-free shutdown.
+/// time `wrapper_receive()` errors while [`WrapperReceiver::is_terminal`] holds for
+/// clean, panic-free shutdown. Any other error (one message that failed to
+/// decrypt or decompress, or a child the wrapper has just removed) is logged and
+/// skipped: the poller re-snapshots the child set and keeps receiving.
 ///
 /// Children discovered after subscribe (pattern `TopicListChanged` deltas,
 /// partition growth) inherit the listener: each iteration the poller races its
@@ -454,10 +488,22 @@ pub fn spawn_wrapper_message_listener<R: WrapperReceiver>(
                 r = receiver.wrapper_receive() => r,
                 () = receiver.membership_changed() => continue,
             };
-            let Ok((topic, msg)) = outcome else {
-                // Every child closed / terminally disconnected: stop cleanly.
-                // (An empty-set error is handled above and never reaches here.)
-                break;
+            let (topic, msg) = match outcome {
+                Ok(delivery) => delivery,
+                // A child of the current set is terminal: stop cleanly. (An
+                // empty-set error is handled above and never reaches here.)
+                Err(_) if receiver.is_terminal() => break,
+                // One message failed, or a child the wrapper itself removed
+                // closed under the parked receive: the set is still live, so
+                // re-snapshot it and receive again.
+                Err(err) => {
+                    tracing::debug!(
+                        target: "magnetar::consumer_listener",
+                        error = %err,
+                        "wrapper push delivery skipped a receive that failed",
+                    );
+                    continue;
+                }
             };
             // Hand the façade message to the callback. The callback acks
             // explicitly via the wrapper's topic-routed ack — the poller never
@@ -563,6 +609,9 @@ mod tests {
         membership: Arc<tokio::sync::Notify>,
         /// Mirrors the wrapper's empty-child-set predicate.
         empty: Arc<std::sync::atomic::AtomicBool>,
+        /// One-shot: the next `wrapper_receive` resolves `Err` while the wrapper stays open and
+        /// non-empty, as the runtime `receive()` does for an error on a single message.
+        fail_next: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockWrapper {
@@ -572,7 +621,14 @@ mod tests {
                 delivered: Arc::new(tokio::sync::Notify::new()),
                 membership: Arc::new(tokio::sync::Notify::new()),
                 empty: Arc::new(std::sync::atomic::AtomicBool::new(empty)),
+                fail_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// Arm the one-shot per-message receive error.
+        fn fail_next_receive(&self) {
+            self.fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Push a message and wake a parked `wrapper_receive`.
@@ -608,6 +664,14 @@ mod tests {
             &self,
         ) -> Result<(String, magnetar_proto::IncomingMessage), PulsarError> {
             loop {
+                if self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(PulsarError::Other(
+                        "receive: decrypt: no decryptor configured".to_owned(),
+                    ));
+                }
                 if let Some((topic, seq)) = self.queue.lock().pop_front() {
                     return Ok((topic, mock_message(seq)));
                 }
@@ -660,6 +724,44 @@ mod tests {
             ],
             "wrapper poller delivered every message, topic-tagged, in order",
         );
+    }
+
+    /// A per-message `receive()` error (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`) leaves the wrapper open and non-empty, so it is not the
+    /// "closed" signal the poller documents. The message queued behind it must still be
+    /// delivered and the poller must still be running. The error is one-shot: an endless `Err`
+    /// would never yield on `current_thread` and would hang instead of failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapper_poller_survives_a_per_message_receive_error() {
+        let mock = MockWrapper::new(false);
+        mock.fail_next_receive();
+        mock.push("t-a", 5);
+        let seen: Arc<parking_lot::Mutex<Vec<(String, u64)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let done = Arc::new(tokio::sync::Notify::new());
+        let done_cb = done.clone();
+        let listener: WrapperMessageListener =
+            Arc::new(move |topic: &str, msg: &IncomingMessage| {
+                seen_cb.lock().push((topic.to_owned(), msg.sequence_id()));
+                done_cb.notify_one();
+            });
+
+        let handle = spawn_wrapper_message_listener(mock, listener);
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(3), done.notified())
+            .await
+            .is_ok();
+        let running = handle.is_running();
+        handle.close().await;
+
+        assert!(
+            delivered,
+            "the message queued behind one receive() error was never delivered: the wrapper \
+             poller treated a per-message error as 'consumer closed' and exited \
+             (poller running = {running})",
+        );
+        assert!(running, "the poller must outlive a per-message error");
+        assert_eq!(*seen.lock(), vec![("t-a".to_owned(), 5)]);
     }
 
     /// Inheritance: the poller starts with an EMPTY wrapper (no child yet),

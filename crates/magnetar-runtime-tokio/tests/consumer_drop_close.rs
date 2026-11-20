@@ -22,7 +22,7 @@ use bytes::BytesMut;
 use magnetar_proto::{
     ConnectionConfig, FrameError, MessageId, SubscribeRequest, decode_one, encode_command, pb,
 };
-use magnetar_runtime_tokio::Client;
+use magnetar_runtime_tokio::{Client, ClientError};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -436,4 +436,43 @@ async fn explicit_close_then_drop_sends_single_close_consumer() {
     );
     barrier.close().await.expect("barrier close ok");
     client.close().await;
+}
+
+/// `Consumer::is_terminal` is the gate `receive()` resolves `Err(Closed)` on, so a facade push
+/// loop can tell a terminal receive error from an error about one message. A live consumer is
+/// not terminal; once the connection is closed for good (no supervisor) `receive()` resolves
+/// `Err(Closed)` and `is_terminal()` holds, and it keeps holding (the state is permanent).
+/// 1:1 twin of the moonpool engine's same-named test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn is_terminal_tracks_the_receive_gate() {
+    let (url, _log) = spawn_recording_broker().await;
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect ok");
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/is-terminal".to_owned(),
+            subscription: "is-terminal".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe ok");
+    assert!(!consumer.is_terminal(), "a live consumer is not terminal");
+
+    client.close().await;
+
+    let received = tokio::time::timeout(Duration::from_secs(3), consumer.receive())
+        .await
+        .expect("receive resolves on a terminally closed connection instead of parking");
+    assert!(
+        matches!(received, Err(ClientError::Closed)),
+        "receive on a terminally closed connection resolves Err(Closed)"
+    );
+    assert!(
+        consumer.is_terminal(),
+        "the receive gate reports the terminal state the Err(Closed) came from"
+    );
+    assert!(consumer.is_terminal(), "the terminal state is permanent");
 }

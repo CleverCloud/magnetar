@@ -872,6 +872,17 @@ where
         MultiTopicsConsumer::is_empty(self)
     }
 
+    fn is_terminal(&self) -> bool {
+        // Clone the snapshot and release the set's mutex before asking the children: each
+        // `ConsumerApi::is_terminal` takes the global Connection mutex (ADR-0038 order), and a
+        // child the wrapper has already removed is not in the snapshot, so closing it on
+        // purpose never reads as a terminal wrapper.
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
+        snapshot
+            .iter()
+            .any(|nc| ConsumerApi::is_terminal(&nc.consumer))
+    }
+
     async fn membership_changed(&self) {
         let notify = self.inner.membership_changed.clone();
         notify.notified().await;
@@ -1411,8 +1422,10 @@ where
     /// The poller delivers messages sequentially and in order across every
     /// subscribed topic, handing the callback the originating topic and message,
     /// and does **not** auto-ack (the callback acks explicitly via
-    /// [`MultiTopicsConsumer::ack`]). It stops cleanly when the consumer set is
-    /// drained or the returned handle is dropped. Topics added later (via
+    /// [`MultiTopicsConsumer::ack`]). It stops cleanly when a child consumer is
+    /// terminal (closed, or its connection lost for good) or the returned handle is
+    /// dropped; an error on one message, or on a child `remove_topic` just removed, is
+    /// skipped. Topics added later (via
     /// [`MultiTopicsConsumer::add_topic`]) are picked up automatically.
     ///
     /// Because the consumer is moved into the poller, there is no handle left to

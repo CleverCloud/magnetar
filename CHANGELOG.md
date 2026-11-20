@@ -10,6 +10,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit. The option is also available on reader and V5 consumer builders; bounded codec output and the aggregate batch-memory budget still apply. Raw `None` payloads are not decompressed and retain the normal wire-frame limit.
 - Adding `max_uncompressed_message_size` to public `SubscribeRequest`, `StreamConsumerOptions`, and `SegmentConsumerOptions` requires downstream struct-literal initializers to provide the field; callers using `Default` or builders remain source-compatible.
+- **`Consumer::is_terminal()` on both runtime consumers, surfaced as `ConsumerApi::is_terminal()`, and `WrapperReceiver::is_terminal()`** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  `Consumer::is_terminal()` evaluates the gate `receive()` itself resolves `Err(Closed)` on, which is broader than `is_closed()`: a per-handle terminal subscribe failure never sets `closed`.
+  `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
+  `WrapperReceiver::is_terminal` has a default of `false`; an implementation whose `wrapper_receive` can fail for good must override it.
+
+### Fixed
+
+- **A push listener or a `TableView` no longer stops for good on one message that fails to decrypt or decompress** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
+  `subscribe_with_listener`, the multi-topic, partitioned and pattern listeners, and the `TableView` drain read any `receive()` error as "the consumer is closed" and exited.
+  `receive()` also resolves `Err` for a single message the consumer could not decrypt or decompress under the default `CryptoFailureAction::Fail`, while it stays open, so one such message closed a builder push consumer, left the healthy topics of a wrapper undrained, or froze a `TableView` while `is_connected()` stayed `true`.
+  The loops now end only when the consumer is terminal, and otherwise log the error at `debug!`, leave the message unacked and read the next one.
+- **`remove_topic` and a pattern removal no longer end push delivery for the topics that remain.**
+  The child the wrapper had just closed resolved `Err(Closed)` under the parked poller, and the poller read it as the whole consumer closing.
+  A child that becomes terminal while it stays in the wrapper's set still ends the wrapper push consumer, as before; skipping it belongs to the wedge in the pull `receive()`.
 
 ## [2.0.0] - 2026-11-19
 

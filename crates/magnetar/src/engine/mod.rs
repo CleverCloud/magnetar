@@ -486,6 +486,18 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `true` once the consumer has entered a terminal state.
     fn is_closed(&self) -> bool;
 
+    /// `true` once [`Self::receive`] can only resolve `Err` on an empty queue: the runtime's own
+    /// receive gate (a closed consumer, a per-handle terminal subscribe failure, a connection
+    /// closed for good or left with no driver). A recoverable supervised reconnect window is not
+    /// terminal, and the state is permanent.
+    ///
+    /// Broader than [`Self::is_closed`], which only reports the consumer's own `closed` flag (a
+    /// per-handle terminal subscribe failure never sets it). A `receive()` that fails while this
+    /// is `false` concerns one message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`): the consumer is still open and the next `receive()` can
+    /// succeed. The push-delivery loops key their exit on this, not on the error alone.
+    fn is_terminal(&self) -> bool;
+
     /// `true` while the broker connection is up. Mirrors Java
     /// `Consumer#isConnected`.
     fn is_connected(&self) -> bool;

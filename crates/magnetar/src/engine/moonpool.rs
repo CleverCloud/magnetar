@@ -1236,6 +1236,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
         magnetar_runtime_moonpool::Consumer::is_closed(self)
     }
 
+    fn is_terminal(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_terminal(self)
+    }
+
     fn is_connected(&self) -> bool {
         magnetar_runtime_moonpool::Consumer::is_connected(self)
     }

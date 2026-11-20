@@ -506,6 +506,17 @@ where
         PatternConsumer::is_empty(self)
     }
 
+    fn is_terminal(&self) -> bool {
+        // Clone the snapshot and release the set's mutex before asking the children: each
+        // `ConsumerApi::is_terminal` takes the global Connection mutex (ADR-0038 order), and a
+        // child the wrapper has already removed is not in the snapshot, so closing it on
+        // purpose never reads as a terminal wrapper.
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
+        snapshot
+            .iter()
+            .any(|nc| ConsumerApi::is_terminal(&nc.consumer))
+    }
+
     async fn membership_changed(&self) {
         let notify = self.inner.membership_changed.clone();
         notify.notified().await;
@@ -956,8 +967,9 @@ where
     ///
     /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
     /// sequential, in-order delivery, no auto-ack (the callback acks via
-    /// [`PatternConsumer::ack`]), clean shutdown on consumer-set drain / handle
-    /// drop. **Pattern children discovered after subscribe inherit the listener** —
+    /// [`PatternConsumer::ack`]), clean shutdown once a child is terminal / on handle
+    /// drop (an error on one message, or on a child `update()` removed, is skipped). **Pattern
+    /// children discovered after subscribe inherit the listener** —
     /// call [`PatternConsumer::update`] (or
     /// [`PatternConsumer::start_auto_reconcile`]) to subscribe newly-matched
     /// topics; the running poller picks them up on its next `receive()` sweep, since

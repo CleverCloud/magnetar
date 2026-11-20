@@ -724,7 +724,8 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     }
 
     /// Mirrors Java `ConsumerBuilder#cryptoFailureAction`. Controls what the consumer does
-    /// when payload decryption fails (PIP-4): `Fail` (default) propagates the error,
+    /// when payload decryption fails (PIP-4): `Fail` (default) propagates the error (a push
+    /// listener logs it, leaves the message unacked and keeps running),
     /// `Discard` silently drops the message, `Consume` returns the encrypted ciphertext
     /// as-is. All three arms are honored by the
     /// [`magnetar_runtime_tokio::Consumer`] receive path.

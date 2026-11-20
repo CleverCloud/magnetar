@@ -226,6 +226,29 @@ impl<P: Providers> Consumer<P> {
         self.slot.state.lock().closed
     }
 
+    /// `true` once [`Self::receive`] can only resolve `Err(ClientError::Closed)` on an empty queue:
+    /// the very predicate the receive future gates on, so `false` means a failed `receive()` was
+    /// an error about one message (a decrypt or decompress failure under the default
+    /// `CryptoFailureAction::Fail`) and the next `receive()` can still succeed. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Consumer::is_terminal`.
+    ///
+    /// Broader than [`Self::is_closed`], which reads only the slot's `closed` flag: a per-handle
+    /// terminal subscribe failure (issue #302, or a redirect after a bundle move) sets a terminal
+    /// marker and never `closed`. A connection closed for good or left with no driver is terminal
+    /// too. A recoverable supervised reconnect window is not terminal. The state is permanent:
+    /// once `true` it stays `true`.
+    ///
+    /// Takes the global Connection mutex, then the per-slot mutex below it (ADR-0038).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        let handle_terminal = self
+            .shared
+            .inner
+            .lock()
+            .consumer_handle_is_terminal(self.handle);
+        handle_terminal || self.shared.is_no_driver()
+    }
+
     /// PIP-180 / ADR-0033: pre-populate shadow-topic metadata on this
     /// consumer. 1:1 mirror of
     /// `magnetar_runtime_tokio::Consumer::set_shadow_source`. Once set,
