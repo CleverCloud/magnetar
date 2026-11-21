@@ -2235,8 +2235,8 @@ impl Connection {
     /// Number of in-flight publish snapshots stashed for `handle` by the most recent
     /// [`Self::reset`]. Returns `0` when the snapshot has already been drained by
     /// [`Self::rebuild_producers`] or the producer never had any in-flight publish at
-    /// reset time. Test-facing observability hook — runtimes do not call this in the
-    /// hot path.
+    /// reset time. Runtimes do not call this in the hot path; their `flush` and
+    /// `pending_count` reach it through [`Self::producer_unacknowledged_count`].
     #[must_use]
     pub fn in_flight_publish_snapshot_len(&self, handle: ProducerHandle) -> usize {
         self.in_flight_publish_snapshots
@@ -6463,13 +6463,34 @@ impl Connection {
         n
     }
 
-    /// Number of in-flight sends on a producer (i.e. sends with no `CommandSendReceipt` yet).
-    /// Used by the runtime engines' `Producer::flush` to know when it's safe to return.
+    /// Number of sends in a producer's live `pending` queue: sends written (or staged) on the
+    /// current session that have no `CommandSendReceipt` yet.
+    ///
+    /// A send that a [`Self::reset`] relocated into the snapshot bucket is NOT counted here — it
+    /// is out of the queue until the broker acknowledges the producer's re-attachment. The
+    /// runtime engines' `Producer::flush` and `pending_count` must not read this alone; they use
+    /// [`Self::producer_unacknowledged_count`], which adds the relocated sends back.
     #[must_use]
     pub fn producer_pending_count(&self, handle: ProducerHandle) -> usize {
         self.producers
             .get(&handle)
             .map_or(0, |slot| slot.state.lock().pending.len())
+    }
+
+    /// Number of sends on a producer the broker has not acknowledged yet: the live queue
+    /// ([`Self::producer_pending_count`]) plus the publishes a [`Self::reset`] relocated into the
+    /// snapshot bucket ([`Self::in_flight_publish_snapshot_len`]).
+    ///
+    /// The relocated sends return to the live queue only when the broker acknowledges the
+    /// producer's re-attachment (`CommandProducerSuccess`), and are then acknowledged by their
+    /// own `CommandSendReceipt`; until then each is still owed a receipt, so `Producer::flush`
+    /// ("wait for every in-flight send to be acknowledged") and `pending_count` must count it. A
+    /// send never sits in both places: the `ProducerSuccess` handler moves the bucket back into
+    /// the queue within one connection-lock section, so the two counts are consistent for every
+    /// caller holding the connection lock.
+    #[must_use]
+    pub fn producer_unacknowledged_count(&self, handle: ProducerHandle) -> usize {
+        self.producer_pending_count(handle) + self.in_flight_publish_snapshot_len(handle)
     }
 
     /// Number of messages currently buffered in the producer's batch container (waiting
@@ -15960,6 +15981,131 @@ mod conn_state_tests {
         assert_eq!(
             observed_seqs, expected_seqs,
             "replay preserves FIFO + original sequence ids"
+        );
+    }
+
+    /// A send is unacknowledged from the moment it is queued until its own `CommandSendReceipt`,
+    /// wherever it sits meanwhile: `reset()` moves it out of the live `pending` queue into the
+    /// snapshot bucket, and the re-attachment's `CommandProducerSuccess` moves it back.
+    /// `producer_unacknowledged_count` must read the same number at every step of that journey —
+    /// `Producer::flush` and `pending_count` in both engines are built on it — while
+    /// `producer_pending_count` keeps reporting the live queue alone (it reads `0` inside the
+    /// bucket window).
+    #[test]
+    fn unacknowledged_count_covers_the_send_across_reset_snapshot_and_replay() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/unacked-count".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let mut seqs: Vec<SequenceId> = Vec::new();
+        for i in 0..2 {
+            seqs.push(
+                conn.send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::copy_from_slice(format!("u{i}").as_bytes()),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 2,
+                        num_messages: 1,
+                        txn_id: None,
+                        source_message_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue"),
+            );
+        }
+        let _ = drain_outbound_commands(&mut conn);
+        assert_eq!(conn.producer_pending_count(producer), 2);
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 0);
+        assert_eq!(
+            conn.producer_unacknowledged_count(producer),
+            2,
+            "queued sends are unacknowledged"
+        );
+
+        // Reset: both sends leave the live queue for the snapshot bucket and stay owed a receipt.
+        conn.reset();
+        assert_eq!(conn.producer_pending_count(producer), 0);
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 2);
+        assert_eq!(
+            conn.producer_unacknowledged_count(producer),
+            2,
+            "sends relocated into the reset snapshot bucket are still unacknowledged"
+        );
+
+        // Re-handshake + rebuild: the re-attachment is on the wire, its ack withheld.
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = drain_outbound_commands(&mut conn);
+        let rebuild_rids = conn.rebuild_producers();
+        assert_eq!(conn.producer_pending_count(producer), 0);
+        assert_eq!(
+            conn.producer_unacknowledged_count(producer),
+            2,
+            "the bucket window lasts until the re-attachment is acknowledged"
+        );
+
+        // A send staged inside that window sits in the live queue beside the bucket: both count.
+        seqs.push(
+            conn.send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"window"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 6,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue inside the window"),
+        );
+        assert_eq!(conn.producer_pending_count(producer), 1);
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 2);
+        assert_eq!(conn.producer_unacknowledged_count(producer), 3);
+
+        // Re-attachment ack: the bucket moves back to the live queue, with no double count.
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
+        let _ = drain_outbound_commands(&mut conn);
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 0);
+        assert_eq!(conn.producer_pending_count(producer), 3);
+        assert_eq!(
+            conn.producer_unacknowledged_count(producer),
+            3,
+            "replayed sends are counted once, in the live queue"
+        );
+
+        // Receipts drain the count one send at a time; flush may resolve only after the last.
+        for (acked, seq) in seqs.iter().enumerate() {
+            conn.handle_bytes(Instant::now(), &send_receipt_bytes(producer, *seq))
+                .expect("receipt");
+            assert_eq!(
+                conn.producer_unacknowledged_count(producer),
+                seqs.len() - acked - 1
+            );
+        }
+
+        // An unknown handle owes nothing.
+        assert_eq!(
+            conn.producer_unacknowledged_count(ProducerHandle(u64::MAX)),
+            0
         );
     }
 

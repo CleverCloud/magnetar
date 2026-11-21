@@ -38,6 +38,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                                                                                     | 🧠 needs design decision |
 | 29  | [Intermittent high ACK/NACK reconnect test](#29-intermittent-high-ack-nack-reconnect-test)                                                                                                                          | 🔬 needs reproduction    |
 | 31  | [Topic-list watchers are never deregistered, and a reconnect does not reconcile what changed while down](#31-topic-list-watchers-are-never-deregistered-and-a-reconnect-does-not-reconcile-what-changed-while-down) | 🧠 needs design decision |
+| 32  | [A parked `flush` is not woken by the send-timeout sweep](#32-a-parked-flush-is-not-woken-by-the-send-timeout-sweep)                                                                                                | ⚡ ready to dispatch     |
 
 ---
 
@@ -172,6 +173,16 @@ A topic created or deleted while the connection was down is therefore not report
 **Why it stays open.** Closing the watchers needs a close entry point on `Connection` and a deregistration call from `topic_list_snapshot` (once its reply is read) and from the pattern consumer (on close), in both engines.
 Reconciling the outage needs either a per-watcher topic set to diff the re-registration's list against or a re-snapshot driven from `PatternConsumer`, with the topic set that implies.
 Each carries the ADR-0024 layers.
+
+## 32. A parked `flush` is not woken by the send-timeout sweep
+
+**Gap.** `Producer::flush` parks on `ConnectionShared::driver_waker` and re-reads the producer's unacknowledged count when the driver calls `driver_waker.notify_waiters()`, which both drivers do after each inbound packet.
+The drivers' timer arm runs `Connection::handle_timeout` (which includes the `send_timeout` sweep of the live queue and of the reset snapshot bucket) and then wakes `event_waker` only.
+A `flush` whose last unacknowledged send is failed by that sweep is therefore re-checked at the next inbound packet rather than at the sweep.
+Since [ADR-0137](../specs/adr/0137-count-the-reset-snapshot-in-producer-flush-and-pending-count.md) the sends a reset relocated count as unacknowledged, which lengthens the window in which this can show: the connection is down, nothing inbound arrives, and the sweep may fail them first.
+This is read from the two timer arms; no test exercises it.
+
+**Why it stays open.** The fix is one `driver_waker.notify_waiters()` in each timer arm, and it needs the ADR-0024 layers: a test that holds a send unacknowledged past `send_timeout` with a `flush` parked on it, on both engines.
 
 ## Notes on this file
 

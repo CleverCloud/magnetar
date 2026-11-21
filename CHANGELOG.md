@@ -23,6 +23,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Producer::flush` no longer returns `Ok` while sends are still owed a receipt across a reconnect.**
+  `Connection::reset()` moves every replayable in-flight publish out of the producer's `pending` queue into the connection's reset snapshot bucket, and they return to `pending` only when the broker acknowledges the producer's re-attachment.
+  Both engines' `flush` looped on the live queue alone, so a `flush()` issued in that window — or parked across the socket drop and re-checked after the new `CONNECTED` frame — read zero and resolved `Ok(())` with no send acknowledged; the documented `flush().await` then `close()` (or process exit) recipe could complete while publishes were still unacknowledged.
+  `Producer::pending_count` read the same queue and reported `0` for the same sends, and a timed-out `flush_with_timeout` said "0 sends still pending".
+  `flush`, `pending_count` and the `flush_with_timeout` message now count the live queue plus the relocated sends through the new `Connection::producer_unacknowledged_count`, in both runtimes, so `flush` resolves only after the replayed sends' receipts.
+  `pending_count` and the `flush` probe now take the connection lock, then the slot lock, instead of the slot lock alone (global → per-slot; `Producer::send` is unchanged), and `pending_count` can exceed `ProducerStats::pending_queue_size`, which still reports the live queue.
+  A `flush` parked while the `send_timeout` sweep fails its last send is re-checked at the next inbound packet rather than at the sweep, as it already was for the live queue (`docs/follow-ups.md` §32, [ADR-0137](specs/adr/0137-count-the-reset-snapshot-in-producer-flush-and-pending-count.md)).
+
 - **A pattern consumer keeps discovering topics after a reconnect.**
   The broker keeps a PIP-145 topic-list watcher per connection, so it dies with the session, and the new session pushes no `CommandWatchTopicUpdate` until the client sends `CommandWatchTopicList` again.
   `Connection::reset()` replaced the whole watcher registry and the supervisors re-attached only producers and consumers, so after the first supervised reconnect every `PatternConsumer` stopped seeing new or deleted topics, with no error and no log; its existing children kept working, which hid the loss.

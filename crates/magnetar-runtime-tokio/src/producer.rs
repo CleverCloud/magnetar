@@ -26,13 +26,15 @@ use crate::error::ClientError;
 /// # Lock-ordering (ADR-0038)
 ///
 /// Identity reads (topic, access mode, handle) go through `slot.identity` and
-/// take **no lock at all**. State-machine reads (`pending_count`, `batch_len`,
+/// take **no lock at all**. State-machine reads (`batch_len`,
 /// `last_sequence_id_*`, `stats`, `is_closed`) take only the per-slot mutex
 /// via `slot.state.lock()` — they do **not** acquire the global Connection
-/// mutex. Operations that drive protocol I/O (`send`, `flush`, `close`,
-/// `get_schema`) still take `shared.inner.lock()` because they mutate the
-/// connection-wide state machine. Acquisition order is always **global →
-/// per-slot, never the reverse**.
+/// mutex. `pending_count` is the exception: it also counts the sends a reset
+/// relocated into the connection's snapshot bucket (ADR-0137), so it takes the
+/// global mutex and then the slot's. Operations that drive protocol I/O
+/// (`send`, `flush`, `close`, `get_schema`) still take `shared.inner.lock()`
+/// because they mutate the connection-wide state machine. Acquisition order is
+/// always **global → per-slot, never the reverse**.
 #[derive(Debug)]
 pub struct Producer {
     pub(crate) shared: Arc<ConnectionShared>,
@@ -197,13 +199,21 @@ impl Producer {
     }
 
     /// Number of in-flight sends (queued and not yet acked by the broker). Mirrors the
-    /// un-batched view of Java `ProducerStats#getPendingQueueSize`. Equivalent to
-    /// `self.stats().pending_queue_size as usize` but spares the full stats snapshot.
+    /// un-batched view of Java `ProducerStats#getPendingQueueSize`.
     ///
-    /// Per-slot read — does NOT take the global Connection mutex.
+    /// A send that a supervised reconnect relocated into the connection's reset snapshot stays
+    /// counted until the broker acknowledges its replay, so this can exceed
+    /// `self.stats().pending_queue_size`, which reports the live queue only.
+    ///
+    /// Takes the global Connection mutex (global → per-slot, ADR-0038): the relocated sends live
+    /// in the connection, and reading them together with the live queue must be atomic against
+    /// the re-attachment acknowledgement that moves them back (ADR-0137).
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.slot.state.lock().pending.len()
+        self.shared
+            .inner
+            .lock()
+            .producer_unacknowledged_count(self.handle)
     }
 
     /// Number of messages currently buffered in the batch container, waiting for the next
@@ -530,15 +540,20 @@ impl Producer {
         }
         self.shared.driver_waker.notify_one();
 
-        // Drain by waiting on the driver waker until the producer's pending queue is empty.
-        // The driver task notifies all parked tasks after every inbound packet, so each
-        // `CommandSendReceipt` wakes us; we re-check the count and re-park if needed.
+        // Drain by waiting on the driver waker until the producer has no unacknowledged send:
+        // neither in its live pending queue nor in the reset snapshot bucket, where a
+        // supervised reconnect parks a send until the broker acknowledges the re-attachment
+        // (ADR-0137). The driver task notifies all parked tasks after every inbound packet,
+        // so each `CommandSendReceipt` (and the re-attachment acknowledgement) wakes us; we
+        // re-check the count and re-park if needed.
         //
-        // ADR-0038: the pending-count probe reads from the per-slot mutex directly
-        // (no global Connection lock), so a parallel send on a sibling producer
-        // doesn't serialise against this drain.
+        // The probe takes the global Connection lock, briefly and never across an `.await`
+        // (global → per-slot, ADR-0038): the snapshot bucket lives in the connection, and
+        // reading it beside the live queue must be atomic against the re-attachment
+        // acknowledgement that moves the sends back. `Producer::send` stays lock-free on the
+        // global mutex.
         loop {
-            let pending = self.slot.state.lock().pending.len();
+            let pending = self.pending_count();
             if pending == 0 {
                 return Ok(());
             }
@@ -566,8 +581,7 @@ impl Producer {
         if let Ok(res) = tokio::time::timeout(timeout, self.flush()).await {
             res
         } else {
-            // ADR-0038: per-slot read, no global lock.
-            let pending = self.slot.state.lock().pending.len();
+            let pending = self.pending_count();
             Err(ClientError::Timeout(format!(
                 "producer flush exceeded {timeout:?} with {pending} sends still pending"
             )))
@@ -1475,6 +1489,70 @@ mod tests {
             .flush_with_timeout(Duration::from_secs(5))
             .await
             .expect("idempotent flush on quiescent producer must succeed");
+    }
+
+    /// A producer with one queued send that a supervised reset then moved out of the live
+    /// `pending` queue into the connection's snapshot bucket, where it stays until the
+    /// re-attachment is acknowledged: the send is still unacknowledged by the broker.
+    fn producer_with_send_relocated_by_reset() -> (std::sync::Arc<ConnectionShared>, Producer) {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            let h = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/flush-relocated".to_owned(),
+                ..Default::default()
+            });
+            let _ = conn.send(
+                h,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                1_700_000_000_000,
+                std::time::Instant::now(),
+            );
+            conn.reset();
+            h
+        };
+        assert_eq!(
+            shared.inner.lock().in_flight_publish_snapshot_len(handle),
+            1,
+            "precondition: the reset must relocate the send into the snapshot bucket"
+        );
+        let producer = Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
+        (shared, producer)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn flush_with_timeout_times_out_while_a_reset_holds_the_send_in_the_snapshot() {
+        let (_shared, producer) = producer_with_send_relocated_by_reset();
+        // No driver runs, so the re-attachment is never acknowledged and the send never is.
+        let outcome = producer.flush_with_timeout(Duration::from_millis(50)).await;
+        assert!(
+            matches!(outcome, Err(ClientError::Timeout(_))),
+            "flush must keep waiting while the send is unacknowledged in the reset snapshot \
+             bucket, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_count_includes_the_send_a_reset_moved_into_the_snapshot() {
+        let (_shared, producer) = producer_with_send_relocated_by_reset();
+        assert_eq!(
+            producer.pending_count(),
+            1,
+            "a send relocated by a reset is still queued and unacknowledged by the broker"
+        );
     }
 
     fn get_schema_response_bytes(request_id: u64, schema: Option<pb::Schema>) -> BytesMut {
