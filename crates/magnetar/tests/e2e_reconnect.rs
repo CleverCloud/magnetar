@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 mod common;
 
+use common::frame_proxy::{FrameProxy, authority};
 use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, init_tracing, start_pulsar};
 
 static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -969,6 +970,188 @@ async fn e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoi
         "connection must be down after the supervisor gives up"
     );
 
+    client.close().await;
+    Ok(())
+}
+
+/// Retry `attempt` until it succeeds or `budget` runs out, each attempt bounded by 10 s so a peer
+/// that never comes back fails the caller instead of hanging it.
+async fn retry_until_ok<T, E, F>(budget: Duration, mut attempt: impl FnMut() -> F) -> bool
+where
+    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(10), attempt()).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(err)) => {
+                tracing::info!(%err, "attempt failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(_elapsed) => tracing::info!("attempt timed out; retrying"),
+        }
+    }
+    false
+}
+
+/// Create `topic` by publishing one message whose payload is the topic name.
+async fn publish_topic_name(
+    client: &PulsarClient,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let producer = client.producer(topic).create().await?;
+    producer
+        .send(OutgoingMessage::with_payload(topic.as_bytes().to_vec()).into())
+        .await?;
+    producer.close().await?;
+    Ok(())
+}
+
+/// Poll `PatternConsumer::update` for 10 s; returns the first of `created` it subscribed.
+async fn subscribed_one_of(
+    pattern_consumer: &magnetar::PatternConsumer,
+    client: &PulsarClient,
+    created: &[String],
+) -> Option<String> {
+    for _ in 0..20 {
+        // A refused child subscribe stays in the backlog for the next call.
+        if let Err(err) = pattern_consumer.update(client).await {
+            tracing::info!(%err, "pattern update failed; retrying");
+        }
+        let subscribed = pattern_consumer.topics();
+        if let Some(topic) = subscribed.into_iter().find(|t| created.contains(t)) {
+            return Some(topic);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    None
+}
+
+/// Receive (and ack) until the message published to `topic` arrives, for at most 30 s.
+async fn receive_from(
+    pattern_consumer: &magnetar::PatternConsumer,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let received = tokio::time::timeout(remaining, pattern_consumer.receive())
+            .await
+            .map_err(|_| format!("no message from {topic} within 30 s"))??;
+        let _ = pattern_consumer
+            .ack(&received.topic, received.message.message_id)
+            .await;
+        if received.topic == topic {
+            assert_eq!(received.message.payload.as_ref(), topic.as_bytes());
+            return Ok(());
+        }
+    }
+}
+
+/// A `PatternConsumer` built before a supervised reconnect keeps discovering topics after it.
+///
+/// The broker holds a PIP-145 topic-list watcher per connection, so the one the pattern
+/// consumer registered dies with the session the proxy cuts. The reconnect must register it
+/// again; otherwise no `CommandWatchTopicUpdate` ever reaches the client and
+/// `PatternConsumer::update` never subscribes a matching topic created afterwards, while the
+/// children it already had keep working and hide the loss.
+///
+/// A topic created after the reconnect but before the broker has the watcher again is not
+/// announced (the reply to a re-registration is not turned into a delta), so the test creates
+/// one fresh matching topic per round, after the session is proven back, until one is
+/// subscribed or the rounds run out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pattern_consumer_discovers_topics_created_after_a_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    // The pattern carries a UUID, past the broker's default `subscriptionPatternMaxLength` of 50.
+    let (service_url, _admin_url, _container) = Pulsar::new(Broker::Default)
+        .config("subscriptionPatternMaxLength", "200")
+        .start()
+        .await?
+        .into_parts();
+    let proxy = FrameProxy::start(authority(&service_url)).await?;
+    let client = PulsarClient::builder()
+        .service_url(proxy.url())
+        .enable_reconnect(supervisor_for_e2e())
+        .operation_timeout(Duration::from_mins(1))
+        .build()
+        .await?;
+
+    let suite = Uuid::new_v4().simple().to_string();
+    let prefix = format!("persistent://public/default/magnetar-e2e-patrc-{suite}");
+    let topic_a = format!("{prefix}-aa");
+    let pattern = format!("{prefix}-.*");
+
+    // Topic A exists before the pattern consumer, so the snapshot subscribes it, and its
+    // producer, held across the reconnect, tells when the new session is back.
+    let producer_a = restart_producer(&client, &topic_a).await?;
+    producer_a
+        .send(OutgoingMessage::with_payload(b"before-reconnect".to_vec()).into())
+        .await?;
+    let pattern_consumer = client
+        .pattern_consumer()
+        .namespace("public/default")
+        .pattern(&pattern)
+        .subscription(format!("magnetar-patrc-{suite}"))
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    assert_eq!(
+        pattern_consumer.topics(),
+        std::slice::from_ref(&topic_a),
+        "the snapshot must subscribe topic A alone"
+    );
+
+    let cut = proxy.cut();
+    tracing::info!(
+        cut,
+        "cut every client connection under a live pattern consumer"
+    );
+    assert!(
+        cut > 0,
+        "the client must have had a connection through the proxy"
+    );
+
+    // A publish on the producer held across the cut completes only once the supervisor has
+    // re-handshaked and rebuilt the connection's producers and consumers.
+    let published = retry_until_ok(Duration::from_mins(2), || {
+        producer_a.send(OutgoingMessage::with_payload(b"after-reconnect".to_vec()).into())
+    })
+    .await;
+    assert!(
+        published,
+        "post-reconnect publish on topic A never succeeded"
+    );
+
+    // One fresh matching topic per round: created, published to, then `update` polled.
+    let mut created: Vec<String> = Vec::new();
+    let mut discovered: Option<String> = None;
+    for round in 0..6 {
+        let topic = format!("{prefix}-n{round}");
+        publish_topic_name(&client, &topic).await?;
+        created.push(topic);
+        discovered = subscribed_one_of(&pattern_consumer, &client, &created).await;
+        if discovered.is_some() {
+            break;
+        }
+    }
+    let Some(discovered) = discovered else {
+        panic!(
+            "the pattern consumer discovered none of the {} matching topics created after the \
+             reconnect: no topic-list update reached it once the session was back \
+             (subscribed: {:?}, created: {created:?})",
+            created.len(),
+            pattern_consumer.topics(),
+        );
+    };
+
+    // The discovered child serves the message published to its topic.
+    receive_from(&pattern_consumer, &discovered).await?;
+
+    pattern_consumer.close().await?;
+    producer_a.close().await?;
     client.close().await;
     Ok(())
 }

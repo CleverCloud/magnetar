@@ -23,6 +23,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A pattern consumer keeps discovering topics after a reconnect.**
+  The broker keeps a PIP-145 topic-list watcher per connection, so it dies with the session, and the new session pushes no `CommandWatchTopicUpdate` until the client sends `CommandWatchTopicList` again.
+  `Connection::reset()` replaced the whole watcher registry and the supervisors re-attached only producers and consumers, so after the first supervised reconnect every `PatternConsumer` stopped seeing new or deleted topics, with no error and no log; its existing children kept working, which hid the loss.
+  `reset()` now keeps the watchers the broker had acknowledged and `rebuild_consumers()` — which both supervisors already call after the handshake — sends their `CommandWatchTopicList` again with the same watcher id, namespace and pattern and the last topics hash the broker reported, in ascending watcher id order.
+  A watcher still awaiting its first reply is not kept: its caller is told `SessionLost`.
+  Nobody awaits the re-registration, so its reply is consumed in place (no `OpOutcome`, no event), a refusal is logged with a `warn!` and retried by the next rebuild, and a registration the broker never answered is owed again after the next reset.
+  The returned `Vec<RequestId>` of `rebuild_consumers()` is unchanged: it lists the re-subscribed consumers only.
+  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher is ever deregistered, so the ones `topic_list_snapshot` leaves behind are now registered again on every reconnect (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+
+- **A send relocated by a reconnect no longer hangs when its producer is closed before the rebuild.**
+  `Producer::close()` and the last-clone drop guard mark the producer closed and leave its unacknowledged sends pending until the broker acknowledges the close.
+  A close issued after `Connection::reset()` had moved the sends into the reset snapshots, and before the rebuild, left the producer out of the rebuild, and `rebuild_producers()` discarded its snapshots without resolving them; the close acknowledgement, which arrives after the rebuild, then found nothing to fail, so each `SendFut` stayed pending until the whole client shut down, and `send_timeout` could not reach it because the send was in no queue and no snapshot.
+  `rebuild_producers()` now fails the snapshots of every producer it does not re-attach with `OpOutcome::Terminal` (`producer closed before the send was acknowledged`), releasing their memory reservations as before, so the futures resolve with `PeerClosed`; a close acknowledgement that lands afterwards finds no bucket and drains nothing twice.
+  A close still unacknowledged when the session resets already failed its sends in `reset()`, and `Producer::close()` itself still returns `ClientError::Other` for a close that the reset severed ([ADR-0135](specs/adr/0135-fail-the-sends-of-a-producer-closed-across-a-reset-at-the-rebuild.md)).
+
 - **`Client::close()` no longer hangs, and no longer reconnects, when a socket failure or a late handshake frame races it.**
   `Connection::close()` records the user's intent only as the handshake state `Closing`, and the supervised driver's one stop signal is `is_user_closed()`.
   A transport failure while the close was still draining its write queue (a read error, an EOF, a decode error, or the ADR-0083 write deadline against a broker that stopped reading) called `mark_disconnected()`, which turned `Closing` into the redialable `Failed`.

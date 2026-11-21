@@ -600,6 +600,9 @@ A cross (`❌`) is a known-missing feature.
 | Manual `update()` reconcile     | ✅   | ✅       | `PatternConsumer::update(&client)` returns a `ReconcileReport`.                                                                                                                        |
 | Auto-update background ticker   | ✅   | ✅       | `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval` loop that calls `update(&client)` on every tick; returns a `JoinHandle` for clean shutdown. |
 
+The broker keeps a topic-list watcher per connection, so a supervised reconnect registers the acknowledged ones again and the delta stream resumes ([ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+A topic created or deleted while the connection was down is not reported to the pattern consumer, and no watcher is ever deregistered ([`docs/follow-ups.md`](docs/follow-ups.md) §31).
+
 ### Reader
 
 | Feature                                         | Java | Magnetar | Notes                                                           |

@@ -758,6 +758,7 @@ The supervisor:
 2. **Resets the state machine** with `Connection::reset()` — this snaps the handshake back to `Uninitialized`, bumps the `session_epoch`, drains the pending-op slabs, and **accumulates** in-flight publish snapshots into `Connection::in_flight_publish_snapshots` (append, never clear).
    The snapshot is `rebuild_producers`'s single consumer, so multiple reset cycles within a single rebuild are safe.
    User-facing send futures stay `Pending`; the snapshot carries enough state to replay them.
+   A producer that is closed when the rebuild runs is not re-attached, so there is nothing to replay onto: its snapshotted sends fail with `OpOutcome::Terminal` there, as they would on the broker's close acknowledgement, which a close issued after the reset does not outrun; a close still unacknowledged at the reset has already failed them in `reset()` ([ADR-0135](specs/adr/0135-fail-the-sends-of-a-producer-closed-across-a-reset-at-the-rebuild.md)).
    Producers / consumers see `is_connected() = false` but stay live.
 3. **Gates on `is_user_closed()`** — only the explicit `Closing` / `Closed` states stop the supervisor.
    The transport-drop state (`Failed`, set by `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls into the backoff / redial path instead of returning.
@@ -777,6 +778,7 @@ The supervisor:
    Each helper re-emits `CommandProducer` / `CommandSubscribe` for every still-open handle, stamps the new `session_epoch`, and replays the in-flight `OpSend` cached wire frames once the broker acks the producer.
    Consumers replay `initial_flow` followed by an explicit `CommandRedeliverUnacknowledgedMessages` after `SubscribeAcked` (the broker silently drops `CommandFlow` for an unknown `consumer_id`, so the Java `ConsumerImpl#reconnectLater` ordering is mandatory).
    User-facing futures stay registered; they get woken when the broker re-issues the producer/consumer IDs.
+   `rebuild_consumers` also registers every acknowledged PIP-145 topic-list watcher again ([Across a reconnect](#across-a-reconnect)).
 
 The supervisor never retries past `ReconnectConfig::max_attempts`; on exhaustion it propagates the last `EngineError::Io` upward and the `Client` is closed.
 The give-up budget counts the FULL dial+handshake cycle, not just TCP-dial failures ([ADR-0061](specs/adr/0061-supervisor-give-up-counts-handshake-failures.md)): the `give_up_attempts` counter is hoisted OUTSIDE the outer supervisor loop and gated by the sans-io `SupervisorConfig::should_give_up(attempts)` helper, so a connection that dials successfully (TCP accept) but then fails the Pulsar handshake — the docker-proxy / LB storm where the backend is down — counts against `max_attempts` instead of resetting it.
@@ -1389,6 +1391,17 @@ Cancellation likewise stops future traversal while preserving completed children
 
 `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval` loop that calls `update(&client)` on every tick; the returned `JoinHandle` is used for clean shutdown.
 Same pattern as the partitioned producer / consumer auto-update tickers.
+
+### Across a reconnect
+
+The broker keeps a topic-list watcher per connection, so one dies with the session that registered it and the new session pushes no `CommandWatchTopicUpdate` until the client registers it again.
+`Connection::reset()` therefore keeps every watcher the broker had acknowledged (its id, namespace, pattern and last topics hash) and marks it as owing a registration; a watcher still awaiting its first reply is dropped, because its caller is told `SessionLost`.
+`Connection::rebuild_consumers()` — which both supervisors already call after the handshake — sends the owed `CommandWatchTopicList` again, in ascending watcher id order, under a fresh request id and carrying the last hash the broker reported.
+The watcher keeps its id, so the deltas of the new session are still addressed to the same owner.
+Nobody awaits that request, so its reply is consumed in place: no `OpOutcome` is recorded, no event is queued, and a refusal is logged and leaves the watcher owing a registration for the next rebuild.
+A registration the broker never answered is owed again after the next reset, and a rebuild is idempotent within a session.
+The topic list the broker returns is not forwarded, so a topic created or deleted while the connection was down is not reported to the pattern consumer; only later changes are.
+Nothing deregisters a watcher (`CommandWatchTopicListClose` is never sent), so one lives as long as its connection and is registered again on every reconnect ([`docs/follow-ups.md`](docs/follow-ups.md) §31; [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
 
 ---
 

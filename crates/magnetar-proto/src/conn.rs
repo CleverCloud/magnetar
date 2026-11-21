@@ -44,7 +44,7 @@ use crate::lookup::{LookupRegistry, LookupRequest, LookupSubmitError, is_partiti
 use crate::memory_limit::MemoryReservation;
 use crate::pb;
 use crate::producer::{OpSend, ProducerState, SendDecision};
-use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
+use crate::topic_watcher::{Registration, TopicWatcher, TopicWatcherRegistry};
 use crate::txn::{TxnAction, TxnClient, TxnError, TxnId};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
 
@@ -284,7 +284,9 @@ pub struct Connection {
     /// verbatim onto the new session. Implements at-least-once publish parity (the
     /// `OpOutcome::SessionLost` short-circuit is *not* installed on the outcome slab for
     /// snapshotted sends — the user-facing future sees the eventual `CommandSendReceipt`
-    /// without ever observing the reset).
+    /// without ever observing the reset). A producer that is closed when the rebuild runs is
+    /// not re-attached, so its bucket is failed with [`OpOutcome::Terminal`] there rather than
+    /// dropped.
     in_flight_publish_snapshots: HashMap<ProducerHandle, Vec<crate::producer::OpSend>>,
     /// Open consumers.
     ///
@@ -1312,10 +1314,12 @@ impl Connection {
         #[cfg(feature = "scalable-topics")]
         self.scalable_subscribe_requests.clear();
 
-        // Lookup / topic-watcher registries hold no Wakers themselves — their futures
-        // poll via the per-request waker slab we already drained above. Clearing the
-        // registries avoids replaying stale `Connect`/`Redirect` traffic on the new
-        // socket.
+        // The lookup registry holds no Wakers itself — its futures poll via the per-request
+        // waker slab we already drained above. Clearing it avoids replaying stale
+        // `Connect`/`Redirect` traffic on the new socket. The topic-watcher registry is NOT
+        // cleared: the broker's watcher died with the old session, but the acknowledged ones
+        // are still held by their callers and `rebuild_consumers` registers them again (see
+        // `TopicWatcherRegistry::begin_session`).
         //
         // **Belt-and-suspenders drain** (lookup multi-agent review HIGH-3): every
         // in-flight lookup / partitioned-metadata request is *also* keyed in
@@ -1346,7 +1350,7 @@ impl Connection {
             max_pending: self.config.max_pending_lookups,
             ..LookupRegistry::default()
         };
-        self.topic_watchers = TopicWatcherRegistry::default();
+        self.topic_watchers.begin_session();
 
         // (5) Back to Uninitialized so begin_handshake on the freshly-handshaked socket
         // succeeds.
@@ -2147,8 +2151,13 @@ impl Connection {
     /// `resendMessages`.
     ///
     /// Producers explicitly closed via [`Self::close_producer`] (or by the broker via
-    /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured. Any snapshot
-    /// for a now-closed producer is discarded along with the rest of its state.
+    /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured. A skipped
+    /// producer's snapshotted publishes are failed with
+    /// [`OpOutcome::Terminal`] (`producer closed before the send was acknowledged`) instead of
+    /// being dropped: a close issued after [`Self::reset`] is still unacknowledged, and its ack,
+    /// on which `fail_sends_of_closed_producer` drains them, arrives after the rebuild (a close
+    /// the reset took has already failed them there), while a publish that is in no queue and no
+    /// snapshot bucket is out of reach of the `send_timeout` sweep too.
     pub fn rebuild_producers(&mut self) -> Vec<RequestId> {
         // ADR-0049 negative-space assertion (the canonical one called
         // out in `docs/simulation-patterns.md` §3 takeaway 2): a
@@ -2206,11 +2215,20 @@ impl Connection {
             // `ProducerSuccess` handler replays the snapshots and opens the per-slot
             // drain gate (`broker_ready`).
         }
-        // Drop any snapshots that belong to producers we did NOT rebuild (e.g. ones closed
-        // between reset and rebuild). Their `OpSend`s never reach a future — the user-facing
-        // close path is responsible for surfacing the disposition (`Closed` error).
-        self.in_flight_publish_snapshots
-            .retain(|h, _| live_handles.contains(h));
+        // Fail the snapshots that belong to producers we did NOT rebuild: ones closed between
+        // reset and rebuild, whose close ack arrives only after this (a close `reset()` took has
+        // already failed its sends there). Discarding the bucket would leave each `OpSend` in no
+        // queue, bucket or pending request, with its future parked for good. A close ack that
+        // lands later finds no bucket and drains nothing twice.
+        let orphaned: Vec<ProducerHandle> = self
+            .in_flight_publish_snapshots
+            .keys()
+            .copied()
+            .filter(|h| !live_handles.contains(h))
+            .collect();
+        for handle in orphaned {
+            self.terminalize_snapshot_bucket(handle, PRODUCER_CLOSED_REASON);
+        }
         request_ids
     }
 
@@ -2238,6 +2256,11 @@ impl Connection {
     ///
     /// Consumers explicitly closed via [`Self::close_consumer`] / [`Self::unsubscribe`] (or by
     /// the broker via `CommandCloseConsumer`) are skipped — their `closed` flag is honoured.
+    ///
+    /// The same call registers every acknowledged topic-list watcher again (PIP-145, see
+    /// [`Self::watch_topic_list`]), because the pattern consumers that read its deltas are
+    /// consumers too. Those registrations have no subscribe to wait for, so their request ids are
+    /// not in the returned list, which holds one id per re-subscribed consumer.
     pub fn rebuild_consumers(&mut self) -> Vec<RequestId> {
         let pending: Vec<(ConsumerHandle, SubscribeRequest, Option<MessageId>)> = self
             .consumer_subscribe_requests
@@ -2267,6 +2290,7 @@ impl Connection {
             );
             request_ids.push(subscribe_request_id);
         }
+        self.rebuild_topic_watchers();
         request_ids
     }
 
@@ -3364,7 +3388,24 @@ impl Connection {
                         );
                         self.wake_for_request(request_id);
                     }
-                    None => {}
+                    // No pending request: either a reply to nothing this connection knows, or
+                    // the broker refusing a topic-list watcher registered again after a
+                    // reconnect, which is tracked on the watcher and has no future to fail.
+                    None => {
+                        if self.topic_watchers.reject_reattach(request_id) {
+                            let bounded_message =
+                                crate::log_fields::truncate_broker_str(&err.message);
+                            tracing::warn!(
+                                target: "magnetar_proto::conn",
+                                request_id = ?request_id,
+                                code = err.error,
+                                message = %bounded_message,
+                                "broker rejected re-registering a topic-list watcher after a \
+                                 reconnect; a pattern consumer receives no topic updates from it \
+                                 until the next reconnect"
+                            );
+                        }
+                    }
                 }
                 if let Some(
                     PendingRequestKind::ProducerClose { handle }
@@ -4158,6 +4199,12 @@ impl Connection {
                             "missing CommandWatchTopicListSuccess",
                         ))?;
                 let rid = RequestId(ok.request_id);
+                // The reply to a watcher registered again after a reconnect has no future behind
+                // it: recording an outcome would leave one entry per watcher per reconnect that
+                // nothing ever takes.
+                if self.topic_watchers.complete_reattach(rid, &ok.topics_hash) {
+                    return Ok(());
+                }
                 if let Some(watcher) = self.topic_watchers.lookup_by_request(rid) {
                     watcher.topics_hash = Some(ok.topics_hash.clone());
                     watcher.initialised = true;
@@ -7714,23 +7761,17 @@ impl Connection {
     }
 
     /// Start a topic-list watcher (PIP-145).
+    ///
+    /// Once the broker acknowledges it, the watcher outlives a supervised reconnect:
+    /// [`Self::reset`] keeps it and [`Self::rebuild_consumers`] registers it again on the new
+    /// session. One that is still awaiting its first reply when the session resets is not kept;
+    /// its request resolves with [`OpOutcome::SessionLost`]. Nothing deregisters a watcher yet
+    /// (`CommandWatchTopicListClose` is never sent), so it lives as long as the connection.
     pub fn watch_topic_list(&mut self, namespace: &str, pattern: &str) -> RequestId {
         let request_id = self.alloc_request_id();
         let watcher_id = self.next_watcher_id;
         self.next_watcher_id = self.next_watcher_id.wrapping_add(1);
-        let cmd = pb::CommandWatchTopicList {
-            request_id: request_id.0,
-            watcher_id,
-            namespace: namespace.to_owned(),
-            topics_pattern: pattern.to_owned(),
-            topics_hash: None,
-        };
-        let base = pb::BaseCommand {
-            r#type: pb::base_command::Type::WatchTopicList as i32,
-            watch_topic_list: Some(cmd),
-            ..Default::default()
-        };
-        let _ = self.encode_command(&base);
+        self.encode_watch_topic_list(request_id, watcher_id, namespace, pattern, None);
         self.topic_watchers.insert(
             watcher_id,
             request_id,
@@ -7739,11 +7780,61 @@ impl Connection {
                 namespace: namespace.to_owned(),
                 topics_hash: None,
                 initialised: false,
+                registration: Registration::Live,
             },
         );
         self.pending_requests
             .insert(request_id, PendingRequestKind::TopicWatcher { watcher_id });
         request_id
+    }
+
+    /// Encode one `CommandWatchTopicList`. `topics_hash` is the last hash the broker reported for
+    /// the watcher, sent only when it is registered again on a new session.
+    fn encode_watch_topic_list(
+        &mut self,
+        request_id: RequestId,
+        watcher_id: u64,
+        namespace: &str,
+        pattern: &str,
+        topics_hash: Option<String>,
+    ) {
+        let cmd = pb::CommandWatchTopicList {
+            request_id: request_id.0,
+            watcher_id,
+            namespace: namespace.to_owned(),
+            topics_pattern: pattern.to_owned(),
+            topics_hash,
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::WatchTopicList as i32,
+            watch_topic_list: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+    }
+
+    /// Register, on the session the handshake just opened, every topic-list watcher the broker
+    /// had acknowledged before the last [`Self::reset`], with the watcher id, namespace and
+    /// pattern it had and the topics hash it last saw. The broker keeps a watcher per connection,
+    /// so without this a pattern consumer receives no further update after a reconnect.
+    ///
+    /// The broker's reply is consumed in place (no future awaits it), and the topic list it
+    /// carries is not forwarded: a topic created or deleted while the connection was down is not
+    /// reported to the pattern consumer, only later changes are (`docs/follow-ups.md` §31,
+    /// ADR-0136).
+    fn rebuild_topic_watchers(&mut self) {
+        let reattach = self
+            .topic_watchers
+            .begin_reattach(|| Self::take_request_id(&mut self.next_request_id));
+        for watcher in reattach {
+            self.encode_watch_topic_list(
+                watcher.request_id,
+                watcher.watcher_id,
+                &watcher.namespace,
+                &watcher.pattern,
+                watcher.topics_hash,
+            );
+        }
     }
 
     /// Close a producer. The caller is expected to await the broker ack via
@@ -8494,8 +8585,13 @@ impl Connection {
     }
 
     fn alloc_request_id(&mut self) -> RequestId {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
+        Self::take_request_id(&mut self.next_request_id)
+    }
+
+    /// The one request-id allocator, usable while another field of `self` is borrowed.
+    fn take_request_id(next_request_id: &mut u64) -> RequestId {
+        let id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
         RequestId(id)
     }
 

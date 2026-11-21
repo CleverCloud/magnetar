@@ -20,23 +20,24 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🔬 needs reproduction · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                                     | Status                   |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| 12  | [PIP-460 remaining GA wire and API gaps](#12-pip-460-remaining-ga-wire-and-api-gaps)                                                                         | ⚡ ready to dispatch     |
-| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered)           | 🟡 deferred              |
-| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                           | 🟡 deferred              |
-| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                 | 🧠 needs design decision |
-| 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection) | 🧠 needs design decision |
-| 20  | [No deadline on a pending `Subscribe` request](#20-no-deadline-on-a-pending-subscribe-request)                                                           | ⚡ ready to dispatch     |
-| 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                             | 🧠 needs design decision |
-| 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                       | 🟡 deferred              |
-| 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                   | ⚡ ready to dispatch     |
-| 24  | [A Reader started inside a batch re-delivers the members before it](#24-a-reader-started-inside-a-batch-re-delivers-the-members-before-it)               | ⚡ ready to dispatch     |
-| 25  | [`permit_balance` cannot go negative](#25-permit_balance-cannot-go-negative)                                                                             | 🟡 deferred              |
-| 26  | [`receive_batch` inner pops do not wake the driver](#26-receive_batch-inner-pops-do-not-wake-the-driver)                                                 | ⚡ ready to dispatch     |
-| 27  | [An undecodable batched entry is dropped without an ack](#27-an-undecodable-batched-entry-is-dropped-without-an-ack)                                     | 🧠 needs design decision |
-| 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                          | 🧠 needs design decision |
-| 29  | [Intermittent high ACK/NACK reconnect test](#29-intermittent-high-ack-nack-reconnect-test)                                                              | 🔬 needs reproduction    |
+| #   | Item                                                                                                                                                                                                                | Status                   |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| 12  | [PIP-460 remaining GA wire and API gaps](#12-pip-460-remaining-ga-wire-and-api-gaps)                                                                                                                                | ⚡ ready to dispatch     |
+| 16  | [The batched `deliver` loop counts dead-lettered members as delivered](#16-the-batched-deliver-loop-counts-dead-lettered-members-as-delivered)                                                                      | 🟡 deferred              |
+| 17  | [The PIP-33 marker branch returns before `maybe_flow`](#17-the-pip-33-marker-branch-returns-before-maybe_flow)                                                                                                      | 🟡 deferred              |
+| 18  | [`dead_letter_pending` is unbounded and never auto-drained](#18-dead_letter_pending-is-unbounded-and-never-auto-drained)                                                                                            | 🧠 needs design decision |
+| 19  | [Re-home an established producer or consumer to another broker connection](#19-re-home-an-established-producer-or-consumer-to-another-broker-connection)                                                            | 🧠 needs design decision |
+| 20  | [No deadline on a pending `Subscribe` request](#20-no-deadline-on-a-pending-subscribe-request)                                                                                                                      | ⚡ ready to dispatch     |
+| 21  | [Optional partitioned-router readiness skip](#21-optional-partitioned-router-readiness-skip)                                                                                                                        | 🧠 needs design decision |
+| 22  | [Memory reservations of publishes the broker will never answer](#22-memory-reservations-of-publishes-the-broker-will-never-answer)                                                                                  | 🟡 deferred              |
+| 23  | [Dropped send futures leave their outcome behind](#23-dropped-send-futures-leave-their-outcome-behind)                                                                                                              | ⚡ ready to dispatch     |
+| 24  | [A Reader started inside a batch re-delivers the members before it](#24-a-reader-started-inside-a-batch-re-delivers-the-members-before-it)                                                                          | ⚡ ready to dispatch     |
+| 25  | [`permit_balance` cannot go negative](#25-permit_balance-cannot-go-negative)                                                                                                                                        | 🟡 deferred              |
+| 26  | [`receive_batch` inner pops do not wake the driver](#26-receive_batch-inner-pops-do-not-wake-the-driver)                                                                                                            | ⚡ ready to dispatch     |
+| 27  | [An undecodable batched entry is dropped without an ack](#27-an-undecodable-batched-entry-is-dropped-without-an-ack)                                                                                                | 🧠 needs design decision |
+| 28  | [Batched + encrypted messages are not Java-compatible](#28-batched--encrypted-messages-are-not-java-compatible)                                                                                                     | 🧠 needs design decision |
+| 29  | [Intermittent high ACK/NACK reconnect test](#29-intermittent-high-ack-nack-reconnect-test)                                                                                                                          | 🔬 needs reproduction    |
+| 31  | [Topic-list watchers are never deregistered, and a reconnect does not reconcile what changed while down](#31-topic-list-watchers-are-never-deregistered-and-a-reconnect-does-not-reconcile-what-changed-while-down) | 🧠 needs design decision |
 
 ---
 
@@ -158,6 +159,19 @@ Consumer side: a Java batched + encrypted entry has to be decrypted as one body,
 **Gap.** Three exact scenarios have temporary, non-gating test-result diagnostics while their intermittent results are investigated. Names, source evidence, owner, the 2026-10-30 review date, and reactivation conditions are recorded in the [test-quarantine register](test-quarantine.md) under [ADR-0123](../specs/adr/0123-quarantine-exact-intermittent-test-scenarios.md). The separate ACK/NACK exception remains item 29.
 
 **Why it stays open.** Test assertions remain intact, and the focused diagnostic runs provide evidence for deciding when each exact scenario can return to the blocking suite.
+
+## 31. Topic-list watchers are never deregistered, and a reconnect does not reconcile what changed while down
+
+**Gap.** Nothing sends `CommandWatchTopicListClose`: every `PulsarClient::topic_list_snapshot` call and every `PatternConsumer` leaves a watcher in the connection's registry, and a broker-side watcher on its session, for as long as the connection lives.
+Since [ADR-0136](../specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md) a reconnect keeps every acknowledged watcher and registers it again, so that growth now outlives the session instead of being reset by it: a client that calls `topic_list_snapshot` repeatedly re-registers all of them, and the broker pushes an update for each, on every reconnect.
+The deltas the broker sends to a watcher nobody reads any more (a snapshot's, a closed `PatternConsumer`'s) pass the connection's filter, because the watcher is still held, and queue in each runtime's `ConnectionShared::topic_list_changes`, which has no bound and is drained only by `take_topic_list_change(watcher_id)`.
+Before ADR-0136 that queue stopped growing at the first reconnect, which dropped the watchers; now it grows for the client's whole life.
+The reply to a re-registration carries the current topic list, and it is not forwarded: it is a whole list rather than a delta, `PatternConsumer::update` applies deltas only, and the connection keeps no per-watcher topic set to diff the list against.
+A topic created or deleted while the connection was down is therefore not reported to the `PatternConsumer`; only later changes are.
+
+**Why it stays open.** Closing the watchers needs a close entry point on `Connection` and a deregistration call from `topic_list_snapshot` (once its reply is read) and from the pattern consumer (on close), in both engines.
+Reconciling the outage needs either a per-watcher topic set to diff the re-registration's list against or a re-snapshot driven from `PatternConsumer`, with the topic set that implies.
+Each carries the ADR-0024 layers.
 
 ## Notes on this file
 

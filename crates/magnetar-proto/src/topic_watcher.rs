@@ -14,33 +14,68 @@
 //! 3. As the namespace changes, broker pushes `CommandWatchTopicUpdate { watcher_id, new_topics,
 //!    deleted_topics, topics_hash }`.
 //! 4. Client may send `CommandWatchTopicListClose { request_id, watcher_id }` to deregister.
+//!
+//! # Across a reconnect
+//!
+//! The broker keeps a watcher per connection, so one dies with the session that registered it and
+//! the new session pushes no update until it is registered again. A watcher the broker had
+//! acknowledged therefore survives `TopicWatcherRegistry::begin_session` (the connection's
+//! `reset()`) with its namespace, pattern and last topics hash, and the connection's
+//! `rebuild_consumers` registers it again under a fresh request id
+//! (`TopicWatcherRegistry::begin_reattach`). Nobody awaits that request, so its reply is
+//! consumed here instead of being recorded as an outcome.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::RequestId;
+
+/// Where a watcher stands against the broker session the connection is on now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// The broker holds it for this session, or its first reply is still owed to the caller that
+    /// registered it.
+    Live,
+    /// A reset took the registration down with the old session and no `CommandWatchTopicList`
+    /// has gone out for it yet.
+    Owed,
+    /// The registration went out again as this request and has no reply yet.
+    Awaiting(RequestId),
+}
 
 /// In-flight state for a topic-list watcher.
 #[derive(Debug, Clone)]
 pub(crate) struct TopicWatcher {
     /// Pattern requested by the user (re-resolved server-side; the state machine just echoes it).
-    // reason: carried for the derived `Debug` trace context and read by unit tests; future
-    // re-subscribe paths re-issue with the original pattern.
-    #[allow(dead_code)]
     pub(crate) pattern: String,
     /// Namespace the pattern applies to.
-    // reason: same as `pattern` — kept for Debug + future re-subscribe payload.
-    #[allow(dead_code)]
     pub(crate) namespace: String,
-    /// Topics-hash from the last broker response (used to skip no-op updates).
+    /// Topics-hash from the last broker response (used to skip no-op updates, and sent back to
+    /// the broker when the watcher is registered again on a new session).
     pub(crate) topics_hash: Option<String>,
-    /// Whether the initial snapshot has been received.
+    /// Whether the initial snapshot has been received. Survives a reset: it is what tells a
+    /// watcher the caller holds (and must keep hearing from) from one still awaiting its first
+    /// reply, whose caller is told the session was lost.
     pub(crate) initialised: bool,
+    /// Whether the broker's current session has this watcher.
+    pub(crate) registration: Registration,
+}
+
+/// One watcher registration to put on the wire again, as returned by
+/// [`TopicWatcherRegistry::begin_reattach`].
+#[derive(Debug)]
+pub(crate) struct Reattach {
+    pub(crate) watcher_id: u64,
+    pub(crate) request_id: RequestId,
+    pub(crate) namespace: String,
+    pub(crate) pattern: String,
+    pub(crate) topics_hash: Option<String>,
 }
 
 /// Registry of watchers indexed by `watcher_id`.
 #[derive(Debug, Default)]
 pub(crate) struct TopicWatcherRegistry {
-    pub(crate) by_watcher: HashMap<u64, TopicWatcher>,
+    /// Ordered by id, so registrations go out in a deterministic order.
+    pub(crate) by_watcher: BTreeMap<u64, TopicWatcher>,
     pub(crate) by_request: HashMap<RequestId, u64>,
 }
 
@@ -48,6 +83,67 @@ impl TopicWatcherRegistry {
     pub(crate) fn insert(&mut self, watcher_id: u64, request_id: RequestId, watcher: TopicWatcher) {
         self.by_watcher.insert(watcher_id, watcher);
         self.by_request.insert(request_id, watcher_id);
+    }
+
+    /// Start a new broker session: keep the watchers the broker had acknowledged, mark each as
+    /// owing a registration, and forget every request id of the dead session.
+    ///
+    /// A watcher still awaiting its first reply is dropped: its pending request is failed with
+    /// `SessionLost`, so its caller holds no watcher to keep alive. Idempotent across several
+    /// resets before a rebuild, and a watcher whose re-registration is unanswered is owed again.
+    pub(crate) fn begin_session(&mut self) {
+        self.by_watcher.retain(|_, watcher| watcher.initialised);
+        for watcher in self.by_watcher.values_mut() {
+            watcher.registration = Registration::Owed;
+        }
+        self.by_request.clear();
+    }
+
+    /// Take every watcher that owes a registration, in ascending id order, giving each the next
+    /// request id from `next_request_id` and marking it as awaiting that reply.
+    pub(crate) fn begin_reattach(
+        &mut self,
+        mut next_request_id: impl FnMut() -> RequestId,
+    ) -> Vec<Reattach> {
+        let mut reattach = Vec::new();
+        for (watcher_id, watcher) in self
+            .by_watcher
+            .iter_mut()
+            .filter(|(_, watcher)| watcher.registration == Registration::Owed)
+        {
+            let request_id = next_request_id();
+            watcher.registration = Registration::Awaiting(request_id);
+            self.by_request.insert(request_id, *watcher_id);
+            reattach.push(Reattach {
+                watcher_id: *watcher_id,
+                request_id,
+                namespace: watcher.namespace.clone(),
+                pattern: watcher.pattern.clone(),
+                topics_hash: watcher.topics_hash.clone(),
+            });
+        }
+        reattach
+    }
+
+    /// Settle the broker's success for `request_id` when it answers a re-registration. Returns
+    /// `true` when it did, and the caller must record nothing for it: no future awaits it.
+    pub(crate) fn complete_reattach(&mut self, request_id: RequestId, topics_hash: &str) -> bool {
+        self.lookup_by_request(request_id)
+            .filter(|watcher| watcher.registration == Registration::Awaiting(request_id))
+            .map(|watcher| {
+                watcher.registration = Registration::Live;
+                watcher.topics_hash = Some(topics_hash.to_owned());
+            })
+            .is_some()
+    }
+
+    /// Settle the broker's error for `request_id` when it answers a re-registration. Returns
+    /// `true` when it did. The watcher owes a registration again, so the next rebuild retries it.
+    pub(crate) fn reject_reattach(&mut self, request_id: RequestId) -> bool {
+        self.lookup_by_request(request_id)
+            .filter(|watcher| watcher.registration == Registration::Awaiting(request_id))
+            .map(|watcher| watcher.registration = Registration::Owed)
+            .is_some()
     }
 
     // reason: called only from unit tests today; the engine hooks the close path through
@@ -79,6 +175,7 @@ mod tests {
             namespace: namespace.to_owned(),
             topics_hash: None,
             initialised: false,
+            registration: Registration::Live,
         }
     }
 
