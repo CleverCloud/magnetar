@@ -370,9 +370,11 @@ pub trait ProducerApi: 'static + Send + Sync {
 
     /// Number of in-flight sends (queued and not yet acked by the
     /// broker). Mirrors the un-batched view of Java
-    /// `ProducerStats#getPendingQueueSize`. Equivalent to
-    /// `self.stats().pending_queue_size as usize` but spares the full
-    /// stats snapshot.
+    /// `ProducerStats#getPendingQueueSize`. A send a supervised
+    /// reconnect relocated into the connection's reset snapshot counts
+    /// until its replay is acknowledged, so this can exceed
+    /// `self.stats().pending_queue_size`, which reports the live queue
+    /// only; it is the number [`Self::flush`] waits on (ADR-0137).
     fn pending_count(&self) -> usize;
 
     /// Number of messages currently buffered in the batch container,
@@ -654,6 +656,11 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `max_wait` for the first message, then drains additional
     /// already-buffered messages without further waiting. Mirrors Java
     /// `Consumer#batchReceive`.
+    ///
+    /// A member after the first that fails post-processing (decryption under
+    /// `CryptoFailureAction::Fail`, decompression) ends the batch there without discarding the
+    /// messages already popped: they are returned in `Ok`, and the failure is returned by the
+    /// next `receive*` call on this consumer, ahead of every message still queued.
     fn receive_batch(&self, max_messages: usize, max_wait: Duration) -> ReceiveBatchFut<'_, Self>;
 
     /// Same as [`Self::receive_batch`] but stops once the accumulated
@@ -1146,7 +1153,9 @@ pub struct StreamConsumerOptions {
     pub consumer_name: String,
     /// Broker schema metadata copied to every ordinary child subscribe.
     pub schema: magnetar_proto::pb::Schema,
-    /// One aggregate receive budget, never multiplied by child count.
+    /// One aggregate receive budget. A fixed budget is never multiplied by child
+    /// count; a growing one adds one maximum frame per assigned segment beyond
+    /// the first.
     pub receiver_budget: magnetar_proto::ReceiverBudget,
     /// Per-child decompressed payload ceiling.
     pub max_uncompressed_message_size: usize,

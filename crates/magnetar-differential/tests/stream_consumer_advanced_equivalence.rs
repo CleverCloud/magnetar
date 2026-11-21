@@ -4950,11 +4950,12 @@ const BUDGET_RESYNC_LIMIT: usize = 2;
 /// the budget failure with a resynchronization, because nothing was acknowledged
 /// and the broker replays the same first chunk after every reconnect.
 ///
-/// The default budget holds a single maximum-frame permit besides the authority
-/// headroom, so only one of the two children flows at a time and the one that
-/// flows first is not fixed. One chain is therefore queued on each segment,
-/// followed by a small complete entry: a consumer that skips the chain must
-/// still deliver it, so going quiet is a failure and not a pass.
+/// The default budget grows by one maximum-frame permit per further assigned
+/// segment (ADR-0141), and that room is not counted toward the chain, so both
+/// children flow and which chain arrives first is not fixed. One chain is
+/// therefore queued on each segment, followed by a small complete entry: a
+/// consumer that skips the chain must still deliver it, so going quiet is a
+/// failure and not a pass.
 async fn observe_unassemblable_chunk_chain<E>(client: &PulsarClient<E>, cluster: &M1SocketCluster)
 where
     E: Engine,

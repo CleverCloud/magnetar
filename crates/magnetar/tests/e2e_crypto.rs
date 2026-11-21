@@ -21,6 +21,9 @@
 //!    plaintext.
 //! 5. PIP-4 + PIP-37 cross-feature: a > `max_message_size` payload that is both chunked AND
 //!    encrypted reassembles + decrypts on the consumer.
+//! 6. `receive_batch` with a later member the consumer cannot decrypt (it holds one producer's key
+//!    and not the other's) under `CryptoFailureAction::Fail`: the messages the batch popped before
+//!    it are delivered, its error surfaces once, and the message queued behind it still flows.
 
 #![cfg(feature = "encryption")]
 
@@ -401,6 +404,117 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
         "reassembled + decrypted payload bytes mismatch"
     );
     consumer.ack(msg.message_id).await?;
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+/// (6) `receive_batch` on a consumer that holds the key of one producer but not of the other,
+/// under the default `CryptoFailureAction::Fail`. The batch call takes `keep-0` and pops
+/// `keep-1` before it reaches the message it cannot decrypt: those two must still reach the
+/// caller, the undecryptable message must surface its error once, and `keep-3`, queued behind
+/// it, must still flow. Before the batch kept its good prefix, the call returned the decrypt
+/// error and dropped `keep-0` and `keep-1`, which were never shown, acked or nacked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_crypto_receive_batch_keeps_the_messages_popped_before_an_undecryptable_one()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    // The consumer's key reader holds `alice` only, so `bob`'s message cannot be decrypted.
+    let (alice, _alice_reader) = make_crypto("alice");
+    let (bob, _bob_reader) = make_crypto("bob");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let topic = fresh_topic("magnetar-e2e-crypto-batch-fail");
+
+    let consumer = client
+        .consumer(&topic)
+        .subscription("magnetar-e2e-crypto-batch-fail")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .encryption(bridge_for(alice.clone()) as Arc<dyn MessageDecryptor>)
+        .crypto_failure_action(CryptoFailureAction::Fail)
+        .subscribe_with_decryption()
+        .await?;
+
+    let alice_producer = client
+        .producer(&topic)
+        .encryption(bridge_for(alice) as Arc<dyn MessageEncryptor>)
+        .create_with_encryption()
+        .await?;
+    let bob_producer = client
+        .producer(&topic)
+        .encryption(bridge_for(bob) as Arc<dyn MessageEncryptor>)
+        .create_with_encryption()
+        .await?;
+    // Each send is awaited before the next, so the topic holds them in this order.
+    for (producer, payload) in [
+        (&alice_producer, &b"keep-0"[..]),
+        (&alice_producer, &b"keep-1"[..]),
+        (&bob_producer, &b"undecryptable-2"[..]),
+        (&alice_producer, &b"keep-3"[..]),
+    ] {
+        producer
+            .send(OutgoingMessage::with_payload(payload.to_vec()).into())
+            .await?;
+    }
+    alice_producer.close().await?;
+    bob_producer.close().await?;
+
+    // All four must be in the consumer's queue before the first batch call, so that call pops
+    // `keep-1` and then reaches the undecryptable message.
+    let queued = async {
+        while consumer.available_in_queue() < 4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), queued)
+        .await
+        .map_err(|_| {
+            format!(
+                "the four messages never reached the consumer's queue (queued: {})",
+                consumer.available_in_queue()
+            )
+        })?;
+
+    let mut delivered: Vec<Vec<u8>> = Vec::new();
+    let mut errors = 0_usize;
+    let mut calls: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        match consumer.receive_batch(10, Duration::from_secs(2)).await {
+            Ok(batch) => {
+                calls.push(format!("Ok({} messages)", batch.len()));
+                for message in &batch {
+                    delivered.push(message.payload.to_vec());
+                    consumer.ack(message.message_id).await?;
+                }
+            }
+            Err(err) => {
+                calls.push(format!("Err({err})"));
+                errors += 1;
+            }
+        }
+        if delivered.iter().any(|p| p.as_slice() == b"keep-3") {
+            break;
+        }
+    }
+    let delivered: Vec<String> = delivered
+        .iter()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    assert_eq!(
+        delivered,
+        ["keep-0", "keep-1", "keep-3"],
+        "every decryptable message must be delivered once, in order; the ones the failing batch \
+         had already popped must not be lost (calls: {calls:?})"
+    );
+    assert_eq!(
+        errors, 1,
+        "the undecryptable message must surface its error exactly once (calls: {calls:?})"
+    );
     consumer.close().await?;
     client.close().await;
     Ok(())

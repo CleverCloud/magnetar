@@ -53,7 +53,16 @@ pub struct Consumer {
     pub(crate) decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     /// Last-clone close guard shared by every `Consumer` clone.
     pub(crate) close_guard: Arc<ConsumerCloseGuard>,
+    /// Failures of batch members that were popped after good messages were already in the
+    /// batch under construction, shared by every `Consumer` clone and drained, oldest first, by
+    /// the next [`ReceiveFut`] poll. See [`Consumer::receive_batch_with_bytes_cap`].
+    pub(crate) deferred_batch_errors: DeferredBatchErrors,
 }
+
+/// Leaf mutex over the deferred batch-member failures. It is only ever taken while the
+/// connection mutex is held (global → leaf, ADR-0038) and nothing is acquired under it.
+pub(crate) type DeferredBatchErrors =
+    Arc<parking_lot::Mutex<std::collections::VecDeque<ClientError>>>;
 
 /// A seek already written to the wire and not yet awaited.
 ///
@@ -91,6 +100,7 @@ impl Clone for Consumer {
             slot: self.slot.clone(),
             decryptor: self.decryptor.clone(),
             close_guard: self.close_guard.clone(),
+            deferred_batch_errors: self.deferred_batch_errors.clone(),
         }
     }
 }
@@ -153,6 +163,7 @@ impl Consumer {
             slot,
             decryptor,
             close_guard,
+            deferred_batch_errors: DeferredBatchErrors::default(),
         }
     }
 
@@ -465,11 +476,16 @@ impl Consumer {
     /// slab on [`magnetar_proto::consumer::ConsumerState`]; arrival drains the slab and
     /// every parked future is re-polled. The first to acquire the connection
     /// lock pops the message; the others observe an empty queue and re-park.
+    ///
+    /// A batch member that failed post-processing after good messages were already in its
+    /// batch (see [`Self::receive_batch_with_bytes_cap`]) is reported here first, before any
+    /// message still queued.
     pub fn receive(&self) -> ReceiveFut {
         ReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
             decryptor: self.decryptor.clone(),
+            deferred_batch_errors: self.deferred_batch_errors.clone(),
             slab_key: None,
         }
     }
@@ -1508,11 +1524,32 @@ impl Consumer {
         self.has_reached_end_of_topic()
     }
 
+    /// Park the failure of a batch member for the next [`ReceiveFut`] poll of any clone of this
+    /// consumer, and wake every `receive()` already parked on the slab so that one of them
+    /// reports it instead of sleeping until the next arrival.
+    ///
+    /// The push and the drain share one connection-lock section, the section a [`ReceiveFut`]
+    /// poll reads the parked failures, pops and registers its waker in: a poll that ran before
+    /// it has its waker in the slab and is woken here, a poll that runs after it sees the
+    /// failure. Wakers run after the locks are released.
+    fn park_batch_failure(&self, error: ClientError) {
+        let wakers: Vec<std::task::Waker> = {
+            let _conn = self.shared.inner.lock();
+            self.deferred_batch_errors.lock().push_back(error);
+            self.slot.state.lock().receive_wakers.drain().collect()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
     /// Receive up to `max_messages` messages in one call. Mirrors Java
     /// `Consumer#batchReceive`. Waits up to `max_wait` for the first message, then drains any
     /// additional already-buffered messages without further waiting.
     ///
-    /// Returns an empty `Vec` if the timeout elapses with no messages.
+    /// Returns an empty `Vec` if the timeout elapses with no messages. A later member that fails
+    /// post-processing does not discard the messages already popped; see
+    /// [`Self::receive_batch_with_bytes_cap`].
     pub async fn receive_batch(
         &self,
         max_messages: usize,
@@ -1528,6 +1565,16 @@ impl Consumer {
     /// fires first. Pass `usize::MAX` to disable a cap. The first message is always
     /// included even if it alone exceeds `max_bytes` (matches Java's "deliver at least
     /// one" semantic), but subsequent ones obey the cap strictly.
+    ///
+    /// # Errors
+    /// - A failure of the first message (or [`ClientError::Closed`]) is returned at once.
+    /// - A later member that fails post-processing (decryption under
+    ///   [`magnetar_proto::CryptoFailureAction::Fail`], a missing decryptor, an unknown or
+    ///   undecodable compression) ends the batch there: the good messages popped before it are
+    ///   returned in `Ok`, and the failure is returned by the next `receive`,
+    ///   `receive_with_timeout` or `receive_batch*` call on this consumer (any clone), ahead of
+    ///   every message still queued. The failing message is neither acked nor nacked, as for
+    ///   [`Self::receive`].
     pub async fn receive_batch_with_bytes_cap(
         &self,
         max_messages: usize,
@@ -1592,7 +1639,15 @@ impl Consumer {
                     drop(conn);
                     self.shared.driver_waker.notify_one();
                 }
-                PostProcessOutcome::Fail(err) => return Err(err),
+                PostProcessOutcome::Fail(err) => {
+                    // `out` already holds the first message, so returning `Err` here would drop
+                    // every good message this call popped (never shown, acked or nacked). Hand
+                    // the good prefix back now and park the error for the next `receive*` call,
+                    // which keeps one error per failing message and the arrival order. The
+                    // failing member itself is dropped unacked, exactly as in `receive()`.
+                    self.park_batch_failure(err);
+                    break;
+                }
             }
         }
         // Postcondition (ADR-0024): the batch accumulator never exceeds the
@@ -1740,6 +1795,8 @@ pub struct ReceiveFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
     decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
+    /// The owning [`Consumer`]'s deferred batch-member failures, drained before any message.
+    deferred_batch_errors: DeferredBatchErrors,
     /// Slab key of the currently-installed waker, if any. `Some` once we've
     /// registered on the per-consumer slab; cleared on cancel / wake.
     slab_key: Option<usize>,
@@ -1771,6 +1828,16 @@ impl Future for ReceiveFut {
             // connection mutex (ADR-0038).
             let now = std::time::Instant::now();
             let mut conn = shared.inner.lock();
+            // A batch member that failed after good messages were already in its batch parked
+            // its error (`Consumer::park_batch_failure`); it was popped before anything still
+            // queued, so its error is delivered before the next message. Read in the same
+            // connection-lock section that pops and registers the waker below, so a failure
+            // parked meanwhile is either seen here or wakes the slot installed below. A slab
+            // slot an earlier poll installed is evicted by `Drop`.
+            let deferred = this.deferred_batch_errors.lock().pop_front();
+            if let Some(err) = deferred {
+                return Poll::Ready(Err(err));
+            }
             let max_uncompressed_message_size = conn.consumer_max_uncompressed_message_size(handle);
             let Some(mut msg) = conn.pop_message(handle, now) else {
                 // No message ready. First, check whether this consumer handle
@@ -4945,6 +5012,210 @@ mod tests {
                 "no undecryptable message may leak into the batch",
             );
         }
+    }
+
+    /// `CryptoFailureAction::Fail` on a LATER batch member must not lose the good
+    /// messages the same call already popped. Queue: two decryptable messages, then one the
+    /// decryptor refuses. Whichever way the failure is surfaced (the good prefix returned with
+    /// the error deferred, or the good messages left in the queue), `keep-0` and `keep-1` must
+    /// still reach the caller through `receive_batch`. The guarded defect: the failing call
+    /// returned `Err` and dropped the `out` accumulator, so both were gone for good (never
+    /// shown, acked or nacked). 1:1 with the moonpool test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_fail_on_later_member_does_not_lose_popped_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch-fail-later".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Fail,
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            // entry 0 (via `receive()`) and entry 1 (popped inside the batch loop) decrypt;
+            // entry 2 is refused by the decryptor and fails the batch under `Fail`.
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 0, "xor-test", b"keep-0"),
+            )
+            .expect("handle msg 0");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 1, "xor-test", b"keep-1"),
+            )
+            .expect("handle msg 1");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 2, "bad-key", b"poison-2"),
+            )
+            .expect("handle msg 2");
+        }
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer::assemble(
+            shared,
+            handle,
+            slot,
+            Some(std::sync::Arc::new(SelectiveDecryptor)),
+        );
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        let mut outcomes: Vec<String> = Vec::new();
+        // The first call hits the poisoned member; the follow-ups drain whatever it left.
+        for max_wait_ms in [2_000_u64, 100, 100, 100] {
+            match consumer
+                .receive_batch(10, std::time::Duration::from_millis(max_wait_ms))
+                .await
+            {
+                Ok(batch) => {
+                    outcomes.push(format!("Ok({} messages)", batch.len()));
+                    delivered.extend(batch.iter().map(|m| m.payload.to_vec()));
+                }
+                Err(e) => outcomes.push(format!("Err({e})")),
+            }
+        }
+        for good in [&b"keep-0"[..], &b"keep-1"[..]] {
+            assert!(
+                delivered.iter().any(|p| p.as_slice() == good),
+                "the good message {:?} popped before the failing member was lost: no \
+                 receive_batch call ever delivered it (calls: {outcomes:?}, delivered: {:?})",
+                String::from_utf8_lossy(good),
+                delivered
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// The failure of a LATER batch member is reported exactly once, by the NEXT
+    /// receive call (here through a clone, which shares the parked failure), ahead of the
+    /// message still queued behind it. Queue: two decryptable messages, one the decryptor
+    /// refuses, then one more decryptable message. The guarded opposite defects: the failure
+    /// swallowed (the poisoned member vanishing without a trace), returned twice, or returned
+    /// after `keep-3`. 1:1 with the moonpool test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_fail_on_later_member_reports_the_error_once_before_queued_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch-fail-once".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Fail,
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            for (entry, key, payload) in [
+                (0_u64, "xor-test", &b"keep-0"[..]),
+                (1, "xor-test", &b"keep-1"[..]),
+                (2, "bad-key", &b"poison-2"[..]),
+                (3, "xor-test", &b"keep-3"[..]),
+            ] {
+                conn.handle_bytes(
+                    Instant::now(),
+                    &encrypted_message_bytes_with_key(handle.0, entry, key, payload),
+                )
+                .expect("handle CommandMessage");
+            }
+        }
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer::assemble(
+            shared,
+            handle,
+            slot,
+            Some(std::sync::Arc::new(SelectiveDecryptor)),
+        );
+        let payloads = |batch: &[magnetar_proto::IncomingMessage]| -> Vec<Vec<u8>> {
+            batch.iter().map(|m| m.payload.to_vec()).collect()
+        };
+        // The batch ends at the poisoned member and still returns the good prefix.
+        let prefix = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("the good prefix must be returned, not the failure of a later member");
+        assert_eq!(payloads(&prefix), [b"keep-0".to_vec(), b"keep-1".to_vec()]);
+        // The failure is the next result, through any clone, and ahead of `keep-3`.
+        let error = consumer
+            .clone()
+            .receive()
+            .await
+            .expect_err("the parked failure must be the next receive result");
+        assert!(
+            matches!(&error, ClientError::Other(message) if message.starts_with("decrypt: ")),
+            "unexpected parked failure: {error:?}",
+        );
+        // `keep-3` was never touched by the failing call and comes next, and the failure is
+        // not repeated.
+        let tail = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("the message queued behind the poisoned member must be delivered");
+        assert_eq!(payloads(&tail), [b"keep-3".to_vec()]);
+        let drained = consumer
+            .receive_batch(10, std::time::Duration::from_millis(100))
+            .await
+            .expect("the parked failure must be returned exactly once");
+        assert!(
+            drained.is_empty(),
+            "nothing is left to deliver: {drained:?}"
+        );
+    }
+
+    /// Parking a batch member's failure wakes a `receive()` already parked on the empty
+    /// queue (it would otherwise sleep on a known failure until the next arrival), and that
+    /// receive's next poll returns the failure exactly once. 1:1 with the moonpool test of the
+    /// same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parked_batch_failure_wakes_a_parked_receive_and_is_returned_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWake(AtomicUsize);
+        impl std::task::Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch-fail-wake".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer::assemble(shared, handle, slot, None);
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        // The empty queue parks the receive on the per-consumer waker slab.
+        let mut parked = Box::pin(consumer.receive());
+        assert!(parked.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        // Parking a failure drains the slab and wakes the receive.
+        consumer.park_batch_failure(ClientError::Other("decrypt: parked".to_owned()));
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "parking a batch failure must wake the receive parked on the empty queue",
+        );
+        match parked.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(ClientError::Other(message))) => {
+                assert_eq!(message, "decrypt: parked");
+            }
+            other => panic!("the woken receive must resolve with the parked failure: {other:?}"),
+        }
+        // The failure was taken: a further receive parks again instead of repeating it.
+        let mut again = Box::pin(consumer.receive());
+        assert!(again.as_mut().poll(&mut cx).is_pending());
     }
 
     #[tokio::test(flavor = "current_thread")]

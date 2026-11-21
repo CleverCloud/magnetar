@@ -1676,8 +1676,9 @@ where
                     // State-consistency postcondition (asserted on the *same* guard — no
                     // re-lock, so no race with concurrent user futures; ADR-0038): once
                     // `mark_disconnected()` runs the connection must report
-                    // `!is_connected()` (state snaps to `Failed`). A regression that left it
-                    // `Connected` would leak a dead socket into user-facing `is_connected()`.
+                    // `!is_connected()` (state snaps to `Failed`, or stays `Closing` / `Closed`
+                    // after a user close, ADR-0134). A regression that left it `Connected`
+                    // would leak a dead socket into user-facing `is_connected()`.
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();

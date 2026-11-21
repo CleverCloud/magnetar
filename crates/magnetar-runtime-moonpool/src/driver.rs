@@ -1837,7 +1837,8 @@ where
                     // Peer closed cleanly. State-consistency postcondition (asserted on the
                     // *same* guard — no re-lock, so no race with concurrent user futures;
                     // ADR-0038): once `mark_disconnected()` runs the connection must report
-                    // `!is_connected()` (state snaps to `Failed`). Mirror of the tokio engine.
+                    // `!is_connected()` (state snaps to `Failed`, or stays `Closing` / `Closed`
+                    // after a user close, ADR-0134). Mirror of the tokio engine.
                     {
                         let mut conn = shared.inner.lock();
                         conn.mark_disconnected();

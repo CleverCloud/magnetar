@@ -6,6 +6,8 @@
 //! [`pulsar`] is the one place that boots an `apachepulsar/pulsar` broker
 //! (ADR-0115), and [`container`] runs every Docker container the suites
 //! start, through the `docker` command line (ADR-0127).
+//! [`frame_proxy`] sits between a client and the broker and reads the frames it forwards, so a
+//! test can choose the moment a session breaks.
 
 // Every test binary compiles this module but uses only part of it, and an
 // integration test has no way to share a `pub(crate)` item across binaries:
@@ -14,4 +16,5 @@
 #![allow(dead_code, unreachable_pub)]
 
 pub mod container;
+pub mod frame_proxy;
 pub mod pulsar;
