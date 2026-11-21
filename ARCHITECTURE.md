@@ -989,6 +989,9 @@ See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md) and [`do
 Owns the transaction-coordinator client.
 Pulsar transactions use four opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SUBSCRIPTION_TO_TXN`, `END_TXN_*`) routed to the TC.
 `TxnClient` carries the `TxnId` registry and surfaces a Rust `Transaction` handle.
+A transaction is in that registry from the `CommandNewTxnResponse` that opens it until the connection handles the `CommandEndTxnResponse` that ends it, committed, aborted or refused; the connection then forgets it, because the outcome handed to the caller already carries the final state and nothing reads the record again.
+The connection outlives every reconnect, so a record kept past that point would stay for as long as the client runs.
+A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, keeps its record, and `TxnClient` has no timeout or other policy to retire it.
 The producer attaches `txn_id` to its publish via `OutgoingMessage::txn`, and the consumer attaches it to acks via `ack_with_txn` / `ack_cumulative_with_txn` / `ack_batch_with_txn`.
 A `new_txn`, `add_partition_to_txn` or `add_subscription_to_txn` request is correlated by its request id like a lookup: the runtimes await it through the cancellable request future, and the response arms record an outcome only for a request still pending, so a caller that gives up leaves nothing for the broker's late reply to land in; that reply still reaches `TxnClient`, which records a registration the broker performed ([ADR-0129](specs/adr/0129-bound-and-fast-fail-pip-31-transaction-requests.md)).
 `Connection::reset` retires the client's per-request entries of every transaction request of the ended session, pending at the reset or cancelled before it (`TxnClient::forget_all_requests`), since the dead session answers none of them; an `EndTxn` outcome is still retained across a reset so a retried commit or abort resumes the canonical request, and that resume never reads the `TxnClient` entry ([ADR-0138](specs/adr/0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)).
@@ -1408,6 +1411,7 @@ The watcher keeps its id, so the deltas of the new session are still addressed t
 Nobody awaits that request, so its reply is consumed in place: no `OpOutcome` is recorded, no event is queued, and a refusal is logged and leaves the watcher owing a registration for the next rebuild.
 A registration the broker never answered is owed again after the next reset, and a rebuild is idempotent within a session.
 The topic list the broker returns is not forwarded, so a topic created or deleted while the connection was down is not reported to the pattern consumer; only later changes are.
+A `CommandWatchTopicListSuccess` is recorded as an outcome only while its request is still pending: a `topic_list_snapshot` future that was dropped or hit its operation deadline went through `Connection::cancel_request`, which removed the request and closed the watcher, so a reply that arrives afterwards is ignored instead of leaving the broker's whole topic list in `outcomes` for the life of the connection.
 Nothing deregisters a watcher (`CommandWatchTopicListClose` is never sent), so one lives as long as its connection and is registered again on every reconnect ([`docs/follow-ups.md`](docs/follow-ups.md) §31; [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
 
 ---

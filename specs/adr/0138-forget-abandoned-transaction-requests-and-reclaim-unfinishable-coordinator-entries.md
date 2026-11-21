@@ -1,6 +1,6 @@
 # ADR-0138 — Forget abandoned transaction requests and reclaim coordinator entries nobody can finish
 
-- **Status**: Accepted (amends the entry retention of the transaction coordinator described in [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md): a refused outcome keeps the entry only while a participant that could still accept it is alive; the rest of ADR-0120 remains binding. Bounds the per-request `TxnClient` record that [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md) left as a residual to the session that carried the request)
+- **Status**: Accepted (amends the entry retention of the transaction coordinator described in [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md): a refused outcome keeps the entry only while a participant that could still accept it is alive; the rest of ADR-0120 remains binding. Bounds the per-request `TxnClient` record that [ADR-0129](0129-bound-and-fast-fail-pip-31-transaction-requests.md) left as a residual to the session that carried the request; amended 2026-11-21 — ended transactions are forgotten)
 - **Date**: 2026-11-20
 - **Decider**: Florentin Dubois
 - **Tags**: transactions, resource-leak, proto, facade
@@ -47,7 +47,7 @@ Alternatives considered:
   - A transaction the application never ends keeps its coordinator entry for the life of the client; bounding that needs the eviction decision above.
   - A cancelled transaction request whose reply never comes keeps its `TxnClient` entry until its session ends, as ADR-0129 accepted.
   - An `EndTxn` outcome kept after a cancelled waiter that the application never retries stays, by the retry contract.
-  - `TxnClient` keeps one `TransactionMetadata` record for every transaction ever opened, ended or not: no production path calls `TxnClient::forget`. This change does not alter that.
+  - `TxnClient` kept one `TransactionMetadata` record for every transaction ever opened, ended or not, because no production path called `TxnClient::forget`; this change did not alter that. Amended 2026-11-21: the connection now calls `TxnClient::forget` once it has handled the reply to the transaction's `CommandEndTxn` (committed, aborted or refused), so a record outlives only a transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again.
   - Every transaction response arm pushes a `ConnectionEvent::TxnResponse` with a bare `push_back`, past the observational cap of the event queue, and nothing in the workspace drains that event, so those events accumulate until the next reset. This change does not alter that.
 - Test layers, as they are:
   - (a) `magnetar-proto`: `txn_request_reset_retires_the_per_request_client_state`, for a request pending at the reset and for one cancelled before it.

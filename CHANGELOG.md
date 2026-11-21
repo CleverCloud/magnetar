@@ -33,6 +33,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **The connection no longer keeps a record of every transaction it ever opened.**
+  `TxnClient::handle_new_txn_response` registers one `TransactionMetadata` (ids, state, timeout, and the topics and subscriptions registered under the transaction) per `CommandNewTxn`, and a `CommandEndTxnResponse` only rewrote its state to `Committed`, `Aborted` or `Errored`.
+  The one remover, `TxnClient::forget`, had no caller outside its unit test, and the `Connection` is built once and reused across every supervised reconnect, so an exactly-once client gained one record per transaction for as long as it ran.
+  Nothing reads a record after the transaction has ended: the outcome handed to the caller already carries the final state.
+  The `EndTxnResponse` arm now forgets the transaction once the broker has answered its `CommandEndTxn`, whether it committed, aborted or refused it, so `TxnClient::len()` counts only transactions still open, and `Connection::txn_client().transaction(id)` returns `None` once the reply to that transaction's `CommandEndTxn` has been handled.
+  Both engines run the same `Connection` code and behave identically.
+  A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, still keeps its record, since `TxnClient` has no timeout policy; the request and waker entries of a transaction call in flight at a reset are not touched here either.
+
+- **A topic-list snapshot reply that lands after its caller gave up no longer leaves the topic list behind.**
+  `Connection::cancel_request` is what a dropped or timed-out `topic_list_snapshot` (and pattern-subscribe) future calls, and documents that "a late broker reply is ignored".
+  The `CommandWatchTopicListSuccess` arm recorded a `TopicListSnapshot` outcome holding the broker's full topic list regardless, nobody was left to take it, and `reset()` does not clear `outcomes`, so each abandoned snapshot that was answered afterwards cost one such outcome for the life of the connection.
+  The arm now records the outcome, wakes the waiter and queues the `TopicListSnapshot` event only while the request is still pending as a topic watcher; a reply for any other request id is ignored.
+  A late `CommandError` for the same request was already ignored, because the request kind is gone.
+  Both engines run the same `Connection` code and behave identically.
+
 - **`Producer::flush` no longer returns `Ok` while sends are still owed a receipt across a reconnect.**
   `Connection::reset()` moves every replayable in-flight publish out of the producer's `pending` queue into the connection's reset snapshot bucket, and they return to `pending` only when the broker acknowledges the producer's re-attachment.
   Both engines' `flush` looped on the live queue alone, so a `flush()` issued in that window — or parked across the socket drop and re-checked after the new `CONNECTED` frame — read zero and resolved `Ok(())` with no send acknowledged; the documented `flush().await` then `close()` (or process exit) recipe could complete while publishes were still unacknowledged.

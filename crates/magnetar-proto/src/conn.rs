@@ -4213,17 +4213,22 @@ impl Connection {
                 if self.topic_watchers.complete_reattach(rid, &ok.topics_hash) {
                     return Ok(());
                 }
+                // A snapshot the caller gave up on (its future was dropped, or the operation
+                // deadline fired) went through `cancel_request`, which removed the pending request
+                // and closed the watcher, so there is nobody to take an outcome and no watcher to
+                // update. Recording one would leave the broker's whole topic list in `outcomes`
+                // for the life of the connection.
+                // The id this connection allocated, which is the one every later delta for the
+                // watcher is keyed on.
+                let watcher_id = match self.pending_requests.get(&rid) {
+                    Some(PendingRequestKind::TopicWatcher { watcher_id }) => *watcher_id,
+                    _ => return Ok(()),
+                };
+                self.pending_requests.remove(&rid);
                 if let Some(watcher) = self.topic_watchers.lookup_by_request(rid) {
                     watcher.topics_hash = Some(ok.topics_hash.clone());
                     watcher.initialised = true;
                 }
-                // The id this connection allocated, which is the one every later delta for the
-                // watcher is keyed on. A request cancelled before its response (its pending
-                // entry is gone) has no reader, so the id the broker echoed stands in.
-                let watcher_id = match self.pending_requests.remove(&rid) {
-                    Some(PendingRequestKind::TopicWatcher { watcher_id }) => watcher_id,
-                    _ => ok.watcher_id,
-                };
                 let topics = ok.topic.clone();
                 self.outcomes.insert(
                     PendingOpKey::Request(rid),
@@ -4348,7 +4353,15 @@ impl Connection {
                     ))?;
                 let request_id = RequestId(resp.request_id);
                 self.pending_requests.remove(&request_id);
+                let ended = self.txn_client.txn_being_ended(request_id);
                 let result = self.txn_client.handle_end_txn_response(resp);
+                // The outcome below carries the final state, so the transaction's record has no
+                // further reader. Without this it stayed for the life of the connection, which
+                // outlives every reconnect: one record per transaction, for as long as the
+                // client ran.
+                if let Some(txn) = ended {
+                    self.txn_client.forget(txn);
+                }
                 self.outcomes.insert(
                     PendingOpKey::Request(request_id),
                     OpOutcome::EndTxn {
@@ -12066,6 +12079,182 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    /// The broker refusing a `CommandEndTxn` is as terminal for the connection's record of the
+    /// transaction as an accepted one: the caller gets the refusal through its outcome, and
+    /// nothing reads the record again. Keeping it would leak one per refused end, the same as
+    /// one per committed transaction.
+    #[test]
+    fn end_txn_refused_by_the_broker_leaves_no_record_of_the_transaction() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 11);
+
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+        assert_eq!(
+            conn.txn_client().len(),
+            1,
+            "the open transaction is tracked"
+        );
+
+        let end_request = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("claim the EndTxn waiter");
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::EndTxnResponse as i32,
+                end_txn_response: Some(pb::CommandEndTxnResponse {
+                    request_id: end_request.0,
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    error: Some(pb::ServerError::TransactionConflict as i32),
+                    message: Some("conflict".to_owned()),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode EndTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle EndTxn response");
+
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(end_request)),
+                Some(OpOutcome::EndTxn {
+                    result: Err(TxnError::Conflict),
+                    ..
+                })
+            ),
+            "the caller still receives the broker's refusal"
+        );
+        assert!(
+            conn.txn_client().is_empty(),
+            "a refused end must not leave the transaction tracked"
+        );
+    }
+
+    /// What a refused end leaves behind: the connection no longer tracks the transaction, while the
+    /// broker may still hold it open (a retriable refusal). The application can still end it: the
+    /// retry is a new `CommandEndTxn` that resolves on its own reply and leaves no record either.
+    #[test]
+    fn a_transaction_whose_end_was_refused_can_be_ended_again() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 12);
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let end_response = |request_id: RequestId, error: Option<pb::ServerError>| {
+            let mut encoded = BytesMut::new();
+            encode_command(
+                &mut encoded,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::EndTxnResponse as i32,
+                    end_txn_response: Some(pb::CommandEndTxnResponse {
+                        request_id: request_id.0,
+                        txnid_least_bits: Some(txn.least_sig_bits),
+                        txnid_most_bits: Some(txn.most_sig_bits),
+                        error: error.map(|e| e as i32),
+                        message: error.map(|_| "not ready".to_owned()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("encode EndTxn response");
+            encoded
+        };
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+
+        let refused = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("claim the EndTxn waiter");
+        conn.handle_bytes(
+            Instant::now(),
+            &end_response(
+                refused,
+                Some(pb::ServerError::TransactionCoordinatorNotFound),
+            ),
+        )
+        .expect("handle the refusal");
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(refused)),
+                Some(OpOutcome::EndTxn { result: Err(_), .. })
+            ),
+            "the first end is refused"
+        );
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+        assert!(
+            conn.txn_client().is_empty(),
+            "the refusal forgot the record"
+        );
+
+        let retry = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("a refused transaction can be ended again");
+        assert_ne!(retry, refused, "the retry is a request of its own");
+        conn.handle_bytes(Instant::now(), &end_response(retry, None))
+            .expect("handle the retry's reply");
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(retry)),
+                Some(OpOutcome::EndTxn {
+                    result: Ok(crate::TxnState::Committed),
+                    ..
+                })
+            ),
+            "the retry resolves on its own reply"
+        );
+        assert!(
+            conn.txn_client().is_empty(),
+            "the retry leaves no record either"
         );
     }
 

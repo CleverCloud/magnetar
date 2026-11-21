@@ -263,4 +263,8 @@ ADR-0111's list of the places a publish's memory reservation is released names "
 
 ADR-0037's pattern consumer applies PIP-145 deltas from the connection's watcher; ADR-0136 keeps that watcher registered across a supervised reconnect, which the pass-2 lift did not say.
 
+ADR-0132's statement that the reply to a cancelled topic-list snapshot is recorded under the id the broker echoed is amended in place on 2026-11-20: a `CommandWatchTopicListSuccess` is recorded only while its request is still pending, so that reply records no outcome and queues no event; the rest of ADR-0132 is unchanged.
+
+ADR-0138's "Not addressed" bullet on `TransactionMetadata` records is amended in place on 2026-11-21: the connection now calls `TxnClient::forget` once it has handled the reply to a transaction's `CommandEndTxn`, so a record outlives only a transaction the application never ends. ADR-0138's decisions are unchanged.
+
 ADR-0038's statement that the observability getters (`Producer::pending_count` among them) bypass the global connection mutex is amended by ADR-0137 for `pending_count` and for `flush`'s probe, which read the live queue and the reset snapshot bucket together under the connection lock; the lock order (global → per-slot) and the lock-free `Producer::send` hot path are unchanged.
