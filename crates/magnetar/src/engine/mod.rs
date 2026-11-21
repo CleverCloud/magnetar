@@ -70,6 +70,12 @@ pub use tokio::TokioEngine;
 /// `TableView::drain_task`, `MultiTopicsConsumer::auto_update`, and the
 /// other surface lifts off `impl PulsarClient<TokioEngine>`. See
 /// [ADR-0025](../../specs/adr/0025-engine-trait-task-and-timer-primitives.md).
+///
+/// Both engines implement them with Tokio (`tokio::spawn`, `tokio::time::interval`), which
+/// reads the host executor and the host clock. They take no client, so they cannot reach the
+/// providers a `MoonpoolEngine` client was built over, and they have no production caller. A
+/// helper task that must run on a client's providers is spawned through `BackgroundApi`
+/// instead (ADR-0139).
 pub trait Engine:
     'static + Send + Sync + Debug + MessageEncryptorApi + MessageDecryptorApi
 {
@@ -80,10 +86,9 @@ pub trait Engine:
     /// so the façade can be moved across spawn boundaries unchanged.
     type ClientState: 'static + Send + Sync;
 
-    /// Opaque, cancel-safe handle to a background task spawned via
-    /// [`Self::spawn`]. Dropping the handle aborts the task on the tokio
-    /// engine; explicit [`Self::abort_task`] is the happens-before-Drop
-    /// path the façade uses on shutdown.
+    /// Opaque handle to a background task spawned via [`Self::spawn`]. Both
+    /// engines use `tokio::task::JoinHandle<()>`, so dropping the handle
+    /// detaches the task; stopping it is an explicit [`Self::abort_task`].
     type TaskHandle: 'static + Send;
 
     /// Opaque periodic timer created via [`Self::new_interval`]. The
@@ -100,9 +105,10 @@ pub trait Engine:
         std::any::type_name::<Self>()
     }
 
-    /// Spawn an async future on the engine's executor. Returns a cancel-
-    /// safe [`Self::TaskHandle`]. Tokio wraps [`::tokio::spawn`]; moonpool
-    /// delegates through its `Providers::TaskProvider` (`moonpool_core`).
+    /// Spawn an async future on the ambient Tokio runtime and return its
+    /// [`Self::TaskHandle`]. Both engines wrap [`::tokio::spawn`]: the moonpool
+    /// engine does not go through its `Providers::TaskProvider`, so this is
+    /// not usable under `SimProviders`.
     fn spawn<F>(fut: F) -> Self::TaskHandle
     where
         F: Future<Output = ()> + Send + 'static;
@@ -751,6 +757,48 @@ pub struct TopicListChange {
     pub removed: Vec<String>,
 }
 
+/// A boxed future the façade runs, or waits on, as a client background task.
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub type BackgroundFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// An owned sleep on a client's clock: `sleeper(d)` resolves `true` once `d` has elapsed on it,
+/// and `false` if the clock is gone and will never fire again (a simulation run that has ended),
+/// so a paced loop ends instead of spinning.
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub type BackgroundSleep = std::sync::Arc<
+    dyn Fn(Duration) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync,
+>;
+
+/// Engine-side background execution: where a façade surface's helper task (the
+/// [`crate::TableView`] drain, the auto-update partition ticker of a
+/// [`crate::PartitionedProducer`], [`crate::MultiTopicsConsumer`] or [`crate::TableView`]) is
+/// spawned and how it waits.
+///
+/// Both come from the client, because the client alone knows which providers it was built over.
+/// The Tokio client schedules on the ambient Tokio runtime. The Moonpool client schedules on its
+/// `moonpool_core::TaskProvider` and waits on its `moonpool_core::TimeProvider`, so under
+/// `SimProviders` a helper task runs on the seeded simulation executor and clock, where
+/// `tokio::spawn` panics for want of a runtime and `tokio::time` would read the host clock
+/// ([ADR-0078](../../specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).
+/// The [`Engine`] spawn and interval primitives take no client, so they cannot say this.
+///
+/// A supertrait of [`SubscribeApi`] and [`CreateProducerApi`], the two bounds every surface that
+/// owns a helper task already carries. Not meant to be implemented outside the workspace.
+#[cfg(feature = "tokio")]
+pub trait BackgroundApi: 'static + Send + Sync {
+    /// Spawn `task` and return a future that resolves once it has ended. Dropping that future
+    /// does not stop the task, and a provider may not be able to cancel one at all, so the
+    /// caller stops it cooperatively (see `BackgroundTask`).
+    #[doc(hidden)]
+    fn spawn_background(&self, name: &str, task: BackgroundFuture) -> BackgroundFuture;
+
+    /// An owned sleep on this client's clock.
+    #[doc(hidden)]
+    fn background_sleeper(&self) -> BackgroundSleep;
+}
+
 /// One setup-operation context shared across every caller-visible stage.
 ///
 /// The pinned timer enforces the total deadline, while `last_broker_error`
@@ -884,7 +932,7 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
 /// surfaces (`TypedSchemas`, `MultiTopicsConsumer` /
 /// `PartitionedConsumer`, `PatternConsumer`).
 #[cfg(feature = "tokio")]
-pub trait SubscribeApi: 'static + Send + Sync {
+pub trait SubscribeApi: 'static + Send + Sync + BackgroundApi {
     /// Concrete consumer type each runtime returns. Required to
     /// implement [`ConsumerApi`] so generic surfaces can dispatch
     /// further methods through that trait.
@@ -968,7 +1016,7 @@ pub type WatchTopicListWithIdFut<'a, B> = Pin<
 /// and `PartitionedProducer<E>`. Same shape as [`SubscribeApi`] for
 /// the producer side.
 #[cfg(feature = "tokio")]
-pub trait CreateProducerApi: 'static + Send + Sync {
+pub trait CreateProducerApi: 'static + Send + Sync + BackgroundApi {
     /// Concrete producer type each runtime returns.
     type Producer: ProducerApi;
     /// Runtime client error.

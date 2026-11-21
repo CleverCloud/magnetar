@@ -20,9 +20,9 @@ use std::time::Duration;
 
 #[cfg(feature = "tokio")]
 use super::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OperationDeadline, ProducerApi,
-    ReceiveBatchFut, ReceiveOptFut, SubscribeApi, TopicListChange, WatchTopicListFut,
-    WatchTopicListWithIdFut,
+    BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
+    CreateProducerApi, OperationDeadline, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
+    SubscribeApi, TopicListChange, WatchTopicListFut, WatchTopicListWithIdFut,
 };
 use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, TransactionApi};
 
@@ -83,7 +83,9 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
     // in `magnetar-runtime-moonpool`'s `AutoClusterFailover::start`. These
     // four `Engine` methods are static and take no providers argument, so
     // they cannot be retrofitted in place; they currently have no production
-    // call sites.
+    // call sites. The façade's own helper tasks (the `TableView` drain, the
+    // auto-update tickers) are spawned through `BackgroundApi` below, which
+    // the client implements over the providers it was built with (ADR-0139).
     type TaskHandle = tokio::task::JoinHandle<()>;
     type Interval = tokio::time::Interval;
 
@@ -874,6 +876,22 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
                 removed: c.removed,
             }
         })
+    }
+}
+
+// A helper task of a Moonpool client is spawned on the client's own `TaskProvider` and waits on
+// its `TimeProvider` (ADR-0078), not on `tokio::spawn` / `tokio::time`: under `SimProviders` there
+// is no Tokio runtime and the host clock is outside the seed.
+#[cfg(feature = "tokio")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> BackgroundApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    fn spawn_background(&self, name: &str, task: BackgroundFuture) -> BackgroundFuture {
+        magnetar_runtime_moonpool::Client::spawn_background(self, name, task)
+    }
+
+    fn background_sleeper(&self) -> BackgroundSleep {
+        magnetar_runtime_moonpool::Client::background_sleeper(self)
     }
 }
 

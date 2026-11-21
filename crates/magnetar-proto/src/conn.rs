@@ -1157,6 +1157,14 @@ impl Connection {
             }
         }
 
+        // The dead session answers no transaction request: neither those resolved with
+        // `SessionLost` above nor those whose caller was cancelled before the reset (an operation
+        // deadline that fired during the outage), which have already left `pending_requests`. So
+        // the transaction client must not keep their per-request entries for the life of the
+        // connection. A retried `EndTxn` resumes through the `SessionLost` outcome and the
+        // `end_txn_*` maps, which stay; the transaction client's entries are no part of that.
+        self.txn_client.forget_all_requests();
+
         // Events queued before reset belong to the dead session. Clear them before producing any
         // local reset outcomes so a non-replayable batch's SendError remains observable.
         self.events.clear();
@@ -4184,7 +4192,8 @@ impl Connection {
                     Ok(Some(id)) => Ok(id),
                     Ok(None) => {
                         // Unknown request id — drop the outcome silently. The driver will not
-                        // surface a future for a request we never enqueued.
+                        // surface a future for a request we never enqueued, and a request whose
+                        // session was reset was forgotten.
                         return Ok(());
                     }
                     Err(err) => Err(err),
@@ -15587,6 +15596,181 @@ mod conn_state_tests {
                 vec!["persistent://public/default/live-1".to_owned()]
             )],
             "only the delta of the watcher this connection holds is surfaced"
+        );
+    }
+
+    /// The transaction requests. `TXN_REQUEST_KINDS` lists those a runtime cancels when their
+    /// operation deadline fires (`RequestFut::cancellable`, ADR-0129); `EndTxn` is not one of
+    /// them: its outcome is retained across a cancelled waiter by contract, so a retried commit
+    /// or abort resumes the canonical request. A reset still ends every kind's `TxnClient`
+    /// entry, `EndTxn` included.
+    #[derive(Debug, Clone, Copy)]
+    enum TxnRequestKind {
+        NewTxn,
+        AddPartition,
+        AddSubscription,
+        EndTxn,
+    }
+
+    const TXN_REQUEST_KINDS: [TxnRequestKind; 3] = [
+        TxnRequestKind::NewTxn,
+        TxnRequestKind::AddPartition,
+        TxnRequestKind::AddSubscription,
+    ];
+
+    fn issue_txn_request(conn: &mut Connection, kind: TxnRequestKind) -> RequestId {
+        let txn = TxnId::new(0x11, 0x22);
+        let topic = "persistent://public/default/txn-leak".to_owned();
+        match kind {
+            TxnRequestKind::NewTxn => conn.new_txn(Duration::from_mins(1)),
+            TxnRequestKind::AddPartition => conn.add_partition_to_txn(txn, topic),
+            TxnRequestKind::AddSubscription => {
+                conn.add_subscription_to_txn(txn, "txn-leak-sub".to_owned(), topic)
+            }
+            TxnRequestKind::EndTxn => conn
+                .end_txn(txn, TxnAction::Commit)
+                .expect("a first EndTxn is issuable"),
+        }
+    }
+
+    /// Feed the broker's successful reply to the request `request_id` of `kind`.
+    fn feed_txn_reply(conn: &mut Connection, kind: TxnRequestKind, request_id: RequestId) {
+        let reply = match kind {
+            TxnRequestKind::NewTxn => pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: request_id.0,
+                    txnid_most_bits: Some(0x11),
+                    txnid_least_bits: Some(0x22),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+            TxnRequestKind::AddPartition => pb::BaseCommand {
+                r#type: pb::base_command::Type::AddPartitionToTxnResponse as i32,
+                add_partition_to_txn_response: Some(pb::CommandAddPartitionToTxnResponse {
+                    request_id: request_id.0,
+                    txnid_most_bits: None,
+                    txnid_least_bits: None,
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+            TxnRequestKind::AddSubscription => pb::BaseCommand {
+                r#type: pb::base_command::Type::AddSubscriptionToTxnResponse as i32,
+                add_subscription_to_txn_response: Some(pb::CommandAddSubscriptionToTxnResponse {
+                    request_id: request_id.0,
+                    txnid_most_bits: None,
+                    txnid_least_bits: None,
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+            TxnRequestKind::EndTxn => pb::BaseCommand {
+                r#type: pb::base_command::Type::EndTxnResponse as i32,
+                end_txn_response: Some(pb::CommandEndTxnResponse {
+                    request_id: request_id.0,
+                    txnid_least_bits: Some(0x22),
+                    txnid_most_bits: Some(0x11),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &reply).expect("encode transaction reply");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle transaction reply");
+    }
+
+    /// Whether the embedded `TxnClient` still tracks the request `request_id` of `kind`.
+    ///
+    /// `TxnClient::register_*_waker` stores a waker only for a request it still tracks, so a
+    /// probe waker that the client kept a clone of proves the per-request entry is still there.
+    fn txn_client_tracks(
+        conn: &mut Connection,
+        kind: TxnRequestKind,
+        request_id: RequestId,
+    ) -> bool {
+        #[derive(Default)]
+        struct Probe(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for Probe {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let probe = std::sync::Arc::new(Probe::default());
+        let waker = Waker::from(std::sync::Arc::clone(&probe));
+        let client = conn.txn_client_mut();
+        match kind {
+            TxnRequestKind::NewTxn => client.register_new_txn_waker(request_id, waker),
+            TxnRequestKind::AddPartition => client.register_add_partition_waker(request_id, waker),
+            TxnRequestKind::AddSubscription => {
+                client.register_add_subscription_waker(request_id, waker);
+            }
+            TxnRequestKind::EndTxn => client.register_end_txn_waker(request_id, waker),
+        }
+        std::sync::Arc::strong_count(&probe) > 1
+    }
+
+    /// A session reset turns every in-flight transaction request into a `SessionLost` outcome;
+    /// the broker will never answer it, so the request's entry in the embedded `TxnClient` (and
+    /// its waker slot) has to go with it instead of staying for the life of the connection. The
+    /// same holds for a request cancelled before the reset (its operation deadline fired during
+    /// the outage): it has already left `pending_requests`, and its reply can only come on the
+    /// session the reset ends.
+    #[test]
+    fn txn_request_reset_retires_the_per_request_client_state() {
+        let mut retained = Vec::new();
+        let mut retained_after_cancel = Vec::new();
+        for kind in TXN_REQUEST_KINDS
+            .into_iter()
+            .chain([TxnRequestKind::EndTxn])
+        {
+            // Control: the probe sees a pending request, and no longer sees an answered one.
+            let mut control = handshaked_connection();
+            let pending = issue_txn_request(&mut control, kind);
+            assert!(
+                txn_client_tracks(&mut control, kind, pending),
+                "{kind:?}: the probe sees a request awaiting its reply"
+            );
+            feed_txn_reply(&mut control, kind, pending);
+            assert!(
+                !txn_client_tracks(&mut control, kind, pending),
+                "{kind:?}: the probe no longer sees an answered request"
+            );
+
+            let mut conn = handshaked_connection();
+            let request_id = issue_txn_request(&mut conn, kind);
+            conn.reset();
+            assert!(
+                matches!(
+                    conn.take_outcome(PendingOpKey::Request(request_id)),
+                    Some(OpOutcome::SessionLost { .. })
+                ),
+                "{kind:?}: the reset resolves the waiting caller with SessionLost"
+            );
+            if txn_client_tracks(&mut conn, kind, request_id) {
+                retained.push(kind);
+            }
+        }
+        for kind in TXN_REQUEST_KINDS {
+            let mut conn = handshaked_connection();
+            let request_id = issue_txn_request(&mut conn, kind);
+            conn.cancel_request(request_id);
+            conn.reset();
+            if txn_client_tracks(&mut conn, kind, request_id) {
+                retained_after_cancel.push(kind);
+            }
+        }
+        assert!(
+            retained.is_empty() && retained_after_cancel.is_empty(),
+            "the reset left the TxnClient tracking requests the dead session will never answer: \
+             {retained:?} pending at the reset, {retained_after_cancel:?} cancelled before it"
         );
     }
 

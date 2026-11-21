@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, Engine, MessageDecryptorApi,
-    MessageEncryptorApi, OperationDeadline, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
-    SubscribeApi, TopicListChange, TransactionApi, WatchTopicListFut, WatchTopicListWithIdFut,
+    BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
+    CreateProducerApi, Engine, MessageDecryptorApi, MessageEncryptorApi, OperationDeadline,
+    ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi, TopicListChange, TransactionApi,
+    WatchTopicListFut, WatchTopicListWithIdFut,
 };
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -121,6 +122,27 @@ impl TransactionApi for magnetar_runtime_tokio::Client {
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnState, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_tokio::Client::end_txn(self, txn, action))
+    }
+}
+
+// The Tokio client runs on the ambient Tokio runtime and clock: `tokio::spawn` and
+// `tokio::time::sleep` are this engine's providers (ADR-0078).
+impl BackgroundApi for magnetar_runtime_tokio::Client {
+    fn spawn_background(&self, _name: &str, task: BackgroundFuture) -> BackgroundFuture {
+        let join = tokio::spawn(task);
+        Box::pin(async move {
+            // A cancelled or panicked task has ended all the same.
+            let _ended = join.await;
+        })
+    }
+
+    fn background_sleeper(&self) -> BackgroundSleep {
+        Arc::new(|duration| {
+            Box::pin(async move {
+                tokio::time::sleep(duration).await;
+                true
+            })
+        })
     }
 }
 

@@ -35,8 +35,9 @@ use parking_lot::Mutex;
 use crate::driver::DriverHandle;
 use crate::pool::ProxyConnectionPool;
 use crate::{
-    ConnectionShared, EngineError, MoonpoolEngine, SleepProvider, TopicListChange,
-    sleep_provider_from_time, tokio_sleep_provider,
+    BackgroundFuture, BackgroundSleeper, ConnectionShared, EngineError, MoonpoolEngine,
+    SleepProvider, TaskSpawner, TopicListChange, sleep_provider_from_time, task_spawner_from_task,
+    tokio_sleep_provider, tokio_task_spawner,
 };
 
 pub(crate) type OperationDeadline<'a> = Pin<&'a mut (dyn Future<Output = ()> + Send)>;
@@ -206,6 +207,11 @@ pub struct Client<P: Providers> {
     /// through this client. Kept out of the public `ConnectionShared` layout
     /// so provider selection remains an engine concern.
     sleep_provider: Arc<SleepProvider>,
+    /// Runtime-owned task spawner, bound to the same provider bundle as [`Self::sleep_provider`],
+    /// for the background tasks the façade starts on this client's behalf (a `TableView` drain,
+    /// an auto-update partition ticker). Under `SimProviders` a task runs on Moonpool's own
+    /// executor with no ambient Tokio runtime, so those tasks must not use `tokio::spawn`.
+    task_spawner: Arc<TaskSpawner>,
     /// Held only so `Client` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -260,6 +266,7 @@ impl<P: Providers> Client<P> {
         driver: DriverHandle,
         pool: Option<Arc<ProxyConnectionPool<P>>>,
         sleep_provider: Arc<SleepProvider>,
+        task_spawner: Arc<TaskSpawner>,
     ) -> Self {
         Self {
             shared,
@@ -268,6 +275,7 @@ impl<P: Providers> Client<P> {
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
             sleep_provider,
+            task_spawner,
             _providers: std::marker::PhantomData,
         }
     }
@@ -352,6 +360,7 @@ impl<P: Providers> Client<P> {
             driver,
             Some(pool),
             sleep_provider_from_time(engine.providers().time().clone()),
+            task_spawner_from_task(engine.providers().task().clone()),
         ))
     }
 
@@ -397,6 +406,7 @@ impl<P: Providers> Client<P> {
             driver,
             Some(ProxyConnectionPool::new(factory)),
             sleep_provider_from_time(engine.providers().time().clone()),
+            task_spawner_from_task(engine.providers().task().clone()),
         ))
     }
 
@@ -412,7 +422,13 @@ impl<P: Providers> Client<P> {
     /// against a hand-rolled connection).
     #[must_use]
     pub fn from_parts(shared: Arc<ConnectionShared>, driver: DriverHandle) -> Self {
-        Self::assemble(shared, driver, None, tokio_sleep_provider())
+        Self::assemble(
+            shared,
+            driver,
+            None,
+            tokio_sleep_provider(),
+            tokio_task_spawner(),
+        )
     }
 
     /// Wrap an existing `(shared, driver)` pair and bind user-facing
@@ -432,6 +448,7 @@ impl<P: Providers> Client<P> {
             driver,
             None,
             sleep_provider_from_time(providers.time().clone()),
+            task_spawner_from_task(providers.task().clone()),
         )
     }
 
@@ -476,6 +493,30 @@ impl<P: Providers> Client<P> {
         let sleep = (self.sleep_provider)(timeout);
         Box::pin(async move {
             let _ = sleep.await;
+        })
+    }
+
+    /// Spawn `task` on the [`moonpool_core::TaskProvider`] this client was built over, so a
+    /// façade background task runs on the simulation executor under `SimProviders` instead of
+    /// the ambient Tokio runtime. The returned future resolves once the task has ended. The
+    /// provider cannot cancel a task, so stopping one is the caller's job (the façade races it
+    /// against a stop signal). [`Self::from_parts`] binds Tokio's own provider.
+    #[doc(hidden)]
+    pub fn spawn_background(&self, name: &str, task: BackgroundFuture) -> BackgroundFuture {
+        (self.task_spawner)(name, task)
+    }
+
+    /// An owned sleep on the [`moonpool_core::TimeProvider`] this client was built over, for a
+    /// façade background task that paces itself. Under `SimProviders` the wait is virtual time.
+    /// The future resolves `true` once the duration has elapsed, and `false` if the provider has
+    /// shut down (the simulation world is gone) and will never fire again, so the paced loop
+    /// ends instead of spinning.
+    #[doc(hidden)]
+    pub fn background_sleeper(&self) -> BackgroundSleeper {
+        let sleep_provider = self.sleep_provider.clone();
+        Arc::new(move |duration| {
+            let sleep = sleep_provider(duration);
+            Box::pin(async move { sleep.await.is_ok() })
         })
     }
 
@@ -2236,6 +2277,7 @@ mod tests {
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
             sleep_provider: crate::tokio_sleep_provider(),
+            task_spawner: crate::tokio_task_spawner(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -2497,6 +2539,7 @@ mod tests {
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
             sleep_provider: crate::tokio_sleep_provider(),
+            task_spawner: crate::tokio_task_spawner(),
             _providers: std::marker::PhantomData,
         };
         let mut pending = Box::pin(client.scalable_topic_subscribe(
@@ -2666,6 +2709,7 @@ mod tests {
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
             sleep_provider: crate::tokio_sleep_provider(),
+            task_spawner: crate::tokio_task_spawner(),
             _providers: std::marker::PhantomData,
         };
         let emit = |command: pb::BaseCommand| {
@@ -2819,6 +2863,7 @@ mod tests {
                 connections_per_broker: 1,
                 connection_rr: AtomicUsize::new(0),
                 sleep_provider: crate::tokio_sleep_provider(),
+                task_spawner: crate::tokio_task_spawner(),
                 _providers: std::marker::PhantomData,
             };
             let emit = |command: pb::BaseCommand| {
@@ -2938,6 +2983,7 @@ mod tests {
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
             sleep_provider: crate::tokio_sleep_provider(),
+            task_spawner: crate::tokio_task_spawner(),
             _providers: std::marker::PhantomData,
         };
         let mut deadline = Box::pin(std::future::pending::<()>());

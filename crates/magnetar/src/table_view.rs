@@ -7,6 +7,11 @@
 //! and `value` is its raw payload. Late-bound listeners can react to mutations. The view
 //! lives as long as the [`TableView`] handle; dropping it tears down the background drain
 //! task.
+//!
+//! The drain task (and the optional auto-update partition ticker) is spawned through the
+//! client's [`crate::BackgroundApi`], so it runs on the executor of the provider bundle the
+//! client was built over: the ambient Tokio runtime for `TokioEngine`, the simulation's
+//! `TaskProvider` for `MoonpoolEngine<SimProviders>` (ADR-0078).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +22,11 @@ use bytes::Bytes;
 use magnetar_proto::conn::CryptoFailureAction;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 use crate::auto_update_task::{AutoUpdateTask, spawn_auto_update_task};
+use crate::background_task::BackgroundTask;
 use crate::client::PulsarError;
-use crate::{Engine, PulsarClient, TokioEngine};
+use crate::{BackgroundApi, Engine, PulsarClient, TokioEngine};
 
 /// Callback fired for every mutation applied to the table view.
 ///
@@ -37,15 +42,15 @@ pub type TableViewListener = Arc<dyn Fn(&str, Option<&Bytes>) + Send + Sync>;
 /// `magnetar::TableView` without a type argument — pointing at the
 /// tokio specialisation. Moonpool callers name
 /// `TableView<magnetar_runtime_moonpool::Consumer<P>>` directly. The
-/// drain task uses `tokio::spawn` regardless of engine, which matches
-/// ADR-0025's note that both engines ultimately schedule on tokio
-/// (determinism comes from substituting the providers, not from
-/// replacing the executor).
+/// drain task is spawned through the client's [`crate::BackgroundApi`],
+/// so it runs on the provider bundle the client was built over: under
+/// `SimProviders` that is the seeded simulation executor, where
+/// `tokio::spawn` has no runtime to run on (ADR-0078).
 #[derive(Clone)]
 pub struct TableView<C: crate::ConsumerApi + Clone = magnetar_runtime_tokio::Consumer> {
     state: Arc<RwLock<HashMap<String, Bytes>>>,
     listeners: Arc<RwLock<Vec<TableViewListener>>>,
-    drain: Arc<DrainTask>,
+    drain: Arc<BackgroundTask>,
     /// Optional background partition-watcher task. `Some` when the builder configured
     /// [`TableViewBuilder::auto_update_partitions_interval`], `None` otherwise
     /// (default). The task is a pure timer that signals
@@ -64,20 +69,6 @@ impl<C: crate::ConsumerApi + Clone> std::fmt::Debug for TableView<C> {
         f.debug_struct("TableView")
             .field("size", &self.state.read().len())
             .finish_non_exhaustive()
-    }
-}
-
-struct DrainTask {
-    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for DrainTask {
-    fn drop(&mut self) {
-        if let Ok(mut g) = self.handle.try_lock() {
-            if let Some(h) = g.take() {
-                h.abort();
-            }
-        }
     }
 }
 
@@ -142,19 +133,9 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
 
     /// Tear down the background drain task. The view's snapshot remains queryable.
     pub async fn close(self) {
-        let mut g = self.drain.handle.lock().await;
-        if let Some(h) = g.take() {
-            h.abort();
-            let _ = h.await;
-        }
-        drop(g);
+        self.drain.shutdown().await;
         if let Some(auto) = &self.auto_update {
-            auto.shutdown.notify_waiters();
-            let mut ag = auto.handle.lock().await;
-            if let Some(h) = ag.take() {
-                h.abort();
-                let _ = h.await;
-            }
+            auto.task.shutdown().await;
         }
     }
 
@@ -500,11 +481,16 @@ impl<'a, E: Engine> TableViewBuilder<'a, E> {
         let consumer_view = consumer.clone();
         let auto_update = self
             .auto_update_partitions_interval
-            .map(|interval| spawn_auto_update_task(topic, interval, 0));
+            .map(|interval| spawn_auto_update_task(&self.client.inner, topic, interval, 0));
         Ok(spawn_drain::<
+            E::ClientState,
             <E::ClientState as crate::SubscribeApi>::Consumer,
         >(
-            consumer, consumer_view, self.listener, auto_update
+            &self.client.inner,
+            consumer,
+            consumer_view,
+            self.listener,
+            auto_update,
         ))
     }
 }
@@ -568,8 +554,12 @@ impl TableViewBuilder<'_, TokioEngine> {
         let consumer_view = consumer.clone();
         let auto_update = self
             .auto_update_partitions_interval
-            .map(|interval| spawn_auto_update_task(topic, interval, 0));
-        Ok(spawn_drain::<magnetar_runtime_tokio::Consumer>(
+            .map(|interval| spawn_auto_update_task(&self.client.inner, topic, interval, 0));
+        Ok(spawn_drain::<
+            magnetar_runtime_tokio::Client,
+            magnetar_runtime_tokio::Consumer,
+        >(
+            &self.client.inner,
             consumer,
             consumer_view,
             self.listener,
@@ -582,7 +572,8 @@ impl TableViewBuilder<'_, TokioEngine> {
 /// [`TableView`]. Pulled out of [`TableViewBuilder::create`] /
 /// [`TableViewBuilder::create_with_decryption`] so both code paths
 /// share the drain loop's lock-discipline + dead-letter handling.
-fn spawn_drain<C: crate::ConsumerApi + Clone>(
+fn spawn_drain<A: BackgroundApi, C: crate::ConsumerApi + Clone>(
+    api: &A,
     consumer: C,
     consumer_view: C,
     listener: Option<TableViewListener>,
@@ -593,7 +584,7 @@ fn spawn_drain<C: crate::ConsumerApi + Clone>(
     let listeners: Arc<RwLock<Vec<TableViewListener>>> =
         Arc::new(RwLock::new(listener.into_iter().collect()));
     let listeners_drain = listeners.clone();
-    let join = tokio::spawn(async move {
+    let drain = BackgroundTask::spawn(api, "magnetar-table-view-drain", async move {
         loop {
             let msg = match crate::ConsumerApi::receive(&consumer).await {
                 Ok(msg) => msg,
@@ -642,9 +633,7 @@ fn spawn_drain<C: crate::ConsumerApi + Clone>(
     TableView {
         state,
         listeners,
-        drain: Arc::new(DrainTask {
-            handle: tokio::sync::Mutex::new(Some(join)),
-        }),
+        drain: Arc::new(drain),
         auto_update,
         consumer: consumer_view,
     }
@@ -995,6 +984,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use super::*;
+    use crate::background_task::TokioBackground;
 
     #[test]
     fn empty_view_snapshot_returns_empty_map() {
@@ -1124,15 +1114,13 @@ mod tests {
         let observed = Arc::new(AtomicU32::new(0));
         let changes = Arc::new(AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(async {});
+        let api = TokioBackground::default();
         let task = Arc::new(AutoUpdateTask {
             topic: "persistent://public/default/unit-test".to_owned(),
             observed_partitions: observed.clone(),
             change_count: changes.clone(),
             changed: notify.clone(),
-            shutdown,
-            handle: tokio::sync::Mutex::new(Some(handle)),
+            task: BackgroundTask::spawn(&api, "unit-test", async {}),
         });
         let with_watcher = Some(task);
         assert!(has_auto_update(with_watcher.as_ref()));
@@ -1180,7 +1168,9 @@ mod tests {
     /// are covered by [`crate::auto_update_task::tests`].
     #[tokio::test(start_paused = true)]
     async fn auto_update_timer_signals_on_tick() {
+        let api = TokioBackground::default();
         let task = spawn_auto_update_task(
+            &api,
             "persistent://public/default/timer-test".to_owned(),
             Duration::from_millis(100),
             0,

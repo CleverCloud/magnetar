@@ -83,6 +83,12 @@ magnetar-auth-sasl = { workspace = true }
 # two engine-shaped drivers. `crypto-aws-lc-rs` for the deterministic RS256.
 magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
 async-trait = { workspace = true }
+# `tests/table_view_sim_providers.rs` runs the façade `TableView` over `MoonpoolEngine<SimProviders>`:
+# `moonpool-sim` supplies the deterministic providers, `futures` the futures-io stream extension
+# traits the simulated sockets implement and `FutureExt::catch_unwind`. Both are already in the
+# lockfile through `magnetar-runtime-moonpool`; dev-only.
+moonpool-sim = { workspace = true }
+futures = { workspace = true, features = ["std"] }
 # PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
 prost = { workspace = true }
 flate2 = { workspace = true }
