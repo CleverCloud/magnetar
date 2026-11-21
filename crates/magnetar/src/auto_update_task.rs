@@ -14,10 +14,12 @@
 //!
 //! Lifetime is bounded by the surface that owns the
 //! `Arc<AutoUpdateTask>`: dropping every clone of that surface drops the
-//! `Arc`, which runs [`Drop`] for [`AutoUpdateTask`] and aborts the
-//! spawned tokio task. No channels — coordination is `Arc<Mutex<...>>` +
-//! [`tokio::sync::Notify`] + [`tokio::time::interval`] (per the
-//! project's "no channels in Rust async code" policy).
+//! `Arc`, which drops the [`BackgroundTask`] and stops the spawned task. The task
+//! is spawned and paced through the owning client's [`BackgroundApi`], so it runs on
+//! the executor and clock of the provider bundle that client was built over: Tokio's
+//! for `TokioEngine`, the simulation's for `MoonpoolEngine<SimProviders>` (ADR-0078).
+//! No channels — coordination is [`tokio::sync::Notify`] plus the client's sleep (per
+//! the project's "no channels in Rust async code" policy).
 //!
 //! Private — no public API surface.
 
@@ -26,7 +28,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+
+use crate::BackgroundApi;
+use crate::background_task::BackgroundTask;
 
 /// Background partition-watcher timer task. See module docs.
 #[derive(Debug)]
@@ -48,30 +52,9 @@ pub(crate) struct AutoUpdateTask {
     /// the owning surface's `refresh_partitions` detects a real
     /// partition-count change.
     pub(crate) changed: Arc<Notify>,
-    /// Signalled on drop to cooperatively wake the loop sleeping on
-    /// [`Notify`] so it can notice it has been aborted promptly. The
-    /// `handle.abort()` is the source of truth; the notify is only there
-    /// to short-circuit a long `tick().await`.
-    pub(crate) shutdown: Arc<Notify>,
-    /// The spawned task. Held in a [`tokio::sync::Mutex`] so [`Drop`]
-    /// can take it on the best-effort path without blocking; some
-    /// owners (`TableView::close`) drain it explicitly via the lock.
-    pub(crate) handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for AutoUpdateTask {
-    fn drop(&mut self) {
-        // Best-effort wake of the loop, then abort. If the lock is contended the abort
-        // still happens once `Mutex<Option<JoinHandle>>` is dropped via the inner Option,
-        // but the JoinHandle's own `Drop` does not abort by itself — only the explicit
-        // `abort()` here does — so this `try_lock` matters for prompt teardown.
-        self.shutdown.notify_waiters();
-        if let Ok(mut g) = self.handle.try_lock()
-            && let Some(h) = g.take()
-        {
-            h.abort();
-        }
-    }
+    /// The spawned timer task. Dropping the `AutoUpdateTask` stops it; some owners
+    /// (`TableView::close`) stop it earlier and wait for it to end.
+    pub(crate) task: BackgroundTask,
 }
 
 /// Spawn the partition-watcher *timer* task.
@@ -89,9 +72,11 @@ impl Drop for AutoUpdateTask {
 /// [`crate::TableView`]) pass `0` so the first observed refresh always logs a
 /// change.
 ///
-/// The `Arc<AutoUpdateTask>` returned wraps a [`Drop`] that aborts the spawned
-/// task, so the timer is bounded by the owning surface's lifetime.
-pub(crate) fn spawn_auto_update_task(
+/// The `Arc<AutoUpdateTask>` returned owns the spawned task and stops it when dropped, so the
+/// timer is bounded by the owning surface's lifetime. `api` is the owning surface's client: the
+/// task is spawned, and sleeps, where that client runs.
+pub(crate) fn spawn_auto_update_task<A: BackgroundApi>(
+    api: &A,
     topic: String,
     interval: Duration,
     initial_partitions: u32,
@@ -99,22 +84,14 @@ pub(crate) fn spawn_auto_update_task(
     let observed_partitions = Arc::new(AtomicU32::new(initial_partitions));
     let change_count = Arc::new(AtomicU64::new(0));
     let changed = Arc::new(Notify::new());
-    let shutdown = Arc::new(Notify::new());
 
     let changed_task = changed.clone();
-    let shutdown_task = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate tick so the first real signal happens after one interval.
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown_task.notified() => break,
-                _ = ticker.tick() => {}
-            }
+    let sleep = api.background_sleeper();
+    let task = BackgroundTask::spawn(api, "magnetar-auto-update-partitions", async move {
+        // The first signal comes one interval after the spawn, and each next one an interval
+        // after the previous signal (the old `MissedTickBehavior::Delay`). The sleep resolves
+        // `false` once the client's clock is gone, which ends the task instead of spinning.
+        while sleep(interval).await {
             changed_task.notify_waiters();
         }
     });
@@ -124,8 +101,7 @@ pub(crate) fn spawn_auto_update_task(
         observed_partitions,
         change_count,
         changed,
-        shutdown,
-        handle: tokio::sync::Mutex::new(Some(handle)),
+        task,
     })
 }
 
@@ -134,41 +110,86 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+    use crate::background_task::TokioBackground;
 
-    /// Spawn the auto-update timer and confirm the [`Drop`] impl aborts the
+    /// Spawn the auto-update timer and confirm dropping the owner stops the
     /// spawned task. Uses `tokio::time::pause()` for deterministic timing.
     #[tokio::test(start_paused = true)]
     async fn drop_aborts_spawned_task() {
+        let api = TokioBackground::default();
         let task = spawn_auto_update_task(
+            &api,
             "persistent://public/default/drop-abort-test".to_owned(),
             Duration::from_millis(100),
             0,
         );
-        // Capture the JoinHandle's abort handle so we can verify it was aborted
+        // Keep the spawned task's abort handle so we can verify it finished
         // after the `Arc` drops.
-        let abort_handle = {
-            let g = task.handle.lock().await;
-            g.as_ref()
-                .expect("handle is Some until Drop runs")
-                .abort_handle()
-        };
+        let abort_handle = api.spawned.lock()[0].clone();
         assert!(!abort_handle.is_finished());
         // Advance virtual time and let the spawned task make progress before drop.
         tokio::time::advance(Duration::from_millis(150)).await;
         tokio::task::yield_now().await;
+        assert!(
+            !abort_handle.is_finished(),
+            "the timer loop runs until it is stopped"
+        );
 
-        // Dropping the only Arc clone runs `Drop` → `handle.abort()`.
+        // Dropping the only Arc clone drops the owned `BackgroundTask` → stop.
         drop(task);
-        // Give the runtime a turn to observe the abort.
+        // Give the runtime a turn to observe the stop.
         tokio::task::yield_now().await;
         assert!(abort_handle.is_finished());
+    }
+
+    /// A client whose clock is gone: every sleep resolves `false` at once, as a time provider
+    /// does once its simulation has ended.
+    struct ClockGone(TokioBackground);
+
+    impl BackgroundApi for ClockGone {
+        fn spawn_background(
+            &self,
+            name: &str,
+            task: crate::BackgroundFuture,
+        ) -> crate::BackgroundFuture {
+            self.0.spawn_background(name, task)
+        }
+
+        fn background_sleeper(&self) -> crate::BackgroundSleep {
+            Arc::new(|_| Box::pin(async { false }))
+        }
+    }
+
+    /// The ticker ends on its own when the clock is gone, instead of looping without ever
+    /// yielding (which no stop signal could interrupt). Nothing stops it here: the test waits for
+    /// the task to finish by itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ticker_ends_when_the_clock_is_gone() {
+        let api = ClockGone(TokioBackground::default());
+        let task = spawn_auto_update_task(
+            &api,
+            "persistent://public/default/clock-gone".to_owned(),
+            Duration::from_millis(100),
+            0,
+        );
+        let abort_handle = api.0.spawned.lock()[0].clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !abort_handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the ticker must end by itself once the clock is gone");
+        drop(task);
     }
 
     /// `initial_partitions` seeds the observed counter so the owning surface
     /// can detect the first real change.
     #[tokio::test(start_paused = true)]
     async fn initial_partitions_seeds_observed_counter() {
+        let api = TokioBackground::default();
         let task = spawn_auto_update_task(
+            &api,
             "persistent://public/default/seed-test".to_owned(),
             Duration::from_mins(1),
             7,

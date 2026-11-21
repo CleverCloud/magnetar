@@ -127,7 +127,9 @@ Full surfaces are documented under the PIP feature notes in [`docs/pip-features.
 Several Java client features rely on periodic background work (`PatternConsumer` topic rediscovery, `TableView` partition tracking, `PartitionedProducer`/`PartitionedConsumer`/`MultiTopicsConsumer` partition-count updates).
 The pattern is uniform:
 
-- The ticker spawns a `tokio::time::interval` task that signals a `Notify` on every tick.
+- The ticker is a task spawned and paced through the owning client's `BackgroundApi` ([ADR-0139](specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)) that signals a `Notify` on every tick: ambient Tokio for `TokioEngine`, the client's `TaskProvider` and `TimeProvider` for `MoonpoolEngine<P>` (the seeded executor and virtual clock under `SimProviders`).
+  The task stops cooperatively when its owner is dropped; `TableView::close` waits for it to end.
+  `PatternConsumer::start_auto_reconcile` is the exception: it still spawns with `tokio::spawn`, paces with `tokio::time::interval` and returns the `JoinHandle`, so it needs a Tokio runtime on either engine.
 - The runtime façade (`magnetar-runtime-tokio`) takes the `Instant::now()` snapshot at the call site and forwards it into `magnetar-proto::Connection` entries.
 - `magnetar-proto` itself never reads the host clock — the `check-no-internal-clock` xtask enforces this.
 
@@ -136,7 +138,7 @@ The schedule API lives on the relevant builder (`PartitionedProducerBuilder::aut
 ### Push delivery (consumer `MessageListener`)
 
 `ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (and the `TypedConsumerBuilder` twin) flip a consumer from pull to push, mirroring Java `ConsumerBuilder#messageListener` ([ADR-0064](specs/adr/0064-consumer-message-listener-push-delivery.md)).
-The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` background task `TableView::listen` uses (`crates/magnetar/src/table_view.rs` `spawn_drain`), generalised in `crates/magnetar/src/consumer_listener.rs` over `C: ConsumerApi + Clone` so the tokio and moonpool consumers share one poller.
+The mechanism is the same `loop { receive(); callback }` background task the `TableView` drain runs (`crates/magnetar/src/table_view.rs` `spawn_drain`), but spawned with `tokio::spawn` (the `TableView` drain itself goes through the client's `BackgroundApi`, ADR-0139), generalised in `crates/magnetar/src/consumer_listener.rs` over `C: ConsumerApi + Clone` so the tokio and moonpool consumers share one poller.
 It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
 Delivery is sequential and in order, and the callback acks explicitly (the poller never auto-acks).
 An explicit or terminal remote close ends the task when `receive()` returns an error.
@@ -979,6 +981,8 @@ Owns the transaction-coordinator client.
 Pulsar transactions use four opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SUBSCRIPTION_TO_TXN`, `END_TXN_*`) routed to the TC.
 `TxnClient` carries the `TxnId` registry and surfaces a Rust `Transaction` handle.
 The producer attaches `txn_id` to its publish via `OutgoingMessage::txn`, and the consumer attaches it to acks via `ack_with_txn` / `ack_cumulative_with_txn` / `ack_batch_with_txn`.
+A `new_txn`, `add_partition_to_txn` or `add_subscription_to_txn` request is correlated by its request id like a lookup: the runtimes await it through the cancellable request future, and the response arms record an outcome only for a request still pending, so a caller that gives up leaves nothing for the broker's late reply to land in; that reply still reaches `TxnClient`, which records a registration the broker performed ([ADR-0129](specs/adr/0129-bound-and-fast-fail-pip-31-transaction-requests.md)).
+`Connection::reset` retires the client's per-request entries of every transaction request of the ended session, pending at the reset or cancelled before it (`TxnClient::forget_all_requests`), since the dead session answers none of them; an `EndTxn` outcome is still retained across a reset so a retried commit or abort resumes the canonical request, and that resume never reads the `TxnClient` entry ([ADR-0138](specs/adr/0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)).
 
 [`crates/magnetar-proto/src/conn.rs`]: crates/magnetar-proto/src/conn.rs
 
@@ -1541,6 +1545,7 @@ trait set:
 | `TransactionApi`                                                       | runtime `Client`   | `PulsarClient::new_transaction` + commit/abort.                                                                                                                                                                                              |
 | `SubscribeApi` (with `type Consumer: ConsumerApi`)                     | runtime `Client`   | `ConsumerBuilder<'a, E>::subscribe` + every consumer-spawning builder (`MultiTopicsConsumerBuilder<'a, E>`, `PartitionedConsumerBuilder<'a, E>`, `PatternConsumerBuilder<'a, E>`, `ReaderBuilder<'a, E>`, `TypedConsumerBuilder<'a, S, E>`). |
 | `CreateProducerApi` (with `type Producer: ProducerApi`)                | runtime `Client`   | `ProducerBuilder<'a, E>::create` + `TypedProducerBuilder<'a, S, E>`.                                                                                                                                                                         |
+| `BackgroundApi` (supertrait of `SubscribeApi` and `CreateProducerApi`) | runtime `Client`   | The `TableView` drain and the auto-update partition tickers of `TableView`, `PartitionedProducer` and `MultiTopicsConsumer`: `spawn_background` / `background_sleeper` run them on the client's own providers (ADR-0139).                    |
 | `ConsumerApi` (with `type Producer: ProducerApi<Error = Self::Error>`) | runtime `Consumer` | All inherent methods of `MultiTopicsConsumer<C>` / `PatternConsumer<C>` / `Reader<C>` / `TableView<C>` (and the DLQ + retry helpers route through the associated `Producer`).                                                                |
 | `ProducerApi`                                                          | runtime `Producer` | `PartitionedProducer<P>` inherent methods.                                                                                                                                                                                                   |
 | `BrokerMetadataApi`                                                    | runtime `Client`   | `PulsarClient::partitions_for_topic` / `topic_list_snapshot`; `PartitionedConsumerBuilder` (partition discovery) + `PatternConsumer::update` (PIP-145 delta polling).                                                                        |
