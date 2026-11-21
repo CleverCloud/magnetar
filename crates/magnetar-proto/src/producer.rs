@@ -157,6 +157,14 @@ pub struct OpSend {
     /// Payload bytes inside [`OutboundFrame`] are `bytes::Bytes`, so cloning the vector
     /// is refcounted and cheap.
     pub replay_frames: Vec<OutboundFrame>,
+    /// The lowest sequence id of the batch frame this publish rides in, or `None` for a publish
+    /// that is its own frame (a single message or a chunked one). Every member of one batch
+    /// shares the value, which is the `sequence_id` the flushed `CommandSend` carries, so it
+    /// names the frame before the frame exists. The broker answers a batch frame with ONE
+    /// `CommandSendError` naming one member's id, and the entry was not persisted, so no
+    /// receipt will ever come for the others: [`ProducerState::apply_send_error`] fails every
+    /// op that shares this value.
+    pub(crate) batch_lowest: Option<SequenceId>,
     /// Bytes this publish holds against the client-wide memory budget (issue #867,
     /// ADR-0111). Released exactly once, when this `OpSend` is dropped — that is, when the
     /// publish leaves the client for good. Every method that removes an op from the pending
@@ -1210,6 +1218,7 @@ impl ProducerState {
             error: None,
             enqueued_at: now,
             replay_frames,
+            batch_lowest: None,
             reservation,
         };
         self.pending_index.insert(seq, self.pending.len());
@@ -1271,7 +1280,8 @@ impl ProducerState {
         self.last_sequence_id_pushed = msg_seq as i64;
         self.batch.highest_sequence_id = Some(msg_seq);
         // Each batched message gets its own `OpSend` with `num_messages = 1` so
-        // `apply_receipt` (or `apply_send_error`) can resolve them individually. The
+        // `apply_receipt` can resolve them individually (`apply_send_error` fails every op of
+        // the frame through `batch_lowest`). The
         // `flush_batch` path emits a single wire frame with `sequence_id = lowest`
         // and `highest_sequence_id = highest` — the inbound receipt then fans out over
         // `[lowest, highest]` and each `OpSend` is removed in turn.
@@ -1287,6 +1297,9 @@ impl ProducerState {
             // batch, so reconnect cannot replay it once per logical send. Reset resolves these
             // entries with a deterministic send error instead.
             replay_frames: Vec::new(),
+            // The frame this member will leave in is named by the batch's lowest id, which is
+            // set above on the first member and never changes until the flush.
+            batch_lowest: self.batch.lowest_sequence_id.map(SequenceId),
             // Each batched message holds its own reservation: the receipt fan-out releases
             // them one op at a time.
             reservation,
@@ -1594,6 +1607,7 @@ impl ProducerState {
             error: None,
             enqueued_at: now,
             replay_frames,
+            batch_lowest: None,
             // One reservation for the whole logical message, held by its single op.
             reservation,
         };
@@ -1669,19 +1683,48 @@ impl ProducerState {
         Some((op, mid))
     }
 
-    /// Apply a `CommandSendError` to the pending queue. Returns the removed op (its waker
-    /// still parked on it) with the broker's error code and message; the caller drops the op
-    /// (releasing its memory reservation) after the per-slot lock is gone.
-    pub fn apply_send_error(
-        &mut self,
-        err: &pb::CommandSendError,
-    ) -> Option<(OpSend, i32, String)> {
-        let seq = SequenceId(err.sequence_id);
+    /// Apply a `CommandSendError` to the pending queue. Returns every removed op (its waker
+    /// still parked on it) with the broker's error code and message, oldest first; the caller
+    /// drops each op (releasing its memory reservation) after the per-slot lock is gone. Empty
+    /// when the named sequence id is not pending.
+    ///
+    /// A batch is ONE wire frame, so the broker answers a rejected batch with one error that
+    /// names one member's id (the HIGHEST, because it validates the frame against its
+    /// `highest_sequence_id`). The entry was not persisted, so no receipt follows for the other
+    /// members: they fail with the same error here, exactly as the receipt fans a success out
+    /// over `[lowest, highest]`. The members are the pending ops that share the named op's
+    /// `batch_lowest` (the lowest sequence id of the frame they ride in); an unbatched or
+    /// chunked publish has none and fails alone.
+    pub fn apply_send_error(&mut self, err: &pb::CommandSendError) -> Vec<(OpSend, i32, String)> {
+        let named = SequenceId(err.sequence_id);
+        let frame = self
+            .pending
+            .iter()
+            .find(|op| op.sequence_id == named)
+            .and_then(|op| op.batch_lowest);
+        let members: Vec<SequenceId> = match frame {
+            Some(lowest) => self
+                .pending
+                .iter()
+                .filter(|op| op.batch_lowest == Some(lowest))
+                .map(|op| op.sequence_id)
+                .collect(),
+            None => vec![named],
+        };
+        members
+            .into_iter()
+            .filter_map(|seq| self.take_pending(seq))
+            .map(|op| (op, err.error, err.message.clone()))
+            .collect()
+    }
+
+    /// Remove the pending op for `seq` and keep `pending_index` consistent with the queue.
+    fn take_pending(&mut self, seq: SequenceId) -> Option<OpSend> {
         let _idx = self.pending_index.remove(&seq)?;
         let position = self.pending.iter().position(|op| op.sequence_id == seq)?;
         let op = self.pending.remove(position)?;
         self.shift_pending_index_left(position);
-        Some((op, err.error, err.message.clone()))
+        Some(op)
     }
 
     /// Decrement every `pending_index` value strictly greater than

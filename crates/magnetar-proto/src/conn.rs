@@ -2893,21 +2893,23 @@ impl Connection {
                     "missing CommandSendError",
                 ))?;
                 let handle = ProducerHandle(err.producer_id);
-                let resolved: Option<(OpSend, i32, String)> = if let Some(slot) =
-                    self.producers.get(&handle)
-                {
-                    let mut producer = slot.state.lock();
-                    let outcome = producer.apply_send_error(&err);
-                    if outcome.is_some() {
-                        producer.total_send_failed = producer.total_send_failed.saturating_add(1);
-                    }
-                    outcome
-                } else {
-                    None
-                };
-                // The op drops (releasing its memory reservation) at the end of this block,
-                // after the per-slot guard is gone (ADR-0111).
-                if let Some((mut op, code, message)) = resolved {
+                // A rejected batch frame fails every member, not only the one the broker names
+                // (see `ProducerState::apply_send_error`).
+                let resolved: Vec<(OpSend, i32, String)> = self
+                    .producers
+                    .get(&handle)
+                    .map(|slot| {
+                        let mut producer = slot.state.lock();
+                        let outcome = producer.apply_send_error(&err);
+                        producer.total_send_failed = producer
+                            .total_send_failed
+                            .saturating_add(outcome.len() as u64);
+                        outcome
+                    })
+                    .unwrap_or_default();
+                // Each op drops (releasing its memory reservation) at the end of its
+                // iteration, after the per-slot guard is gone (ADR-0111).
+                for (mut op, code, message) in resolved {
                     let seq = op.sequence_id;
                     let waker = op.waker.take();
                     let key = PendingOpKey::Send(handle, seq);
@@ -25849,6 +25851,184 @@ mod memory_limit_release_tests {
             conn.take_outcome(PendingOpKey::Send(handle, s1)),
             Some(OpOutcome::SendError { .. })
         ));
+    }
+
+    /// A broker `CommandSendError` for a batched frame fails EVERY member of the batch.
+    ///
+    /// `flush_batch` folds the per-member ops `[s0, s1, s2]` into one `CommandSend` carrying
+    /// `sequence_id = s0` and `highest_sequence_id = s2`. The broker validates a batch frame
+    /// against its HIGHEST id, so every pre-persist rejection (`PersistenceError`,
+    /// `ChecksumError`, `MetadataError`) names `s2`. The entry was not persisted, so no receipt
+    /// will ever come for `s0` and `s1`: they must fail with the same error and release their
+    /// bytes, exactly as the receipt arm fans a success out over `[lowest, highest]`.
+    #[test]
+    fn send_error_for_a_batched_frame_fails_every_member_of_the_batch() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-batch-error")
+            },
+        );
+        let budget = budget(100);
+        let s0 = send(&mut conn, handle, &budget, 10, at);
+        let s1 = send(&mut conn, handle, &budget, 10, at);
+        let s2 = send(&mut conn, handle, &budget, 10, at);
+        assert_eq!(budget.used_bytes(), 30);
+        assert_eq!(
+            conn.flush_producer(handle, 0, at),
+            1,
+            "the three members leave as one frame"
+        );
+        let frames = transmitted(&mut conn);
+        let batch = frames
+            .iter()
+            .find_map(|c| c.send.as_ref())
+            .expect("the batch left as one CommandSend");
+        assert_eq!(batch.sequence_id, s0.0, "the frame names the lowest id");
+        assert_eq!(
+            batch.highest_sequence_id,
+            Some(s2.0),
+            "and the highest as the range end"
+        );
+        assert_eq!(conn.producer_pending_count(handle), 3);
+
+        // The broker answers a batch frame with the HIGHEST sequence id.
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: s2.0,
+                    error: pb::ServerError::MetadataError as i32,
+                    message: "Messages must be encrypted".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        for (label, seq) in [("s0", s0), ("s1", s1), ("s2", s2)] {
+            match conn.take_outcome(PendingOpKey::Send(handle, seq)) {
+                Some(OpOutcome::SendError { code, message, .. }) => {
+                    assert_eq!(
+                        code,
+                        pb::ServerError::MetadataError as i32,
+                        "{label} carries the broker's error code"
+                    );
+                    assert_eq!(
+                        message, "Messages must be encrypted",
+                        "{label} carries the broker's message"
+                    );
+                }
+                other => panic!(
+                    "{label} ({seq:?}) must resolve with the broker's SendError, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            0,
+            "no member of the rejected batch may stay pending"
+        );
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "every member's reservation is released"
+        );
+    }
+
+    /// What a rejected batch leaves behind: every member removed from the queue and its reservation
+    /// released, with the producer still open. Its next batch is a frame of its own that resolves
+    /// on its own receipt, unaffected by the members failed before it.
+    #[test]
+    fn the_next_batch_after_a_rejected_one_resolves_on_its_own_receipt() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-batch-error-recovery")
+            },
+        );
+        let budget = budget(100);
+        let rejected: Vec<_> = (0..3)
+            .map(|_| send(&mut conn, handle, &budget, 10, at))
+            .collect();
+        assert_eq!(conn.flush_producer(handle, 0, at), 1);
+        let _ = transmitted(&mut conn);
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: rejected[2].0,
+                    error: pb::ServerError::MetadataError as i32,
+                    message: "Messages must be encrypted".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        for seq in &rejected {
+            assert!(matches!(
+                conn.take_outcome(PendingOpKey::Send(handle, *seq)),
+                Some(OpOutcome::SendError { .. })
+            ));
+        }
+        assert_eq!(budget.used_bytes(), 0);
+
+        let next: Vec<_> = (0..2)
+            .map(|_| send(&mut conn, handle, &budget, 10, at))
+            .collect();
+        assert_eq!(
+            conn.flush_producer(handle, 0, at),
+            1,
+            "the next batch leaves"
+        );
+        let frames = transmitted(&mut conn);
+        let batch = frames
+            .iter()
+            .find_map(|c| c.send.as_ref())
+            .expect("the next batch left as one CommandSend");
+        assert_eq!(batch.sequence_id, next[0].0);
+        assert_eq!(batch.highest_sequence_id, Some(next[1].0));
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: next[0].0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 0,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: Some(next[1].0),
+                }),
+                ..Default::default()
+            },
+        );
+        for seq in &next {
+            assert!(
+                matches!(
+                    conn.take_outcome(PendingOpKey::Send(handle, *seq)),
+                    Some(OpOutcome::SendReceipt { .. })
+                ),
+                "{seq:?} of the next batch resolves on its receipt"
+            );
+        }
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]

@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A broker error for a batched send now fails every member of the batch.**
+  A batching producer folds its messages into one `CommandSend` carrying the range `[lowest, highest]`, and the broker validates and rejects that frame against its highest sequence id, so a rejection before the entry is persisted (`MetadataError` "Messages must be encrypted", `ChecksumError`, a closed producer's `PersistenceError`) names one member.
+  The `SendError` arm resolved only that member: the receipt arm fans out over the range, the error arm had no equivalent, and no receipt ever follows for the others, so each kept its future and its bytes against the client-wide `memory_limit` until `send_timeout` (forever with `send_timeout: None`) and then failed with the synthetic "send timeout" instead of the broker's error.
+  A batching producer without encryption on a topic that requires it left N-1 of every N sends hanging that way.
+  Each batched `OpSend` now records the lowest sequence id of its frame, and `ProducerState::apply_send_error` fails every pending op that shares it with the broker's code and message and releases their bytes, on both engines ([ADR-0145](specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md)).
+  A single or chunked publish still fails alone.
+  `magnetar_proto::producer::ProducerState::apply_send_error` now returns a `Vec<(OpSend, i32, String)>` (every removed op, oldest first) instead of an `Option`; the `magnetar` façade is unchanged.
+
 - **The connection no longer keeps a record of every transaction it ever opened.**
   `TxnClient::handle_new_txn_response` registers one `TransactionMetadata` (ids, state, timeout, and the topics and subscriptions registered under the transaction) per `CommandNewTxn`, and a `CommandEndTxnResponse` only rewrote its state to `Committed`, `Aborted` or `Errored`.
   The one remover, `TxnClient::forget`, had no caller outside its unit test, and the `Connection` is built once and reused across every supervised reconnect, so an exactly-once client gained one record per transaction for as long as it ran.
