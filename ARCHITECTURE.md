@@ -1559,6 +1559,7 @@ Before the broker publishes a controller URL, registration reuses only the alrea
 Explicit close through any clone is globally definitive for local routes, tasks, and children; final drop performs synchronous best-effort fencing without blocking or spawning. On GA, close marks in-flight registrations to leave after their subscribe responses arrive, then sends type-82 unsubscribe without waiting for its broker response; M1 retains connection-close cleanup behavior. A cancelled registration retains its fixed-size request record until its response or physical connection reset. These control-plane records are outside the aggregate receive budget, and the low-level connection API has no admission cap.
 
 The old drop-on-change event remains only on the raw diagnostic layout-session surface.
+When `Connection` rejects an unusable update on that surface or on a namespace or TC watch, it drops the watch locally and also stages the matching close command, so the broker stops pushing on it; a failure the broker reported leaves nothing to close ([ADR-0149](specs/adr/0149-close-a-scalable-topic-watch-the-client-rejects-at-the-broker.md)).
 The high-level aggregate reconciles DAG and assignment changes in place under the contracts above.
 See [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md); upstream ancestry, assignment-generation, and proxy-routing gaps remain explicit rather than being papered over by local fencing.
 

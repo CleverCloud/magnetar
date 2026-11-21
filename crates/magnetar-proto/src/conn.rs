@@ -8785,16 +8785,28 @@ impl Connection {
         if self.scalable_sessions.remove(&session_id).is_none() {
             return;
         }
+        self.encode_scalable_topic_close(session_id);
+        self.events.push_back(ConnectionEvent::DagWatchClosed {
+            session_id,
+            reason: Some("client-initiated close".to_owned()),
+        });
+    }
+
+    /// Stage `CommandScalableTopicClose` for a session this connection has just
+    /// dropped from its registry.
+    ///
+    /// The broker keeps pushing on a session until it receives this command, so
+    /// every client-side removal of a session the broker did not itself end must
+    /// stage it: [`Self::close_scalable_topic_session`] and the rejection arm of
+    /// [`Self::handle_scalable_topic_update`].
+    #[cfg(feature = "scalable-topics")]
+    fn encode_scalable_topic_close(&mut self, session_id: u64) {
         let cmd = pb::BaseCommand {
             r#type: pb::base_command::Type::ScalableTopicClose as i32,
             scalable_topic_close: Some(pb::CommandScalableTopicClose { session_id }),
             ..Default::default()
         };
         let _ = self.encode_command(&cmd);
-        self.events.push_back(ConnectionEvent::DagWatchClosed {
-            session_id,
-            reason: Some("client-initiated close".to_owned()),
-        });
     }
 
     /// Snapshot the current DAG for a session (for the CLI `topic-info`
@@ -9231,7 +9243,18 @@ impl Connection {
                     .push_back(ConnectionEvent::ScalableTopicsChanged { watch_id, change });
             }
             Err(err) => {
-                self.scalable_topic_watches.remove(&watch_id);
+                // A failure the broker reported ended the watch at the broker.
+                // Any other rejection (an update carrying neither an event nor
+                // an error) leaves it live there, pushing, until the client
+                // closes it.
+                if matches!(
+                    err,
+                    crate::scalable_consumer::TopicsWatchError::Broker { .. }
+                ) {
+                    self.scalable_topic_watches.remove(&watch_id);
+                } else {
+                    self.close_scalable_topics_watch(watch_id);
+                }
                 self.events
                     .push_back(ConnectionEvent::ScalableTopicsWatchClosed {
                         watch_id,
@@ -9249,17 +9272,26 @@ impl Connection {
             return;
         }
         let Some(snapshot) = upd.snapshot else {
-            self.tc_assignment_watches.remove(&watch_id);
+            let reason = match upd.error {
+                // The broker ended the watch itself.
+                Some(code) => {
+                    self.tc_assignment_watches.remove(&watch_id);
+                    format!(
+                        "broker rejected the TC-assignment watch (code {code}): {}",
+                        upd.message.unwrap_or_default()
+                    )
+                }
+                // The client refuses the update; the watch is still live at the
+                // broker, pushing, until the client closes it.
+                None => {
+                    self.close_tc_assignments_watch(watch_id);
+                    "TC-assignment update carried no snapshot".to_owned()
+                }
+            };
             self.events
                 .push_back(ConnectionEvent::TcAssignmentsWatchClosed {
                     watch_id,
-                    reason: Some(match upd.error {
-                        Some(code) => format!(
-                            "broker rejected the TC-assignment watch (code {code}): {}",
-                            upd.message.unwrap_or_default()
-                        ),
-                        None => "TC-assignment update carried no snapshot".to_owned(),
-                    }),
+                    reason: Some(reason),
                 });
             return;
         };
@@ -9340,6 +9372,13 @@ impl Connection {
                 // A rejected update closes the session (drop-on-change). The
                 // runtime re-resolves.
                 self.scalable_sessions.remove(&session_id);
+                // A failure the broker reported ended the session at the
+                // broker. Any other rejection (a bodyless update, a layout that
+                // fails whole-snapshot validation) leaves it live there,
+                // pushing, until the client closes it.
+                if !matches!(err, crate::dag_watch::DagError::Broker { .. }) {
+                    self.encode_scalable_topic_close(session_id);
+                }
                 self.events.push_back(ConnectionEvent::DagWatchClosed {
                     session_id,
                     reason: Some(format!("scalable-topic update rejected: {err}")),

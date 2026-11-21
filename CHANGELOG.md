@@ -33,6 +33,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A scalable-topic watch the client itself refuses is now closed at the broker.**
+  A DAG session, a namespace scalable-topics watch and a TC-assignment watch each live at the broker until the client sends `CommandScalableTopicClose`, `CommandWatchScalableTopicsClose` or `CommandWatchTcAssignmentsClose` (ADR-0093 § D2 for the DAG session; the upstream `PulsarApi.proto` for the two watches).
+  When `Connection` rejected an update because it was unusable (a bodyless update on any of the three, or a forward-epoch DAG layout that failed whole-snapshot validation), it dropped the watch from its registry and queued the `*WatchClosed` event but encoded no close frame, and every later close was a no-op because the watch was already gone.
+  The broker kept the watch, and kept pushing on it, for the life of the TCP connection.
+  The aggregate's reconnect path re-opens the DAG session through `retry_control_plane_error`, which has no attempt cap and sleeps 100 ms, so a layout that stayed rejectable abandoned one more broker-side session on every pass.
+  The rejection arms now stage the matching close frame, through the same encoder as the explicit close, for every rejection except a failure the broker itself reported (`DagError::Broker`, `TopicsWatchError::Broker`, an update carrying `error`), which ended that watch at the broker and needs no close; the events are unchanged.
+  Only a non-conformant broker, or a client validator stricter than the broker, sends an unusable update, and `scalable-topics` is default-off, so the severity is low.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0149](specs/adr/0149-close-a-scalable-topic-watch-the-client-rejects-at-the-broker.md)).
+
 - **A `CommandSendReceipt` is now applied in time bounded by the producer's own in-flight sends, not by a number the broker wrote.**
   The `SendReceipt` arm fanned a batch receipt out by counting `lowest..=highest` one sequence id at a time, with `highest` taken from the broker's `highest_sequence_id` and bounded only by `highest >= lowest` and `highest != u64::MAX` (the Java `-1` sentinel).
   A receipt claiming a range far wider than anything the producer sent kept the thread in that loop for as long as the range was long, with the connection mutex and the producer slot lock both held, so every other operation of the client waited behind it and no timeout or heartbeat could fire on the same thread.
