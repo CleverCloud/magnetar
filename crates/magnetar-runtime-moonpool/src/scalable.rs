@@ -3,8 +3,11 @@
 //! Owned, bounded routes for scalable-topic control-plane events.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 
 use moonpool_core::{Providers, TaskProvider};
 use parking_lot::Mutex;
@@ -18,6 +21,12 @@ use crate::{ConnectionShared, ScalableEvent, SleepProvider};
 const MAX_ROUTE_EVENTS: usize = 64;
 const MAX_AGGREGATE_EVENTS: usize = 256;
 const MAX_RETIRED_ROUTES: usize = 256;
+/// How many successfully propagated transaction outcomes the aggregate keeps, the
+/// newest ones, evicting the oldest first. A repeated outcome for a transaction
+/// still in this window is answered from its record instead of being propagated
+/// again; the facade reports each transaction once and never asks about it again,
+/// so the window only has to outlive a duplicate or a retry, not the aggregate.
+const MAX_SETTLED_TRANSACTION_OUTCOMES: usize = 1024;
 const DISCARD_POLICY_ERROR: &str = "scalable child used discard policy";
 
 fn route_error_is_recoverable(error: &ClientError) -> bool {
@@ -71,6 +80,24 @@ fn validate_decompression_ceiling(
 /// like every other control-plane failure.
 fn reopen_error_is_terminal(error: &StreamConsumerError) -> bool {
     matches!(error, StreamConsumerError::Client(client) if control_plane_error_is_terminal(client))
+}
+
+/// Whether the model refused a retained transaction authority because a resynchronization
+/// retired it.
+///
+/// A resynchronization fences the aggregate and replaces its delivery epoch, so every authority
+/// admitted before it is refused: as `InvalidAggregatePhase` in the fenced `ResyncRequired`
+/// phase, and as `StaleAcknowledgementAuthority` once the aggregate reconnected. Such an
+/// authority has nothing left to settle, which is not a failure of the transaction outcome.
+/// Any other phase, a closing aggregate's included, is a failure.
+fn authority_is_retired(error: &magnetar_proto::StreamConsumerModelError) -> bool {
+    matches!(
+        error,
+        magnetar_proto::StreamConsumerModelError::StaleAcknowledgementAuthority
+            | magnetar_proto::StreamConsumerModelError::InvalidAggregatePhase {
+                phase: magnetar_proto::AggregatePhase::ResyncRequired,
+            }
+    )
 }
 
 /// Complete runtime configuration for one assignment-driven aggregate.
@@ -1009,6 +1036,10 @@ struct AggregateState<P: Providers> {
     transaction_registrations:
         BTreeMap<(magnetar_proto::TxnId, magnetar_proto::SegmentSource), TransactionRegistration>,
     transaction_outcomes: BTreeMap<magnetar_proto::TxnId, Arc<TransactionOutcomeCompletion>>,
+    /// Transactions of `transaction_outcomes` whose propagation succeeded, oldest
+    /// first. At most `MAX_SETTLED_TRANSACTION_OUTCOMES` records outlive their
+    /// success.
+    settled_transaction_outcomes: VecDeque<magnetar_proto::TxnId>,
     controller_registration: Option<ControllerRegistration>,
     terminal_error: Option<String>,
     reconnect_requested: bool,
@@ -1034,6 +1065,7 @@ impl<P: Providers> AggregateState<P> {
             pending_transactions: BTreeMap::new(),
             transaction_registrations: BTreeMap::new(),
             transaction_outcomes: BTreeMap::new(),
+            settled_transaction_outcomes: VecDeque::new(),
             controller_registration: Some(controller_registration),
             terminal_error: None,
             reconnect_requested: false,
@@ -1055,6 +1087,48 @@ struct AcknowledgementCancellation<'a, P: Providers> {
     inner: Weak<StreamConsumerInner<P>>,
     authority: &'a magnetar_proto::AcknowledgementAuthority,
     armed: bool,
+}
+
+/// The work a settled acknowledgement leaves behind, boxed so a dropped caller
+/// can hand it to an owned task.
+type SettledWork = Pin<Box<dyn Future<Output = Result<(), StreamConsumerError>> + Send>>;
+
+/// Drives settled work inline with its caller, so the non-cancelled path behaves
+/// as if the caller ran it directly. Dropping the caller before the work finishes
+/// moves the unfinished future onto an owned, tracked task instead of cancelling
+/// it: the model has already committed the settlement, so its follow-up actions
+/// (`CloseChild`, `GrantFlow`, ...) must still run to completion. A failure the
+/// vanished caller cannot receive requests a resynchronization.
+struct ContinueOnDrop<P: Providers> {
+    inner: Arc<StreamConsumerInner<P>>,
+    work: Option<SettledWork>,
+}
+
+impl<P: Providers + Send + Sync + 'static> Future for ContinueOnDrop<P> {
+    type Output = Result<(), StreamConsumerError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let work = self
+            .work
+            .as_mut()
+            .expect("settled work is polled until it completes");
+        let result = std::task::ready!(work.as_mut().poll(context));
+        self.work = None;
+        Poll::Ready(result)
+    }
+}
+
+impl<P: Providers + Send + Sync + 'static> Drop for ContinueOnDrop<P> {
+    fn drop(&mut self) {
+        if let Some(work) = self.work.take() {
+            let inner = self.inner.clone();
+            self.inner.spawn_action_work(async move {
+                if let Err(error) = work.await {
+                    inner.request_resync(error.to_string());
+                }
+            });
+        }
+    }
 }
 
 struct SeekCancellation<P: Providers> {
@@ -1749,23 +1823,50 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         if actions.is_empty() {
             return;
         }
+        let inner = self.clone();
+        self.spawn_action_work(async move {
+            inner.execute_actions_or_resync(actions).await;
+        });
+    }
+
+    /// Run `work` on a tracked task that the aggregate's close joins; a close
+    /// already in progress closes every child itself, so nothing is spawned.
+    fn spawn_action_work<F>(self: &Arc<Self>, work: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let mut state = self.state.lock();
         if !state.close_state.is_closing() {
-            let inner = self.clone();
             let completion_inner = Arc::downgrade(self);
-            let handle = self.subscriber.spawn_task_with_completion(
-                "scalable-actions",
-                async move {
-                    inner.execute_actions_or_resync(actions).await;
-                },
-                move || {
-                    if let Some(inner) = completion_inner.upgrade() {
-                        inner.notify.notify_waiters();
-                    }
-                },
-            );
+            let handle =
+                self.subscriber
+                    .spawn_task_with_completion("scalable-actions", work, move || {
+                        if let Some(inner) = completion_inner.upgrade() {
+                            inner.notify.notify_waiters();
+                        }
+                    });
             Self::track_task(&mut state, handle);
         }
+    }
+
+    /// Execute what a committed settlement left to do: offer the acknowledged
+    /// `components` for completion, then run `actions`. The caller's future drives
+    /// it inline; if that future is dropped first, the rest finishes on an owned
+    /// task instead of being lost.
+    async fn execute_settled(
+        self: &Arc<Self>,
+        components: Vec<magnetar_proto::AcknowledgementComponent>,
+        actions: Vec<magnetar_proto::StreamConsumerAction>,
+    ) -> Result<(), StreamConsumerError> {
+        let inner = self.clone();
+        ContinueOnDrop {
+            inner: self.clone(),
+            work: Some(Box::pin(async move {
+                inner.try_complete_components(&components).await;
+                inner.execute_actions(actions).await
+            })),
+        }
+        .await
     }
 
     async fn execute_actions_or_resync(
@@ -2199,9 +2300,13 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                 Ok(None) => {
                     let actions = {
                         let mut state = self.state.lock();
+                        let state = &mut *state;
+                        // The end of the topic leaves nothing more to arrive, so the
+                        // chunk chains the child still holds open are abandoned
+                        // with their budget instead of pinning the segment.
                         state
-                            .model
-                            .observe_terminal(source.segment_id(), generation)
+                            .receive
+                            .observe_terminal(&mut state.model, source.segment_id(), generation)
                             .unwrap_or_default()
                     };
                     if let Err(error) = self.execute_actions(actions).await {
@@ -2510,8 +2615,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             .model
             .settle_acknowledgement(&transition.authority, &confirmed_sources)?;
         cancellation.disarm();
-        self.try_complete_components(&transition.components).await;
-        self.execute_actions(actions).await?;
+        self.execute_settled(transition.components, actions).await?;
         if failed.is_empty() {
             Ok(())
         } else {
@@ -2545,7 +2649,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                 };
                 cancellation.disarm();
-                self.execute_actions(actions).await?;
+                self.execute_settled(Vec::new(), actions).await?;
                 return Err(error);
             }
             let consumer =
@@ -2578,7 +2682,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     }
                 };
                 cancellation.disarm();
-                self.execute_actions(actions).await?;
+                self.execute_settled(Vec::new(), actions).await?;
                 return Err(error.into());
             }
         }
@@ -2704,6 +2808,9 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         let result = inner
                             .propagate_transaction_outcome(txn_id, outcome, &task_completion)
                             .await;
+                        if result.is_ok() {
+                            inner.retire_settled_transaction_outcome(txn_id);
+                        }
                         task_completion.finish(result.map_err(|error| error.to_string()));
                     },
                     move || {
@@ -2720,6 +2827,19 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             completion
         };
         completion.wait().await.map_err(StreamConsumerError::Failed)
+    }
+
+    /// Notes that the propagation of `txn_id` succeeded and drops the oldest
+    /// settled records beyond `MAX_SETTLED_TRANSACTION_OUTCOMES`. A record that
+    /// failed stays until it is retried: its checkpoint is what a retry resumes.
+    fn retire_settled_transaction_outcome(&self, txn_id: magnetar_proto::TxnId) {
+        let mut state = self.state.lock();
+        state.settled_transaction_outcomes.push_back(txn_id);
+        if state.settled_transaction_outcomes.len() > MAX_SETTLED_TRANSACTION_OUTCOMES
+            && let Some(oldest) = state.settled_transaction_outcomes.pop_front()
+        {
+            state.transaction_outcomes.remove(&oldest);
+        }
     }
 
     async fn propagate_transaction_outcome(
@@ -2754,11 +2874,16 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     } else {
                         let mut actions = Vec::new();
                         for authority in authorities {
-                            actions.extend(
-                                state
-                                    .model
-                                    .settle_transactional_acknowledgement(&authority, outcome)?,
-                            );
+                            let settled = state
+                                .model
+                                .settle_transactional_acknowledgement(&authority, outcome);
+                            // The list outlives a resynchronization, so a retired
+                            // authority can sit ahead of live ones: skip it and
+                            // keep settling the rest.
+                            if matches!(&settled, Err(error) if authority_is_retired(error)) {
+                                continue;
+                            }
+                            actions.extend(settled?);
                         }
                         actions
                     };
@@ -2940,15 +3065,34 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         self.execute_actions(actions).await
     }
 
+    /// Re-resolve the closed DAG watch and align it with the controller assignment.
+    ///
+    /// The alignment waits for the broker to push the epoch the other side is missing, so it
+    /// races the aggregate's close like the alignment of `reconnect_control_plane`: close
+    /// removes the controller registration, so no assignment push can ever complete that wait.
+    /// `Ok(None)` means the aggregate began closing while the alignment waited: the replacement
+    /// is dropped, which releases it, and the caller ends the control task.
     async fn reopen_dag_watch(
         self: &Arc<Self>,
         controller: &mut ControllerSession,
-    ) -> Result<DagSession, StreamConsumerError> {
+    ) -> Result<Option<DagSession>, StreamConsumerError> {
         let mut replacement = self.subscriber.open_dag_session(&self.topic).await?;
-        SegmentSubscriber::<P>::align_control_plane(&mut replacement, controller).await?;
+        let aligned = {
+            let alignment =
+                SegmentSubscriber::<P>::align_control_plane(&mut replacement, controller);
+            let mut alignment = std::pin::pin!(alignment);
+            let closing = self.wait_for_close();
+            let mut closing = std::pin::pin!(closing);
+            moonpool_core::select! {
+                biased;
+                () = &mut closing => return Ok(None),
+                result = &mut alignment => result,
+            }
+        };
+        aligned?;
         self.apply_aligned_control_plane(&replacement, controller)
             .await?;
-        Ok(replacement)
+        Ok(Some(replacement))
     }
 
     async fn control_loop(self: Arc<Self>, mut dag: DagSession, mut controller: ControllerSession) {
@@ -3012,11 +3156,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         reason: reason.unwrap_or_else(|| "scalable DAG watch closed".to_owned()),
                     });
                     match self.reopen_dag_watch(&mut controller).await {
-                        Ok(replacement) => {
+                        Ok(Some(replacement)) => {
                             let previous = core::mem::replace(&mut dag, replacement);
                             previous.close();
                             self.push_assignment_event(controller.assignment());
                         }
+                        Ok(None) => break,
                         Err(error) if reopen_error_is_terminal(&error) => {
                             self.fail_closed(error.to_string());
                             break;
@@ -3224,6 +3369,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     state.pending_transactions.clear();
                     state.transaction_registrations.clear();
                     state.transaction_outcomes.clear();
+                    state.settled_transaction_outcomes.clear();
                     let cancelled_opens: Vec<_> = actions
                         .into_iter()
                         .filter_map(|action| match action {
@@ -3334,6 +3480,7 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
             state.pending_transactions.clear();
             state.transaction_registrations.clear();
             state.transaction_outcomes.clear();
+            state.settled_transaction_outcomes.clear();
             (
                 state
                     .children
@@ -4467,6 +4614,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -4518,6 +4666,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -4878,6 +5027,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -7233,6 +7383,125 @@ mod tests {
         );
     }
 
+    /// Park a spawned (so `close` joins it) control task inside the epoch alignment of a
+    /// replacement DAG watch: the live watch closes, the replacement baseline is at layout
+    /// epoch 2 and the controller assignment stays at layout epoch 1, so the alignment waits for
+    /// an assignment push that nothing sends.
+    async fn aggregate_parked_in_dag_reopen_alignment()
+    -> Arc<StreamConsumerInner<moonpool_core::TokioProviders>> {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let (snapshot, assignment) = control_plane_fixture();
+        let epoch = shared.inner.lock().session_epoch();
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 81),
+            session_id: 81,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot,
+            closed: true,
+        };
+        let controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
+            shared: shared.clone(),
+            route: shared.scalable_routes.claim_at_epoch(
+                shared.clone(),
+                ScalableRouteKey::consumer(42, magnetar_proto::ControllerIncarnation(1)),
+                epoch,
+            ),
+            consumer_id: 42,
+            incarnation: magnetar_proto::ControllerIncarnation(1),
+            assignment,
+            registration_topic: "topic://public/default/scaled".to_owned(),
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+        };
+        inner.spawn_control_task(dag, controller);
+
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::DagWatchClosed {
+                    session_id: 81,
+                    reason: Some("DAG watch moved".to_owned()),
+                })
+                .is_none()
+        );
+        let lookup = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(session_id) = staged_dag_lookup_session(&shared) {
+                    return session_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the closed DAG watch is re-resolved");
+        let replacement = control_plane_fixture_at(2).0;
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup,
+                    resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+                    controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                    controller_broker_url_tls: None,
+                    segments: replacement.segments(),
+                    epoch: 2,
+                    snapshot: replacement,
+                })
+                .is_none()
+        );
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        inner
+    }
+
+    #[tokio::test]
+    async fn close_is_not_blocked_by_the_epoch_alignment_of_a_replacement_dag_watch() {
+        let inner = aggregate_parked_in_dag_reopen_alignment().await;
+
+        // Half the fixture's one-second `operation_timeout`: close must interrupt the alignment,
+        // not merely outlast its deadline.
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inner.close()).await;
+
+        assert!(
+            closed.is_ok(),
+            "close() must interrupt the replacement DAG watch's epoch alignment: the \
+             control task is parked on an assignment push that nothing can send, and close \
+             joins it"
+        );
+        closed.expect("close finished").expect("close succeeds");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_aggregate_releases_a_replacement_dag_watch_alignment() {
+        let inner = aggregate_parked_in_dag_reopen_alignment().await;
+
+        inner.close_best_effort();
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        // Half the fixture's one-second `operation_timeout`, as in the close test above.
+        let released = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            for task in tasks {
+                let _ = task.join().await;
+            }
+        })
+        .await;
+
+        assert!(
+            released.is_ok(),
+            "a fenced aggregate must not keep its control task parked in the epoch alignment \
+             of a replacement DAG watch, holding the DAG session and the controller route"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_open_without_runtime_child_completes_model_cleanup() {
         let inner = empty_aggregate_inner();
@@ -7469,6 +7738,146 @@ mod tests {
         assert!(!state.children.contains_key(&magnetar_proto::SegmentId(2)));
     }
 
+    /// The phase of a strict-ordering descendant after its parent's broker
+    /// consumer reports the end of the topic and the child loop handles it,
+    /// with or without chunk zero of a two-chunk message buffered on the parent.
+    async fn descendant_phase_after_parent_end_of_topic(
+        buffer_chunk_zero: bool,
+    ) -> Option<magnetar_proto::SegmentPhase> {
+        let (snapshot, parent_assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from_ordered(
+            snapshot,
+            parent_assignment.clone(),
+            magnetar_proto::OrderingMode::Strict,
+        );
+        let parent = inner.state.lock().children[&magnetar_proto::SegmentId(1)].clone();
+        let assigned = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: parent_assignment.layout_epoch(),
+                segments: vec![
+                    magnetar_proto::pb::ScalableAssignedSegment {
+                        bucket_ranges: Vec::new(),
+                        segment_id: 1,
+                        hash_start: 0,
+                        hash_end: 65_535,
+                        segment_topic: parent.source.topic().to_owned(),
+                    },
+                    magnetar_proto::pb::ScalableAssignedSegment {
+                        bucket_ranges: Vec::new(),
+                        segment_id: 2,
+                        hash_start: 0,
+                        hash_end: 32_767,
+                        segment_topic: magnetar_proto::canonical_segment_topic(
+                            "topic://public/default/scaled",
+                            magnetar_proto::KeyRange::new(0, 32_767).expect("child range"),
+                            magnetar_proto::SegmentId(2),
+                        )
+                        .expect("canonical child topic"),
+                    },
+                ],
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("parent and descendant assignment");
+        {
+            let mut state = inner.state.lock();
+            let actions = state
+                .model
+                .apply_assignment(assigned)
+                .expect("assign descendant");
+            let generation = actions
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::OpenChild {
+                        source,
+                        child_generation,
+                        ..
+                    } if source.segment_id() == magnetar_proto::SegmentId(2) => {
+                        Some(*child_generation)
+                    }
+                    _ => None,
+                })
+                .expect("descendant opens");
+            state
+                .model
+                .child_opened(magnetar_proto::SegmentId(2), generation)
+                .expect("attach blocked descendant");
+        }
+        if buffer_chunk_zero {
+            let session_epoch = child_shared.inner.lock().session_epoch();
+            inner
+                .message_arrived(
+                    parent.source.clone(),
+                    parent.generation,
+                    session_epoch,
+                    &parent.consumer,
+                    deferred_message(
+                        10,
+                        magnetar_proto::pb::MessageMetadata {
+                            uuid: Some("never-finished".to_owned()),
+                            num_chunks_from_msg: Some(2),
+                            chunk_id: Some(0),
+                            total_chunk_msg_size: Some(4),
+                            ..Default::default()
+                        },
+                        bytes::Bytes::from_static(b"ab"),
+                        1,
+                    ),
+                )
+                .await
+                .expect("buffer chunk zero");
+        }
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ReachedEndOfTopic as i32,
+                    reached_end_of_topic: Some(magnetar_proto::pb::CommandReachedEndOfTopic {
+                        consumer_id: parent.consumer.handle().0,
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("parent reaches the end of the topic");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            inner.clone().child_loop(
+                parent.source.clone(),
+                parent.generation,
+                parent.consumer.clone(),
+            ),
+        )
+        .await
+        .expect("the parent's child loop ends at the end of the topic");
+        let state = inner.state.lock();
+        assert!(state.terminal_error.is_none(), "{:?}", state.terminal_error);
+        assert!(!state.reconnect_requested, "the aggregate resynchronized");
+        state
+            .model
+            .segment_phase(magnetar_proto::SegmentId(2))
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent() {
+        // Control: with no chunk buffered the terminal parent completes and the
+        // descendant, no longer waiting on its predecessor, is granted FLOW.
+        assert_eq!(
+            descendant_phase_after_parent_end_of_topic(false).await,
+            Some(magnetar_proto::SegmentPhase::Flowing)
+        );
+        // Chunk zero of a message whose last chunk never arrives is not
+        // resolvable by the application and the broker sends nothing more after
+        // the end of the topic, so it must not keep the parent from completing.
+        assert_eq!(
+            descendant_phase_after_parent_end_of_topic(true).await,
+            Some(magnetar_proto::SegmentPhase::Flowing),
+            "a terminal parent whose last chunk chain never finished must still complete"
+        );
+    }
+
     #[tokio::test]
     async fn final_ack_completes_sealed_parent_before_deferred_close_confirmation() {
         let (snapshot, assignment) = sealed_parent_fixture();
@@ -7614,6 +8023,296 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.open_tasks, 0, "completed sealed parent never reopens");
+    }
+
+    /// A caller that gives up on `acknowledge` while the drained parent's
+    /// `CommandCloseConsumer` is in flight must not strand the model's
+    /// post-settlement actions: the child still leaves `children` and the model.
+    #[tokio::test]
+    async fn dropped_acknowledgement_still_finishes_the_drained_child_close() {
+        let (snapshot, assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from(snapshot, assignment.clone());
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("sealed parent child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    71,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"terminal"),
+                    1,
+                ),
+            )
+            .await
+            .expect("retain sealed-parent delivery");
+        let message = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve sealed-parent delivery")
+            .pop()
+            .expect("one sealed-parent delivery");
+        let empty = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: assignment.layout_epoch(),
+                segments: Vec::new(),
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("empty rebalance assignment");
+        let stop = inner
+            .state
+            .lock()
+            .model
+            .apply_assignment(empty)
+            .expect("sealed parent loses ownership while delivery is live");
+        inner.execute_actions(stop).await.expect("stop parent flow");
+        assert_eq!(
+            inner
+                .state
+                .lock()
+                .model
+                .apply_assignment(assignment)
+                .expect("sealed parent regains ownership while draining"),
+            [] as [magnetar_proto::StreamConsumerAction; 0]
+        );
+        {
+            let mut state = inner.state.lock();
+            assert_eq!(state.model.pending_ownership(), vec![child.source.clone()]);
+            assert_eq!(
+                state
+                    .model
+                    .observe_terminal(child.source.segment_id(), child.generation)
+                    .expect("sealed parent terminal with live acknowledgement"),
+                [] as [magnetar_proto::StreamConsumerAction; 0]
+            );
+        }
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let mut acknowledgement = Box::pin(consumer.acknowledge(&message.token));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let ack = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode terminal acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let ack_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: ack.consumer_id,
+                request_id: ack.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&ack_response))
+            .expect("confirm terminal acknowledgement");
+        // The caller's last poll: the broker confirmed the acknowledgement and the
+        // settled actions are now closing the drained parent.
+        std::future::poll_fn(|context| {
+            let _ = std::future::Future::poll(acknowledgement.as_mut(), context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Whoever executes the settled actions stages the close; the budget keeps a
+        // missing close from hanging the test.
+        let mut close_request_id = None;
+        for _ in 0..64 {
+            let mut transmitted = child_shared.inner.lock().poll_transmit();
+            while !transmitted.is_empty() {
+                let frame = magnetar_proto::decode_one(&mut transmitted)
+                    .expect("decode transmitted sealed-parent frame");
+                if let Some(close) = frame.command.close_consumer {
+                    close_request_id = Some(close.request_id);
+                }
+            }
+            if close_request_id.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let close_request_id =
+            close_request_id.expect("the settled actions close the drained sealed parent");
+        // The application times out and walks away while the close is in flight.
+        drop(acknowledgement);
+        let close_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id: close_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&close_response))
+            .expect("confirm sealed-parent close");
+        for _ in 0..64 {
+            if inner.state.lock().children.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = inner.state.lock();
+        assert!(
+            state.children.is_empty(),
+            "the confirmed close of a drained parent removes its runtime child even when the acknowledgement future was dropped"
+        );
+        assert_eq!(
+            state.model.segment_phase(child.source.segment_id()),
+            None,
+            "the model finishes the drained parent's close even when the acknowledgement future was dropped"
+        );
+        assert_eq!(
+            state.model.pending_ownership(),
+            [] as [magnetar_proto::SegmentSource; 0]
+        );
+    }
+
+    /// The owned task that finishes a dropped acknowledgement has no caller left to
+    /// receive a failure of the drained parent's close, so it requests a
+    /// resynchronization instead of dropping the error.
+    #[tokio::test]
+    async fn dropped_acknowledgement_resyncs_when_the_drained_child_close_fails() {
+        let (snapshot, assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from(snapshot, assignment.clone());
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("sealed parent child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    71,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"terminal"),
+                    1,
+                ),
+            )
+            .await
+            .expect("retain sealed-parent delivery");
+        let message = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve sealed-parent delivery")
+            .pop()
+            .expect("one sealed-parent delivery");
+        let empty = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: assignment.layout_epoch(),
+                segments: Vec::new(),
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("empty rebalance assignment");
+        let stop = inner
+            .state
+            .lock()
+            .model
+            .apply_assignment(empty)
+            .expect("sealed parent loses ownership while delivery is live");
+        inner.execute_actions(stop).await.expect("stop parent flow");
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let mut acknowledgement = Box::pin(consumer.acknowledge(&message.token));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let ack = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode terminal acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let ack_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: ack.consumer_id,
+                request_id: ack.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(child_shared.now_instant(), &encode(&ack_response))
+            .expect("confirm terminal acknowledgement");
+        // The caller's last poll stages the close, then the caller walks away.
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(acknowledgement);
+        reject_pending_child_close(&child_shared);
+        for _ in 0..64 {
+            if inner.state.lock().reconnect_requested {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = inner.state.lock();
+        assert!(
+            state.reconnect_requested,
+            "a close failure nobody can receive requests a resynchronization"
+        );
+        assert!(state.children.is_empty());
+        assert!(
+            state
+                .model
+                .segment_phase(child.source.segment_id())
+                .is_none()
+        );
+        assert!(state.events.iter().any(|event| matches!(
+            event,
+            StreamConsumerEvent::ResyncRequired { reason } if reason.contains("close failed")
+        )));
     }
 
     #[tokio::test]
@@ -8434,6 +9133,343 @@ mod tests {
         assert!(state.reconnect_requested);
     }
 
+    fn success(request_id: u64) -> bytes::BytesMut {
+        encode(&magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Success as i32,
+            success: Some(magnetar_proto::pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// An aggregate with two attached children and one `SeekChild` action for
+    /// each, for the paths that abandon a seek the broker will still answer.
+    fn aggregate_inner_with_two_seek_children() -> (
+        Arc<StreamConsumerInner<moonpool_core::TokioProviders>>,
+        Vec<magnetar_proto::StreamConsumerAction>,
+        [Arc<ConnectionShared>; 2],
+    ) {
+        let (inner, first_shared) = aggregate_inner_with_child();
+        let (first_source, generation, controller_incarnation) = {
+            let state = inner.state.lock();
+            let child = state.children.values().next().expect("first child");
+            (
+                child.source.clone(),
+                child.generation,
+                state.model.controller_incarnation(),
+            )
+        };
+        let second_source = magnetar_proto::SegmentSource::new(
+            magnetar_proto::SegmentId(2),
+            magnetar_proto::canonical_segment_topic(
+                "topic://public/default/scaled",
+                magnetar_proto::KeyRange::FULL,
+                magnetar_proto::SegmentId(2),
+            )
+            .expect("second segment topic"),
+        )
+        .expect("second source");
+        let (second_consumer, second_shared) =
+            attached_child_consumer(&second_source, magnetar_proto::MAX_FRAME_SIZE);
+        inner.state.lock().children.insert(
+            second_source.segment_id(),
+            ChildRuntime {
+                source: second_source.clone(),
+                generation,
+                consumer: second_consumer,
+            },
+        );
+        let target = |source: magnetar_proto::SegmentSource, entry_id| {
+            magnetar_proto::StreamMessageId::new(
+                source,
+                magnetar_proto::MessageId {
+                    ledger_id: 3,
+                    entry_id,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                },
+            )
+            .expect("seek target")
+        };
+        let actions = vec![
+            magnetar_proto::StreamConsumerAction::SeekChild {
+                source: first_source.clone(),
+                controller_incarnation,
+                child_generation: generation,
+                stream_message_id: target(first_source, 5),
+            },
+            magnetar_proto::StreamConsumerAction::SeekChild {
+                source: second_source.clone(),
+                controller_incarnation,
+                child_generation: generation,
+                stream_message_id: target(second_source, 6),
+            },
+        ];
+        (inner, actions, [first_shared, second_shared])
+    }
+
+    /// The `request_id` of the one `CommandSeek` staged on this connection.
+    fn staged_seek_request_id(shared: &Arc<ConnectionShared>) -> u64 {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let mut request_id = None;
+        while !bytes.is_empty() {
+            if let Some(seek) = magnetar_proto::decode_one(&mut bytes)
+                .expect("decode staged seek")
+                .command
+                .seek
+            {
+                assert!(
+                    request_id.replace(seek.request_id).is_none(),
+                    "one seek is staged per child"
+                );
+            }
+        }
+        request_id.expect("a CommandSeek is staged")
+    }
+
+    /// Whether the connection still holds an unclaimed outcome for the request.
+    fn retains_request_outcome(shared: &Arc<ConnectionShared>, request_id: u64) -> bool {
+        shared
+            .inner
+            .lock()
+            .take_outcome(magnetar_proto::PendingOpKey::Request(
+                magnetar_proto::RequestId(request_id),
+            ))
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn failed_aggregate_seek_leaves_no_outcome_for_abandoned_sibling_seeks() {
+        // Both seeks are on the wire before either is awaited. The first one is
+        // rejected, so `execute_actions` returns without ever awaiting the
+        // second: the broker's late reply to it must not be kept for a caller
+        // that no longer exists.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+                    error: Some(magnetar_proto::pb::CommandError {
+                        request_id: first_request_id,
+                        error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                        message: "seek failed".to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("reject the first seek");
+        let result = std::future::Future::poll(operation.as_mut(), &mut context);
+        assert!(
+            matches!(&result, std::task::Poll::Ready(Err(_))),
+            "a rejected seek fails the action list, got {result:?}"
+        );
+        drop(operation);
+
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the abandoned seek");
+        assert!(
+            !retains_request_outcome(&second_shared, second_request_id),
+            "the abandoned sibling seek's late reply left an outcome nobody will take"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_aggregate_seek_leaves_no_outcome_for_its_staged_seeks() {
+        // Dropping the action list after both seeks were staged abandons the
+        // awaited one and the one never awaited alike; the broker still answers
+        // both.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(first_request_id))
+            .expect("late reply to the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the never-awaited seek");
+        let awaited = retains_request_outcome(&first_shared, first_request_id);
+        let staged = retains_request_outcome(&second_shared, second_request_id);
+        assert!(
+            !awaited && !staged,
+            "late replies left outcomes nobody will take (awaited seek: {awaited}, never-awaited seek: {staged})"
+        );
+    }
+
+    /// The consumer slot of the child the aggregate holds for `segment`.
+    fn child_consumer_slot(
+        inner: &StreamConsumerInner<moonpool_core::TokioProviders>,
+        shared: &Arc<ConnectionShared>,
+        segment: magnetar_proto::SegmentId,
+    ) -> Arc<magnetar_proto::ConsumerSlot> {
+        let handle = inner
+            .state
+            .lock()
+            .children
+            .get(&segment)
+            .expect("child runtime")
+            .consumer
+            .handle();
+        shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .expect("child consumer slot")
+            .clone()
+    }
+
+    /// Whether a `CommandSubscribe` is among the frames staged on `shared`.
+    fn stages_subscribe(shared: &Arc<ConnectionShared>) -> bool {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let mut subscribed = false;
+        while !bytes.is_empty() {
+            subscribed |= magnetar_proto::decode_one(&mut bytes)
+                .expect("decode staged frame")
+                .command
+                .subscribe
+                .is_some();
+        }
+        subscribed
+    }
+
+    #[tokio::test]
+    async fn dropped_aggregate_seek_hands_its_awaited_request_to_the_connection() {
+        // `execute_actions` stages both seeks, then awaits the first. Dropped
+        // there, the awaited seek belongs to the abandon guard (ADR-0133): the
+        // connection keeps its request, retagged, and re-attaches the consumer
+        // the broker dropped when the `Success` lands. Only the seek never
+        // awaited is cancelled. Were the staged seek's own cancellation still
+        // armed for the awaited one, it would remove the retagged request and
+        // the `Success` would re-attach nothing.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        let awaited_pending = first_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(first_request_id));
+        let staged_pending = second_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(second_request_id));
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(first_request_id))
+            .expect("late reply to the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the never-awaited seek");
+        let awaited_resubscribed = stages_subscribe(&first_shared);
+        let staged_resubscribed = stages_subscribe(&second_shared);
+        assert!(
+            awaited_pending && awaited_resubscribed,
+            "awaited seek retagged (pending: {awaited_pending}) and re-attached on Success \
+             (resubscribed: {awaited_resubscribed})"
+        );
+        assert!(
+            !staged_pending && !staged_resubscribed,
+            "never-awaited seek cancelled (pending: {staged_pending}) and its Success ignored \
+             (resubscribed: {staged_resubscribed})"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_aggregate_seek_leaves_a_rejected_awaited_seek_to_the_connection() {
+        // The same drop, answered with a rejection: the connection must still
+        // own the awaited seek's request, so its `Error` runs the rejected-seek
+        // recovery, which thaws the consumer `begin_seek` froze. The seek never
+        // awaited was cancelled and its rejection finds no request.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let first_segment = match &actions[0] {
+            magnetar_proto::StreamConsumerAction::SeekChild { source, .. } => source.segment_id(),
+            other => panic!("the first action seeks the first child, got {other:?}"),
+        };
+        let first_slot = child_consumer_slot(&inner, &first_shared, first_segment);
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        let staged_pending = second_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(second_request_id));
+        let reject = |request_id| {
+            encode(&magnetar_proto::pb::BaseCommand {
+                r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+                error: Some(magnetar_proto::pb::CommandError {
+                    request_id,
+                    error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                    message: "seek failed".to_owned(),
+                }),
+                ..Default::default()
+            })
+        };
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &reject(first_request_id))
+            .expect("late rejection of the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &reject(second_request_id))
+            .expect("late rejection of the never-awaited seek");
+        // `seek_acked` hands back the seek still pending on the consumer: none
+        // once the rejection was recovered.
+        let still_frozen = first_slot.state.lock().seek_acked();
+        assert_eq!(
+            still_frozen, None,
+            "the awaited seek's rejection must thaw its consumer"
+        );
+        assert!(
+            !staged_pending,
+            "the never-awaited seek's request must have been cancelled"
+        );
+        assert!(
+            !retains_request_outcome(&first_shared, first_request_id)
+                && !retains_request_outcome(&second_shared, second_request_id),
+            "late rejections left outcomes nobody will take"
+        );
+    }
+
     #[tokio::test]
     async fn failed_aggregate_seek_closes_children_before_requesting_resync() {
         let (inner, child_shared) = aggregate_inner_with_child();
@@ -8635,6 +9671,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settled_transaction_outcomes_are_not_retained_until_the_aggregate_closes() {
+        // The facade reports each transaction's outcome once and then forgets
+        // the transaction, so a long-lived consumer must not keep one
+        // completion record per transaction it ever took part in. A second
+        // round of distinct transactions must not grow what the first round
+        // left behind: evicting a record once its result was delivered, or
+        // keeping a bounded window no wider than one round, satisfies it.
+        const ROUND: u64 = 4_096;
+        let inner = empty_aggregate_inner();
+        let mut retained = Vec::new();
+        for start in [0, ROUND] {
+            for sequence in start..start + ROUND {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    inner.transaction_outcome(
+                        magnetar_proto::TxnId::new(sequence, 1),
+                        magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+                    ),
+                )
+                .await
+                .expect("outcome propagation finishes")
+                .expect("outcome propagation succeeds");
+            }
+            retained.push(inner.state.lock().transaction_outcomes.len());
+        }
+
+        let (after_first, after_second) = (retained[0], retained[1]);
+        assert!(
+            after_second <= after_first,
+            "settled transaction outcomes grow with the transaction count: {after_first} \
+             retained after {ROUND} transactions, {after_second} after {}",
+            2 * ROUND
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_transaction_outcomes_keep_the_newest_window_and_evict_the_oldest() {
+        // The record of a settled transaction answers a repeated outcome for it,
+        // so the aggregate keeps the newest records and drops the oldest first,
+        // and a record that is still in the window is not propagated again.
+        let inner = empty_aggregate_inner();
+        let window = MAX_SETTLED_TRANSACTION_OUTCOMES as u64;
+        for sequence in 0..window + 3 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                inner.transaction_outcome(
+                    magnetar_proto::TxnId::new(sequence, 1),
+                    magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+                ),
+            )
+            .await
+            .expect("outcome propagation finishes")
+            .expect("outcome propagation succeeds");
+        }
+        let retained = || {
+            inner
+                .state
+                .lock()
+                .transaction_outcomes
+                .keys()
+                .map(|txn_id| txn_id.most_sig_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retained(), (3..window + 3).collect::<Vec<_>>());
+        assert_eq!(
+            inner.state.lock().settled_transaction_outcomes.len(),
+            MAX_SETTLED_TRANSACTION_OUTCOMES
+        );
+
+        // A repeat of a retained transaction is answered from its record: the
+        // window neither grows nor moves.
+        inner
+            .transaction_outcome(
+                magnetar_proto::TxnId::new(window + 2, 1),
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await
+            .expect("repeated outcome is answered from its record");
+        assert_eq!(retained(), (3..window + 3).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_failed_transaction_outcome_propagation_keeps_its_record_for_the_retry() {
+        // An unknown outcome resynchronizes the aggregate, which closes its child; the broker
+        // rejects that close, so the propagation fails. The record is what a retry resumes, so it
+        // stays, and it does not join the window of settled records that are evicted oldest first.
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let txn_id = magnetar_proto::TxnId::new(0x5e, 0x77);
+        let mut outcome = Box::pin(inner.transaction_outcome(
+            txn_id,
+            magnetar_proto::TransactionAcknowledgementOutcome::Unknown,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(outcome.as_mut(), context).is_pending(),
+                "the propagation waits for the child close"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut close_request_id = None;
+        for _ in 0..1024 {
+            let mut staged = child_shared.inner.lock().poll_transmit();
+            while !staged.is_empty() {
+                let command = magnetar_proto::decode_one(&mut staged)
+                    .expect("decode child frame")
+                    .command;
+                if let Some(close) = command.close_consumer {
+                    close_request_id = Some(close.request_id);
+                }
+            }
+            if close_request_id.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let close_request_id = close_request_id.expect("the resynchronization closes the child");
+        let error = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+            error: Some(magnetar_proto::pb::CommandError {
+                request_id: close_request_id,
+                error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                message: "close failed".to_owned(),
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&error))
+            .expect("reject the child close");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), outcome)
+            .await
+            .expect("outcome propagation finishes");
+        assert!(
+            result.is_err(),
+            "a rejected child close fails the propagation: {result:?}"
+        );
+        let state = inner.state.lock();
+        assert!(
+            state.transaction_outcomes.contains_key(&txn_id),
+            "a failed propagation keeps its record for the retry"
+        );
+        assert!(
+            !state.settled_transaction_outcomes.contains(&txn_id),
+            "a failed propagation is not a settled one"
+        );
+    }
+
+    #[tokio::test]
     async fn transaction_outcome_continues_after_waiter_cancellation() {
         let mut inner = empty_aggregate_inner();
         let hook = Arc::new(TransactionOutcomeParkHook::default());
@@ -8740,6 +9927,265 @@ mod tests {
             0,
             "an unknown outcome must discard the deliveries queued for the closed children"
         );
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_completes_while_the_aggregate_is_fenced() {
+        // A commit that lands between a resynchronization and the replacement
+        // baseline finds the aggregate fenced, so every retained authority is
+        // refused by the model. The outcome must still be reported once: a
+        // fenced authority has nothing left to settle and is not a failure.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let fenced = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(fenced);
+        }
+        inner.request_resync("test resynchronization".to_owned());
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        for task in tasks {
+            task.join().await.expect("resynchronization close joins");
+        }
+        assert_eq!(
+            inner.state.lock().model.phase(),
+            magnetar_proto::AggregatePhase::ResyncRequired
+        );
+
+        let result = inner
+            .transaction_outcome(
+                txn_id,
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await;
+        let reported = inner
+            .state
+            .lock()
+            .events
+            .iter()
+            .filter(|event| matches!(event, StreamConsumerEvent::TransactionOutcome { .. }))
+            .count();
+        assert_eq!(
+            reported, 1,
+            "the commit of a fenced authority must be reported (result: {result:?})"
+        );
+        result.expect("a fenced authority must not fail the commit propagation");
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_after_the_model_began_closing_is_not_reported() {
+        // Only a resynchronization retires an authority. The aggregate's own
+        // close() empties the per-transaction list in the step that moves the
+        // model to Closing, so this state is built by hand: the model is
+        // Closing and an authority is still listed. The skip must refuse it
+        // rather than treat every aggregate phase as retired.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let authority = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(authority);
+            state.model.close().expect("the model begins closing");
+            assert_eq!(state.model.phase(), magnetar_proto::AggregatePhase::Closing);
+        }
+
+        let result = inner
+            .transaction_outcome(
+                txn_id,
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await;
+        let reported = inner
+            .state
+            .lock()
+            .events
+            .iter()
+            .filter(|event| matches!(event, StreamConsumerEvent::TransactionOutcome { .. }))
+            .count();
+        assert_eq!(
+            reported, 0,
+            "a closing aggregate must not report the commit as settled (result: {result:?})"
+        );
+        assert!(
+            matches!(&result, Err(StreamConsumerError::Failed(message)) if message.contains("Closing")),
+            "the closing phase must fail the commit propagation, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_settles_live_authorities_behind_a_stale_one() {
+        // A resynchronization between two acknowledgements of one transaction
+        // retires the first authority (its delivery epoch is gone) but leaves
+        // it in the runtime's per-transaction list, ahead of the authority
+        // admitted after the reconnect. Propagating the commit must skip the
+        // fenced authority and still settle the live one; it must not drop the
+        // whole list and stop at the first stale entry.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let retired = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("first acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(retired);
+        }
+
+        // Resynchronize: the model fences every authority and the close task
+        // confirms the child, as a broker-side child failure would.
+        inner.request_resync("test resynchronization".to_owned());
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        for task in tasks {
+            task.join().await.expect("resynchronization close joins");
+        }
+
+        // Reconnect: a replacement incarnation reopens the child and delivers
+        // a message of the new delivery epoch.
+        let (snapshot, assignment) = control_plane_fixture();
+        let source = assignment.segments()[0].source();
+        {
+            let mut state = inner.state.lock();
+            let open = state
+                .model
+                .apply_reconnect_baseline(
+                    magnetar_proto::ControllerIncarnation(2),
+                    snapshot,
+                    assignment,
+                )
+                .expect("replacement baseline");
+            let generation = open
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::OpenChild {
+                        child_generation, ..
+                    } => Some(*child_generation),
+                    _ => None,
+                })
+                .expect("replacement child open action");
+            let flow = state
+                .model
+                .child_opened(source.segment_id(), generation)
+                .expect("replacement child opened");
+            let reservation = flow
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::GrantFlow { reservation, .. } => {
+                        Some(*reservation)
+                    }
+                    _ => None,
+                })
+                .expect("replacement flow grant");
+            let message = magnetar_proto::IncomingMessage {
+                message_id: magnetar_proto::MessageId {
+                    ledger_id: 1,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                },
+                metadata: Arc::new(magnetar_proto::pb::MessageMetadata::default()),
+                single_metadata: None,
+                payload: bytes::Bytes::from_static(b"data"),
+                redelivery_count: 0,
+                broker_entry_metadata: None,
+                arrived_at: std::time::Instant::now(),
+            };
+            let transition = state
+                .model
+                .message_arrived(
+                    source.segment_id(),
+                    generation,
+                    reservation,
+                    message.retained_bytes(),
+                )
+                .expect("replacement message retained");
+            let message_id_data = message.message_id.to_pb();
+            state.queue.push_back(QueuedMessage {
+                source: source.clone(),
+                generation,
+                message,
+                delivery: QueuedDelivery::Fresh {
+                    reservation: transition.retained,
+                    message_id_data,
+                },
+            });
+        }
+        let second = consumer.receive().await.expect("replacement delivery");
+        {
+            let mut state = inner.state.lock();
+            let live = state
+                .model
+                .admit_individual_transactional_acknowledgement(&second.token)
+                .expect("replacement acknowledgement is admitted at the new epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(live);
+        }
+
+        // The application commits; the retry is what the facade would not do,
+        // so a lost authority cannot be recovered by it.
+        let committed = magnetar_proto::TransactionAcknowledgementOutcome::Committed;
+        let first_result = inner.transaction_outcome(txn_id, committed).await;
+        let retry_result = inner.transaction_outcome(txn_id, committed).await;
+
+        // Committing settles the live authority and so resolves its delivery
+        // lease: the replacement token is gone, not still pending.
+        let probe = inner
+            .state
+            .lock()
+            .model
+            .clone()
+            .admit_individual_transactional_acknowledgement(&second.token);
+        assert!(
+            matches!(
+                probe,
+                Err(magnetar_proto::StreamConsumerModelError::StaleDeliveryToken)
+            ),
+            "the live authority behind a stale one must be settled by the commit \
+             (first call: {first_result:?}, retry: {retry_result:?}), but the replacement \
+             delivery is still held: {probe:?}"
+        );
+        first_result.expect("a stale authority must not fail the commit propagation");
+        retry_result.expect("a retry after propagation succeeds");
     }
 
     #[tokio::test]

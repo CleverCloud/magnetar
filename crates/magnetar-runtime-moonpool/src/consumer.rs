@@ -100,11 +100,32 @@ pub struct Consumer<P: Providers> {
     _providers: std::marker::PhantomData<fn() -> P>,
 }
 
+/// A seek already written to the wire and not yet awaited.
+///
+/// A seek staged for the scalable aggregate (`stage_seek_to_message_id_data`) is
+/// cancelled when this value is dropped before `complete_staged_seek` takes it
+/// over: the aggregate abandons every sibling seek it has not awaited yet when one
+/// fails and when its caller is dropped, and the broker's reply to a seek nobody
+/// awaits would otherwise be recorded in the connection's `outcomes` for the life
+/// of the connection. Once `complete_staged_seek` awaits the seek, its abandon
+/// guard hands a dropped seek to the connection instead (ADR-0133), so the two
+/// never act on one request. A seek staged for an ordinary consumer `seek_*` call
+/// is never cancelled this way.
 pub(crate) struct StagedConsumerSeek {
     request_id: RequestId,
     receiver_queue_size: usize,
     seek_message_id: Option<String>,
     seek_timestamp: Option<u64>,
+    /// The connection to cancel the request on when dropped before it is awaited.
+    cancel_on_drop: Option<Arc<ConnectionShared>>,
+}
+
+impl Drop for StagedConsumerSeek {
+    fn drop(&mut self) {
+        if let Some(shared) = self.cancel_on_drop.take() {
+            shared.inner.lock().cancel_request(self.request_id);
+        }
+    }
 }
 
 impl<P: Providers> Clone for Consumer<P> {
@@ -1516,7 +1537,9 @@ impl<P: Providers> Consumer<P> {
         &self,
         message_id: pb::MessageIdData,
     ) -> StagedConsumerSeek {
-        self.stage_seek(SeekTarget::MessageIdData(message_id))
+        let mut staged = self.stage_seek(SeekTarget::MessageIdData(message_id));
+        staged.cancel_on_drop = Some(self.shared.clone());
+        staged
     }
 
     /// Seek this consumer to a specific publish timestamp (millis since the
@@ -1554,19 +1577,20 @@ impl<P: Providers> Consumer<P> {
             receiver_queue_size,
             seek_message_id,
             seek_timestamp,
+            cancel_on_drop: None,
         }
     }
 
     pub(crate) async fn complete_staged_seek(
         &self,
-        staged: StagedConsumerSeek,
+        mut staged: StagedConsumerSeek,
     ) -> Result<(), ClientError> {
-        let StagedConsumerSeek {
-            request_id,
-            receiver_queue_size,
-            seek_message_id,
-            seek_timestamp,
-        } = staged;
+        // Awaited from here on: the abandon guard below owns a dropped seek.
+        staged.cancel_on_drop = None;
+        let request_id = staged.request_id;
+        let receiver_queue_size = staged.receiver_queue_size;
+        let seek_message_id = staged.seek_message_id.take();
+        let seek_timestamp = staged.seek_timestamp;
         // The re-attach below belongs to this future; if the caller drops it first (a
         // `timeout`, a `select!`, an aborted task) the connection takes it over.
         let mut abandon = SeekAbandonGuard {
