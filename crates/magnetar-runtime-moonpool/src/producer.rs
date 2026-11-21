@@ -301,7 +301,12 @@ impl<P: Providers> Producer<P> {
 
     /// Last sequence id the broker has acknowledged via
     /// `CommandSendReceipt`. Returns `-1` if no sends have been acked
-    /// yet. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceIdPublished`.
+    /// yet and the producer has no resume point. A producer opened with
+    /// `initial_sequence_id` reports `initial_sequence_id - 1` until the first
+    /// receipt, and the `last_sequence_id` a broker with deduplication state
+    /// returns at attach can raise the value; neither the attach nor a
+    /// re-attach ever lowers it. Mirrors
+    /// `org.apache.pulsar.client.api.Producer#getLastSequenceIdPublished`.
     /// Useful for resume-from-checkpoint flows.
     ///
     /// Per-slot read — does NOT take the global Connection mutex.

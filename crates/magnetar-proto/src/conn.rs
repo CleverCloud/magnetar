@@ -3055,7 +3055,15 @@ impl Connection {
                         let mut producer = slot.state.lock();
                         producer.open_request_id = None;
                         producer.name = Some(ok.producer_name.clone());
-                        producer.last_sequence_id_published = ok.last_sequence_id.unwrap_or(-1);
+                        // The broker's `last_sequence_id` is what it persisted for this
+                        // producer name (`-1` with no deduplication state). It can raise
+                        // the counter, never lower it: the counter already holds the
+                        // `initial_sequence_id - 1` resume point or the highest id a
+                        // receipt acknowledged, and a re-attach answered with a smaller
+                        // value must not erase either.
+                        producer.last_sequence_id_published = producer
+                            .last_sequence_id_published
+                            .max(ok.last_sequence_id.unwrap_or(-1));
                         // Java `ProducerImpl#handleProducerSuccess` →
                         // `resendMessages` parity (producer-not-ready livelock
                         // fix): the broker has acked the (re-)attachment — only
@@ -6582,7 +6590,11 @@ impl Connection {
     }
 
     /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. `-1` if the
-    /// producer has no acknowledged sends yet. Useful for at-least-once resume-on-restart.
+    /// producer has no acknowledged sends yet and no resume point. A producer opened with
+    /// `initial_sequence_id` reports `initial_sequence_id - 1` until the first receipt, the
+    /// `last_sequence_id` of a `CommandProducerSuccess` can raise the value but never lowers
+    /// it, so a re-attach keeps the highest id already known. Useful for at-least-once
+    /// resume-on-restart.
     #[must_use]
     pub fn producer_last_sequence_id_published(&self, handle: ProducerHandle) -> i64 {
         self.producers

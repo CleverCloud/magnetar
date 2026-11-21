@@ -33,6 +33,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`CommandProducerSuccess` no longer moves `Producer::last_sequence_id_published` backwards.**
+  `ProducerState::set_initial_sequence_id` stamps the counter with `initial_sequence_id - 1` so the producer reports its resume point until the first receipt, and `apply_receipt` advances it to the highest acknowledged id.
+  The `CommandProducerSuccess` arm then overwrote it unconditionally with the broker's `last_sequence_id`, on the first attach and on every re-attach.
+  A broker that keeps no deduplication state answers `-1`, so the resume point was gone before the `Producer` handle was returned, and an acknowledged id moved backwards each time the producer re-attached after a reconnect.
+  The broker's value now only raises the counter, so a fresh producer still adopts the id a broker with deduplication state persisted for its name, and a resume point or an acknowledged id survives every attach.
+  Both engines run the same `Connection` code and behave identically; `ConnectionEvent::ProducerReady::last_sequence_id` still carries the broker's raw value.
+
 - **A `receive()` or `next_active_change()` woken after a sibling already resolved no longer evicts the sibling's new waker.**
   `ConsumerState` parked every in-flight `receive()` on a `Slab<Waker>` and handed the future the raw slab key; a message arrival, a close or a reset drains the whole slab, and `Slab::drain` rewinds its next key to `0`, so the first registration after a drain received key `0` again while every woken future still held the key it was given before.
   `cancel_receive_waker` removed whatever occupied a key, and `ReceiveFut::poll` cancels its stored key on an empty re-poll, after a successful pop and on `Drop`: with two concurrent `receive()` calls on clones of one consumer, a woken future that polled after its sibling had popped the message and started a new `receive()` removed that new waker.

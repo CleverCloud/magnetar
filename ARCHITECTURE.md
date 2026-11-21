@@ -1146,6 +1146,7 @@ Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/prod
 - Sequence ids are assigned inside the chunk loop (Java `ProducerImpl.java:696-704`, `:745-753` — both first-send and resend paths; Apache Pulsar Java reference, external).
 - Resend reuses the original sequence id.
 - `last_sequence_id` and `last_sequence_id_published` are tracked separately so the runtime can drive resend-safe dedup.
+- `last_sequence_id_published` starts at `initial_sequence_id - 1` for a resumed producer and follows the receipts; the `last_sequence_id` of a `CommandProducerSuccess` (first attach and every re-attach) can only raise it, so a broker without deduplication state (`-1`) never erases the resume point or an acknowledged id.
 - Sequence id and request id are **monotonically non-decreasing** per connection per producer ([GUIDELINES.md §Protocol-correctness invariants point 4](GUIDELINES.md#protocol-correctness-invariants)).
 
 ---
