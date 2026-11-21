@@ -1,6 +1,6 @@
 # ADR-0025 — Engine trait extension: task + timer primitives (façade-lift phase 1)
 
-- **Status**: Accepted
+- **Status**: Accepted — the façade's helper tasks (the `TableView` drain and the auto-update partition tickers) do not use these primitives: they take no client, so they cannot reach a client's providers; those tasks go through `BackgroundApi` instead, per [ADR-0139](0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md). The rest of this ADR remains binding.
 - **Date**: 2026-05-23
 - **Decider**: Florentin Dubois
 - **Tags**: engine, façade, moonpool-parity, task-spawn, interval, adr-0019-followup

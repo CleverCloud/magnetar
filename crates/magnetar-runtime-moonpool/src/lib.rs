@@ -139,6 +139,42 @@ pub(crate) fn tokio_sleep_provider() -> Arc<SleepProvider> {
     sleep_provider_from_time(moonpool_core::TokioTimeProvider::new())
 }
 
+/// A boxed future the façade hands to the client's task provider, and the boxed join future it
+/// gets back. Neither names the provider, so [`Client`] stays the only generic type.
+pub(crate) type BackgroundFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// An owned sleep on the client's clock: the future resolves `true` once the duration has
+/// elapsed and `false` if the time provider has shut down.
+pub(crate) type BackgroundSleeper = Arc<
+    dyn Fn(Duration) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Spawns a named future on the [`moonpool_core::TaskProvider`] the client was built over and
+/// returns a future that resolves once that task has ended.
+pub(crate) type TaskSpawner =
+    dyn Fn(&str, BackgroundFuture) -> BackgroundFuture + Send + Sync + 'static;
+
+pub(crate) fn task_spawner_from_task<T>(task: T) -> Arc<TaskSpawner>
+where
+    T: moonpool_core::TaskProvider,
+{
+    Arc::new(move |name, future| {
+        let join = task.spawn_task(name, future);
+        Box::pin(async move {
+            // Cancelled or panicked: either way the task has ended, which is all the caller waits
+            // for.
+            let _ended = join.await;
+        })
+    })
+}
+
+pub(crate) fn tokio_task_spawner() -> Arc<TaskSpawner> {
+    task_spawner_from_task(moonpool_core::TokioTaskProvider)
+}
+
 /// Default wall-clock epoch used by deterministic-sim callers that pin a
 /// fixed base via [`ConnectionShared::with_auth_and_wall_clock_base`].
 ///

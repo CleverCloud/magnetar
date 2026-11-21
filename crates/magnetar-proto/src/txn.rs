@@ -339,6 +339,26 @@ impl TxnClient {
         }
     }
 
+    /// Forget every per-request entry, and its waker slot, of the requests issued on a session
+    /// that has ended (`Connection::reset`).
+    ///
+    /// The dead session answers none of them, whether the request was still pending at the reset
+    /// or its caller had already been cancelled (an operation deadline that fired during the
+    /// outage), and no reply to one of these ids can reach the next session: the reset clears the
+    /// connection's buffers, and the next session's broker never saw them. Forgetting an `end_txn`
+    /// request loses no retry: a retried commit or abort resumes through the connection's own
+    /// `EndTxn` bookkeeping and its retained outcome, never through this entry.
+    pub fn forget_all_requests(&mut self) {
+        self.new_txn_by_request.clear();
+        self.pending_new_txn.clear();
+        self.add_partition_by_request.clear();
+        self.pending_add_partition.clear();
+        self.add_subscription_by_request.clear();
+        self.pending_add_subscription.clear();
+        self.end_txn_by_request.clear();
+        self.pending_end_txn.clear();
+    }
+
     /// Build a [`pb::CommandNewTxn`] to open a new transaction with the configured timeout.
     ///
     /// The caller must wrap the result in a `BaseCommand` of type `NEW_TXN` and place it onto

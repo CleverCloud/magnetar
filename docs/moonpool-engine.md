@@ -33,6 +33,7 @@ The published library target depends on `moonpool-core`; the crate's test suite 
 [ADR-0078](../specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md) makes the provider boundary authoritative for code that runs under either provider bundle.
 
 - Runtime tasks are spawned through `TaskProvider::spawn_task`.
+  The façade's helper tasks (the `TableView` drain and the auto-update partition tickers) reach the client's providers through `BackgroundApi` ([ADR-0139](../specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)) and stop cooperatively, because a `TaskProvider` join handle cannot cancel its task.
 - Sleeps and timeouts run through `TimeProvider::sleep` or `TimeProvider::timeout`.
 - Concurrent waits use `moonpool_core::select!`.
   Its fair form draws the starting branch from Moonpool's seeded source; `biased;` keeps explicit source order where protocol fairness or shutdown priority requires it.

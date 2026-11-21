@@ -1,6 +1,6 @@
 # ADR-0064 — Consumer-side MessageListener push delivery
 
-- **Status**: Accepted — the "Clean shutdown" rule (any `receive()` error breaks the poller) is amended by [ADR-0130](0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md): the loop breaks only when the consumer is terminal, and an error about one message is logged and skipped. Everything else below remains binding.
+- **Status**: Accepted — the "Clean shutdown" rule (any `receive()` error breaks the poller) is amended by [ADR-0130](0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md): the loop breaks only when the consumer is terminal, and an error about one message is logged and skipped. [ADR-0140](0140-return-the-pattern-consumer-next-to-its-listener-handle.md) (Proposed, awaiting arbitration) adds a second pattern terminal that returns the consumer next to the handle: for that terminal the pull / push exclusion is a documented contract, not a structural one, and a pattern child joins only when a holder of the consumer calls `update`. Everything else below remains binding.
 - **Date**: 2026-06-14
 - **Decider**: Florentin Dubois
 - **Tags**: consumer, push-delivery, parity, runtime, sans-io

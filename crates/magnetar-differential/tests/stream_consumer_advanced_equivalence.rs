@@ -2836,6 +2836,146 @@ async fn run_moonpool_transactions() -> TransactionTrace {
     trace
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusedEntryTrace {
+    /// Entries the client's coordinator holds right after a broker-confirmed commit whose
+    /// participant refused the outcome (it was closed while the commit was in flight).
+    entries_after_refused_commit: usize,
+    /// Entries it holds once that participant is dropped and an unrelated transaction has gone
+    /// through a whole commit.
+    entries_after_unrelated_commit: usize,
+}
+
+/// Number of transactions the client's coordinator holds an entry for, read from the
+/// `transactions` field of the coordinator's `Debug` rendering inside the client's.
+fn coordinator_entries<E>(client: &PulsarClient<E>) -> usize
+where
+    E: Engine,
+    E::ClientState: std::fmt::Debug,
+{
+    const MARKER: &str = "TransactionCoordinator { transactions: ";
+    let rendered = format!("{client:?}");
+    let tail = rendered
+        .split_once(MARKER)
+        .unwrap_or_else(|| panic!("coordinator count missing from {rendered}"))
+        .1;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("coordinator count unreadable in {rendered}"))
+}
+
+async fn observe_refused_entry_reclaim<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> RefusedEntryTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi + std::fmt::Debug,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("refused-entry-sub")
+        .consumer_name("refused-entry-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe refused-entry aggregate");
+    cluster
+        .wait_for("refused-entry initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"refused-entry")))
+        .expect("enqueue refused-entry participant");
+    cluster
+        .wait_for("refused-entry delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let message = receive(&consumer).await;
+    let txn = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open refused-entry transaction");
+    consumer
+        .acknowledge_in_transaction(&message, txn)
+        .await
+        .expect("stage refused-entry acknowledgement");
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            Ok(())
+        })
+        .expect("clear routes before refused-entry commit");
+    cluster.hold_command(
+        Endpoint::Controller,
+        magnetar::proto::pb::base_command::Type::EndTxnResponse,
+    );
+    let mut commit = Box::pin(client.commit_transaction(txn));
+    tokio::select! {
+        biased;
+        result = &mut commit => panic!("held refused-entry commit completed early: {result:?}"),
+        () = cluster.wait_for("refused-entry EndTxn command", |fake| {
+            end_transaction_command_count(fake, "commit") == 1
+        }) => {}
+    }
+    consumer
+        .close()
+        .await
+        .expect("close the participant after the broker confirmed the commit");
+    cluster.release_command(
+        Endpoint::Controller,
+        magnetar::proto::pb::base_command::Type::EndTxnResponse,
+    );
+    assert_eq!(
+        commit
+            .await
+            .expect("broker-confirmed commit survives the refused finalization"),
+        magnetar::TxnState::Committed
+    );
+    let entries_after_refused_commit = coordinator_entries(client);
+
+    // `close` consumed the application's handle and the commit's own reference ended with the
+    // commit, so nothing can accept the refused outcome any more. An unrelated transaction now
+    // runs the whole coordinator.
+    drop(message);
+    let unrelated = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open unrelated transaction");
+    assert_eq!(
+        client
+            .commit_transaction(unrelated)
+            .await
+            .expect("commit unrelated transaction"),
+        magnetar::TxnState::Committed
+    );
+    RefusedEntryTrace {
+        entries_after_refused_commit,
+        entries_after_unrelated_commit: coordinator_entries(client),
+    }
+}
+
+async fn run_tokio_refused_entry_reclaim() -> RefusedEntryTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_refused_entry_reclaim(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_refused_entry_reclaim() -> RefusedEntryTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_refused_entry_reclaim(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_operation_cancellation<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -6738,6 +6878,22 @@ async fn vector_transactions_commit_abort_redeliver_and_poison_equivalently() {
     let moonpool_trace = run_moonpool_transactions().await;
     assert_eq!(tokio_trace, moonpool_trace);
     assert!(tokio_trace.outcome_retry_reused_retained_close);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_refusing_participant_entry_is_reclaimed_equivalently() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_refused_entry_reclaim().await;
+    let moonpool_trace = run_moonpool_refused_entry_reclaim().await;
+    assert_eq!(tokio_trace, moonpool_trace);
+    // Retention right after the refused commit is the retry contract: a retried confirmed commit
+    // resumes without a second `EndTxn` (see the confirmed-retry steps of
+    // `vector_transactions_commit_abort_redeliver_and_poison_equivalently`).
+    assert_eq!(tokio_trace.entries_after_refused_commit, 1);
+    assert_eq!(
+        tokio_trace.entries_after_unrelated_commit, 0,
+        "the entry of a transaction whose participant is gone must be reclaimed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
