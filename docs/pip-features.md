@@ -813,12 +813,14 @@ The first installation also discards every message the consumer had received but
 A resynchronization retires every transactional authority admitted before it, but the aggregate keeps them in the per-transaction list until the transaction ends, ahead of the authorities admitted after the reconnect.
 Propagating a commit or an abort therefore skips an authority the model refuses as retired (`InvalidAggregatePhase` while fenced, `StaleAcknowledgementAuthority` after the reconnect), because it has nothing left to settle, and settles the others; the outcome is reported once, and any other refusal still fails the propagation.
 Once the coordinator confirms commit or abort, an owned completion task records that terminal state and checkpoints each completed local participant action, so cancellation causes neither a second `EndTxn` nor replay of an already-issued FLOW prefix.
+The aggregate keeps the record of its 1,024 most recently propagated transactions and evicts the oldest first, so a repeated outcome for a transaction inside that window is answered without propagating again; a record whose propagation failed stays until it is retried or the consumer closes, as does the facade's own entry for that transaction, and `close()` drops them all.
 
 Vector seek is limited to the exact current layout epoch and every currently owned, attached active leaf.
 It rejects an omitted source and any live receive, batch, delivery, or transactional-ack reservation.
 It cannot cross a layout transition, rewind a sealed or remote ancestor, or infer earliest/latest for an omitted segment.
 A chunk position is projected to its first chunk, while a batch position is projected to the residual suffix in `ack_set`; The wire handler ignores the richer batch/chunk fields on `CommandSeek`, so they are not transmitted as authority.
 Both runtimes stage every child SEEK before awaiting any child response.
+A staged seek that is never awaited, because an earlier one failed or the caller was dropped first, is cancelled on its child connection, so the broker's late reply is ignored there instead of being stored for the life of that connection; an awaited one whose caller is dropped is handed to the connection instead (ADR-0133).
 A successful seek clears pre-seek buffers and invalidates old tokens; any child failure leaves the aggregate resynchronization-required.
 It also discards each child's confirmed cumulative-acknowledgement watermark, because the broker cursor no longer sits where that watermark was confirmed: a cumulative or vector acknowledgement of a replayed position at or below the pre-seek watermark admits a component and reaches the broker, instead of returning success with no wire acknowledgement and no lease release.
 

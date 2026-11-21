@@ -20,6 +20,12 @@ use crate::{ClientError, ConnectionShared, ScalableEvent};
 const MAX_ROUTE_EVENTS: usize = 64;
 const MAX_AGGREGATE_EVENTS: usize = 256;
 const MAX_RETIRED_ROUTES: usize = 256;
+/// How many successfully propagated transaction outcomes the aggregate keeps, the
+/// newest ones, evicting the oldest first. A repeated outcome for a transaction
+/// still in this window is answered from its record instead of being propagated
+/// again; the facade reports each transaction once and never asks about it again,
+/// so the window only has to outlive a duplicate or a retry, not the aggregate.
+const MAX_SETTLED_TRANSACTION_OUTCOMES: usize = 1024;
 const DISCARD_POLICY_ERROR: &str = "scalable child used discard policy";
 
 fn route_error_is_recoverable(error: &ClientError) -> bool {
@@ -970,6 +976,10 @@ struct AggregateState {
     transaction_registrations:
         BTreeMap<(magnetar_proto::TxnId, magnetar_proto::SegmentSource), TransactionRegistration>,
     transaction_outcomes: BTreeMap<magnetar_proto::TxnId, Arc<TransactionOutcomeCompletion>>,
+    /// Transactions of `transaction_outcomes` whose propagation succeeded, oldest
+    /// first. At most `MAX_SETTLED_TRANSACTION_OUTCOMES` records outlive their
+    /// success.
+    settled_transaction_outcomes: VecDeque<magnetar_proto::TxnId>,
     controller_registration: Option<ControllerRegistration>,
     terminal_error: Option<String>,
     reconnect_requested: bool,
@@ -995,6 +1005,7 @@ impl AggregateState {
             pending_transactions: BTreeMap::new(),
             transaction_registrations: BTreeMap::new(),
             transaction_outcomes: BTreeMap::new(),
+            settled_transaction_outcomes: VecDeque::new(),
             controller_registration: Some(controller_registration),
             terminal_error: None,
             reconnect_requested: false,
@@ -2704,6 +2715,9 @@ impl StreamConsumerInner {
                         let result = inner
                             .propagate_transaction_outcome(txn_id, outcome, &task_completion)
                             .await;
+                        if result.is_ok() {
+                            inner.retire_settled_transaction_outcome(txn_id);
+                        }
                         task_completion.finish(result.map_err(|error| error.to_string()));
                     },
                     move || {
@@ -2720,6 +2734,19 @@ impl StreamConsumerInner {
             completion
         };
         completion.wait().await.map_err(StreamConsumerError::Failed)
+    }
+
+    /// Notes that the propagation of `txn_id` succeeded and drops the oldest
+    /// settled records beyond `MAX_SETTLED_TRANSACTION_OUTCOMES`. A record that
+    /// failed stays until it is retried: its checkpoint is what a retry resumes.
+    fn retire_settled_transaction_outcome(&self, txn_id: magnetar_proto::TxnId) {
+        let mut state = self.state.lock();
+        state.settled_transaction_outcomes.push_back(txn_id);
+        if state.settled_transaction_outcomes.len() > MAX_SETTLED_TRANSACTION_OUTCOMES
+            && let Some(oldest) = state.settled_transaction_outcomes.pop_front()
+        {
+            state.transaction_outcomes.remove(&oldest);
+        }
     }
 
     async fn propagate_transaction_outcome(
@@ -3233,6 +3260,7 @@ impl StreamConsumerInner {
                     state.pending_transactions.clear();
                     state.transaction_registrations.clear();
                     state.transaction_outcomes.clear();
+                    state.settled_transaction_outcomes.clear();
                     let cancelled_opens: Vec<_> = actions
                         .into_iter()
                         .filter_map(|action| match action {
@@ -3342,6 +3370,7 @@ impl StreamConsumerInner {
             state.pending_transactions.clear();
             state.transaction_registrations.clear();
             state.transaction_outcomes.clear();
+            state.settled_transaction_outcomes.clear();
             (
                 state
                     .children
@@ -4529,6 +4558,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -4580,6 +4610,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -4922,6 +4953,7 @@ mod tests {
                 pending_transactions: BTreeMap::new(),
                 transaction_registrations: BTreeMap::new(),
                 transaction_outcomes: BTreeMap::new(),
+                settled_transaction_outcomes: VecDeque::new(),
                 controller_registration: None,
                 terminal_error: None,
                 reconnect_requested: false,
@@ -8830,6 +8862,332 @@ mod tests {
         assert!(state.reconnect_requested);
     }
 
+    /// An aggregate with two attached children and one `SeekChild` action for
+    /// each, for the paths that abandon a seek the broker will still answer.
+    fn aggregate_inner_with_two_seek_children() -> (
+        Arc<StreamConsumerInner>,
+        Vec<magnetar_proto::StreamConsumerAction>,
+        [Arc<ConnectionShared>; 2],
+    ) {
+        let (inner, first_shared) = aggregate_inner_with_child();
+        let (first_source, generation, controller_incarnation) = {
+            let state = inner.state.lock();
+            let child = state.children.values().next().expect("first child");
+            (
+                child.source.clone(),
+                child.generation,
+                state.model.controller_incarnation(),
+            )
+        };
+        let second_source = magnetar_proto::SegmentSource::new(
+            magnetar_proto::SegmentId(2),
+            magnetar_proto::canonical_segment_topic(
+                "topic://public/default/scaled",
+                magnetar_proto::KeyRange::FULL,
+                magnetar_proto::SegmentId(2),
+            )
+            .expect("second segment topic"),
+        )
+        .expect("second source");
+        let (second_consumer, second_shared) =
+            attached_child_consumer(&second_source, magnetar_proto::MAX_FRAME_SIZE);
+        inner.state.lock().children.insert(
+            second_source.segment_id(),
+            ChildRuntime {
+                source: second_source.clone(),
+                generation,
+                consumer: second_consumer,
+            },
+        );
+        let target = |source: magnetar_proto::SegmentSource, entry_id| {
+            magnetar_proto::StreamMessageId::new(
+                source,
+                magnetar_proto::MessageId {
+                    ledger_id: 3,
+                    entry_id,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                },
+            )
+            .expect("seek target")
+        };
+        let actions = vec![
+            magnetar_proto::StreamConsumerAction::SeekChild {
+                source: first_source.clone(),
+                controller_incarnation,
+                child_generation: generation,
+                stream_message_id: target(first_source, 5),
+            },
+            magnetar_proto::StreamConsumerAction::SeekChild {
+                source: second_source.clone(),
+                controller_incarnation,
+                child_generation: generation,
+                stream_message_id: target(second_source, 6),
+            },
+        ];
+        (inner, actions, [first_shared, second_shared])
+    }
+
+    /// The `request_id` of the one `CommandSeek` staged on this connection.
+    fn staged_seek_request_id(shared: &Arc<ConnectionShared>) -> u64 {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let mut request_id = None;
+        while !bytes.is_empty() {
+            if let Some(seek) = magnetar_proto::decode_one(&mut bytes)
+                .expect("decode staged seek")
+                .command
+                .seek
+            {
+                assert!(
+                    request_id.replace(seek.request_id).is_none(),
+                    "one seek is staged per child"
+                );
+            }
+        }
+        request_id.expect("a CommandSeek is staged")
+    }
+
+    /// Whether the connection still holds an unclaimed outcome for the request.
+    fn retains_request_outcome(shared: &Arc<ConnectionShared>, request_id: u64) -> bool {
+        shared
+            .inner
+            .lock()
+            .take_outcome(magnetar_proto::PendingOpKey::Request(
+                magnetar_proto::RequestId(request_id),
+            ))
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn failed_aggregate_seek_leaves_no_outcome_for_abandoned_sibling_seeks() {
+        // Both seeks are on the wire before either is awaited. The first one is
+        // rejected, so `execute_actions` returns without ever awaiting the
+        // second: the broker's late reply to it must not be kept for a caller
+        // that no longer exists.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+                    error: Some(magnetar_proto::pb::CommandError {
+                        request_id: first_request_id,
+                        error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                        message: "seek failed".to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("reject the first seek");
+        let result = std::future::Future::poll(operation.as_mut(), &mut context);
+        assert!(
+            matches!(&result, std::task::Poll::Ready(Err(_))),
+            "a rejected seek fails the action list, got {result:?}"
+        );
+        drop(operation);
+
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the abandoned seek");
+        assert!(
+            !retains_request_outcome(&second_shared, second_request_id),
+            "the abandoned sibling seek's late reply left an outcome nobody will take"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_aggregate_seek_leaves_no_outcome_for_its_staged_seeks() {
+        // Dropping the action list after both seeks were staged abandons the
+        // awaited one and the one never awaited alike; the broker still answers
+        // both.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(first_request_id))
+            .expect("late reply to the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the never-awaited seek");
+        let awaited = retains_request_outcome(&first_shared, first_request_id);
+        let staged = retains_request_outcome(&second_shared, second_request_id);
+        assert!(
+            !awaited && !staged,
+            "late replies left outcomes nobody will take (awaited seek: {awaited}, never-awaited seek: {staged})"
+        );
+    }
+
+    /// The consumer slot of the child the aggregate holds for `segment`.
+    fn child_consumer_slot(
+        inner: &StreamConsumerInner,
+        shared: &Arc<ConnectionShared>,
+        segment: magnetar_proto::SegmentId,
+    ) -> Arc<magnetar_proto::ConsumerSlot> {
+        let handle = inner
+            .state
+            .lock()
+            .children
+            .get(&segment)
+            .expect("child runtime")
+            .consumer
+            .handle();
+        shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .expect("child consumer slot")
+            .clone()
+    }
+
+    /// Whether a `CommandSubscribe` is among the frames staged on `shared`.
+    fn stages_subscribe(shared: &Arc<ConnectionShared>) -> bool {
+        let mut bytes = shared.inner.lock().poll_transmit();
+        let mut subscribed = false;
+        while !bytes.is_empty() {
+            subscribed |= magnetar_proto::decode_one(&mut bytes)
+                .expect("decode staged frame")
+                .command
+                .subscribe
+                .is_some();
+        }
+        subscribed
+    }
+
+    #[tokio::test]
+    async fn dropped_aggregate_seek_hands_its_awaited_request_to_the_connection() {
+        // `execute_actions` stages both seeks, then awaits the first. Dropped
+        // there, the awaited seek belongs to the abandon guard (ADR-0133): the
+        // connection keeps its request, retagged, and re-attaches the consumer
+        // the broker dropped when the `Success` lands. Only the seek never
+        // awaited is cancelled. Were the staged seek's own cancellation still
+        // armed for the awaited one, it would remove the retagged request and
+        // the `Success` would re-attach nothing.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        let awaited_pending = first_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(first_request_id));
+        let staged_pending = second_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(second_request_id));
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(first_request_id))
+            .expect("late reply to the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(second_request_id))
+            .expect("late reply to the never-awaited seek");
+        let awaited_resubscribed = stages_subscribe(&first_shared);
+        let staged_resubscribed = stages_subscribe(&second_shared);
+        assert!(
+            awaited_pending && awaited_resubscribed,
+            "awaited seek retagged (pending: {awaited_pending}) and re-attached on Success \
+             (resubscribed: {awaited_resubscribed})"
+        );
+        assert!(
+            !staged_pending && !staged_resubscribed,
+            "never-awaited seek cancelled (pending: {staged_pending}) and its Success ignored \
+             (resubscribed: {staged_resubscribed})"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_aggregate_seek_leaves_a_rejected_awaited_seek_to_the_connection() {
+        // The same drop, answered with a rejection: the connection must still
+        // own the awaited seek's request, so its `Error` runs the rejected-seek
+        // recovery, which thaws the consumer `begin_seek` froze. The seek never
+        // awaited was cancelled and its rejection finds no request.
+        let (inner, actions, [first_shared, second_shared]) =
+            aggregate_inner_with_two_seek_children();
+        let first_segment = match &actions[0] {
+            magnetar_proto::StreamConsumerAction::SeekChild { source, .. } => source.segment_id(),
+            other => panic!("the first action seeks the first child, got {other:?}"),
+        };
+        let first_slot = child_consumer_slot(&inner, &first_shared, first_segment);
+        let mut operation = Box::pin(inner.execute_actions(actions));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+        let first_request_id = staged_seek_request_id(&first_shared);
+        let second_request_id = staged_seek_request_id(&second_shared);
+        drop(operation);
+
+        let staged_pending = second_shared
+            .inner
+            .lock()
+            .has_pending_request_for_test(magnetar_proto::RequestId(second_request_id));
+        let reject = |request_id| {
+            encode(&magnetar_proto::pb::BaseCommand {
+                r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+                error: Some(magnetar_proto::pb::CommandError {
+                    request_id,
+                    error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                    message: "seek failed".to_owned(),
+                }),
+                ..Default::default()
+            })
+        };
+        first_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &reject(first_request_id))
+            .expect("late rejection of the awaited seek");
+        second_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &reject(second_request_id))
+            .expect("late rejection of the never-awaited seek");
+        // `seek_acked` hands back the seek still pending on the consumer: none
+        // once the rejection was recovered.
+        let still_frozen = first_slot.state.lock().seek_acked();
+        assert_eq!(
+            still_frozen, None,
+            "the awaited seek's rejection must thaw its consumer"
+        );
+        assert!(
+            !staged_pending,
+            "the never-awaited seek's request must have been cancelled"
+        );
+        assert!(
+            !retains_request_outcome(&first_shared, first_request_id)
+                && !retains_request_outcome(&second_shared, second_request_id),
+            "late rejections left outcomes nobody will take"
+        );
+    }
+
     #[tokio::test]
     async fn failed_aggregate_seek_closes_children_before_requesting_resync() {
         let (inner, child_shared) = aggregate_inner_with_child();
@@ -9028,6 +9386,88 @@ mod tests {
         let state = completion.state.lock();
         assert!(matches!(state.result, Some(Ok(()))));
         assert!(!state.running);
+    }
+
+    #[tokio::test]
+    async fn settled_transaction_outcomes_are_not_retained_until_the_aggregate_closes() {
+        // The facade reports each transaction's outcome once and then forgets
+        // the transaction, so a long-lived consumer must not keep one
+        // completion record per transaction it ever took part in. A second
+        // round of distinct transactions must not grow what the first round
+        // left behind: evicting a record once its result was delivered, or
+        // keeping a bounded window no wider than one round, satisfies it.
+        const ROUND: u64 = 4_096;
+        let inner = empty_aggregate_inner();
+        let mut retained = Vec::new();
+        for start in [0, ROUND] {
+            for sequence in start..start + ROUND {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    inner.transaction_outcome(
+                        magnetar_proto::TxnId::new(sequence, 1),
+                        magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+                    ),
+                )
+                .await
+                .expect("outcome propagation finishes")
+                .expect("outcome propagation succeeds");
+            }
+            retained.push(inner.state.lock().transaction_outcomes.len());
+        }
+
+        let (after_first, after_second) = (retained[0], retained[1]);
+        assert!(
+            after_second <= after_first,
+            "settled transaction outcomes grow with the transaction count: {after_first} \
+             retained after {ROUND} transactions, {after_second} after {}",
+            2 * ROUND
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_transaction_outcomes_keep_the_newest_window_and_evict_the_oldest() {
+        // The record of a settled transaction answers a repeated outcome for it,
+        // so the aggregate keeps the newest records and drops the oldest first,
+        // and a record that is still in the window is not propagated again.
+        let inner = empty_aggregate_inner();
+        let window = MAX_SETTLED_TRANSACTION_OUTCOMES as u64;
+        for sequence in 0..window + 3 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                inner.transaction_outcome(
+                    magnetar_proto::TxnId::new(sequence, 1),
+                    magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+                ),
+            )
+            .await
+            .expect("outcome propagation finishes")
+            .expect("outcome propagation succeeds");
+        }
+        let retained = || {
+            inner
+                .state
+                .lock()
+                .transaction_outcomes
+                .keys()
+                .map(|txn_id| txn_id.most_sig_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retained(), (3..window + 3).collect::<Vec<_>>());
+        assert_eq!(
+            inner.state.lock().settled_transaction_outcomes.len(),
+            MAX_SETTLED_TRANSACTION_OUTCOMES
+        );
+
+        // A repeat of a retained transaction is answered from its record: the
+        // window neither grows nor moves.
+        inner
+            .transaction_outcome(
+                magnetar_proto::TxnId::new(window + 2, 1),
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await
+            .expect("repeated outcome is answered from its record");
+        assert_eq!(retained(), (3..window + 3).collect::<Vec<_>>());
     }
 
     #[tokio::test]
