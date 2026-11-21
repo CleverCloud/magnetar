@@ -800,6 +800,127 @@ async fn run_moonpool_budget() -> BudgetTrace {
     trace
 }
 
+/// How long a busy segment may go without FLOW before the scenario calls it
+/// starved. Delivery over the loopback fake takes milliseconds; the shared
+/// hang guard leaves room for a remedy that reclaims an idle permit on a timer.
+const IDLE_SIBLING_DEADLINE: Duration = magnetar_differential::HANG_GUARD;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdleSiblingTrace {
+    /// Every message of the busy segment reached the application.
+    Delivered(Vec<MessageIdentity>),
+    /// The aggregate refused to run two segments on a budget with one permit.
+    Refused,
+}
+
+/// A refusal is acceptable only when it is the typed budget failure, so a
+/// stall, a resync loop or an unrelated error never passes for one.
+fn is_budget_refusal(error: &magnetar::scalable::StreamConsumerError) -> bool {
+    matches!(
+        error,
+        magnetar::scalable::StreamConsumerError::Budget(_)
+            | magnetar::scalable::StreamConsumerError::Model(
+                magnetar::proto::StreamConsumerModelError::Budget(_)
+            )
+    )
+}
+
+async fn observe_idle_sibling_at_default_budget<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> IdleSiblingTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    const SUBSCRIPTION: &str = "idle-sibling-sub";
+    // No `receiver_budget`: the facade default holds exactly one maximum-frame
+    // FLOW permit for the two assigned segments.
+    let subscribed = client
+        .scalable_stream_consumer(
+            "topic://public/default/scaled",
+            Arc::new(BytesSchema::new()),
+        )
+        .subscription(SUBSCRIPTION)
+        .consumer_name("idle-sibling-consumer")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .subscribe()
+        .await;
+    let consumer = match subscribed {
+        Ok(consumer) => consumer,
+        Err(error) if is_budget_refusal(&error) => return IdleSiblingTrace::Refused,
+        Err(error) => panic!("subscribe default-budget aggregate: {error}"),
+    };
+    assert!(
+        consumer.status().receiver_budget_limit()
+            >= magnetar::scalable::DEFAULT_RECEIVER_BUDGET_BYTES,
+        "the scenario must run at the facade default, not below it"
+    );
+    cluster
+        .wait_for("two children attached and FLOW granted", |fake| {
+            let counts = fake.resource_counts();
+            counts.child_consumers == 2 && counts.permits >= 1
+        })
+        .await;
+
+    // Segment 1 carries all the traffic and segment 2 never receives anything.
+    for payload in [&b"busy-one"[..], &b"busy-two"[..]] {
+        cluster
+            .update(|fake| fake.enqueue_message(1, Bytes::copy_from_slice(payload)))
+            .expect("enqueue a message on the busy segment");
+    }
+    let mut delivered = Vec::new();
+    for position in 1..=2 {
+        let received = tokio::time::timeout(IDLE_SIBLING_DEADLINE, consumer.receive()).await;
+        let message = match received {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) if is_budget_refusal(&error) => return IdleSiblingTrace::Refused,
+            Ok(Err(error)) => panic!("default-budget aggregate receive failed: {error}"),
+            Err(_) => {
+                let (resources, busy_permits, idle_permits) = cluster.inspect(|fake| {
+                    (
+                        fake.resource_counts(),
+                        fake.segment_permits(SUBSCRIPTION, 1),
+                        fake.segment_permits(SUBSCRIPTION, 2),
+                    )
+                });
+                panic!(
+                    "busy segment 1 is starved: message {position} of 2 was not delivered within \
+                     {IDLE_SIBLING_DEADLINE:?} and the aggregate raised neither an event nor an \
+                     error; wire permits segment1={busy_permits} segment2={idle_permits}, \
+                     resources={resources:?}, status={:?}",
+                    consumer.status()
+                );
+            }
+        };
+        delivered.push(message_identity(&message));
+        consumer
+            .acknowledge(&message)
+            .await
+            .expect("acknowledge a busy-segment delivery");
+    }
+    let close = consumer.close().await;
+    cluster.assert_healthy();
+    close.expect("close default-budget aggregate");
+    IdleSiblingTrace::Delivered(delivered)
+}
+
+async fn run_tokio_idle_sibling() -> IdleSiblingTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_idle_sibling_at_default_budget(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_idle_sibling() -> IdleSiblingTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_idle_sibling_at_default_budget(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_assignment_and_drain<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -3216,6 +3337,13 @@ async fn aggregate_receiver_budget_is_equivalent() {
     let tokio = run_tokio_budget().await;
     let moonpool = run_moonpool_budget().await;
     assert_eq!(tokio, moonpool, "receiver budget traces diverged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_budget_does_not_strand_a_busy_segment_behind_an_idle_sibling() {
+    let tokio = run_tokio_idle_sibling().await;
+    let moonpool = run_moonpool_idle_sibling().await;
+    assert_eq!(tokio, moonpool, "idle-sibling budget traces diverged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

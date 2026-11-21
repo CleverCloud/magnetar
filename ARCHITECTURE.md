@@ -1486,7 +1486,8 @@ Both modes preserve broker FIFO within one segment and define no total order bet
 
 Every child is in manual-FLOW mode.
 One aggregate arbiter reserves `MAX_FRAME_SIZE` before granting one message permit and accounts for retained frames, decompression/chunk/batch work, queue and ledger nodes, canonical-id/source sidecars, position-map nodes, ordering-barrier storage, delivery leases, retiring children, and source-qualified authority.
-Adding segments redistributes capacity; it never multiplies the configured budget.
+Adding segments redistributes capacity; it never multiplies a fixed `ReceiverBudget::bytes` budget.
+The default budget is `ReceiverBudget::growing_bytes`, which adds one `MAX_FRAME_SIZE` for each assigned segment beyond the first so that every segment can hold a permit, and never shrinks ([ADR-0141](specs/adr/0141-default-stream-consumer-budget-grows-per-assigned-segment.md), proposed).
 Partial-batch dispatch charges only the logical members selected by the broker's `ack_set`; fresh grants remain replayable, while batch overshoot debt is repaid only on the current wire and is discarded with obsolete credit at seek.
 
 The validated minimum is exactly:
