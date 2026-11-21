@@ -65,6 +65,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A bucket reaped empty (every delivery in it acknowledged in its window, the healthy steady state) with an arrival after its deadline and before the timer-driven sweep left the survivor's index pointing one bucket too high, so the ack of that arrival found no bucket, released nothing, and the id was redelivered when its own window closed.
   The index is now rebuilt whenever any bucket was reaped.
 
+- **A `send_timeout` sweep that expires only the oldest sends no longer misroutes the wakers of the sends that survive it.**
+  `ProducerState` keeps a `sequence id -> position` index beside its queue of in-flight sends, and `apply_receipt` and `apply_send_error` shift it after every removal.
+  `drain_timed_out_sends` popped the front of the queue and dropped only the popped keys, so each survivor's recorded position stayed too high by the number of sends the sweep expired.
+  `register_waker` and `clear_waker` address the queue by that position without checking the sequence id, and `Connection::register_waker` skips the connection-wide slab on a `true` return, so a send future polled for the first time, or re-polled, after the sweep parked its waker on the send behind it and overwrote that send's own waker; a `Connection::unregister_waker` call for a survivor cleared the waker of the send behind it the same way.
+  The receipt then woke the wrong waker: when the two sends were awaited by different tasks, the victim's task was never woken, so a send that completed stayed pending on a healthy connection, and once the op left the queue no later sweep could find its waker (awaited by one task, it was only a late or spurious wake).
+  The sweep now moves every surviving position forward by the number of expired sends, in one pass that is skipped when nothing expired.
+  Both engines run the same `Connection` code and behave identically.
+
 - **`Consumer::resume` releases the flow a pause withheld.**
   `pause()` stops the automatic flow refill, so a receive loop that drains the whole window while paused leaves the broker holding zero permits and the client owing it the whole window.
   `resume()` only stored `paused = false` and woke the driver; nothing ran `maybe_flow`, whose only callers are the arrival of a message and a pop.

@@ -821,6 +821,17 @@ impl ProducerState {
                 break;
             }
         }
+        // `pending_index` stores POSITIONS, and the loop above removed a prefix: every survivor
+        // moved `out.len()` slots toward the front. Leaving the values alone would make
+        // `register_waker` / `clear_waker` address the op BEHIND the intended one. One pass,
+        // skipped when nothing expired (the common tick), like `shift_pending_index_left` does
+        // for a single removal.
+        let expired = out.len();
+        if expired > 0 {
+            for position in self.pending_index.values_mut() {
+                *position = position.saturating_sub(expired);
+            }
+        }
         out
     }
 
