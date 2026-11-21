@@ -14,6 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `Consumer::is_terminal()` evaluates the gate `receive()` itself resolves `Err(Closed)` on, which is broader than `is_closed()`: a per-handle terminal subscribe failure never sets `closed`.
   `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
   `WrapperReceiver::is_terminal` has a default of `false`; an implementation whose `wrapper_receive` can fail for good must override it.
+- **`PatternConsumerBuilder::subscribe_with_listener_and_consumer()`, a listener terminal that returns the `PatternConsumer` next to the `MessageListenerHandle`** ([ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md), a proposal for the maintainers to arbitrate).
+  `subscribe_with_listener()` builds the consumer inside the call, moves it into the poller and returns the handle alone, and discovery after the first snapshot is driven only by `PatternConsumer::update` (directly or through `start_auto_reconcile`), which its caller holds nothing to call on: a pattern push consumer built through the builder stayed on the topics matched at subscribe.
+  The new terminal hands a clone to the poller and returns the consumer itself, so a topic created after subscribe reaches the listener once the caller's `update` on that consumer has subscribed it.
+  Discovery stays caller-driven: nothing reconciles on its own.
+  The caller must not call `receive()` on the returned consumer while the handle is live, and closes the handle before the consumer, because `PatternConsumer::close` closes nothing while the poller's clone is alive.
+  `subscribe_with_listener()` keeps its signature and its behaviour.
+  The ADR records the two alternatives the arbitration can still pick: an auto-reconcile interval started inside the terminal, and a documentation-only correction.
 
 ### Changed
 
@@ -54,6 +61,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The broker sends nothing after the end of the topic and the child hands over every entry it received first, so no chain that could still finish is abandoned.
   The broker reports the end of a topic only once every entry is acknowledged, so this covers a chain whose first chunk a cumulative acknowledgement of a later entry already covered.
   A chain whose first chunk stays unacknowledged, which is what a producer that died mid-message leaves, still keeps the broker from ending the topic and the segment from completing, because nothing expires, abandons or acknowledges it; on a live segment it is held until the child closes or the aggregate resynchronizes, as before.
+- **The documentation of `PatternConsumerBuilder::subscribe_with_listener()` no longer tells a caller to use a consumer the terminal does not return** ([ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md)).
+  It promised that topics matched after subscribe inherit the listener and advised holding a `PatternConsumer` clone "before `subscribe_with_listener`", which cannot be done: the builder consumes itself and no consumer exists before the call.
+  That documentation, `README.md` and `ARCHITECTURE.md` now say that this terminal delivers the topics matched at subscribe and only those, and point to `subscribe_with_listener_and_consumer()`.
 - **The tokio supervisor closes a socket it abandoned instead of holding it open through the redial delay.**
   `supervised_driver_loop` lent its transport to `driver_loop_inner` as `&mut` and kept it in a local, so after an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable auth challenge, an undecodable frame, a write or handshake deadline) the peer was still alive and the stream stayed open, unread, through the anti-thrash cooldown, the backoff sleep and the dial, and was dropped only when the replacement was assigned.
   For that whole delay (up to `max_backoff` plus `connect_timeout`, 60 s plus the dial budget by default) the broker kept the connection and its producers and consumers registered, and kept dispatching to a client that no longer read.
