@@ -40,7 +40,14 @@ use crate::engine::{RawStreamMessage, StreamConsumerBackend, StreamConsumerOptio
 pub use crate::engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi, SegmentSubscriberApi};
 use crate::{Engine, PulsarClient};
 
-/// Default aggregate receive budget: 16 MiB including the fixed cleanup reserve.
+/// Default aggregate receive budget for one assigned segment: 16 MiB including
+/// the fixed cleanup reserve.
+///
+/// A builder that never calls [`StreamConsumerBuilder::receiver_budget`] uses
+/// this size through [`ReceiverBudget::growing_bytes`]: the aggregate adds one
+/// maximum frame to the limit for every further assigned segment, so each
+/// segment can hold a FLOW permit and a busy segment never waits for an idle
+/// one. `StreamConsumerStatus::receiver_budget_limit` reports the grown limit.
 pub const DEFAULT_RECEIVER_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// Invalid atomic batch-receive policy.
@@ -371,7 +378,8 @@ impl StreamConsumerStatus {
         &self.ordering_unprovable
     }
 
-    /// Configured aggregate bytes, including cleanup reserve.
+    /// Aggregate bytes, including cleanup reserve: the configured size, plus
+    /// what a default budget has grown to cover its assigned segments.
     #[must_use]
     pub const fn receiver_budget_limit(&self) -> usize {
         self.receiver_budget_limit
@@ -916,7 +924,7 @@ where
     E::ClientState: SegmentSubscriberApi,
 {
     fn new(client: &'a PulsarClient<E>, topic: String, schema: Arc<S>) -> Self {
-        let receiver_budget = ReceiverBudget::bytes(DEFAULT_RECEIVER_BUDGET_BYTES)
+        let receiver_budget = ReceiverBudget::growing_bytes(DEFAULT_RECEIVER_BUDGET_BYTES)
             .expect("the fixed default stream receiver budget must remain valid");
         Self {
             client,
@@ -945,8 +953,12 @@ where
         self
     }
 
-    /// Set one validated aggregate receive budget. Adding assigned segments
-    /// redistributes this capacity and never multiplies it.
+    /// Set one validated fixed aggregate receive budget. Adding assigned
+    /// segments redistributes this capacity and never multiplies it, so a budget
+    /// that holds fewer maximum-frame FLOW permits than there are assigned
+    /// segments can leave a busy segment waiting for an idle one. Without this
+    /// call the budget starts at [`DEFAULT_RECEIVER_BUDGET_BYTES`] and grows by
+    /// one maximum frame per further assigned segment.
     #[must_use]
     pub const fn receiver_budget(mut self, receiver_budget: ReceiverBudget) -> Self {
         self.receiver_budget = receiver_budget;

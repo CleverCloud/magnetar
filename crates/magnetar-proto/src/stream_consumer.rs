@@ -131,6 +131,10 @@ pub enum BudgetUse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverBudget {
     bytes: usize,
+    /// `None` for a fixed budget. For a growing one, the bytes added so far on
+    /// top of the configured size: one `MAX_FRAME_SIZE` for each assigned
+    /// segment beyond the first.
+    growth: Option<usize>,
 }
 
 impl ReceiverBudget {
@@ -138,6 +142,13 @@ impl ReceiverBudget {
     ///
     /// The total must fit one maximum Pulsar frame, worst-case live and retained
     /// authority metadata, and the fixed control-plane cleanup reserve.
+    ///
+    /// The budget is fixed: it holds `bytes` however many segments the
+    /// aggregate is assigned. One maximum-frame FLOW permit costs
+    /// [`MAX_FRAME_SIZE`], so a budget that holds fewer permits than there are
+    /// assigned segments lets a permit parked on a segment without traffic keep
+    /// every busier segment from receiving. Use [`Self::growing_bytes`] to have
+    /// the aggregate add room for one permit per assigned segment.
     ///
     /// # Errors
     ///
@@ -149,7 +160,29 @@ impl ReceiverBudget {
         if bytes < minimum {
             return Err(BudgetError::BudgetTooSmall { bytes, minimum });
         }
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes,
+            growth: None,
+        })
+    }
+
+    /// Validate a byte budget that grows with the assignment.
+    ///
+    /// `bytes` is the budget for one assigned segment, validated like
+    /// [`Self::bytes`]. The aggregate adds one [`MAX_FRAME_SIZE`] to the limit
+    /// for each further assigned segment, so every assigned segment can hold a
+    /// FLOW permit at once and keeps the retained-message room that `bytes`
+    /// leaves for one. The limit follows the assignment upward and never
+    /// shrinks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BudgetError::BudgetTooSmall`] below the required minimum.
+    pub fn growing_bytes(bytes: usize) -> Result<Self, BudgetError> {
+        Self::bytes(bytes).map(|budget| Self {
+            growth: Some(0),
+            ..budget
+        })
     }
 
     /// Configured aggregate bytes, including cleanup reserve.
@@ -162,6 +195,25 @@ impl ReceiverBudget {
     #[must_use]
     pub const fn data_limit(self) -> usize {
         self.bytes - CONTROL_PLANE_CLEANUP_RESERVE
+    }
+
+    /// Bytes a growing budget has added to its configured size so far.
+    const fn grown(self) -> usize {
+        match self.growth {
+            Some(grown) => grown,
+            None => 0,
+        }
+    }
+
+    /// Raise a growing budget to hold one FLOW permit for each of `segments`.
+    /// A fixed budget, and a growing one that already covers `segments`, stay
+    /// as they are: the limit never shrinks below bytes already reserved.
+    fn fit_segments(&mut self, segments: usize) {
+        if let Some(grown) = self.growth {
+            let target = grown.max(segments.saturating_sub(1).saturating_mul(MAX_FRAME_SIZE));
+            self.bytes = self.bytes.saturating_add(target - grown);
+            self.growth = Some(target);
+        }
     }
 }
 
@@ -296,11 +348,15 @@ impl ReceiverBudgetState {
 
     /// Most that every non-authority reservation of one kind may hold together,
     /// even when the ledger is otherwise empty: the data limit minus the
-    /// authority headroom that must stay free.
+    /// authority headroom that must stay free. A growing budget's added room
+    /// belongs to the FLOW permits of the other segments, so it is not counted:
+    /// a chain that fits only with that room could meet those permits and fail
+    /// as `Exhausted` forever instead of being refused as too large.
     const fn non_authority_limit(&self) -> usize {
         self.budget
             .data_limit()
             .saturating_sub(RECEIVER_BUDGET_AUTHORITY_HEADROOM)
+            .saturating_sub(self.budget.grown())
     }
 
     fn authority_used(&self) -> usize {
@@ -2950,7 +3006,7 @@ impl StreamConsumerModel {
         let mut children = self.children.clone();
         let mut pending_ownership = self.pending_ownership.clone();
         let mut ownership_history = self.ownership_history.clone();
-        let budget = self.budget.clone();
+        let mut budget = self.budget.clone();
         let mut next_child_generation = self.next_child_generation;
         let mut actions = Vec::new();
         let mut retiring: BTreeMap<SegmentId, SegmentSource> = before
@@ -3059,6 +3115,8 @@ impl StreamConsumerModel {
             });
         }
 
+        // Every child, a draining one included, can hold a FLOW permit.
+        budget.budget.fit_segments(children.len());
         self.generation = AggregateGeneration(next_generation);
         self.next_child_generation = next_child_generation;
         self.children = children;
@@ -5484,6 +5542,26 @@ mod tests {
         .expect("model")
     }
 
+    /// Like [`model_with_data_capacity`], over a budget that grows with the
+    /// assignment from the same one-segment size.
+    fn growing_model_with_data_capacity(
+        mode: OrderingMode,
+        data_capacity: usize,
+    ) -> StreamConsumerModel {
+        StreamConsumerModel::new(
+            "topic://t/n/x".to_owned(),
+            ConsumerInstanceId(10),
+            ControllerIncarnation(3),
+            mode,
+            split_dag(),
+            ReceiverBudget::growing_bytes(
+                data_capacity + RECEIVER_BUDGET_AUTHORITY_HEADROOM + CONTROL_PLANE_CLEANUP_RESERVE,
+            )
+            .expect("budget"),
+        )
+        .expect("model")
+    }
+
     fn message_id(entry_id: u64) -> MessageId {
         MessageId {
             ledger_id: 1,
@@ -7679,6 +7757,149 @@ mod tests {
             back_to_one.actions.as_slice(),
             [StreamConsumerAction::GrantFlow { source, .. }]
                 if source.segment_id() == SegmentId(1)
+        ));
+    }
+
+    #[test]
+    fn growing_budget_holds_a_flow_permit_for_every_assigned_segment() {
+        // The fixed budget of `freed_capacity_rotates_fairly_across_eligible_children`
+        // holds one permit, so a busy segment hands it to an idle sibling after
+        // every message. The same size, grown for two segments, holds both.
+        let data_capacity = MAX_FRAME_SIZE + 2 * MIN_RETAINED_MESSAGE_RESERVATION;
+        let mut model =
+            growing_model_with_data_capacity(OrderingMode::BrokerManaged, data_capacity);
+        let one_segment_limit = model.budget.limit();
+        let opens = model
+            .apply_assignment(assignment(1, &[1, 2]))
+            .expect("assignment");
+        assert_eq!(model.budget.limit(), one_segment_limit + MAX_FRAME_SIZE);
+        let generation_one = opened_generation(&opens[0]);
+        let generation_two = opened_generation(&opens[1]);
+        let first = model
+            .child_opened(SegmentId(1), generation_one)
+            .expect("first child");
+        let second = model
+            .child_opened(SegmentId(2), generation_two)
+            .expect("second child");
+        assert!(
+            matches!(
+                second.as_slice(),
+                [StreamConsumerAction::GrantFlow { source, .. }]
+                    if source.segment_id() == SegmentId(2)
+            ),
+            "the second segment holds a permit as well, got {second:?}"
+        );
+        assert_eq!(model.budget.data_used(), 2 * MAX_FRAME_SIZE);
+
+        // Segment 2 never receives. Segment 1 gets its next permit back instead
+        // of waiting for the idle segment to use its own.
+        let busy = model
+            .message_arrived(SegmentId(1), generation_one, flow_reservation(&first), 0)
+            .expect("busy arrival");
+        assert!(
+            matches!(
+                busy.actions.as_slice(),
+                [StreamConsumerAction::GrantFlow { source, .. }]
+                    if source.segment_id() == SegmentId(1)
+            ),
+            "the busy segment regains FLOW, got {:?}",
+            busy.actions
+        );
+    }
+
+    #[test]
+    fn growing_budget_adds_one_frame_per_further_segment_and_never_shrinks() {
+        let mut model =
+            growing_model_with_data_capacity(OrderingMode::BrokerManaged, MAX_FRAME_SIZE);
+        let one_segment_limit = model.budget.limit();
+
+        // One segment is the configured size.
+        model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("one segment");
+        assert_eq!(model.budget.limit(), one_segment_limit);
+
+        model
+            .apply_assignment(assignment(1, &[0, 1, 2]))
+            .expect("three segments");
+        let three_segment_limit = one_segment_limit + 2 * MAX_FRAME_SIZE;
+        assert_eq!(model.budget.limit(), three_segment_limit);
+
+        // Segments that leave keep their room: the limit is a high-water mark,
+        // so it cannot fall below bytes already reserved.
+        model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("segments leave");
+        assert_eq!(model.budget.limit(), three_segment_limit);
+    }
+
+    #[test]
+    fn fixed_budget_keeps_its_limit_as_segments_are_assigned() {
+        let mut model = model_with_data_capacity(OrderingMode::BrokerManaged, MAX_FRAME_SIZE);
+        let limit = model.budget.limit();
+        model
+            .apply_assignment(assignment(1, &[0, 1, 2]))
+            .expect("three segments");
+        assert_eq!(model.budget.limit(), limit);
+        assert_ne!(
+            ReceiverBudget::bytes(limit),
+            ReceiverBudget::growing_bytes(limit),
+            "a growing budget is not a fixed budget of the same size"
+        );
+    }
+
+    #[test]
+    fn growing_budget_is_validated_like_a_fixed_one() {
+        assert_eq!(
+            ReceiverBudget::growing_bytes(0),
+            ReceiverBudget::bytes(0),
+            "the same minimum applies, with the same error"
+        );
+        let minimum = match ReceiverBudget::bytes(0) {
+            Err(BudgetError::BudgetTooSmall { minimum, .. }) => minimum,
+            other => panic!("expected the minimum, got {other:?}"),
+        };
+        assert_eq!(
+            ReceiverBudget::growing_bytes(minimum)
+                .expect("the minimum is valid")
+                .limit(),
+            minimum
+        );
+    }
+
+    #[test]
+    fn chunk_chain_is_judged_against_the_configured_budget_not_its_growth() {
+        // The room a growing budget adds belongs to the permits of the other
+        // segments. A chain that fits only with it would meet those permits and
+        // fail as `Exhausted` after every resynchronization, so it is refused as
+        // too large exactly as at the configured size.
+        let mut model =
+            growing_model_with_data_capacity(OrderingMode::BrokerManaged, 2 * MAX_FRAME_SIZE);
+        let open = model
+            .apply_assignment(assignment(1, &[1, 2]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = flow_reservation(
+            &model
+                .child_opened(SegmentId(1), generation)
+                .expect("first child"),
+        );
+        model
+            .child_opened(SegmentId(2), opened_generation(&open[1]))
+            .expect("second child");
+        let limit = model.budget.non_authority_limit();
+        assert_eq!(
+            limit,
+            2 * MAX_FRAME_SIZE,
+            "the configured size, not the grown one"
+        );
+
+        let over = limit - MAX_FRAME_SIZE + 1;
+        assert!(matches!(
+            model.chunk_frame_buffered(SegmentId(1), generation, flow, None, over),
+            Err(StreamConsumerModelError::Budget(
+                BudgetError::MessageTooLargeForBudget { required, limit: reported }
+            )) if required == limit + 1 && reported == limit
         ));
     }
 

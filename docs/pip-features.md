@@ -742,7 +742,9 @@ Neither mode defines a total order between independent branches; broker FIFO rem
 
 All children use manual FLOW.
 One aggregate budget covers granted-but-unconsumed permits, encoded and decompressed payload, batch/chunk work, queue and ledger nodes, every retained canonical-id/source sidecar, position-map nodes, DAG-barrier holding state, delivery leases, source-qualified authority, and retiring children.
-Adding segments redistributes capacity; it never multiplies the budget by segment count.
+An explicit `receiver_budget` is fixed: adding segments redistributes its capacity and never multiplies it.
+The default budget is the exception ([ADR-0141](../specs/adr/0141-default-stream-consumer-budget-grows-per-assigned-segment.md), proposed): it starts at `DEFAULT_RECEIVER_BUDGET_BYTES` for one assigned segment and grows by one `MAX_FRAME_SIZE` for each further assigned segment (16,777,216 bytes for one, 22,020,096 for two), counting draining children, and the limit never shrinks.
+`StreamConsumerStatus::receiver_budget_limit` reports the grown limit, and `ReceiverBudget::growing_bytes` builds the same kind of budget for a caller that wants another starting size.
 
 The exact minimum is:
 
@@ -758,19 +760,25 @@ MAX_FRAME_SIZE
 
 `DELIVERY_ACK_GENERATION_OVERHEAD` is one `u64` per live delivery lease. It is charged once with the lease; the canonical delivered-position map keeps its existing charge.
 
-The default and examples use 16 MiB.
+The examples set an explicit 16 MiB, and the default starts at 16 MiB for one segment.
 An 8 MiB budget is invalid.
 The guarantee covers allocations Magnetar controls or derives from the wire; arbitrary additional memory allocated inside user-defined `S::Owned` during decoding is outside it.
 
 Budget exhaustion stops new FLOW or returns a typed resource failure.
 It never marks an ordering predecessor complete, and cleanup retains its independent 64 KiB reserve.
 
+Each granted FLOW permit is charged `MAX_FRAME_SIZE` and Pulsar cannot take a granted permit back, so a permit stays charged until a frame arrives on its segment, the segment ends, is sought or closes.
+A fixed budget that holds fewer permits than there are assigned segments therefore lets a permit granted to a segment without traffic keep every busier segment from receiving until the idle one gets a message, and neither an event nor an error reports it.
+After every arrival the arbiter hands the freed capacity to the next eligible segment in turn, so with one permit a busy segment delivers one message per message that reaches each of its siblings.
+An explicit budget that must not stall holds one permit per assigned segment: `13,697,160 + (n − 1) × 5,242,880` bytes is the smallest that does for `n` segments, and it leaves no room for retained messages, so a segment gets its next permit only after its previous message was acknowledged; add room for the messages you keep in flight.
+A draining child that waits for a flow drain pins its permit in the same way until it receives a frame.
+
 Chunked messages (PIP-37) are reassembled per child, with one chain per chunk `uuid`, because the chunks of several producers interleave on one segment.
 A child holds at most `MAX_PENDING_CHUNK_CHAINS` chains at once (10, the ordinary consumer's `max_pending_chunked_message` default); opening an eleventh is a malformed delivery and requests resynchronization.
 Each chain reserves `buffered bytes + announced size` from the aggregate budget before its first chunk is retained, together with one `MAX_FRAME_SIZE` permit for the next entry, so the budget bounds every open chain.
 An entry that is not part of a chain, a complete message, a batch, or the chunks of another chain, spends the child's permit as itself and leaves every chain open; the flow arbiter serves a child that holds a chain before any sibling, so a sibling cannot take the frame its chain needs to finish.
 
-A chain whose assemblies and continuation frame cannot fit the budget even when nothing else is retained, that is `buffered + announced size + MAX_FRAME_SIZE` above the data limit minus the authority headroom (8,322,936 bytes at the default 16 MiB budget), can never be assembled: the broker redelivers the unacknowledged first chunk after every resynchronization.
+A chain whose assemblies and continuation frame cannot fit the budget even when nothing else is retained, that is `buffered + announced size + MAX_FRAME_SIZE` above the data limit minus the authority headroom (8,322,936 bytes at the default 16 MiB budget, and the room a growing budget added for further segments is not counted), can never be assembled: the broker redelivers the unacknowledged first chunk after every resynchronization.
 It therefore fails the consumer with the typed `MessageTooLargeForBudget` text (`receive` and `next_event` return `StreamConsumerError::Failed`, naming the required bytes and the data budget) instead of requesting resynchronization, and the remedy is a larger `receiver_budget`.
 A message chunked because it exceeds the broker's default 5 MiB `max_message_size` is above that bound at the default budget; the bound holds for any `max_message_size` of about 1.54 MB or more.
 A chain that would fit alone but meets a budget held by sibling children or retained messages fails with `Exhausted` and still resynchronizes, because that pressure can clear.

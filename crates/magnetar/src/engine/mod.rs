@@ -1098,7 +1098,9 @@ pub struct StreamConsumerOptions {
     pub consumer_name: String,
     /// Broker schema metadata copied to every ordinary child subscribe.
     pub schema: magnetar_proto::pb::Schema,
-    /// One aggregate receive budget, never multiplied by child count.
+    /// One aggregate receive budget. A fixed budget is never multiplied by child
+    /// count; a growing one adds one maximum frame per assigned segment beyond
+    /// the first.
     pub receiver_budget: magnetar_proto::ReceiverBudget,
     /// Per-child decompressed payload ceiling.
     pub max_uncompressed_message_size: usize,
