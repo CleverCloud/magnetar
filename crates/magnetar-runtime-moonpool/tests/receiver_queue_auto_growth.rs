@@ -6,8 +6,8 @@
 //! mirror of `magnetar-runtime-tokio/tests/receiver_queue_auto_growth.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): four `#[test]` functions here mirror the
-//! tokio file's four.
+//! (`check-runtime-test-parity`): nine `#[test]` functions here mirror the
+//! tokio file's nine.
 //!
 //! ## What this pins
 //!
@@ -31,6 +31,22 @@
 //!    regression: a continuous `CommandAckResponse` stream refreshes `last_activity` on every frame
 //!    and so defers the keepalive deadline indefinitely; the armed adjust deadline must be unmoved
 //!    by it, and the tick on that deadline must still grow the target.
+//! 5. `auto_growth_tops_up_the_broker_window_after_refund_rounds` and
+//!    `auto_consumer_keeps_a_path_to_its_next_refill_after_refund_rounds` — a growth tick sizes its
+//!    grant against the live broker window, not the cumulative grant record that every refill
+//!    inflates, so refunds can neither leave the window short of the target nor strand the
+//!    consumer.
+//! 6. `auto_shrink_converges_the_broker_window_to_the_smaller_target` — the out-of-memory shrink
+//!    must bring the broker window down, not only the refill threshold.
+//! 7. `auto_oom_guard_forgets_the_bytes_a_reset_dropped` — a reset that drops the receiver queue
+//!    must also drop the bytes the guard counts as buffered.
+//!
+//! 8. `auto_growth_after_a_shrink_is_covered_by_the_surplus_the_window_still_holds` — a growth
+//!    right after the out-of-memory shrink grants nothing the broker window does not lack: the
+//!    permits a shrink could not take back cover the target's regained size.
+//!
+//! Scenarios 5–8 keep the broker faithful (it never dispatches more than the granted permits),
+//! unlike the ramp tests, which over-deliver on purpose.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -408,5 +424,341 @@ fn auto_adjust_schedule_survives_continuous_ack_response_traffic() {
         drain_flow_grants(&shared, handle),
         vec![MIN as u32],
         "the delta tops the additive grant mirror up to the new target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Accounting drift between the three counters `Auto` reasons about
+// (`granted_permits`, the broker window, `queued_bytes`). Unlike the ramp tests
+// above, which over-deliver on purpose, every scenario below keeps the broker
+// faithful: it never dispatches more than the permits the client has granted.
+// ---------------------------------------------------------------------------
+
+/// Deliver `count` single-message dispatch units of `payload` to `handle` and
+/// drop the resulting `Message` events. Outbound bytes are left alone.
+fn deliver(
+    shared: &ConnectionShared,
+    handle: ConsumerHandle,
+    count: u64,
+    payload: &[u8],
+    next_entry_id: &mut u64,
+    at: Instant,
+) {
+    let mut conn = shared.inner.lock();
+    for _ in 0..count {
+        let frame = drain_message_frame(handle, *next_entry_id, payload);
+        *next_entry_id += 1;
+        conn.handle_bytes(at, &frame).expect("deliver message");
+    }
+    while conn.poll_event().is_some() {}
+}
+
+/// Pop every queued message of `handle`, as an application draining its
+/// receiver would. Refill flows the pops stage stay in the outbound buffer.
+/// Returns the number popped.
+fn pop_all(shared: &ConnectionShared, handle: ConsumerHandle, at: Instant) -> u64 {
+    let mut conn = shared.inner.lock();
+    let mut popped = 0;
+    while conn.pop_message(handle, at).is_some() {
+        popped += 1;
+    }
+    popped
+}
+
+fn available_permits(shared: &ConnectionShared, handle: ConsumerHandle) -> u32 {
+    shared.inner.lock().consumer_available_permits(handle)
+}
+
+fn target(shared: &ConnectionShared, handle: ConsumerHandle) -> usize {
+    shared.inner.lock().consumer_receiver_queue_size(handle)
+}
+
+/// An `Auto(100, 400_000)` consumer fed 1000-byte messages (byte-budget cap
+/// 400) after four rounds in which the broker dispatched the whole 100-permit
+/// window and the application popped all of it, with a fifth window
+/// dispatched and left unpopped. The refunds of the four rounds raised the
+/// cumulative grant record to 500 while the broker window stayed at 100, and
+/// the permit balance is zero, so the next adjust tick sees starvation. The
+/// byte budget is never approached (100 000 buffered of 400 000).
+fn refund_rounds_then_starve(shared: &ConnectionShared, t0: Instant) -> (ConsumerHandle, u64) {
+    let handle = open_auto_consumer(
+        shared,
+        "persistent://public/default/auto-refund-rounds",
+        MIN,
+        400_000,
+        TICK,
+        t0,
+    );
+    let payload = [b'x'; 1000];
+    let mut next_entry_id = 0u64;
+    for _ in 0..4 {
+        deliver(shared, handle, 100, &payload, &mut next_entry_id, t0);
+        assert_eq!(pop_all(shared, handle, t0), 100, "the window is popped");
+    }
+    deliver(shared, handle, 100, &payload, &mut next_entry_id, t0);
+    let _ = drain_flow_grants(shared, handle);
+    // Read the three values one lock at a time: the mutex is not reentrant.
+    let balance = available_permits(shared, handle);
+    let queued = shared.inner.lock().consumer_queue_len(handle);
+    let current_target = target(shared, handle);
+    assert_eq!(
+        (balance, queued, current_target),
+        (0, 100, MIN),
+        "precondition: the broker window is still the original 100, fully dispatched"
+    );
+    (handle, next_entry_id)
+}
+
+#[test]
+fn auto_growth_tops_up_the_broker_window_after_refund_rounds() {
+    // ADR-0147: the growth grant was sized against the cumulative grant record
+    // (500) instead of the live window (100), so the target doubled to 200 and
+    // the `200 - 500` delta saturated to zero: no flow, and a window that no
+    // longer matches the target.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let (handle, _) = refund_rounds_then_starve(&shared, t0);
+
+    shared.inner.lock().handle_timeout(t0 + TICK);
+
+    assert_eq!(
+        target(&shared, handle),
+        200,
+        "starvation doubles the target"
+    );
+    assert_eq!(
+        drain_flow_grants(&shared, handle),
+        vec![100],
+        "growing 100 -> 200 over a window of 100 grants the missing 100 permits"
+    );
+}
+
+#[test]
+fn auto_consumer_keeps_a_path_to_its_next_refill_after_refund_rounds() {
+    // ADR-0147, consequence: the target reached 400 (refill threshold 200) while
+    // the broker window stayed at 100, so no pop could ever refill again and the
+    // consumer waited on a broker holding no permit.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let (handle, mut next_entry_id) = refund_rounds_then_starve(&shared, t0);
+
+    shared.inner.lock().handle_timeout(t0 + TICK);
+    let _ = drain_flow_grants(&shared, handle);
+    for round in 2..=4u32 {
+        pop_all(&shared, handle, t0);
+        let held = available_permits(&shared, handle);
+        deliver(
+            &shared,
+            handle,
+            u64::from(held),
+            &[b'x'; 1000],
+            &mut next_entry_id,
+            t0,
+        );
+        let _ = drain_flow_grants(&shared, handle);
+        shared.inner.lock().handle_timeout(t0 + TICK * round);
+        let _ = drain_flow_grants(&shared, handle);
+    }
+
+    pop_all(&shared, handle, t0);
+    assert!(
+        available_permits(&shared, handle) > 0,
+        "once the application has drained what it holds, the broker must hold permits again"
+    );
+}
+
+#[test]
+fn auto_shrink_converges_the_broker_window_to_the_smaller_target() {
+    // ADR-0147: a shrink under memory pressure stores the smaller target and
+    // emits nothing, and each pop then refunds one for one, so the broker window
+    // never falls and the buffered-bytes bound is not enforced.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    // 20 000-byte budget; the cap stays at 400 so only the OOM branch lowers the target.
+    let handle = open_auto_consumer(
+        &shared,
+        "persistent://public/default/auto-shrink-window",
+        MIN,
+        20_000,
+        TICK,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+
+    // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+    for i in 1..=2u32 {
+        deliver(&shared, handle, 100, b"x", &mut next_entry_id, t0);
+        shared.inner.lock().handle_timeout(t0 + TICK * i);
+        let _ = drain_flow_grants(&shared, handle);
+    }
+    assert_eq!(target(&shared, handle), 400, "grown to 400");
+
+    // The broker dispatches the 200 permits it still holds as 100-byte
+    // messages: 20 200 buffered bytes, past the budget, so the tick halves it.
+    let held = available_permits(&shared, handle);
+    assert_eq!(
+        held, 200,
+        "precondition: 200 permits still held by the broker"
+    );
+    deliver(
+        &shared,
+        handle,
+        u64::from(held),
+        &[b'x'; 100],
+        &mut next_entry_id,
+        t0,
+    );
+    shared.inner.lock().handle_timeout(t0 + TICK * 3);
+    assert_eq!(
+        target(&shared, handle),
+        200,
+        "precondition: the out-of-memory guard halved the target"
+    );
+    assert!(
+        drain_flow_grants(&shared, handle).is_empty(),
+        "a shrink emits no flow"
+    );
+
+    // The application drains and the broker keeps dispatching what it holds. No
+    // tick runs, so the target stays 200: the permits held after a drain must fit it.
+    let mut held_after_drain = 0;
+    for _ in 0..3 {
+        pop_all(&shared, handle, t0);
+        held_after_drain = available_permits(&shared, handle);
+        deliver(
+            &shared,
+            handle,
+            u64::from(held_after_drain),
+            b"x",
+            &mut next_entry_id,
+            t0,
+        );
+        let _ = drain_flow_grants(&shared, handle);
+    }
+    assert!(
+        held_after_drain as usize <= target(&shared, handle),
+        "after the drain the broker holds {held_after_drain} permits, more than the shrunk \
+         target {}; the window never shrank",
+        target(&shared, handle)
+    );
+}
+
+#[test]
+fn auto_oom_guard_forgets_the_bytes_a_reset_dropped() {
+    // `reset` cleared the receiver queue but not the buffered-byte
+    // counter, so the dropped messages kept counting toward the out-of-memory
+    // guard for good and pinned the target at its floor.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    // 10 000-byte budget; the first window of 100 x 100-byte messages fills it exactly.
+    let handle = open_auto_consumer(
+        &shared,
+        "persistent://public/default/auto-reset-bytes",
+        MIN,
+        10_000,
+        TICK,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+    deliver(&shared, handle, 100, &[b'x'; 100], &mut next_entry_id, t0);
+    assert_eq!(shared.inner.lock().consumer_queue_len(handle), 100);
+
+    // The transport drops: the queue is discarded and the client re-grants its window.
+    {
+        let mut conn = shared.inner.lock();
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(t0, &handshake_response_bytes())
+            .expect("Connected");
+        let _ = conn.poll_event();
+        assert_eq!(conn.consumer_queue_len(handle), 0, "reset drops the queue");
+        let _ = conn.initial_flow(handle, t0);
+        let _ = conn.poll_transmit();
+    }
+
+    // The broker redelivers a window of tiny messages: 100 live bytes, far
+    // below the budget, with the permit balance drained.
+    deliver(&shared, handle, 100, b"x", &mut next_entry_id, t0);
+    assert_eq!(
+        available_permits(&shared, handle),
+        0,
+        "precondition: window dispatched"
+    );
+
+    shared.inner.lock().handle_timeout(t0 + TICK);
+
+    assert_eq!(
+        target(&shared, handle),
+        MIN * 2,
+        "100 live bytes of a 10 000-byte budget leave room: starvation must double the target"
+    );
+    assert_eq!(drain_flow_grants(&shared, handle), vec![MIN as u32]);
+}
+
+#[test]
+fn auto_growth_after_a_shrink_is_covered_by_the_surplus_the_window_still_holds() {
+    // After a shrink the broker still holds the old window (400 here) against a target of 200.
+    // A growth back to 400 needs no new permit: the permits are already there, and a flow for
+    // the 200 the target gained would put the window at 600, past the byte budget the target is
+    // sized for.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    // 20 000-byte budget; the cap stays at 400 so only the budget decides the target.
+    let handle = open_auto_consumer(
+        &shared,
+        "persistent://public/default/auto-shrink-then-grow",
+        MIN,
+        20_000,
+        TICK,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+
+    // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+    for i in 1..=2u32 {
+        deliver(&shared, handle, 100, b"x", &mut next_entry_id, t0);
+        shared.inner.lock().handle_timeout(t0 + TICK * i);
+        let _ = drain_flow_grants(&shared, handle);
+    }
+    assert_eq!(target(&shared, handle), 400, "precondition: grown to 400");
+
+    // The 200 permits the broker still holds arrive as 99-byte messages: exactly the
+    // 20 000-byte budget, so the next tick halves the target. The broker keeps its 400.
+    deliver(&shared, handle, 200, &[b'x'; 99], &mut next_entry_id, t0);
+    shared.inner.lock().handle_timeout(t0 + TICK * 3);
+    assert_eq!(
+        target(&shared, handle),
+        200,
+        "precondition: the out-of-memory guard halved the target"
+    );
+    assert!(
+        drain_flow_grants(&shared, handle).is_empty(),
+        "a shrink emits no flow"
+    );
+
+    // The application frees one byte, which puts the buffer back under the budget while the
+    // balance is still zero: the next tick sees starvation with room and doubles.
+    {
+        let mut conn = shared.inner.lock();
+        assert!(conn.pop_message(handle, t0).is_some());
+        conn.handle_timeout(t0 + TICK * 4);
+    }
+    assert_eq!(
+        target(&shared, handle),
+        400,
+        "starvation with room grows the target back"
+    );
+    assert!(
+        drain_flow_grants(&shared, handle).is_empty(),
+        "the broker already holds the window the target regained: nothing to grant"
+    );
+
+    // The surplus is spent: the application's refunds are granted in full again, up to the 400
+    // window and not beyond.
+    pop_all(&shared, handle, t0);
+    assert_eq!(
+        available_permits(&shared, handle),
+        400,
+        "the window is the target, no more and no less"
     );
 }

@@ -48,6 +48,20 @@
 //! deadline that slid with the traffic would mean the schedule never armed,
 //! which is precisely the defect, and under moonpool it would also make the
 //! first adjust land at a seed-dependent simulated instant.
+//!
+//! ## Further scenarios: accounting drift under a faithful broker
+//!
+//! The scenarios above over-deliver on purpose (`DRAIN_BATCH`). The four at the end of the file
+//! keep the broker faithful — it never dispatches more than the permits the client granted — and
+//! pin that the counters `Auto` reasons about stay consistent across both engines:
+//! `receiver_queue_growth_after_refund_rounds_agrees_and_tops_up_the_window` (a growth grant is
+//! sized against the live broker window, not the cumulative grant record every refill inflates),
+//! `receiver_queue_shrink_agrees_and_converges_the_broker_window` (the out-of-memory shrink brings
+//! the broker window down, not only the refill threshold) and
+//! `receiver_queue_oom_guard_after_reset_agrees_and_forgets_dropped_bytes` (a reset that drops the
+//! receiver queue drops the bytes the guard counts as buffered) and
+//! `receiver_queue_growth_after_shrink_agrees_and_grants_only_what_the_window_lacks` (a growth
+//! right after a shrink is covered by the permits the shrink could not take back).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -246,10 +260,10 @@ fn receiver_queue_policy_auto_event_streams_agree() {
 
     // And the ramp is the correct bounded-doubling trajectory on both
     // engines: seed at the floor, then 200, 400, 800, 1600 across four
-    // ticks. `granted_permits` (the additive grant mirror the want-have
-    // delta is computed against — issue #349 design item 1) is NEVER
-    // decremented by dispatch, so each incremental flow tops it up from the
-    // PREVIOUS target to the new one: 100->200 (+100), 200->400 (+200),
+    // ticks. A growth tick sizes its grant against the window the broker
+    // holds, which is the PREVIOUS target (ADR-0147; not the cumulative
+    // `granted_permits`), so each incremental flow tops the window up from
+    // the previous target to the new one: 100->200 (+100), 200->400 (+200),
     // 400->800 (+400), 800->1600 (+800).
     let expected = Reaction {
         seeded_target: MIN,
@@ -409,5 +423,429 @@ fn receiver_queue_adjust_arming_agrees_under_continuous_ack_traffic() {
     assert_eq!(
         tokio_reaction, expected,
         "the armed adjust deadline must be immovable by inbound traffic, got {tokio_reaction:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Accounting drift between the counters `Auto` reasons about
+// (`granted_permits`, the broker window, `queued_bytes`). The scenarios above
+// over-deliver on purpose; every scenario below keeps the broker faithful —
+// it never dispatches more than the permits the client has granted — so the
+// expected window does not depend on how the drift is repaired.
+// ---------------------------------------------------------------------------
+
+/// Handshake + subscribe an `Auto(min, max_bytes)` consumer + initial flow, and
+/// drain the outbound frames.
+fn open_auto(
+    conn: &mut Connection,
+    topic: &str,
+    min: usize,
+    max_bytes: usize,
+    t0: Instant,
+) -> ConsumerHandle {
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    let _ = conn.poll_event();
+    let handle = conn.subscribe(SubscribeRequest {
+        topic: topic.to_owned(),
+        subscription: "sub-auto-rq-drift".to_owned(),
+        receiver_queue_policy: Some(Arc::new(Auto::new(min, max_bytes))),
+        receiver_queue_adjust_interval: Some(TICK),
+        ..Default::default()
+    });
+    let _ = conn.initial_flow(handle, t0);
+    let _ = conn.poll_transmit();
+    handle
+}
+
+/// Dispatch `count` single-message units of `payload` to `handle` and drop the
+/// resulting `Message` events. Outbound bytes are left alone.
+fn deliver(
+    conn: &mut Connection,
+    handle: ConsumerHandle,
+    count: u64,
+    payload: &[u8],
+    next_entry_id: &mut u64,
+    at: Instant,
+) {
+    for _ in 0..count {
+        let frame = drain_message_frame(handle, *next_entry_id, payload);
+        *next_entry_id += 1;
+        conn.handle_bytes(at, &frame).expect("deliver message");
+    }
+    while conn.poll_event().is_some() {}
+}
+
+/// Pop every queued message of `handle`, as an application draining its
+/// receiver would. Returns the number popped.
+fn pop_all(conn: &mut Connection, handle: ConsumerHandle, at: Instant) -> u64 {
+    let mut popped = 0;
+    while conn.pop_message(handle, at).is_some() {
+        popped += 1;
+    }
+    popped
+}
+
+/// Reaction of an `Auto(100, 400_000)` consumer that popped four full windows
+/// of 1000-byte messages (the refunds raise the cumulative grant record to 500
+/// while the broker window stays 100) and then starved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefundRoundsReaction {
+    /// Receiver-queue target after the first adjust tick.
+    target_after_tick: usize,
+    /// `CommandFlow` grants that tick emitted.
+    grants_after_tick: Vec<u32>,
+    /// Permits the broker holds after three more faithful rounds and a final
+    /// drain by the application.
+    permits_after_final_drain: u32,
+}
+
+fn run_refund_rounds(conn: &mut Connection, t0: Instant) -> RefundRoundsReaction {
+    let handle = open_auto(
+        conn,
+        "persistent://public/default/auto-rq-refund-rounds",
+        MIN,
+        400_000,
+        t0,
+    );
+    let payload = [b'x'; 1000];
+    let mut next_entry_id = 0u64;
+    for _ in 0..4 {
+        deliver(conn, handle, 100, &payload, &mut next_entry_id, t0);
+        assert_eq!(pop_all(conn, handle, t0), 100, "the window is popped");
+    }
+    deliver(conn, handle, 100, &payload, &mut next_entry_id, t0);
+    let _ = drain_flow_grants(conn, handle);
+    assert_eq!(
+        (
+            conn.consumer_available_permits(handle),
+            conn.consumer_queue_len(handle),
+            conn.consumer_receiver_queue_size(handle)
+        ),
+        (0, 100, MIN),
+        "precondition: the broker window is still the original 100, fully dispatched"
+    );
+
+    conn.handle_timeout(t0 + TICK);
+    let target_after_tick = conn.consumer_receiver_queue_size(handle);
+    let grants_after_tick = drain_flow_grants(conn, handle);
+
+    for round in 2..=4u32 {
+        pop_all(conn, handle, t0);
+        let held = u64::from(conn.consumer_available_permits(handle));
+        deliver(conn, handle, held, &payload, &mut next_entry_id, t0);
+        let _ = drain_flow_grants(conn, handle);
+        conn.handle_timeout(t0 + TICK * round);
+        let _ = drain_flow_grants(conn, handle);
+    }
+    pop_all(conn, handle, t0);
+
+    RefundRoundsReaction {
+        target_after_tick,
+        grants_after_tick,
+        permits_after_final_drain: conn.consumer_available_permits(handle),
+    }
+}
+
+#[test]
+fn receiver_queue_growth_after_refund_rounds_agrees_and_tops_up_the_window() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_refund_rounds(&mut conn, t0)
+    };
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_refund_rounds(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on Auto growth after refund rounds"
+    );
+    assert_eq!(
+        tokio_reaction.target_after_tick, 200,
+        "starvation doubles the target, got {tokio_reaction:?}"
+    );
+    assert_eq!(
+        tokio_reaction.grants_after_tick,
+        vec![100],
+        "growing 100 -> 200 over a window of 100 grants the missing 100 permits, got {tokio_reaction:?}"
+    );
+    assert!(
+        tokio_reaction.permits_after_final_drain > 0,
+        "the consumer must keep a path to its next refill, got {tokio_reaction:?}"
+    );
+}
+
+/// Reaction of an `Auto(100, 20_000)` consumer whose window grew to 400 on tiny
+/// messages and whose buffered bytes then crossed the budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShrinkReaction {
+    /// Target after the tick that crossed the byte budget.
+    target_after_shrink: usize,
+    /// `CommandFlow` grants that tick emitted.
+    grants_on_shrink: Vec<u32>,
+    /// Permits the broker holds after the application drained for three faithful rounds.
+    permits_held_after_drain: u32,
+}
+
+fn run_shrink(conn: &mut Connection, t0: Instant) -> ShrinkReaction {
+    let handle = open_auto(
+        conn,
+        "persistent://public/default/auto-rq-shrink-window",
+        MIN,
+        20_000,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+    // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+    for i in 1..=2u32 {
+        deliver(conn, handle, 100, b"x", &mut next_entry_id, t0);
+        conn.handle_timeout(t0 + TICK * i);
+        let _ = drain_flow_grants(conn, handle);
+    }
+    assert_eq!(
+        conn.consumer_receiver_queue_size(handle),
+        400,
+        "precondition: grown to 400"
+    );
+    // The broker dispatches the 200 permits it still holds as 100-byte messages:
+    // 20 200 buffered bytes, past the budget.
+    let held = conn.consumer_available_permits(handle);
+    assert_eq!(
+        held, 200,
+        "precondition: 200 permits still held by the broker"
+    );
+    deliver(
+        conn,
+        handle,
+        u64::from(held),
+        &[b'x'; 100],
+        &mut next_entry_id,
+        t0,
+    );
+    conn.handle_timeout(t0 + TICK * 3);
+    let target_after_shrink = conn.consumer_receiver_queue_size(handle);
+    let grants_on_shrink = drain_flow_grants(conn, handle);
+
+    // No tick runs from here on, so the target stays where the shrink left it.
+    let mut permits_held_after_drain = 0;
+    for _ in 0..3 {
+        pop_all(conn, handle, t0);
+        permits_held_after_drain = conn.consumer_available_permits(handle);
+        deliver(
+            conn,
+            handle,
+            u64::from(permits_held_after_drain),
+            b"x",
+            &mut next_entry_id,
+            t0,
+        );
+        let _ = drain_flow_grants(conn, handle);
+    }
+    ShrinkReaction {
+        target_after_shrink,
+        grants_on_shrink,
+        permits_held_after_drain,
+    }
+}
+
+#[test]
+fn receiver_queue_shrink_agrees_and_converges_the_broker_window() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_shrink(&mut conn, t0)
+    };
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_shrink(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on the Auto out-of-memory shrink"
+    );
+    assert_eq!(
+        (
+            tokio_reaction.target_after_shrink,
+            &tokio_reaction.grants_on_shrink
+        ),
+        (200, &Vec::new()),
+        "the out-of-memory guard halves the target and a shrink emits no flow, got {tokio_reaction:?}"
+    );
+    assert!(
+        tokio_reaction.permits_held_after_drain as usize <= tokio_reaction.target_after_shrink,
+        "the broker window never shrank to the smaller target, got {tokio_reaction:?}"
+    );
+}
+
+/// Reaction of an `Auto(100, 10_000)` consumer whose first window of 100 x
+/// 100-byte messages exactly filled the byte budget before a transport reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResetBytesReaction {
+    /// Receiver-queue length right after the reset.
+    queue_len_after_reset: usize,
+    /// Target after the first starved tick on the redelivered 1-byte window.
+    target_after_tick: usize,
+    /// `CommandFlow` grants that tick emitted.
+    grants_after_tick: Vec<u32>,
+}
+
+fn run_reset_bytes(conn: &mut Connection, t0: Instant) -> ResetBytesReaction {
+    let handle = open_auto(
+        conn,
+        "persistent://public/default/auto-rq-reset-bytes",
+        MIN,
+        10_000,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+    deliver(conn, handle, 100, &[b'x'; 100], &mut next_entry_id, t0);
+    assert_eq!(conn.consumer_queue_len(handle), 100, "precondition");
+
+    // The transport drops: the queue is discarded and the client re-grants its window.
+    conn.reset();
+    conn.begin_handshake().expect("re-handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    let _ = conn.poll_event();
+    let queue_len_after_reset = conn.consumer_queue_len(handle);
+    let _ = conn.initial_flow(handle, t0);
+    let _ = conn.poll_transmit();
+
+    // The broker redelivers a window of tiny messages: 100 live bytes of a
+    // 10 000-byte budget, with the permit balance drained.
+    deliver(conn, handle, 100, b"x", &mut next_entry_id, t0);
+    assert_eq!(
+        conn.consumer_available_permits(handle),
+        0,
+        "precondition: window dispatched"
+    );
+    conn.handle_timeout(t0 + TICK);
+    ResetBytesReaction {
+        queue_len_after_reset,
+        target_after_tick: conn.consumer_receiver_queue_size(handle),
+        grants_after_tick: drain_flow_grants(conn, handle),
+    }
+}
+
+#[test]
+fn receiver_queue_oom_guard_after_reset_agrees_and_forgets_dropped_bytes() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_reset_bytes(&mut conn, t0)
+    };
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_reset_bytes(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on the Auto out-of-memory guard after a reset"
+    );
+    let expected = ResetBytesReaction {
+        queue_len_after_reset: 0,
+        target_after_tick: MIN * 2,
+        grants_after_tick: vec![MIN as u32],
+    };
+    assert_eq!(
+        tokio_reaction, expected,
+        "100 live bytes of a 10 000-byte budget leave room: starvation must double the target"
+    );
+}
+
+/// Reaction of an `Auto(100, 20_000)` consumer whose window shrank from 400 to 200 under memory
+/// pressure and whose target then grew back to 400 while the broker still held the old window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShrinkThenGrowReaction {
+    /// Target after the tick that crossed the byte budget.
+    target_after_shrink: usize,
+    /// Target after the tick that found the buffer under budget and the balance at zero.
+    target_after_regrowth: usize,
+    /// `CommandFlow` grants that regrowth tick emitted.
+    grants_on_regrowth: Vec<u32>,
+    /// Permits the broker holds once the application has drained the queue.
+    permits_after_drain: u32,
+}
+
+fn run_shrink_then_grow(conn: &mut Connection, t0: Instant) -> ShrinkThenGrowReaction {
+    let handle = open_auto(
+        conn,
+        "persistent://public/default/auto-rq-shrink-then-grow",
+        MIN,
+        20_000,
+        t0,
+    );
+    let mut next_entry_id = 0u64;
+    // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+    for i in 1..=2u32 {
+        deliver(conn, handle, 100, b"x", &mut next_entry_id, t0);
+        conn.handle_timeout(t0 + TICK * i);
+        let _ = drain_flow_grants(conn, handle);
+    }
+    // The 200 permits the broker still holds arrive as 99-byte messages: exactly the 20 000-byte
+    // budget, so the next tick halves the target.
+    deliver(conn, handle, 200, &[b'x'; 99], &mut next_entry_id, t0);
+    conn.handle_timeout(t0 + TICK * 3);
+    let target_after_shrink = conn.consumer_receiver_queue_size(handle);
+    let _ = drain_flow_grants(conn, handle);
+
+    // One pop frees a byte: back under the budget with the balance still zero.
+    assert!(conn.pop_message(handle, t0).is_some());
+    conn.handle_timeout(t0 + TICK * 4);
+    let target_after_regrowth = conn.consumer_receiver_queue_size(handle);
+    let grants_on_regrowth = drain_flow_grants(conn, handle);
+
+    pop_all(conn, handle, t0);
+    ShrinkThenGrowReaction {
+        target_after_shrink,
+        target_after_regrowth,
+        grants_on_regrowth,
+        permits_after_drain: conn.consumer_available_permits(handle),
+    }
+}
+
+#[test]
+fn receiver_queue_growth_after_shrink_agrees_and_grants_only_what_the_window_lacks() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_shrink_then_grow(&mut conn, t0)
+    };
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        run_shrink_then_grow(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on Auto growth right after a shrink"
+    );
+    let expected = ShrinkThenGrowReaction {
+        target_after_shrink: 200,
+        target_after_regrowth: 400,
+        grants_on_regrowth: Vec::new(),
+        permits_after_drain: 400,
+    };
+    assert_eq!(
+        tokio_reaction, expected,
+        "the broker already holds the window the target regained: nothing to grant, and the window ends at the target"
     );
 }

@@ -73,6 +73,15 @@ impl NegativeAcksTracker {
         self.pending.remove(message_id);
     }
 
+    /// Drop tracking for every message a cumulative ack at `horizon` covers, with the coverage
+    /// rule of [`UnackedMessageTracker::remove_through`](super::UnackedMessageTracker::remove_through):
+    /// the application acknowledged them after nacking them, so the redelivery they were waiting
+    /// for would be spurious.
+    pub fn remove_through(&mut self, horizon: &MessageId) {
+        self.pending
+            .retain(|id, _| !id.is_covered_by_cumulative_ack(horizon));
+    }
+
     /// Tick the tracker. Returns redelivery actions for any messages whose delay has elapsed.
     pub fn poll(&mut self, now: Instant) -> Vec<NackAction> {
         let mut due: Vec<MessageId> = self
@@ -204,6 +213,25 @@ mod tests {
         t.add(mid(1), t0);
         t.remove(&mid(1));
         assert_eq!(t.poll(t0 + Duration::from_secs(10)), [] as [NackAction; 0]);
+    }
+
+    #[test]
+    fn remove_through_cancels_every_covered_nack_and_keeps_the_rest() {
+        let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        for entry in 1..=4 {
+            t.add(mid(entry), t0);
+        }
+        t.remove_through(&mid(3));
+        let actions = t.poll(t0 + Duration::from_secs(10));
+        assert_eq!(
+            actions,
+            [NackAction::RedeliverUnacked {
+                handle: ConsumerHandle(1),
+                message_ids: vec![mid(4)],
+            }],
+            "only the nack above the cumulative horizon is still owed a redelivery"
+        );
     }
 
     #[test]

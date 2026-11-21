@@ -41,7 +41,7 @@ A reservation is held for exactly as long as the client retains the publish.
 It travels with the publish's pending op (`magnetar_proto::producer::OpSend`) and is released, exactly once, when that op leaves the client:
 
 - the broker's `CommandSendReceipt` — for a batch, each message's op on its own, as the receipt fans out;
-- the broker's `CommandSendError`;
+- the broker's `CommandSendError` — for a batch, every member's op, because the broker rejects the whole frame and names only one member (the highest sequence id) ([ADR-0145](../specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md));
 - the producer's `send_timeout` firing, including for a publish held across a reconnect;
 - the broker acknowledging the producer's `close()`, which fails every send still pending — typically messages left in the batch container, which `close` does not flush — with a terminal error;
 - the producer failing to open or re-attach for good, or the connection failing terminally;

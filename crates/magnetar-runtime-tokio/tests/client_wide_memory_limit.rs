@@ -27,6 +27,8 @@
 //! - Closing a producer releases the bytes of its never-acknowledged (batched) sends.
 //! - A reconnect replays a retained publish without releasing or re-charging it.
 //! - A broker `SendError` and a send timeout both release the reservation.
+//! - A broker `SendError` for a batched frame (naming the frame's highest sequence id) fails every
+//!   member of the batch and releases all of their bytes.
 //!
 //! Twin of `crates/magnetar-runtime-moonpool/tests/client_wide_memory_limit.rs`
 //! (ADR-0024 1:1 parity).
@@ -317,6 +319,26 @@ impl Broker {
                     sequence_id: send.sequence_id,
                     error: pb::ServerError::PersistenceError as i32,
                     message: "held publish rejected by the test".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Answer the `index`-th publish with a `CommandSendError` the way a real broker answers a
+    /// batched frame: naming the frame's HIGHEST sequence id. The broker validates a batch frame
+    /// against `highest_sequence_id`, so every pre-persist rejection carries it.
+    fn reject_naming_highest(&self, index: usize) {
+        let send = self.sends.lock()[index];
+        self.reply_to(
+            index,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: send.producer_id,
+                    sequence_id: send.highest_sequence_id.unwrap_or(send.sequence_id),
+                    error: pb::ServerError::MetadataError as i32,
+                    message: "Messages must be encrypted".to_owned(),
                 }),
                 ..Default::default()
             },
@@ -781,6 +803,84 @@ async fn send_error_and_send_timeout_release_the_reservation() {
         .await
         .expect("b2 resolves")
         .expect("b2 acknowledged");
+    shut_down(client);
+}
+
+/// How long a member of a rejected batch may take to resolve. The correct client resolves it the
+/// moment the `CommandSendError` is decoded, so this only bounds a failing run: without it the
+/// defect would hang on the send timeout (30 s) or [`HANG_GUARD`].
+const BATCH_MEMBER_RESOLVE: Duration = Duration::from_secs(5);
+
+/// A broker `CommandSendError` for a batched frame fails EVERY member of the batch and releases
+/// all of their bytes.
+///
+/// Three batched sends leave as one `CommandSend` (`sequence_id` = lowest, `highest_sequence_id`
+/// = highest). The broker answers a rejected batch frame with the HIGHEST id, and the entry was
+/// not persisted, so no receipt follows for the other members: they must resolve with the same
+/// broker error instead of waiting for the send timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_error_for_a_batched_frame_fails_every_member() {
+    let (broker, client, _a, b) = two_connection_client(MemoryLimitPolicy::FailImmediately).await;
+    let batching = open(
+        &client,
+        CreateProducerRequest {
+            enable_batching: true,
+            ..producer_request("cwml-batch-error")
+        },
+    )
+    .await;
+
+    let mut m0 = Box::pin(batching.send(msg(100)));
+    let mut m1 = Box::pin(batching.send(msg(100)));
+    let mut m2 = Box::pin(batching.send(msg(100)));
+    assert!(poll_once(&mut m0).await.is_pending());
+    assert!(poll_once(&mut m1).await.is_pending());
+    assert!(poll_once(&mut m2).await.is_pending());
+    // `flush` waits for the acknowledgements, so poll it once to put the batch on the wire.
+    let mut flush = Box::pin(batching.flush());
+    assert!(poll_once(&mut flush).await.is_pending());
+    assert!(
+        broker.wait_for_sends(1, HANG_GUARD).await,
+        "the three members leave as one frame"
+    );
+    let frame = broker.sends()[0];
+    assert!(
+        frame
+            .highest_sequence_id
+            .is_some_and(|highest| highest == frame.sequence_id + 2),
+        "one frame carries the range of three sequence ids: {frame:?}"
+    );
+
+    broker.reject_naming_highest(0);
+
+    // `m2` is the member the broker names; `m0` and `m1` are the ones that keep no receipt coming.
+    for (label, member) in [("m2", &mut m2), ("m0", &mut m0), ("m1", &mut m1)] {
+        let outcome = tokio::time::timeout(BATCH_MEMBER_RESOLVE, member)
+            .await
+            .unwrap_or_else(|_| panic!("{label} must resolve when its batch is rejected"));
+        assert!(
+            matches!(&outcome, Err(ClientError::SendRejected { message, .. })
+                if message == "Messages must be encrypted"),
+            "{label} must fail with the broker's error: {outcome:?}"
+        );
+    }
+    tokio::time::timeout(BATCH_MEMBER_RESOLVE, flush)
+        .await
+        .expect("no member of the rejected batch stays pending")
+        .expect("flush drained");
+
+    // All 300 reserved bytes are back: a send of the whole budget is admitted.
+    let mut whole = Box::pin(b.send(msg(1000)));
+    assert!(
+        poll_once(&mut whole).await.is_pending(),
+        "the rejected batch released every member's bytes"
+    );
+    assert!(broker.wait_for_sends(2, HANG_GUARD).await);
+    broker.release(1);
+    tokio::time::timeout(HANG_GUARD, whole)
+        .await
+        .expect("whole resolves")
+        .expect("whole acknowledged");
     shut_down(client);
 }
 

@@ -1,9 +1,16 @@
 # ADR-0132 — Address PIP-145 topic-list deltas to the watcher they belong to
 
-- **Status**: Accepted (amends the single-buffer delta surface that [ADR-0037](0037-multi-topics-pattern-consumer-pass-2-lift.md) lifted into `BrokerMetadataApi`; the rest of ADR-0037 remains binding)
+- **Status**: Accepted (amends the single-buffer delta surface that [ADR-0037](0037-multi-topics-pattern-consumer-pass-2-lift.md) lifted into `BrokerMetadataApi`; the rest of ADR-0037 remains binding; amended 2026-11-20 — the reply to a cancelled snapshot records nothing)
 - **Date**: 2026-11-19
 - **Decider**: Florentin Dubois
 - **Tags**: pattern-consumer, pip-145, topic-watcher, proto, runtime, facade
+
+> **Amendment (2026-11-20, the reply to a cancelled snapshot).** The Decision below says that a request cancelled before its response arrived has no pending entry, and that the id the broker echoed then stands in for the outcome nobody reads.
+> That outcome was never taken and `reset()` does not clear `outcomes`, so each one held the broker's whole topic list for the life of the connection.
+> A `CommandWatchTopicListSuccess` is now recorded only while its request is still pending as a `TopicWatcher`, and the id comes from that pending entry: the reply to a cancelled snapshot records no outcome, queues no event and leaves the closed watcher alone.
+> The broker-side watcher of that snapshot stays open, as before ([`docs/follow-ups.md`](../../docs/follow-ups.md) §31), and a new snapshot on the same connection is a new request that resolves on its own reply.
+> `topic_list_watcher_contract.rs` follows: its cancelled-watch case now asserts that no outcome is recorded instead of the echoed id.
+> The rest of this ADR is unchanged.
 
 ## Context
 
@@ -62,5 +69,5 @@ A delta is addressed to the watcher it belongs to from the wire to the consumer 
 - `crates/magnetar/tests/pattern_watcher_delta_isolation.rs`, `crates/magnetar/tests/pattern_concurrent_update_single_child.rs`.
 - `crates/magnetar-differential/tests/facade_pattern_watcher_delta_isolation.rs` — `a_lone_consumer_applies_the_delta_of_its_own_watcher`, `update_does_not_apply_a_delta_addressed_to_another_watcher`, `the_owner_of_a_delta_still_receives_it_after_another_consumer_updated`, on the tokio and the moonpool engine.
 - `crates/magnetar-differential/tests/facade_pattern_concurrent_update_single_child.rs` — `overlapping_updates_register_a_duplicate_announcement_once`, on the tokio and the moonpool engine.
-- `crates/magnetar-differential/tests/topic_list_watcher_contract.rs` — `a_snapshot_names_the_watcher_its_request_allocated`, `a_snapshot_answering_a_cancelled_watch_names_the_watcher_the_broker_echoed`.
+- `crates/magnetar-differential/tests/topic_list_watcher_contract.rs` — `a_snapshot_names_the_watcher_its_request_allocated`, `a_snapshot_answering_a_cancelled_watch_records_no_outcome` (it asserted the echoed id before the amendment above).
 - [ADR-0037](0037-multi-topics-pattern-consumer-pass-2-lift.md), [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md).

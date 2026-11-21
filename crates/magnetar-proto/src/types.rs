@@ -506,6 +506,28 @@ impl MessageId {
         }
     }
 
+    /// Whether a cumulative acknowledgement at `horizon` covers this delivery.
+    ///
+    /// A cumulative ack acknowledges every earlier `(ledger, entry)` and the entry it names. In
+    /// the horizon's own entry a horizon without a batch index (`batch_index < 0`, the whole
+    /// entry) covers every member, while a horizon at member `k` covers only the members up to
+    /// and including `k`. The partition is ignored: one consumer holds one partition's ids.
+    ///
+    /// The derived [`Ord`] cannot answer this: it compares the partition and batch fields as
+    /// signed integers, so a whole-entry horizon (`batch_index == -1`) sorts below that entry's
+    /// per-member ids. Casting the index unsigned maps `-1` above every member index instead.
+    pub(crate) fn is_covered_by_cumulative_ack(&self, horizon: &Self) -> bool {
+        (
+            self.ledger_id,
+            self.entry_id,
+            self.batch_index.cast_unsigned(),
+        ) <= (
+            horizon.ledger_id,
+            horizon.entry_id,
+            horizon.batch_index.cast_unsigned(),
+        )
+    }
+
     /// Serialise this message id to a portable byte string. Mirrors Java
     /// `MessageId#toByteArray` — encodes a `MessageIdData` protobuf message. Callers can
     /// stash the result anywhere (Kafka header, DB column, log line) and reconstruct via
@@ -589,6 +611,46 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    fn id(ledger_id: u64, entry_id: u64, batch_index: i32) -> MessageId {
+        MessageId {
+            ledger_id,
+            entry_id,
+            partition: -1,
+            batch_index,
+            batch_size: if batch_index < 0 { 0 } else { 4 },
+        }
+    }
+
+    #[test]
+    fn cumulative_ack_covers_earlier_entries_and_the_horizon_entry() {
+        let horizon = id(7, 3, -1);
+        assert!(id(6, 99, -1).is_covered_by_cumulative_ack(&horizon));
+        assert!(id(7, 2, -1).is_covered_by_cumulative_ack(&horizon));
+        assert!(horizon.is_covered_by_cumulative_ack(&horizon));
+        assert!(!id(7, 4, -1).is_covered_by_cumulative_ack(&horizon));
+        assert!(!id(8, 0, -1).is_covered_by_cumulative_ack(&horizon));
+    }
+
+    #[test]
+    fn whole_entry_horizon_covers_every_member_of_its_entry() {
+        // A derived `Ord` sorts the whole-entry horizon (`batch_index == -1`) below every
+        // member id of the same entry; the cumulative-coverage rule must not.
+        let horizon = id(7, 3, -1);
+        assert!(id(7, 3, 0).is_covered_by_cumulative_ack(&horizon));
+        assert!(id(7, 3, 3).is_covered_by_cumulative_ack(&horizon));
+        assert!(!id(7, 4, 0).is_covered_by_cumulative_ack(&horizon));
+    }
+
+    #[test]
+    fn member_horizon_covers_only_members_up_to_its_index() {
+        let horizon = id(7, 3, 1);
+        assert!(id(7, 2, 3).is_covered_by_cumulative_ack(&horizon));
+        assert!(id(7, 3, 0).is_covered_by_cumulative_ack(&horizon));
+        assert!(id(7, 3, 1).is_covered_by_cumulative_ack(&horizon));
+        assert!(!id(7, 3, 2).is_covered_by_cumulative_ack(&horizon));
+        assert!(!id(7, 4, 0).is_covered_by_cumulative_ack(&horizon));
+    }
 
     #[cfg(feature = "scalable-topics")]
     #[test]

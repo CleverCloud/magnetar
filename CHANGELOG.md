@@ -33,6 +33,109 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A scalable-topic watch the client itself refuses is now closed at the broker.**
+  A DAG session, a namespace scalable-topics watch and a TC-assignment watch each live at the broker until the client sends `CommandScalableTopicClose`, `CommandWatchScalableTopicsClose` or `CommandWatchTcAssignmentsClose` (ADR-0093 § D2 for the DAG session; the upstream `PulsarApi.proto` for the two watches).
+  When `Connection` rejected an update because it was unusable (a bodyless update on any of the three, or a forward-epoch DAG layout that failed whole-snapshot validation), it dropped the watch from its registry and queued the `*WatchClosed` event but encoded no close frame, and every later close was a no-op because the watch was already gone.
+  The broker kept the watch, and kept pushing on it, for the life of the TCP connection.
+  The aggregate's reconnect path re-opens the DAG session through `retry_control_plane_error`, which has no attempt cap and sleeps 100 ms, so a layout that stayed rejectable abandoned one more broker-side session on every pass.
+  The rejection arms now stage the matching close frame, through the same encoder as the explicit close, for every rejection except a failure the broker itself reported (`DagError::Broker`, `TopicsWatchError::Broker`, an update carrying `error`), which ended that watch at the broker and needs no close; the events are unchanged.
+  Only a non-conformant broker, or a client validator stricter than the broker, sends an unusable update, and `scalable-topics` is default-off, so the severity is low.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0149](specs/adr/0149-close-a-scalable-topic-watch-the-client-rejects-at-the-broker.md)).
+
+- **A `CommandSendReceipt` is now applied in time bounded by the producer's own in-flight sends, not by a number the broker wrote.**
+  The `SendReceipt` arm fanned a batch receipt out by counting `lowest..=highest` one sequence id at a time, with `highest` taken from the broker's `highest_sequence_id` and bounded only by `highest >= lowest` and `highest != u64::MAX` (the Java `-1` sentinel).
+  A receipt claiming a range far wider than anything the producer sent kept the thread in that loop for as long as the range was long, with the connection mutex and the producer slot lock both held, so every other operation of the client waited behind it and no timeout or heartbeat could fire on the same thread.
+  Only a non-conformant or hostile broker or proxy can send such a frame (TCP guarantees command-frame integrity in production, and the in-repo brokers echo a one-byte range), so the severity is low.
+  The arm now walks `ProducerState::pending_sequence_ids_in(lowest, highest)`, the pending sends whose id lies in the range, so the cost is the producer's in-flight count whatever the receipt claims; a genuine batch receipt still resolves every member it names, and an id in the range that is not pending was skipped before as well.
+  Both engines run the same `Connection` code and behave identically.
+  The new `ProducerState::pending_sequence_ids_in` is crate-private, so no public API changed.
+
+- **`CommandProducerSuccess` no longer moves `Producer::last_sequence_id_published` backwards.**
+  `ProducerState::set_initial_sequence_id` stamps the counter with `initial_sequence_id - 1` so the producer reports its resume point until the first receipt, and `apply_receipt` advances it to the highest acknowledged id.
+  The `CommandProducerSuccess` arm then overwrote it unconditionally with the broker's `last_sequence_id`, on the first attach and on every re-attach.
+  A broker that keeps no deduplication state answers `-1`, so the resume point was gone before the `Producer` handle was returned, and an acknowledged id moved backwards each time the producer re-attached after a reconnect.
+  The broker's value now only raises the counter, so a fresh producer still adopts the id a broker with deduplication state persisted for its name, and a resume point or an acknowledged id survives every attach.
+  Both engines run the same `Connection` code and behave identically; `ConnectionEvent::ProducerReady::last_sequence_id` still carries the broker's raw value.
+
+- **A `receive()` or `next_active_change()` woken after a sibling already resolved no longer evicts the sibling's new waker.**
+  `ConsumerState` parked every in-flight `receive()` on a `Slab<Waker>` and handed the future the raw slab key; a message arrival, a close or a reset drains the whole slab, and `Slab::drain` rewinds its next key to `0`, so the first registration after a drain received key `0` again while every woken future still held the key it was given before.
+  `cancel_receive_waker` removed whatever occupied a key, and `ReceiveFut::poll` cancels its stored key on an empty re-poll, after a successful pop and on `Drop`: with two concurrent `receive()` calls on clones of one consumer, a woken future that polled after its sibling had popped the message and started a new `receive()` removed that new waker.
+  The next arrival then woke only the evictor, and the sibling's task stayed parked for good (for the life of the consumer, once the evictor stopped receiving) while messages sat in the queue.
+  `next_active_change()` parks on the mirrored `active_change_wakers` slab and had the same eviction.
+  Both sets are now a `ParkedWakers`, keys from a counter that only moves forward (the rule ADR-0111 gave the client-wide memory waiters), so a drained key is never handed out again and cancelling it, once or twice, removes nothing ([ADR-0148](specs/adr/0148-never-reissue-a-consumer-waker-registration-key.md)).
+  Both engines run the same `Connection` code and behave identically; the key is still a `usize`, so `register_consumer_receive_waker`, `cancel_consumer_receive_waker` and their active-change twins keep their signatures.
+  `ConsumerState::receive_wakers` and `active_change_wakers`, public fields, change type from `Slab<Waker>` to the new `magnetar_proto::consumer::ParkedWakers`, which keeps `len`, `is_empty` and `drain` and drops the `Slab`-only methods.
+
+- **An `Auto` consumer that has been through a few windows of messages is no longer left unable to refill after its target grows.**
+  `adjust_receiver_queue` sized a growth grant as `new_target - granted_permits`, and `granted_permits` is the cumulative grant record: every `maybe_flow` refill adds to it, so after a few windows of pops it exceeds the window the broker holds.
+  A growth tick then saturated to a zero delta and emitted no `CommandFlow`, while the target and the refill threshold (`target / 2`) rose anyway.
+  Two doublings later the threshold was above the window, `maybe_flow` could never fire again, and the balance stayed at zero with the broker holding no permit; the stall watchdog needs a positive balance and the starvation gate is read only at the two `initial_flow` sites, so nothing rescued it, and once the byte-budget cap was at or below `granted_permits` (the messages consumed since the last reconnect or seek) it was permanent.
+  A growth tick now grants the `new_target - previous_target` the target gained, which is the window the broker holds, so the ramp of 100, 200, 400, 800 is unchanged and a consumer that popped four windows first is topped up from 100 to 200 instead of wedging ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
+  Both engines run the same `Connection` code and behave identically.
+
+- **An `Auto` shrink under memory pressure now brings the broker window down.**
+  When the buffered bytes reached the budget the target halved, but the broker window did not: a shrink emitted nothing and `maybe_flow` refunded every popped unit one for one, so only the refill threshold moved and the window stayed at its peak until a reconnect or seek re-seeded it, which left the out-of-memory guard unable to bound the bytes it exists to bound.
+  A shrink now records the permits the broker cannot take back as `ConsumerState::window_surplus`; `maybe_flow` retires owed refunds against it instead of granting them, and a growth tick absorbs it before granting, so the window converges to the new target as the application pops and a growth right after a shrink may emit no `CommandFlow` at all.
+  A consumer whose target never moves is unaffected, and a broker that dispatches past its window is still repaid in full.
+  `window_surplus` is `pub(crate)`; no public API changed ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
+
+- **A reset no longer leaves the dropped messages counting toward `Auto`'s out-of-memory guard.**
+  `Connection::reset` cleared every consumer's receiver queue and zeroed the permit mirrors but not `queued_bytes`, the counter `flow_stats` reports as `in_flight_bytes`.
+  Each transport reset therefore left the bytes of the messages it dropped counted forever, the redelivered copies were added on top, and once the stale total plus the live bytes reached the per-partition budget the guard took its shrink branch on every tick and pinned the target at `min`.
+  `reset` now zeroes `queued_bytes` with the queue, as `begin_seek` already did.
+
+- **A cumulative ack now releases every delivery it covers from the ack-timeout and nack trackers.**
+  `apply_local_ack_state` removed only the ids a `CommandAck` named, and the trackers had no way to drop a range.
+  After `acknowledge_cumulative`, every earlier delivery stayed tracked, and when `ack_timeout` closed (or a nack delay elapsed) the sweep sent a `CommandRedeliverUnacknowledgedMessages` for messages the application had already acknowledged; on an Exclusive or Failover subscription the broker ignores the id list and rewinds, redelivering the in-flight messages above the acknowledged position as duplicates.
+  `UnackedMessageTracker::remove_through` and `NegativeAcksTracker::remove_through` now drop every tracked id the horizon covers: each earlier `(ledger, entry)`, and in the horizon's own entry every member for a horizon without a batch index or the members up to and including its index otherwise.
+  With `scalable-topics` the complete ids parked beside the nack entries go with them.
+  An individual ack still releases only the ids it names, and a transactional cumulative ack releases on commit as before.
+  Both engines run the same `Connection` code and behave identically.
+  `UnackedMessageTracker::remove_through` and `NegativeAcksTracker::remove_through` are new public methods; nothing existing changed signature.
+
+- **An ack after an empty ack-timeout bucket was reaped now releases its id.**
+  `UnackedMessageTracker::poll` removes the buckets whose deadline has passed from the front of its list, which shifts every surviving bucket down, but rebuilt the id-to-bucket index only when something was emitted.
+  A bucket reaped empty (every delivery in it acknowledged in its window, the healthy steady state) with an arrival after its deadline and before the timer-driven sweep left the survivor's index pointing one bucket too high, so the ack of that arrival found no bucket, released nothing, and the id was redelivered when its own window closed.
+  The index is now rebuilt whenever any bucket was reaped.
+
+- **A `send_timeout` sweep that expires only the oldest sends no longer misroutes the wakers of the sends that survive it.**
+  `ProducerState` keeps a `sequence id -> position` index beside its queue of in-flight sends, and `apply_receipt` and `apply_send_error` shift it after every removal.
+  `drain_timed_out_sends` popped the front of the queue and dropped only the popped keys, so each survivor's recorded position stayed too high by the number of sends the sweep expired.
+  `register_waker` and `clear_waker` address the queue by that position without checking the sequence id, and `Connection::register_waker` skips the connection-wide slab on a `true` return, so a send future polled for the first time, or re-polled, after the sweep parked its waker on the send behind it and overwrote that send's own waker; a `Connection::unregister_waker` call for a survivor cleared the waker of the send behind it the same way.
+  The receipt then woke the wrong waker: when the two sends were awaited by different tasks, the victim's task was never woken, so a send that completed stayed pending on a healthy connection, and once the op left the queue no later sweep could find its waker (awaited by one task, it was only a late or spurious wake).
+  The sweep now moves every surviving position forward by the number of expired sends, in one pass that is skipped when nothing expired.
+  Both engines run the same `Connection` code and behave identically.
+
+- **`Consumer::resume` releases the flow a pause withheld.**
+  `pause()` stops the automatic flow refill, so a receive loop that drains the whole window while paused leaves the broker holding zero permits and the client owing it the whole window.
+  `resume()` only stored `paused = false` and woke the driver; nothing ran `maybe_flow`, whose only callers are the arrival of a message and a pop.
+  The broker has nothing it may dispatch, the stall watchdog skips a consumer with no permits, and a `receive()` parked on the empty queue before the resume is woken by arrivals only, so with a fixed receiver queue the consumer stayed parked until it was closed.
+  `Connection::set_paused` now runs `maybe_flow` after storing the flag and stages the `CommandFlow` it returns, and both engines' `Consumer::resume` call it under the connection lock (global → per-slot, as `pending_count` does since ADR-0137) before waking the driver; a pause, a resume with nothing owed and a second resume stage nothing ([ADR-0146](specs/adr/0146-release-the-withheld-flow-when-a-consumer-resumes.md)).
+  `Connection::set_paused(handle, false)` is the only observable change in the `magnetar-proto` API: it can now stage an outbound `CommandFlow`.
+
+- **A broker error for a batched send now fails every member of the batch.**
+  A batching producer folds its messages into one `CommandSend` carrying the range `[lowest, highest]`, and the broker validates and rejects that frame against its highest sequence id, so a rejection before the entry is persisted (`MetadataError` "Messages must be encrypted", `ChecksumError`, a closed producer's `PersistenceError`) names one member.
+  The `SendError` arm resolved only that member: the receipt arm fans out over the range, the error arm had no equivalent, and no receipt ever follows for the others, so each kept its future and its bytes against the client-wide `memory_limit` until `send_timeout` (forever with `send_timeout: None`) and then failed with the synthetic "send timeout" instead of the broker's error.
+  A batching producer without encryption on a topic that requires it left N-1 of every N sends hanging that way.
+  Each batched `OpSend` now records the lowest sequence id of its frame, and `ProducerState::apply_send_error` fails every pending op that shares it with the broker's code and message and releases their bytes, on both engines ([ADR-0145](specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md)).
+  A single or chunked publish still fails alone.
+  `magnetar_proto::producer::ProducerState::apply_send_error` now returns a `Vec<(OpSend, i32, String)>` (every removed op, oldest first) instead of an `Option`; the `magnetar` façade is unchanged.
+
+- **The connection no longer keeps a record of every transaction it ever opened.**
+  `TxnClient::handle_new_txn_response` registers one `TransactionMetadata` (ids, state, timeout, and the topics and subscriptions registered under the transaction) per `CommandNewTxn`, and a `CommandEndTxnResponse` only rewrote its state to `Committed`, `Aborted` or `Errored`.
+  The one remover, `TxnClient::forget`, had no caller outside its unit test, and the `Connection` is built once and reused across every supervised reconnect, so an exactly-once client gained one record per transaction for as long as it ran.
+  Nothing reads a record after the transaction has ended: the outcome handed to the caller already carries the final state.
+  The `EndTxnResponse` arm now forgets the transaction once the broker has answered its `CommandEndTxn`, whether it committed, aborted or refused it, so `TxnClient::len()` counts only transactions still open, and `Connection::txn_client().transaction(id)` returns `None` once the reply to that transaction's `CommandEndTxn` has been handled.
+  Both engines run the same `Connection` code and behave identically.
+  A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, still keeps its record, since `TxnClient` has no timeout policy; the request and waker entries of a transaction call in flight at a reset are not touched here either.
+
+- **A topic-list snapshot reply that lands after its caller gave up no longer leaves the topic list behind.**
+  `Connection::cancel_request` is what a dropped or timed-out `topic_list_snapshot` (and pattern-subscribe) future calls, and documents that "a late broker reply is ignored".
+  The `CommandWatchTopicListSuccess` arm recorded a `TopicListSnapshot` outcome holding the broker's full topic list regardless, nobody was left to take it, and `reset()` does not clear `outcomes`, so each abandoned snapshot that was answered afterwards cost one such outcome for the life of the connection.
+  The arm now records the outcome, wakes the waiter and queues the `TopicListSnapshot` event only while the request is still pending as a topic watcher; a reply for any other request id is ignored.
+  A late `CommandError` for the same request was already ignored, because the request kind is gone.
+  Both engines run the same `Connection` code and behave identically.
+
 - **`Producer::flush` no longer returns `Ok` while sends are still owed a receipt across a reconnect.**
   `Connection::reset()` moves every replayable in-flight publish out of the producer's `pending` queue into the connection's reset snapshot bucket, and they return to `pending` only when the broker acknowledges the producer's re-attachment.
   Both engines' `flush` looped on the live queue alone, so a `flush()` issued in that window — or parked across the socket drop and re-checked after the new `CONNECTED` frame — read zero and resolved `Ok(())` with no send acknowledged; the documented `flush().await` then `close()` (or process exit) recipe could complete while publishes were still unacknowledged.

@@ -115,9 +115,10 @@ pub trait ReceiverQueuePolicy: Send + Sync + fmt::Debug {
     /// Recompute the receiver queue target from the observed [`FlowStats`].
     ///
     /// Returns the new target. The connection grows the broker's grant when the
-    /// target rises (emitting an incremental `CommandFlow`) and stops
-    /// replenishing — letting permits drain naturally — when it falls (permits
-    /// already granted cannot be un-granted).
+    /// target rises (emitting an incremental `CommandFlow`) and, when it falls,
+    /// emits nothing (permits already granted cannot be un-granted) but retires
+    /// the refunds that would keep the window above the new target, so the
+    /// window the broker holds comes down as the application pops.
     ///
     /// MUST be pure (see the trait-level purity contract).
     fn adjust(&self, flow: &FlowStats) -> usize;
@@ -154,7 +155,8 @@ impl ReceiverQueuePolicy for Fixed {
 ///    stays above zero.
 /// 2. **Never OOM.** The target is capped so the projected buffered bytes (`target *
 ///    avg_message_bytes`, summed across partitions) never exceed [`Self::max_bytes`]. When
-///    `in_flight_bytes` approaches the budget the target shrinks.
+///    `in_flight_bytes` approaches the budget the target shrinks, and the broker window follows it
+///    down as the application pops (the connection retires the refunds past the new target).
 /// 3. **Converge, don't thrash.** Growth is multiplicative-but-capped (at most a doubling per tick)
 ///    and decay is gentle (at most a halving toward [`Self::min`]), and the target only moves when
 ///    a clear signal is present — so it settles instead of oscillating.

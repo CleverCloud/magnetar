@@ -2,7 +2,8 @@
 
 //! A TCP forwarder between a client and the broker that reads the Pulsar frames it forwards, so an
 //! end-to-end test can choose the moment a session breaks: stop reading what the client writes,
-//! drop one client frame, hold the broker's frames from one kind on, or cut every connection.
+//! drop one client frame, corrupt one so the broker's checksum check refuses it, hold the broker's
+//! frames from one kind on, or cut every connection.
 //!
 //! The broker itself keeps running, so nothing depends on a standalone container coming back
 //! from a restart.
@@ -28,6 +29,10 @@ struct Controls {
     drop_client: Mutex<Option<Type>>,
     /// Client frames dropped so far.
     dropped: AtomicUsize,
+    /// Flip the last byte of the next client frame of this type, once.
+    corrupt_client: Mutex<Option<Type>>,
+    /// Client frames corrupted so far.
+    corrupted: AtomicUsize,
     /// On connections accepted from now on, hold the broker's frames from the first of this type.
     hold_broker: Mutex<Option<Type>>,
     /// Broker frames a connection started holding at.
@@ -98,6 +103,18 @@ impl FrameProxy {
     /// Client frames dropped so far.
     pub fn dropped(&self) -> usize {
         self.controls.dropped.load(Ordering::SeqCst)
+    }
+
+    /// Flip the last byte of the next client frame of type `kind`, once. For a frame that carries
+    /// a payload that byte is the payload's last, which the frame's CRC32C covers, so the broker
+    /// refuses the frame instead of reading a different message.
+    pub fn corrupt_next_client_frame(&self, kind: Type) {
+        *self.controls.corrupt_client.lock().expect("proxy controls") = Some(kind);
+    }
+
+    /// Client frames corrupted so far.
+    pub fn corrupted(&self) -> usize {
+        self.controls.corrupted.load(Ordering::SeqCst)
     }
 
     /// On connections accepted from now on, hold the broker's frames from the first of type `kind`
@@ -220,6 +237,25 @@ async fn client_to_broker(
                 controls.progress.notify_waiters();
                 continue;
             }
+            let corrupt_it = {
+                let mut corrupt_client = controls.corrupt_client.lock().expect("proxy controls");
+                if kind.is_some() && *corrupt_client == kind {
+                    *corrupt_client = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            let bytes = if corrupt_it && !bytes.is_empty() {
+                let mut corrupted = BytesMut::from(&bytes[..]);
+                let last = corrupted.len() - 1;
+                corrupted[last] ^= 0xff;
+                controls.corrupted.fetch_add(1, Ordering::SeqCst);
+                controls.progress.notify_waiters();
+                corrupted.freeze()
+            } else {
+                bytes
+            };
             if to.write_all(&bytes).await.is_err() {
                 return;
             }
