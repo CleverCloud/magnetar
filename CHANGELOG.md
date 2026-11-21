@@ -33,6 +33,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Consumer::resume` releases the flow a pause withheld.**
+  `pause()` stops the automatic flow refill, so a receive loop that drains the whole window while paused leaves the broker holding zero permits and the client owing it the whole window.
+  `resume()` only stored `paused = false` and woke the driver; nothing ran `maybe_flow`, whose only callers are the arrival of a message and a pop.
+  The broker has nothing it may dispatch, the stall watchdog skips a consumer with no permits, and a `receive()` parked on the empty queue before the resume is woken by arrivals only, so with a fixed receiver queue the consumer stayed parked until it was closed.
+  `Connection::set_paused` now runs `maybe_flow` after storing the flag and stages the `CommandFlow` it returns, and both engines' `Consumer::resume` call it under the connection lock (global → per-slot, as `pending_count` does since ADR-0137) before waking the driver; a pause, a resume with nothing owed and a second resume stage nothing ([ADR-0146](specs/adr/0146-release-the-withheld-flow-when-a-consumer-resumes.md)).
+  `Connection::set_paused(handle, false)` is the only observable change in the `magnetar-proto` API: it can now stage an outbound `CommandFlow`.
+
 - **A broker error for a batched send now fails every member of the batch.**
   A batching producer folds its messages into one `CommandSend` carrying the range `[lowest, highest]`, and the broker validates and rejects that frame against its highest sequence id, so a rejection before the entry is persisted (`MetadataError` "Messages must be encrypted", `ChecksumError`, a closed producer's `PersistenceError`) names one member.
   The `SendError` arm resolved only that member: the receipt arm fans out over the range, the error arm had no equivalent, and no receipt ever follows for the others, so each kept its future and its bytes against the client-wide `memory_limit` until `send_timeout` (forever with `send_timeout: None`) and then failed with the synthetic "send timeout" instead of the broker's error.

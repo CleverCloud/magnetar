@@ -7246,9 +7246,21 @@ impl Connection {
     /// paused the consumer skips automatic flow refills, so the broker stops dispatching new
     /// messages once already-issued permits drain. Buffered messages remain available via
     /// [`Self::pop_message`].
+    ///
+    /// Resuming releases the flow the pause withheld. A consumer whose receive loop drained its
+    /// window while paused owes the broker that whole window and the broker holds no permit,
+    /// so nothing else can send it: no arrival comes, [`Self::pop_message`] has nothing to
+    /// pop, and the stall watchdog skips a consumer with no permits.
+    /// [`crate::consumer::ConsumerState::maybe_flow`] returns `None` while paused, so the call
+    /// after the store emits nothing for a pause.
     pub fn set_paused(&mut self, handle: ConsumerHandle, paused: bool) {
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().paused = paused;
+        let flow = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            consumer.paused = paused;
+            consumer.maybe_flow()
+        });
+        if let Some(flow) = flow {
+            self.stage_flow(flow);
         }
     }
 
@@ -22841,6 +22853,46 @@ mod consumer_stall_and_recovery_tests {
             RQ as u32,
             "and mutates nothing — the refusal path must leave the consumer exactly as it \
              was, not strictly worse off than the stall it was in"
+        );
+    }
+
+    /// ADR-0146: a consumer paused while its receive loop drained the whole window owes the broker
+    /// that window, and resuming must release it. Nothing else will: the broker holds zero
+    /// permits (`permit_balance == 0`) so no arrival comes, the stall watchdog skips a consumer
+    /// with no permits, and the `Message` arm and `pop_message` — the only other `maybe_flow`
+    /// callers — need an arrival or a pop. A `receive()` parked before the resume is neither.
+    #[test]
+    fn resuming_a_drained_paused_consumer_releases_the_flow_it_owes_the_broker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+
+        conn.set_paused(handle, true);
+        deliver_messages(&mut conn, handle, 0, RQ as u64, t0);
+        let (entries, grants) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(
+            entries.len(),
+            RQ,
+            "the paused consumer still hands out the whole buffered window"
+        );
+        assert!(
+            grants.is_empty(),
+            "a paused consumer emits no flow while it drains: {grants:?}"
+        );
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (0, 0, RQ as u32, RQ as u32),
+            "the window is fully drained: the broker holds no permit and the client owes it \
+             the whole window back"
+        );
+
+        conn.set_paused(handle, false);
+
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            grants,
+            vec![RQ as u32],
+            "resume must release the window the pause withheld; with no arrival and no pop to \
+             come, the flow is never sent and the consumer is stranded"
         );
     }
 }
