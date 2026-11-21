@@ -53,6 +53,14 @@
 //! consumer, so there is no consumer handle left to call `receive()` on. The
 //! listener owns delivery for the lifetime of the handle.
 //!
+//! One terminal returns the consumer as well:
+//! [`crate::PatternConsumerBuilder::subscribe_with_listener_and_consumer`], because
+//! only a holder of a pattern consumer can subscribe the topics that match after
+//! subscribe (see "Pattern-child inheritance" below). There the exclusion is the
+//! caller's to keep (no `receive()` on the returned consumer while the handle is
+//! live), as it already is for a caller of [`spawn_message_listener`] or
+//! [`spawn_wrapper_message_listener`] who kept a clone.
+//!
 //! ## Wrapper consumers (multi-topic / partitioned / pattern)
 //!
 //! The single-topic poller above is bound to [`crate::ConsumerApi`], whose
@@ -86,6 +94,16 @@
 //! creates every child — initial or later-discovered — with its own
 //! `messageListener` set to `null` (`getInternalConsumerConfig`), routing all
 //! delivery through the parent's listener.
+//!
+//! Inheritance is what happens once a child has joined; it does not make one
+//! join. The poller never reconciles: a pattern consumer subscribes a later topic
+//! only when a holder of the consumer calls [`crate::PatternConsumer::update`],
+//! directly or through [`crate::PatternConsumer::start_auto_reconcile`]. A pattern
+//! push consumer therefore follows later topics only where the caller holds the
+//! consumer: after `subscribe()` and [`spawn_wrapper_message_listener`] on a clone,
+//! or after [`crate::PatternConsumerBuilder::subscribe_with_listener_and_consumer`].
+//! [`crate::PatternConsumerBuilder::subscribe_with_listener`] returns the handle
+//! alone, and its consumer stays on the topics matched at subscribe.
 //!
 //! ## `ConsumerEventListener` (issue #348, ADR-0081)
 //!

@@ -148,6 +148,8 @@ Dropping the returned `MessageListenerHandle` instead aborts the poller and drop
 The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
 Its callback is `Fn(&str, &IncomingMessage)`: the originating topic is the extra argument so the callback can route an explicit ack to the right child.
 Pattern / partition children discovered **after** subscribe inherit the listener — each poller iteration races the in-flight `receive()` against a membership-change `Notify` the wrapper signals on every child add, so a child that joins while the poller is parked is swept on the next iteration (matching Java's parent-owns-the-listener model, where every child is created with `messageListener` `null`).
+Inheriting is not discovering: the poller never reconciles, and a pattern consumer subscribes a later topic only when a holder of the consumer calls `update`, directly or through `start_auto_reconcile`.
+`PatternConsumerBuilder::subscribe_with_listener()` moves its consumer into the poller and returns the handle alone, so it delivers the topics matched at subscribe and only those; `subscribe_with_listener_and_consumer()` returns the consumer next to the handle for a caller that must follow later topics, at the price of a pull / push exclusion that is a documented contract instead of a structural one (proposed, [ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md)).
 
 ---
 

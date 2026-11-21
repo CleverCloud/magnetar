@@ -17,6 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`BackgroundApi`, a supertrait of `SubscribeApi` and `CreateProducerApi`** ([ADR-0139](specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)).
   It gives each runtime client the two `#[doc(hidden)]` methods the façade starts its helper tasks with, `spawn_background` and `background_sleeper`, and is implemented for the Tokio client and for the Moonpool `Client<P>` for every `P`.
   It is a required supertrait, so an external implementor of `SubscribeApi` or `CreateProducerApi` must add it.
+- **`PatternConsumerBuilder::subscribe_with_listener_and_consumer()`, a listener terminal that returns the `PatternConsumer` next to the `MessageListenerHandle`** ([ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md), a proposal for the maintainers to arbitrate).
+  `subscribe_with_listener()` builds the consumer inside the call, moves it into the poller and returns the handle alone, and discovery after the first snapshot is driven only by `PatternConsumer::update` (directly or through `start_auto_reconcile`), which its caller holds nothing to call on: a pattern push consumer built through the builder stayed on the topics matched at subscribe.
+  The new terminal hands a clone to the poller and returns the consumer itself, so a topic created after subscribe reaches the listener once the caller's `update` on that consumer has subscribed it.
+  Discovery stays caller-driven: nothing reconciles on its own.
+  The caller must not call `receive()` on the returned consumer while the handle is live, and closes the handle before the consumer, because `PatternConsumer::close` closes nothing while the poller's clone is alive.
+  `subscribe_with_listener()` keeps its signature and its behaviour.
+  The ADR records the two alternatives the arbitration can still pick: an auto-reconcile interval started inside the terminal, and a documentation-only correction.
 
 ### Changed
 
@@ -40,6 +47,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A scalable aggregate closed while its handle is alive refuses the committed or aborted outcome, and the coordinator keeps the entry so a retried commit resumes without a second `EndTxn`; once the handle was dropped nothing could accept the outcome and nothing removed the entry either, because dead participants were pruned only by a further `commit_transaction` on that transaction.
   `new_transaction` now reclaims every `Committed` or `Aborted` entry with no end in flight whose remaining participants are all dropped.
   A retried commit or abort on a transaction swept that way answers `UnknownTransaction`, like a retry after a fully successful end; open, closing, issued and `Unknown` transactions are never swept, and a transaction the application never ends keeps its entry.
+- **The documentation of `PatternConsumerBuilder::subscribe_with_listener()` no longer tells a caller to use a consumer the terminal does not return** ([ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md)).
+  It promised that topics matched after subscribe inherit the listener and advised holding a `PatternConsumer` clone "before `subscribe_with_listener`", which cannot be done: the builder consumes itself and no consumer exists before the call.
+  That documentation, `README.md` and `ARCHITECTURE.md` now say that this terminal delivers the topics matched at subscribe and only those, and point to `subscribe_with_listener_and_consumer()`.
 - **The tokio supervisor closes a socket it abandoned instead of holding it open through the redial delay.**
   `supervised_driver_loop` lent its transport to `driver_loop_inner` as `&mut` and kept it in a local, so after an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable auth challenge, an undecodable frame, a write or handshake deadline) the peer was still alive and the stream stayed open, unread, through the anti-thrash cooldown, the backoff sleep and the dial, and was dropped only when the replacement was assigned.
   For that whole delay (up to `max_backoff` plus `connect_timeout`, 60 s plus the dial budget by default) the broker kept the connection and its producers and consumers registered, and kept dispatching to a client that no longer read.
