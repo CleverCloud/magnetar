@@ -603,6 +603,10 @@ pub trait ConsumerApi: 'static + Send + Sync {
     fn pause(&self);
 
     /// Re-enable automatic flow refills. Mirrors Java `Consumer#resume`.
+    ///
+    /// Also releases the flow the pause withheld: a consumer whose receive loop drained its
+    /// window while paused owes the broker that whole window, so this call stages the
+    /// `CommandFlow` for it instead of waiting for an arrival or a pop that cannot come.
     fn resume(&self);
 
     /// Number of messages currently buffered in the per-consumer

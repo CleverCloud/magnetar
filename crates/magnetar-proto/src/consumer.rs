@@ -330,6 +330,64 @@ pub struct ShadowTopicMetadata {
     pub source_topic: String,
 }
 
+/// The wakers of the futures parked on one consumer (`receive()` and `next_active_change()`),
+/// keyed by a registration key that is never issued twice.
+///
+/// A message arrival, a close or a reset drains the WHOLE set, which frees every key it held, yet
+/// each woken future still carries the key it was given and cancels it on its next poll, after a
+/// successful pop and on `Drop`. Keys that a slab recycles (a drained `Slab` hands key `0` out
+/// again) let that stale cancel evict the waker of a different future that registered after the
+/// drain, and the evicted future's task is then never woken. A key from a counter that only moves
+/// forward can name one registration only, so cancelling it after a drain is a no-op and
+/// cancelling it twice is too. This is the same identity rule as
+/// [`MemoryWaiterId`](crate::memory_limit::MemoryWaiterId).
+///
+/// The counter is a `usize` so the key stays the `usize` the runtimes hold; it wraps instead of
+/// overflowing and cannot reach a registration that is still parked: it would take 2^64
+/// registrations on a 64-bit target, and every arrival drains the set long before 2^32 on a
+/// 32-bit one. The `BTreeMap` keeps wake order equal to registration order, which keeps the
+/// moonpool simulation reproducible per seed.
+///
+/// Reads (`len`, `is_empty`, `contains_key`, ...) are the map's own through
+/// [`Deref`](std::ops::Deref). Every mutation goes through [`Self::insert`], [`Self::remove`] and
+/// [`Self::drain`], so a key cannot be minted outside the counter and [`Self::drain`] never rewinds
+/// it.
+#[derive(Debug, Default)]
+pub struct ParkedWakers {
+    next_key: usize,
+    parked: std::collections::BTreeMap<usize, Waker>,
+}
+
+impl ParkedWakers {
+    /// Park `waker` and return the key that names this registration alone.
+    pub fn insert(&mut self, waker: Waker) -> usize {
+        let key = self.next_key;
+        self.next_key = key.wrapping_add(1);
+        self.parked.insert(key, waker);
+        key
+    }
+
+    /// Evict the registration `key` names, if it is still parked. Idempotent: a key that a drain
+    /// already took, or that was already removed, names nothing and is never reissued.
+    pub fn remove(&mut self, key: usize) {
+        self.parked.remove(&key);
+    }
+
+    /// Take every parked waker, oldest registration first, leaving the set empty. The key counter
+    /// is not rewound, so a key handed out before the drain is never handed out again.
+    pub fn drain(&mut self) -> std::collections::btree_map::IntoValues<usize, Waker> {
+        std::mem::take(&mut self.parked).into_values()
+    }
+}
+
+impl std::ops::Deref for ParkedWakers {
+    type Target = std::collections::BTreeMap<usize, Waker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parked
+    }
+}
+
 /// Per-consumer state.
 // reason: `closed` / `paused` / `reached_end_of_topic` /
 // `closed` / `paused` / `reached_end_of_topic` are orthogonal protocol axes
@@ -374,8 +432,9 @@ pub struct ConsumerState {
     /// Running total of `payload.len()` across every message currently buffered
     /// in [`Self::queue`] (issue #301). Maintained in lock-step: bumped on
     /// enqueue in [`Self::classify_and_queue`], decremented on dequeue in
-    /// [`Self::pop_message`]. This is the `in_flight_bytes` signal the
-    /// [`crate::receiver_queue::Auto`] OOM guard bounds; it is distinct from
+    /// [`Self::pop_message`], and zeroed wherever the queue is dropped
+    /// ([`Self::begin_seek`], [`crate::Connection::reset`]). This is the `in_flight_bytes` signal
+    /// the [`crate::receiver_queue::Auto`] OOM guard bounds; it is distinct from
     /// [`Self::chunk_buffered_bytes`] (which counts *incomplete* chunk
     /// reassembly buffers, not delivered queue entries).
     pub(crate) queued_bytes: u64,
@@ -396,8 +455,11 @@ pub struct ConsumerState {
     /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
     /// actually arrive, so it does not track the client's decrementing estimate. It is still
     /// the right register for "how much have we told the broker it may use": the #307
-    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
-    /// that question answered, and this additive counter answers it correctly. For the
+    /// failover-reflow gate and the `adjust_receiver_queue` churn-window guard both need exactly
+    /// that question answered, and this additive counter answers it correctly. It is NOT the
+    /// size of the window the broker holds: every `maybe_flow` refill adds to it, so it grows
+    /// past the window with the messages consumed since the last zeroing, and a growth grant
+    /// sized against it would be too small. For the
     /// decrementing client-accounted balance — the starvation signal
     /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
     /// [`Self::permit_balance`].
@@ -480,10 +542,29 @@ pub struct ConsumerState {
     /// [`Self::record_marker_consumed`], the dead-letter branch of
     /// `classify_and_queue` (issue #437), and the undecodable batch members in
     /// [`Self::deliver`] (issue #860, ADR-0112) — and zeroed by [`Self::maybe_flow`] when it
-    /// grants, plus at the churn boundaries that zero the permit mirrors. It is
+    /// grants or retires it against [`Self::window_surplus`], plus at the churn boundaries that
+    /// zero the permit mirrors. It is
     /// refund-driven, not pop-driven: the invariant it holds up is
     /// `granted window == permit_balance + consumed_since_flow + queue.len()`.
     pub(crate) consumed_since_flow: u32,
+    /// Permits the broker holds beyond [`Self::receiver_queue_size`] because
+    /// [`Self::adjust_receiver_queue`] lowered the target (a shrink under memory pressure):
+    /// permits already granted cannot be un-granted, so the window stays at its old size until
+    /// the owed refunds retire the difference. [`Self::maybe_flow`] settles
+    /// `consumed_since_flow` against it before granting anything, and a growth tick absorbs it
+    /// before granting anything, so the window the broker holds is `receiver_queue_size +
+    /// window_surplus`.
+    ///
+    /// Zeroed by [`Self::initial_flow`], the one site that seeds the window afresh at the target
+    /// (subscribe, reconnect, post-seek resubscribe, in-place recovery, failover re-arm). Every
+    /// site that zeroes the permit mirrors on a consumer that re-attaches is followed by one; a
+    /// terminal subscribe failure and an in-place re-attach the consumer is no longer eligible
+    /// for leave it stale until the next `initial_flow`, which is harmless: the churn-window guard
+    /// skips every adjust tick while `granted_permits == 0`, and a refund retired meanwhile is one
+    /// the broker would have dropped against a consumer id it no longer holds. Deliberately NOT
+    /// part of `SeekRollback`: a rejected seek leaves the broker's window exactly as it was,
+    /// surplus included, and a successful one ends in `initial_flow`.
+    pub(crate) window_surplus: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
     /// Raw broker entries owned by an aggregate receive budget. Ordinary
@@ -547,16 +628,18 @@ pub struct ConsumerState {
     /// future dropped between the reply and its continuation hand the re-attach to the
     /// connection ([`crate::Connection::abandon_consumer_seek_waiter`]).
     pub(crate) seek_reattach_owed: Option<RequestId>,
-    /// Per-consumer waker slab. Each in-flight `receive()` future registers a
+    /// Per-consumer waker set. Each in-flight `receive()` future registers a
     /// `Waker` here via [`Self::register_receive_waker`] and evicts it on `Drop`
     /// via [`Self::cancel_receive_waker`]. When a new message arrives (or the
     /// consumer is closed / has reached end-of-topic), every parked waker is
     /// drained and woken — this lets multiple concurrent receivers fan out
-    /// cleanly without one waker clobbering another.
+    /// cleanly without one waker clobbering another. A registration key is
+    /// never reissued (see [`ParkedWakers`]), so a woken future that cancels
+    /// the key it held across the drain cannot evict a later registration.
     ///
-    /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
+    /// Not a channel — a keyed `Waker` set is the canonical no-channel wake pattern
     /// (see [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
-    pub receive_wakers: Slab<Waker>,
+    pub receive_wakers: ParkedWakers,
     /// Reusable ordinary-close operation shared by every consumer clone.
     pub terminal_operation: ConsumerTerminalOperation,
     /// Reclaim this slot after the current close settles, once its owner releases it.
@@ -756,9 +839,10 @@ pub struct ConsumerState {
     /// future registers a `Waker` via [`Self::register_active_change_waker`]
     /// and evicts it on `Drop` via [`Self::cancel_active_change_waker`]; a
     /// new recorded transition (or a terminal close) drains and wakes every
-    /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
-    /// no-channel wake pattern (ADR-0003).
-    pub active_change_wakers: Slab<Waker>,
+    /// parked slot. Not a channel — a keyed `Waker` set is the canonical
+    /// no-channel wake pattern (ADR-0003). Keys are never reissued, for the same
+    /// reason as [`Self::receive_wakers`].
+    pub active_change_wakers: ParkedWakers,
 }
 
 /// One open silence window on a consumer that currently satisfies
@@ -1253,6 +1337,7 @@ impl ConsumerState {
             stall_watch: None,
             stall_recovery_attempts: 0,
             consumed_since_flow: 0,
+            window_surplus: 0,
             queue: VecDeque::new(),
             #[cfg(feature = "scalable-topics")]
             deferred_queue: VecDeque::new(),
@@ -1270,7 +1355,7 @@ impl ConsumerState {
             pending_seek: None,
             seek_rollback: None,
             seek_reattach_owed: None,
-            receive_wakers: Slab::new(),
+            receive_wakers: ParkedWakers::default(),
             terminal_operation: ConsumerTerminalOperation::Open,
             release_after_close: false,
             close_waiters: Slab::new(),
@@ -1314,7 +1399,7 @@ impl ConsumerState {
             shadow_metadata: None,
             is_active: None,
             active_changes: VecDeque::new(),
-            active_change_wakers: Slab::new(),
+            active_change_wakers: ParkedWakers::default(),
         }
     }
 
@@ -1524,6 +1609,12 @@ impl ConsumerState {
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
+    ///
+    /// While a shrink left the broker holding more than the target (`window_surplus`), the
+    /// owed refunds settle against that surplus first and only the rest is granted: the units are
+    /// retired instead of re-granted, which is how the window comes down to the lowered target as
+    /// the application pops. With no surplus every owed unit is refunded one for one, and a
+    /// refund that settles entirely against it emits nothing (the owed count is still cleared).
     pub fn maybe_flow(&mut self) -> Option<pb::CommandFlow> {
         if self.closed
             || self.pending_seek.is_some()
@@ -1536,8 +1627,13 @@ impl ConsumerState {
         if self.consumed_since_flow < threshold {
             return None;
         }
-        let permits = self.consumed_since_flow;
+        let retired = self.consumed_since_flow.min(self.window_surplus);
+        self.window_surplus = self.window_surplus.saturating_sub(retired);
+        let permits = self.consumed_since_flow.saturating_sub(retired);
         self.consumed_since_flow = 0;
+        if permits == 0 {
+            return None;
+        }
         self.granted_permits = self.granted_permits.saturating_add(permits);
         self.permit_balance = self.permit_balance.saturating_add(permits);
         self.clear_stall_watch();
@@ -1773,6 +1869,9 @@ impl ConsumerState {
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
+        // The grant seeds the window at the target: a surplus the previous attach carried
+        // belonged to a window the broker no longer holds.
+        self.window_surplus = 0;
         // Issue #427: this attach's initial grant is now on its way to the broker, so no
         // other grant site owes it one. `Connection::initial_flow` reads the flag back to
         // stay idempotent per attach.
@@ -1817,12 +1916,18 @@ impl ConsumerState {
     /// Run one auto-adjust tick (issue #301). Recomputes the receiver-queue
     /// target via `policy.adjust(&FlowStats)` and reconciles the broker grant:
     ///
-    /// - **Grow** (`new > current`): the broker has fewer permits than the new target wants, so
-    ///   emit an incremental `CommandFlow` for the delta and bump both `granted_permits` and
-    ///   `permit_balance`. This is what keeps a starving consumer fed.
+    /// - **Grow** (`new > current`): the broker holds a window of `current + window_surplus`
+    ///   permits (every grant site tops it up to the target, a refund hands back exactly what a pop
+    ///   consumed, and a surplus is what an earlier shrink could not take back), so emit an
+    ///   incremental `CommandFlow` for the `new - current` the target gained, less what the surplus
+    ///   already covers, and bump both `granted_permits` and `permit_balance`. This is what keeps a
+    ///   starving consumer fed. The delta is NOT taken against `granted_permits`: that is the
+    ///   cumulative grant record, which every refill inflates, so it overshoots the window after a
+    ///   few rounds of refunds and a growth would grant nothing.
     /// - **Shrink / hold** (`new <= current`): permits already granted to the broker cannot be
-    ///   un-granted, so emit nothing — the surplus drains naturally as messages arrive and
-    ///   `maybe_flow` simply asks for less next time (its threshold is `new / 2`).
+    ///   un-granted, so emit nothing and record the difference as `window_surplus`. The window
+    ///   comes down as the application pops, because [`Self::maybe_flow`] retires owed refunds
+    ///   against the surplus instead of granting them.
     ///
     /// Records `now` as the last-adjust timestamp so [`Self::next_adjust_deadline`]
     /// schedules the following tick. Pure given (`policy`, `FlowStats`, `now`):
@@ -1860,16 +1965,20 @@ impl ConsumerState {
         let current = self.receiver_queue_size;
         self.receiver_queue_size = new_target;
         if new_target <= current {
-            // Shrink or hold: cannot un-grant permits, so let them drain. The
-            // smaller `maybe_flow` threshold (`new_target / 2`) then asks for
-            // less on the next refill.
+            // Shrink or hold: cannot un-grant permits, so emit nothing. What the
+            // broker holds beyond the new target is retired by `maybe_flow` as
+            // the owed refunds come in (a hold adds nothing).
+            let shed = u32::try_from(current - new_target).unwrap_or(u32::MAX);
+            self.window_surplus = self.window_surplus.saturating_add(shed);
             return None;
         }
-        // Grow: top the broker's grant up to the new target with an incremental
-        // flow for the delta the broker does not yet have.
-        let want = new_target as u32;
-        let have = self.granted_permits;
-        let delta = want.saturating_sub(have);
+        // Grow: top the broker's window up from `current + window_surplus` to
+        // the new target with an incremental flow. The window is that, not
+        // `granted_permits`, which is cumulative (see the method docs).
+        let growth = u32::try_from(new_target - current).unwrap_or(u32::MAX);
+        let absorbed = growth.min(self.window_surplus);
+        self.window_surplus = self.window_surplus.saturating_sub(absorbed);
+        let delta = growth.saturating_sub(absorbed);
         if delta == 0 {
             return None;
         }
@@ -2800,23 +2909,25 @@ impl ConsumerState {
     }
 
     /// Register a waker that fires when a new message arrives, the consumer is
-    /// closed, or end-of-topic is signaled. Returns a slab key that the caller
-    /// MUST pass to [`Self::cancel_receive_waker`] if the future is dropped
-    /// before observing the wake — otherwise the slab leaks the entry until the
-    /// next drain.
+    /// closed, or end-of-topic is signaled. Returns a key that names this
+    /// registration alone and that the caller MUST pass to
+    /// [`Self::cancel_receive_waker`] if the future is dropped before observing
+    /// the wake — otherwise the set keeps the entry until the next drain.
     ///
     /// Multiple in-flight `receive()` futures on the same consumer register
-    /// independent slots; arrival drains all of them.
+    /// independent entries; arrival drains all of them. A drain does not free
+    /// its keys for reuse, so the key a woken future still holds can never name
+    /// a registration made after the drain.
     pub fn register_receive_waker(&mut self, waker: Waker) -> usize {
         self.receive_wakers.insert(waker)
     }
 
-    /// Evict a previously-registered receive waker. Idempotent — a missing slot
-    /// is a no-op (a concurrent wake may already have drained it).
+    /// Evict a previously-registered receive waker. Idempotent — a key whose
+    /// entry is gone is a no-op (a concurrent wake may already have drained
+    /// it), and it can never evict another future's entry because a key is
+    /// never reissued.
     pub fn cancel_receive_waker(&mut self, slab_key: usize) {
-        if self.receive_wakers.contains(slab_key) {
-            self.receive_wakers.remove(slab_key);
-        }
+        self.receive_wakers.remove(slab_key);
     }
 
     /// Return the reusable ordinary-close completion, if it has landed.
@@ -2899,21 +3010,21 @@ impl ConsumerState {
     }
 
     /// Register a waker that fires when a new active-change transition is
-    /// recorded or the consumer reaches a terminal state. Returns a slab key
-    /// the caller MUST pass to [`Self::cancel_active_change_waker`] if the
+    /// recorded or the consumer reaches a terminal state. Returns a key that
+    /// names this registration alone, which the caller MUST pass to
+    /// [`Self::cancel_active_change_waker`] if the
     /// future is dropped before observing the wake. Mirrors
     /// [`Self::register_receive_waker`].
     pub fn register_active_change_waker(&mut self, waker: Waker) -> usize {
         self.active_change_wakers.insert(waker)
     }
 
-    /// Evict a previously-registered active-change waker. Idempotent — a
-    /// missing slot is a no-op (a concurrent wake may already have drained
-    /// it). Mirrors [`Self::cancel_receive_waker`].
+    /// Evict a previously-registered active-change waker. Idempotent — a key
+    /// whose entry is gone is a no-op (a concurrent wake may already have
+    /// drained it) and never evicts another future's entry. Mirrors
+    /// [`Self::cancel_receive_waker`].
     pub fn cancel_active_change_waker(&mut self, slab_key: usize) {
-        if self.active_change_wakers.contains(slab_key) {
-            self.active_change_wakers.remove(slab_key);
-        }
+        self.active_change_wakers.remove(slab_key);
     }
 
     /// Drain every parked active-change waker and wake it. Mirrors
@@ -5383,6 +5494,38 @@ mod tests {
         // Subsequent cancel of already-drained keys is idempotent.
         c.cancel_receive_waker(k1);
         c.cancel_receive_waker(k2);
+    }
+
+    #[test]
+    fn a_receive_waker_key_is_never_reissued_and_cancelling_it_twice_keeps_one_entry_per_waker() {
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let (w1, count1) = counting_waker();
+        let k1 = c.register_receive_waker(w1);
+        c.close();
+        assert_eq!(count1.0.load(Ordering::SeqCst), 1);
+        assert_eq!(c.receive_wakers.len(), 0, "the drain took the waker");
+
+        // A registration made after the drain does not receive the drained key.
+        let (w2, count2) = counting_waker();
+        let k2 = c.register_receive_waker(w2);
+        assert_ne!(k1, k2, "a drained key is not handed out again");
+
+        // The stale key, cancelled twice, names nothing and leaves the later waker parked.
+        c.cancel_receive_waker(k1);
+        c.cancel_receive_waker(k1);
+        assert_eq!(c.receive_wakers.len(), 1);
+
+        // Cancelling the live key twice removes its one entry and nothing else.
+        let (w3, _count3) = counting_waker();
+        let k3 = c.register_receive_waker(w3);
+        c.cancel_receive_waker(k2);
+        c.cancel_receive_waker(k2);
+        assert_eq!(c.receive_wakers.len(), 1);
+        c.cancel_receive_waker(k3);
+        assert_eq!(c.receive_wakers.len(), 0);
+        assert_eq!(count2.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

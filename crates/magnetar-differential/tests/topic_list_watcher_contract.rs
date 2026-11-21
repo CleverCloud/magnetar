@@ -5,8 +5,9 @@
 //! A topic-list snapshot outcome names the watcher every later delta is keyed on
 //! ([ADR-0132](../../../specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
 //! That is the id the connection allocated for the request, whatever id the
-//! broker echoes; only a snapshot answering a request its caller has already
-//! cancelled, which no reader holds any more, falls back to the echoed id.
+//! broker echoes. A snapshot answering a request its caller has already
+//! cancelled has no reader and no allocated id left to name, so it records no
+//! outcome at all.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
@@ -99,15 +100,13 @@ fn a_snapshot_names_the_watcher_its_request_allocated() {
 }
 
 #[test]
-fn a_snapshot_answering_a_cancelled_watch_names_the_watcher_the_broker_echoed() {
+fn a_snapshot_answering_a_cancelled_watch_records_no_outcome() {
     let mut conn = handshaked_connection();
     let (request, allocated) = watch(&mut conn, "cancelled-.*");
     conn.cancel_request(request);
-    let echoed = allocated.wrapping_add(1_000);
-    feed_snapshot(&mut conn, request, echoed);
-    assert_eq!(
-        snapshot_watcher_id(&mut conn, request),
-        echoed,
-        "a cancelled request has no allocated id left to name, so the echoed one stands in"
+    feed_snapshot(&mut conn, request, allocated.wrapping_add(1_000));
+    assert!(
+        conn.take_outcome(PendingOpKey::Request(request)).is_none(),
+        "a cancelled request has no reader: the late reply must not leave its topic list behind"
     );
 }

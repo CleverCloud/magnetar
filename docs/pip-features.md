@@ -609,7 +609,8 @@ The policy is threaded through partitioned, multi-topics, and pattern consumers 
 - **Grow** (bounded doubling) while received dispatch units have drained the client-accounted balance to zero (`available_permits == 0`, the starvation signal) and the byte budget still has room.
   A grown target emits an incremental `CommandFlow` so the broker is fed more.
 - **Shrink** (gentle halving toward `min`) when the buffered-queue bytes reach the byte budget (the OOM guard).
-  Permits already granted cannot be un-granted, so the surplus drains naturally and the next refill asks for less.
+  Permits already granted cannot be un-granted, so a shrink emits nothing and records the difference as `ConsumerState::window_surplus`: the owed refunds settle against it instead of being granted, so the broker window comes down to the new target as the application pops.
+  A later growth is covered by the surplus first and grants only the rest ([ADR-0147](../specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
 - **Hold** otherwise — the target only moves on a clear starve/OOM signal, so it converges without thrashing.
 
 For partitioned consumers the byte budget is divided across the live partition count, so the **aggregate** buffered bytes across all partitions stay within `max_bytes`.
@@ -660,6 +661,8 @@ The default-off feature provides a bounded, assignment-driven typed aggregate ra
   An update whose `epoch` does **not** advance is ignored — `handle_update` returns `Ok(None)`, the layout is untouched, no event is emitted, and the session stays open.
   That is not a detail: Pulsar 5.0.0 answers the lookup with the current layout and then pushes that same layout, at that same epoch, on the watch the lookup just opened, so treating a duplicate as a protocol error ended the watch before it had ever seen a change ([ADR-0095](../specs/adr/0095-ignore-a-re-sent-scalable-layout-epoch.md)).
   A duplicate or reordered epoch is the no-op; a session-id mismatch, broker-side error, bodyless update, or invalid forward snapshot rejects the raw update without partially replacing the graph and closes that raw session.
+  When the client itself refuses the update (a bodyless one, or a layout that fails whole-snapshot validation) the close also reaches the broker as `CommandScalableTopicClose`, because the broker keeps pushing on a session until it receives that command; a failure the broker reported already ended the session there and is not closed again.
+  The namespace scalable-topics watch and the TC-assignment watch follow the same rule for a bodyless update, with `CommandWatchScalableTopicsClose` and `CommandWatchTcAssignmentsClose` ([ADR-0149](../specs/adr/0149-close-a-scalable-topic-watch-the-client-rejects-at-the-broker.md)).
 - **`scalable::StreamConsumer<S, E>`** on the façade, schema-generic and available on both Tokio and Moonpool.
   Public runtime clients remain non-`Clone`; each runtime gives the aggregate an internal owned `SegmentSubscriber`, while the aggregate itself is cheap to clone over shared state.
 - **Consumer registration with the controller leader** — `CommandScalableTopicSubscribe` / `…SubscribeResponse` / `…AssignmentUpdate` grant and rebalance segment ownership.

@@ -795,12 +795,18 @@ impl<P: Providers> Consumer<P> {
         self.slot.state.lock().paused = true;
     }
 
-    /// Re-enables automatic flow refills. Wakes the driver so it can flush
-    /// any FLOW frames the state machine queues as a result.
+    /// Re-enables automatic flow refills and releases the flow the pause withheld: a receive loop
+    /// that drained the window while paused owes the broker all of it, the broker holds no permit,
+    /// and neither an arrival nor a pop is left to send it
+    /// ([`magnetar_proto::Connection::set_paused`]). Wakes the driver so it can flush the FLOW
+    /// frame the state machine queues as a result.
+    ///
+    /// Takes the connection mutex, then the slot's (global → per-slot, ADR-0038), because it
+    /// stages a `CommandFlow` in the connection's outbound buffer.
     ///
     /// Mirrors `org.apache.pulsar.client.api.Consumer#resume`.
     pub fn resume(&self) {
-        self.slot.state.lock().paused = false;
+        self.shared.inner.lock().set_paused(self.handle, false);
         self.shared.driver_waker.notify_one();
     }
 
@@ -5191,6 +5197,99 @@ mod tests {
         // The failure was taken: a further receive parks again instead of repeating it.
         let mut again = Box::pin(consumer.receive());
         assert!(again.as_mut().poll(&mut cx).is_pending());
+    }
+
+    /// ADR-0146: a consumer paused while its receive loop drained the whole window owes the broker
+    /// that window, and `resume()` must release it. The broker holds zero permits, so no arrival
+    /// comes, and the `receive()` parked before the resume is only woken by an arrival, so
+    /// nothing else sends the flow. 1:1 with the tokio test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_releases_the_flow_owed_to_a_receive_parked_during_the_pause() {
+        /// The `message_permits` of every `CommandFlow` staged for transmission, in wire order.
+        fn staged_flow_grants(shared: &Arc<ConnectionShared>) -> Vec<u32> {
+            let mut staged = shared.inner.lock().poll_transmit();
+            let mut grants = Vec::new();
+            while !staged.is_empty() {
+                let frame = decode_one(&mut staged).expect("staged frame must decode");
+                if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                    grants.push(frame.command.flow.expect("CommandFlow").message_permits);
+                }
+            }
+            grants
+        }
+
+        const RQ: usize = 8;
+        let t0 = Instant::now();
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            let subscribe_request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/resume-owed-flow".to_owned(),
+                subscription: "s".to_owned(),
+                receiver_queue_size: RQ,
+                ..Default::default()
+            });
+            let mut success = BytesMut::new();
+            encode_command(
+                &mut success,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::Success as i32,
+                    success: Some(pb::CommandSuccess {
+                        request_id: subscribe_request_id,
+                        schema: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("encode CommandSuccess");
+            conn.handle_bytes(t0, &success).expect("subscribe acked");
+            let _ = conn.initial_flow(handle, t0);
+            handle
+        };
+        assert_eq!(
+            staged_flow_grants(&shared),
+            vec![RQ as u32],
+            "the initial grant is the whole receiver queue"
+        );
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+
+        // The broker dispatches the whole window while the consumer is paused, and the receive
+        // loop drains it: no permit is left at the broker and the client owes all of them back.
+        consumer.pause();
+        {
+            let mut conn = shared.inner.lock();
+            for entry in 0..RQ as u64 {
+                conn.handle_bytes(t0, &command_message_bytes(handle.0, entry, b"x"))
+                    .expect("deliver message");
+            }
+        }
+        for _ in 0..RQ {
+            consumer.receive().await.expect("buffered message");
+        }
+        assert!(
+            staged_flow_grants(&shared).is_empty(),
+            "a paused consumer emits no flow while it drains"
+        );
+
+        // The receive loop parks on the empty queue; another task resumes the consumer.
+        let wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut parked = Box::pin(consumer.receive());
+        assert!(parked.as_mut().poll(&mut cx).is_pending());
+        consumer.resume();
+        // A runtime re-polls a future exactly when its waker fired.
+        if wake.0.load(Ordering::SeqCst) > 0 {
+            assert!(parked.as_mut().poll(&mut cx).is_pending());
+        }
+
+        assert_eq!(
+            staged_flow_grants(&shared),
+            vec![RQ as u32],
+            "resume must release the window the pause withheld; the parked receive is not woken \
+             by any arrival, so the flow is otherwise never sent and the consumer is stranded"
+        );
     }
 
     fn make_consumer<P: moonpool_core::Providers>(

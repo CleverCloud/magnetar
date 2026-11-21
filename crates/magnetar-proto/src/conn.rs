@@ -100,6 +100,23 @@ fn apply_local_ack_state(
         #[cfg(feature = "scalable-topics")]
         consumer.canonical_nack_ids.remove(id);
     }
+    // A cumulative ack also acknowledges every delivery before the id it names, so none of
+    // those may stay tracked: the ack-timeout sweep and the nack-delay sweep would otherwise
+    // ask the broker to redeliver messages the application already acknowledged.
+    if !matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
+        for horizon in &ack.message_ids {
+            if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+                tracker.remove_through(horizon);
+            }
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                tracker.remove_through(horizon);
+            }
+            #[cfg(feature = "scalable-topics")]
+            consumer
+                .canonical_nack_ids
+                .retain(|id, _| !id.is_covered_by_cumulative_ack(horizon));
+        }
+    }
     apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
 }
 
@@ -1286,6 +1303,10 @@ impl Connection {
             let mut consumer = slot.state.lock();
             consumer.subscribe_waiter_completed = false;
             consumer.queue.clear();
+            // The buffered-byte counter is the sum of the payloads the queues hold (the
+            // out-of-memory guard's `in_flight_bytes`): it empties with them, or the dropped
+            // messages keep counting toward the budget for good (`begin_seek` does the same).
+            consumer.queued_bytes = 0;
             #[cfg(feature = "scalable-topics")]
             {
                 consumer.clear_deferred_messages();
@@ -2842,9 +2863,12 @@ impl Connection {
                             lowest
                         };
                         let mut resolved: Vec<(OpSend, MessageId)> = Vec::new();
-                        for seq in lowest..=highest {
+                        // Walk the producer's own in-flight sends inside the range, never the
+                        // range itself: `highest` is the broker's number, and counting up to it
+                        // would hold this mutex and the slot lock for as long as it is wide.
+                        for seq in producer.pending_sequence_ids_in(lowest, highest) {
                             let mut synth = receipt.clone();
-                            synth.sequence_id = seq;
+                            synth.sequence_id = seq.0;
                             synth.highest_sequence_id = None;
                             if let Some(tuple) = producer.apply_receipt(&synth, now) {
                                 resolved.push(tuple);
@@ -2893,21 +2917,23 @@ impl Connection {
                     "missing CommandSendError",
                 ))?;
                 let handle = ProducerHandle(err.producer_id);
-                let resolved: Option<(OpSend, i32, String)> = if let Some(slot) =
-                    self.producers.get(&handle)
-                {
-                    let mut producer = slot.state.lock();
-                    let outcome = producer.apply_send_error(&err);
-                    if outcome.is_some() {
-                        producer.total_send_failed = producer.total_send_failed.saturating_add(1);
-                    }
-                    outcome
-                } else {
-                    None
-                };
-                // The op drops (releasing its memory reservation) at the end of this block,
-                // after the per-slot guard is gone (ADR-0111).
-                if let Some((mut op, code, message)) = resolved {
+                // A rejected batch frame fails every member, not only the one the broker names
+                // (see `ProducerState::apply_send_error`).
+                let resolved: Vec<(OpSend, i32, String)> = self
+                    .producers
+                    .get(&handle)
+                    .map(|slot| {
+                        let mut producer = slot.state.lock();
+                        let outcome = producer.apply_send_error(&err);
+                        producer.total_send_failed = producer
+                            .total_send_failed
+                            .saturating_add(outcome.len() as u64);
+                        outcome
+                    })
+                    .unwrap_or_default();
+                // Each op drops (releasing its memory reservation) at the end of its
+                // iteration, after the per-slot guard is gone (ADR-0111).
+                for (mut op, code, message) in resolved {
                     let seq = op.sequence_id;
                     let waker = op.waker.take();
                     let key = PendingOpKey::Send(handle, seq);
@@ -3032,7 +3058,15 @@ impl Connection {
                         let mut producer = slot.state.lock();
                         producer.open_request_id = None;
                         producer.name = Some(ok.producer_name.clone());
-                        producer.last_sequence_id_published = ok.last_sequence_id.unwrap_or(-1);
+                        // The broker's `last_sequence_id` is what it persisted for this
+                        // producer name (`-1` with no deduplication state). It can raise
+                        // the counter, never lower it: the counter already holds the
+                        // `initial_sequence_id - 1` resume point or the highest id a
+                        // receipt acknowledged, and a re-attach answered with a smaller
+                        // value must not erase either.
+                        producer.last_sequence_id_published = producer
+                            .last_sequence_id_published
+                            .max(ok.last_sequence_id.unwrap_or(-1));
                         // Java `ProducerImpl#handleProducerSuccess` →
                         // `resendMessages` parity (producer-not-ready livelock
                         // fix): the broker has acked the (re-)attachment — only
@@ -4099,7 +4133,8 @@ impl Connection {
                 // double-flow): only when `granted_permits == 0` — issue #349
                 // kept this gate on the additive grant mirror (not
                 // `permit_balance`), the same "has the broker been told it may
-                // use anything yet" question the want-have delta answers — and
+                // use anything yet" question the churn-window guard of
+                // `adjust_receiver_queue` asks — and
                 // only when the consumer is in a dispatch-eligible state — not
                 // user-closed, not paused, no in-flight seek freezing the
                 // queue, not terminal, and not mid-re-attach (the re-attach
@@ -4213,17 +4248,22 @@ impl Connection {
                 if self.topic_watchers.complete_reattach(rid, &ok.topics_hash) {
                     return Ok(());
                 }
+                // A snapshot the caller gave up on (its future was dropped, or the operation
+                // deadline fired) went through `cancel_request`, which removed the pending request
+                // and closed the watcher, so there is nobody to take an outcome and no watcher to
+                // update. Recording one would leave the broker's whole topic list in `outcomes`
+                // for the life of the connection.
+                // The id this connection allocated, which is the one every later delta for the
+                // watcher is keyed on.
+                let watcher_id = match self.pending_requests.get(&rid) {
+                    Some(PendingRequestKind::TopicWatcher { watcher_id }) => *watcher_id,
+                    _ => return Ok(()),
+                };
+                self.pending_requests.remove(&rid);
                 if let Some(watcher) = self.topic_watchers.lookup_by_request(rid) {
                     watcher.topics_hash = Some(ok.topics_hash.clone());
                     watcher.initialised = true;
                 }
-                // The id this connection allocated, which is the one every later delta for the
-                // watcher is keyed on. A request cancelled before its response (its pending
-                // entry is gone) has no reader, so the id the broker echoed stands in.
-                let watcher_id = match self.pending_requests.remove(&rid) {
-                    Some(PendingRequestKind::TopicWatcher { watcher_id }) => watcher_id,
-                    _ => ok.watcher_id,
-                };
                 let topics = ok.topic.clone();
                 self.outcomes.insert(
                     PendingOpKey::Request(rid),
@@ -4348,7 +4388,15 @@ impl Connection {
                     ))?;
                 let request_id = RequestId(resp.request_id);
                 self.pending_requests.remove(&request_id);
+                let ended = self.txn_client.txn_being_ended(request_id);
                 let result = self.txn_client.handle_end_txn_response(resp);
+                // The outcome below carries the final state, so the transaction's record has no
+                // further reader. Without this it stayed for the life of the connection, which
+                // outlives every reconnect: one record per transaction, for as long as the
+                // client ran.
+                if let Some(txn) = ended {
+                    self.txn_client.forget(txn);
+                }
                 self.outcomes.insert(
                     PendingOpKey::Request(request_id),
                     OpOutcome::EndTxn {
@@ -5035,7 +5083,7 @@ impl Connection {
             // incremental `CommandFlow`, staged here and emitted after the loop.
             // `next_adjust_deadline`/`poll_timeout` gate when this actually fires;
             // a sub-interval tick is a cheap no-op (the policy recomputes the
-            // same target and the `delta == 0` guard suppresses the flow).
+            // same target, which is a hold: no flow and no surplus).
             match consumer.next_adjust_deadline() {
                 Some(d) if now >= d => {
                     // Per-partition proto consumer: partition count is 1 here;
@@ -6545,7 +6593,11 @@ impl Connection {
     }
 
     /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. `-1` if the
-    /// producer has no acknowledged sends yet. Useful for at-least-once resume-on-restart.
+    /// producer has no acknowledged sends yet and no resume point. A producer opened with
+    /// `initial_sequence_id` reports `initial_sequence_id - 1` until the first receipt, the
+    /// `last_sequence_id` of a `CommandProducerSuccess` can raise the value but never lowers
+    /// it, so a re-attach keeps the highest id already known. Useful for at-least-once
+    /// resume-on-restart.
     #[must_use]
     pub fn producer_last_sequence_id_published(&self, handle: ProducerHandle) -> i64 {
         self.producers
@@ -6652,7 +6704,7 @@ impl Connection {
     /// ADR-0101 amends ADR-0082 §Consequences accordingly.
     ///
     /// For "how much have we told the broker it may use" — the question the #307
-    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta ask — read
+    /// failover-reflow gate and the `adjust_receiver_queue` churn-window guard ask — read
     /// [`crate::consumer::ConsumerState::granted_permits`] directly; it is unchanged.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
@@ -7231,9 +7283,21 @@ impl Connection {
     /// paused the consumer skips automatic flow refills, so the broker stops dispatching new
     /// messages once already-issued permits drain. Buffered messages remain available via
     /// [`Self::pop_message`].
+    ///
+    /// Resuming releases the flow the pause withheld. A consumer whose receive loop drained its
+    /// window while paused owes the broker that whole window and the broker holds no permit,
+    /// so nothing else can send it: no arrival comes, [`Self::pop_message`] has nothing to
+    /// pop, and the stall watchdog skips a consumer with no permits.
+    /// [`crate::consumer::ConsumerState::maybe_flow`] returns `None` while paused, so the call
+    /// after the store emits nothing for a pause.
     pub fn set_paused(&mut self, handle: ConsumerHandle, paused: bool) {
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().paused = paused;
+        let flow = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            consumer.paused = paused;
+            consumer.maybe_flow()
+        });
+        if let Some(flow) = flow {
+            self.stage_flow(flow);
         }
     }
 
@@ -8524,15 +8588,18 @@ impl Connection {
             .and_then(|slot| slot.state.lock().queue.front().map(|m| m.payload.len()))
     }
 
-    /// Register a per-consumer receive waker. Returns `Some(slab_key)` if the
-    /// consumer is alive (the caller MUST evict the slot via
+    /// Register a per-consumer receive waker. Returns `Some(key)` if the
+    /// consumer is alive (the caller MUST evict the entry via
     /// [`Self::cancel_consumer_receive_waker`] on drop), or `None` if the
     /// consumer has been closed in the meantime.
     ///
-    /// This is the per-consumer waker slab the runtime crates park
+    /// This is the per-consumer waker set the runtime crates park
     /// `receive()` futures on. Multiple in-flight receives on the same
-    /// consumer get independent slab slots and all fan out on message arrival
-    /// (see [`ConsumerState::register_receive_waker`]).
+    /// consumer get independent entries and all fan out on message arrival
+    /// (see [`ConsumerState::register_receive_waker`]). The key names this
+    /// registration alone: a drain does not free it for reuse, so a future
+    /// that cancels the key it held across a drain cannot evict another
+    /// future's entry.
     pub fn register_consumer_receive_waker(
         &mut self,
         handle: ConsumerHandle,
@@ -8544,7 +8611,7 @@ impl Connection {
 
     /// Evict a previously-registered per-consumer receive waker. Idempotent —
     /// safe to call from a `Drop` impl even if the consumer has been removed
-    /// or the slot already drained.
+    /// or the entry already drained.
     pub fn cancel_consumer_receive_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().cancel_receive_waker(slab_key);
@@ -8552,8 +8619,8 @@ impl Connection {
     }
 
     /// Register a per-consumer active-change waker (issue #348). Returns
-    /// `Some(slab_key)` if the consumer is alive (the caller MUST evict the
-    /// slot via [`Self::cancel_consumer_active_change_waker`] on drop), or
+    /// `Some(key)` if the consumer is alive (the caller MUST evict the
+    /// entry via [`Self::cancel_consumer_active_change_waker`] on drop), or
     /// `None` if the consumer has been closed in the meantime. Mirrors
     /// [`Self::register_consumer_receive_waker`].
     pub fn register_consumer_active_change_waker(
@@ -8718,16 +8785,28 @@ impl Connection {
         if self.scalable_sessions.remove(&session_id).is_none() {
             return;
         }
+        self.encode_scalable_topic_close(session_id);
+        self.events.push_back(ConnectionEvent::DagWatchClosed {
+            session_id,
+            reason: Some("client-initiated close".to_owned()),
+        });
+    }
+
+    /// Stage `CommandScalableTopicClose` for a session this connection has just
+    /// dropped from its registry.
+    ///
+    /// The broker keeps pushing on a session until it receives this command, so
+    /// every client-side removal of a session the broker did not itself end must
+    /// stage it: [`Self::close_scalable_topic_session`] and the rejection arm of
+    /// [`Self::handle_scalable_topic_update`].
+    #[cfg(feature = "scalable-topics")]
+    fn encode_scalable_topic_close(&mut self, session_id: u64) {
         let cmd = pb::BaseCommand {
             r#type: pb::base_command::Type::ScalableTopicClose as i32,
             scalable_topic_close: Some(pb::CommandScalableTopicClose { session_id }),
             ..Default::default()
         };
         let _ = self.encode_command(&cmd);
-        self.events.push_back(ConnectionEvent::DagWatchClosed {
-            session_id,
-            reason: Some("client-initiated close".to_owned()),
-        });
     }
 
     /// Snapshot the current DAG for a session (for the CLI `topic-info`
@@ -9164,7 +9243,18 @@ impl Connection {
                     .push_back(ConnectionEvent::ScalableTopicsChanged { watch_id, change });
             }
             Err(err) => {
-                self.scalable_topic_watches.remove(&watch_id);
+                // A failure the broker reported ended the watch at the broker.
+                // Any other rejection (an update carrying neither an event nor
+                // an error) leaves it live there, pushing, until the client
+                // closes it.
+                if matches!(
+                    err,
+                    crate::scalable_consumer::TopicsWatchError::Broker { .. }
+                ) {
+                    self.scalable_topic_watches.remove(&watch_id);
+                } else {
+                    self.close_scalable_topics_watch(watch_id);
+                }
                 self.events
                     .push_back(ConnectionEvent::ScalableTopicsWatchClosed {
                         watch_id,
@@ -9182,17 +9272,26 @@ impl Connection {
             return;
         }
         let Some(snapshot) = upd.snapshot else {
-            self.tc_assignment_watches.remove(&watch_id);
+            let reason = match upd.error {
+                // The broker ended the watch itself.
+                Some(code) => {
+                    self.tc_assignment_watches.remove(&watch_id);
+                    format!(
+                        "broker rejected the TC-assignment watch (code {code}): {}",
+                        upd.message.unwrap_or_default()
+                    )
+                }
+                // The client refuses the update; the watch is still live at the
+                // broker, pushing, until the client closes it.
+                None => {
+                    self.close_tc_assignments_watch(watch_id);
+                    "TC-assignment update carried no snapshot".to_owned()
+                }
+            };
             self.events
                 .push_back(ConnectionEvent::TcAssignmentsWatchClosed {
                     watch_id,
-                    reason: Some(match upd.error {
-                        Some(code) => format!(
-                            "broker rejected the TC-assignment watch (code {code}): {}",
-                            upd.message.unwrap_or_default()
-                        ),
-                        None => "TC-assignment update carried no snapshot".to_owned(),
-                    }),
+                    reason: Some(reason),
                 });
             return;
         };
@@ -9273,6 +9372,13 @@ impl Connection {
                 // A rejected update closes the session (drop-on-change). The
                 // runtime re-resolves.
                 self.scalable_sessions.remove(&session_id);
+                // A failure the broker reported ended the session at the
+                // broker. Any other rejection (a bodyless update, a layout that
+                // fails whole-snapshot validation) leaves it live there,
+                // pushing, until the client closes it.
+                if !matches!(err, crate::dag_watch::DagError::Broker { .. }) {
+                    self.encode_scalable_topic_close(session_id);
+                }
                 self.events.push_back(ConnectionEvent::DagWatchClosed {
                     session_id,
                     reason: Some(format!("scalable-topic update rejected: {err}")),
@@ -9799,8 +9905,8 @@ impl Connection {
     ///
     /// 1. zero the permit mirrors (`granted_permits`, `permit_balance`, `consumed_since_flow`) and
     ///    drop any open stall window — the broker has released this consumer's permits, so the
-    ///    client's mirrors must follow or the want-have delta and the starvation signal both read a
-    ///    grant that no longer exists;
+    ///    client's mirrors must follow or the churn-window guard and the starvation signal both
+    ///    read a grant that no longer exists;
     /// 2. fail every in-flight ack for this handle (issue #346) — the consumer id they were
     ///    correlated against is gone, so no `CommandAckResponse` for them will ever arrive;
     /// 3. re-emit `CommandSubscribe`, deferring the initial `CommandFlow` to ITS `Success` (Pulsar
@@ -12066,6 +12172,182 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    /// The broker refusing a `CommandEndTxn` is as terminal for the connection's record of the
+    /// transaction as an accepted one: the caller gets the refusal through its outcome, and
+    /// nothing reads the record again. Keeping it would leak one per refused end, the same as
+    /// one per committed transaction.
+    #[test]
+    fn end_txn_refused_by_the_broker_leaves_no_record_of_the_transaction() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 11);
+
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+        assert_eq!(
+            conn.txn_client().len(),
+            1,
+            "the open transaction is tracked"
+        );
+
+        let end_request = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("claim the EndTxn waiter");
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::EndTxnResponse as i32,
+                end_txn_response: Some(pb::CommandEndTxnResponse {
+                    request_id: end_request.0,
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    error: Some(pb::ServerError::TransactionConflict as i32),
+                    message: Some("conflict".to_owned()),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode EndTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle EndTxn response");
+
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(end_request)),
+                Some(OpOutcome::EndTxn {
+                    result: Err(TxnError::Conflict),
+                    ..
+                })
+            ),
+            "the caller still receives the broker's refusal"
+        );
+        assert!(
+            conn.txn_client().is_empty(),
+            "a refused end must not leave the transaction tracked"
+        );
+    }
+
+    /// What a refused end leaves behind: the connection no longer tracks the transaction, while the
+    /// broker may still hold it open (a retriable refusal). The application can still end it: the
+    /// retry is a new `CommandEndTxn` that resolves on its own reply and leaves no record either.
+    #[test]
+    fn a_transaction_whose_end_was_refused_can_be_ended_again() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 12);
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let end_response = |request_id: RequestId, error: Option<pb::ServerError>| {
+            let mut encoded = BytesMut::new();
+            encode_command(
+                &mut encoded,
+                &pb::BaseCommand {
+                    r#type: pb::base_command::Type::EndTxnResponse as i32,
+                    end_txn_response: Some(pb::CommandEndTxnResponse {
+                        request_id: request_id.0,
+                        txnid_least_bits: Some(txn.least_sig_bits),
+                        txnid_most_bits: Some(txn.most_sig_bits),
+                        error: error.map(|e| e as i32),
+                        message: error.map(|_| "not ready".to_owned()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("encode EndTxn response");
+            encoded
+        };
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+
+        let refused = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("claim the EndTxn waiter");
+        conn.handle_bytes(
+            Instant::now(),
+            &end_response(
+                refused,
+                Some(pb::ServerError::TransactionCoordinatorNotFound),
+            ),
+        )
+        .expect("handle the refusal");
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(refused)),
+                Some(OpOutcome::EndTxn { result: Err(_), .. })
+            ),
+            "the first end is refused"
+        );
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+        assert!(
+            conn.txn_client().is_empty(),
+            "the refusal forgot the record"
+        );
+
+        let retry = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("a refused transaction can be ended again");
+        assert_ne!(retry, refused, "the retry is a request of its own");
+        conn.handle_bytes(Instant::now(), &end_response(retry, None))
+            .expect("handle the retry's reply");
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(retry)),
+                Some(OpOutcome::EndTxn {
+                    result: Ok(crate::TxnState::Committed),
+                    ..
+                })
+            ),
+            "the retry resolves on its own reply"
+        );
+        assert!(
+            conn.txn_client().is_empty(),
+            "the retry leaves no record either"
         );
     }
 
@@ -18617,6 +18899,294 @@ mod conn_state_tests {
         );
     }
 
+    /// Deliver `count` single-message dispatch units of `payload` to `handle`, the way a
+    /// broker holding `count` permits would, and drop the resulting `Message` events.
+    fn deliver_payloads(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        count: u64,
+        payload: &[u8],
+        at: Instant,
+    ) {
+        for _ in 0..count {
+            let frame = message_frame(handle.0, &regular_metadata(), payload);
+            conn.handle_bytes(at, &frame).expect("deliver message");
+        }
+        while conn.poll_event().is_some() {}
+    }
+
+    /// Pop every queued message of `handle`, as an application that drains its receiver
+    /// would, discarding the refill flows the pops stage. Returns the number popped.
+    fn pop_all(conn: &mut Connection, handle: ConsumerHandle, at: Instant) -> u64 {
+        let mut popped = 0;
+        while conn.pop_message(handle, at).is_some() {
+            popped += 1;
+        }
+        let _ = conn.poll_transmit();
+        popped
+    }
+
+    /// An `Auto(100, 400_000)` consumer fed 1000-byte messages (byte-budget cap 400) after four
+    /// rounds in which the broker dispatched the whole 100-permit window and the application
+    /// popped all of it, with a fifth window dispatched and left unpopped. The refunds of the
+    /// four rounds have raised the cumulative `granted_permits` to 500 while the broker
+    /// window stayed at 100, and the balance is zero, so the next adjust tick sees starvation.
+    /// The byte budget is never approached (100 000 buffered of 400 000), so only the growth
+    /// accounting is in play.
+    fn auto_consumer_starving_after_refund_rounds(
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle, Duration) {
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 400_000, interval, t0);
+        let payload = [b'x'; 1000];
+        for _ in 0..4 {
+            deliver_payloads(&mut conn, handle, 100, &payload, t0);
+            assert_eq!(pop_all(&mut conn, handle, t0), 100, "the window is popped");
+        }
+        deliver_payloads(&mut conn, handle, 100, &payload, t0);
+        let _ = conn.poll_transmit();
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.granted_permits, 500,
+                "precondition: four rounds of refunds (100 each) on top of the initial 100"
+            );
+            assert_eq!(
+                (
+                    consumer.permit_balance,
+                    consumer.consumed_since_flow,
+                    consumer.queue.len(),
+                    consumer.receiver_queue_size
+                ),
+                (0, 0, 100, 100),
+                "precondition: the broker window is still the original 100, fully dispatched"
+            );
+        }
+        (conn, handle, interval)
+    }
+
+    #[test]
+    fn auto_growth_tops_up_the_broker_window_to_the_new_target_after_refunds() {
+        // ADR-0147: `adjust_receiver_queue` sized the grant against the cumulative
+        // `granted_permits` (500 here) instead of the live window (100), so the target
+        // doubled to 200 and `200 - 500` saturated to a zero delta: no flow, a broker window
+        // that no longer matches the target and a refill threshold that is no longer reachable.
+        let t0 = Instant::now();
+        let (mut conn, handle, interval) = auto_consumer_starving_after_refund_rounds(t0);
+
+        conn.handle_timeout(t0 + interval);
+
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "starvation doubles the target"
+        );
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.permit_balance as usize
+                    + consumer.consumed_since_flow as usize
+                    + consumer.queue.len(),
+                consumer.receiver_queue_size,
+                "after a growth tick the broker window (balance + owed refunds + queued) must \
+                 equal the new target"
+            );
+        }
+        assert_eq!(
+            drain_command_flow(&mut conn, handle).map(|flow| flow.message_permits),
+            Some(100),
+            "growing 100 -> 200 over a window of 100 grants the missing 100 permits"
+        );
+    }
+
+    #[test]
+    fn auto_consumer_is_not_left_unable_to_refill_after_growth_over_refunded_window() {
+        // ADR-0147, consequence: the target reached 400 (so the refill threshold is 200) while
+        // the broker window stayed at 100, hence `maybe_flow` could never fire again and the
+        // consumer starved with `permit_balance == 0` and nothing the client can still send.
+        // The broker here is faithful: each round it dispatches every permit it holds.
+        let t0 = Instant::now();
+        let (mut conn, handle, interval) = auto_consumer_starving_after_refund_rounds(t0);
+
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        for round in 2..=4u32 {
+            pop_all(&mut conn, handle, t0);
+            let held = u64::from(conn.consumer_available_permits(handle));
+            deliver_payloads(&mut conn, handle, held, &[b'x'; 1000], t0);
+            let _ = conn.poll_transmit();
+            conn.handle_timeout(t0 + interval * round);
+            let _ = conn.poll_transmit();
+        }
+
+        assert!(
+            !conn.consumers[&handle].state.lock().is_flow_starved(),
+            "the consumer must keep a path to its next refill (permit balance or a reachable \
+             refill threshold), not wait on a broker that holds no permit"
+        );
+    }
+
+    #[test]
+    fn auto_shrink_converges_the_broker_window_to_the_smaller_target() {
+        // ADR-0147: a shrink under memory pressure stores the smaller target and emits nothing,
+        // and `maybe_flow` then refunds every popped unit one for one, so the broker window
+        // (balance + owed refunds + queued) never falls: the buffered-bytes bound the policy
+        // promises is not enforced. Only the threshold (target / 2) moved.
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 20 000-byte budget; the cap stays at 400 so only the OOM branch can lower the target.
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 20_000, interval, t0);
+
+        // Grow 100 -> 200 -> 400 on 1-byte messages, deliver and tick only: no pops, so no
+        // refund can disturb the growth accounting this test is not about.
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval * 2);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "grown to 400"
+        );
+
+        // The broker dispatches the 200 permits it still holds as 100-byte messages: 20 200
+        // buffered bytes, past the budget, so the next tick halves the target.
+        let held = u64::from(conn.consumer_available_permits(handle));
+        assert_eq!(
+            held, 200,
+            "precondition: 200 permits still held by the broker"
+        );
+        deliver_payloads(&mut conn, handle, held, &[b'x'; 100], t0);
+        let _ = conn.poll_transmit();
+        conn.handle_timeout(t0 + interval * 3);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "precondition: the out-of-memory guard halved the target"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "a shrink emits no flow"
+        );
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                (consumer.permit_balance, consumer.queue.len()),
+                (0, 400),
+                "precondition: the whole 400 window is dispatched and queued"
+            );
+        }
+
+        // The application drains and the broker keeps dispatching what it holds. No tick runs,
+        // so the target stays 200: the permits the broker holds after the drain must fit it.
+        let mut held_after_drain = 0;
+        for _ in 0..3 {
+            pop_all(&mut conn, handle, t0);
+            held_after_drain = conn.consumer_available_permits(handle);
+            deliver_payloads(&mut conn, handle, u64::from(held_after_drain), b"x", t0);
+            let _ = conn.poll_transmit();
+        }
+        assert!(
+            held_after_drain as usize <= conn.consumer_receiver_queue_size(handle),
+            "after the drain the broker holds {held_after_drain} permits, more than the shrunk \
+             target {}; the window never shrank",
+            conn.consumer_receiver_queue_size(handle)
+        );
+    }
+
+    #[test]
+    fn reset_zeroes_the_buffered_byte_counter_with_the_queue() {
+        // `reset` clears every consumer's queue and zeroes the permit mirrors but left
+        // `queued_bytes` (the `Auto` out-of-memory guard's `in_flight_bytes`) counting the
+        // dropped messages forever; the redelivered copies are added on top and only they
+        // decay on pop.
+        let t0 = Instant::now();
+        let (mut conn, handle, _) =
+            handshake_subscribe_auto(100, 128 * 1024 * 1024, Duration::from_secs(1), t0);
+        deliver_payloads(&mut conn, handle, 3, &[b'x'; 10], t0);
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.queue.len(),
+                3,
+                "precondition: three queued messages"
+            );
+            assert_eq!(consumer.flow_stats(1).in_flight_bytes, 30, "precondition");
+        }
+
+        conn.reset();
+
+        let consumer = conn.consumers[&handle].state.lock();
+        assert_eq!(consumer.queue.len(), 0, "reset drops the queued messages");
+        assert_eq!(
+            consumer.flow_stats(1).in_flight_bytes,
+            0,
+            "the bytes of the messages reset dropped must stop counting as buffered"
+        );
+    }
+
+    #[test]
+    fn auto_growth_after_a_shrink_is_covered_by_the_surplus_the_window_still_holds() {
+        // After a shrink the broker still holds the old window (400 here) against a target of
+        // 200. A growth back to 400 needs no new permit: the permits are already there, and a
+        // flow for the 200 the target gained would put the window at 600, past the byte budget
+        // the target is sized for.
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 20 000-byte budget; the cap stays at 400 so only the budget decides the target.
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 20_000, interval, t0);
+
+        // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval * 2);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "precondition: grown to 400"
+        );
+
+        // The 200 permits the broker still holds arrive as 99-byte messages: exactly the
+        // 20 000-byte budget, so the next tick halves the target. The broker keeps its 400.
+        deliver_payloads(&mut conn, handle, 200, &[b'x'; 99], t0);
+        conn.handle_timeout(t0 + interval * 3);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "precondition: the out-of-memory guard halved the target"
+        );
+        assert!(drain_command_flow(&mut conn, handle).is_none());
+
+        // The application frees one byte, which puts the buffer back under the budget while
+        // the balance is still zero: the next tick sees starvation with room and doubles.
+        assert!(conn.pop_message(handle, t0).is_some());
+        let _ = conn.poll_transmit();
+        conn.handle_timeout(t0 + interval * 4);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "starvation with room grows the target back"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "the broker already holds the window the target regained: nothing to grant"
+        );
+
+        // The surplus is spent: the application's refunds are granted in full again, up to the
+        // 400 window and not beyond.
+        pop_all(&mut conn, handle, t0);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            400,
+            "the window is the target, no more and no less"
+        );
+    }
+
     /// Encode a broker `CommandAckResponse` resolving `request_id` for `handle`.
     fn ack_response_frame(handle: ConsumerHandle, request_id: RequestId) -> bytes::BytesMut {
         let cmd = pb::BaseCommand {
@@ -19896,6 +20466,210 @@ mod conn_state_tests {
             vec![(8, 0)],
             "a cumulative ack must prune every tracker entry at or below its position, \
              not just the exact (ledger, entry) of the acked id (issue #326)"
+        );
+    }
+
+    /// A cumulative ack covers every earlier delivery, so none of them may stay in the
+    /// ack-timeout tracker: the sweep would otherwise ask the broker to redeliver
+    /// messages the application already acknowledged.
+    #[test]
+    fn cumulative_ack_releases_every_covered_id_from_the_unacked_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        for entry in 1..=4 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        // Cumulative ack at (7, 3): (7, 1), (7, 2) and (7, 3) are acknowledged; (7, 4) is
+        // above the horizon and is the only delivery still owed an ack.
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                }],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        let redelivered: Vec<(u64, u64)> = drain_outbound_commands(&mut conn)
+            .into_iter()
+            .filter_map(|command| command.redeliver_unacknowledged_messages)
+            .flat_map(|redelivery| redelivery.message_ids)
+            .map(|id| (id.ledger_id, id.entry_id))
+            .collect();
+        assert_eq!(
+            redelivered,
+            vec![(7, 4)],
+            "the ack-timeout sweep must redeliver only the delivery above the cumulative \
+             horizon, not the ids the cumulative ack already covered"
+        );
+    }
+
+    /// The ids a redelivery sweep asked the broker for, as `(ledger, entry, batch_index)`.
+    fn redelivered_ids(conn: &mut Connection) -> Vec<(u64, u64, i32)> {
+        drain_outbound_commands(conn)
+            .into_iter()
+            .filter_map(|command| command.redeliver_unacknowledged_messages)
+            .flat_map(|redelivery| redelivery.message_ids)
+            .map(|id| (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1)))
+            .collect()
+    }
+
+    /// A cumulative ack at a batch member covers the members up to and including it, so the
+    /// ack-timeout sweep redelivers only the later members; the entries after it stay owed.
+    #[test]
+    fn cumulative_ack_at_a_batch_member_releases_only_the_members_up_to_it() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        deliver_batch(&mut conn, handle, t0, 7, 1, 3);
+        deliver_batch(&mut conn, handle, t0, 7, 2, 3);
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: 1,
+                    batch_size: 3,
+                }],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 1, 2), (7, 2, 0), (7, 2, 1), (7, 2, 2)],
+            "members 0 and 1 of entry 1 are acknowledged; member 2 and the next entry are not"
+        );
+    }
+
+    /// A cumulative ack covers the messages the application nacked earlier too: their pending
+    /// redelivery must not fire once the nack delay elapses.
+    #[test]
+    fn cumulative_ack_releases_every_covered_id_from_the_nack_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            nack_test_conn(Duration::from_secs(10), Some(Duration::from_secs(5)));
+        for entry in 1..=4 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        let delivered = |entry| MessageId {
+            ledger_id: 7,
+            entry_id: entry,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        conn.negative_ack(handle, vec![delivered(1), delivered(2), delivered(4)], t0);
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![delivered(3)],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(6));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 4, -1)],
+            "the nack sweep must redeliver only the nack above the cumulative horizon, \
+             not the nacks the cumulative ack already covered"
+        );
+    }
+
+    /// The complete id a scalable nack parks beside the nack tracker entry must go with it:
+    /// nothing would ever take it out once the entry is released.
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn cumulative_ack_releases_every_covered_canonical_nack_id() {
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            nack_test_conn(Duration::from_secs(10), Some(Duration::from_secs(5)));
+        let canonical = |entry_id| pb::MessageIdData {
+            ledger_id: 7,
+            entry_id,
+            partition: Some(-1),
+            batch_index: Some(-1),
+            ack_set: Vec::new(),
+            batch_size: Some(0),
+            first_chunk_message_id: None,
+        };
+        conn.negative_ack_with_message_id_data(
+            handle,
+            vec![canonical(1), canonical(2), canonical(4)],
+            t0,
+        );
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&canonical(3))],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let parked: Vec<u64> = conn.consumers[&handle]
+            .state
+            .lock()
+            .canonical_nack_ids
+            .keys()
+            .map(|id| id.entry_id)
+            .collect();
+        assert_eq!(
+            parked,
+            vec![4],
+            "only the nack above the cumulative horizon keeps its complete id"
+        );
+    }
+
+    /// An individual ack releases exactly the id it names: the earlier deliveries stay owed.
+    #[test]
+    fn individual_ack_releases_only_the_named_id_from_the_unacked_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        for entry in 1..=3 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 1, -1), (7, 2, -1)],
+            "an individual ack must not release the deliveries before it"
         );
     }
 
@@ -22650,6 +23424,46 @@ mod consumer_stall_and_recovery_tests {
             RQ as u32,
             "and mutates nothing — the refusal path must leave the consumer exactly as it \
              was, not strictly worse off than the stall it was in"
+        );
+    }
+
+    /// ADR-0146: a consumer paused while its receive loop drained the whole window owes the broker
+    /// that window, and resuming must release it. Nothing else will: the broker holds zero
+    /// permits (`permit_balance == 0`) so no arrival comes, the stall watchdog skips a consumer
+    /// with no permits, and the `Message` arm and `pop_message` — the only other `maybe_flow`
+    /// callers — need an arrival or a pop. A `receive()` parked before the resume is neither.
+    #[test]
+    fn resuming_a_drained_paused_consumer_releases_the_flow_it_owes_the_broker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+
+        conn.set_paused(handle, true);
+        deliver_messages(&mut conn, handle, 0, RQ as u64, t0);
+        let (entries, grants) = pop_all_entries(&mut conn, handle, t0);
+        assert_eq!(
+            entries.len(),
+            RQ,
+            "the paused consumer still hands out the whole buffered window"
+        );
+        assert!(
+            grants.is_empty(),
+            "a paused consumer emits no flow while it drains: {grants:?}"
+        );
+        assert_eq!(
+            flow_ledger(&conn, handle),
+            (0, 0, RQ as u32, RQ as u32),
+            "the window is fully drained: the broker holds no permit and the client owes it \
+             the whole window back"
+        );
+
+        conn.set_paused(handle, false);
+
+        let (_, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(
+            grants,
+            vec![RQ as u32],
+            "resume must release the window the pause withheld; with no arrival and no pop to \
+             come, the flow is never sent and the consumer is stranded"
         );
     }
 }
@@ -25660,6 +26474,184 @@ mod memory_limit_release_tests {
             conn.take_outcome(PendingOpKey::Send(handle, s1)),
             Some(OpOutcome::SendError { .. })
         ));
+    }
+
+    /// A broker `CommandSendError` for a batched frame fails EVERY member of the batch.
+    ///
+    /// `flush_batch` folds the per-member ops `[s0, s1, s2]` into one `CommandSend` carrying
+    /// `sequence_id = s0` and `highest_sequence_id = s2`. The broker validates a batch frame
+    /// against its HIGHEST id, so every pre-persist rejection (`PersistenceError`,
+    /// `ChecksumError`, `MetadataError`) names `s2`. The entry was not persisted, so no receipt
+    /// will ever come for `s0` and `s1`: they must fail with the same error and release their
+    /// bytes, exactly as the receipt arm fans a success out over `[lowest, highest]`.
+    #[test]
+    fn send_error_for_a_batched_frame_fails_every_member_of_the_batch() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-batch-error")
+            },
+        );
+        let budget = budget(100);
+        let s0 = send(&mut conn, handle, &budget, 10, at);
+        let s1 = send(&mut conn, handle, &budget, 10, at);
+        let s2 = send(&mut conn, handle, &budget, 10, at);
+        assert_eq!(budget.used_bytes(), 30);
+        assert_eq!(
+            conn.flush_producer(handle, 0, at),
+            1,
+            "the three members leave as one frame"
+        );
+        let frames = transmitted(&mut conn);
+        let batch = frames
+            .iter()
+            .find_map(|c| c.send.as_ref())
+            .expect("the batch left as one CommandSend");
+        assert_eq!(batch.sequence_id, s0.0, "the frame names the lowest id");
+        assert_eq!(
+            batch.highest_sequence_id,
+            Some(s2.0),
+            "and the highest as the range end"
+        );
+        assert_eq!(conn.producer_pending_count(handle), 3);
+
+        // The broker answers a batch frame with the HIGHEST sequence id.
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: s2.0,
+                    error: pb::ServerError::MetadataError as i32,
+                    message: "Messages must be encrypted".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        for (label, seq) in [("s0", s0), ("s1", s1), ("s2", s2)] {
+            match conn.take_outcome(PendingOpKey::Send(handle, seq)) {
+                Some(OpOutcome::SendError { code, message, .. }) => {
+                    assert_eq!(
+                        code,
+                        pb::ServerError::MetadataError as i32,
+                        "{label} carries the broker's error code"
+                    );
+                    assert_eq!(
+                        message, "Messages must be encrypted",
+                        "{label} carries the broker's message"
+                    );
+                }
+                other => panic!(
+                    "{label} ({seq:?}) must resolve with the broker's SendError, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            0,
+            "no member of the rejected batch may stay pending"
+        );
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "every member's reservation is released"
+        );
+    }
+
+    /// What a rejected batch leaves behind: every member removed from the queue and its reservation
+    /// released, with the producer still open. Its next batch is a frame of its own that resolves
+    /// on its own receipt, unaffected by the members failed before it.
+    #[test]
+    fn the_next_batch_after_a_rejected_one_resolves_on_its_own_receipt() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                ..request("mem-batch-error-recovery")
+            },
+        );
+        let budget = budget(100);
+        let rejected: Vec<_> = (0..3)
+            .map(|_| send(&mut conn, handle, &budget, 10, at))
+            .collect();
+        assert_eq!(conn.flush_producer(handle, 0, at), 1);
+        let _ = transmitted(&mut conn);
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendError as i32,
+                send_error: Some(pb::CommandSendError {
+                    producer_id: handle.0,
+                    sequence_id: rejected[2].0,
+                    error: pb::ServerError::MetadataError as i32,
+                    message: "Messages must be encrypted".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        for seq in &rejected {
+            assert!(matches!(
+                conn.take_outcome(PendingOpKey::Send(handle, *seq)),
+                Some(OpOutcome::SendError { .. })
+            ));
+        }
+        assert_eq!(budget.used_bytes(), 0);
+
+        let next: Vec<_> = (0..2)
+            .map(|_| send(&mut conn, handle, &budget, 10, at))
+            .collect();
+        assert_eq!(
+            conn.flush_producer(handle, 0, at),
+            1,
+            "the next batch leaves"
+        );
+        let frames = transmitted(&mut conn);
+        let batch = frames
+            .iter()
+            .find_map(|c| c.send.as_ref())
+            .expect("the next batch left as one CommandSend");
+        assert_eq!(batch.sequence_id, next[0].0);
+        assert_eq!(batch.highest_sequence_id, Some(next[1].0));
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: next[0].0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 0,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: Some(next[1].0),
+                }),
+                ..Default::default()
+            },
+        );
+        for seq in &next {
+            assert!(
+                matches!(
+                    conn.take_outcome(PendingOpKey::Send(handle, *seq)),
+                    Some(OpOutcome::SendReceipt { .. })
+                ),
+                "{seq:?} of the next batch resolves on its receipt"
+            );
+        }
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]

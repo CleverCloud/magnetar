@@ -268,7 +268,9 @@ pub struct TxnClient {
     /// Wakers for in-flight `CommandEndTxn` requests.
     pending_end_txn: Slab<Waker>,
     end_txn_by_request: HashMap<RequestId, PendingEndTxn>,
-    /// Live transactions keyed by id.
+    /// Live transactions keyed by id: from the `CommandNewTxnResponse` that opens one until the
+    /// connection forgets it when the `CommandEndTxnResponse` that ends it has been handled
+    /// (see [`Self::forget`]).
     transactions: HashMap<TxnId, TransactionMetadata>,
 }
 
@@ -297,6 +299,14 @@ impl TxnClient {
     /// Look up an in-flight transaction by id (read-only).
     pub fn transaction(&self, id: TxnId) -> Option<&TransactionMetadata> {
         self.transactions.get(&id)
+    }
+
+    /// The transaction an in-flight `CommandEndTxn` request ends, or `None` when `request_id`
+    /// names no such request (never issued, or its response was already handled).
+    pub(crate) fn txn_being_ended(&self, request_id: RequestId) -> Option<TxnId> {
+        self.end_txn_by_request
+            .get(&request_id)
+            .map(|pending| pending.txn)
     }
 
     /// Number of currently-tracked transactions.
@@ -635,6 +645,11 @@ impl TxnClient {
 
     /// Drop a transaction from the local registry. The caller is responsible for ensuring the TC
     /// has been notified (via `end_txn`) — this is purely a memory hygiene operation.
+    ///
+    /// [`Connection`](crate::Connection) calls it once the broker has answered the transaction's
+    /// `CommandEndTxn`, whether the answer committed it, aborted it or refused it. The record is
+    /// read by nothing after that, and the connection outlives every reconnect, so a record kept
+    /// would stay for as long as the client runs.
     pub fn forget(&mut self, txn: TxnId) {
         self.transactions.remove(&txn);
     }

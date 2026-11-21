@@ -472,7 +472,7 @@ The full order is **global → per-slot → memory-limit waiters**.
         │                                     │    │                                     │
         │   state: parking_lot::Mutex<…>  ←── │    │   state: parking_lot::Mutex<…>  ←── │ per-slot mutex
         │     ─ pending: VecDeque<OpSend>     │    │     ─ queue: VecDeque<…>            │
-        │     ─ batch: BatchContainer         │    │     ─ receive_wakers: Slab<Waker>   │
+        │     ─ batch: BatchContainer         │    │     ─ receive_wakers: ParkedWakers  │
         │     ─ outbound: VecDeque<Frame>     │    │    ─ granted_permits, permit_balance│
         │     ─ name, epoch, stats, ...       │    │     ─ ack_tracker, paused, ...      │
         └─────────────────────────────────────┘    └─────────────────────────────────────┘
@@ -565,7 +565,9 @@ Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permi
 
 - **`granted_permits: u32`** — a purely ADDITIVE record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CommandCloseConsumer`).
   Bumped at the three grant sites (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth branch); never decremented by dispatch.
-  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`), `adjust_receiver_queue`'s want-have delta, and `Connection::initial_flow`'s once-per-attach guard (ADR-0102) all need exactly that, so all three read this field.
+  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`), `adjust_receiver_queue`'s churn-window guard, and `Connection::initial_flow`'s once-per-attach guard (ADR-0102) all need exactly that, so all three read this field.
+  It is not the size of the window the broker holds: every refill adds to it.
+  A growth tick sizes its grant against the window the broker holds, the previous target plus `window_surplus` (below), never against this field ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
 - **`permit_balance: u32`** — the client-accounted decrementing balance: grants recorded locally minus one unit per dispatch unit received. It is an estimate, not the broker's admin permit statistic.
   Incremented at the same three grant sites, by the identical delta.
   Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
@@ -574,6 +576,8 @@ Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permi
   It has one writer, `record_broker_permit_consumed`, and exactly four callers: `pop_message`, the incomplete-chunk buffer in `deliver`, `record_marker_consumed`, and `classify_and_queue`'s dead-letter branch.
   The rule they share is that a unit the broker charged is refunded the moment the client decides it will never be popped — which is `ConsumerImpl.messageReceived`'s `increaseAvailablePermits(cnx)` and `receiveIndividualMessagesFromBatch`'s `increaseAvailablePermits(cnx, skippedMessages)` ([ADR-0107](specs/adr/0107-refund-the-flow-permit-of-a-dead-lettered-dispatch-unit.md)).
   The resulting invariant on every frame path is `granted window == permit_balance + consumed_since_flow + queue.len()`: `Delivered` is refunded at pop, `Buffered` at buffering, `Dropped` moves neither side, and a position the broker never charged (an [ADR-0105](specs/adr/0105-read-the-delivered-batch-index-ack-set.md) cleared `ack_set` bit) moves neither side either.
+- **`window_surplus: u32`** — the permits the broker holds beyond `receiver_queue_size` because an `Auto` shrink lowered the target and granted permits cannot be taken back ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
+  A shrink adds the difference, `maybe_flow` retires owed `consumed_since_flow` units against it before granting the rest, a growth tick absorbs it before granting, and `initial_flow` zeroes it, so while the broker dispatches within its permits the granted window is `receiver_queue_size + window_surplus`.
 
 `flow_stats` feeds `permit_balance` — not `granted_permits` — into `FlowStats::available_permits`, the signal [`Auto::adjust`](../crates/magnetar-proto/src/receiver_queue.rs) uses to detect starvation.
 Before this split, the single additive field never registered a genuine dispatch-driven starvation (issue #349): `Auto` never scaled up under real load.
@@ -989,6 +993,9 @@ See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md) and [`do
 Owns the transaction-coordinator client.
 Pulsar transactions use four opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SUBSCRIPTION_TO_TXN`, `END_TXN_*`) routed to the TC.
 `TxnClient` carries the `TxnId` registry and surfaces a Rust `Transaction` handle.
+A transaction is in that registry from the `CommandNewTxnResponse` that opens it until the connection handles the `CommandEndTxnResponse` that ends it, committed, aborted or refused; the connection then forgets it, because the outcome handed to the caller already carries the final state and nothing reads the record again.
+The connection outlives every reconnect, so a record kept past that point would stay for as long as the client runs.
+A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, keeps its record, and `TxnClient` has no timeout or other policy to retire it.
 The producer attaches `txn_id` to its publish via `OutgoingMessage::txn`, and the consumer attaches it to acks via `ack_with_txn` / `ack_cumulative_with_txn` / `ack_batch_with_txn`.
 A `new_txn`, `add_partition_to_txn` or `add_subscription_to_txn` request is correlated by its request id like a lookup: the runtimes await it through the cancellable request future, and the response arms record an outcome only for a request still pending, so a caller that gives up leaves nothing for the broker's late reply to land in; that reply still reaches `TxnClient`, which records a registration the broker performed ([ADR-0129](specs/adr/0129-bound-and-fast-fail-pip-31-transaction-requests.md)).
 `Connection::reset` retires the client's per-request entries of every transaction request of the ended session, pending at the reset or cancelled before it (`TxnClient::forget_all_requests`), since the dead session answers none of them; an `EndTxn` outcome is still retained across a reset so a retried commit or abort resumes the canonical request, and that resume never reads the `TxnClient` entry ([ADR-0138](specs/adr/0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md)).
@@ -1139,6 +1146,7 @@ Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/prod
 - Sequence ids are assigned inside the chunk loop (Java `ProducerImpl.java:696-704`, `:745-753` — both first-send and resend paths; Apache Pulsar Java reference, external).
 - Resend reuses the original sequence id.
 - `last_sequence_id` and `last_sequence_id_published` are tracked separately so the runtime can drive resend-safe dedup.
+- `last_sequence_id_published` starts at `initial_sequence_id - 1` for a resumed producer and follows the receipts; the `last_sequence_id` of a `CommandProducerSuccess` (first attach and every re-attach) can only raise it, so a broker without deduplication state (`-1`) never erases the resume point or an acknowledged id.
 - Sequence id and request id are **monotonically non-decreasing** per connection per producer ([GUIDELINES.md §Protocol-correctness invariants point 4](GUIDELINES.md#protocol-correctness-invariants)).
 
 ---
@@ -1246,6 +1254,11 @@ It is also read on the way IN: a `CommandMessage` carrying `ack_set` is a re-dis
                                                   capped at max_delay).
 ```
 
+A positive ack releases the ids it names.
+A cumulative ack releases every tracked delivery it covers: each earlier `(ledger, entry)`, and in the horizon's own entry either every member (a horizon without a batch index) or the members up to and including the horizon's index (`UnackedMessageTracker::remove_through`, from `apply_local_ack_state`).
+The covered delivery is dropped from the ack-timeout buckets and from the per-message backoff deadlines alike; a delivery above the horizon stays tracked and is still redelivered when its window closes.
+`poll` reaps an expired bucket, empty or not, and rebuilds the id-to-bucket index whenever it reaped one, so a later ack still finds the bucket its id sits in.
+
 ### Negative-ack tracker
 
 ```text
@@ -1282,6 +1295,7 @@ It is also read on the way IN: a `CommandMessage` carrying `ack_set` is a re-dis
 `negative_ack` removes the nacked id from the `UnackedMessageTracker` **before** it touches the nack tracker, and does so unconditionally — on both the nack-tracker-present and nack-tracker-absent paths.
 Without that removal a message that is both nacked and ack-timeout tracked is redelivered twice: once when the nack delay elapses, once when the ack-timeout window elapses.
 The removal is symmetric with the positive-ack path, which already drops acked ids from both the unacked tracker and the nack tracker, and mirrors the Java client's `ConsumerImpl#negativeAcknowledge`.
+The positive-ack path is symmetric in the other direction too: an individual ack drops the acked id from both trackers, and a cumulative ack drops every id it covers from both (`NegativeAcksTracker::remove_through`) and, with `scalable-topics`, the complete ids parked beside them, so a message the application nacked and then acknowledged is not redelivered when the nack delay elapses.
 
 ### DLQ + retry-letter
 
@@ -1408,6 +1422,7 @@ The watcher keeps its id, so the deltas of the new session are still addressed t
 Nobody awaits that request, so its reply is consumed in place: no `OpOutcome` is recorded, no event is queued, and a refusal is logged and leaves the watcher owing a registration for the next rebuild.
 A registration the broker never answered is owed again after the next reset, and a rebuild is idempotent within a session.
 The topic list the broker returns is not forwarded, so a topic created or deleted while the connection was down is not reported to the pattern consumer; only later changes are.
+A `CommandWatchTopicListSuccess` is recorded as an outcome only while its request is still pending: a `topic_list_snapshot` future that was dropped or hit its operation deadline went through `Connection::cancel_request`, which removed the request and closed the watcher, so a reply that arrives afterwards is ignored instead of leaving the broker's whole topic list in `outcomes` for the life of the connection.
 Nothing deregisters a watcher (`CommandWatchTopicListClose` is never sent), so one lives as long as its connection and is registered again on every reconnect ([`docs/follow-ups.md`](docs/follow-ups.md) §31; [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
 
 ---
@@ -1544,6 +1559,7 @@ Before the broker publishes a controller URL, registration reuses only the alrea
 Explicit close through any clone is globally definitive for local routes, tasks, and children; final drop performs synchronous best-effort fencing without blocking or spawning. On GA, close marks in-flight registrations to leave after their subscribe responses arrive, then sends type-82 unsubscribe without waiting for its broker response; M1 retains connection-close cleanup behavior. A cancelled registration retains its fixed-size request record until its response or physical connection reset. These control-plane records are outside the aggregate receive budget, and the low-level connection API has no admission cap.
 
 The old drop-on-change event remains only on the raw diagnostic layout-session surface.
+When `Connection` rejects an unusable update on that surface or on a namespace or TC watch, it drops the watch locally and also stages the matching close command, so the broker stops pushing on it; a failure the broker reported leaves nothing to close ([ADR-0149](specs/adr/0149-close-a-scalable-topic-watch-the-client-rejects-at-the-broker.md)).
 The high-level aggregate reconciles DAG and assignment changes in place under the contracts above.
 See [ADR-0120](specs/adr/0120-assignment-driven-m1-hardened-stream-consumer.md); upstream ancestry, assignment-generation, and proxy-routing gaps remain explicit rather than being papered over by local fencing.
 
@@ -1781,6 +1797,7 @@ Supervised, the `Failed` state lasts only until `reset()`; unsupervised (the fa�
 User futures stay live across the migration.
 `Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots single and chunked operations and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
 A producer batch has one ranged wire frame but one `OpSend` per logical member and therefore no safe per-message replay frame; reset installs a deterministic `SendError` for every such operation before waking it, including after flush and before receipt ([ADR-0096](specs/adr/0096-reconnect-batch-and-durable-cursor-safety.md)).
+The broker's reply to that frame resolves the members together as well: a `CommandSendReceipt` fans out over the pending sends that lie in `[lowest, highest]` (found by one pass over the producer's own queue, `ProducerState::pending_sequence_ids_in`, so the broker-written `highest` never sets the cost), and a `CommandSendError`, which names only one member (the highest sequence id) and carries no range, fails every pending op that shares the named op's `OpSend::batch_lowest`, so no member of a rejected batch waits for the send timeout ([ADR-0145](specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md)).
 Consumer rebuild likewise distinguishes client hints from durable state: a never-attached or non-durable consumer keeps only its explicit initial position, while every established durable `CommandSubscribe` reattach omits `start_message_id` so the broker's persisted cursor is authoritative.
 No reattach uses a locally submitted ack because it is neither broker-confirmed nor necessarily contiguous ([ADR-0099](specs/adr/0099-nondurable-reattach-cursor-safety.md)).
 Because reset clears the session-local PIP-54 tracker, a later individual batch ack with valid coordinates reconstructs an all-unacked `BatchAckEntry` and clears only the requested index; missing state never degrades to a full-entry ack.
