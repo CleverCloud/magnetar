@@ -648,6 +648,11 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `max_wait` for the first message, then drains additional
     /// already-buffered messages without further waiting. Mirrors Java
     /// `Consumer#batchReceive`.
+    ///
+    /// A member after the first that fails post-processing (decryption under
+    /// `CryptoFailureAction::Fail`, decompression) ends the batch there without discarding the
+    /// messages already popped: they are returned in `Ok`, and the failure is returned by the
+    /// next `receive*` call on this consumer, ahead of every message still queued.
     fn receive_batch(&self, max_messages: usize, max_wait: Duration) -> ReceiveBatchFut<'_, Self>;
 
     /// Same as [`Self::receive_batch`] but stops once the accumulated

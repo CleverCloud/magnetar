@@ -23,6 +23,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A batched receive no longer drops the good messages it already popped when a later member fails.**
+  `Consumer::receive_batch` / `receive_batch_with_bytes_cap` take the first message through `receive()` and pop the rest under the connection lock into a local accumulator.
+  A member after the first that failed post-processing — decryption under the default `CryptoFailureAction::Fail`, a consumer with no decryptor, an unknown compression code, a decompress error — returned `Err` straight from that loop and dropped the accumulator, so up to `max_messages - 1` good messages were never shown, acked or nacked and stayed unacknowledged at the broker (with the default `ack_timeout` of `None`, until a reconnect), with no indication of which.
+  The batch now ends at the failing member and returns the good prefix in `Ok`; the failure is parked on the consumer, shared by every clone, and returned by the next `receive`, `receive_with_timeout` or `receive_batch*` call, ahead of every message still queued, so each failing message still yields exactly one error and arrival order is kept.
+  Parking the failure also wakes any `receive()` already parked on the empty queue, in the connection-lock section those futures read the parked failures and register their waker in, so a receive on another clone cannot sleep on a known failure until the next arrival.
+  The failing message itself is neither acked nor nacked, as for a failing `receive()`; `CryptoFailureAction::Discard` and `Consume` are unchanged, and a failure of the first message is still returned at once.
+  The tokio and moonpool runtimes behave identically, and `magnetar-proto` is untouched (no message is pushed back into its queue, so no flow permit is granted twice).
+  `TypedConsumer::receive_batch*` still returns the first schema-decode error of a batch and drops the members of that batch, as documented; only the post-processing failure of the runtime batch is covered here.
+
 - **The tokio supervisor closes a socket it abandoned instead of holding it open through the redial delay.**
   `supervised_driver_loop` lent its transport to `driver_loop_inner` as `&mut` and kept it in a local, so after an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable auth challenge, an undecodable frame, a write or handshake deadline) the peer was still alive and the stream stayed open, unread, through the anti-thrash cooldown, the backoff sleep and the dial, and was dropped only when the replacement was assigned.
   For that whole delay (up to `max_backoff` plus `connect_timeout`, 60 s plus the dial budget by default) the broker kept the connection and its producers and consumers registered, and kept dispatching to a client that no longer read.
