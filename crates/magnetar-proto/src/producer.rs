@@ -1694,6 +1694,21 @@ impl ProducerState {
         Some((op, mid))
     }
 
+    /// The sequence ids of the in-flight sends that lie in `[lowest, highest]`, oldest first.
+    ///
+    /// This is the fan-out set of a ranged `CommandSendReceipt`. The cost is one pass over the
+    /// producer's own pending queue, never the width of the range: `highest` is a number the
+    /// broker wrote, and walking it id by id would hold the connection mutex and the producer
+    /// slot lock for as long as the range is long. An id in the range that is not pending
+    /// (already resolved, or never sent) was skipped by the receipt anyway.
+    pub(crate) fn pending_sequence_ids_in(&self, lowest: u64, highest: u64) -> Vec<SequenceId> {
+        self.pending
+            .iter()
+            .map(|op| op.sequence_id)
+            .filter(|seq| (lowest..=highest).contains(&seq.0))
+            .collect()
+    }
+
     /// Apply a `CommandSendError` to the pending queue. Returns every removed op (its waker
     /// still parked on it) with the broker's error code and message, oldest first; the caller
     /// drops each op (releasing its memory reservation) after the per-slot lock is gone. Empty

@@ -2863,9 +2863,12 @@ impl Connection {
                             lowest
                         };
                         let mut resolved: Vec<(OpSend, MessageId)> = Vec::new();
-                        for seq in lowest..=highest {
+                        // Walk the producer's own in-flight sends inside the range, never the
+                        // range itself: `highest` is the broker's number, and counting up to it
+                        // would hold this mutex and the slot lock for as long as it is wide.
+                        for seq in producer.pending_sequence_ids_in(lowest, highest) {
                             let mut synth = receipt.clone();
-                            synth.sequence_id = seq;
+                            synth.sequence_id = seq.0;
                             synth.highest_sequence_id = None;
                             if let Some(tuple) = producer.apply_receipt(&synth, now) {
                                 resolved.push(tuple);

@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A `CommandSendReceipt` is now applied in time bounded by the producer's own in-flight sends, not by a number the broker wrote.**
+  The `SendReceipt` arm fanned a batch receipt out by counting `lowest..=highest` one sequence id at a time, with `highest` taken from the broker's `highest_sequence_id` and bounded only by `highest >= lowest` and `highest != u64::MAX` (the Java `-1` sentinel).
+  A receipt claiming a range far wider than anything the producer sent kept the thread in that loop for as long as the range was long, with the connection mutex and the producer slot lock both held, so every other operation of the client waited behind it and no timeout or heartbeat could fire on the same thread.
+  Only a non-conformant or hostile broker or proxy can send such a frame (TCP guarantees command-frame integrity in production, and the in-repo brokers echo a one-byte range), so the severity is low.
+  The arm now walks `ProducerState::pending_sequence_ids_in(lowest, highest)`, the pending sends whose id lies in the range, so the cost is the producer's in-flight count whatever the receipt claims; a genuine batch receipt still resolves every member it names, and an id in the range that is not pending was skipped before as well.
+  Both engines run the same `Connection` code and behave identically.
+  The new `ProducerState::pending_sequence_ids_in` is crate-private, so no public API changed.
+
 - **`CommandProducerSuccess` no longer moves `Producer::last_sequence_id_published` backwards.**
   `ProducerState::set_initial_sequence_id` stamps the counter with `initial_sequence_id - 1` so the producer reports its resume point until the first receipt, and `apply_receipt` advances it to the highest acknowledged id.
   The `CommandProducerSuccess` arm then overwrote it unconditionally with the broker's `last_sequence_id`, on the first attach and on every re-attach.
