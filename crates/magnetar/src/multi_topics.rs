@@ -91,10 +91,10 @@ struct Inner<C: ConsumerApi> {
     /// otherwise (default). Tracks one watched topic — the "base" topic used by a
     /// [`crate::PartitionedConsumer`] (the underlying surface). Aborts on drop.
     ///
-    /// The task uses [`tokio::task::JoinHandle`] + [`tokio::sync::Notify`]
-    /// directly — both engines (`TokioEngine`, `MoonpoolEngine<P>`) schedule
-    /// onto tokio under the hood (see `Engine::TaskHandle = tokio::task::JoinHandle`
-    /// in `engine.rs`), so this scaffolding is engine-invariant.
+    /// The task is spawned and paced through the client's [`crate::BackgroundApi`], so it
+    /// runs on the provider bundle the client was built over (the ambient Tokio runtime for
+    /// `TokioEngine`, the `TaskProvider` / `TimeProvider` for `MoonpoolEngine<P>`, ADR-0078)
+    /// and signals through a [`tokio::sync::Notify`].
     auto_update: Option<Arc<AutoUpdateTask>>,
 }
 
@@ -1444,7 +1444,7 @@ where
             // We do not have an initial partition count for the direct multi-topic
             // case (each topic was passed explicitly); seed with 0 so the first
             // refresh always logs a change.
-            spawn_auto_update_task(watched_topic, interval, 0)
+            spawn_auto_update_task(&self.client.inner, watched_topic, interval, 0)
         });
 
         Ok(MultiTopicsConsumer {

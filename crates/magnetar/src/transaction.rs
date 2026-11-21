@@ -66,8 +66,11 @@ impl From<Transaction> for magnetar_proto::TxnId {
 /// Outcome sink retained weakly by the client transaction coordinator.
 ///
 /// Implemented by a scalable aggregate's final user guard. Runtime tasks do not
-/// retain this guard, and stale weak participants disappear naturally after
-/// close/drop.
+/// retain this guard. A dropped participant stays in its transaction's entry as
+/// a dead `Weak` until the entry goes: `complete` removes the participants that
+/// accepted the outcome, `pending_participants` prunes the dead ones of an entry
+/// that is ended, and [`TransactionCoordinator::open`] reclaims an entry whose
+/// confirmed outcome only dead participants were left to receive.
 #[cfg(feature = "scalable-topics")]
 pub(crate) trait TransactionParticipant: Send + Sync {
     fn transaction_outcome(
@@ -120,8 +123,37 @@ impl Default for TransactionCoordinator {
 
 #[cfg(feature = "scalable-topics")]
 impl TransactionCoordinator {
+    /// Register a freshly opened transaction.
+    ///
+    /// This is also the coordinator's only sweep. A participant that refuses the outcome of a
+    /// confirmed transaction (it was closed while its handle was still alive) keeps the entry, so
+    /// the application can retry the end without a second `EndTxn`. Once every participant left
+    /// in such an entry is gone nothing can accept the outcome any more, and nothing else would
+    /// ever remove the entry, so it is reclaimed here. Only a `Committed` or `Aborted` gate
+    /// qualifies, with no end in flight: an open transaction with no live participant can still be
+    /// ended, and an `Unknown` one still needs its retry to reach the coordinator. A transaction
+    /// the application never ends is not reclaimed.
+    ///
+    /// The entry map's lock is taken before an entry's state lock, which is the only place both
+    /// are held; no path takes the map while holding a state.
     pub(crate) fn open(&self, txn_id: magnetar_proto::TxnId) {
-        self.entries.lock().insert(
+        let mut entries = self.entries.lock();
+        entries.retain(|_, entry| {
+            let state = entry.state.lock();
+            let outcome_confirmed = matches!(
+                state.gate.state(),
+                magnetar_proto::AggregateTransactionState::Committed
+                    | magnetar_proto::AggregateTransactionState::Aborted
+            );
+            let orphaned = outcome_confirmed
+                && !state.end_claimed
+                && state
+                    .participants
+                    .values()
+                    .all(|participant| participant.strong_count() == 0);
+            !orphaned
+        });
+        entries.insert(
             txn_id,
             Arc::new(TransactionEntry {
                 state: parking_lot::Mutex::new(TransactionEntryState {
@@ -687,6 +719,26 @@ mod tests {
         }
     }
 
+    /// Participant that refuses every outcome, as a scalable aggregate does once it is closing.
+    struct RefusingParticipant;
+
+    impl TransactionParticipant for RefusingParticipant {
+        fn transaction_outcome(
+            &self,
+            _txn_id: magnetar_proto::TxnId,
+            _outcome: crate::scalable::TransactionOutcome,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(), crate::scalable::StreamConsumerError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Err(crate::scalable::StreamConsumerError::Engine {
+                    engine: "test",
+                    message: "the participant is closed".to_owned(),
+                })
+            })
+        }
+    }
+
     /// Waker that counts how often it is woken.
     #[derive(Default)]
     struct CountingWake(AtomicUsize);
@@ -777,6 +829,83 @@ mod tests {
             },
             entry.state.lock().gate.state(),
             wake_counter.0.load(Ordering::SeqCst),
+        );
+    }
+
+    /// Whether the coordinator still holds an entry for `txn_id`.
+    fn holds_entry(coordinator: &TransactionCoordinator, txn_id: magnetar_proto::TxnId) -> bool {
+        coordinator.entries.lock().contains_key(&txn_id)
+    }
+
+    /// A participant that refuses the coordinator's outcome (it was closed while its handle was
+    /// still alive) keeps the entry of a confirmed transaction: the application can retry the
+    /// commit, which resumes without a second `EndTxn`. That retention is deliberate. It must end
+    /// with the participant: once its handle is dropped nothing can ever accept the outcome, and
+    /// the entry holds only a dead `Weak`, so the coordinator must reclaim it on its next
+    /// activity instead of keeping it for the life of the client (the trait documents that "stale
+    /// weak participants disappear naturally after close/drop").
+    #[tokio::test]
+    async fn entry_kept_for_a_refusing_participant_is_reclaimed_once_the_participant_is_dropped() {
+        let coordinator = TransactionCoordinator::default();
+        let refused = magnetar_proto::TxnId::new(1, 1);
+        coordinator.open(refused);
+        let participant: Arc<dyn TransactionParticipant> = Arc::new(RefusingParticipant);
+        coordinator
+            .admit(
+                refused,
+                coordinator.next_participant_id(),
+                Arc::downgrade(&participant),
+            )
+            .expect("an open transaction admits an acknowledgement")
+            .finish(true)
+            .expect("the admitted acknowledgement settles");
+        let preparation = coordinator
+            .prepare_commit(refused)
+            .await
+            .expect("the commit is issuable once nothing is pending");
+        let completed = coordinator
+            .complete(preparation, crate::scalable::TransactionOutcome::Committed)
+            .await;
+        assert!(
+            completed.is_err(),
+            "the closed participant refuses the committed outcome"
+        );
+        assert!(
+            holds_entry(&coordinator, refused),
+            "while the refusing participant is alive the entry stays, so a retry can finish the job"
+        );
+
+        // The participant's handle goes away: nothing can accept the outcome any more.
+        drop(participant);
+
+        // The coordinator's next activity, on a transaction that has nothing to do with it: open,
+        // acknowledge, commit, finalize.
+        let unrelated = magnetar_proto::TxnId::new(2, 2);
+        coordinator.open(unrelated);
+        let live: Arc<dyn TransactionParticipant> = Arc::new(IdleParticipant);
+        coordinator
+            .admit(
+                unrelated,
+                coordinator.next_participant_id(),
+                Arc::downgrade(&live),
+            )
+            .expect("an open transaction admits an acknowledgement")
+            .finish(true)
+            .expect("the admitted acknowledgement settles");
+        let preparation = coordinator
+            .prepare_commit(unrelated)
+            .await
+            .expect("the unrelated commit is issuable");
+        coordinator
+            .complete(preparation, crate::scalable::TransactionOutcome::Committed)
+            .await
+            .expect("the live participant accepts the outcome");
+
+        assert!(
+            !holds_entry(&coordinator, refused),
+            "the dead participant's entry must have been reclaimed, but the coordinator still \
+             holds {} entr(ies) for transaction(s) nobody can finish",
+            coordinator.entries.lock().len(),
         );
     }
 }

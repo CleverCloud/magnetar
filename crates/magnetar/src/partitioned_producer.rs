@@ -997,8 +997,14 @@ where
     // [`PartitionedProducer::refresh_partitions`] (the crate-wide
     // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime
     // into a `'static` spawn).
-    let auto_update = auto_update_partitions_interval
-        .map(|interval| spawn_auto_update_task(base_topic.clone(), interval, partitions_count));
+    let auto_update = auto_update_partitions_interval.map(|interval| {
+        spawn_auto_update_task(
+            &client.inner,
+            base_topic.clone(),
+            interval,
+            partitions_count,
+        )
+    });
 
     Ok(PartitionedProducer {
         partitions: child_producers,
@@ -1093,9 +1099,14 @@ impl PartitionedProducerBuilder<'_, TokioEngine> {
             }
         }
 
-        let auto_update = self
-            .auto_update_partitions_interval
-            .map(|interval| spawn_auto_update_task(self.topic.clone(), interval, partitions_count));
+        let auto_update = self.auto_update_partitions_interval.map(|interval| {
+            spawn_auto_update_task(
+                &self.client.inner,
+                self.topic.clone(),
+                interval,
+                partitions_count,
+            )
+        });
 
         Ok(PartitionedProducer {
             partitions: child_producers,

@@ -1,6 +1,6 @@
 # ADR-0120 — Adopt the assignment-driven M1-hardened scalable StreamConsumer
 
-- **Status**: Accepted
+- **Status**: Accepted — the client coordinator's retention of a confirmed transaction after a participant refused its outcome is amended by [ADR-0138](0138-forget-abandoned-transaction-requests-and-reclaim-unfinishable-coordinator-entries.md): the entry stays only while a participant that could still accept the outcome is alive. Everything else below remains binding.
 - **Date**: 2026-08-05
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, stream-consumer, assignment, ordering, flow-control, transactions, coverage
