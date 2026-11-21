@@ -8573,15 +8573,18 @@ impl Connection {
             .and_then(|slot| slot.state.lock().queue.front().map(|m| m.payload.len()))
     }
 
-    /// Register a per-consumer receive waker. Returns `Some(slab_key)` if the
-    /// consumer is alive (the caller MUST evict the slot via
+    /// Register a per-consumer receive waker. Returns `Some(key)` if the
+    /// consumer is alive (the caller MUST evict the entry via
     /// [`Self::cancel_consumer_receive_waker`] on drop), or `None` if the
     /// consumer has been closed in the meantime.
     ///
-    /// This is the per-consumer waker slab the runtime crates park
+    /// This is the per-consumer waker set the runtime crates park
     /// `receive()` futures on. Multiple in-flight receives on the same
-    /// consumer get independent slab slots and all fan out on message arrival
-    /// (see [`ConsumerState::register_receive_waker`]).
+    /// consumer get independent entries and all fan out on message arrival
+    /// (see [`ConsumerState::register_receive_waker`]). The key names this
+    /// registration alone: a drain does not free it for reuse, so a future
+    /// that cancels the key it held across a drain cannot evict another
+    /// future's entry.
     pub fn register_consumer_receive_waker(
         &mut self,
         handle: ConsumerHandle,
@@ -8593,7 +8596,7 @@ impl Connection {
 
     /// Evict a previously-registered per-consumer receive waker. Idempotent —
     /// safe to call from a `Drop` impl even if the consumer has been removed
-    /// or the slot already drained.
+    /// or the entry already drained.
     pub fn cancel_consumer_receive_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().cancel_receive_waker(slab_key);
@@ -8601,8 +8604,8 @@ impl Connection {
     }
 
     /// Register a per-consumer active-change waker (issue #348). Returns
-    /// `Some(slab_key)` if the consumer is alive (the caller MUST evict the
-    /// slot via [`Self::cancel_consumer_active_change_waker`] on drop), or
+    /// `Some(key)` if the consumer is alive (the caller MUST evict the
+    /// entry via [`Self::cancel_consumer_active_change_waker`] on drop), or
     /// `None` if the consumer has been closed in the meantime. Mirrors
     /// [`Self::register_consumer_receive_waker`].
     pub fn register_consumer_active_change_waker(

@@ -330,6 +330,64 @@ pub struct ShadowTopicMetadata {
     pub source_topic: String,
 }
 
+/// The wakers of the futures parked on one consumer (`receive()` and `next_active_change()`),
+/// keyed by a registration key that is never issued twice.
+///
+/// A message arrival, a close or a reset drains the WHOLE set, which frees every key it held, yet
+/// each woken future still carries the key it was given and cancels it on its next poll, after a
+/// successful pop and on `Drop`. Keys that a slab recycles (a drained `Slab` hands key `0` out
+/// again) let that stale cancel evict the waker of a different future that registered after the
+/// drain, and the evicted future's task is then never woken. A key from a counter that only moves
+/// forward can name one registration only, so cancelling it after a drain is a no-op and
+/// cancelling it twice is too. This is the same identity rule as
+/// [`MemoryWaiterId`](crate::memory_limit::MemoryWaiterId).
+///
+/// The counter is a `usize` so the key stays the `usize` the runtimes hold; it wraps instead of
+/// overflowing and cannot reach a registration that is still parked: it would take 2^64
+/// registrations on a 64-bit target, and every arrival drains the set long before 2^32 on a
+/// 32-bit one. The `BTreeMap` keeps wake order equal to registration order, which keeps the
+/// moonpool simulation reproducible per seed.
+///
+/// Reads (`len`, `is_empty`, `contains_key`, ...) are the map's own through
+/// [`Deref`](std::ops::Deref). Every mutation goes through [`Self::insert`], [`Self::remove`] and
+/// [`Self::drain`], so a key cannot be minted outside the counter and [`Self::drain`] never rewinds
+/// it.
+#[derive(Debug, Default)]
+pub struct ParkedWakers {
+    next_key: usize,
+    parked: std::collections::BTreeMap<usize, Waker>,
+}
+
+impl ParkedWakers {
+    /// Park `waker` and return the key that names this registration alone.
+    pub fn insert(&mut self, waker: Waker) -> usize {
+        let key = self.next_key;
+        self.next_key = key.wrapping_add(1);
+        self.parked.insert(key, waker);
+        key
+    }
+
+    /// Evict the registration `key` names, if it is still parked. Idempotent: a key that a drain
+    /// already took, or that was already removed, names nothing and is never reissued.
+    pub fn remove(&mut self, key: usize) {
+        self.parked.remove(&key);
+    }
+
+    /// Take every parked waker, oldest registration first, leaving the set empty. The key counter
+    /// is not rewound, so a key handed out before the drain is never handed out again.
+    pub fn drain(&mut self) -> std::collections::btree_map::IntoValues<usize, Waker> {
+        std::mem::take(&mut self.parked).into_values()
+    }
+}
+
+impl std::ops::Deref for ParkedWakers {
+    type Target = std::collections::BTreeMap<usize, Waker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parked
+    }
+}
+
 /// Per-consumer state.
 // reason: `closed` / `paused` / `reached_end_of_topic` /
 // `closed` / `paused` / `reached_end_of_topic` are orthogonal protocol axes
@@ -570,16 +628,18 @@ pub struct ConsumerState {
     /// future dropped between the reply and its continuation hand the re-attach to the
     /// connection ([`crate::Connection::abandon_consumer_seek_waiter`]).
     pub(crate) seek_reattach_owed: Option<RequestId>,
-    /// Per-consumer waker slab. Each in-flight `receive()` future registers a
+    /// Per-consumer waker set. Each in-flight `receive()` future registers a
     /// `Waker` here via [`Self::register_receive_waker`] and evicts it on `Drop`
     /// via [`Self::cancel_receive_waker`]. When a new message arrives (or the
     /// consumer is closed / has reached end-of-topic), every parked waker is
     /// drained and woken — this lets multiple concurrent receivers fan out
-    /// cleanly without one waker clobbering another.
+    /// cleanly without one waker clobbering another. A registration key is
+    /// never reissued (see [`ParkedWakers`]), so a woken future that cancels
+    /// the key it held across the drain cannot evict a later registration.
     ///
-    /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
+    /// Not a channel — a keyed `Waker` set is the canonical no-channel wake pattern
     /// (see [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
-    pub receive_wakers: Slab<Waker>,
+    pub receive_wakers: ParkedWakers,
     /// Reusable ordinary-close operation shared by every consumer clone.
     pub terminal_operation: ConsumerTerminalOperation,
     /// Reclaim this slot after the current close settles, once its owner releases it.
@@ -779,9 +839,10 @@ pub struct ConsumerState {
     /// future registers a `Waker` via [`Self::register_active_change_waker`]
     /// and evicts it on `Drop` via [`Self::cancel_active_change_waker`]; a
     /// new recorded transition (or a terminal close) drains and wakes every
-    /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
-    /// no-channel wake pattern (ADR-0003).
-    pub active_change_wakers: Slab<Waker>,
+    /// parked slot. Not a channel — a keyed `Waker` set is the canonical
+    /// no-channel wake pattern (ADR-0003). Keys are never reissued, for the same
+    /// reason as [`Self::receive_wakers`].
+    pub active_change_wakers: ParkedWakers,
 }
 
 /// One open silence window on a consumer that currently satisfies
@@ -1294,7 +1355,7 @@ impl ConsumerState {
             pending_seek: None,
             seek_rollback: None,
             seek_reattach_owed: None,
-            receive_wakers: Slab::new(),
+            receive_wakers: ParkedWakers::default(),
             terminal_operation: ConsumerTerminalOperation::Open,
             release_after_close: false,
             close_waiters: Slab::new(),
@@ -1338,7 +1399,7 @@ impl ConsumerState {
             shadow_metadata: None,
             is_active: None,
             active_changes: VecDeque::new(),
-            active_change_wakers: Slab::new(),
+            active_change_wakers: ParkedWakers::default(),
         }
     }
 
@@ -2848,23 +2909,25 @@ impl ConsumerState {
     }
 
     /// Register a waker that fires when a new message arrives, the consumer is
-    /// closed, or end-of-topic is signaled. Returns a slab key that the caller
-    /// MUST pass to [`Self::cancel_receive_waker`] if the future is dropped
-    /// before observing the wake — otherwise the slab leaks the entry until the
-    /// next drain.
+    /// closed, or end-of-topic is signaled. Returns a key that names this
+    /// registration alone and that the caller MUST pass to
+    /// [`Self::cancel_receive_waker`] if the future is dropped before observing
+    /// the wake — otherwise the set keeps the entry until the next drain.
     ///
     /// Multiple in-flight `receive()` futures on the same consumer register
-    /// independent slots; arrival drains all of them.
+    /// independent entries; arrival drains all of them. A drain does not free
+    /// its keys for reuse, so the key a woken future still holds can never name
+    /// a registration made after the drain.
     pub fn register_receive_waker(&mut self, waker: Waker) -> usize {
         self.receive_wakers.insert(waker)
     }
 
-    /// Evict a previously-registered receive waker. Idempotent — a missing slot
-    /// is a no-op (a concurrent wake may already have drained it).
+    /// Evict a previously-registered receive waker. Idempotent — a key whose
+    /// entry is gone is a no-op (a concurrent wake may already have drained
+    /// it), and it can never evict another future's entry because a key is
+    /// never reissued.
     pub fn cancel_receive_waker(&mut self, slab_key: usize) {
-        if self.receive_wakers.contains(slab_key) {
-            self.receive_wakers.remove(slab_key);
-        }
+        self.receive_wakers.remove(slab_key);
     }
 
     /// Return the reusable ordinary-close completion, if it has landed.
@@ -2947,21 +3010,21 @@ impl ConsumerState {
     }
 
     /// Register a waker that fires when a new active-change transition is
-    /// recorded or the consumer reaches a terminal state. Returns a slab key
-    /// the caller MUST pass to [`Self::cancel_active_change_waker`] if the
+    /// recorded or the consumer reaches a terminal state. Returns a key that
+    /// names this registration alone, which the caller MUST pass to
+    /// [`Self::cancel_active_change_waker`] if the
     /// future is dropped before observing the wake. Mirrors
     /// [`Self::register_receive_waker`].
     pub fn register_active_change_waker(&mut self, waker: Waker) -> usize {
         self.active_change_wakers.insert(waker)
     }
 
-    /// Evict a previously-registered active-change waker. Idempotent — a
-    /// missing slot is a no-op (a concurrent wake may already have drained
-    /// it). Mirrors [`Self::cancel_receive_waker`].
+    /// Evict a previously-registered active-change waker. Idempotent — a key
+    /// whose entry is gone is a no-op (a concurrent wake may already have
+    /// drained it) and never evicts another future's entry. Mirrors
+    /// [`Self::cancel_receive_waker`].
     pub fn cancel_active_change_waker(&mut self, slab_key: usize) {
-        if self.active_change_wakers.contains(slab_key) {
-            self.active_change_wakers.remove(slab_key);
-        }
+        self.active_change_wakers.remove(slab_key);
     }
 
     /// Drain every parked active-change waker and wake it. Mirrors
@@ -5431,6 +5494,38 @@ mod tests {
         // Subsequent cancel of already-drained keys is idempotent.
         c.cancel_receive_waker(k1);
         c.cancel_receive_waker(k2);
+    }
+
+    #[test]
+    fn a_receive_waker_key_is_never_reissued_and_cancelling_it_twice_keeps_one_entry_per_waker() {
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let (w1, count1) = counting_waker();
+        let k1 = c.register_receive_waker(w1);
+        c.close();
+        assert_eq!(count1.0.load(Ordering::SeqCst), 1);
+        assert_eq!(c.receive_wakers.len(), 0, "the drain took the waker");
+
+        // A registration made after the drain does not receive the drained key.
+        let (w2, count2) = counting_waker();
+        let k2 = c.register_receive_waker(w2);
+        assert_ne!(k1, k2, "a drained key is not handed out again");
+
+        // The stale key, cancelled twice, names nothing and leaves the later waker parked.
+        c.cancel_receive_waker(k1);
+        c.cancel_receive_waker(k1);
+        assert_eq!(c.receive_wakers.len(), 1);
+
+        // Cancelling the live key twice removes its one entry and nothing else.
+        let (w3, _count3) = counting_waker();
+        let k3 = c.register_receive_waker(w3);
+        c.cancel_receive_waker(k2);
+        c.cancel_receive_waker(k2);
+        assert_eq!(c.receive_wakers.len(), 1);
+        c.cancel_receive_waker(k3);
+        assert_eq!(c.receive_wakers.len(), 0);
+        assert_eq!(count2.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

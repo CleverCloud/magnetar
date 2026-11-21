@@ -33,6 +33,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A `receive()` or `next_active_change()` woken after a sibling already resolved no longer evicts the sibling's new waker.**
+  `ConsumerState` parked every in-flight `receive()` on a `Slab<Waker>` and handed the future the raw slab key; a message arrival, a close or a reset drains the whole slab, and `Slab::drain` rewinds its next key to `0`, so the first registration after a drain received key `0` again while every woken future still held the key it was given before.
+  `cancel_receive_waker` removed whatever occupied a key, and `ReceiveFut::poll` cancels its stored key on an empty re-poll, after a successful pop and on `Drop`: with two concurrent `receive()` calls on clones of one consumer, a woken future that polled after its sibling had popped the message and started a new `receive()` removed that new waker.
+  The next arrival then woke only the evictor, and the sibling's task stayed parked for good (for the life of the consumer, once the evictor stopped receiving) while messages sat in the queue.
+  `next_active_change()` parks on the mirrored `active_change_wakers` slab and had the same eviction.
+  Both sets are now a `ParkedWakers`, keys from a counter that only moves forward (the rule ADR-0111 gave the client-wide memory waiters), so a drained key is never handed out again and cancelling it, once or twice, removes nothing ([ADR-0148](specs/adr/0148-never-reissue-a-consumer-waker-registration-key.md)).
+  Both engines run the same `Connection` code and behave identically; the key is still a `usize`, so `register_consumer_receive_waker`, `cancel_consumer_receive_waker` and their active-change twins keep their signatures.
+  `ConsumerState::receive_wakers` and `active_change_wakers`, public fields, change type from `Slab<Waker>` to the new `magnetar_proto::consumer::ParkedWakers`, which keeps `len`, `is_empty` and `drain` and drops the `Slab`-only methods.
+
 - **An `Auto` consumer that has been through a few windows of messages is no longer left unable to refill after its target grows.**
   `adjust_receiver_queue` sized a growth grant as `new_target - granted_permits`, and `granted_permits` is the cumulative grant record: every `maybe_flow` refill adds to it, so after a few windows of pops it exceeds the window the broker holds.
   A growth tick then saturated to a zero delta and emitted no `CommandFlow`, while the target and the refill threshold (`target / 2`) rose anyway.

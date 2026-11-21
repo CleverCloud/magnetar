@@ -472,7 +472,7 @@ The full order is **global → per-slot → memory-limit waiters**.
         │                                     │    │                                     │
         │   state: parking_lot::Mutex<…>  ←── │    │   state: parking_lot::Mutex<…>  ←── │ per-slot mutex
         │     ─ pending: VecDeque<OpSend>     │    │     ─ queue: VecDeque<…>            │
-        │     ─ batch: BatchContainer         │    │     ─ receive_wakers: Slab<Waker>   │
+        │     ─ batch: BatchContainer         │    │     ─ receive_wakers: ParkedWakers  │
         │     ─ outbound: VecDeque<Frame>     │    │    ─ granted_permits, permit_balance│
         │     ─ name, epoch, stats, ...       │    │     ─ ack_tracker, paused, ...      │
         └─────────────────────────────────────┘    └─────────────────────────────────────┘
