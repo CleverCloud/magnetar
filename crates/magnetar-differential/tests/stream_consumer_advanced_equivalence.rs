@@ -7499,3 +7499,157 @@ async fn delivery_authority_budget_failure_is_atomic_and_equivalent() {
     client.close().await;
     assert_eq!(tokio, moonpool);
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResyncedCommitTrace {
+    resync_reason_decompress: bool,
+    committed: bool,
+    committed_outcome_event: bool,
+    after_close: ResourceCounts,
+}
+
+/// A transaction acknowledges a delivery, then a malformed delivery resynchronizes the aggregate,
+/// retiring every authority admitted before it. The child closes are held, so the aggregate stays
+/// fenced and the coordinator session stays live while the transaction commits. The runtime still
+/// holds the retired authority, so the commit must report its outcome instead of failing on an
+/// authority that has nothing left to settle.
+async fn observe_commit_while_the_aggregate_is_fenced<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> ResyncedCommitTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("fenced-commit-sub")
+        .consumer_name("fenced-commit-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe fenced-commit aggregate");
+    cluster
+        .wait_for("fenced-commit children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"fenced-commit")))
+        .expect("enqueue fenced-commit participant");
+    cluster
+        .wait_for("fenced-commit participant delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let message = receive(&consumer).await;
+    let transaction = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open fenced-commit transaction");
+    consumer
+        .acknowledge_in_transaction(&message, transaction)
+        .await
+        .expect("admit the acknowledgement that the resynchronization retires");
+
+    cluster
+        .update(|fake| {
+            for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+                fake.script_next(endpoint, OperationKind::Close, ScriptedBehavior::Delay)?;
+            }
+            fake.enqueue_message_with_metadata(
+                1,
+                magnetar::proto::pb::MessageMetadata {
+                    compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                    uncompressed_size: Some(4),
+                    ..Default::default()
+                },
+                snappy(b"fenced-commit"),
+                Vec::new(),
+            )
+        })
+        .expect("enqueue the malformed delivery that resynchronizes the aggregate");
+    let resync_reason_decompress = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason } => break reason.contains("decompress"),
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected fenced-commit event: {unexpected:?}"),
+        }
+    };
+    cluster
+        .wait_for("held fenced-commit child close", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::Close)
+        })
+        .await;
+    assert_eq!(
+        consumer.status().phase(),
+        magnetar::proto::AggregatePhase::ResyncRequired
+    );
+
+    let committed = client
+        .commit_transaction(transaction)
+        .await
+        .expect("commit while the aggregate is fenced")
+        == magnetar::TxnState::Committed;
+    let mut committed_outcome_event = false;
+    while !committed_outcome_event {
+        if let StreamConsumerEvent::TransactionOutcome {
+            txn_id,
+            outcome: magnetar::scalable::TransactionOutcome::Committed,
+        } = next_event(&consumer).await
+        {
+            committed_outcome_event = txn_id == transaction.id();
+        }
+    }
+    for _ in 0..2 {
+        cluster
+            .wait_for("held fenced-commit child close", |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::Close)
+            })
+            .await;
+        let pending = cluster
+            .inspect(|fake| {
+                fake.pending_operations()
+                    .into_iter()
+                    .find(|pending| pending.kind == OperationKind::Close)
+                    .map(|pending| pending.id)
+            })
+            .expect("held fenced-commit child close id");
+        cluster
+            .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+            .expect("release the held fenced-commit child close");
+    }
+    ResyncedCommitTrace {
+        resync_reason_decompress,
+        committed,
+        committed_outcome_event,
+        after_close: close_and_count(consumer, cluster).await,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_while_the_aggregate_is_fenced_is_reported_equivalently() {
+    let _guard = advanced_socket_test_guard();
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let tokio = observe_commit_while_the_aggregate_is_fenced(&client, &cluster).await;
+    client.close().await;
+    drop(cluster);
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let moonpool = observe_commit_while_the_aggregate_is_fenced(&client, &cluster).await;
+    client.close().await;
+    assert_eq!(tokio, moonpool);
+    assert!(tokio.resync_reason_decompress);
+    assert!(tokio.committed);
+    assert!(tokio.committed_outcome_event);
+}

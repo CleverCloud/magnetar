@@ -76,6 +76,24 @@ fn reopen_error_is_terminal(error: &StreamConsumerError) -> bool {
     matches!(error, StreamConsumerError::Client(client) if control_plane_error_is_terminal(client))
 }
 
+/// Whether the model refused a retained transaction authority because a resynchronization
+/// retired it.
+///
+/// A resynchronization fences the aggregate and replaces its delivery epoch, so every authority
+/// admitted before it is refused: as `InvalidAggregatePhase` in the fenced `ResyncRequired`
+/// phase, and as `StaleAcknowledgementAuthority` once the aggregate reconnected. Such an
+/// authority has nothing left to settle, which is not a failure of the transaction outcome.
+/// Any other phase, a closing aggregate's included, is a failure.
+fn authority_is_retired(error: &magnetar_proto::StreamConsumerModelError) -> bool {
+    matches!(
+        error,
+        magnetar_proto::StreamConsumerModelError::StaleAcknowledgementAuthority
+            | magnetar_proto::StreamConsumerModelError::InvalidAggregatePhase {
+                phase: magnetar_proto::AggregatePhase::ResyncRequired,
+            }
+    )
+}
+
 /// Complete runtime configuration for one assignment-driven aggregate.
 #[derive(Debug, Clone)]
 pub struct StreamConsumerOptions {
@@ -2825,11 +2843,16 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                     } else {
                         let mut actions = Vec::new();
                         for authority in authorities {
-                            actions.extend(
-                                state
-                                    .model
-                                    .settle_transactional_acknowledgement(&authority, outcome)?,
-                            );
+                            let settled = state
+                                .model
+                                .settle_transactional_acknowledgement(&authority, outcome);
+                            // The list outlives a resynchronization, so a retired
+                            // authority can sit ahead of live ones: skip it and
+                            // keep settling the rest.
+                            if matches!(&settled, Err(error) if authority_is_retired(error)) {
+                                continue;
+                            }
+                            actions.extend(settled?);
                         }
                         actions
                     };
@@ -9240,6 +9263,265 @@ mod tests {
             0,
             "an unknown outcome must discard the deliveries queued for the closed children"
         );
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_completes_while_the_aggregate_is_fenced() {
+        // A commit that lands between a resynchronization and the replacement
+        // baseline finds the aggregate fenced, so every retained authority is
+        // refused by the model. The outcome must still be reported once: a
+        // fenced authority has nothing left to settle and is not a failure.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let fenced = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(fenced);
+        }
+        inner.request_resync("test resynchronization".to_owned());
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        for task in tasks {
+            task.join().await.expect("resynchronization close joins");
+        }
+        assert_eq!(
+            inner.state.lock().model.phase(),
+            magnetar_proto::AggregatePhase::ResyncRequired
+        );
+
+        let result = inner
+            .transaction_outcome(
+                txn_id,
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await;
+        let reported = inner
+            .state
+            .lock()
+            .events
+            .iter()
+            .filter(|event| matches!(event, StreamConsumerEvent::TransactionOutcome { .. }))
+            .count();
+        assert_eq!(
+            reported, 1,
+            "the commit of a fenced authority must be reported (result: {result:?})"
+        );
+        result.expect("a fenced authority must not fail the commit propagation");
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_after_the_model_began_closing_is_not_reported() {
+        // Only a resynchronization retires an authority. The aggregate's own
+        // close() empties the per-transaction list in the step that moves the
+        // model to Closing, so this state is built by hand: the model is
+        // Closing and an authority is still listed. The skip must refuse it
+        // rather than treat every aggregate phase as retired.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let authority = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(authority);
+            state.model.close().expect("the model begins closing");
+            assert_eq!(state.model.phase(), magnetar_proto::AggregatePhase::Closing);
+        }
+
+        let result = inner
+            .transaction_outcome(
+                txn_id,
+                magnetar_proto::TransactionAcknowledgementOutcome::Committed,
+            )
+            .await;
+        let reported = inner
+            .state
+            .lock()
+            .events
+            .iter()
+            .filter(|event| matches!(event, StreamConsumerEvent::TransactionOutcome { .. }))
+            .count();
+        assert_eq!(
+            reported, 0,
+            "a closing aggregate must not report the commit as settled (result: {result:?})"
+        );
+        assert!(
+            matches!(&result, Err(StreamConsumerError::Failed(message)) if message.contains("Closing")),
+            "the closing phase must fail the commit propagation, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_outcome_settles_live_authorities_behind_a_stale_one() {
+        // A resynchronization between two acknowledgements of one transaction
+        // retires the first authority (its delivery epoch is gone) but leaves
+        // it in the runtime's per-transaction list, ahead of the authority
+        // admitted after the reconnect. Propagating the commit must skip the
+        // fenced authority and still settle the live one; it must not drop the
+        // whole list and stop at the first stale entry.
+        let inner = aggregate_inner_with_two_messages();
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let txn_id = magnetar_proto::TxnId::new(7, 11);
+
+        let first = consumer.receive().await.expect("first delivery");
+        {
+            let mut state = inner.state.lock();
+            let retired = state
+                .model
+                .admit_individual_transactional_acknowledgement(&first.token)
+                .expect("first acknowledgement is admitted at the current epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(retired);
+        }
+
+        // Resynchronize: the model fences every authority and the close task
+        // confirms the child, as a broker-side child failure would.
+        inner.request_resync("test resynchronization".to_owned());
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        for task in tasks {
+            task.join().await.expect("resynchronization close joins");
+        }
+
+        // Reconnect: a replacement incarnation reopens the child and delivers
+        // a message of the new delivery epoch.
+        let (snapshot, assignment) = control_plane_fixture();
+        let source = assignment.segments()[0].source();
+        {
+            let mut state = inner.state.lock();
+            let open = state
+                .model
+                .apply_reconnect_baseline(
+                    magnetar_proto::ControllerIncarnation(2),
+                    snapshot,
+                    assignment,
+                )
+                .expect("replacement baseline");
+            let generation = open
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::OpenChild {
+                        child_generation, ..
+                    } => Some(*child_generation),
+                    _ => None,
+                })
+                .expect("replacement child open action");
+            let flow = state
+                .model
+                .child_opened(source.segment_id(), generation)
+                .expect("replacement child opened");
+            let reservation = flow
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::GrantFlow { reservation, .. } => {
+                        Some(*reservation)
+                    }
+                    _ => None,
+                })
+                .expect("replacement flow grant");
+            let message = magnetar_proto::IncomingMessage {
+                message_id: magnetar_proto::MessageId {
+                    ledger_id: 1,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                },
+                metadata: Arc::new(magnetar_proto::pb::MessageMetadata::default()),
+                single_metadata: None,
+                payload: bytes::Bytes::from_static(b"data"),
+                redelivery_count: 0,
+                broker_entry_metadata: None,
+                arrived_at: std::time::Instant::now(),
+            };
+            let transition = state
+                .model
+                .message_arrived(
+                    source.segment_id(),
+                    generation,
+                    reservation,
+                    message.retained_bytes(),
+                )
+                .expect("replacement message retained");
+            let message_id_data = message.message_id.to_pb();
+            state.queue.push_back(QueuedMessage {
+                source: source.clone(),
+                generation,
+                message,
+                delivery: QueuedDelivery::Fresh {
+                    reservation: transition.retained,
+                    message_id_data,
+                },
+            });
+        }
+        let second = consumer.receive().await.expect("replacement delivery");
+        {
+            let mut state = inner.state.lock();
+            let live = state
+                .model
+                .admit_individual_transactional_acknowledgement(&second.token)
+                .expect("replacement acknowledgement is admitted at the new epoch")
+                .authority;
+            state
+                .pending_transactions
+                .entry(txn_id)
+                .or_default()
+                .push(live);
+        }
+
+        // The application commits; the retry is what the facade would not do,
+        // so a lost authority cannot be recovered by it.
+        let committed = magnetar_proto::TransactionAcknowledgementOutcome::Committed;
+        let first_result = inner.transaction_outcome(txn_id, committed).await;
+        let retry_result = inner.transaction_outcome(txn_id, committed).await;
+
+        // Committing settles the live authority and so resolves its delivery
+        // lease: the replacement token is gone, not still pending.
+        let probe = inner
+            .state
+            .lock()
+            .model
+            .clone()
+            .admit_individual_transactional_acknowledgement(&second.token);
+        assert!(
+            matches!(
+                probe,
+                Err(magnetar_proto::StreamConsumerModelError::StaleDeliveryToken)
+            ),
+            "the live authority behind a stale one must be settled by the commit \
+             (first call: {first_result:?}, retry: {retry_result:?}), but the replacement \
+             delivery is still held: {probe:?}"
+        );
+        first_result.expect("a stale authority must not fail the commit propagation");
+        retry_result.expect("a retry after propagation succeeds");
     }
 
     #[tokio::test]

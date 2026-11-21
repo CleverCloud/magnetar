@@ -8371,6 +8371,84 @@ mod tests {
     }
 
     #[test]
+    fn transactional_authority_retired_by_resync_is_refused_until_a_live_one_settles() {
+        // The runtimes keep every transactional authority of one transaction in a list that
+        // outlives a resynchronization and skip exactly these two refusals, so that a
+        // retired authority cannot hide the live one admitted behind it.
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let retired = model
+            .admit_individual_transactional_acknowledgement(&token)
+            .expect("admit the acknowledgement that the resynchronization retires")
+            .authority;
+        model.require_resync().expect("enter resync");
+        assert_eq!(
+            model.settle_transactional_acknowledgement(
+                &retired,
+                TransactionAcknowledgementOutcome::Committed
+            ),
+            Err(StreamConsumerModelError::InvalidAggregatePhase {
+                phase: AggregatePhase::ResyncRequired,
+            }),
+            "a fenced aggregate refuses the retired authority"
+        );
+
+        model
+            .child_closed(SegmentId(1), generation)
+            .expect("close confirmation");
+        model
+            .begin_controller_incarnation(ControllerIncarnation(4))
+            .expect("new controller incarnation");
+        let reopen = model
+            .apply_assignment_for(ControllerIncarnation(4), assignment(1, &[1]))
+            .expect("replacement baseline");
+        let replacement = opened_generation(&reopen[0]);
+        let replacement_flow = model
+            .child_opened(SegmentId(1), replacement)
+            .expect("replacement open");
+        let (replacement_token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            replacement,
+            flow_reservation(&replacement_flow),
+            6,
+        );
+        let live = model
+            .admit_individual_transactional_acknowledgement(&replacement_token)
+            .expect("admit the acknowledgement of the replacement epoch")
+            .authority;
+        assert_eq!(
+            model.settle_transactional_acknowledgement(
+                &retired,
+                TransactionAcknowledgementOutcome::Committed
+            ),
+            Err(StreamConsumerModelError::StaleAcknowledgementAuthority),
+            "a reopened aggregate refuses the authority of the previous delivery epoch"
+        );
+        model
+            .settle_transactional_acknowledgement(
+                &live,
+                TransactionAcknowledgementOutcome::Committed,
+            )
+            .expect("the authority of the replacement epoch still settles");
+        assert_eq!(
+            model.resolve_delivery(&replacement_token),
+            Err(StreamConsumerModelError::StaleDeliveryToken)
+        );
+    }
+
+    #[test]
     fn failure_resync_generation_exhaustion_is_atomic() {
         let mut model = model(OrderingMode::BrokerManaged);
         model.delivery_epoch = DeliveryEpoch(u64::MAX);
