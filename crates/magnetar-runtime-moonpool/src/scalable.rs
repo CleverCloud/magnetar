@@ -2940,15 +2940,34 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
         self.execute_actions(actions).await
     }
 
+    /// Re-resolve the closed DAG watch and align it with the controller assignment.
+    ///
+    /// The alignment waits for the broker to push the epoch the other side is missing, so it
+    /// races the aggregate's close like the alignment of `reconnect_control_plane`: close
+    /// removes the controller registration, so no assignment push can ever complete that wait.
+    /// `Ok(None)` means the aggregate began closing while the alignment waited: the replacement
+    /// is dropped, which releases it, and the caller ends the control task.
     async fn reopen_dag_watch(
         self: &Arc<Self>,
         controller: &mut ControllerSession,
-    ) -> Result<DagSession, StreamConsumerError> {
+    ) -> Result<Option<DagSession>, StreamConsumerError> {
         let mut replacement = self.subscriber.open_dag_session(&self.topic).await?;
-        SegmentSubscriber::<P>::align_control_plane(&mut replacement, controller).await?;
+        let aligned = {
+            let alignment =
+                SegmentSubscriber::<P>::align_control_plane(&mut replacement, controller);
+            let mut alignment = std::pin::pin!(alignment);
+            let closing = self.wait_for_close();
+            let mut closing = std::pin::pin!(closing);
+            moonpool_core::select! {
+                biased;
+                () = &mut closing => return Ok(None),
+                result = &mut alignment => result,
+            }
+        };
+        aligned?;
         self.apply_aligned_control_plane(&replacement, controller)
             .await?;
-        Ok(replacement)
+        Ok(Some(replacement))
     }
 
     async fn control_loop(self: Arc<Self>, mut dag: DagSession, mut controller: ControllerSession) {
@@ -3012,11 +3031,12 @@ impl<P: Providers + Send + Sync + 'static> StreamConsumerInner<P> {
                         reason: reason.unwrap_or_else(|| "scalable DAG watch closed".to_owned()),
                     });
                     match self.reopen_dag_watch(&mut controller).await {
-                        Ok(replacement) => {
+                        Ok(Some(replacement)) => {
                             let previous = core::mem::replace(&mut dag, replacement);
                             previous.close();
                             self.push_assignment_event(controller.assignment());
                         }
+                        Ok(None) => break,
                         Err(error) if reopen_error_is_terminal(&error) => {
                             self.fail_closed(error.to_string());
                             break;
@@ -7230,6 +7250,125 @@ mod tests {
         assert!(
             second_lookup.is_some_and(|session_id| session_id != first_lookup),
             "the rejected replacement lookup is retried with a further lookup"
+        );
+    }
+
+    /// Park a spawned (so `close` joins it) control task inside the epoch alignment of a
+    /// replacement DAG watch: the live watch closes, the replacement baseline is at layout
+    /// epoch 2 and the controller assignment stays at layout epoch 1, so the alignment waits for
+    /// an assignment push that nothing sends.
+    async fn aggregate_parked_in_dag_reopen_alignment()
+    -> Arc<StreamConsumerInner<moonpool_core::TokioProviders>> {
+        let inner = empty_aggregate_inner();
+        let shared = inner.subscriber.bootstrap.clone();
+        connect_shared(&shared);
+        let (snapshot, assignment) = control_plane_fixture();
+        let epoch = shared.inner.lock().session_epoch();
+        let dag = DagSession {
+            shared: shared.clone(),
+            route: claim_dag(&shared, 81),
+            session_id: 81,
+            requested_topic: "topic://public/default/scaled".to_owned(),
+            resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+            controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+            controller_broker_url_tls: None,
+            snapshot,
+            closed: true,
+        };
+        let controller = ControllerSession {
+            leave_on_drop: true,
+            cleanup_candidates: Vec::new(),
+            shared: shared.clone(),
+            route: shared.scalable_routes.claim_at_epoch(
+                shared.clone(),
+                ScalableRouteKey::consumer(42, magnetar_proto::ControllerIncarnation(1)),
+                epoch,
+            ),
+            consumer_id: 42,
+            incarnation: magnetar_proto::ControllerIncarnation(1),
+            assignment,
+            registration_topic: "topic://public/default/scaled".to_owned(),
+            subscription: "workers".to_owned(),
+            consumer_name: "worker-a".to_owned(),
+        };
+        inner.spawn_control_task(dag, controller);
+
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::DagWatchClosed {
+                    session_id: 81,
+                    reason: Some("DAG watch moved".to_owned()),
+                })
+                .is_none()
+        );
+        let lookup = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(session_id) = staged_dag_lookup_session(&shared) {
+                    return session_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the closed DAG watch is re-resolved");
+        let replacement = control_plane_fixture_at(2).0;
+        assert!(
+            shared
+                .scalable_routes
+                .publish(ScalableEvent::LookupResolved {
+                    session_id: lookup,
+                    resolved_topic_name: Some("topic://public/default/scaled".to_owned()),
+                    controller_broker_url: Some("pulsar://allowed.example:6650".to_owned()),
+                    controller_broker_url_tls: None,
+                    segments: replacement.segments(),
+                    epoch: 2,
+                    snapshot: replacement,
+                })
+                .is_none()
+        );
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        inner
+    }
+
+    #[tokio::test]
+    async fn close_is_not_blocked_by_the_epoch_alignment_of_a_replacement_dag_watch() {
+        let inner = aggregate_parked_in_dag_reopen_alignment().await;
+
+        // Half the fixture's one-second `operation_timeout`: close must interrupt the alignment,
+        // not merely outlast its deadline.
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inner.close()).await;
+
+        assert!(
+            closed.is_ok(),
+            "close() must interrupt the replacement DAG watch's epoch alignment: the \
+             control task is parked on an assignment push that nothing can send, and close \
+             joins it"
+        );
+        closed.expect("close finished").expect("close succeeds");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_aggregate_releases_a_replacement_dag_watch_alignment() {
+        let inner = aggregate_parked_in_dag_reopen_alignment().await;
+
+        inner.close_best_effort();
+        let tasks = core::mem::take(&mut inner.state.lock().tasks);
+        // Half the fixture's one-second `operation_timeout`, as in the close test above.
+        let released = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            for task in tasks {
+                let _ = task.join().await;
+            }
+        })
+        .await;
+
+        assert!(
+            released.is_ok(),
+            "a fenced aggregate must not keep its control task parked in the epoch alignment \
+             of a replacement DAG watch, holding the DAG session and the controller route"
         );
     }
 

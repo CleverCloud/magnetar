@@ -345,6 +345,14 @@ struct MalformedDeliveryTrace {
     after_close: Vec<ResourceCounts>,
 }
 
+/// How the parked replacement DAG watch of `observe_dag_watch_recovery` is ended: the broker
+/// drops the controller connection, or the application closes the aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DagReopenAlignmentExit {
+    Disconnect,
+    Close,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct DagWatchRecoveryTrace {
@@ -5712,6 +5720,7 @@ async fn run_moonpool_malformed_delivery() -> MalformedDeliveryTrace {
 async fn observe_dag_watch_recovery<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
+    exit: DagReopenAlignmentExit,
 ) -> DagWatchRecoveryTrace
 where
     E: Engine,
@@ -5847,6 +5856,22 @@ where
         .await;
     assert_eq!(cluster.inspect(M1FakeCluster::layout_epoch), 2);
     assert_eq!(consumer.status().layout_epoch(), Some(1));
+    if exit == DagReopenAlignmentExit::Close {
+        // The control task is parked in the epoch alignment of the replacement watch, waiting
+        // for an assignment push. Closing removes the controller registration, so nothing can
+        // ever push it: close must interrupt the alignment instead of joining the task.
+        let after_close = close_and_count(consumer, cluster).await;
+        return DagWatchRecoveryTrace {
+            watch_failure_reported,
+            baseline_reported,
+            replacement_session,
+            controller_opens,
+            terminal_watch_failure_reported,
+            terminal_reopen_failed: false,
+            replacement_assignment_after_terminal: false,
+            after_close,
+        };
+    }
     cluster
         .update(|fake| fake.disconnect_connection(replacement_connection))
         .expect("disconnect replacement DAG-watch controller");
@@ -5893,18 +5918,18 @@ where
     }
 }
 
-async fn run_tokio_dag_watch_recovery() -> DagWatchRecoveryTrace {
+async fn run_tokio_dag_watch_recovery(exit: DagReopenAlignmentExit) -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
-    let trace = observe_dag_watch_recovery(&client, &cluster).await;
+    let trace = observe_dag_watch_recovery(&client, &cluster, exit).await;
     client.close().await;
     trace
 }
 
-async fn run_moonpool_dag_watch_recovery() -> DagWatchRecoveryTrace {
+async fn run_moonpool_dag_watch_recovery(exit: DagReopenAlignmentExit) -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
-    let trace = observe_dag_watch_recovery(&client, &cluster).await;
+    let trace = observe_dag_watch_recovery(&client, &cluster, exit).await;
     client.close().await;
     trace
 }
@@ -6824,8 +6849,16 @@ async fn malformed_compressed_delivery_resynchronizes_equivalently() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dag_watch_failure_reopens_the_control_plane_equivalently() {
     let _serial = advanced_socket_test_guard();
-    let tokio_trace = run_tokio_dag_watch_recovery().await;
-    let moonpool_trace = run_moonpool_dag_watch_recovery().await;
+    let tokio_trace = run_tokio_dag_watch_recovery(DagReopenAlignmentExit::Disconnect).await;
+    let moonpool_trace = run_moonpool_dag_watch_recovery(DagReopenAlignmentExit::Disconnect).await;
+    assert_eq!(tokio_trace, moonpool_trace);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_interrupts_the_replacement_dag_watch_alignment_equivalently() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_dag_watch_recovery(DagReopenAlignmentExit::Close).await;
+    let moonpool_trace = run_moonpool_dag_watch_recovery(DagReopenAlignmentExit::Close).await;
     assert_eq!(tokio_trace, moonpool_trace);
 }
 

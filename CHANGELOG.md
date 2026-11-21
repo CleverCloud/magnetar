@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`close()` and drop no longer hang on a `StreamConsumer` whose replacement DAG watch is waiting for its epoch alignment.**
+  When the broker closed the retained DAG watch, the control loop of both runtimes (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) re-resolved it inline and awaited the alignment of the replacement with the controller assignment without racing the aggregate's close.
+  If the replacement baseline was at a layout epoch the assignment had not reached, that wait needed an assignment push from the broker, and `close()` itself removes the controller registration that receives it, so the push could never arrive: `close()` joined the control task forever, and a dropped aggregate kept the task, the DAG session and the controller route alive until the physical connection died.
+  The alignment now races the aggregate's close, as the reconnect loop's alignment already did, and the control task ends when the aggregate begins closing, which releases the replacement watch.
 - **The tokio supervisor closes a socket it abandoned instead of holding it open through the redial delay.**
   `supervised_driver_loop` lent its transport to `driver_loop_inner` as `&mut` and kept it in a local, so after an exit the client decided on its own (`CommandTopicMigrated` with no allow-list, an unanswerable auth challenge, an undecodable frame, a write or handshake deadline) the peer was still alive and the stream stayed open, unread, through the anti-thrash cooldown, the backoff sleep and the dial, and was dropped only when the replacement was assigned.
   For that whole delay (up to `max_backoff` plus `connect_timeout`, 60 s plus the dial budget by default) the broker kept the connection and its producers and consumers registered, and kept dispatching to a client that no longer read.
