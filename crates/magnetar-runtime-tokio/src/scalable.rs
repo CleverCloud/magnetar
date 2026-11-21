@@ -9615,6 +9615,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_transaction_outcome_propagation_keeps_its_record_for_the_retry() {
+        // An unknown outcome resynchronizes the aggregate, which closes its child; the broker
+        // rejects that close, so the propagation fails. The record is what a retry resumes, so it
+        // stays, and it does not join the window of settled records that are evicted oldest first.
+        let (inner, child_shared) = aggregate_inner_with_child();
+        let txn_id = magnetar_proto::TxnId::new(0x5e, 0x77);
+        let mut outcome = Box::pin(inner.transaction_outcome(
+            txn_id,
+            magnetar_proto::TransactionAcknowledgementOutcome::Unknown,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(outcome.as_mut(), context).is_pending(),
+                "the propagation waits for the child close"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut close_request_id = None;
+        for _ in 0..1024 {
+            let mut staged = child_shared.inner.lock().poll_transmit();
+            while !staged.is_empty() {
+                let command = magnetar_proto::decode_one(&mut staged)
+                    .expect("decode child frame")
+                    .command;
+                if let Some(close) = command.close_consumer {
+                    close_request_id = Some(close.request_id);
+                }
+            }
+            if close_request_id.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let close_request_id = close_request_id.expect("the resynchronization closes the child");
+        let error = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::Error as i32,
+            error: Some(magnetar_proto::pb::CommandError {
+                request_id: close_request_id,
+                error: magnetar_proto::pb::ServerError::MetadataError as i32,
+                message: "close failed".to_owned(),
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&error))
+            .expect("reject the child close");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), outcome)
+            .await
+            .expect("outcome propagation finishes");
+        assert!(
+            result.is_err(),
+            "a rejected child close fails the propagation: {result:?}"
+        );
+        let state = inner.state.lock();
+        assert!(
+            state.transaction_outcomes.contains_key(&txn_id),
+            "a failed propagation keeps its record for the retry"
+        );
+        assert!(
+            !state.settled_transaction_outcomes.contains(&txn_id),
+            "a failed propagation is not a settled one"
+        );
+    }
+
+    #[tokio::test]
     async fn transaction_outcome_continues_after_waiter_cancellation() {
         let mut inner = empty_aggregate_inner();
         let hook = Arc::new(TransactionOutcomeParkHook::default());
