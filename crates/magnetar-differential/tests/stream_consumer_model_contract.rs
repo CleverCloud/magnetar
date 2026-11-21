@@ -1875,6 +1875,59 @@ fn receive_state_reassembles_chunks_and_expands_partial_batches() {
 }
 
 #[test]
+fn terminal_does_not_wait_for_an_incomplete_chunk_chain() {
+    // Control: a child that holds no chain completes once it is terminal.
+    let (mut plain, plain_generation, _) = opened_one_child();
+    plain
+        .observe_terminal(SegmentId(1), plain_generation)
+        .expect("terminal on a child with no chain");
+    plain
+        .complete_segment(SegmentId(1), plain_generation)
+        .expect("a terminal child with no chain completes");
+
+    // Chunk zero of a two-chunk message arrives and the producer never writes
+    // chunk one. Once the segment is terminal the broker sends nothing more, so
+    // the assembly and the continuation permit must not keep it from
+    // completing: completion is what unblocks its descendants.
+    let (mut model, generation, flow) = opened_one_child();
+    let mut receive = StreamReceiveState::default();
+    let buffered = receive
+        .accept_entry(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow,
+            deferred_entry(
+                10,
+                Bytes::from_static(b"ab"),
+                pb::MessageMetadata {
+                    num_chunks_from_msg: Some(2),
+                    chunk_id: Some(0),
+                    total_chunk_msg_size: Some(4),
+                    uuid: Some("never-finished".to_owned()),
+                    ..Default::default()
+                },
+                Vec::new(),
+                1,
+            ),
+        )
+        .expect("buffer chunk zero");
+    assert!(
+        matches!(buffered, StreamEntryAcceptance::Buffered { .. }),
+        "chunk zero is buffered: {buffered:?}"
+    );
+    model
+        .observe_terminal(SegmentId(1), generation)
+        .expect("terminal with a chunk chain still open");
+    let completed = model.complete_segment(SegmentId(1), generation);
+    assert!(
+        completed.is_ok(),
+        "a terminal segment must complete although its last chunk chain never finished: \
+         {completed:?}"
+    );
+}
+
+#[test]
 fn receive_state_accounts_transform_work_and_discards_ordinary_and_chunk_entries() {
     let (mut zstd_model, zstd_generation, zstd_flow) = opened_one_child();
     let mut zstd_receive = StreamReceiveState::default();

@@ -1,6 +1,6 @@
 # ADR-0131 — Hold several chunk chains per `StreamConsumer` child and fail the consumer on a chain its budget cannot hold
 
-- **Status**: Accepted (amends [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md) §Aggregate receive budget and concurrency: the single purpose-fenced chunk chain per child and the resynchronization answer to every receive-accounting failure)
+- **Status**: Accepted (amends [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md) §Aggregate receive budget and concurrency: the single purpose-fenced chunk chain per child and the resynchronization answer to every receive-accounting failure) (amended 2026-11-20 — a child whose topic has ended abandons its chunk chains)
 - **Date**: 2026-11-19
 - **Decider**: Florentin Dubois
 - **Tags**: scalable-topics, stream-consumer, chunking, pip-37, receive-budget, flow-control
@@ -57,3 +57,17 @@ Two properties of the first implementation turned ordinary broker behaviour into
 - `crates/magnetar-runtime-tokio/src/scalable.rs`, `crates/magnetar-runtime-moonpool/src/scalable.rs` — `message_arrived`.
 - `crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs` — `interleaved_chunk_chain_does_not_resynchronize_forever_on_{tokio,moonpool}`, `unassemblable_chunk_chain_does_not_resynchronize_forever_on_{tokio,moonpool}`.
 - [ADR-0063](0063-bounded-chunk-reassembly.md), [ADR-0120](0120-assignment-driven-m1-hardened-stream-consumer.md), [`docs/pip-features.md`](../../docs/pip-features.md) §Aggregate receive budget.
+
+## Amendment (2026-11-20): a child whose topic has ended abandons its chunk chains
+
+- **A terminal child abandons its chains.**
+  `StreamConsumerModel::observe_terminal` releases, with the flow permit, the assembly of every chain the child holds and counts each out of the child's pre-terminal reservations, before it looks at the drain or re-arbitrates flow.
+  `StreamReceiveState::observe_terminal` calls it and drops the chunks those chains retained, and the end-of-topic arm of `child_loop` in both runtimes calls that.
+  The broker sends nothing after the end of the topic, and the child hands over every entry it received before it reports it, so no chain that could still finish is abandoned; the broker reports the end of the topic only once every entry is acknowledged, so a chain reaches this point only after a cumulative acknowledgement of a later entry covered its first chunk.
+  A chain whose first chunk is never acknowledged keeps the broker from reporting the end of the topic at all, so on a sealed segment it still blocks completion and the segment's descendants.
+  Without it the unreleased assembly kept `complete_segment` failing with `SegmentNotComplete`, which the runtimes swallow, and the segment's descendants stayed blocked behind a parent that had nothing left to deliver.
+- **Consequence that changes.**
+  The cap can still loop on a live segment: only the end of the topic abandons a chain, and nothing expires one whose remaining chunks never arrive, so a child that holds ten such chains answers the first chunk of an eleventh with a resynchronization, and the broker replays the same eleven chains after it.
+  The same open chain keeps an ownership drain of a non-terminal child, and a vector seek, waiting until the child closes or the aggregate resynchronizes; an expiry that abandons it on a timer, as the ordinary consumer's `expire_time_of_incomplete_chunked_message` does, is not implemented, and whether to add one remains an open decision.
+- **References.**
+  `crates/magnetar-proto/src/stream_consumer.rs` — `observe_terminal`; `crates/magnetar-runtime-tokio/src/scalable.rs`, `crates/magnetar-runtime-moonpool/src/scalable.rs` — `child_loop`; `crates/magnetar-differential/tests/stream_consumer_advanced_equivalence.rs` — `incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent_on_{tokio,moonpool}`.

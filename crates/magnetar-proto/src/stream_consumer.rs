@@ -1590,6 +1590,29 @@ impl StreamReceiveState {
             .retain(|(chain_owner, _), _| *chain_owner != owner);
     }
 
+    /// Record ordinary terminal/end-of-topic for a child and drop the chunks of
+    /// every chain it still holds open.
+    ///
+    /// [`StreamConsumerModel::observe_terminal`] gives back the budget of those
+    /// chains' assemblies; the chunks they retained go in the same step, because
+    /// they would otherwise outlive their reservation until the child closes.
+    /// The chains are dropped only once the model accepted the terminal, so a
+    /// refusal leaves the model and the chains agreeing.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale child generations.
+    pub fn observe_terminal(
+        &mut self,
+        model: &mut StreamConsumerModel,
+        segment_id: SegmentId,
+        generation: ChildGeneration,
+    ) -> Result<Vec<StreamConsumerAction>, StreamConsumerModelError> {
+        let actions = model.observe_terminal(segment_id, generation)?;
+        self.remove_child(segment_id, generation);
+        Ok(actions)
+    }
+
     fn live_chains(&self, owner: BudgetReservationOwner) -> usize {
         self.chunks
             .range((owner, String::new())..)
@@ -4462,6 +4485,15 @@ impl StreamConsumerModel {
 
     /// Record ordinary terminal/end-of-topic for a child.
     ///
+    /// The broker sends nothing more on a terminal child, so a chunk chain whose
+    /// remaining chunks have not arrived can never finish and nothing the
+    /// application can resolve is left on it. The child gives back its flow
+    /// permit and the assembly of every such chain, which is what lets the
+    /// segment complete, a draining child close and its descendants start.
+    /// Callers that hold a [`StreamReceiveState`] go through
+    /// [`StreamReceiveState::observe_terminal`] so the abandoned chains' retained
+    /// chunks are dropped with their budget.
+    ///
     /// # Errors
     ///
     /// Rejects stale child generations.
@@ -4473,48 +4505,55 @@ impl StreamConsumerModel {
         self.require_callback_phase()?;
         let child = self.child(segment_id, generation)?;
         let phase = child.phase.clone();
-        let reservation = child.flow_reservation;
         let owner = child.owner();
         if phase == SegmentPhase::Opening {
             return Err(StreamConsumerModelError::InvalidChildTransition { segment_id, phase });
         }
-        let pre_terminal_reservations = reservation
-            .map(|_| {
+        // Each of these counts once in the pre-terminal reservations: the flow
+        // permit, and one assembly per live chain. A child can hold assemblies
+        // without a permit after an interleaved entry spent it.
+        let released: Vec<(BudgetReservationId, BudgetUse)> = child
+            .flow_reservation
+            .map(|reservation| (reservation, BudgetUse::FlowPermit))
+            .into_iter()
+            .chain(
                 child
-                    .completion
-                    .pre_terminal_reservations
-                    .checked_sub(1)
-                    .ok_or(StreamConsumerModelError::UnbalancedCompletionHook {
-                        segment_id,
-                        kind: "pre-terminal reservation",
-                    })
-            })
-            .transpose()?;
-        reservation
-            .map_or(Ok(()), |reservation| {
-                self.budget
-                    .owned(reservation, owner, BudgetUse::FlowPermit)
-                    .and_then(|_| self.budget.release(reservation))
-                    .map_err(StreamConsumerModelError::from)
-            })
-            .and_then(|()| {
-                let child = self.child_mut(segment_id, generation)?;
-                child.flow_reservation = None;
-                child.flow_purpose = None;
-                if let Some(pre_terminal_reservations) = pre_terminal_reservations {
-                    child.completion.pre_terminal_reservations = pre_terminal_reservations;
-                }
-                child.completion.terminal = true;
-                if !matches!(
-                    child.phase,
-                    SegmentPhase::Draining | SegmentPhase::Closing | SegmentPhase::Failed
-                ) {
-                    child.phase = SegmentPhase::Terminal;
-                }
-                let mut actions = self.close_if_drained(segment_id, generation)?;
-                actions.extend(self.arbitrate_flow()?);
-                Ok(actions)
-            })
+                    .chunk_assemblies
+                    .iter()
+                    .map(|assembly| (*assembly, BudgetUse::ChunkAssembly)),
+            )
+            .collect();
+        let pre_terminal_reservations = child
+            .completion
+            .pre_terminal_reservations
+            .checked_sub(released.len())
+            .ok_or(StreamConsumerModelError::UnbalancedCompletionHook {
+                segment_id,
+                kind: "pre-terminal reservation",
+            })?;
+        // Prove every reservation is this child's before the first release, so a
+        // refusal leaves the ledger untouched.
+        for (reservation, use_) in &released {
+            self.budget.owned(*reservation, owner, *use_)?;
+        }
+        for (reservation, _) in &released {
+            self.budget.release(*reservation)?;
+        }
+        let child = self.child_mut(segment_id, generation)?;
+        child.flow_reservation = None;
+        child.flow_purpose = None;
+        child.chunk_assemblies.clear();
+        child.completion.pre_terminal_reservations = pre_terminal_reservations;
+        child.completion.terminal = true;
+        if !matches!(
+            child.phase,
+            SegmentPhase::Draining | SegmentPhase::Closing | SegmentPhase::Failed
+        ) {
+            child.phase = SegmentPhase::Terminal;
+        }
+        let mut actions = self.close_if_drained(segment_id, generation)?;
+        actions.extend(self.arbitrate_flow()?);
+        Ok(actions)
     }
 
     /// Admit an acknowledgement operation that must settle before completion.
@@ -7570,6 +7609,248 @@ mod tests {
     }
 
     #[test]
+    fn terminal_does_not_wait_for_an_incomplete_chunk_chain() {
+        // Control: a child that holds no chain completes once it is terminal.
+        let (mut plain, plain_generation, _) = one_child_model(3 * MAX_FRAME_SIZE);
+        plain
+            .observe_terminal(SegmentId(1), plain_generation)
+            .expect("terminal on a child with no chain");
+        plain
+            .complete_segment(SegmentId(1), plain_generation)
+            .expect("a terminal child with no chain completes");
+
+        // Chunk zero of a two-chunk message arrives and the producer never
+        // writes chunk one: the segment is then terminal, so the broker will
+        // send nothing more and nothing the application can resolve is left.
+        // The assembly and the continuation permit must not keep the segment
+        // from completing, because completion is what unblocks its descendants.
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let buffered = receive
+            .accept_entry(
+                &mut model,
+                SegmentId(1),
+                generation,
+                flow,
+                chunk_entry(10, "never-finished", 0, 2, 4, b"ab"),
+            )
+            .expect("buffer chunk zero");
+        assert!(
+            matches!(buffered, StreamEntryAcceptance::Buffered { .. }),
+            "chunk zero is buffered: {buffered:?}"
+        );
+        model
+            .observe_terminal(SegmentId(1), generation)
+            .expect("terminal with a chunk chain still open");
+        let completed = model.complete_segment(SegmentId(1), generation);
+        assert!(
+            completed.is_ok(),
+            "a terminal segment must complete although its last chunk chain never finished: \
+             {completed:?}"
+        );
+    }
+
+    /// Open one chain per uuid on segment 1, each under the permit the previous
+    /// one granted, and return the permit that is outstanding afterwards.
+    fn open_chains(
+        model: &mut StreamConsumerModel,
+        receive: &mut StreamReceiveState,
+        generation: ChildGeneration,
+        mut permit: BudgetReservationId,
+        uuids: &[&str],
+    ) -> BudgetReservationId {
+        for (entry, uuid) in uuids.iter().enumerate() {
+            let buffered = receive
+                .accept_entry(
+                    model,
+                    SegmentId(1),
+                    generation,
+                    permit,
+                    chunk_entry(entry as u64, uuid, 0, 2, 4, b"ab"),
+                )
+                .expect("open a chain");
+            let StreamEntryAcceptance::Buffered { actions } = buffered else {
+                panic!("expected a buffered chunk, got {buffered:?}");
+            };
+            permit = flow_reservation(&actions);
+        }
+        permit
+    }
+
+    #[test]
+    fn terminal_abandons_every_chain_and_the_chunks_it_retained() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let owner = BudgetReservationOwner::new(SegmentId(1), generation);
+        open_chains(
+            &mut model,
+            &mut receive,
+            generation,
+            flow,
+            &["chain-a", "chain-b"],
+        );
+        let assemblies: Vec<_> = model.children[&SegmentId(1)]
+            .chunk_assemblies
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(assemblies.len(), 2);
+        assert_eq!(receive.live_chains(owner), 2);
+        assert_eq!(
+            model.children[&SegmentId(1)]
+                .completion
+                .pre_terminal_reservations,
+            3,
+            "two assemblies and the continuation permit"
+        );
+
+        receive
+            .observe_terminal(&mut model, SegmentId(1), generation)
+            .expect("terminal with two chains open");
+
+        assert!(
+            receive.chunks.is_empty(),
+            "the abandoned chains' chunks go with their budget"
+        );
+        for assembly in assemblies {
+            assert_eq!(model.budget.use_of(assembly), None);
+        }
+        let child = &model.children[&SegmentId(1)];
+        assert!(child.chunk_assemblies.is_empty());
+        assert_eq!(child.flow_reservation, None);
+        assert_eq!(child.completion.pre_terminal_reservations, 0);
+        assert_eq!(model.budget.data_used(), 0, "nothing is left charged");
+        model
+            .complete_segment(SegmentId(1), generation)
+            .expect("the terminal segment completes");
+
+        // A repeated terminal releases nothing a second time.
+        receive
+            .observe_terminal(&mut model, SegmentId(1), generation)
+            .expect("a repeated terminal is a no-op");
+        assert_eq!(
+            model.children[&SegmentId(1)]
+                .completion
+                .pre_terminal_reservations,
+            0
+        );
+        assert_eq!(model.budget.data_used(), 0);
+    }
+
+    #[test]
+    fn terminal_abandons_a_chain_after_an_interleaved_entry_spent_the_permit() {
+        // The ordinary message that arrives between two chunks spends the child's
+        // permit, and a budget its retained bytes mostly fill grants no new one:
+        // the child holds the chain's assembly and no permit.
+        let (mut model, generation, flow) = one_child_model(2 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        let permit = open_chains(&mut model, &mut receive, generation, flow, &["chain-a"]);
+        model
+            .bind_flow_purpose(SegmentId(1), generation, permit, FlowPurpose::Message)
+            .expect("the interleaved entry is an ordinary message");
+        model
+            .message_arrived(SegmentId(1), generation, permit, 6_000_000)
+            .expect("the interleaved message is retained");
+        let child = &model.children[&SegmentId(1)];
+        assert_eq!(child.flow_reservation, None, "no room for another permit");
+        assert_eq!(child.chunk_assemblies.len(), 1);
+        assert_eq!(
+            child.completion.pre_terminal_reservations, 2,
+            "the assembly and the retained message"
+        );
+
+        receive
+            .observe_terminal(&mut model, SegmentId(1), generation)
+            .expect("terminal with an assembly and no permit");
+
+        let child = &model.children[&SegmentId(1)];
+        assert!(child.chunk_assemblies.is_empty());
+        assert_eq!(
+            child.completion.pre_terminal_reservations, 1,
+            "the retained message is the only reservation left"
+        );
+        assert!(receive.chunks.is_empty());
+        assert_eq!(
+            model.budget.data_used(),
+            6_000_000,
+            "only the delivered message stays charged"
+        );
+    }
+
+    #[test]
+    fn terminal_closes_a_draining_child_that_held_a_chain() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        open_chains(&mut model, &mut receive, generation, flow, &["chain-a"]);
+        let lost = model
+            .apply_assignment(assignment(1, &[]))
+            .expect("equal-epoch assignment removes ownership");
+        assert!(matches!(
+            lost.as_slice(),
+            [StreamConsumerAction::StopFlow { .. }]
+        ));
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::Draining),
+            "the open chain keeps the drain from settling"
+        );
+
+        let closed = receive
+            .observe_terminal(&mut model, SegmentId(1), generation)
+            .expect("terminal on a draining child");
+
+        assert!(
+            matches!(closed.as_slice(), [StreamConsumerAction::CloseChild { .. }]),
+            "the abandoned chain no longer holds the drain open: {closed:?}"
+        );
+        assert_eq!(
+            model.segment_phase(SegmentId(1)),
+            Some(&SegmentPhase::Closing)
+        );
+        assert!(receive.chunks.is_empty());
+    }
+
+    #[test]
+    fn refused_terminal_keeps_the_chains_it_did_not_abandon() {
+        let (mut model, generation, flow) = one_child_model(3 * MAX_FRAME_SIZE);
+        let mut receive = StreamReceiveState::default();
+        open_chains(&mut model, &mut receive, generation, flow, &["chain-a"]);
+        let owner = BudgetReservationOwner::new(SegmentId(1), generation);
+        let stale = ChildGeneration(generation.0 + 1);
+
+        assert!(matches!(
+            receive.observe_terminal(&mut model, SegmentId(1), stale),
+            Err(StreamConsumerModelError::StaleChildGeneration { .. })
+        ));
+        assert_eq!(
+            receive.live_chains(owner),
+            1,
+            "a refused terminal abandons nothing"
+        );
+        assert_eq!(model.children[&SegmentId(1)].chunk_assemblies.len(), 1);
+
+        // A refusal for the child's own generation must keep its chains too:
+        // the stale case above cannot tell, because the chains are keyed by
+        // generation.
+        model
+            .children
+            .get_mut(&SegmentId(1))
+            .expect("child")
+            .completion
+            .pre_terminal_reservations = 0;
+        assert!(matches!(
+            receive.observe_terminal(&mut model, SegmentId(1), generation),
+            Err(StreamConsumerModelError::UnbalancedCompletionHook { .. })
+        ));
+        assert_eq!(
+            receive.live_chains(owner),
+            1,
+            "a terminal the model refused abandons nothing"
+        );
+        assert_eq!(model.children[&SegmentId(1)].chunk_assemblies.len(), 1);
+    }
+
+    #[test]
     fn reservation_owner_rejects_cross_child_delivery() {
         let mut model = model(OrderingMode::BrokerManaged);
         let opens = model
@@ -8589,6 +8870,84 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn transactional_authority_retired_by_resync_is_refused_until_a_live_one_settles() {
+        // The runtimes keep every transactional authority of one transaction in a list that
+        // outlives a resynchronization and skip exactly these two refusals, so that a
+        // retired authority cannot hide the live one admitted behind it.
+        let mut model = model(OrderingMode::BrokerManaged);
+        let open = model
+            .apply_assignment(assignment(1, &[1]))
+            .expect("assignment");
+        let generation = opened_generation(&open[0]);
+        let flow = model.child_opened(SegmentId(1), generation).expect("open");
+        let (token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            generation,
+            flow_reservation(&flow),
+            5,
+        );
+        let retired = model
+            .admit_individual_transactional_acknowledgement(&token)
+            .expect("admit the acknowledgement that the resynchronization retires")
+            .authority;
+        model.require_resync().expect("enter resync");
+        assert_eq!(
+            model.settle_transactional_acknowledgement(
+                &retired,
+                TransactionAcknowledgementOutcome::Committed
+            ),
+            Err(StreamConsumerModelError::InvalidAggregatePhase {
+                phase: AggregatePhase::ResyncRequired,
+            }),
+            "a fenced aggregate refuses the retired authority"
+        );
+
+        model
+            .child_closed(SegmentId(1), generation)
+            .expect("close confirmation");
+        model
+            .begin_controller_incarnation(ControllerIncarnation(4))
+            .expect("new controller incarnation");
+        let reopen = model
+            .apply_assignment_for(ControllerIncarnation(4), assignment(1, &[1]))
+            .expect("replacement baseline");
+        let replacement = opened_generation(&reopen[0]);
+        let replacement_flow = model
+            .child_opened(SegmentId(1), replacement)
+            .expect("replacement open");
+        let (replacement_token, _) = issue_test_delivery(
+            &mut model,
+            SegmentId(1),
+            replacement,
+            flow_reservation(&replacement_flow),
+            6,
+        );
+        let live = model
+            .admit_individual_transactional_acknowledgement(&replacement_token)
+            .expect("admit the acknowledgement of the replacement epoch")
+            .authority;
+        assert_eq!(
+            model.settle_transactional_acknowledgement(
+                &retired,
+                TransactionAcknowledgementOutcome::Committed
+            ),
+            Err(StreamConsumerModelError::StaleAcknowledgementAuthority),
+            "a reopened aggregate refuses the authority of the previous delivery epoch"
+        );
+        model
+            .settle_transactional_acknowledgement(
+                &live,
+                TransactionAcknowledgementOutcome::Committed,
+            )
+            .expect("the authority of the replacement epoch still settles");
+        assert_eq!(
+            model.resolve_delivery(&replacement_token),
+            Err(StreamConsumerModelError::StaleDeliveryToken)
+        );
     }
 
     #[test]

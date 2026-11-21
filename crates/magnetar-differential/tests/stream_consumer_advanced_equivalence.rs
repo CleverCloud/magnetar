@@ -68,6 +68,16 @@ struct SealedPlacementTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DroppedFinalAckTrace {
+    descendants_blocked_before_ack: bool,
+    parent_close_commands: usize,
+    parent_subscribes: usize,
+    descendant_flow_commands: Vec<u64>,
+    attached_segments: usize,
+    after_close: ResourceCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OrderingModeTrace {
     ordering_unprovable: Vec<u64>,
     event_ancestors: Vec<u64>,
@@ -343,6 +353,14 @@ struct MalformedDeliveryTrace {
     resync_reasons: Vec<String>,
     close_routes: Vec<usize>,
     after_close: Vec<ResourceCounts>,
+}
+
+/// How the parked replacement DAG watch of `observe_dag_watch_recovery` is ended: the broker
+/// drops the controller connection, or the application closes the aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DagReopenAlignmentExit {
+    Disconnect,
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1158,6 +1176,240 @@ async fn run_moonpool_exact_m1_sealed_placement() -> SealedPlacementTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_moonpool(&cluster).await;
     let trace = observe_exact_m1_sealed_placement(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+/// The application gives up on the acknowledgement of a drained sealed parent's
+/// last delivery while the parent's `CommandCloseConsumer` is in flight. The
+/// settled close and the descendants' FLOW grants do not belong to the caller's
+/// future, so both engines must still finish them once the broker confirms the
+/// close.
+async fn observe_dropped_final_acknowledgement<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> DroppedFinalAckTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("dropped-final-ack-sub")
+        .consumer_name("dropped-final-ack-member")
+        .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe dropped-final-ack aggregate");
+    cluster
+        .wait_for("dropped-final-ack initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    let sink = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("dropped-final-ack-sub")
+        .consumer_name("dropped-final-ack-sink")
+        .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe dropped-final-ack sink member");
+    let _ = wait_for_assignment(&sink, 1, &[]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"dropped-final-ack-parent")))
+        .expect("enqueue dropped-final-ack parent delivery");
+    cluster
+        .wait_for("dropped-final-ack parent delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let parent = receive(&consumer).await;
+    assert_eq!(parent.source().segment_id().0, 1);
+    let member = cluster
+        .inspect(|fake| fake.member("dropped-final-ack-sub", "dropped-final-ack-member"))
+        .expect("dropped-final-ack member observable");
+    let sink_member = cluster
+        .inspect(|fake| fake.member("dropped-final-ack-sub", "dropped-final-ack-sink"))
+        .expect("dropped-final-ack sink member observable");
+    cluster
+        .update(|fake| {
+            fake.advance_layout(2, split_layout())?;
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![
+                    FullAssignment::new(member, [1, 2, 3, 4]),
+                    FullAssignment::new(sink_member, []),
+                ],
+            )?;
+            fake.terminate_segment(1)
+        })
+        .expect("publish dropped-final-ack sealed assignment");
+    let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
+    cluster
+        .wait_for(
+            "dropped-final-ack descendants attach without FLOW",
+            |fake| {
+                let subscribed =
+                    command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+                subscribed.contains(&3) && subscribed.contains(&4)
+            },
+        )
+        .await;
+    let descendants_blocked_before_ack = cluster
+        .inspect(|fake| flow_command_count(fake, 3) == 0 && flow_command_count(fake, 4) == 0);
+    assert!(descendants_blocked_before_ack);
+    cluster
+        .update(|fake| {
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![
+                    FullAssignment::new(member, [2, 3, 4]),
+                    FullAssignment::new(sink_member, [1]),
+                ],
+            )
+        })
+        .expect("temporarily revoke dropped-final-ack sealed parent");
+    let _ = wait_for_assignment(&consumer, 2, &[2, 3, 4]).await;
+    cluster
+        .update(|fake| {
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![
+                    FullAssignment::new(member, [1, 2, 3, 4]),
+                    FullAssignment::new(sink_member, []),
+                ],
+            )
+        })
+        .expect("restore dropped-final-ack sealed parent while it drains");
+    let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
+    assert_eq!(
+        consumer.status().pending_ownership(),
+        &[parent.source().clone()]
+    );
+
+    cluster
+        .update(|fake| {
+            fake.script_next(
+                Endpoint::Segment(1),
+                OperationKind::Close,
+                ScriptedBehavior::Delay,
+            )
+        })
+        .expect("delay the drained sealed parent's close");
+    let mut acknowledgement = Box::pin(consumer.acknowledge(&parent));
+    tokio::select! {
+        biased;
+        result = &mut acknowledgement => {
+            result.expect("acknowledgement finished before the parent's close was sent");
+        }
+        () = cluster.wait_for("pending drained sealed-parent close", |fake| {
+            fake.pending_operations().iter().any(|pending| {
+                pending.kind == OperationKind::Close && pending.endpoint == Endpoint::Segment(1)
+            })
+        }) => {}
+    }
+    // The caller times out and walks away while the close round trip is in flight.
+    drop(acknowledgement);
+    drop(parent);
+    cluster
+        .wait_for(
+            "pending drained sealed-parent close after the drop",
+            |fake| {
+                fake.pending_operations().iter().any(|pending| {
+                    pending.kind == OperationKind::Close && pending.endpoint == Endpoint::Segment(1)
+                })
+            },
+        )
+        .await;
+    let pending_close = cluster
+        .inspect(|fake| {
+            fake.pending_operations()
+                .into_iter()
+                .find(|pending| {
+                    pending.kind == OperationKind::Close && pending.endpoint == Endpoint::Segment(1)
+                })
+                .map(|pending| pending.id)
+        })
+        .expect("drained sealed-parent close id");
+    cluster
+        .update(|fake| fake.complete_pending(pending_close, PendingCompletion::Succeed))
+        .expect("confirm the drained sealed-parent close");
+
+    // The close was confirmed after the caller was gone: the aggregate still
+    // retires the drained parent instead of keeping it as a draining child.
+    let status = tokio::time::timeout(magnetar_differential::HANG_GUARD, async {
+        loop {
+            let status = consumer.status();
+            if status.pending_ownership().is_empty() && status.draining_segments() == 0 {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the confirmed close of the drained parent never retired it: {:?}",
+            consumer.status()
+        )
+    });
+    cluster
+        .wait_for("dropped-final-ack descendants receive FLOW", |fake| {
+            flow_command_count(fake, 3) > 0 && flow_command_count(fake, 4) > 0
+        })
+        .await;
+    let (parent_close_commands, parent_subscribes, descendant_flow_commands) =
+        cluster.inspect(|fake| {
+            let descendant_flow_commands = [3, 4]
+                .into_iter()
+                .filter(|segment_id| flow_command_count(fake, *segment_id) > 0)
+                .collect::<Vec<_>>();
+            (
+                command_segment_count(
+                    fake,
+                    magnetar::proto::pb::base_command::Type::CloseConsumer,
+                    1,
+                ),
+                command_segment_count(fake, magnetar::proto::pb::base_command::Type::Subscribe, 1),
+                descendant_flow_commands,
+            )
+        });
+    assert_eq!(
+        parent_close_commands, 1,
+        "the drained sealed parent is closed exactly once"
+    );
+    assert_eq!(
+        parent_subscribes, 1,
+        "the completed sealed parent never reopens after the dropped acknowledgement"
+    );
+    sink.close()
+        .await
+        .expect("close dropped-final-ack sink member");
+    DroppedFinalAckTrace {
+        descendants_blocked_before_ack,
+        parent_close_commands,
+        parent_subscribes,
+        descendant_flow_commands,
+        attached_segments: status.attached_segments(),
+        after_close: close_and_count(consumer, cluster).await,
+    }
+}
+
+async fn run_tokio_dropped_final_acknowledgement() -> DroppedFinalAckTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_dropped_final_acknowledgement(&client, &cluster).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_dropped_final_acknowledgement() -> DroppedFinalAckTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_dropped_final_acknowledgement(&client, &cluster).await;
     client.close().await;
     trace
 }
@@ -4907,6 +5159,151 @@ async fn run_moonpool_interleaved_chunk_chain() {
     client.close().await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalChunkChainTrace {
+    flowing: Vec<u64>,
+    descendants_flowing_on_the_wire: Vec<u64>,
+}
+
+/// The producer of segment 1 writes chunk zero of a two-chunk message and never
+/// writes chunk one; the segment is then split and sealed, and the broker
+/// reports its end of topic. Nothing the application can resolve is left on the
+/// segment and the broker sends nothing more, so the parent must complete and
+/// release its descendants. With `chunk_zero` false the same split is the
+/// control: the parent completes at once. The fake reports the end of the topic
+/// once every entry is delivered, while a real broker waits until every entry is
+/// acknowledged, so this stands for a chain whose first chunk a cumulative
+/// acknowledgement of a later entry covered.
+async fn observe_terminal_with_incomplete_chunk_chain<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+    chunk_zero: bool,
+) -> TerminalChunkChainTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("terminal-chunk-sub")
+        .consumer_name("terminal-chunk-member")
+        .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(
+            magnetar::proto::ReceiverBudget::bytes(64 * 1024 * 1024)
+                .expect("large terminal-chunk receive budget"),
+        )
+        .subscribe()
+        .await
+        .expect("subscribe terminal-chunk aggregate");
+    cluster
+        .wait_for("terminal-chunk initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster.retain_sealed_placements();
+
+    if chunk_zero {
+        let flows_before = cluster.inspect(|fake| flow_command_count(fake, 1));
+        cluster
+            .update(|fake| {
+                fake.enqueue_message_with_metadata(
+                    1,
+                    magnetar::proto::pb::MessageMetadata {
+                        uuid: Some("never-finished".to_owned()),
+                        num_chunks_from_msg: Some(2),
+                        chunk_id: Some(0),
+                        total_chunk_msg_size: Some(4),
+                        ..Default::default()
+                    },
+                    Bytes::from_static(b"ab"),
+                    Vec::new(),
+                )
+            })
+            .expect("enqueue chunk zero of a message whose last chunk never arrives");
+        cluster
+            .wait_for("continuation FLOW of the open chunk chain", |fake| {
+                flow_command_count(fake, 1) > flows_before
+            })
+            .await;
+    }
+
+    let member = cluster
+        .inspect(|fake| fake.member("terminal-chunk-sub", "terminal-chunk-member"))
+        .expect("terminal-chunk member observable");
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.advance_layout(2, split_layout())?;
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![FullAssignment::new(member, [1, 2, 3, 4])],
+            )?;
+            fake.terminate_segment(1)
+        })
+        .expect("publish early split descendants and the parent terminal");
+    let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
+    cluster
+        .wait_for("split descendants attach without FLOW", |fake| {
+            let subscribed =
+                command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+            subscribed.contains(&3) && subscribed.contains(&4)
+        })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        wait_for_flowing_sources(&consumer, &[3, 4]).await;
+        cluster
+            .wait_for("split descendants receive FLOW", |fake| {
+                flow_command_count(fake, 3) > 0 && flow_command_count(fake, 4) > 0
+            })
+            .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the descendants never received FLOW (chunk zero buffered: {chunk_zero}): the \
+             terminal parent's incomplete chunk chain keeps the parent from completing"
+        )
+    });
+    let descendants_flowing_on_the_wire = cluster.inspect(|fake| {
+        command_segments(fake, magnetar::proto::pb::base_command::Type::Flow)
+            .into_iter()
+            .filter(|segment_id| matches!(segment_id, 3 | 4))
+            .collect::<Vec<_>>()
+    });
+    let _ = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.close()).await;
+    TerminalChunkChainTrace {
+        flowing: vec![3, 4],
+        descendants_flowing_on_the_wire,
+    }
+}
+
+/// Both engines, with and without the open chunk chain, release exactly the two
+/// split descendants.
+fn expected_terminal_chunk_chain_trace() -> TerminalChunkChainTrace {
+    TerminalChunkChainTrace {
+        flowing: vec![3, 4],
+        descendants_flowing_on_the_wire: vec![3, 4],
+    }
+}
+
+async fn run_tokio_terminal_chunk_chain(chunk_zero: bool) -> TerminalChunkChainTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_terminal_with_incomplete_chunk_chain(&client, &cluster, chunk_zero).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_terminal_chunk_chain(chunk_zero: bool) -> TerminalChunkChainTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_terminal_with_incomplete_chunk_chain(&client, &cluster, chunk_zero).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_child_open_lifecycle<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -5853,6 +6250,7 @@ async fn run_moonpool_malformed_delivery() -> MalformedDeliveryTrace {
 async fn observe_dag_watch_recovery<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
+    exit: DagReopenAlignmentExit,
 ) -> DagWatchRecoveryTrace
 where
     E: Engine,
@@ -5988,6 +6386,22 @@ where
         .await;
     assert_eq!(cluster.inspect(M1FakeCluster::layout_epoch), 2);
     assert_eq!(consumer.status().layout_epoch(), Some(1));
+    if exit == DagReopenAlignmentExit::Close {
+        // The control task is parked in the epoch alignment of the replacement watch, waiting
+        // for an assignment push. Closing removes the controller registration, so nothing can
+        // ever push it: close must interrupt the alignment instead of joining the task.
+        let after_close = close_and_count(consumer, cluster).await;
+        return DagWatchRecoveryTrace {
+            watch_failure_reported,
+            baseline_reported,
+            replacement_session,
+            controller_opens,
+            terminal_watch_failure_reported,
+            terminal_reopen_failed: false,
+            replacement_assignment_after_terminal: false,
+            after_close,
+        };
+    }
     cluster
         .update(|fake| fake.disconnect_connection(replacement_connection))
         .expect("disconnect replacement DAG-watch controller");
@@ -6034,18 +6448,18 @@ where
     }
 }
 
-async fn run_tokio_dag_watch_recovery() -> DagWatchRecoveryTrace {
+async fn run_tokio_dag_watch_recovery(exit: DagReopenAlignmentExit) -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_tokio_with_terminal_reconnect_budget(&cluster).await;
-    let trace = observe_dag_watch_recovery(&client, &cluster).await;
+    let trace = observe_dag_watch_recovery(&client, &cluster, exit).await;
     client.close().await;
     trace
 }
 
-async fn run_moonpool_dag_watch_recovery() -> DagWatchRecoveryTrace {
+async fn run_moonpool_dag_watch_recovery(exit: DagReopenAlignmentExit) -> DagWatchRecoveryTrace {
     let cluster = M1SocketCluster::bind().await;
     let client = connect_moonpool_with_terminal_reconnect_budget(&cluster).await;
-    let trace = observe_dag_watch_recovery(&client, &cluster).await;
+    let trace = observe_dag_watch_recovery(&client, &cluster, exit).await;
     client.close().await;
     trace
 }
@@ -6854,6 +7268,14 @@ async fn exact_m1_sealed_assignment_drains_without_parent_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_final_acknowledgement_still_closes_the_drained_parent() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_dropped_final_acknowledgement().await;
+    let moonpool_trace = run_moonpool_dropped_final_acknowledgement().await;
+    assert_eq!(tokio_trace, moonpool_trace);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_and_broker_managed_cross_member_ordering_are_explicit() {
     let _serial = advanced_socket_test_guard();
     let tokio_trace = run_tokio_cross_member().await;
@@ -6981,8 +7403,16 @@ async fn malformed_compressed_delivery_resynchronizes_equivalently() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dag_watch_failure_reopens_the_control_plane_equivalently() {
     let _serial = advanced_socket_test_guard();
-    let tokio_trace = run_tokio_dag_watch_recovery().await;
-    let moonpool_trace = run_moonpool_dag_watch_recovery().await;
+    let tokio_trace = run_tokio_dag_watch_recovery(DagReopenAlignmentExit::Disconnect).await;
+    let moonpool_trace = run_moonpool_dag_watch_recovery(DagReopenAlignmentExit::Disconnect).await;
+    assert_eq!(tokio_trace, moonpool_trace);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_interrupts_the_replacement_dag_watch_alignment_equivalently() {
+    let _serial = advanced_socket_test_guard();
+    let tokio_trace = run_tokio_dag_watch_recovery(DagReopenAlignmentExit::Close).await;
+    let moonpool_trace = run_moonpool_dag_watch_recovery(DagReopenAlignmentExit::Close).await;
     assert_eq!(tokio_trace, moonpool_trace);
 }
 
@@ -7016,6 +7446,28 @@ async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_tokio() {
 async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_moonpool() {
     let _serial = advanced_socket_test_guard();
     run_moonpool_interleaved_chunk_chain().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent_on_tokio() {
+    let _serial = advanced_socket_test_guard();
+    let control = run_tokio_terminal_chunk_chain(false).await;
+    assert_eq!(control, expected_terminal_chunk_chain_trace());
+    assert_eq!(
+        run_tokio_terminal_chunk_chain(true).await,
+        expected_terminal_chunk_chain_trace()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent_on_moonpool() {
+    let _serial = advanced_socket_test_guard();
+    let control = run_moonpool_terminal_chunk_chain(false).await;
+    assert_eq!(control, expected_terminal_chunk_chain_trace());
+    assert_eq!(
+        run_moonpool_terminal_chunk_chain(true).await,
+        expected_terminal_chunk_chain_trace()
+    );
 }
 
 async fn observe_withdrawn_open_finishing_during_close<E>(
@@ -7370,4 +7822,158 @@ async fn delivery_authority_budget_failure_is_atomic_and_equivalent() {
     let moonpool = observe_atomic_delivery_budget_pressure(&client, &cluster).await;
     client.close().await;
     assert_eq!(tokio, moonpool);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResyncedCommitTrace {
+    resync_reason_decompress: bool,
+    committed: bool,
+    committed_outcome_event: bool,
+    after_close: ResourceCounts,
+}
+
+/// A transaction acknowledges a delivery, then a malformed delivery resynchronizes the aggregate,
+/// retiring every authority admitted before it. The child closes are held, so the aggregate stays
+/// fenced and the coordinator session stays live while the transaction commits. The runtime still
+/// holds the retired authority, so the commit must report its outcome instead of failing on an
+/// authority that has nothing left to settle.
+async fn observe_commit_while_the_aggregate_is_fenced<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+) -> ResyncedCommitTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi + TransactionApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("fenced-commit-sub")
+        .consumer_name("fenced-commit-member")
+        .ordering_mode(magnetar::proto::OrderingMode::BrokerManaged)
+        .receiver_budget(two_frame_receiver_budget())
+        .subscribe()
+        .await
+        .expect("subscribe fenced-commit aggregate");
+    cluster
+        .wait_for("fenced-commit children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster
+        .update(|fake| fake.enqueue_message(1, Bytes::from_static(b"fenced-commit")))
+        .expect("enqueue fenced-commit participant");
+    cluster
+        .wait_for("fenced-commit participant delivery", |fake| {
+            fake.resource_counts().unacked_messages == 1
+        })
+        .await;
+    let message = receive(&consumer).await;
+    let transaction = client
+        .new_transaction(Duration::from_secs(30))
+        .await
+        .expect("open fenced-commit transaction");
+    consumer
+        .acknowledge_in_transaction(&message, transaction)
+        .await
+        .expect("admit the acknowledgement that the resynchronization retires");
+
+    cluster
+        .update(|fake| {
+            for endpoint in [Endpoint::Segment(1), Endpoint::Segment(2)] {
+                fake.script_next(endpoint, OperationKind::Close, ScriptedBehavior::Delay)?;
+            }
+            fake.enqueue_message_with_metadata(
+                1,
+                magnetar::proto::pb::MessageMetadata {
+                    compression: Some(magnetar::proto::pb::CompressionType::Snappy as i32),
+                    uncompressed_size: Some(4),
+                    ..Default::default()
+                },
+                snappy(b"fenced-commit"),
+                Vec::new(),
+            )
+        })
+        .expect("enqueue the malformed delivery that resynchronizes the aggregate");
+    let resync_reason_decompress = loop {
+        match next_event(&consumer).await {
+            StreamConsumerEvent::ResyncRequired { reason } => break reason.contains("decompress"),
+            StreamConsumerEvent::AssignmentApplied { .. }
+            | StreamConsumerEvent::SegmentPhaseChanged { .. }
+            | StreamConsumerEvent::OrderingUnprovable { .. }
+            | StreamConsumerEvent::TransactionOutcome { .. } => {}
+            unexpected => panic!("unexpected fenced-commit event: {unexpected:?}"),
+        }
+    };
+    cluster
+        .wait_for("held fenced-commit child close", |fake| {
+            fake.pending_operations()
+                .iter()
+                .any(|pending| pending.kind == OperationKind::Close)
+        })
+        .await;
+    assert_eq!(
+        consumer.status().phase(),
+        magnetar::proto::AggregatePhase::ResyncRequired
+    );
+
+    let committed = client
+        .commit_transaction(transaction)
+        .await
+        .expect("commit while the aggregate is fenced")
+        == magnetar::TxnState::Committed;
+    let mut committed_outcome_event = false;
+    while !committed_outcome_event {
+        if let StreamConsumerEvent::TransactionOutcome {
+            txn_id,
+            outcome: magnetar::scalable::TransactionOutcome::Committed,
+        } = next_event(&consumer).await
+        {
+            committed_outcome_event = txn_id == transaction.id();
+        }
+    }
+    for _ in 0..2 {
+        cluster
+            .wait_for("held fenced-commit child close", |fake| {
+                fake.pending_operations()
+                    .iter()
+                    .any(|pending| pending.kind == OperationKind::Close)
+            })
+            .await;
+        let pending = cluster
+            .inspect(|fake| {
+                fake.pending_operations()
+                    .into_iter()
+                    .find(|pending| pending.kind == OperationKind::Close)
+                    .map(|pending| pending.id)
+            })
+            .expect("held fenced-commit child close id");
+        cluster
+            .update(|fake| fake.complete_pending(pending, PendingCompletion::Succeed))
+            .expect("release the held fenced-commit child close");
+    }
+    ResyncedCommitTrace {
+        resync_reason_decompress,
+        committed,
+        committed_outcome_event,
+        after_close: close_and_count(consumer, cluster).await,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_while_the_aggregate_is_fenced_is_reported_equivalently() {
+    let _guard = advanced_socket_test_guard();
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let tokio = observe_commit_while_the_aggregate_is_fenced(&client, &cluster).await;
+    client.close().await;
+    drop(cluster);
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let moonpool = observe_commit_while_the_aggregate_is_fenced(&client, &cluster).await;
+    client.close().await;
+    assert_eq!(tokio, moonpool);
+    assert!(tokio.resync_reason_decompress);
+    assert!(tokio.committed);
+    assert!(tokio.committed_outcome_event);
 }
