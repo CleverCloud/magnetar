@@ -100,6 +100,23 @@ fn apply_local_ack_state(
         #[cfg(feature = "scalable-topics")]
         consumer.canonical_nack_ids.remove(id);
     }
+    // A cumulative ack also acknowledges every delivery before the id it names, so none of
+    // those may stay tracked: the ack-timeout sweep and the nack-delay sweep would otherwise
+    // ask the broker to redeliver messages the application already acknowledged.
+    if !matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
+        for horizon in &ack.message_ids {
+            if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+                tracker.remove_through(horizon);
+            }
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                tracker.remove_through(horizon);
+            }
+            #[cfg(feature = "scalable-topics")]
+            consumer
+                .canonical_nack_ids
+                .retain(|id, _| !id.is_covered_by_cumulative_ack(horizon));
+        }
+    }
     apply_batch_ack_state(&mut consumer.batch_ack_tracker, ack, message_id_data)
 }
 
@@ -20099,6 +20116,210 @@ mod conn_state_tests {
             vec![(8, 0)],
             "a cumulative ack must prune every tracker entry at or below its position, \
              not just the exact (ledger, entry) of the acked id (issue #326)"
+        );
+    }
+
+    /// A cumulative ack covers every earlier delivery, so none of them may stay in the
+    /// ack-timeout tracker: the sweep would otherwise ask the broker to redeliver
+    /// messages the application already acknowledged.
+    #[test]
+    fn cumulative_ack_releases_every_covered_id_from_the_unacked_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        for entry in 1..=4 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        // Cumulative ack at (7, 3): (7, 1), (7, 2) and (7, 3) are acknowledged; (7, 4) is
+        // above the horizon and is the only delivery still owed an ack.
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                }],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        let redelivered: Vec<(u64, u64)> = drain_outbound_commands(&mut conn)
+            .into_iter()
+            .filter_map(|command| command.redeliver_unacknowledged_messages)
+            .flat_map(|redelivery| redelivery.message_ids)
+            .map(|id| (id.ledger_id, id.entry_id))
+            .collect();
+        assert_eq!(
+            redelivered,
+            vec![(7, 4)],
+            "the ack-timeout sweep must redeliver only the delivery above the cumulative \
+             horizon, not the ids the cumulative ack already covered"
+        );
+    }
+
+    /// The ids a redelivery sweep asked the broker for, as `(ledger, entry, batch_index)`.
+    fn redelivered_ids(conn: &mut Connection) -> Vec<(u64, u64, i32)> {
+        drain_outbound_commands(conn)
+            .into_iter()
+            .filter_map(|command| command.redeliver_unacknowledged_messages)
+            .flat_map(|redelivery| redelivery.message_ids)
+            .map(|id| (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1)))
+            .collect()
+    }
+
+    /// A cumulative ack at a batch member covers the members up to and including it, so the
+    /// ack-timeout sweep redelivers only the later members; the entries after it stay owed.
+    #[test]
+    fn cumulative_ack_at_a_batch_member_releases_only_the_members_up_to_it() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        deliver_batch(&mut conn, handle, t0, 7, 1, 3);
+        deliver_batch(&mut conn, handle, t0, 7, 2, 3);
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 1,
+                    partition: -1,
+                    batch_index: 1,
+                    batch_size: 3,
+                }],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 1, 2), (7, 2, 0), (7, 2, 1), (7, 2, 2)],
+            "members 0 and 1 of entry 1 are acknowledged; member 2 and the next entry are not"
+        );
+    }
+
+    /// A cumulative ack covers the messages the application nacked earlier too: their pending
+    /// redelivery must not fire once the nack delay elapses.
+    #[test]
+    fn cumulative_ack_releases_every_covered_id_from_the_nack_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            nack_test_conn(Duration::from_secs(10), Some(Duration::from_secs(5)));
+        for entry in 1..=4 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        let delivered = |entry| MessageId {
+            ledger_id: 7,
+            entry_id: entry,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        conn.negative_ack(handle, vec![delivered(1), delivered(2), delivered(4)], t0);
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![delivered(3)],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(6));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 4, -1)],
+            "the nack sweep must redeliver only the nack above the cumulative horizon, \
+             not the nacks the cumulative ack already covered"
+        );
+    }
+
+    /// The complete id a scalable nack parks beside the nack tracker entry must go with it:
+    /// nothing would ever take it out once the entry is released.
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn cumulative_ack_releases_every_covered_canonical_nack_id() {
+        let t0 = Instant::now();
+        let (mut conn, handle) =
+            nack_test_conn(Duration::from_secs(10), Some(Duration::from_secs(5)));
+        let canonical = |entry_id| pb::MessageIdData {
+            ledger_id: 7,
+            entry_id,
+            partition: Some(-1),
+            batch_index: Some(-1),
+            ack_set: Vec::new(),
+            batch_size: Some(0),
+            first_chunk_message_id: None,
+        };
+        conn.negative_ack_with_message_id_data(
+            handle,
+            vec![canonical(1), canonical(2), canonical(4)],
+            t0,
+        );
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId::from_pb(&canonical(3))],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let parked: Vec<u64> = conn.consumers[&handle]
+            .state
+            .lock()
+            .canonical_nack_ids
+            .keys()
+            .map(|id| id.entry_id)
+            .collect();
+        assert_eq!(
+            parked,
+            vec![4],
+            "only the nack above the cumulative horizon keeps its complete id"
+        );
+    }
+
+    /// An individual ack releases exactly the id it names: the earlier deliveries stay owed.
+    #[test]
+    fn individual_ack_releases_only_the_named_id_from_the_unacked_tracker() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        for entry in 1..=3 {
+            deliver_one(&mut conn, handle, t0, 7, entry);
+        }
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = drain_outbound_commands(&mut conn);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            redelivered_ids(&mut conn),
+            vec![(7, 1, -1), (7, 2, -1)],
+            "an individual ack must not release the deliveries before it"
         );
     }
 

@@ -33,6 +33,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A cumulative ack now releases every delivery it covers from the ack-timeout and nack trackers.**
+  `apply_local_ack_state` removed only the ids a `CommandAck` named, and the trackers had no way to drop a range.
+  After `acknowledge_cumulative`, every earlier delivery stayed tracked, and when `ack_timeout` closed (or a nack delay elapsed) the sweep sent a `CommandRedeliverUnacknowledgedMessages` for messages the application had already acknowledged; on an Exclusive or Failover subscription the broker ignores the id list and rewinds, redelivering the in-flight messages above the acknowledged position as duplicates.
+  `UnackedMessageTracker::remove_through` and `NegativeAcksTracker::remove_through` now drop every tracked id the horizon covers: each earlier `(ledger, entry)`, and in the horizon's own entry every member for a horizon without a batch index or the members up to and including its index otherwise.
+  With `scalable-topics` the complete ids parked beside the nack entries go with them.
+  An individual ack still releases only the ids it names, and a transactional cumulative ack releases on commit as before.
+  Both engines run the same `Connection` code and behave identically.
+  `UnackedMessageTracker::remove_through` and `NegativeAcksTracker::remove_through` are new public methods; nothing existing changed signature.
+
+- **An ack after an empty ack-timeout bucket was reaped now releases its id.**
+  `UnackedMessageTracker::poll` removes the buckets whose deadline has passed from the front of its list, which shifts every surviving bucket down, but rebuilt the id-to-bucket index only when something was emitted.
+  A bucket reaped empty (every delivery in it acknowledged in its window, the healthy steady state) with an arrival after its deadline and before the timer-driven sweep left the survivor's index pointing one bucket too high, so the ack of that arrival found no bucket, released nothing, and the id was redelivered when its own window closed.
+  The index is now rebuilt whenever any bucket was reaped.
+
 - **`Consumer::resume` releases the flow a pause withheld.**
   `pause()` stops the automatic flow refill, so a receive loop that drains the whole window while paused leaves the broker holding zero permits and the client owing it the whole window.
   `resume()` only stored `paused = false` and woke the driver; nothing ran `maybe_flow`, whose only callers are the arrival of a message and a pop.

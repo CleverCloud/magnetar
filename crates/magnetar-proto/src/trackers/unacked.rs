@@ -137,6 +137,28 @@ impl UnackedMessageTracker {
         self.backoff_pending.remove(message_id);
     }
 
+    /// Stop tracking every message a cumulative ack at `horizon` covers, in both the bucket path
+    /// and the per-message backoff path. Mirrors Java `UnAckedMessageTracker#removeMessagesTill`.
+    ///
+    /// A cumulative ack covers every earlier `(ledger, entry)` and the entry it names. In the
+    /// horizon's own entry a `horizon` with no batch index (`batch_index < 0`) covers every
+    /// member, while a `horizon` at batch member `k` covers only the members up to and including
+    /// `k`; the partition is ignored, since one consumer holds the ids of one partition.
+    ///
+    /// Only drops ids: the buckets themselves stay where they are, so the `locator` indices
+    /// remain valid. Emptied buckets are reaped by [`Self::poll`].
+    pub fn remove_through(&mut self, horizon: &MessageId) {
+        for bucket in &mut self.buckets {
+            bucket
+                .ids
+                .retain(|id| !id.is_covered_by_cumulative_ack(horizon));
+        }
+        self.locator
+            .retain(|id, _| !id.is_covered_by_cumulative_ack(horizon));
+        self.backoff_pending
+            .retain(|id, _| !id.is_covered_by_cumulative_ack(horizon));
+    }
+
     /// Tick the tracker. Buckets whose deadline has passed are evicted and their contents
     /// surfaced as `RedeliverExpired`. When backoff is set, per-message deadlines past `now`
     /// are also drained into the action.
@@ -145,11 +167,13 @@ impl UnackedMessageTracker {
             return Vec::new();
         }
         let mut out = Vec::new();
+        let mut reaped = false;
         while let Some(bucket) = self.buckets.first() {
             if bucket.deadline > now {
                 break;
             }
             let bucket = self.buckets.remove(0);
+            reaped = true;
             if bucket.ids.is_empty() {
                 continue;
             }
@@ -163,8 +187,9 @@ impl UnackedMessageTracker {
                 message_ids: ids,
             });
         }
-        // After removing buckets we need to rebuild the locator indices.
-        if !out.is_empty() {
+        // Removing a bucket, empty or not, shifts every surviving bucket down, so the locator
+        // indices must be rebuilt whenever one was removed, not only when something was emitted.
+        if reaped {
             self.locator.clear();
             for (idx, bucket) in self.buckets.iter().enumerate() {
                 for id in &bucket.ids {
@@ -455,6 +480,117 @@ mod tests {
                 assert_eq!(message_ids, &sorted);
             }
         }
+    }
+
+    /// Reaping an already-empty bucket shifts the surviving buckets down, so every entry that
+    /// stayed tracked must still be released by its ack. An id added after the head bucket's
+    /// deadline lives in the next bucket; once the empty head is reaped, acknowledging that id
+    /// must keep it from being redelivered.
+    #[test]
+    fn remove_after_an_empty_bucket_was_reaped_releases_the_id() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        t.remove(&mid(1));
+        // Arrives after the head bucket's deadline and before the timer-driven poll.
+        let t1 = t0 + Duration::from_millis(101);
+        t.add(mid(2), t1);
+        assert_eq!(
+            t.poll(t1),
+            [] as [UnackedAction; 0],
+            "the head bucket is empty"
+        );
+        t.remove(&mid(2));
+        assert_eq!(
+            t.poll(t0 + Duration::from_millis(500)),
+            [] as [UnackedAction; 0],
+            "an acknowledged id must not be redelivered after the bucket ahead of it was reaped"
+        );
+    }
+
+    fn expired_ids(actions: &[UnackedAction]) -> Vec<MessageId> {
+        actions
+            .iter()
+            .flat_map(|UnackedAction::RedeliverExpired { message_ids, .. }| message_ids.clone())
+            .collect()
+    }
+
+    /// A cumulative ack covers every earlier delivery, in whichever bucket it sits, and must
+    /// leave the buckets (and so the locator indices a later `remove` relies on) intact.
+    #[test]
+    fn remove_through_releases_every_covered_id_in_every_bucket() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(101);
+        t.add(mid(1), t0);
+        t.add(mid(2), t0);
+        t.add(mid(3), t1);
+        t.add(mid(4), t1);
+        t.remove_through(&mid(3));
+        // The id above the horizon is still tracked, and still releasable by its own ack.
+        t.add(mid(5), t1);
+        t.remove(&mid(5));
+        assert_eq!(
+            expired_ids(&t.poll(t0 + Duration::from_millis(500))),
+            [mid(4)],
+            "only the delivery above the cumulative horizon is still owed an ack"
+        );
+    }
+
+    /// An id on the per-message backoff path is released by a cumulative ack as well.
+    #[test]
+    fn remove_through_releases_covered_backoff_ids() {
+        let backoff = MultiplierRedeliveryBackoff {
+            min_delay: Duration::from_millis(50),
+            max_delay: Duration::from_mins(1),
+            multiplier: 2.0,
+        };
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_secs(1))
+            .with_backoff(backoff);
+        let t0 = Instant::now();
+        t.add_with_redelivery_count(mid(1), 0, t0);
+        t.add_with_redelivery_count(mid(2), 0, t0);
+        t.remove_through(&mid(1));
+        assert_eq!(expired_ids(&t.poll(t0 + Duration::from_secs(10))), [mid(2)]);
+    }
+
+    /// A horizon at a batch member covers the members up to and including it; a horizon on the
+    /// whole entry covers all of them.
+    #[test]
+    fn remove_through_a_batch_member_keeps_the_later_members() {
+        let member = |entry, batch_index| MessageId {
+            ledger_id: 1,
+            entry_id: entry,
+            partition: -1,
+            batch_index,
+            batch_size: 3,
+        };
+        let tracked_batch = |t0| {
+            let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+            for batch_index in 0..3 {
+                t.add(member(1, batch_index), t0);
+                t.add(member(2, batch_index), t0);
+            }
+            t
+        };
+        let t0 = Instant::now();
+        let due = t0 + Duration::from_millis(101);
+
+        let mut t = tracked_batch(t0);
+        t.remove_through(&member(1, 1));
+        assert_eq!(
+            expired_ids(&t.poll(due)),
+            [member(1, 2), member(2, 0), member(2, 1), member(2, 2)],
+            "members 0 and 1 of entry 1 are covered, member 2 and the later entry are not"
+        );
+
+        let mut t = tracked_batch(t0);
+        t.remove_through(&mid(1));
+        assert_eq!(
+            expired_ids(&t.poll(due)),
+            [member(2, 0), member(2, 1), member(2, 2)],
+            "a whole-entry horizon covers every member of its entry and none of the next"
+        );
     }
 
     /// A disabled tracker must accept `remove` without panicking and without ever producing

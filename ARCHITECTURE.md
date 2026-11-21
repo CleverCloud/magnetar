@@ -1249,6 +1249,11 @@ It is also read on the way IN: a `CommandMessage` carrying `ack_set` is a re-dis
                                                   capped at max_delay).
 ```
 
+A positive ack releases the ids it names.
+A cumulative ack releases every tracked delivery it covers: each earlier `(ledger, entry)`, and in the horizon's own entry either every member (a horizon without a batch index) or the members up to and including the horizon's index (`UnackedMessageTracker::remove_through`, from `apply_local_ack_state`).
+The covered delivery is dropped from the ack-timeout buckets and from the per-message backoff deadlines alike; a delivery above the horizon stays tracked and is still redelivered when its window closes.
+`poll` reaps an expired bucket, empty or not, and rebuilds the id-to-bucket index whenever it reaped one, so a later ack still finds the bucket its id sits in.
+
 ### Negative-ack tracker
 
 ```text
@@ -1285,6 +1290,7 @@ It is also read on the way IN: a `CommandMessage` carrying `ack_set` is a re-dis
 `negative_ack` removes the nacked id from the `UnackedMessageTracker` **before** it touches the nack tracker, and does so unconditionally — on both the nack-tracker-present and nack-tracker-absent paths.
 Without that removal a message that is both nacked and ack-timeout tracked is redelivered twice: once when the nack delay elapses, once when the ack-timeout window elapses.
 The removal is symmetric with the positive-ack path, which already drops acked ids from both the unacked tracker and the nack tracker, and mirrors the Java client's `ConsumerImpl#negativeAcknowledge`.
+The positive-ack path is symmetric in the other direction too: an individual ack drops the acked id from both trackers, and a cumulative ack drops every id it covers from both (`NegativeAcksTracker::remove_through`) and, with `scalable-topics`, the complete ids parked beside them, so a message the application nacked and then acknowledged is not redelivered when the nack delay elapses.
 
 ### DLQ + retry-letter
 
