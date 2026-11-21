@@ -802,6 +802,8 @@ Vector ack fans out through segment-local semantics.
 Partial failure reports confirmed and failed components; confirmed components cannot be rolled back and retry is idempotent.
 Retrying the same cumulative token reconciles every source in its saved vector and omits only independently confirmed components; it does not restore receive or individual-acknowledgement authority.
 When a broker dispatch carries `ack_set`, only selected batch members are exposed and their canonical ids retain that mask; individual and cumulative acknowledgement preserve the residual mask for later selected members in the same broker entry.
+Cancelling an acknowledgement before the broker confirms it leaves every delivery lease in place.
+Once the broker confirms, the model commits the settlement and the follow-up actions it returned (completing acknowledged segments, closing a drained segment, granting flow) run inline in the caller's future; a caller dropped before they finish hands the unfinished work to an owned task that `close()` joins, so a drained segment's close and removal still complete, and a failure of that work requests resynchronization because no caller is left to receive it.
 
 Transactional acknowledgement registers every represented `(segment topic, subscription)` and admits every component before commit closes admission.
 Commit waits for all admitted operations.

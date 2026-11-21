@@ -3,8 +3,11 @@
 //! Owned, bounded routes for scalable-topic control-plane events.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -997,6 +1000,48 @@ struct AcknowledgementCancellation<'a> {
     armed: bool,
 }
 
+/// The work a settled acknowledgement leaves behind, boxed so a dropped caller
+/// can hand it to an owned task.
+type SettledWork = Pin<Box<dyn Future<Output = Result<(), StreamConsumerError>> + Send>>;
+
+/// Drives settled work inline with its caller, so the non-cancelled path behaves
+/// as if the caller ran it directly. Dropping the caller before the work finishes
+/// moves the unfinished future onto an owned, tracked task instead of cancelling
+/// it: the model has already committed the settlement, so its follow-up actions
+/// (`CloseChild`, `GrantFlow`, ...) must still run to completion. A failure the
+/// vanished caller cannot receive requests a resynchronization.
+struct ContinueOnDrop {
+    inner: Arc<StreamConsumerInner>,
+    work: Option<SettledWork>,
+}
+
+impl Future for ContinueOnDrop {
+    type Output = Result<(), StreamConsumerError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let work = self
+            .work
+            .as_mut()
+            .expect("settled work is polled until it completes");
+        let result = std::task::ready!(work.as_mut().poll(context));
+        self.work = None;
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for ContinueOnDrop {
+    fn drop(&mut self) {
+        if let Some(work) = self.work.take() {
+            let inner = self.inner.clone();
+            self.inner.spawn_action_work(async move {
+                if let Err(error) = work.await {
+                    inner.request_resync(error.to_string());
+                }
+            });
+        }
+    }
+}
+
 struct SeekCancellation {
     inner: Weak<StreamConsumerInner>,
     armed: bool,
@@ -1665,22 +1710,48 @@ impl StreamConsumerInner {
         if actions.is_empty() {
             return;
         }
+        let inner = self.clone();
+        self.spawn_action_work(async move {
+            inner.execute_actions_or_resync(actions).await;
+        });
+    }
+
+    /// Run `work` on a tracked task that the aggregate's close joins; a close
+    /// already in progress closes every child itself, so nothing is spawned.
+    fn spawn_action_work<F>(self: &Arc<Self>, work: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let mut state = self.state.lock();
         if !state.close_state.is_closing() {
-            let inner = self.clone();
             let completion_inner = Arc::downgrade(self);
-            let handle = self.subscriber.spawn_task_with_completion(
-                async move {
-                    inner.execute_actions_or_resync(actions).await;
-                },
-                move || {
-                    if let Some(inner) = completion_inner.upgrade() {
-                        inner.notify.notify_waiters();
-                    }
-                },
-            );
+            let handle = self.subscriber.spawn_task_with_completion(work, move || {
+                if let Some(inner) = completion_inner.upgrade() {
+                    inner.notify.notify_waiters();
+                }
+            });
             Self::track_task(&mut state, handle);
         }
+    }
+
+    /// Execute what a committed settlement left to do: offer the acknowledged
+    /// `components` for completion, then run `actions`. The caller's future drives
+    /// it inline; if that future is dropped first, the rest finishes on an owned
+    /// task instead of being lost.
+    async fn execute_settled(
+        self: &Arc<Self>,
+        components: Vec<magnetar_proto::AcknowledgementComponent>,
+        actions: Vec<magnetar_proto::StreamConsumerAction>,
+    ) -> Result<(), StreamConsumerError> {
+        let inner = self.clone();
+        ContinueOnDrop {
+            inner: self.clone(),
+            work: Some(Box::pin(async move {
+                inner.try_complete_components(&components).await;
+                inner.execute_actions(actions).await
+            })),
+        }
+        .await
     }
 
     async fn execute_actions_or_resync(
@@ -2423,8 +2494,7 @@ impl StreamConsumerInner {
             .model
             .settle_acknowledgement(&transition.authority, &confirmed_sources)?;
         cancellation.disarm();
-        self.try_complete_components(&transition.components).await;
-        self.execute_actions(actions).await?;
+        self.execute_settled(transition.components, actions).await?;
         if failed.is_empty() {
             Ok(())
         } else {
@@ -2458,7 +2528,7 @@ impl StreamConsumerInner {
                     }
                 };
                 cancellation.disarm();
-                self.execute_actions(actions).await?;
+                self.execute_settled(Vec::new(), actions).await?;
                 return Err(error);
             }
             let consumer =
@@ -2491,7 +2561,7 @@ impl StreamConsumerInner {
                     }
                 };
                 cancellation.disarm();
-                self.execute_actions(actions).await?;
+                self.execute_settled(Vec::new(), actions).await?;
                 return Err(error.into());
             }
         }
@@ -7638,6 +7708,288 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.open_tasks, 0, "completed sealed parent never reopens");
+    }
+
+    /// A caller that gives up on `acknowledge` while the drained parent's
+    /// `CommandCloseConsumer` is in flight must not strand the model's
+    /// post-settlement actions: the child still leaves `children` and the model.
+    #[tokio::test]
+    async fn dropped_acknowledgement_still_finishes_the_drained_child_close() {
+        let (snapshot, assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from(snapshot, assignment.clone());
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("sealed parent child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    71,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"terminal"),
+                    1,
+                ),
+            )
+            .await
+            .expect("retain sealed-parent delivery");
+        let message = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve sealed-parent delivery")
+            .pop()
+            .expect("one sealed-parent delivery");
+        let empty = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: assignment.layout_epoch(),
+                segments: Vec::new(),
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("empty rebalance assignment");
+        let stop = inner
+            .state
+            .lock()
+            .model
+            .apply_assignment(empty)
+            .expect("sealed parent loses ownership while delivery is live");
+        inner.execute_actions(stop).await.expect("stop parent flow");
+        assert_eq!(
+            inner
+                .state
+                .lock()
+                .model
+                .apply_assignment(assignment)
+                .expect("sealed parent regains ownership while draining"),
+            [] as [magnetar_proto::StreamConsumerAction; 0]
+        );
+        {
+            let mut state = inner.state.lock();
+            assert_eq!(state.model.pending_ownership(), vec![child.source.clone()]);
+            assert_eq!(
+                state
+                    .model
+                    .observe_terminal(child.source.segment_id(), child.generation)
+                    .expect("sealed parent terminal with live acknowledgement"),
+                [] as [magnetar_proto::StreamConsumerAction; 0]
+            );
+        }
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let mut acknowledgement = Box::pin(consumer.acknowledge(&message.token));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let ack = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode terminal acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let ack_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: ack.consumer_id,
+                request_id: ack.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&ack_response))
+            .expect("confirm terminal acknowledgement");
+        // The caller's last poll: the broker confirmed the acknowledgement and the
+        // settled actions are now closing the drained parent.
+        std::future::poll_fn(|context| {
+            let _ = std::future::Future::poll(acknowledgement.as_mut(), context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Whoever executes the settled actions stages the close; the budget keeps a
+        // missing close from hanging the test.
+        let mut close_request_id = None;
+        for _ in 0..64 {
+            let mut transmitted = child_shared.inner.lock().poll_transmit();
+            while !transmitted.is_empty() {
+                let frame = magnetar_proto::decode_one(&mut transmitted)
+                    .expect("decode transmitted sealed-parent frame");
+                if let Some(close) = frame.command.close_consumer {
+                    close_request_id = Some(close.request_id);
+                }
+            }
+            if close_request_id.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let close_request_id =
+            close_request_id.expect("the settled actions close the drained sealed parent");
+        // The application times out and walks away while the close is in flight.
+        drop(acknowledgement);
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &success(close_request_id))
+            .expect("confirm sealed-parent close");
+        for _ in 0..64 {
+            if inner.state.lock().children.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = inner.state.lock();
+        assert!(
+            state.children.is_empty(),
+            "the confirmed close of a drained parent removes its runtime child even when the acknowledgement future was dropped"
+        );
+        assert_eq!(
+            state.model.segment_phase(child.source.segment_id()),
+            None,
+            "the model finishes the drained parent's close even when the acknowledgement future was dropped"
+        );
+        assert_eq!(
+            state.model.pending_ownership(),
+            [] as [magnetar_proto::SegmentSource; 0]
+        );
+    }
+
+    /// The owned task that finishes a dropped acknowledgement has no caller left to
+    /// receive a failure of the drained parent's close, so it requests a
+    /// resynchronization instead of dropping the error.
+    #[tokio::test]
+    async fn dropped_acknowledgement_resyncs_when_the_drained_child_close_fails() {
+        let (snapshot, assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from(snapshot, assignment.clone());
+        let child = inner
+            .state
+            .lock()
+            .children
+            .values()
+            .next()
+            .expect("sealed parent child")
+            .clone();
+        let session_epoch = child_shared.inner.lock().session_epoch();
+        inner
+            .message_arrived(
+                child.source.clone(),
+                child.generation,
+                session_epoch,
+                &child.consumer,
+                deferred_message(
+                    71,
+                    magnetar_proto::pb::MessageMetadata::default(),
+                    bytes::Bytes::from_static(b"terminal"),
+                    1,
+                ),
+            )
+            .await
+            .expect("retain sealed-parent delivery");
+        let message = inner
+            .reserve_batch(1, usize::MAX)
+            .await
+            .expect("reserve sealed-parent delivery")
+            .pop()
+            .expect("one sealed-parent delivery");
+        let empty = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: assignment.layout_epoch(),
+                segments: Vec::new(),
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("empty rebalance assignment");
+        let stop = inner
+            .state
+            .lock()
+            .model
+            .apply_assignment(empty)
+            .expect("sealed parent loses ownership while delivery is live");
+        inner.execute_actions(stop).await.expect("stop parent flow");
+        let _ = child_shared.inner.lock().poll_transmit();
+
+        let consumer = StreamConsumer {
+            inner: inner.clone(),
+        };
+        let mut acknowledgement = Box::pin(consumer.acknowledge(&message.token));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let ack = magnetar_proto::decode_one(&mut child_shared.inner.lock().poll_transmit())
+            .expect("decode terminal acknowledgement")
+            .command
+            .ack
+            .expect("CommandAck");
+        let ack_response = magnetar_proto::pb::BaseCommand {
+            r#type: magnetar_proto::pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(magnetar_proto::pb::CommandAckResponse {
+                consumer_id: ack.consumer_id,
+                request_id: ack.request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(std::time::Instant::now(), &encode(&ack_response))
+            .expect("confirm terminal acknowledgement");
+        // The caller's last poll stages the close, then the caller walks away.
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                std::future::Future::poll(acknowledgement.as_mut(), context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(acknowledgement);
+        reject_pending_child_close(&child_shared);
+        for _ in 0..64 {
+            if inner.state.lock().reconnect_requested {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = inner.state.lock();
+        assert!(
+            state.reconnect_requested,
+            "a close failure nobody can receive requests a resynchronization"
+        );
+        assert!(state.children.is_empty());
+        assert!(
+            state
+                .model
+                .segment_phase(child.source.segment_id())
+                .is_none()
+        );
+        assert!(state.events.iter().any(|event| matches!(
+            event,
+            StreamConsumerEvent::ResyncRequired { reason } if reason.contains("close failed")
+        )));
     }
 
     #[tokio::test]
