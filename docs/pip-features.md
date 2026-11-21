@@ -775,6 +775,11 @@ It therefore fails the consumer with the typed `MessageTooLargeForBudget` text (
 A message chunked because it exceeds the broker's default 5 MiB `max_message_size` is above that bound at the default budget; the bound holds for any `max_message_size` of about 1.54 MB or more.
 A chain that would fit alone but meets a budget held by sibling children or retained messages fails with `Exhausted` and still resynchronizes, because that pressure can clear.
 Decompression and batch-assembly budget failures keep their resynchronization disposition.
+When the broker ends a child's topic nothing more can arrive on it, so the child abandons every chain it still holds open: the assemblies are released with the flow permit and the chunks they retained are dropped (`StreamReceiveState::observe_terminal`).
+A chunk chain whose last chunk never arrives therefore cannot keep a terminal segment from completing, which is what unblocks its descendants and lets a draining child close.
+The child hands over every entry it received before it reports the end of the topic, so only a chain that can no longer finish is abandoned.
+The broker reports the end of the topic only once every entry is acknowledged, so this applies after a cumulative acknowledgement of a later entry covered the chain's first chunk; a chain whose first chunk stays unacknowledged keeps the segment from completing, because nothing abandons or acknowledges it.
+A chain on a segment that is still live has no expiry: it stays open until the child closes or the aggregate resynchronizes.
 
 ### Concurrent receive and batch ordering
 

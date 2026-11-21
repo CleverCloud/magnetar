@@ -2212,9 +2212,13 @@ impl StreamConsumerInner {
                 Ok(None) => {
                     let actions = {
                         let mut state = self.state.lock();
+                        let state = &mut *state;
+                        // The end of the topic leaves nothing more to arrive, so the
+                        // chunk chains the child still holds open are abandoned
+                        // with their budget instead of pinning the segment.
                         state
-                            .model
-                            .observe_terminal(source.segment_id(), generation)
+                            .receive
+                            .observe_terminal(&mut state.model, source.segment_id(), generation)
                             .unwrap_or_default()
                     };
                     if let Err(error) = self.execute_actions(actions).await {
@@ -7616,6 +7620,146 @@ mod tests {
             Some(parent.generation)
         );
         assert!(!state.children.contains_key(&magnetar_proto::SegmentId(2)));
+    }
+
+    /// The phase of a strict-ordering descendant after its parent's broker
+    /// consumer reports the end of the topic and the child loop handles it,
+    /// with or without chunk zero of a two-chunk message buffered on the parent.
+    async fn descendant_phase_after_parent_end_of_topic(
+        buffer_chunk_zero: bool,
+    ) -> Option<magnetar_proto::SegmentPhase> {
+        let (snapshot, parent_assignment) = sealed_parent_fixture();
+        let (inner, child_shared) = aggregate_inner_with_child_from_ordered(
+            snapshot,
+            parent_assignment.clone(),
+            magnetar_proto::OrderingMode::Strict,
+        );
+        let parent = inner.state.lock().children[&magnetar_proto::SegmentId(1)].clone();
+        let assigned = magnetar_proto::ConsumerAssignment::try_from_pb(
+            &magnetar_proto::pb::ScalableConsumerAssignment {
+                layout_epoch: parent_assignment.layout_epoch(),
+                segments: vec![
+                    magnetar_proto::pb::ScalableAssignedSegment {
+                        bucket_ranges: Vec::new(),
+                        segment_id: 1,
+                        hash_start: 0,
+                        hash_end: 65_535,
+                        segment_topic: parent.source.topic().to_owned(),
+                    },
+                    magnetar_proto::pb::ScalableAssignedSegment {
+                        bucket_ranges: Vec::new(),
+                        segment_id: 2,
+                        hash_start: 0,
+                        hash_end: 32_767,
+                        segment_topic: magnetar_proto::canonical_segment_topic(
+                            "topic://public/default/scaled",
+                            magnetar_proto::KeyRange::new(0, 32_767).expect("child range"),
+                            magnetar_proto::SegmentId(2),
+                        )
+                        .expect("canonical child topic"),
+                    },
+                ],
+            },
+            "topic://public/default/scaled",
+        )
+        .expect("parent and descendant assignment");
+        {
+            let mut state = inner.state.lock();
+            let actions = state
+                .model
+                .apply_assignment(assigned)
+                .expect("assign descendant");
+            let generation = actions
+                .iter()
+                .find_map(|action| match action {
+                    magnetar_proto::StreamConsumerAction::OpenChild {
+                        source,
+                        child_generation,
+                        ..
+                    } if source.segment_id() == magnetar_proto::SegmentId(2) => {
+                        Some(*child_generation)
+                    }
+                    _ => None,
+                })
+                .expect("descendant opens");
+            state
+                .model
+                .child_opened(magnetar_proto::SegmentId(2), generation)
+                .expect("attach blocked descendant");
+        }
+        if buffer_chunk_zero {
+            let session_epoch = child_shared.inner.lock().session_epoch();
+            inner
+                .message_arrived(
+                    parent.source.clone(),
+                    parent.generation,
+                    session_epoch,
+                    &parent.consumer,
+                    deferred_message(
+                        10,
+                        magnetar_proto::pb::MessageMetadata {
+                            uuid: Some("never-finished".to_owned()),
+                            num_chunks_from_msg: Some(2),
+                            chunk_id: Some(0),
+                            total_chunk_msg_size: Some(4),
+                            ..Default::default()
+                        },
+                        bytes::Bytes::from_static(b"ab"),
+                        1,
+                    ),
+                )
+                .await
+                .expect("buffer chunk zero");
+        }
+        child_shared
+            .inner
+            .lock()
+            .handle_bytes(
+                std::time::Instant::now(),
+                &encode(&magnetar_proto::pb::BaseCommand {
+                    r#type: magnetar_proto::pb::base_command::Type::ReachedEndOfTopic as i32,
+                    reached_end_of_topic: Some(magnetar_proto::pb::CommandReachedEndOfTopic {
+                        consumer_id: parent.consumer.handle().0,
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("parent reaches the end of the topic");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            inner.clone().child_loop(
+                parent.source.clone(),
+                parent.generation,
+                parent.consumer.clone(),
+            ),
+        )
+        .await
+        .expect("the parent's child loop ends at the end of the topic");
+        let state = inner.state.lock();
+        assert!(state.terminal_error.is_none(), "{:?}", state.terminal_error);
+        assert!(!state.reconnect_requested, "the aggregate resynchronized");
+        state
+            .model
+            .segment_phase(magnetar_proto::SegmentId(2))
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent() {
+        // Control: with no chunk buffered the terminal parent completes and the
+        // descendant, no longer waiting on its predecessor, is granted FLOW.
+        assert_eq!(
+            descendant_phase_after_parent_end_of_topic(false).await,
+            Some(magnetar_proto::SegmentPhase::Flowing)
+        );
+        // Chunk zero of a message whose last chunk never arrives is not
+        // resolvable by the application and the broker sends nothing more after
+        // the end of the topic, so it must not keep the parent from completing.
+        assert_eq!(
+            descendant_phase_after_parent_end_of_topic(true).await,
+            Some(magnetar_proto::SegmentPhase::Flowing),
+            "a terminal parent whose last chunk chain never finished must still complete"
+        );
     }
 
     #[tokio::test]

@@ -5018,6 +5018,151 @@ async fn run_moonpool_interleaved_chunk_chain() {
     client.close().await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalChunkChainTrace {
+    flowing: Vec<u64>,
+    descendants_flowing_on_the_wire: Vec<u64>,
+}
+
+/// The producer of segment 1 writes chunk zero of a two-chunk message and never
+/// writes chunk one; the segment is then split and sealed, and the broker
+/// reports its end of topic. Nothing the application can resolve is left on the
+/// segment and the broker sends nothing more, so the parent must complete and
+/// release its descendants. With `chunk_zero` false the same split is the
+/// control: the parent completes at once. The fake reports the end of the topic
+/// once every entry is delivered, while a real broker waits until every entry is
+/// acknowledged, so this stands for a chain whose first chunk a cumulative
+/// acknowledgement of a later entry covered.
+async fn observe_terminal_with_incomplete_chunk_chain<E>(
+    client: &PulsarClient<E>,
+    cluster: &M1SocketCluster,
+    chunk_zero: bool,
+) -> TerminalChunkChainTrace
+where
+    E: Engine,
+    E::ClientState: SegmentSubscriberApi,
+{
+    let consumer = client
+        .scalable_stream_consumer(TOPIC, Arc::new(BytesSchema::new()))
+        .subscription("terminal-chunk-sub")
+        .consumer_name("terminal-chunk-member")
+        .ordering_mode(magnetar::proto::OrderingMode::Strict)
+        .receiver_budget(
+            magnetar::proto::ReceiverBudget::bytes(64 * 1024 * 1024)
+                .expect("large terminal-chunk receive budget"),
+        )
+        .subscribe()
+        .await
+        .expect("subscribe terminal-chunk aggregate");
+    cluster
+        .wait_for("terminal-chunk initial children", |fake| {
+            fake.resource_counts().child_consumers == 2
+        })
+        .await;
+    wait_for_initial_flow(&consumer, &[1, 2]).await;
+    cluster.retain_sealed_placements();
+
+    if chunk_zero {
+        let flows_before = cluster.inspect(|fake| flow_command_count(fake, 1));
+        cluster
+            .update(|fake| {
+                fake.enqueue_message_with_metadata(
+                    1,
+                    magnetar::proto::pb::MessageMetadata {
+                        uuid: Some("never-finished".to_owned()),
+                        num_chunks_from_msg: Some(2),
+                        chunk_id: Some(0),
+                        total_chunk_msg_size: Some(4),
+                        ..Default::default()
+                    },
+                    Bytes::from_static(b"ab"),
+                    Vec::new(),
+                )
+            })
+            .expect("enqueue chunk zero of a message whose last chunk never arrives");
+        cluster
+            .wait_for("continuation FLOW of the open chunk chain", |fake| {
+                flow_command_count(fake, 1) > flows_before
+            })
+            .await;
+    }
+
+    let member = cluster
+        .inspect(|fake| fake.member("terminal-chunk-sub", "terminal-chunk-member"))
+        .expect("terminal-chunk member observable");
+    cluster
+        .update(|fake| {
+            fake.clear_routes();
+            fake.advance_layout(2, split_layout())?;
+            fake.publish_early_descendant_assignment_plan(
+                2,
+                vec![FullAssignment::new(member, [1, 2, 3, 4])],
+            )?;
+            fake.terminate_segment(1)
+        })
+        .expect("publish early split descendants and the parent terminal");
+    let _ = wait_for_assignment(&consumer, 2, &[1, 2, 3, 4]).await;
+    cluster
+        .wait_for("split descendants attach without FLOW", |fake| {
+            let subscribed =
+                command_segments(fake, magnetar::proto::pb::base_command::Type::Subscribe);
+            subscribed.contains(&3) && subscribed.contains(&4)
+        })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        wait_for_flowing_sources(&consumer, &[3, 4]).await;
+        cluster
+            .wait_for("split descendants receive FLOW", |fake| {
+                flow_command_count(fake, 3) > 0 && flow_command_count(fake, 4) > 0
+            })
+            .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the descendants never received FLOW (chunk zero buffered: {chunk_zero}): the \
+             terminal parent's incomplete chunk chain keeps the parent from completing"
+        )
+    });
+    let descendants_flowing_on_the_wire = cluster.inspect(|fake| {
+        command_segments(fake, magnetar::proto::pb::base_command::Type::Flow)
+            .into_iter()
+            .filter(|segment_id| matches!(segment_id, 3 | 4))
+            .collect::<Vec<_>>()
+    });
+    let _ = tokio::time::timeout(magnetar_differential::HANG_GUARD, consumer.close()).await;
+    TerminalChunkChainTrace {
+        flowing: vec![3, 4],
+        descendants_flowing_on_the_wire,
+    }
+}
+
+/// Both engines, with and without the open chunk chain, release exactly the two
+/// split descendants.
+fn expected_terminal_chunk_chain_trace() -> TerminalChunkChainTrace {
+    TerminalChunkChainTrace {
+        flowing: vec![3, 4],
+        descendants_flowing_on_the_wire: vec![3, 4],
+    }
+}
+
+async fn run_tokio_terminal_chunk_chain(chunk_zero: bool) -> TerminalChunkChainTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_tokio(&cluster).await;
+    let trace = observe_terminal_with_incomplete_chunk_chain(&client, &cluster, chunk_zero).await;
+    client.close().await;
+    trace
+}
+
+async fn run_moonpool_terminal_chunk_chain(chunk_zero: bool) -> TerminalChunkChainTrace {
+    let cluster = M1SocketCluster::bind().await;
+    let client = connect_moonpool(&cluster).await;
+    let trace = observe_terminal_with_incomplete_chunk_chain(&client, &cluster, chunk_zero).await;
+    client.close().await;
+    trace
+}
+
 async fn observe_child_open_lifecycle<E>(
     client: &PulsarClient<E>,
     cluster: &M1SocketCluster,
@@ -7144,6 +7289,28 @@ async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_tokio() {
 async fn interleaved_chunk_chain_does_not_resynchronize_forever_on_moonpool() {
     let _serial = advanced_socket_test_guard();
     run_moonpool_interleaved_chunk_chain().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent_on_tokio() {
+    let _serial = advanced_socket_test_guard();
+    let control = run_tokio_terminal_chunk_chain(false).await;
+    assert_eq!(control, expected_terminal_chunk_chain_trace());
+    assert_eq!(
+        run_tokio_terminal_chunk_chain(true).await,
+        expected_terminal_chunk_chain_trace()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incomplete_chunk_chain_does_not_block_descendants_of_a_terminal_parent_on_moonpool() {
+    let _serial = advanced_socket_test_guard();
+    let control = run_moonpool_terminal_chunk_chain(false).await;
+    assert_eq!(control, expected_terminal_chunk_chain_trace());
+    assert_eq!(
+        run_moonpool_terminal_chunk_chain(true).await,
+        expected_terminal_chunk_chain_trace()
+    );
 }
 
 async fn observe_withdrawn_open_finishing_during_close<E>(
