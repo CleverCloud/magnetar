@@ -754,6 +754,7 @@ When `driver_loop_inner` returns (the socket errored or the peer closed), the ou
 The supervisor:
 
 1. **Records the disconnect** via `Connection::mark_disconnected(now, wall_now)` so `Producer::last_disconnected_timestamp` and the consumer stats are correct.
+   On a connection the user has already closed it records nothing and leaves `Closing` / `Closed` as it is (item 3).
 2. **Resets the state machine** with `Connection::reset()` — this snaps the handshake back to `Uninitialized`, bumps the `session_epoch`, drains the pending-op slabs, and **accumulates** in-flight publish snapshots into `Connection::in_flight_publish_snapshots` (append, never clear).
    The snapshot is `rebuild_producers`'s single consumer, so multiple reset cycles within a single rebuild are safe.
    User-facing send futures stay `Pending`; the snapshot carries enough state to replay them.
@@ -761,6 +762,11 @@ The supervisor:
 3. **Gates on `is_user_closed()`** — only the explicit `Closing` / `Closed` states stop the supervisor.
    The transport-drop state (`Failed`, set by `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls into the backoff / redial path instead of returning.
    This is the difference between "broker went away" and "user called `.close()`".
+   The gate is only as good as the state it reads, so a user close is **sticky**: `Connection::advance_handshake_state` is the one entry for the transitions a peer or the transport causes (`mark_disconnected`, `CommandConnected`, `CommandAuthChallenge`), and it ignores them while the connection is `Closing` / `Closed`.
+   A close that is still draining its write queue races exactly those arms — a read error, an EOF, a decode error, the ADR-0083 write deadline — and, with the transition applied, the socket's death would demote `Closing` to `Failed`, the supervisor would redial, `reset()` and re-attach every producer and consumer, and `Client::close()` would never return.
+   A `CommandConnected` or `CommandAuthChallenge` that arrives after the close is dropped for the same reason (an answered challenge moves `AuthChallenging` back to `Connected`).
+   Only `reset()` starts a new session, and the check after the dial below keeps the supervisor from calling it on a closed connection.
+   ([ADR-0134](specs/adr/0134-make-a-user-close-sticky-in-the-connection-state-machine.md))
    The gate is checked at the top of every cycle, after every backoff sleep, and once more, under the same lock acquisition as the `Connection::reset()` it guards, after a dial succeeds: a `close()` that lands while the dial is in flight is otherwise erased, because `reset()` snaps `Closing` back to `Uninitialized` and drops the queued `Closed` event, so the supervisor would re-attach every producer and consumer on the fresh socket and `Client::close()`, which joins the driver, would never return.
    A close observed there drops the freshly dialled transport and returns the previous inner result.
 4. **Backs off** with a small exponential schedule capped by `ReconnectConfig::max_backoff` (jittered by the engine clock — under moonpool-sim this is deterministic per seed).

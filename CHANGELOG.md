@@ -23,6 +23,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Client::close()` no longer hangs, and no longer reconnects, when a socket failure or a late handshake frame races it.**
+  `Connection::close()` records the user's intent only as the handshake state `Closing`, and the supervised driver's one stop signal is `is_user_closed()`.
+  A transport failure while the close was still draining its write queue (a read error, an EOF, a decode error, or the ADR-0083 write deadline against a broker that stopped reading) called `mark_disconnected()`, which turned `Closing` into the redialable `Failed`.
+  The supervisor then reconnected, re-attached every producer and consumer and replayed their in-flight publishes, and `close().await` never returned — a zombie session on the broker for the life of the process, since the default `max_attempts` is unbounded.
+  A user close is now sticky in `magnetar-proto`: `mark_disconnected()` and the broker's `CommandConnected` and `CommandAuthChallenge` leave `Closing` / `Closed` alone, because an answered challenge moves the connection back to `Connected` just as a late CONNECTED does ([ADR-0134](specs/adr/0134-make-a-user-close-sticky-in-the-connection-state-machine.md)).
+  An unsupervised connection is unchanged: it never redialled, and its driver exits as before.
+
 - **A batched receive no longer drops the good messages it already popped when a later member fails.**
   `Consumer::receive_batch` / `receive_batch_with_bytes_cap` take the first message through `receive()` and pop the rest under the connection lock into a local accumulator.
   A member after the first that failed post-processing — decryption under the default `CryptoFailureAction::Fail`, a consumer with no decryptor, an unknown compression code, a decompress error — returned `Err` straight from that loop and dropped the accumulator, so up to `max_messages - 1` good messages were never shown, acked or nacked and stayed unacknowledged at the broker (with the default `ack_timeout` of `None`, until a reconnect), with no indication of which.

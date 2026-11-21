@@ -813,6 +813,32 @@ impl Connection {
         }
     }
 
+    /// Apply a handshake transition that a *peer* or the *transport* caused: a socket failure
+    /// ([`Self::mark_disconnected`]) or a broker frame (`CommandConnected`,
+    /// `CommandAuthChallenge`). Returns whether the transition was applied.
+    ///
+    /// A user close is sticky: `Closing` / `Closed` record the application's intent, and the
+    /// supervised driver's only stop signal is [`Self::is_user_closed`]. A close races the
+    /// transport — it keeps draining the write queue, so a read error, an EOF, a decode error or
+    /// the write deadline can still fire — and the broker may answer the handshake after the
+    /// close. Letting any of those overwrite `Closing` hands the supervisor a connection it reads
+    /// as a transport drop: it redials, [`Self::reset`]s, re-attaches every producer and consumer
+    /// and `Client::close()` never returns. Only [`Self::reset`], which a driver must not call on
+    /// a user-closed connection, starts a new session.
+    fn advance_handshake_state(&mut self, next: HandshakeState) -> bool {
+        if self.is_user_closed() {
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                state = ?self.state,
+                ignored = ?next,
+                "handshake transition ignored: the user closed the connection",
+            );
+            return false;
+        }
+        self.set_handshake_state(next);
+        true
+    }
+
     /// Returns whether the connection is ready to accept producer / consumer opens.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, HandshakeState::Connected)
@@ -858,14 +884,15 @@ impl Connection {
     /// Mark the connection as failed (e.g. peer EOF, I/O error) and record the disconnect
     /// timestamp. Called by the runtime driver when the underlying socket dies before a
     /// graceful close has been initiated.
+    ///
+    /// A connection the user has already closed ([`Self::is_user_closed`]) stays `Closing` /
+    /// `Closed`: the socket dying while the close drains is the expected end of that close, not a
+    /// transport drop to redial (see `advance_handshake_state`).
     pub fn mark_disconnected(&mut self) {
-        if !matches!(
-            self.state,
-            HandshakeState::Closed | HandshakeState::Failed | HandshakeState::Closing
-        ) {
+        let first_drop = self.state != HandshakeState::Failed;
+        if self.advance_handshake_state(HandshakeState::Failed) && first_drop {
             self.last_disconnected_at = Some((self.wall_clock)());
         }
-        self.set_handshake_state(HandshakeState::Failed);
     }
 
     /// Monotonic session epoch — incremented each time the supervisor invokes
@@ -2700,16 +2727,19 @@ impl Connection {
                 let connected = command
                     .connected
                     .ok_or(ProtocolError::Handshake("missing CommandConnected"))?;
-                self.set_handshake_state(HandshakeState::Connected);
-                self.last_connected_at = Some((self.wall_clock)());
-                self.broker_max_message_size = connected.max_message_size.map(|v| v as usize);
-                self.broker_protocol_version = connected.protocol_version.unwrap_or(0);
-                self.feature_flags = connected.feature_flags.unwrap_or_default();
-                self.events.push_back(ConnectionEvent::Connected {
-                    protocol_version: self.broker_protocol_version,
-                    max_message_size: connected.max_message_size.unwrap_or(0) as u32,
-                    feature_flags: self.feature_flags,
-                });
+                // A CONNECTED that arrives after the user closed answers a handshake nobody
+                // is waiting for any more: it must not reopen the connection.
+                if self.advance_handshake_state(HandshakeState::Connected) {
+                    self.last_connected_at = Some((self.wall_clock)());
+                    self.broker_max_message_size = connected.max_message_size.map(|v| v as usize);
+                    self.broker_protocol_version = connected.protocol_version.unwrap_or(0);
+                    self.feature_flags = connected.feature_flags.unwrap_or_default();
+                    self.events.push_back(ConnectionEvent::Connected {
+                        protocol_version: self.broker_protocol_version,
+                        max_message_size: connected.max_message_size.unwrap_or(0) as u32,
+                        feature_flags: self.feature_flags,
+                    });
+                }
             }
             pb::base_command::Type::Ping => {
                 // Pong back immediately.
@@ -2731,14 +2761,18 @@ impl Connection {
                 let challenge = command
                     .auth_challenge
                     .ok_or(ProtocolError::Handshake("missing CommandAuthChallenge"))?;
-                self.set_handshake_state(HandshakeState::AuthChallenging);
-                self.events.push_back(ConnectionEvent::AuthChallenge {
-                    method: challenge
-                        .challenge
-                        .as_ref()
-                        .and_then(|d| d.auth_method_name.clone()),
-                    challenge: challenge.challenge.and_then(|d| d.auth_data),
-                });
+                // A challenge after the user closed would be answered by `submit_auth_response`,
+                // which moves `AuthChallenging` to `Connected`: the same resurrection as a late
+                // CONNECTED. Ignore it; there is no session left to authenticate.
+                if self.advance_handshake_state(HandshakeState::AuthChallenging) {
+                    self.events.push_back(ConnectionEvent::AuthChallenge {
+                        method: challenge
+                            .challenge
+                            .as_ref()
+                            .and_then(|d| d.auth_method_name.clone()),
+                        challenge: challenge.challenge.and_then(|d| d.auth_data),
+                    });
+                }
             }
             pb::base_command::Type::SendReceipt => {
                 let receipt = command
@@ -10212,6 +10246,77 @@ mod conn_state_tests {
         assert!(
             !dropped.is_user_closed(),
             "transport drop must NOT short-circuit the supervisor reconnect loop",
+        );
+    }
+
+    /// A user close is sticky against the broker's frames as well as the transport's:
+    /// `submit_auth_response` answers a challenge by moving `AuthChallenging` to `Connected`, so
+    /// a `CommandAuthChallenge` that overwrote `Closing` would resurrect the closed connection,
+    /// the same loss as a transport drop after `close()`: the supervisor redials and
+    /// `Client::close()` never returns. The open connection is the control: the guard must
+    /// discriminate on the user close, not block challenges altogether.
+    #[test]
+    fn auth_challenge_after_close_keeps_the_user_close() {
+        let challenge = || {
+            let cmd = pb::BaseCommand {
+                r#type: pb::base_command::Type::AuthChallenge as i32,
+                auth_challenge: Some(pb::CommandAuthChallenge {
+                    challenge: Some(pb::AuthData {
+                        auth_method_name: Some("token".to_owned()),
+                        auth_data: Some(Bytes::from_static(b"round-1")),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut buf = bytes::BytesMut::new();
+            encode_command(&mut buf, &cmd).expect("encode CommandAuthChallenge");
+            buf
+        };
+        let connected = || {
+            let mut conn = Connection::new(
+                ConnectionConfig::default(),
+                std::sync::Arc::new(std::time::SystemTime::now),
+            );
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+                .expect("handle");
+            while conn.poll_event().is_some() {}
+            conn
+        };
+        let challenged = |conn: &mut Connection| {
+            conn.handle_bytes(Instant::now(), &challenge())
+                .expect("handle challenge");
+            let mut seen = false;
+            while let Some(event) = conn.poll_event() {
+                seen |= matches!(event, ConnectionEvent::AuthChallenge { .. });
+            }
+            seen
+        };
+
+        let mut open = connected();
+        assert!(
+            challenged(&mut open),
+            "an open connection surfaces the challenge"
+        );
+        assert_eq!(open.state(), HandshakeState::AuthChallenging);
+
+        let mut closed = connected();
+        closed.close();
+        assert!(
+            !challenged(&mut closed),
+            "a closed connection has no session left to authenticate"
+        );
+        assert!(
+            closed.is_user_closed(),
+            "a challenge after close() must not reopen the connection (state is now {:?})",
+            closed.state()
+        );
+        closed.submit_auth_response(Bytes::from_static(b"late"), None);
+        assert!(
+            closed.is_user_closed(),
+            "answering a stale challenge must not reopen the connection (state is now {:?})",
+            closed.state()
         );
     }
 
