@@ -736,7 +736,9 @@ pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     start_message_rollback_duration_sec: Option<u64>,
     /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener` at
     /// the pattern scope). Set via [`Self::message_listener`] and subscribe via
-    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores it.
+    /// [`Self::subscribe_with_listener`] or
+    /// [`Self::subscribe_with_listener_and_consumer`]; the plain [`Self::subscribe`]
+    /// ignores it.
     listener: Option<crate::consumer_listener::WrapperMessageListener>,
 }
 
@@ -804,12 +806,15 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
 
     /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
     /// at the pattern scope). Once set, subscribe via
-    /// [`Self::subscribe_with_listener`] to start a background poller over the
+    /// [`Self::subscribe_with_listener`] or
+    /// [`Self::subscribe_with_listener_and_consumer`] to start a background poller over the
     /// matched-topic consumer set, handing every message to `listener`
     /// sequentially and in order, with no auto-ack. The callback receives the
     /// originating topic so it can ack against the right child via
     /// [`PatternConsumer::ack`]. Topics discovered after subscribe (on
-    /// [`PatternConsumer::update`] reconciliation) inherit the listener. The plain
+    /// [`PatternConsumer::update`] reconciliation) inherit the listener; only a holder of
+    /// the consumer can run that reconciliation, and of the two listener terminals only
+    /// [`Self::subscribe_with_listener_and_consumer`] returns the consumer. The plain
     /// [`Self::subscribe`] ignores the listener and returns a pull-mode consumer.
     #[must_use]
     pub fn message_listener(
@@ -1147,15 +1152,17 @@ where
     /// sequential, in-order delivery, no auto-ack (the callback acks via
     /// [`PatternConsumer::ack`]), clean shutdown once every child is terminal / on handle
     /// drop (a terminal child among live ones is skipped, see [`PatternConsumer::receive`],
-    /// and so is an error on one message). **Pattern
-    /// children discovered after subscribe inherit the listener** —
-    /// call [`PatternConsumer::update`] (or
-    /// [`PatternConsumer::start_auto_reconcile`]) to subscribe newly-matched
-    /// topics; the running poller picks them up on its next `receive()` sweep, since
-    /// it shares the consumer's `Arc<Inner>` and `receive()` re-snapshots the child
-    /// set each call. (Hold an extra [`PatternConsumer`] clone before
-    /// `subscribe_with_listener` if you need to drive `update()` yourself — the
-    /// poller consumes the consumer it is handed.)
+    /// and so is an error on one message).
+    ///
+    /// **This terminal delivers the topics matched at subscribe, and only those.** The
+    /// [`PatternConsumer`] is built inside the call and moved into the poller, and only the
+    /// handle comes back. A topic that matches the pattern later is subscribed by
+    /// [`PatternConsumer::update`] (called directly or by
+    /// [`PatternConsumer::start_auto_reconcile`]), which nothing calls here: the poller
+    /// never reconciles, and the caller holds no consumer to call it on. When topics created
+    /// after subscribe must reach the listener, use
+    /// [`Self::subscribe_with_listener_and_consumer`], which returns the consumer next to
+    /// the handle.
     ///
     /// # Errors
     /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
@@ -1174,6 +1181,51 @@ where
         Ok(crate::consumer_listener::spawn_wrapper_message_listener(
             consumer, listener,
         ))
+    }
+
+    /// Like [`Self::subscribe_with_listener`], and also return the [`PatternConsumer`] the
+    /// listener is registered on: the poller holds a clone of it, so both share one child
+    /// set.
+    ///
+    /// Discovery after the first snapshot stays caller-driven. A topic that matches the
+    /// pattern after subscribe reaches the listener once [`PatternConsumer::update`] on the
+    /// returned consumer, called directly or by [`PatternConsumer::start_auto_reconcile`],
+    /// has subscribed it; nothing reconciles on its own.
+    ///
+    /// Holding the consumer changes three things compared with
+    /// [`Self::subscribe_with_listener`]:
+    /// - **Do not call [`PatternConsumer::receive`] on it while the handle is live.** Pull and push
+    ///   are not exclusive by construction here: a `receive()` competes with the poller, and each
+    ///   message goes to one of the two.
+    /// - **Dropping or closing the handle stops delivery and closes nothing**: the returned
+    ///   consumer keeps every subscription open.
+    /// - **Close in order**: [`crate::MessageListenerHandle::close`] first, then
+    ///   [`PatternConsumer::close`]. `close` on a consumer that still has a live clone elsewhere
+    ///   (the poller's, an auto-reconcile task's) returns `Ok(())` without closing any child.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - any subscribe / watch error from [`Self::subscribe`].
+    pub async fn subscribe_with_listener_and_consumer(
+        self,
+    ) -> Result<
+        (
+            PatternConsumer<<E::ClientState as SubscribeApi>::Consumer>,
+            crate::MessageListenerHandle,
+        ),
+        PulsarError,
+    > {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener_and_consumer() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        let handle =
+            crate::consumer_listener::spawn_wrapper_message_listener(consumer.clone(), listener);
+        Ok((consumer, handle))
     }
 }
 
