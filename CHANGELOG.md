@@ -196,6 +196,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Cancelling `Client::close` no longer leaves the pool's connections open** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-11-20 amendment).
   `close` consumes the client, and it closed the bootstrap connection but each pool connection only after the bootstrap driver's join and the joins of the entries before it, so a `close` bounded by a `timeout` or a `select!` and cancelled at one of those awaits left the remaining connections open with their supervised drivers running (on tokio already removed from the pool map) and nothing able to reach them.
   Both engines now tell the bootstrap and every pool entry to close, and moonpool also every pending dial to cancel, before the first `.await`; a cancelled `close` loses only the joins.
+- **A default-budget `StreamConsumer` no longer stalls a busy segment behind an idle one (proposal: the remedy is a design choice for the maintainers to arbitrate, [ADR-0141](specs/adr/0141-default-stream-consumer-budget-grows-per-assigned-segment.md), status Proposed).**
+  The default 16 MiB budget leaves room for exactly one `MAX_FRAME_SIZE` FLOW permit, and a granted permit stays charged until a frame arrives on its segment because Pulsar cannot take it back.
+  `StreamConsumerModel::arbitrate_flow` hands the freed capacity to the next eligible segment after every arrival, so with one idle and one busy segment the permit moved to the idle one and the busy one received one message per message that reached its sibling, which is none, with neither an event nor an error.
+  `StreamConsumerBuilder` now starts from the new `ReceiverBudget::growing_bytes(DEFAULT_RECEIVER_BUDGET_BYTES)`: the aggregate adds one `MAX_FRAME_SIZE` to the limit for each assigned segment beyond the first (16,777,216 bytes for one segment, 22,020,096 for two), never lowers it, and judges a chunk chain against the configured size, not the grown one.
+  The default memory ceiling therefore scales with the segment count, and `StreamConsumerStatus::receiver_budget_limit` reports the grown limit.
+  An explicit `receiver_budget` stays fixed, so one that holds fewer permits than there are assigned segments still stalls the same way; the alternatives not taken (a typed refusal, a higher floor, a larger constant, an arbiter change, a timer that reclaims an idle permit) are recorded in the ADR.
 
 ## [2.0.0] - 2026-11-19
 

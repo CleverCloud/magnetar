@@ -2871,3 +2871,106 @@ fn chunk_continuation_for_a_cancelled_chain_assembly_is_a_budget_error() {
         Err(StreamConsumerModelError::Budget(_))
     ));
 }
+
+fn growing_model_with_data_capacity(data_capacity: usize) -> StreamConsumerModel {
+    StreamConsumerModel::new(
+        "topic://public/default/model".to_owned(),
+        ConsumerInstanceId(10),
+        ControllerIncarnation(3),
+        OrderingMode::BrokerManaged,
+        split_dag(),
+        ReceiverBudget::growing_bytes(
+            data_capacity
+                + magnetar_proto::stream_consumer::RECEIVER_BUDGET_AUTHORITY_HEADROOM
+                + CONTROL_PLANE_CLEANUP_RESERVE,
+        )
+        .expect("growing aggregate budget"),
+    )
+    .expect("aggregate model")
+}
+
+#[test]
+fn growing_budget_holds_a_permit_for_every_assigned_segment_and_never_shrinks() {
+    // One permit and 128 bytes of retained-message room: the size at which a
+    // fixed budget hands its only permit from a busy segment to an idle one.
+    let mut fixed = model_with_data_capacity(MAX_FRAME_SIZE + 128);
+    let mut model = growing_model_with_data_capacity(MAX_FRAME_SIZE + 128);
+    let one_segment_limit = model.budget().limit();
+    assert_eq!(one_segment_limit, fixed.budget().limit());
+
+    let open = model
+        .apply_assignment(assignment(&[1, 2]))
+        .expect("two segments");
+    fixed
+        .apply_assignment(assignment(&[1, 2]))
+        .expect("two segments on a fixed budget");
+    assert_eq!(
+        model.budget().limit(),
+        one_segment_limit + MAX_FRAME_SIZE,
+        "one further frame for the second segment"
+    );
+    assert_eq!(
+        fixed.budget().limit(),
+        one_segment_limit,
+        "a fixed budget keeps its size"
+    );
+    let first = opened_generation(&open[0]);
+    let second = opened_generation(&open[1]);
+    let first_flow = flow_reservation(&model.child_opened(SegmentId(1), first).expect("open"));
+    let second_flow = model.child_opened(SegmentId(2), second).expect("open");
+    assert!(
+        matches!(
+            second_flow.as_slice(),
+            [StreamConsumerAction::GrantFlow { source, .. }]
+                if source.segment_id() == SegmentId(2)
+        ),
+        "the idle segment holds a permit of its own, got {second_flow:?}"
+    );
+
+    // Segment 2 never receives: segment 1 still regains FLOW after a message.
+    let busy = model
+        .message_arrived(SegmentId(1), first, first_flow, 0)
+        .expect("busy arrival");
+    assert!(
+        matches!(
+            busy.actions.as_slice(),
+            [StreamConsumerAction::GrantFlow { source, .. }]
+                if source.segment_id() == SegmentId(1)
+        ),
+        "the busy segment regains FLOW, got {:?}",
+        busy.actions
+    );
+
+    // Segments that leave keep their room: the limit only moves upward.
+    model
+        .apply_assignment(assignment(&[1]))
+        .expect("one segment again");
+    assert_eq!(model.budget().limit(), one_segment_limit + MAX_FRAME_SIZE);
+}
+
+#[test]
+fn growing_budget_refuses_a_chain_beyond_the_configured_size_as_too_large() {
+    // The room added for the second segment is that segment's permit, so a
+    // chain is judged against the configured size and not the grown one.
+    let configured = 2 * MAX_FRAME_SIZE;
+    let mut model = growing_model_with_data_capacity(configured);
+    let open = model
+        .apply_assignment(assignment(&[1, 2]))
+        .expect("two segments");
+    let first = opened_generation(&open[0]);
+    let flow = flow_reservation(&model.child_opened(SegmentId(1), first).expect("open"));
+    model
+        .child_opened(SegmentId(2), opened_generation(&open[1]))
+        .expect("open the second segment");
+
+    let over = configured - MAX_FRAME_SIZE + 1;
+    assert!(matches!(
+        model.chunk_frame_buffered(SegmentId(1), first, flow, None, over),
+        Err(StreamConsumerModelError::Budget(
+            BudgetError::MessageTooLargeForBudget { required, limit }
+        )) if required == configured + 1 && limit == configured
+    ));
+    model
+        .chunk_frame_buffered(SegmentId(1), first, flow, None, over - 1)
+        .expect("a chain that fits the configured size is buffered");
+}
