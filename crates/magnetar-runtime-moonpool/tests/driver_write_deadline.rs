@@ -51,6 +51,12 @@ const BROKER_PORT: u16 = 6650;
 /// in one `poll_write` batch once the broker stops draining.
 const STALLED_PAYLOAD_BYTES: usize = 200 * 1024;
 
+/// Tick (of 500 ms virtual time) at which the close-while-stalled variant
+/// closes the client: late enough that the publish is parked mid-write,
+/// early enough that the write deadline (`operation_timeout`, 30 s) is still
+/// in the future.
+const CLOSE_AT_TICK: usize = 2;
+
 async fn read_into<S: futures::io::AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -265,16 +271,35 @@ struct ClientObservation {
     /// Pre-fix (issue #370) this NEVER flips `false` at all within the
     /// budget, because the write starves the timer arm forever.
     observed_disconnected_after_stall: bool,
+    /// Close-while-stalled variant only: the stalled publish was still
+    /// unresolved and the connection still `Connected` at the instant the
+    /// user closed, so the close really did race a draining write queue.
+    stalled_at_close: Option<bool>,
+    /// Close-while-stalled variant only: `Client::close()` ran to completion.
+    close_returned: bool,
+    /// Close-while-stalled variant only: `is_user_closed()` at the end.
+    user_closed_at_end: Option<bool>,
 }
 
 struct StalledWriteClient {
     obs: Arc<Mutex<ClientObservation>>,
+    /// Close the client (as the application would) while the publish is
+    /// parked mid-write, then keep ticking.
+    close_while_stalled: bool,
 }
 
 impl StalledWriteClient {
     fn new() -> Self {
         Self {
             obs: Arc::new(Mutex::new(ClientObservation::default())),
+            close_while_stalled: false,
+        }
+    }
+
+    fn closing_while_stalled() -> Self {
+        Self {
+            close_while_stalled: true,
+            ..Self::new()
         }
     }
 }
@@ -355,9 +380,14 @@ impl Workload for StalledWriteClient {
             txn_id: None,
             source_message_id: None,
         });
-        let _stalled_send = task.spawn_task("stalled-write-send", async move {
-            let _ = send_fut.await;
-        });
+        let send_resolved = Arc::new(Mutex::new(false));
+        let _stalled_send = {
+            let send_resolved = send_resolved.clone();
+            task.spawn_task("stalled-write-send", async move {
+                let _ = send_fut.await;
+                *send_resolved.lock() = true;
+            })
+        };
 
         // Advance virtual time in small ticks, well past one
         // `operation_timeout` (30s default), so the driver's write-deadline
@@ -370,16 +400,37 @@ impl Workload for StalledWriteClient {
         // `ClientObservation::observed_disconnected_after_stall` for why a
         // single end-of-budget sample would be racy against the
         // supervisor's redial-and-restall cadence.
-        for _ in 0..90 {
+        let shared = client.shared().clone();
+        let mut client = Some(client);
+        let close_returned = Arc::new(Mutex::new(false));
+        for tick in 0..90 {
+            if self.close_while_stalled && tick == CLOSE_AT_TICK {
+                // Exactly what the application does: `Client::close()`.
+                // It parks until the driver exits, so run it detached and
+                // observe its completion through a flag.
+                self.obs.lock().stalled_at_close =
+                    Some(shared.inner.lock().is_connected() && !*send_resolved.lock());
+                let closing = client.take().expect("client is closed once");
+                let close_returned = close_returned.clone();
+                let _close = task.spawn_task("user-close", async move {
+                    closing.close().await;
+                    *close_returned.lock() = true;
+                });
+            }
             if time.sleep(Duration::from_millis(500)).await.is_err() {
                 break;
             }
             for _ in 0..4 {
                 task.yield_now().await;
             }
-            if !client.is_connected() {
+            if !shared.inner.lock().is_connected() {
                 self.obs.lock().observed_disconnected_after_stall = true;
             }
+        }
+        if self.close_while_stalled {
+            let mut obs = self.obs.lock();
+            obs.close_returned = *close_returned.lock();
+            obs.user_closed_at_end = Some(shared.inner.lock().is_user_closed());
         }
 
         Ok(())
@@ -437,5 +488,57 @@ fn stalled_write_is_bounded_by_operation_timeout_sim() {
         "the supervisor must redial after the write-deadline failure, \
          producing a second broker accept (sessions_accepted={})",
         *sessions.lock()
+    );
+}
+
+/// A user `close()` that races a write the broker is not draining must stay a
+/// user close. The driver keeps writing while bytes are queued, so the close
+/// waits for the stalled write; the write deadline then fires and the driver
+/// maps it through `mark_disconnected()`. That used to overwrite `Closing`
+/// with `Failed`, which the supervisor reads as a transport drop: it redialled
+/// (a second broker accept), re-attached the producer and replayed the
+/// publish, and `Client::close().await` never returned.
+#[test]
+fn close_during_stalled_write_is_not_redialled_sim() {
+    let broker = StallAfterProducerBroker::new();
+    let sessions = broker.sessions_accepted.clone();
+    let client = StalledWriteClient::closing_while_stalled();
+    let obs = client.obs.clone();
+    let _report = SimulationBuilder::new()
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![0x0370_0370_0370_0370_u64])
+        .set_iterations(1)
+        .run();
+
+    let obs = obs.lock();
+    assert!(
+        obs.connect_error.is_none(),
+        "setup (connect + open_producer) must succeed before the stall: {obs:?}"
+    );
+    assert_eq!(
+        obs.stalled_at_close,
+        Some(true),
+        "precondition: the publish must be parked mid-write on a connected \
+         session when the user closes: {obs:?}"
+    );
+    assert!(
+        obs.close_returned,
+        "a user close must complete once the stalled write's deadline fires; \
+         instead the write-deadline `mark_disconnected()` demoted `Closing` to \
+         `Failed` and the supervisor resurrected the session \
+         (sessions_accepted={}, obs={obs:?})",
+        *sessions.lock()
+    );
+    assert_eq!(
+        *sessions.lock(),
+        1,
+        "a closed client must not redial the broker: the supervisor must stop \
+         on the user's close, not treat the write-deadline failure as a drop"
+    );
+    assert_eq!(
+        obs.user_closed_at_end,
+        Some(true),
+        "the connection must still report the user's close: {obs:?}"
     );
 }

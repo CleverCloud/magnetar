@@ -33,6 +33,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Producer::flush` no longer returns `Ok` while sends are still owed a receipt across a reconnect.**
+  `Connection::reset()` moves every replayable in-flight publish out of the producer's `pending` queue into the connection's reset snapshot bucket, and they return to `pending` only when the broker acknowledges the producer's re-attachment.
+  Both engines' `flush` looped on the live queue alone, so a `flush()` issued in that window — or parked across the socket drop and re-checked after the new `CONNECTED` frame — read zero and resolved `Ok(())` with no send acknowledged; the documented `flush().await` then `close()` (or process exit) recipe could complete while publishes were still unacknowledged.
+  `Producer::pending_count` read the same queue and reported `0` for the same sends, and a timed-out `flush_with_timeout` said "0 sends still pending".
+  `flush`, `pending_count` and the `flush_with_timeout` message now count the live queue plus the relocated sends through the new `Connection::producer_unacknowledged_count`, in both runtimes, so `flush` resolves only after the replayed sends' receipts.
+  `pending_count` and the `flush` probe now take the connection lock, then the slot lock, instead of the slot lock alone (global → per-slot; `Producer::send` is unchanged), and `pending_count` can exceed `ProducerStats::pending_queue_size`, which still reports the live queue.
+  A `flush` parked while the `send_timeout` sweep fails its last send is re-checked at the next inbound packet rather than at the sweep, as it already was for the live queue (`docs/follow-ups.md` §32, [ADR-0137](specs/adr/0137-count-the-reset-snapshot-in-producer-flush-and-pending-count.md)).
+
+- **A pattern consumer keeps discovering topics after a reconnect.**
+  The broker keeps a PIP-145 topic-list watcher per connection, so it dies with the session, and the new session pushes no `CommandWatchTopicUpdate` until the client sends `CommandWatchTopicList` again.
+  `Connection::reset()` replaced the whole watcher registry and the supervisors re-attached only producers and consumers, so after the first supervised reconnect every `PatternConsumer` stopped seeing new or deleted topics, with no error and no log; its existing children kept working, which hid the loss.
+  `reset()` now keeps the watchers the broker had acknowledged and `rebuild_consumers()` — which both supervisors already call after the handshake — sends their `CommandWatchTopicList` again with the same watcher id, namespace and pattern and the last topics hash the broker reported, in ascending watcher id order.
+  A watcher still awaiting its first reply is not kept: its caller is told `SessionLost`.
+  Nobody awaits the re-registration, so its reply is consumed in place (no `OpOutcome`, no event), a refusal is logged with a `warn!` and retried by the next rebuild, and a registration the broker never answered is owed again after the next reset.
+  The returned `Vec<RequestId>` of `rebuild_consumers()` is unchanged: it lists the re-subscribed consumers only.
+  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher is ever deregistered, so the ones `topic_list_snapshot` leaves behind are now registered again on every reconnect (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+
+- **A send relocated by a reconnect no longer hangs when its producer is closed before the rebuild.**
+  `Producer::close()` and the last-clone drop guard mark the producer closed and leave its unacknowledged sends pending until the broker acknowledges the close.
+  A close issued after `Connection::reset()` had moved the sends into the reset snapshots, and before the rebuild, left the producer out of the rebuild, and `rebuild_producers()` discarded its snapshots without resolving them; the close acknowledgement, which arrives after the rebuild, then found nothing to fail, so each `SendFut` stayed pending until the whole client shut down, and `send_timeout` could not reach it because the send was in no queue and no snapshot.
+  `rebuild_producers()` now fails the snapshots of every producer it does not re-attach with `OpOutcome::Terminal` (`producer closed before the send was acknowledged`), releasing their memory reservations as before, so the futures resolve with `PeerClosed`; a close acknowledgement that lands afterwards finds no bucket and drains nothing twice.
+  A close still unacknowledged when the session resets already failed its sends in `reset()`, and `Producer::close()` itself still returns `ClientError::Other` for a close that the reset severed ([ADR-0135](specs/adr/0135-fail-the-sends-of-a-producer-closed-across-a-reset-at-the-rebuild.md)).
+
+- **`Client::close()` no longer hangs, and no longer reconnects, when a socket failure or a late handshake frame races it.**
+  `Connection::close()` records the user's intent only as the handshake state `Closing`, and the supervised driver's one stop signal is `is_user_closed()`.
+  A transport failure while the close was still draining its write queue (a read error, an EOF, a decode error, or the ADR-0083 write deadline against a broker that stopped reading) called `mark_disconnected()`, which turned `Closing` into the redialable `Failed`.
+  The supervisor then reconnected, re-attached every producer and consumer and replayed their in-flight publishes, and `close().await` never returned — a zombie session on the broker for the life of the process, since the default `max_attempts` is unbounded.
+  A user close is now sticky in `magnetar-proto`: `mark_disconnected()` and the broker's `CommandConnected` and `CommandAuthChallenge` leave `Closing` / `Closed` alone, because an answered challenge moves the connection back to `Connected` just as a late CONNECTED does ([ADR-0134](specs/adr/0134-make-a-user-close-sticky-in-the-connection-state-machine.md)).
+  An unsupervised connection is unchanged: it never redialled, and its driver exits as before.
+
+- **A batched receive no longer drops the good messages it already popped when a later member fails.**
+  `Consumer::receive_batch` / `receive_batch_with_bytes_cap` take the first message through `receive()` and pop the rest under the connection lock into a local accumulator.
+  A member after the first that failed post-processing — decryption under the default `CryptoFailureAction::Fail`, a consumer with no decryptor, an unknown compression code, a decompress error — returned `Err` straight from that loop and dropped the accumulator, so up to `max_messages - 1` good messages were never shown, acked or nacked and stayed unacknowledged at the broker (with the default `ack_timeout` of `None`, until a reconnect), with no indication of which.
+  The batch now ends at the failing member and returns the good prefix in `Ok`; the failure is parked on the consumer, shared by every clone, and returned by the next `receive`, `receive_with_timeout` or `receive_batch*` call, ahead of every message still queued, so each failing message still yields exactly one error and arrival order is kept.
+  Parking the failure also wakes any `receive()` already parked on the empty queue, in the connection-lock section those futures read the parked failures and register their waker in, so a receive on another clone cannot sleep on a known failure until the next arrival.
+  The failing message itself is neither acked nor nacked, as for a failing `receive()`; `CryptoFailureAction::Discard` and `Consume` are unchanged, and a failure of the first message is still returned at once.
+  The tokio and moonpool runtimes behave identically, and `magnetar-proto` is untouched (no message is pushed back into its queue, so no flow permit is granted twice).
+  `TypedConsumer::receive_batch*` still returns the first schema-decode error of a batch and drops the members of that batch, as documented; only the post-processing failure of the runtime batch is covered here.
+
 - **A `TableView`, or a `PartitionedProducer`, `MultiTopicsConsumer` or `TableView` with `auto_update_partitions_interval`, no longer needs a Tokio runtime under `MoonpoolEngine<SimProviders>`** ([ADR-0139](specs/adr/0139-spawn-and-pace-facade-helper-tasks-through-the-clients-providers.md)).
   The `TableView` drain and the auto-update partition ticker were started with `tokio::spawn` and paced with `tokio::time::interval`, which panic ("there is no reactor running") on the seeded simulation executor and would read the host clock if a runtime were present, outside ADR-0078's provider boundary.
   They are now spawned on the client's own `TaskProvider` and wait on its `TimeProvider` (Tokio's for `TokioEngine`), so the ticker fires on virtual time and replays from the seed.
