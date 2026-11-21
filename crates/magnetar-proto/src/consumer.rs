@@ -374,8 +374,9 @@ pub struct ConsumerState {
     /// Running total of `payload.len()` across every message currently buffered
     /// in [`Self::queue`] (issue #301). Maintained in lock-step: bumped on
     /// enqueue in [`Self::classify_and_queue`], decremented on dequeue in
-    /// [`Self::pop_message`]. This is the `in_flight_bytes` signal the
-    /// [`crate::receiver_queue::Auto`] OOM guard bounds; it is distinct from
+    /// [`Self::pop_message`], and zeroed wherever the queue is dropped
+    /// ([`Self::begin_seek`], [`crate::Connection::reset`]). This is the `in_flight_bytes` signal
+    /// the [`crate::receiver_queue::Auto`] OOM guard bounds; it is distinct from
     /// [`Self::chunk_buffered_bytes`] (which counts *incomplete* chunk
     /// reassembly buffers, not delivered queue entries).
     pub(crate) queued_bytes: u64,
@@ -396,8 +397,11 @@ pub struct ConsumerState {
     /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
     /// actually arrive, so it does not track the client's decrementing estimate. It is still
     /// the right register for "how much have we told the broker it may use": the #307
-    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
-    /// that question answered, and this additive counter answers it correctly. For the
+    /// failover-reflow gate and the `adjust_receiver_queue` churn-window guard both need exactly
+    /// that question answered, and this additive counter answers it correctly. It is NOT the
+    /// size of the window the broker holds: every `maybe_flow` refill adds to it, so it grows
+    /// past the window with the messages consumed since the last zeroing, and a growth grant
+    /// sized against it would be too small. For the
     /// decrementing client-accounted balance — the starvation signal
     /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
     /// [`Self::permit_balance`].
@@ -480,10 +484,29 @@ pub struct ConsumerState {
     /// [`Self::record_marker_consumed`], the dead-letter branch of
     /// `classify_and_queue` (issue #437), and the undecodable batch members in
     /// [`Self::deliver`] (issue #860, ADR-0112) — and zeroed by [`Self::maybe_flow`] when it
-    /// grants, plus at the churn boundaries that zero the permit mirrors. It is
+    /// grants or retires it against [`Self::window_surplus`], plus at the churn boundaries that
+    /// zero the permit mirrors. It is
     /// refund-driven, not pop-driven: the invariant it holds up is
     /// `granted window == permit_balance + consumed_since_flow + queue.len()`.
     pub(crate) consumed_since_flow: u32,
+    /// Permits the broker holds beyond [`Self::receiver_queue_size`] because
+    /// [`Self::adjust_receiver_queue`] lowered the target (a shrink under memory pressure):
+    /// permits already granted cannot be un-granted, so the window stays at its old size until
+    /// the owed refunds retire the difference. [`Self::maybe_flow`] settles
+    /// `consumed_since_flow` against it before granting anything, and a growth tick absorbs it
+    /// before granting anything, so the window the broker holds is `receiver_queue_size +
+    /// window_surplus`.
+    ///
+    /// Zeroed by [`Self::initial_flow`], the one site that seeds the window afresh at the target
+    /// (subscribe, reconnect, post-seek resubscribe, in-place recovery, failover re-arm). Every
+    /// site that zeroes the permit mirrors on a consumer that re-attaches is followed by one; a
+    /// terminal subscribe failure and an in-place re-attach the consumer is no longer eligible
+    /// for leave it stale until the next `initial_flow`, which is harmless: the churn-window guard
+    /// skips every adjust tick while `granted_permits == 0`, and a refund retired meanwhile is one
+    /// the broker would have dropped against a consumer id it no longer holds. Deliberately NOT
+    /// part of `SeekRollback`: a rejected seek leaves the broker's window exactly as it was,
+    /// surplus included, and a successful one ends in `initial_flow`.
+    pub(crate) window_surplus: u32,
     /// Inbound queue of messages ready to deliver to the user.
     pub queue: VecDeque<IncomingMessage>,
     /// Raw broker entries owned by an aggregate receive budget. Ordinary
@@ -1253,6 +1276,7 @@ impl ConsumerState {
             stall_watch: None,
             stall_recovery_attempts: 0,
             consumed_since_flow: 0,
+            window_surplus: 0,
             queue: VecDeque::new(),
             #[cfg(feature = "scalable-topics")]
             deferred_queue: VecDeque::new(),
@@ -1524,6 +1548,12 @@ impl ConsumerState {
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
+    ///
+    /// While a shrink left the broker holding more than the target (`window_surplus`), the
+    /// owed refunds settle against that surplus first and only the rest is granted: the units are
+    /// retired instead of re-granted, which is how the window comes down to the lowered target as
+    /// the application pops. With no surplus every owed unit is refunded one for one, and a
+    /// refund that settles entirely against it emits nothing (the owed count is still cleared).
     pub fn maybe_flow(&mut self) -> Option<pb::CommandFlow> {
         if self.closed
             || self.pending_seek.is_some()
@@ -1536,8 +1566,13 @@ impl ConsumerState {
         if self.consumed_since_flow < threshold {
             return None;
         }
-        let permits = self.consumed_since_flow;
+        let retired = self.consumed_since_flow.min(self.window_surplus);
+        self.window_surplus = self.window_surplus.saturating_sub(retired);
+        let permits = self.consumed_since_flow.saturating_sub(retired);
         self.consumed_since_flow = 0;
+        if permits == 0 {
+            return None;
+        }
         self.granted_permits = self.granted_permits.saturating_add(permits);
         self.permit_balance = self.permit_balance.saturating_add(permits);
         self.clear_stall_watch();
@@ -1773,6 +1808,9 @@ impl ConsumerState {
         self.granted_permits = permits;
         self.permit_balance = permits;
         self.consumed_since_flow = 0;
+        // The grant seeds the window at the target: a surplus the previous attach carried
+        // belonged to a window the broker no longer holds.
+        self.window_surplus = 0;
         // Issue #427: this attach's initial grant is now on its way to the broker, so no
         // other grant site owes it one. `Connection::initial_flow` reads the flag back to
         // stay idempotent per attach.
@@ -1817,12 +1855,18 @@ impl ConsumerState {
     /// Run one auto-adjust tick (issue #301). Recomputes the receiver-queue
     /// target via `policy.adjust(&FlowStats)` and reconciles the broker grant:
     ///
-    /// - **Grow** (`new > current`): the broker has fewer permits than the new target wants, so
-    ///   emit an incremental `CommandFlow` for the delta and bump both `granted_permits` and
-    ///   `permit_balance`. This is what keeps a starving consumer fed.
+    /// - **Grow** (`new > current`): the broker holds a window of `current + window_surplus`
+    ///   permits (every grant site tops it up to the target, a refund hands back exactly what a pop
+    ///   consumed, and a surplus is what an earlier shrink could not take back), so emit an
+    ///   incremental `CommandFlow` for the `new - current` the target gained, less what the surplus
+    ///   already covers, and bump both `granted_permits` and `permit_balance`. This is what keeps a
+    ///   starving consumer fed. The delta is NOT taken against `granted_permits`: that is the
+    ///   cumulative grant record, which every refill inflates, so it overshoots the window after a
+    ///   few rounds of refunds and a growth would grant nothing.
     /// - **Shrink / hold** (`new <= current`): permits already granted to the broker cannot be
-    ///   un-granted, so emit nothing — the surplus drains naturally as messages arrive and
-    ///   `maybe_flow` simply asks for less next time (its threshold is `new / 2`).
+    ///   un-granted, so emit nothing and record the difference as `window_surplus`. The window
+    ///   comes down as the application pops, because [`Self::maybe_flow`] retires owed refunds
+    ///   against the surplus instead of granting them.
     ///
     /// Records `now` as the last-adjust timestamp so [`Self::next_adjust_deadline`]
     /// schedules the following tick. Pure given (`policy`, `FlowStats`, `now`):
@@ -1860,16 +1904,20 @@ impl ConsumerState {
         let current = self.receiver_queue_size;
         self.receiver_queue_size = new_target;
         if new_target <= current {
-            // Shrink or hold: cannot un-grant permits, so let them drain. The
-            // smaller `maybe_flow` threshold (`new_target / 2`) then asks for
-            // less on the next refill.
+            // Shrink or hold: cannot un-grant permits, so emit nothing. What the
+            // broker holds beyond the new target is retired by `maybe_flow` as
+            // the owed refunds come in (a hold adds nothing).
+            let shed = u32::try_from(current - new_target).unwrap_or(u32::MAX);
+            self.window_surplus = self.window_surplus.saturating_add(shed);
             return None;
         }
-        // Grow: top the broker's grant up to the new target with an incremental
-        // flow for the delta the broker does not yet have.
-        let want = new_target as u32;
-        let have = self.granted_permits;
-        let delta = want.saturating_sub(have);
+        // Grow: top the broker's window up from `current + window_surplus` to
+        // the new target with an incremental flow. The window is that, not
+        // `granted_permits`, which is cumulative (see the method docs).
+        let growth = u32::try_from(new_target - current).unwrap_or(u32::MAX);
+        let absorbed = growth.min(self.window_surplus);
+        self.window_surplus = self.window_surplus.saturating_sub(absorbed);
+        let delta = growth.saturating_sub(absorbed);
         if delta == 0 {
             return None;
         }

@@ -1303,6 +1303,10 @@ impl Connection {
             let mut consumer = slot.state.lock();
             consumer.subscribe_waiter_completed = false;
             consumer.queue.clear();
+            // The buffered-byte counter is the sum of the payloads the queues hold (the
+            // out-of-memory guard's `in_flight_bytes`): it empties with them, or the dropped
+            // messages keep counting toward the budget for good (`begin_seek` does the same).
+            consumer.queued_bytes = 0;
             #[cfg(feature = "scalable-topics")]
             {
                 consumer.clear_deferred_messages();
@@ -4118,7 +4122,8 @@ impl Connection {
                 // double-flow): only when `granted_permits == 0` — issue #349
                 // kept this gate on the additive grant mirror (not
                 // `permit_balance`), the same "has the broker been told it may
-                // use anything yet" question the want-have delta answers — and
+                // use anything yet" question the churn-window guard of
+                // `adjust_receiver_queue` asks — and
                 // only when the consumer is in a dispatch-eligible state — not
                 // user-closed, not paused, no in-flight seek freezing the
                 // queue, not terminal, and not mid-re-attach (the re-attach
@@ -5067,7 +5072,7 @@ impl Connection {
             // incremental `CommandFlow`, staged here and emitted after the loop.
             // `next_adjust_deadline`/`poll_timeout` gate when this actually fires;
             // a sub-interval tick is a cheap no-op (the policy recomputes the
-            // same target and the `delta == 0` guard suppresses the flow).
+            // same target, which is a hold: no flow and no surplus).
             match consumer.next_adjust_deadline() {
                 Some(d) if now >= d => {
                     // Per-partition proto consumer: partition count is 1 here;
@@ -6684,7 +6689,7 @@ impl Connection {
     /// ADR-0101 amends ADR-0082 §Consequences accordingly.
     ///
     /// For "how much have we told the broker it may use" — the question the #307
-    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta ask — read
+    /// failover-reflow gate and the `adjust_receiver_queue` churn-window guard ask — read
     /// [`crate::consumer::ConsumerState::granted_permits`] directly; it is unchanged.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
@@ -9843,8 +9848,8 @@ impl Connection {
     ///
     /// 1. zero the permit mirrors (`granted_permits`, `permit_balance`, `consumed_since_flow`) and
     ///    drop any open stall window — the broker has released this consumer's permits, so the
-    ///    client's mirrors must follow or the want-have delta and the starvation signal both read a
-    ///    grant that no longer exists;
+    ///    client's mirrors must follow or the churn-window guard and the starvation signal both
+    ///    read a grant that no longer exists;
     /// 2. fail every in-flight ack for this handle (issue #346) — the consumer id they were
     ///    correlated against is gone, so no `CommandAckResponse` for them will ever arrive;
     /// 3. re-emit `CommandSubscribe`, deferring the initial `CommandFlow` to ITS `Success` (Pulsar
@@ -18834,6 +18839,294 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "a churn-window tick must not emit an adjust-driven flow"
+        );
+    }
+
+    /// Deliver `count` single-message dispatch units of `payload` to `handle`, the way a
+    /// broker holding `count` permits would, and drop the resulting `Message` events.
+    fn deliver_payloads(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        count: u64,
+        payload: &[u8],
+        at: Instant,
+    ) {
+        for _ in 0..count {
+            let frame = message_frame(handle.0, &regular_metadata(), payload);
+            conn.handle_bytes(at, &frame).expect("deliver message");
+        }
+        while conn.poll_event().is_some() {}
+    }
+
+    /// Pop every queued message of `handle`, as an application that drains its receiver
+    /// would, discarding the refill flows the pops stage. Returns the number popped.
+    fn pop_all(conn: &mut Connection, handle: ConsumerHandle, at: Instant) -> u64 {
+        let mut popped = 0;
+        while conn.pop_message(handle, at).is_some() {
+            popped += 1;
+        }
+        let _ = conn.poll_transmit();
+        popped
+    }
+
+    /// An `Auto(100, 400_000)` consumer fed 1000-byte messages (byte-budget cap 400) after four
+    /// rounds in which the broker dispatched the whole 100-permit window and the application
+    /// popped all of it, with a fifth window dispatched and left unpopped. The refunds of the
+    /// four rounds have raised the cumulative `granted_permits` to 500 while the broker
+    /// window stayed at 100, and the balance is zero, so the next adjust tick sees starvation.
+    /// The byte budget is never approached (100 000 buffered of 400 000), so only the growth
+    /// accounting is in play.
+    fn auto_consumer_starving_after_refund_rounds(
+        t0: Instant,
+    ) -> (Connection, ConsumerHandle, Duration) {
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 400_000, interval, t0);
+        let payload = [b'x'; 1000];
+        for _ in 0..4 {
+            deliver_payloads(&mut conn, handle, 100, &payload, t0);
+            assert_eq!(pop_all(&mut conn, handle, t0), 100, "the window is popped");
+        }
+        deliver_payloads(&mut conn, handle, 100, &payload, t0);
+        let _ = conn.poll_transmit();
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.granted_permits, 500,
+                "precondition: four rounds of refunds (100 each) on top of the initial 100"
+            );
+            assert_eq!(
+                (
+                    consumer.permit_balance,
+                    consumer.consumed_since_flow,
+                    consumer.queue.len(),
+                    consumer.receiver_queue_size
+                ),
+                (0, 0, 100, 100),
+                "precondition: the broker window is still the original 100, fully dispatched"
+            );
+        }
+        (conn, handle, interval)
+    }
+
+    #[test]
+    fn auto_growth_tops_up_the_broker_window_to_the_new_target_after_refunds() {
+        // ADR-0147: `adjust_receiver_queue` sized the grant against the cumulative
+        // `granted_permits` (500 here) instead of the live window (100), so the target
+        // doubled to 200 and `200 - 500` saturated to a zero delta: no flow, a broker window
+        // that no longer matches the target and a refill threshold that is no longer reachable.
+        let t0 = Instant::now();
+        let (mut conn, handle, interval) = auto_consumer_starving_after_refund_rounds(t0);
+
+        conn.handle_timeout(t0 + interval);
+
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "starvation doubles the target"
+        );
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.permit_balance as usize
+                    + consumer.consumed_since_flow as usize
+                    + consumer.queue.len(),
+                consumer.receiver_queue_size,
+                "after a growth tick the broker window (balance + owed refunds + queued) must \
+                 equal the new target"
+            );
+        }
+        assert_eq!(
+            drain_command_flow(&mut conn, handle).map(|flow| flow.message_permits),
+            Some(100),
+            "growing 100 -> 200 over a window of 100 grants the missing 100 permits"
+        );
+    }
+
+    #[test]
+    fn auto_consumer_is_not_left_unable_to_refill_after_growth_over_refunded_window() {
+        // ADR-0147, consequence: the target reached 400 (so the refill threshold is 200) while
+        // the broker window stayed at 100, hence `maybe_flow` could never fire again and the
+        // consumer starved with `permit_balance == 0` and nothing the client can still send.
+        // The broker here is faithful: each round it dispatches every permit it holds.
+        let t0 = Instant::now();
+        let (mut conn, handle, interval) = auto_consumer_starving_after_refund_rounds(t0);
+
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        for round in 2..=4u32 {
+            pop_all(&mut conn, handle, t0);
+            let held = u64::from(conn.consumer_available_permits(handle));
+            deliver_payloads(&mut conn, handle, held, &[b'x'; 1000], t0);
+            let _ = conn.poll_transmit();
+            conn.handle_timeout(t0 + interval * round);
+            let _ = conn.poll_transmit();
+        }
+
+        assert!(
+            !conn.consumers[&handle].state.lock().is_flow_starved(),
+            "the consumer must keep a path to its next refill (permit balance or a reachable \
+             refill threshold), not wait on a broker that holds no permit"
+        );
+    }
+
+    #[test]
+    fn auto_shrink_converges_the_broker_window_to_the_smaller_target() {
+        // ADR-0147: a shrink under memory pressure stores the smaller target and emits nothing,
+        // and `maybe_flow` then refunds every popped unit one for one, so the broker window
+        // (balance + owed refunds + queued) never falls: the buffered-bytes bound the policy
+        // promises is not enforced. Only the threshold (target / 2) moved.
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 20 000-byte budget; the cap stays at 400 so only the OOM branch can lower the target.
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 20_000, interval, t0);
+
+        // Grow 100 -> 200 -> 400 on 1-byte messages, deliver and tick only: no pops, so no
+        // refund can disturb the growth accounting this test is not about.
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval * 2);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "grown to 400"
+        );
+
+        // The broker dispatches the 200 permits it still holds as 100-byte messages: 20 200
+        // buffered bytes, past the budget, so the next tick halves the target.
+        let held = u64::from(conn.consumer_available_permits(handle));
+        assert_eq!(
+            held, 200,
+            "precondition: 200 permits still held by the broker"
+        );
+        deliver_payloads(&mut conn, handle, held, &[b'x'; 100], t0);
+        let _ = conn.poll_transmit();
+        conn.handle_timeout(t0 + interval * 3);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "precondition: the out-of-memory guard halved the target"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "a shrink emits no flow"
+        );
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                (consumer.permit_balance, consumer.queue.len()),
+                (0, 400),
+                "precondition: the whole 400 window is dispatched and queued"
+            );
+        }
+
+        // The application drains and the broker keeps dispatching what it holds. No tick runs,
+        // so the target stays 200: the permits the broker holds after the drain must fit it.
+        let mut held_after_drain = 0;
+        for _ in 0..3 {
+            pop_all(&mut conn, handle, t0);
+            held_after_drain = conn.consumer_available_permits(handle);
+            deliver_payloads(&mut conn, handle, u64::from(held_after_drain), b"x", t0);
+            let _ = conn.poll_transmit();
+        }
+        assert!(
+            held_after_drain as usize <= conn.consumer_receiver_queue_size(handle),
+            "after the drain the broker holds {held_after_drain} permits, more than the shrunk \
+             target {}; the window never shrank",
+            conn.consumer_receiver_queue_size(handle)
+        );
+    }
+
+    #[test]
+    fn reset_zeroes_the_buffered_byte_counter_with_the_queue() {
+        // `reset` clears every consumer's queue and zeroes the permit mirrors but left
+        // `queued_bytes` (the `Auto` out-of-memory guard's `in_flight_bytes`) counting the
+        // dropped messages forever; the redelivered copies are added on top and only they
+        // decay on pop.
+        let t0 = Instant::now();
+        let (mut conn, handle, _) =
+            handshake_subscribe_auto(100, 128 * 1024 * 1024, Duration::from_secs(1), t0);
+        deliver_payloads(&mut conn, handle, 3, &[b'x'; 10], t0);
+        {
+            let consumer = conn.consumers[&handle].state.lock();
+            assert_eq!(
+                consumer.queue.len(),
+                3,
+                "precondition: three queued messages"
+            );
+            assert_eq!(consumer.flow_stats(1).in_flight_bytes, 30, "precondition");
+        }
+
+        conn.reset();
+
+        let consumer = conn.consumers[&handle].state.lock();
+        assert_eq!(consumer.queue.len(), 0, "reset drops the queued messages");
+        assert_eq!(
+            consumer.flow_stats(1).in_flight_bytes,
+            0,
+            "the bytes of the messages reset dropped must stop counting as buffered"
+        );
+    }
+
+    #[test]
+    fn auto_growth_after_a_shrink_is_covered_by_the_surplus_the_window_still_holds() {
+        // After a shrink the broker still holds the old window (400 here) against a target of
+        // 200. A growth back to 400 needs no new permit: the permits are already there, and a
+        // flow for the 200 the target gained would put the window at 600, past the byte budget
+        // the target is sized for.
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 20 000-byte budget; the cap stays at 400 so only the budget decides the target.
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 20_000, interval, t0);
+
+        // Grow 100 -> 200 -> 400 on 1-byte messages: deliver and tick only, no pops.
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval);
+        let _ = conn.poll_transmit();
+        deliver_payloads(&mut conn, handle, 100, b"x", t0);
+        conn.handle_timeout(t0 + interval * 2);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "precondition: grown to 400"
+        );
+
+        // The 200 permits the broker still holds arrive as 99-byte messages: exactly the
+        // 20 000-byte budget, so the next tick halves the target. The broker keeps its 400.
+        deliver_payloads(&mut conn, handle, 200, &[b'x'; 99], t0);
+        conn.handle_timeout(t0 + interval * 3);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "precondition: the out-of-memory guard halved the target"
+        );
+        assert!(drain_command_flow(&mut conn, handle).is_none());
+
+        // The application frees one byte, which puts the buffer back under the budget while
+        // the balance is still zero: the next tick sees starvation with room and doubles.
+        assert!(conn.pop_message(handle, t0).is_some());
+        let _ = conn.poll_transmit();
+        conn.handle_timeout(t0 + interval * 4);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            400,
+            "starvation with room grows the target back"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "the broker already holds the window the target regained: nothing to grant"
+        );
+
+        // The surplus is spent: the application's refunds are granted in full again, up to the
+        // 400 window and not beyond.
+        pop_all(&mut conn, handle, t0);
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            400,
+            "the window is the target, no more and no less"
         );
     }
 

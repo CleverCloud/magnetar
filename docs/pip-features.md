@@ -609,7 +609,8 @@ The policy is threaded through partitioned, multi-topics, and pattern consumers 
 - **Grow** (bounded doubling) while received dispatch units have drained the client-accounted balance to zero (`available_permits == 0`, the starvation signal) and the byte budget still has room.
   A grown target emits an incremental `CommandFlow` so the broker is fed more.
 - **Shrink** (gentle halving toward `min`) when the buffered-queue bytes reach the byte budget (the OOM guard).
-  Permits already granted cannot be un-granted, so the surplus drains naturally and the next refill asks for less.
+  Permits already granted cannot be un-granted, so a shrink emits nothing and records the difference as `ConsumerState::window_surplus`: the owed refunds settle against it instead of being granted, so the broker window comes down to the new target as the application pops.
+  A later growth is covered by the surplus first and grants only the rest ([ADR-0147](../specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
 - **Hold** otherwise — the target only moves on a clear starve/OOM signal, so it converges without thrashing.
 
 For partitioned consumers the byte budget is divided across the live partition count, so the **aggregate** buffered bytes across all partitions stay within `max_bytes`.

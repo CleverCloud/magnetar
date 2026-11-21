@@ -33,6 +33,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **An `Auto` consumer that has been through a few windows of messages is no longer left unable to refill after its target grows.**
+  `adjust_receiver_queue` sized a growth grant as `new_target - granted_permits`, and `granted_permits` is the cumulative grant record: every `maybe_flow` refill adds to it, so after a few windows of pops it exceeds the window the broker holds.
+  A growth tick then saturated to a zero delta and emitted no `CommandFlow`, while the target and the refill threshold (`target / 2`) rose anyway.
+  Two doublings later the threshold was above the window, `maybe_flow` could never fire again, and the balance stayed at zero with the broker holding no permit; the stall watchdog needs a positive balance and the starvation gate is read only at the two `initial_flow` sites, so nothing rescued it, and once the byte-budget cap was at or below `granted_permits` (the messages consumed since the last reconnect or seek) it was permanent.
+  A growth tick now grants the `new_target - previous_target` the target gained, which is the window the broker holds, so the ramp of 100, 200, 400, 800 is unchanged and a consumer that popped four windows first is topped up from 100 to 200 instead of wedging ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
+  Both engines run the same `Connection` code and behave identically.
+
+- **An `Auto` shrink under memory pressure now brings the broker window down.**
+  When the buffered bytes reached the budget the target halved, but the broker window did not: a shrink emitted nothing and `maybe_flow` refunded every popped unit one for one, so only the refill threshold moved and the window stayed at its peak until a reconnect or seek re-seeded it, which left the out-of-memory guard unable to bound the bytes it exists to bound.
+  A shrink now records the permits the broker cannot take back as `ConsumerState::window_surplus`; `maybe_flow` retires owed refunds against it instead of granting them, and a growth tick absorbs it before granting, so the window converges to the new target as the application pops and a growth right after a shrink may emit no `CommandFlow` at all.
+  A consumer whose target never moves is unaffected, and a broker that dispatches past its window is still repaid in full.
+  `window_surplus` is `pub(crate)`; no public API changed ([ADR-0147](specs/adr/0147-size-auto-growth-against-the-broker-window-and-shrink-it-on-refunds.md)).
+
+- **A reset no longer leaves the dropped messages counting toward `Auto`'s out-of-memory guard.**
+  `Connection::reset` cleared every consumer's receiver queue and zeroed the permit mirrors but not `queued_bytes`, the counter `flow_stats` reports as `in_flight_bytes`.
+  Each transport reset therefore left the bytes of the messages it dropped counted forever, the redelivered copies were added on top, and once the stale total plus the live bytes reached the per-partition budget the guard took its shrink branch on every tick and pinned the target at `min`.
+  `reset` now zeroes `queued_bytes` with the queue, as `begin_seek` already did.
+
 - **A cumulative ack now releases every delivery it covers from the ack-timeout and nack trackers.**
   `apply_local_ack_state` removed only the ids a `CommandAck` named, and the trackers had no way to drop a range.
   After `acknowledge_cumulative`, every earlier delivery stayed tracked, and when `ack_timeout` closed (or a nack delay elapsed) the sweep sent a `CommandRedeliverUnacknowledgedMessages` for messages the application had already acknowledged; on an Exclusive or Failover subscription the broker ignores the id list and rewinds, redelivering the in-flight messages above the acknowledged position as duplicates.
