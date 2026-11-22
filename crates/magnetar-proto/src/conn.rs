@@ -1143,7 +1143,11 @@ impl Connection {
     ///    themselves are *not* removed — [`Self::rebuild_producers`] and
     ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
     ///    the new transport.
-    /// 5. Clear connection-level outbound + inbound byte buffers; flush queued events.
+    /// 5. Clear connection-level outbound + inbound byte buffers; flush queued events. With
+    ///    `scalable-topics`, forget every raw scalable-topic registration that lived on the dead
+    ///    session: the DAG sessions, the namespace watches and the TC-assignment watches (their ids
+    ///    are never reused), plus the in-flight scalable subscribe requests. The broker reaped them
+    ///    with the connection and nothing sends their subscribe again.
     /// 6. Snap the state machine back to [`HandshakeState::Uninitialized`] so
     ///    [`Self::begin_handshake`] can fire again on the new socket.
     pub fn reset(&mut self) {
@@ -1341,7 +1345,19 @@ impl Connection {
         self.outbound.clear();
         self.inbound.clear();
         #[cfg(feature = "scalable-topics")]
-        self.scalable_subscribe_requests.clear();
+        {
+            self.scalable_subscribe_requests.clear();
+            // The raw DAG sessions, namespace watches and TC-assignment watches live at the
+            // broker only as long as the connection that carried their subscribe command,
+            // and nothing writes that command again (`watch_scalable_topics` sends "a fresh
+            // subscribe, not a reconnect resync"). Keeping them registered would leave their
+            // accessors reporting the dead session's layout and topic set as live, and a
+            // later close would stage a close frame for an id the new session never opened.
+            // The id counters are deliberately kept, so an old id is never handed out again.
+            self.scalable_sessions.clear();
+            self.scalable_topic_watches.clear();
+            self.tc_assignment_watches.clear();
+        }
 
         // The lookup registry holds no Wakers itself — its futures poll via the per-request
         // waker slab we already drained above. Clearing it avoids replaying stale

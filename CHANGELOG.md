@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A transport reset now forgets the raw scalable-topic watches that lived on the dead session.**
+  A DAG session, a namespace scalable-topics watch and a TC-assignment watch live at the broker only as long as the TCP connection that carried their subscribe command, and nothing in the client writes that command again (`watch_scalable_topics` sends "a fresh subscribe, not a reconnect resync").
+  `Connection::reset()` cleared the events, the outbound buffer and the scalable subscribe requests but kept `scalable_sessions`, `scalable_topic_watches` and `tc_assignment_watches` registered, so after a supervised reconnect `dag_snapshot`, `scalable_resolved_topic_name` and `scalable_topics_snapshot` kept reporting the layout and the topic set of the dead session as if the watch were live, and a later close staged a close frame for an id the new session never opened.
+  A watch opened while the connection was `Failed` survived the reset too, although the reset wiped the outbound buffer that held its subscribe frame.
+  A parked `next_scalable_event` already ended with `None` on a disconnect, so the effect was on a caller that polls the accessors or was not parked, on the raw surface of a default-off feature.
+  `reset()` now clears the three registries; the session and watch id counters are not reset, so an old id is never handed to a new registration, and the owned `StreamConsumer`, which opens its own session under a fresh id after a reconnect, is unaffected.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0150](specs/adr/0150-forget-the-raw-scalable-registrations-on-a-reset.md)).
+
 - **`close()` and drop no longer hang on a `StreamConsumer` whose replacement DAG watch is waiting for its epoch alignment.**
   When the broker closed the retained DAG watch, the control loop of both runtimes (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) re-resolved it inline and awaited the alignment of the replacement with the controller assignment without racing the aggregate's close.
   If the replacement baseline was at a layout epoch the assignment had not reached, that wait needed an assignment push from the broker, and `close()` itself removes the controller registration that receives it, so the push could never arrive: `close()` joined the control task forever, and a dropped aggregate kept the task, the DAG session and the controller route alive until the physical connection died.
