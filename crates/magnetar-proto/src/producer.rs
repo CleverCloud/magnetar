@@ -248,9 +248,13 @@ pub struct ProducerState {
     /// the WHOLE connection on a `CommandSend` for a producer that is not
     /// ready ("Received message, but the producer is not ready : N.
     /// Closing the connection.") — staged sends wait in the slot until the
-    /// ack lands. Mirrors Java `ProducerImpl#handleProducerSuccess` →
-    /// `resendMessages`, which only re-issues pending messages after the
-    /// broker confirms the attachment.
+    /// ack lands. A staged send leaves the slot early only by being given up
+    /// on: the `send_timeout` sweep drops the staged frame of an expired send
+    /// ([`Self::drain_timed_out_sends`]), and a user close drops what is still
+    /// staged ([`Self::close`]) and keeps the gate shut when an open it had
+    /// outstanding is acknowledged afterwards (ADR-0151). Mirrors Java
+    /// `ProducerImpl#handleProducerSuccess` → `resendMessages`, which only
+    /// re-issues pending messages after the broker confirms the attachment.
     pub broker_ready: bool,
     /// Whether this producer has completed at least one broker attachment.
     /// Retryable failures before the first success return to the routing-aware
@@ -798,6 +802,24 @@ impl ProducerState {
     /// corresponding `OpOutcome::SendError` is registered by the connection layer, which
     /// drops each op (releasing its memory reservation) after the per-slot lock is gone.
     /// Mirrors Java's `ClientCnx#timedOutSendOps` sweep.
+    ///
+    /// A caller that is told its send failed must not see that message published later, so the
+    /// sweep also takes back what the expired sends would still put on the wire:
+    ///
+    /// - **A staged frame.** The frame of an expired send that is still waiting in `outbound`
+    ///   behind the `broker_ready` drain gate is dropped, every chunk of a chunked send included. A
+    ///   flushed batch frame is keyed by the lowest sequence id of its members, which is the id of
+    ///   the first member, and the first member is the first to expire. The frame carries every
+    ///   member's payload and cannot be cut down, so the members behind it that have not expired
+    ///   yet stay in `pending` with no frame and fail at their own deadline.
+    /// - **The unflushed batch container.** A message that expires while it is still waiting for a
+    ///   flush would be published by the next flush, so the container is discarded as a unit and
+    ///   its other members are returned with the expired ones, as Java's `failPendingBatchMessages`
+    ///   discards `batchMessageContainer`. Container members are the tail of `pending` (a message
+    ///   that cannot join the batch flushes it first), and the expired ops are a prefix, so once
+    ///   one of them was a member everything that remains in `pending` is a member too.
+    ///
+    /// A frame already written to the connection is out of reach and is left to the broker.
     pub fn drain_timed_out_sends(&mut self, now: std::time::Instant) -> Vec<OpSend> {
         let Some(timeout) = self.send_timeout else {
             return Vec::new();
@@ -830,6 +852,22 @@ impl ProducerState {
         if expired > 0 {
             for position in self.pending_index.values_mut() {
                 *position = position.saturating_sub(expired);
+            }
+            // The frame an expired send would still write: its own id, or for a batch member
+            // the lowest id of the batch, which names the batch frame.
+            let frame_ids: rustc_hash::FxHashSet<SequenceId> = out
+                .iter()
+                .map(|op| op.batch_lowest.unwrap_or(op.sequence_id))
+                .collect();
+            self.outbound
+                .retain(|frame| !frame_ids.contains(&frame.sequence_id));
+            let container_lowest = self.batch.lowest_sequence_id.map(SequenceId);
+            if container_lowest.is_some()
+                && out.iter().any(|op| op.batch_lowest == container_lowest)
+            {
+                self.batch.clear();
+                out.extend(self.pending.drain(..));
+                self.pending_index.clear();
             }
         }
         out
@@ -1329,13 +1367,24 @@ impl ProducerState {
     }
 
     /// Wall-clock deadline at which the batch should be force-flushed. Returns `None`
-    /// when batching has no max-publish-delay, or the batch is currently empty.
+    /// when batching has no max-publish-delay, the batch is currently empty, or the producer
+    /// is closed.
+    ///
+    /// A closed producer never flushes ([`Self::flush_batch`] returns 0 for it without clearing
+    /// `first_added_at`), and its unflushed batch stays in place until the close ack, a reset, the
+    /// `send_timeout` sweep ([`Self::drain_timed_out_sends`]) or `fail_all_pending` discards it.
+    /// Reporting the deadline meanwhile would leave it armed in
+    /// the past: `poll_timeout` would stay due, `handle_timeout` would flush nothing, and the
+    /// driver's timer arm would re-enter at a zero sleep until that release.
     ///
     /// Uses [`crate::time::deadline_with_clamp`] so a pathological
     /// `Duration::MAX` cannot panic via `Instant::add` overflow
     /// (invariant #6 — no panics in proto).
     #[must_use]
     pub fn next_batch_deadline(&self) -> Option<std::time::Instant> {
+        if self.closed {
+            return None;
+        }
         let max_delay = self.batching_max_publish_delay?;
         let first = self.batch.first_added_at?;
         Some(crate::time::deadline_with_clamp(first, max_delay))
@@ -1958,8 +2007,16 @@ impl ProducerState {
     }
 
     /// Mark the producer closed. New sends return [`ProducerError::Closed`].
+    ///
+    /// Frames still staged in `outbound` are dropped. [`crate::Connection::close_producer`]
+    /// writes the ones the drain gate lets through ahead of `CommandCloseProducer`, so what is
+    /// left is behind a shut gate (the broker has not acknowledged the (re-)attachment) and a
+    /// `CommandSend` for a producer the client has told the broker to drop would either be
+    /// rejected or make the broker close the whole connection. The sends stay in `pending` and
+    /// fail with the rest when the broker acknowledges the close.
     pub fn close(&mut self) {
         self.closed = true;
+        self.outbound.clear();
     }
 }
 
@@ -3301,6 +3358,165 @@ mod tests {
         assert!(drained.is_empty());
         // The pending entry stayed in the queue.
         assert_eq!(p.pending.len(), 1);
+    }
+
+    /// An expired send takes every frame it staged with it — all the chunks of a chunked send —
+    /// and leaves the frames of the sends that have not expired where they are, in order.
+    #[test]
+    fn drain_timed_out_sends_drops_every_staged_chunk_of_an_expired_send_only() {
+        let t0 = std::time::Instant::now();
+        let mut p =
+            ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
+        p.chunking_enabled = true;
+        p.send_timeout = Some(std::time::Duration::from_secs(10));
+        let _ = p
+            .queue_send(small_message(&[b'a'; 25]), 100, t0)
+            .expect("chunked send");
+        let _ = p
+            .queue_send(
+                small_message(b"short"),
+                100,
+                t0 + std::time::Duration::from_secs(5),
+            )
+            .expect("single send");
+        assert_eq!(p.outbound_len(), 4, "three chunks and one single frame");
+
+        let drained = p.drain_timed_out_sends(t0 + std::time::Duration::from_secs(10));
+
+        assert_eq!(
+            drained.iter().map(|op| op.sequence_id).collect::<Vec<_>>(),
+            vec![SequenceId(0)]
+        );
+        assert_eq!(
+            p.outbound_len(),
+            1,
+            "only the unexpired send keeps its frame"
+        );
+        assert_eq!(
+            p.next_outbound_frame().expect("survivor").sequence_id,
+            SequenceId(1)
+        );
+        assert_eq!(p.pending_index.get(&SequenceId(1)), Some(&0));
+    }
+
+    /// A flushed batch frame waiting behind the gate is keyed by the lowest id of its members, so
+    /// it goes when its first member expires. The members behind it stay pending with no frame and
+    /// fail at their own deadline; a frame already written would be out of reach either way.
+    #[test]
+    fn drain_timed_out_sends_drops_a_staged_batch_frame_with_its_first_member() {
+        let t0 = std::time::Instant::now();
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            128 * 1024,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 2;
+        p.send_timeout = Some(std::time::Duration::from_secs(10));
+        let _ = p
+            .queue_send(small_message(b"first"), 100, t0)
+            .expect("first member");
+        let _ = p
+            .queue_send(
+                small_message(b"second"),
+                100,
+                t0 + std::time::Duration::from_secs(5),
+            )
+            .expect("second member fills the batch and flushes it");
+        assert_eq!(p.outbound_len(), 1, "the batch frame is staged");
+
+        let first_sweep = p.drain_timed_out_sends(t0 + std::time::Duration::from_secs(10));
+        assert_eq!(first_sweep.len(), 1, "only the first member has expired");
+        assert_eq!(
+            p.outbound_len(),
+            0,
+            "the batch frame goes with its first member"
+        );
+        assert_eq!(p.pending_index.get(&SequenceId(1)), Some(&0));
+
+        let second_sweep = p.drain_timed_out_sends(t0 + std::time::Duration::from_secs(15));
+        assert_eq!(
+            second_sweep.len(),
+            1,
+            "the second member fails at its own deadline"
+        );
+        assert!(p.pending.is_empty() && p.pending_index.is_empty());
+    }
+
+    /// A message that expires in the unflushed batch container takes the whole container with it:
+    /// Java discards `batchMessageContainer` on a send timeout, and the member that did not expire
+    /// yet would otherwise be published by a flush with no caller left to want it. The index and
+    /// the container are left empty, and a later flush has nothing to write.
+    #[test]
+    fn drain_timed_out_sends_discards_the_unflushed_batch_container_as_a_unit() {
+        let t0 = std::time::Instant::now();
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            128 * 1024,
+        );
+        p.batching_enabled = true;
+        p.send_timeout = Some(std::time::Duration::from_secs(10));
+        let _ = p
+            .queue_send(small_message(b"first"), 100, t0)
+            .expect("first member");
+        let _ = p
+            .queue_send(
+                small_message(b"second"),
+                100,
+                t0 + std::time::Duration::from_secs(5),
+            )
+            .expect("second member");
+        assert_eq!(p.batch.len(), 2);
+
+        let drained = p.drain_timed_out_sends(t0 + std::time::Duration::from_secs(10));
+
+        assert_eq!(
+            drained.iter().map(|op| op.sequence_id).collect::<Vec<_>>(),
+            vec![SequenceId(0), SequenceId(1)],
+            "the member that had not expired fails with its container"
+        );
+        assert!(p.batch.is_empty());
+        assert!(p.pending.is_empty() && p.pending_index.is_empty());
+        assert_eq!(
+            p.flush_batch(100, t0),
+            0,
+            "a later flush has nothing to publish"
+        );
+        assert_eq!(p.outbound_len(), 0);
+    }
+
+    /// An unbatched send never matches the container: an empty container has no lowest id, and
+    /// that absence must not compare equal to the `None` an unbatched op carries.
+    #[test]
+    fn drain_timed_out_sends_leaves_an_unexpired_send_alone_when_the_container_is_empty() {
+        let t0 = std::time::Instant::now();
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            128 * 1024,
+        );
+        p.send_timeout = Some(std::time::Duration::from_secs(10));
+        let _ = p
+            .queue_send(small_message(b"old"), 100, t0)
+            .expect("old send");
+        let _ = p
+            .queue_send(
+                small_message(b"young"),
+                100,
+                t0 + std::time::Duration::from_secs(5),
+            )
+            .expect("young send");
+
+        let drained = p.drain_timed_out_sends(t0 + std::time::Duration::from_secs(10));
+
+        assert_eq!(drained.len(), 1);
+        assert_eq!(p.pending.len(), 1, "the unexpired send stays pending");
+        assert_eq!(p.pending_index.get(&SequenceId(1)), Some(&0));
+        assert_eq!(p.outbound_len(), 1, "and keeps its frame");
     }
 
     /// V9: the batched flush path previously had

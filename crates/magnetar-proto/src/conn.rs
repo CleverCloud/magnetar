@@ -1143,7 +1143,11 @@ impl Connection {
     ///    themselves are *not* removed — [`Self::rebuild_producers`] and
     ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
     ///    the new transport.
-    /// 5. Clear connection-level outbound + inbound byte buffers; flush queued events.
+    /// 5. Clear connection-level outbound + inbound byte buffers; flush queued events. With
+    ///    `scalable-topics`, forget every raw scalable-topic registration that lived on the dead
+    ///    session: the DAG sessions, the namespace watches and the TC-assignment watches (their ids
+    ///    are never reused), plus the in-flight scalable subscribe requests. The broker reaped them
+    ///    with the connection and nothing sends their subscribe again.
     /// 6. Snap the state machine back to [`HandshakeState::Uninitialized`] so
     ///    [`Self::begin_handshake`] can fire again on the new socket.
     pub fn reset(&mut self) {
@@ -1341,7 +1345,19 @@ impl Connection {
         self.outbound.clear();
         self.inbound.clear();
         #[cfg(feature = "scalable-topics")]
-        self.scalable_subscribe_requests.clear();
+        {
+            self.scalable_subscribe_requests.clear();
+            // The raw DAG sessions, namespace watches and TC-assignment watches live at the
+            // broker only as long as the connection that carried their subscribe command,
+            // and nothing writes that command again (`watch_scalable_topics` sends "a fresh
+            // subscribe, not a reconnect resync"). Keeping them registered would leave their
+            // accessors reporting the dead session's layout and topic set as live, and a
+            // later close would stage a close frame for an id the new session never opened.
+            // The id counters are deliberately kept, so an old id is never handed out again.
+            self.scalable_sessions.clear();
+            self.scalable_topic_watches.clear();
+            self.tc_assignment_watches.clear();
+        }
 
         // The lookup registry holds no Wakers itself — its futures poll via the per-request
         // waker slab we already drained above. Clearing it avoids replaying stale
@@ -3053,7 +3069,24 @@ impl Connection {
                     // The name attached: this client owns the registration,
                     // so nothing is left to reclaim under it (issue #406).
                     self.forget_abandoned_producer_opens(handle);
-                    let snapshots = self.in_flight_publish_snapshots.remove(&handle);
+                    // A user close issued after this open went out owns the producer now. Its
+                    // staged and relocated sends must not be written for a producer the broker
+                    // is being told to drop, so the arm replays nothing and leaves the drain
+                    // gate shut; Java's `handleProducerSuccess` likewise sends nothing for a
+                    // closing producer. The relocated sends are failed below, as
+                    // `rebuild_producers` fails them for a producer it does not re-attach; the
+                    // answer to the close, a `Success` or a `CommandError`, then reaches
+                    // `fail_sends_of_closed_producer` with the bucket empty and resolves
+                    // nothing twice.
+                    let closed = self
+                        .producers
+                        .get(&handle)
+                        .is_some_and(|slot| slot.state.lock().closed);
+                    let snapshots = if closed {
+                        None
+                    } else {
+                        self.in_flight_publish_snapshots.remove(&handle)
+                    };
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
                         producer.open_request_id = None;
@@ -3077,11 +3110,13 @@ impl Connection {
                         // then open the drain gate.
                         let pending_before = producer.pending.len();
                         let snapshot_count = snapshots.as_ref().map_or(0, Vec::len);
-                        producer.replay_pending_outbound();
-                        if let Some(snapshots) = snapshots {
-                            producer.replay_snapshots(snapshots);
+                        if !closed {
+                            producer.replay_pending_outbound();
+                            if let Some(snapshots) = snapshots {
+                                producer.replay_snapshots(snapshots);
+                            }
+                            slot.set_broker_ready(&mut producer, true, self.is_connected());
                         }
-                        slot.set_broker_ready(&mut producer, true, self.is_connected());
                         producer.has_ever_attached = true;
                         // The re-attach succeeded — clear the transient-retry
                         // budget so a future bundle reshuffle starts its backoff
@@ -3093,8 +3128,12 @@ impl Connection {
                             handle = ?handle,
                             pending = pending_before,
                             replayed_snapshots = snapshot_count,
-                            "producer re-attach acked; replay staged and drain gate opened"
+                            closed,
+                            "producer re-attach acked; replay staged and drain gate opened unless closed"
                         );
+                    }
+                    if closed {
+                        self.terminalize_snapshot_bucket(handle, PRODUCER_CLOSED_REASON);
                     }
                     self.events.push_back(ConnectionEvent::ProducerReady {
                         handle,
@@ -7934,6 +7973,11 @@ impl Connection {
     /// Close a producer. The caller is expected to await the broker ack via
     /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
     /// with [`Self::take_outcome`].
+    ///
+    /// Sends the producer staged before the close are written ahead of
+    /// `CommandCloseProducer` when the connection is `Connected` and the slot's
+    /// drain gate is open; any still staged are dropped, and the ack of the close
+    /// fails them with the rest of the producer's pending sends (ADR-0151).
     pub fn close_producer(&mut self, handle: ProducerHandle) -> RequestId {
         self.close_producer_inner(handle, false)
     }
@@ -7963,6 +8007,12 @@ impl Connection {
             close_producer: Some(cmd),
             ..Default::default()
         };
+        // Sends the producer staged before this close go out AHEAD of it, as they do in Java,
+        // where a send is written when it is issued: a `CommandSend` behind the close would be
+        // rejected, or close the whole connection if the broker had already removed the
+        // producer. The drain honours the gate, so frames staged behind a shut one are not
+        // written; `ProducerState::close` drops them below.
+        self.drain_producer_outbound();
         let _ = self.encode_command(&base);
         if let Some(slot) = self.producers.get(&handle) {
             let mut state = slot.state.lock();
@@ -8461,12 +8511,28 @@ impl Connection {
 
     /// Commit or abort the transaction. Returns the request id; the matching
     /// [`OpOutcome::EndTxn`] is consumed via [`Self::take_outcome`] once the broker replies.
+    ///
+    /// A transaction is ended with one action: the fence is [`TxnError::AlreadyEnding`] naming
+    /// the action already under way. It holds while a runtime waiter owns the lease and, past a
+    /// cancelled caller's [`Self::release_end_txn_waiter`], for as long as the
+    /// `CommandEndTxn` that caller staged is unresolved (its outcome not consumed and the
+    /// request not cancelled), because that frame stays on the wire and the coordinator will
+    /// still apply it. Only the same action resumes it.
     pub fn end_txn(&mut self, txn: TxnId, action: TxnAction) -> Result<RequestId, TxnError> {
         let key = (txn, action);
         if let Some(active_action) = self.end_txn_waiters.get(&txn).copied() {
             return Err(TxnError::AlreadyEnding {
                 txn_id: txn,
                 action: active_action,
+            });
+        }
+        if let Some(in_flight_action) = [TxnAction::Commit, TxnAction::Abort]
+            .into_iter()
+            .find(|other| *other != action && self.end_txn_requests.contains_key(&(txn, *other)))
+        {
+            return Err(TxnError::AlreadyEnding {
+                txn_id: txn,
+                action: in_flight_action,
             });
         }
         self.end_txn_waiters.insert(txn, action);
@@ -12172,6 +12238,82 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    /// A caller that gives up on `Transaction::commit` releases its runtime waiter lease, but the
+    /// `CommandEndTxn(Commit)` it staged stays in flight and the coordinator will still apply it.
+    /// The fence against a second, conflicting end must therefore hold for as long as that request
+    /// is unresolved, not only for as long as a waiter holds the lease: an abort issued after the
+    /// cancelled commit has to be refused locally, as the Java client does, instead of putting a
+    /// second `CommandEndTxn(Abort)` behind the first on the same transaction.
+    #[test]
+    fn end_txn_refuses_the_opposite_action_while_a_cancelled_end_is_in_flight() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 11);
+
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+
+        let commit = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("the commit claims the EndTxn waiter");
+        // The commit's caller is dropped before the broker answers: the lease is released and the
+        // request stays on the wire.
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+
+        assert!(
+            matches!(
+                conn.end_txn(txn, TxnAction::Abort),
+                Err(TxnError::AlreadyEnding {
+                    txn_id,
+                    action: TxnAction::Commit,
+                }) if txn_id == txn
+            ),
+            "an abort issued while the cancelled commit is still unresolved must be refused"
+        );
+        assert_eq!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .filter(|command| command.r#type == pb::base_command::Type::EndTxn as i32)
+                .count(),
+            1,
+            "only the commit's CommandEndTxn may reach the wire"
+        );
+        assert_eq!(
+            conn.txn_client()
+                .transaction(txn)
+                .map(|metadata| metadata.state),
+            Some(crate::TxnState::Committing),
+            "a refused abort must leave the local state at the commit in flight"
+        );
+        assert_eq!(
+            conn.end_txn(txn, TxnAction::Commit)
+                .expect("the refused abort leaves the commit resumable"),
+            commit
         );
     }
 
@@ -26732,6 +26874,371 @@ mod memory_limit_release_tests {
             conn.take_outcome(PendingOpKey::Send(forgotten, s_forgotten)),
             Some(OpOutcome::Terminal { .. })
         ));
+    }
+
+    /// The broker closing `handle` on its own initiative, which makes the client re-attach it in
+    /// place and shuts the producer's drain gate until the re-attach is acknowledged.
+    fn broker_closes(handle: ProducerHandle) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseProducer as i32,
+            close_producer: Some(pb::CommandCloseProducer {
+                producer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn producer_success(request_id: RequestId) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id: request_id.0,
+                producer_name: "staged-frames".to_owned(),
+                last_sequence_id: Some(-1),
+                schema_version: None,
+                topic_epoch: None,
+                producer_ready: Some(true),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Sequence ids of the `CommandSend`s in `commands` that name `handle`, in wire order.
+    fn written_sends(commands: &[pb::BaseCommand], handle: ProducerHandle) -> Vec<u64> {
+        commands
+            .iter()
+            .filter_map(|c| c.send.as_ref())
+            .filter(|s| s.producer_id == handle.0)
+            .map(|s| s.sequence_id)
+            .collect()
+    }
+
+    /// A send whose `send_timeout` elapsed while its frame was staged behind the drain gate is
+    /// never written when the gate reopens, its bytes are released once (at the timeout, not again
+    /// when the gate opens), and a send beside it that has not expired is still written.
+    #[test]
+    fn a_send_that_timed_out_behind_the_gate_is_released_once_and_never_written() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                send_timeout: Some(Duration::from_secs(5)),
+                ..request("mem-gated-timeout")
+            },
+        );
+        let budget = budget(100);
+        feed(&mut conn, at, &broker_closes(handle));
+        let reattach = open_of(&transmitted(&mut conn));
+        let timed_out = send(&mut conn, handle, &budget, 10, at);
+        let survivor = send(&mut conn, handle, &budget, 20, at + Duration::from_secs(3));
+        assert_eq!(budget.used_bytes(), 30);
+
+        conn.handle_timeout(at + Duration::from_secs(5));
+        assert_eq!(
+            budget.used_bytes(),
+            20,
+            "the timeout released the expired send"
+        );
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, timed_out)),
+            Some(OpOutcome::SendError { code: -1, .. })
+        ));
+
+        feed(&mut conn, at, &producer_success(reattach));
+        assert_eq!(
+            written_sends(&transmitted(&mut conn), handle),
+            vec![survivor.0],
+            "the re-attach acknowledgement writes the survivor and not the expired send"
+        );
+        assert_eq!(budget.used_bytes(), 20, "opening the gate released nothing");
+    }
+
+    /// A message that expires in the batch container takes the container with it, and every member
+    /// releases its bytes once; a flush afterwards has nothing to publish.
+    #[test]
+    fn a_batched_send_that_timed_out_takes_its_container_and_releases_every_member() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(
+            &mut conn,
+            at,
+            CreateProducerRequest {
+                enable_batching: true,
+                send_timeout: Some(Duration::from_secs(5)),
+                ..request("mem-batch-timeout")
+            },
+        );
+        let budget = budget(100);
+        let first = send(&mut conn, handle, &budget, 10, at);
+        let second = send(&mut conn, handle, &budget, 20, at + Duration::from_secs(3));
+        assert_eq!(budget.used_bytes(), 30);
+
+        conn.handle_timeout(at + Duration::from_secs(5));
+        assert_eq!(budget.used_bytes(), 0, "both members released their bytes");
+        for seq in [first, second] {
+            assert!(matches!(
+                conn.take_outcome(PendingOpKey::Send(handle, seq)),
+                Some(OpOutcome::SendError { code: -1, .. })
+            ));
+        }
+        assert_eq!(conn.producer_pending_count(handle), 0);
+        assert_eq!(conn.producer_batch_len(handle), 0);
+
+        let _ = conn.flush_producer(handle, 0, at + Duration::from_secs(6));
+        assert!(
+            written_sends(&transmitted(&mut conn), handle).is_empty(),
+            "a flush after the sweep must not publish the discarded members"
+        );
+    }
+
+    /// A send staged behind a shut gate when the producer is closed is dropped, not written after
+    /// the close; the acknowledgement of the close fails it and releases its bytes once, and the
+    /// acknowledgement of a re-attach that was in flight at the close does not reopen the gate.
+    #[test]
+    fn closing_a_producer_behind_a_shut_gate_drops_the_staged_send() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("mem-close-gated"));
+        let budget = budget(100);
+        feed(&mut conn, at, &broker_closes(handle));
+        let reattach = open_of(&transmitted(&mut conn));
+        let staged = send(&mut conn, handle, &budget, 15, at);
+
+        let close = conn.close_producer(handle);
+        let wire = transmitted(&mut conn);
+        assert!(
+            written_sends(&wire, handle).is_empty(),
+            "nothing may follow the close"
+        );
+        assert_eq!(closes_of(&wire, handle), vec![close]);
+        assert_eq!(
+            budget.used_bytes(),
+            15,
+            "nothing is released before the broker acks"
+        );
+
+        feed(&mut conn, at, &producer_success(reattach));
+        assert!(
+            written_sends(&transmitted(&mut conn), handle).is_empty(),
+            "the re-attach acknowledgement must not write for a closed producer"
+        );
+        assert!(
+            !conn
+                .producer(handle)
+                .expect("slot")
+                .state
+                .lock()
+                .broker_ready
+        );
+
+        feed(&mut conn, at, &success(close));
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, staged)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    /// A send a reset relocated into the snapshot bucket, then a user close before the re-open is
+    /// acknowledged. Returns the connection, the handle, the relocated send, the close request and
+    /// the budget after the re-open acknowledgement has been processed.
+    fn close_before_the_reopen_is_acknowledged(
+        at: Instant,
+        topic: &str,
+    ) -> (
+        Connection,
+        ProducerHandle,
+        SequenceId,
+        RequestId,
+        Arc<MemoryLimitController>,
+    ) {
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request(topic));
+        let budget = budget(100);
+        let relocated = send(&mut conn, handle, &budget, 25, at);
+        let _ = transmitted(&mut conn);
+
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            },
+        );
+        let reopen = conn.rebuild_producers()[0];
+        let _ = transmitted(&mut conn);
+        assert_eq!(conn.in_flight_publish_snapshot_len(handle), 1);
+
+        let close = conn.close_producer(handle);
+        feed(&mut conn, at, &producer_success(reopen));
+        (conn, handle, relocated, close, budget)
+    }
+
+    /// The re-open acknowledgement writes nothing for a producer the user closed, fails the send
+    /// the reset relocated and releases its bytes once; the close's own acknowledgement, which
+    /// finds the bucket empty, releases and resolves nothing twice.
+    #[test]
+    fn a_reopen_acknowledged_after_the_close_fails_the_relocated_send_once() {
+        let at = Instant::now();
+        let (mut conn, handle, relocated, close, budget) =
+            close_before_the_reopen_is_acknowledged(at, "mem-close-reopen");
+        assert!(
+            written_sends(&transmitted(&mut conn), handle).is_empty(),
+            "the re-open acknowledgement must not replay into a closed producer"
+        );
+        assert_eq!(conn.in_flight_publish_snapshot_len(handle), 0);
+        assert_eq!(budget.used_bytes(), 0, "released by the re-open ack");
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, relocated)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+
+        feed(&mut conn, at, &success(close));
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(handle, relocated))
+                .is_none(),
+            "the close acknowledgement resolves nothing a second time"
+        );
+    }
+
+    /// A close the broker answers with `CommandError` reaches `fail_sends_of_closed_producer` as
+    /// its acknowledgement does, so the relocated send, failed by the re-open acknowledgement, is
+    /// resolved once and its bytes are released once.
+    #[test]
+    fn a_rejected_close_does_not_strand_the_relocated_send() {
+        let at = Instant::now();
+        let (mut conn, handle, relocated, close, budget) =
+            close_before_the_reopen_is_acknowledged(at, "mem-close-rejected");
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: close.0,
+                    error: pb::ServerError::UnknownError as i32,
+                    message: "close rejected".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(conn.in_flight_publish_snapshot_len(handle), 0);
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, relocated)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+    }
+
+    /// While a mid-connection `CommandAuthChallenge` is unanswered the connection is not
+    /// `Connected`, so the drain is held for every producer although each slot's own gate is
+    /// open. A close in that window cannot write the staged send ahead of itself, and the send must
+    /// not be left to follow the close once the answer to the challenge lets the drain run.
+    #[test]
+    fn closing_a_producer_during_an_auth_challenge_leaves_no_send_to_follow_the_close() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("mem-close-auth"));
+        let budget = budget(100);
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::AuthChallenge as i32,
+                auth_challenge: Some(pb::CommandAuthChallenge {
+                    server_version: None,
+                    challenge: Some(pb::AuthData {
+                        auth_method_name: Some("token".to_owned()),
+                        auth_data: Some(bytes::Bytes::from_static(b"refresh")),
+                    }),
+                    protocol_version: Some(21),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(conn.state(), HandshakeState::AuthChallenging);
+        let _ = send(&mut conn, handle, &budget, 15, at);
+
+        let close = conn.close_producer(handle);
+        conn.submit_auth_response(bytes::Bytes::from_static(b"answer"), None);
+        assert_eq!(conn.state(), HandshakeState::Connected);
+
+        let wire = transmitted(&mut conn);
+        assert!(
+            written_sends(&wire, handle).is_empty(),
+            "a send staged before the close was written after it: {:?}",
+            wire.iter().map(|c| c.r#type).collect::<Vec<_>>()
+        );
+        assert_eq!(closes_of(&wire, handle), vec![close]);
+    }
+
+    /// A send staged before the close, with the gate open, is written ahead of the close, as
+    /// Java writes a send when it is issued, so the broker's receipt for it still resolves it.
+    #[test]
+    fn a_send_staged_before_the_close_is_written_ahead_of_it_and_still_receipted() {
+        let at = Instant::now();
+        let mut conn = handshaked(at);
+        let handle = open_producer(&mut conn, at, request("mem-close-open"));
+        let budget = budget(100);
+        // The per-slot hot path `Producer::send` takes stages the frame and drains nothing.
+        let staged = conn
+            .producer(handle)
+            .cloned()
+            .expect("slot")
+            .queue_send_reserved(msg(15), budget.try_reserve(15).expect("fits"), 0, at)
+            .expect("staged on the hot path");
+
+        let close = conn.close_producer(handle);
+        let kinds: Vec<i32> = transmitted(&mut conn).iter().map(|c| c.r#type).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                pb::base_command::Type::Send as i32,
+                pb::base_command::Type::CloseProducer as i32
+            ],
+            "the staged send precedes the close on the wire"
+        );
+
+        feed(
+            &mut conn,
+            at,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::SendReceipt as i32,
+                send_receipt: Some(pb::CommandSendReceipt {
+                    producer_id: handle.0,
+                    sequence_id: staged.0,
+                    message_id: Some(pb::MessageIdData {
+                        ledger_id: 1,
+                        entry_id: 0,
+                        ..Default::default()
+                    }),
+                    highest_sequence_id: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(handle, staged)),
+            Some(OpOutcome::SendReceipt { .. })
+        ));
+        feed(&mut conn, at, &success(close));
+        assert_eq!(conn.producer_pending_count(handle), 0);
     }
 
     /// Every command the connection has staged for the wire, decoded.

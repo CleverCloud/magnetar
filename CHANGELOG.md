@@ -33,6 +33,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A send the client gave up on is no longer written afterwards.**
+  A producer stages the frame of each send in its slot until the connection drains it, and the drain is held while the broker has not acknowledged the (re-)attachment: after a broker-initiated `CommandCloseProducer`, which the client re-attaches in place, and during a reconnect rebuild.
+  The `send_timeout` sweep removed an expired send's pending op and resolved its caller with `send timeout` but left the frame staged, so the broker's `CommandProducerSuccess` for the re-attach reopened the drain and wrote a message the caller had been told failed; a caller that retried published it twice, under two sequence ids that broker deduplication cannot match.
+  A batching producer with no publish delay kept a timed-out message in its batch container in the same way, and the next flush published it.
+  The sweep now drops the staged frame of every expired send (every chunk of a chunked send, and a flushed batch frame together with its first member) and discards the unflushed batch container as a unit, as Java does, failing the container's other members with the same send-timeout error; the members of a dropped batch frame that had not expired fail at their own deadline.
+  A frame already written to the connection is out of reach and is left to the broker.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0151](specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md)).
+
+- **A producer's close is no longer followed by its own staged sends.**
+  `Connection::close_producer` encoded `CommandCloseProducer` into the connection buffer while the producer's staged `CommandSend` frames stayed in its slot, so the wire carried the close and then the sends; the broker rejects such a send, or closes the whole shared connection, with every producer and consumer on it, when the frame lands after it has removed the producer.
+  Sends staged while the drain gate is open are now written ahead of the close, as Java writes a send when it is issued, and are receipted as usual; those staged behind a shut gate, or while an authentication challenge is unanswered, are dropped and fail with the rest when the broker acknowledges the close.
+  A `CommandProducerSuccess` answering an open that was sent before the close no longer replays the producer's pending frames and reset snapshots or reopens its drain gate; the reset snapshots are failed there instead, as a rebuild fails them for a producer it does not re-attach.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0151](specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md)).
+
+- **A closed producer no longer leaves its batch-flush deadline armed in the past.**
+  A batching producer with a `batching_max_publish_delay` arms `first_added_at + delay` as soon as its first message sits in the batch, and `Connection::poll_timeout` reports that deadline for every producer slot.
+  Closing the producer keeps the unflushed batch in place until the broker acknowledges the close, and `flush_batch` returns at once for a closed producer without clearing `first_added_at`, so once the delay had elapsed `handle_timeout` selected the slot as due and flushed nothing, and `poll_timeout` kept answering the same instant.
+  Each driver turned that into a zero sleep, took its timer arm, locked the connection and looped, until the close acknowledgement, a reset or `fail_all_pending` emptied the batch; the broker answers a close only once the producer's earlier publishes are persisted, so the loop lasted as long as that took.
+  The delay is opt-in and the loop ends with the close, so the severity is low.
+  `ProducerState::next_batch_deadline` now returns `None` for a closed producer, which also makes `batch_deadline_elapsed` false for it, so neither `poll_timeout` nor the `handle_timeout` batch sweep considers a closed producer's batch; an open producer's deadline is unchanged.
+  Both engines run the same `Connection` code and behave identically; no public API changed.
+
+- **A transport reset now forgets the raw scalable-topic watches that lived on the dead session.**
+  A DAG session, a namespace scalable-topics watch and a TC-assignment watch live at the broker only as long as the TCP connection that carried their subscribe command, and nothing in the client writes that command again (`watch_scalable_topics` sends "a fresh subscribe, not a reconnect resync").
+  `Connection::reset()` cleared the events, the outbound buffer and the scalable subscribe requests but kept `scalable_sessions`, `scalable_topic_watches` and `tc_assignment_watches` registered, so after a supervised reconnect `dag_snapshot`, `scalable_resolved_topic_name` and `scalable_topics_snapshot` kept reporting the layout and the topic set of the dead session as if the watch were live, and a later close staged a close frame for an id the new session never opened.
+  A watch opened while the connection was `Failed` survived the reset too, although the reset wiped the outbound buffer that held its subscribe frame.
+  A parked `next_scalable_event` already ended with `None` on a disconnect, so the effect was on a caller that polls the accessors or was not parked, on the raw surface of a default-off feature.
+  `reset()` now clears the three registries; the session and watch id counters are not reset, so an old id is never handed to a new registration, and the owned `StreamConsumer`, which opens its own session under a fresh id after a reconnect, is unaffected.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0150](specs/adr/0150-forget-the-raw-scalable-registrations-on-a-reset.md)).
+
 - **`close()` and drop no longer hang on a `StreamConsumer` whose replacement DAG watch is waiting for its epoch alignment.**
   When the broker closed the retained DAG watch, the control loop of both runtimes (`magnetar-runtime-tokio` and `magnetar-runtime-moonpool`) re-resolved it inline and awaited the alignment of the replacement with the controller assignment without racing the aggregate's close.
   If the replacement baseline was at a layout epoch the assignment had not reached, that wait needed an assignment push from the broker, and `close()` itself removes the controller registration that receives it, so the push could never arrive: `close()` joined the control task forever, and a dropped aggregate kept the task, the DAG session and the controller route alive until the physical connection died.
@@ -160,6 +190,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The `EndTxnResponse` arm now forgets the transaction once the broker has answered its `CommandEndTxn`, whether it committed, aborted or refused it, so `TxnClient::len()` counts only transactions still open, and `Connection::txn_client().transaction(id)` returns `None` once the reply to that transaction's `CommandEndTxn` has been handled.
   Both engines run the same `Connection` code and behave identically.
   A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, still keeps its record, since `TxnClient` has no timeout policy; the request and waker entries of a transaction call in flight at a reset are not touched here either.
+
+- **A dropped `commit` no longer lets a following `abort` put a second, conflicting `CommandEndTxn` on the wire.**
+  `Connection::end_txn` refuses a second end of a transaction with `TxnError::AlreadyEnding`, but the fence read only the runtime waiter lease.
+  Dropping the `Client::end_txn` future releases that lease through `release_end_txn_waiter` and deliberately keeps the request, so the `CommandEndTxn(Commit)` stays in flight and the transaction coordinator still applies it.
+  An `end_txn(txn, Abort)` issued after the drop therefore passed the fence, overwrote the transaction's local state with `Aborting` and staged a second `CommandEndTxn` behind the first on the same transaction; the Java client refuses that abort locally.
+  The coordinator, not the client, then arbitrated the pair, and the second end could surface to the caller as a broker status error that misdescribes what happened to the transaction.
+  `Connection::end_txn` now also refuses the opposite action for as long as the other action's request is unresolved, that is until its outcome is consumed or the request is cancelled, with `AlreadyEnding` naming the action in flight, and leaves the local state at the end in flight.
+  The same action still resumes the canonical request id.
+  Both engines run the same `Connection` code and behave identically; no public API changed.
+  A transaction whose cancelled end was answered but never consumed (a refusal, or a reset's `SessionLost`) refuses the opposite action until the same action is called again and consumes that outcome, the same as for an unanswered one.
 
 - **A topic-list snapshot reply that lands after its caller gave up no longer leaves the topic list behind.**
   `Connection::cancel_request` is what a dropped or timed-out `topic_list_snapshot` (and pattern-subscribe) future calls, and documents that "a late broker reply is ignored".

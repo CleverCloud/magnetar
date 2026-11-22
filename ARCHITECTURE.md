@@ -434,6 +434,11 @@ The two layers — global Connection mutex and per-slot mutex — are acquired i
 The producer-send hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection-wide outbound buffer under the global lock via `poll_transmit` (`drain_producer_outbound`).
 The reconnect rebuild path (`Connection::rebuild_producers` / `rebuild_consumers`) takes the global lock and each per-slot lock in canonical order.
 
+A frame staged in a producer slot leaves it only when the connection is `Connected` and the slot's `broker_ready` gate is open, and a staged frame does not outlive the client's interest in it ([ADR-0151](specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md)).
+The `send_timeout` sweep drops the staged frame of every send it expires (every chunk of a chunked send; a flushed batch frame together with its first member) and discards the unflushed batch container as a unit, failing its other members with the same send-timeout error.
+`Connection::close_producer` drains first, so frames staged behind an open gate precede `CommandCloseProducer` on the wire, and `ProducerState::close` drops what is still staged behind a shut gate or an unanswered authentication challenge.
+The `CommandProducerSuccess` arm replays nothing and leaves the gate shut for a producer the user has closed, and fails its snapshot bucket with `OpOutcome::Terminal` as `rebuild_producers` does.
+
 A third lock sits below both: the waiter mutex of the client-wide `magnetar_proto::MemoryLimitController` ([ADR-0111](specs/adr/0111-share-one-memory-limit-controller-per-client.md)).
 It is a **leaf**: nothing is acquired while it is held, and no waker is woken or dropped under it.
 Releasing a publish's memory reservation takes it, and that may happen under the global lock — an `OpSend` dropped by the receipt arm — but never under a per-slot lock: the producer state machine hands every removed `OpSend` back to its `Connection` caller, which drops it after the slot guard.
@@ -769,6 +774,7 @@ The supervisor:
    The snapshotted sends are still owed a receipt, so `Producer::flush` and `Producer::pending_count` count them through `Connection::producer_unacknowledged_count` (the live queue plus the bucket) from the reset until their own receipts: a `flush` issued or parked across the reconnect stays pending until the replayed sends are acknowledged ([ADR-0137](specs/adr/0137-count-the-reset-snapshot-in-producer-flush-and-pending-count.md)).
    A producer that is closed when the rebuild runs is not re-attached, so there is nothing to replay onto: its snapshotted sends fail with `OpOutcome::Terminal` there, as they would on the broker's close acknowledgement, which a close issued after the reset does not outrun; a close still unacknowledged at the reset has already failed them in `reset()` ([ADR-0135](specs/adr/0135-fail-the-sends-of-a-producer-closed-across-a-reset-at-the-rebuild.md)).
    Producers / consumers see `is_connected() = false` but stay live.
+   With `scalable-topics`, the raw DAG sessions, namespace watches and TC-assignment watches are forgotten, because the broker reaped them with the connection and nothing sends their subscribe again; their ids are never reused ([ADR-0150](specs/adr/0150-forget-the-raw-scalable-registrations-on-a-reset.md)).
 3. **Gates on `is_user_closed()`** — only the explicit `Closing` / `Closed` states stop the supervisor.
    The transport-drop state (`Failed`, set by `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls into the backoff / redial path instead of returning.
    This is the difference between "broker went away" and "user called `.close()`".

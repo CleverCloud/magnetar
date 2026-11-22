@@ -129,6 +129,7 @@ Commit waits for all admitted operations.
 Any admitted registration or acknowledgement failure permanently poisons commit, returns `TransactionPoisoned`, and emits no `EndTxn(Commit)`; abort remains available.
 Confirmed commit advances participating positions, abort leaves cursors unchanged and permits redelivery, and an unknown outcome fails participants closed and requires resynchronization.
 Only one caller may await `EndTxn` for a transaction at a time; cancellation releases that waiter lease while preserving the canonical request so a same-action retry resumes it without emitting a second wire command.
+While that request is unresolved (its outcome not consumed, the request not cancelled) the opposite action is refused with `AlreadyEnding` naming the action in flight, because the cancelled end stays on the wire and the coordinator will still apply it.
 Once the transaction coordinator confirms commit or abort, an owned runtime completion task records that terminal broker state before notifying local participants, checkpoints each successfully completed participant action, and survives caller cancellation so a retry resumes only unfinished local propagation without replaying FLOW or reissuing `EndTxn`.
 
 Vector seek is limited to the current layout epoch and exactly the currently owned, attached active leaves.

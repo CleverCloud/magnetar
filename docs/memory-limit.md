@@ -42,8 +42,8 @@ It travels with the publish's pending op (`magnetar_proto::producer::OpSend`) an
 
 - the broker's `CommandSendReceipt` — for a batch, each message's op on its own, as the receipt fans out;
 - the broker's `CommandSendError` — for a batch, every member's op, because the broker rejects the whole frame and names only one member (the highest sequence id) ([ADR-0145](../specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md));
-- the producer's `send_timeout` firing, including for a publish held across a reconnect;
-- the broker acknowledging the producer's `close()`, which fails every send still pending — typically messages left in the batch container, which `close` does not flush — with a terminal error;
+- the producer's `send_timeout` firing, including for a publish held across a reconnect — the sweep drops the expired send's staged frame with its op, and a message that expires in the unflushed batch container takes the whole container with it, each member releasing its own bytes ([ADR-0151](../specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md));
+- the broker acknowledging the producer's `close()`, which fails every send still pending — typically messages left in the batch container, which `close` does not flush, and sends whose frames `close` dropped because the drain gate was shut — with a terminal error;
 - the producer failing to open or re-attach for good, or the connection failing terminally;
 - a reconnect that cannot replay a batched send, which fails it.
 
