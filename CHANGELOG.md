@@ -33,6 +33,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A send the client gave up on is no longer written afterwards.**
+  A producer stages the frame of each send in its slot until the connection drains it, and the drain is held while the broker has not acknowledged the (re-)attachment: after a broker-initiated `CommandCloseProducer`, which the client re-attaches in place, and during a reconnect rebuild.
+  The `send_timeout` sweep removed an expired send's pending op and resolved its caller with `send timeout` but left the frame staged, so the broker's `CommandProducerSuccess` for the re-attach reopened the drain and wrote a message the caller had been told failed; a caller that retried published it twice, under two sequence ids that broker deduplication cannot match.
+  A batching producer with no publish delay kept a timed-out message in its batch container in the same way, and the next flush published it.
+  The sweep now drops the staged frame of every expired send (every chunk of a chunked send, and a flushed batch frame together with its first member) and discards the unflushed batch container as a unit, as Java does, failing the container's other members with the same send-timeout error; the members of a dropped batch frame that had not expired fail at their own deadline.
+  A frame already written to the connection is out of reach and is left to the broker.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0151](specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md)).
+
+- **A producer's close is no longer followed by its own staged sends.**
+  `Connection::close_producer` encoded `CommandCloseProducer` into the connection buffer while the producer's staged `CommandSend` frames stayed in its slot, so the wire carried the close and then the sends; the broker rejects such a send, or closes the whole shared connection, with every producer and consumer on it, when the frame lands after it has removed the producer.
+  Sends staged while the drain gate is open are now written ahead of the close, as Java writes a send when it is issued, and are receipted as usual; those staged behind a shut gate, or while an authentication challenge is unanswered, are dropped and fail with the rest when the broker acknowledges the close.
+  A `CommandProducerSuccess` answering an open that was sent before the close no longer replays the producer's pending frames and reset snapshots or reopens its drain gate; the reset snapshots are failed there instead, as a rebuild fails them for a producer it does not re-attach.
+  Both engines run the same `Connection` code and behave identically; no public API changed ([ADR-0151](specs/adr/0151-withdraw-what-a-given-up-send-and-a-closed-producer-still-have-staged.md)).
+
 - **A closed producer no longer leaves its batch-flush deadline armed in the past.**
   A batching producer with a `batching_max_publish_delay` arms `first_added_at + delay` as soon as its first message sits in the batch, and `Connection::poll_timeout` reports that deadline for every producer slot.
   Closing the producer keeps the unflushed batch in place until the broker acknowledges the close, and `flush_batch` returns at once for a closed producer without clearing `first_added_at`, so once the delay had elapsed `handle_timeout` selected the slot as due and flushed nothing, and `poll_timeout` kept answering the same instant.
