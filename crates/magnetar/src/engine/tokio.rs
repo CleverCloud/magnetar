@@ -20,7 +20,7 @@ use super::{
     BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
     CreateProducerApi, Engine, MessageDecryptorApi, MessageEncryptorApi, OperationDeadline,
     ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi, TopicListChange, TransactionApi,
-    WatchTopicListFut, WatchTopicListWithIdFut,
+    WatchTopicListFut, WatchTopicListLeasedFut, WatchTopicListWithIdFut, WatcherLease,
 };
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -204,6 +204,27 @@ impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
                 last_broker_error,
             ),
         )
+    }
+
+    fn watch_topic_list_leased_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListLeasedFut<'a, Self> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(async move {
+            let (watcher_id, topics, lease) =
+                magnetar_runtime_tokio::Client::watch_topic_list_leased_with_operation_deadline(
+                    self,
+                    namespace,
+                    pattern,
+                    timer,
+                    last_broker_error,
+                )
+                .await?;
+            Ok((watcher_id, topics, Box::new(lease) as WatcherLease))
+        })
     }
 
     fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {

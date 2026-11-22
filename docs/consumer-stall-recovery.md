@@ -78,7 +78,7 @@ A consumer whose client-accounted balance remains positive over an **empty** rec
 
 Exactly **once per stall episode**: the next dispatch unit re-arms the watchdog, so a consumer that recovers and wedges again reports again.
 The window opens when the broker is granted its permits (every subscribe ack, reconnect rebuild, post-seek resubscribe, and recovery routes through the same `initial_flow`), so a consumer that is granted and then handed nothing reports one window later — not one window plus a keepalive interval.
-Every state that has its own explanation for the silence suppresses it — `pause`, an in-flight seek, end-of-topic, a terminal subscribe failure, a re-attach in progress, and a non-empty local queue (there the user, not the broker, owes the progress).
+Every state that has its own explanation for the silence suppresses it — `pause`, an in-flight seek (which `operation_timeout` bounds, [ADR-0153](../specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)), end-of-topic, a terminal subscribe failure, a re-attach in progress, and a non-empty local queue (there the user, not the broker, owes the progress).
 
 `Duration::ZERO` disables it. **The knob is off by default**: an armed deadline perturbs the deterministic-simulation engine's wake schedule even when it never fires, and Java has no per-consumer dispatch watchdog to inherit a default from.
 

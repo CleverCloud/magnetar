@@ -384,6 +384,12 @@ The reverse (drain → check → `notified().await`) leaves a window in which th
 This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for the subscribe-readiness waiter).
 The scalable-topic waiters and `next_topic_list_change` carried the same drain-then-park shape: the broker sends each of their events exactly once, so a single lost pulse leaves the caller parked until the connection closes or its own timeout fires, which is the likely cause of the occasional `scalable_assignment_rebalance_parity` differential-test hang.
 The waiters on a per-client buffer (`scalable_topic_lookup`, `scalable_topic_subscribe`, `next_scalable_event`, `next_topic_list_change`, `next_replicated_subscription_marker`) are pinned by `waiter_lost_wakeup.rs` in both runtime crates: the scalable and topic-list tests hold the buffer and connection locks to land the event between the drain and the park.
+`Producer::flush` parks on `driver_waker` under the same rule, with one deliberate difference: it creates its `Notified` before it reads the producer's unacknowledged count, but does not `enable()` it until the read has found something to wait for.
+A `Notified` created ahead of the read already observes a `notify_waiters()` that fires after its creation, because it snapshots the call count when it is created, so the pulse after the last receipt can no longer land between the read and the park and leave the flush waiting for the next inbound frame.
+`enable()` is withheld because it takes a stored `notify_one` permit, and a permit stored by another task's `send` or `close` is the driver's: taking it on the early return of a flush that finds nothing to wait for would leave the driver, whose next `notified()` would have completed at once, asleep until its next wake with that frame staged.
+`Client::await_reconnect_or_terminal`, which also parks on `driver_waker`, keeps its `enable()`.
+See [ADR-0155](specs/adr/0155-create-the-flush-notified-before-it-reads-the-unacknowledged-count.md).
+Both engines carry the same shape, and `flush_is_not_stranded_by_a_pulse_between_its_count_and_its_park` in each runtime's `producer.rs` races the window with real threads (a bounded race: it can pass against the defect on a host with few CPUs, but it cannot fail once the `Notified` precedes the read).
 The driver owes the same pulse when it marks the connection disconnected, because a parked waiter only re-checks `is_closed()` when it is woken and a dead connection pushes nothing more: its read-error, end-of-stream, undecodable-frame, write-error and handshake-deadline paths all call one `wake_close_waiters` helper, which pulses `scalable_notify`, `topic_list_notify` and `replicated_subscription_marker_notify`, so a new per-client buffer's `Notify` has one place to be added.
 The event-drain error exit (`TopicMigrated`, an `AuthChallenge` with no provider, a failed credential refresh) is the same kind of exit: `drain_driver_events_or_disconnect` runs `mark_disconnected()` plus `wake_close_waiters` before the error propagates, because the terminal wrapper's `fail_all_pending` leaves the handshake state alone and a bare `?` would leave the dead connection reporting `Connected`, with `is_closed()` false, the ADR-0059 fast-fail unarmed and the waiters parked.
 The terminal wrapper of every driver spawn (plain and supervised, both engines) calls `wake_close_waiters` as well, because the graceful `Ok(())` exits of the loop (a local `close()` plus the flush) pulse nothing, `close()` having already snapped the state: `DriverHandle::abort` on the moonpool engine is a cooperative `close()` plus a `driver_waker` pulse that ends the driver through one of them, and `take_driver()` is public, so a `&Client` waiter can be parked when it runs.
@@ -537,6 +543,7 @@ Two close paths exist, with different reliability contracts.
 
 - **Explicit `Producer::close().await`** — the reliable path.
   Enqueues `CommandCloseProducer` via `Connection::close_producer`, wakes the driver, and awaits the broker ack through a `RequestFut` that drains the recorded `OpOutcome` with `take_outcome`.
+  A `close()` future dropped before the ack (a `timeout`, a `select!`) hands its request to the connection from `RequestFut::drop` (`Connection::abandon_request_waiter`), which retags it `ProducerCloseForgotten`: the ack still fails the producer's pending sends, and no `OpOutcome` is recorded for a future that is gone ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)).
 - **Last-clone drop (RAII)** — the safety net.
   Every `Producer` clone shares one `Arc<ProducerCloseGuard>`; when the last clone drops, the guard fires `Connection::close_producer_forget` — encode + wake, never await.
   The proto layer registers the request as `ProducerCloseForgotten` and consumes the broker ack in-place: recording an `OpOutcome` would leak one permanent entry per dropped producer, since no future will ever drain it.
@@ -624,6 +631,9 @@ The hold is bounded by the window the broker holds (the snapshot's `permit_balan
   The signal is explicit, never waker presence: a seek can be staged before its future's first poll, as the aggregate consumer does for every child.
   The corollary is that a staged aggregate seek dropped before `complete_staged_seek` is first polled has no guard, and needs none: the aggregate's own resynchronization covers it (`cancelled_aggregate_seek_requests_resynchronization`).
   `reset` clears the snapshot, the hold, the marker and the forgotten request.
+- **A seek the broker never answers** is bounded by `operation_timeout` ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)): `ConsumerSeek` and `ConsumerSeekForgotten` carry an `enqueued_at` baseline, `pending_seek_deadline` feeds both `poll_timeout` and the `handle_timeout` sweep, and an expired seek is treated as a rejection (`expire_pending_seek` fails an awaited future with `seek timeout` and runs the `CommandError` recovery above).
+  The runtimes issue the seek through `Connection::seek_at` with their own clock; the clock-free `Connection::seek` measures from `last_activity` and can fire up to a keepalive interval early.
+  A reply that lands after the expiry finds no pending request and is ignored.
 
 ### Per-consumer stall watchdog (issue #414, ADR-0101, ADR-0103)
 
@@ -925,6 +935,10 @@ At the bound, it drops and counts the observational event after settling the ope
 An awaited ACK owns its outcome as soon as it is staged, including before its first poll; an ACK emitted for grouping or chunk cleanup has no outcome owner.
 Dropping an ACK future relinquishes that ownership while retaining the pending request and wire ID for broker-error and timeout accounting.
 Responses, timeouts, reattachment and session loss record an outcome only for a live owner, and a late response after resolution cannot recreate it.
+
+**Abandoned request futures.**
+The producer and consumer `RequestFut::drop`s call `Connection::abandon_request_waiter` ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)), which unregisters the waker, discards an outcome that landed just before the drop, and acts by the kind still pending: an ACK is relinquished as above, a producer close is retagged `ProducerCloseForgotten`, a schema lookup and a last-message-id request are retired, and a seek is left to its own drop guard.
+Waker presence is not the signal, because an ACK is staged before its future's first poll; the drop is.
 
 ### Producer / consumer states
 
@@ -1334,6 +1348,7 @@ One producer destination is shared across every child, each underlying operation
 Children run sequentially in deterministic vector/topic order, cancellation prevents future children from starting, and the first child error returns immediately with that topic in the context.
 Completed children remain completed: neither cancellation nor a later error rolls back their publications and acknowledgements.
 Concurrent aggregate calls are not serialized and race the runtimes' existing per-child destructive drains, so their counts and outcomes follow those drains; the coordinator adds no cross-call deduplication guarantee.
+A per-consumer call takes its buffer as a whole, but a call that fails or whose future is dropped puts every message it had not republished back at the front of the buffer (`Connection::restore_dead_letter`, [ADR-0154](specs/adr/0154-put-back-the-dead-letters-a-failed-republish-did-not-reach.md)): a message is owed until its DLQ publish returned `Ok`, and nothing is put back after a session reset, because the broker redelivers the unacked messages.
 
 ---
 
@@ -1429,7 +1444,12 @@ Nobody awaits that request, so its reply is consumed in place: no `OpOutcome` is
 A registration the broker never answered is owed again after the next reset, and a rebuild is idempotent within a session.
 The topic list the broker returns is not forwarded, so a topic created or deleted while the connection was down is not reported to the pattern consumer; only later changes are.
 A `CommandWatchTopicListSuccess` is recorded as an outcome only while its request is still pending: a `topic_list_snapshot` future that was dropped or hit its operation deadline went through `Connection::cancel_request`, which removed the request and closed the watcher, so a reply that arrives afterwards is ignored instead of leaving the broker's whole topic list in `outcomes` for the life of the connection.
-Nothing deregisters a watcher (`CommandWatchTopicListClose` is never sent), so one lives as long as its connection and is registered again on every reconnect ([`docs/follow-ups.md`](docs/follow-ups.md) §31; [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+A watcher lives exactly as long as its last user ([ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md)).
+`Connection::close_topic_watcher(watcher_id)` forgets it and stages one `CommandWatchTopicListClose`; an id the connection does not track stages nothing, and a watcher a reset took down and that has not been registered again is only forgotten, because the broker holds nothing for it on the new session.
+`cancel_request` calls it for a watch still pending, and a refused watch loses its registry entry without a frame.
+The `CommandWatchTopicUpdate` arm queues a `TopicListChanged` only for a watcher the registry holds ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)), so the runtime's per-client delta queue stops growing once the watcher is closed.
+Each runtime's `Client::watch_topic_list_leased_with_operation_deadline` hands the caller a `TopicWatcherLease` held from the moment the registration is staged, whose `Drop` closes the watcher and wakes the driver; the persistent `watch_topic_list` detaches it.
+`PatternConsumer` holds the lease for as long as it lives and `PulsarClient::topic_list_snapshot` drops it before it returns, so a closed or dropped consumer and a finished or abandoned snapshot leave no watcher at the broker, no registry entry, and nothing to register again on a reconnect.
 
 ---
 
@@ -1801,7 +1821,7 @@ rebuild_producers() / rebuild_consumers() -> re-emit every still-open
 The error exit marks the connection disconnected (`mark_disconnected()`, state `Failed`) and wakes the per-client-buffer waiters before it propagates, exactly like a transport drop.
 Supervised, the `Failed` state lasts only until `reset()`; unsupervised (the façade default) the driver is gone for good, so the connection reports `!is_connected()` / `is_closed()` and the ADR-0059 fast-fail arms instead of leaving lookups to wait out `operation_timeout`.
 User futures stay live across the migration.
-`Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots single and chunked operations and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
+`Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost` — except a producer open and a consumer subscribe, which no future awaits through the outcome slab (the runtimes wait on `ProducerReady` / `SubscribeAcked` and the rebuild discards the ids it re-issues them under), so recording one would keep an untakeable entry per reset — but treats in-flight **publishes** specially: it snapshots single and chunked operations and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
 A producer batch has one ranged wire frame but one `OpSend` per logical member and therefore no safe per-message replay frame; reset installs a deterministic `SendError` for every such operation before waking it, including after flush and before receipt ([ADR-0096](specs/adr/0096-reconnect-batch-and-durable-cursor-safety.md)).
 The broker's reply to that frame resolves the members together as well: a `CommandSendReceipt` fans out over the pending sends that lie in `[lowest, highest]` (found by one pass over the producer's own queue, `ProducerState::pending_sequence_ids_in`, so the broker-written `highest` never sets the cost), and a `CommandSendError`, which names only one member (the highest sequence id) and carries no range, fails every pending op that shares the named op's `OpSend::batch_lowest`, so no member of a rejected batch waits for the send timeout ([ADR-0145](specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md)).
 Consumer rebuild likewise distinguishes client hints from durable state: a never-attached or non-durable consumer keeps only its explicit initial position, while every established durable `CommandSubscribe` reattach omits `start_message_id` so the broker's persisted cursor is authoritative.

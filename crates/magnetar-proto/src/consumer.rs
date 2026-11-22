@@ -2775,7 +2775,9 @@ impl ConsumerState {
     }
 
     /// Begin a seek operation. Freezes the receiver queue until [`Self::seek_acked`] (the
-    /// broker applied the seek) or `seek_rejected` (it did not).
+    /// broker applied the seek) or `seek_rejected` (it did not, or never answered within
+    /// `operation_timeout`: [`crate::Connection::handle_timeout`] treats that silence as a
+    /// rejection, ADR-0153).
     ///
     /// The freeze is destructive on purpose — a successful seek replaces the broker-side
     /// consumer, so the buffered messages and the old credit belong to a position the caller

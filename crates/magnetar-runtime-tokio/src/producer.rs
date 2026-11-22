@@ -556,14 +556,21 @@ impl Producer {
         // reading it beside the live queue must be atomic against the re-attachment
         // acknowledgement that moves the sends back. `Producer::send` stays lock-free on the
         // global mutex.
+        //
+        // The `Notified` is created BEFORE the count is read. `notify_waiters()` stores no
+        // permit, so a pulse that lands after the read of a non-zero count but before the
+        // `Notified` exists would be lost and leave this flush parked, with nothing to
+        // acknowledge, until the next inbound frame. A `Notified` created ahead of the read
+        // still observes a pulse that lands between the read and the first poll: it snapshots
+        // the `notify_waiters()` call count at creation. It is deliberately not `enable()`d
+        // ahead of the read: `enable()` would take a `notify_one` permit another task's `send`
+        // or `close` stored for the driver even when the read finds nothing to wait for
+        // (ADR-0155).
         loop {
-            let pending = self.pending_count();
-            if pending == 0 {
+            let notified = self.shared.driver_waker.notified();
+            if self.pending_count() == 0 {
                 return Ok(());
             }
-            let notified = self.shared.driver_waker.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             notified.await;
         }
     }
@@ -732,7 +739,7 @@ impl Producer {
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -755,7 +762,7 @@ async fn wait_request(
 ) -> Result<(), ClientError> {
     let outcome = RequestFut {
         shared: shared.clone(),
-        key: PendingOpKey::Request(request_id),
+        request_id,
     }
     .await;
     match outcome {
@@ -918,33 +925,37 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
 /// Helper future to wait for a generic request outcome.
 struct RequestFut {
     shared: Arc<ConnectionShared>,
-    key: PendingOpKey,
+    request_id: magnetar_proto::RequestId,
 }
 
 impl Future for RequestFut {
     type Output = OpOutcome;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let key = PendingOpKey::Request(self.request_id);
         let mut conn = self.shared.inner.lock();
-        if let Some(outcome) = conn.take_outcome(self.key) {
+        if let Some(outcome) = conn.take_outcome(key) {
             drop(conn);
             return Poll::Ready(outcome);
         }
-        conn.register_waker(self.key, cx.waker().clone());
+        conn.register_waker(key, cx.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for RequestFut {
-    /// Drop-time cleanup: clear our entry from the connection's waker slab so
-    /// a cancelled producer-side request future (close-producer, etc.) does
-    /// not leave a dangling [`std::task::Waker`] behind. For
-    /// [`PendingOpKey::Send`] keys [`magnetar_proto::Connection::unregister_waker`]
-    /// also clears the per-producer-slot waker. See the matching docstring on
-    /// [`crate::client::RequestFut::drop`] for the rationale and
-    /// the lookup multi-agent review MEDIUM-4 finding.
+    /// Drop-time cleanup: hand a cancelled producer-side request future (close-producer,
+    /// get-schema) to the connection, which clears its waker, discards an outcome that landed
+    /// just before the drop and arranges for the broker's reply to record none. A cancelled
+    /// `close()` keeps failing the producer's pending sends when the broker answers it. See
+    /// [`magnetar_proto::Connection::abandon_request_waiter`] and the matching docstring on
+    /// [`crate::client::RequestFut::drop`] for the rationale and the lookup multi-agent review
+    /// MEDIUM-4 finding.
     fn drop(&mut self) {
-        self.shared.inner.lock().unregister_waker(self.key);
+        self.shared
+            .inner
+            .lock()
+            .abandon_request_waiter(self.request_id);
     }
 }
 
@@ -2086,6 +2097,410 @@ mod tests {
             producer.batch_bytes(),
             0,
             "batching disabled → batch_bytes == 0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Cancelled request futures. A `Producer::close()` or `get_schema()` future that is dropped
+    // (a caller-side timeout, a cancelled task) must not leave the broker's reply behind as an
+    // `OpOutcome` that nobody can take: `Connection::outcomes` lives as long as the connection.
+    // 1:1 with the moonpool engine's fixtures (ADR-0024 parity).
+
+    /// A producer on a handshaken connection, for the request-future cancellation fixtures.
+    fn producer_for_request_futures(shared: &std::sync::Arc<ConnectionShared>) -> Producer {
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/cancelled-request".to_owned(),
+                ..Default::default()
+            })
+        };
+        Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(shared, handle),
+            CompressionKind::None,
+            None,
+        )
+    }
+
+    /// Encode the broker's `CommandSuccess` for `request_id`.
+    fn success_bytes(request_id: u64) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandSuccess");
+        buf
+    }
+
+    /// Encode the broker's `CommandError` for `request_id`.
+    fn error_bytes(request_id: u64) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::UnknownError as i32,
+                message: "rejected".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandError");
+        buf
+    }
+
+    /// Polls `fut` once and proves it is parked on the broker's reply to `request_id`.
+    fn assert_parked_on_request<F: std::future::Future>(
+        shared: &std::sync::Arc<ConnectionShared>,
+        fut: std::pin::Pin<&mut F>,
+        request_id: u64,
+    ) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            fut.poll(&mut context).is_pending(),
+            "the request future must be waiting for the broker's reply"
+        );
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(request_id)),
+            "the request must be pending on the connection"
+        );
+    }
+
+    /// Delivers a broker frame to the connection, as the driver's read loop does.
+    fn deliver(shared: &std::sync::Arc<ConnectionShared>, frame: &BytesMut) {
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), frame)
+            .expect("handle the broker frame");
+    }
+
+    /// Asserts the connection holds no outcome for `request_id`.
+    fn assert_no_outcome(shared: &std::sync::Arc<ConnectionShared>, request_id: u64, reply: &str) {
+        assert!(
+            shared
+                .inner
+                .lock()
+                .take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id,)
+                ))
+                .is_none(),
+            "{reply} for a cancelled request left an outcome nobody can take"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_get_schema_leaves_no_outcome_when_the_reply_lands_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.get_schema(None));
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        let schema = pb::Schema {
+            name: "cancelled-get-schema".to_owned(),
+            schema_data: Bytes::from_static(b"{}"),
+            r#type: pb::schema::Type::Json as i32,
+            properties: Vec::new(),
+        };
+        deliver(
+            &shared,
+            &get_schema_response_bytes(request_id, Some(schema)),
+        );
+
+        assert_no_outcome(&shared, request_id, "the CommandGetSchemaResponse");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_close_leaves_no_outcome_when_the_broker_acks_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.close());
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        deliver(&shared, &success_bytes(request_id));
+
+        assert_no_outcome(&shared, request_id, "the CommandSuccess");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_close_leaves_no_outcome_when_the_broker_rejects_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.close());
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        deliver(&shared, &error_bytes(request_id));
+
+        assert_no_outcome(&shared, request_id, "the CommandError");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_request_future_discards_an_outcome_that_landed_before_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.get_schema(None));
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        // The reply lands and wakes the parked task, but the future is dropped before the task
+        // polls it again, so nothing ever takes the outcome.
+        deliver(&shared, &get_schema_response_bytes(request_id, None));
+        drop(fut);
+
+        assert_no_outcome(
+            &shared,
+            request_id,
+            "the CommandGetSchemaResponse that landed before the drop",
+        );
+    }
+
+    /// Marks the stand-in driver as woken: `flush`'s own `driver_waker.notify_one()` is the
+    /// first thing the driver, parked in its `select!`, hears from a flush.
+    struct DriverWoken(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for DriverWoken {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `flush` reads the unacknowledged count first and only then creates the `Notified` it parks
+    /// on. The driver ends every inbound packet with `notify_waiters()`, which stores no permit,
+    /// so a pulse that lands between the count read and the creation of that `Notified` is lost:
+    /// a flush that read `1` parks with nothing left to acknowledge, and nothing wakes it until
+    /// the next inbound frame.
+    ///
+    /// No lock sits in that window, so a test cannot pin the flush inside it; it races it with
+    /// real threads. Other threads contending for the connection mutex raise the hit rate by a
+    /// large factor (measured; the race also hits without them, far less often). The likely
+    /// reason is that an unlock with a parked waiter takes `parking_lot`'s slow path, which frees
+    /// the lock before it wakes that waiter, so a driver stand-in spinning on `try_lock` can take
+    /// the lock inside that gap, apply the last receipt and pulse before the flush has created
+    /// its `Notified`. The stand-in starts spinning when the flush's own `notify_one()` reaches
+    /// it, so it is already in position when the flush reaches its read. The test is a bounded
+    /// race: on a host with few parallel CPUs or under heavy oversubscription it can pass against
+    /// the defect, but it cannot fail once the flush enrols before it reads.
+    ///
+    /// A flush is stranded when it is still pending a second after the pulse that followed the
+    /// final receipt, with nothing left unacknowledged. A flush that enrols before it reads cannot
+    /// be: the pulse either finds it parked or has already moved the `Notified`'s creation
+    /// snapshot. The stand-in pulses what the driver pulses after an inbound packet; a fix that
+    /// parks `flush` on a new `Notify` must pulse it here as well.
+    #[test]
+    fn flush_is_not_stranded_by_a_pulse_between_its_count_and_its_park() {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::task::Context;
+
+        const CONTENDERS: usize = 16;
+        const ITERATIONS: u64 = 10_000;
+        const STRANDED_AFTER: Duration = Duration::from_secs(1);
+
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/flush-pulse-race".to_owned(),
+            ..Default::default()
+        });
+        let producer = Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stranded = Arc::new(AtomicBool::new(false));
+        let pulsed = Arc::new(AtomicBool::new(false));
+        let driver_woken = Arc::new(DriverWoken(AtomicBool::new(false)));
+        let sequence_id = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+
+        // Other users of the connection mutex (further producers, consumers, the driver itself).
+        for _ in 0..CONTENDERS {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(shared.inner.lock());
+                }
+            }));
+        }
+
+        // The flushing task.
+        {
+            let producer = producer.clone();
+            let stop = stop.clone();
+            let stranded = stranded.clone();
+            let pulsed = pulsed.clone();
+            let start = start.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("build the flushing runtime");
+                loop {
+                    start.wait();
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Only a wait that began after the pulse counts: a stand-in descheduled under
+                    // load pulses late, not never, so the same flush is kept and waited on again.
+                    let is_stranded = runtime.block_on(async {
+                        let mut flush = std::pin::pin!(producer.flush());
+                        loop {
+                            let pulse_preceded = pulsed.load(Ordering::SeqCst);
+                            match tokio::time::timeout(STRANDED_AFTER, flush.as_mut()).await {
+                                Ok(_) => break false,
+                                Err(_) if pulse_preceded => break producer.pending_count() == 0,
+                                Err(_) => {}
+                            }
+                        }
+                    });
+                    if is_stranded {
+                        stranded.store(true, Ordering::SeqCst);
+                    }
+                    done.wait();
+                }
+            }));
+        }
+
+        // The stand-in for the driver: applies the receipt and pulses, in that order.
+        {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            let pulsed = pulsed.clone();
+            let driver_woken = driver_woken.clone();
+            let sequence_id = sequence_id.clone();
+            let start = start.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                loop {
+                    start.wait();
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let spin_started = Instant::now();
+                    while !driver_woken.0.load(Ordering::SeqCst)
+                        && spin_started.elapsed() < Duration::from_millis(2)
+                    {
+                        std::hint::spin_loop();
+                    }
+                    let receipt = {
+                        let cmd = pb::BaseCommand {
+                            r#type: pb::base_command::Type::SendReceipt as i32,
+                            send_receipt: Some(pb::CommandSendReceipt {
+                                producer_id: handle.0,
+                                sequence_id: sequence_id.load(Ordering::SeqCst),
+                                message_id: Some(pb::MessageIdData {
+                                    ledger_id: 1,
+                                    entry_id: sequence_id.load(Ordering::SeqCst),
+                                    ..Default::default()
+                                }),
+                                highest_sequence_id: None,
+                            }),
+                            ..Default::default()
+                        };
+                        let mut buf = BytesMut::new();
+                        encode_command(&mut buf, &cmd).expect("encode CommandSendReceipt");
+                        buf
+                    };
+                    loop {
+                        if let Some(mut conn) = shared.inner.try_lock() {
+                            conn.handle_bytes(Instant::now(), &receipt)
+                                .expect("handle CommandSendReceipt");
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    shared.event_waker.notify_waiters();
+                    shared.driver_waker.notify_waiters();
+                    pulsed.store(true, Ordering::SeqCst);
+                    done.wait();
+                }
+            }));
+        }
+
+        for iteration in 0..ITERATIONS {
+            let _ = shared.inner.lock().send(
+                handle,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                1_700_000_000_000,
+                Instant::now(),
+            );
+            assert_eq!(
+                producer.pending_count(),
+                1,
+                "iteration {iteration}: one send"
+            );
+            sequence_id.store(iteration, Ordering::SeqCst);
+            pulsed.store(false, Ordering::SeqCst);
+            driver_woken.0.store(false, Ordering::SeqCst);
+            let waker = std::task::Waker::from(driver_woken.clone());
+            let mut cx = Context::from_waker(&waker);
+            // Take the permit an earlier notify_one left, then park the stand-in driver on the
+            // same `Notify` the real one parks on, ahead of the flush.
+            drop({
+                let mut leftover = Box::pin(shared.driver_waker.notified());
+                let _ = leftover.as_mut().poll(&mut cx);
+                leftover
+            });
+            let mut parked_driver = Box::pin(shared.driver_waker.notified());
+            let _ = parked_driver.as_mut().poll(&mut cx);
+            start.wait();
+            done.wait();
+            // Consume the wake the stand-in was handed, so dropping it does not forward it.
+            let _ = parked_driver.as_mut().poll(&mut cx);
+            drop(parked_driver);
+            if stranded.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        start.wait();
+        for thread in threads {
+            thread.join().expect("join a race thread");
+        }
+        assert!(
+            !stranded.load(Ordering::SeqCst),
+            "flush stayed pending for {STRANDED_AFTER:?} after the pulse that followed the final \
+             receipt, with nothing unacknowledged: the pulse landed between flush's read of the \
+             pending count and the creation of the Notified it parks on, and notify_waiters() \
+             stores no permit"
         );
     }
 }

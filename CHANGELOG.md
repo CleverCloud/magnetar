@@ -33,6 +33,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A closed or dropped `PatternConsumer`, and a finished `topic_list_snapshot`, no longer leave a PIP-145 topic-list watcher behind.**
+  Nothing ever sent `CommandWatchTopicListClose`: each `PatternConsumer` and each `PulsarClient::topic_list_snapshot` call left a watcher at the broker and an entry in the connection's registry for the life of the connection, and since ADR-0136 every reconnect registered each of them again.
+  The broker pushed a `CommandWatchTopicUpdate` for every matching topic change to each, and both runtimes queued every one on a per-client queue with no bound that only `poll_topic_list_change` and `next_topic_list_change` drain.
+  A watcher the broker refused kept its registry entry too, and a snapshot future that was dropped or hit its deadline cancelled the registry entry but not the registration already on the wire.
+  `Connection::close_topic_watcher(watcher_id)` now forgets a watcher and stages one `CommandWatchTopicListClose` (nothing for an id it does not track, and nothing for a watcher a reset took down and that has not been registered again); `cancel_request` calls it for a watch still pending, and a refused watch loses its entry without a frame.
+  Each runtime's `Client::watch_topic_list_leased_with_operation_deadline` returns a `TopicWatcherLease` that closes the watcher when dropped, from the moment the registration is staged, so an error, a deadline, a dropped future and a reply that landed unread all close it; the persistent `Client::watch_topic_list` keeps its watcher for the life of the connection as before.
+  A `PatternConsumer` holds the lease until its last handle is closed or dropped, a failed child subscribe in the builder closes it too, and `topic_list_snapshot` drops it before it returns.
+  A `start_auto_reconcile` task holds a clone, so the watcher closes once that task ends or is aborted and the last clone drops.
+  The connection already queued a `TopicListChanged` only for a watcher it tracks ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)), so the delta queue stops growing once a watcher is closed.
+  Both engines run the same `Connection` code and behave identically.
+  `BrokerMetadataApi` gains the required method `watch_topic_list_leased_with_deadline`, which an out-of-tree implementor must add, and `topic_list_snapshot` is a one-shot: on the moonpool façade a caller that read its deltas through `runtime_client().next_topic_list_change()` must register its own watcher with the runtime client's `watch_topic_list`.
+  Still open: deltas already queued at the close, and the growth of the queue for as long as a live pattern consumer's watcher is registered and nothing drains it, which `subscribe_with_listener` gives its caller no way to do (`subscribe_with_listener_and_consumer` returns the consumer to call `update` on) (`docs/follow-ups.md` §31, [ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md)).
+
+- **`Producer::flush()` can no longer miss the wake-up that follows the last receipt.**
+  `flush` read the producer's unacknowledged count and only then created the `Notified` it parks on.
+  The driver ends every inbound packet with `driver_waker.notify_waiters()`, which stores no permit, so a pulse that landed between the read of a non-zero count and the creation of that `Notified` was lost: a flush that had just read `1` parked with nothing left to acknowledge and stayed pending until the next inbound frame, up to a keep-alive interval.
+  Both engines now create the `Notified` before they read the count, so a pulse that follows the read is observed by the first poll.
+  The future is deliberately not `enable()`d before the read, because `enable()` takes a stored `notify_one` permit that belongs to the driver, which the early return of a flush with nothing to wait for would otherwise discard.
+  Both engines run the same shape and behave identically; no public API changed ([ADR-0155](specs/adr/0155-create-the-flush-notified-before-it-reads-the-unacknowledged-count.md)).
+
+- **A failed or cancelled `republish_dead_letters` no longer strands the dead letters it did not reach.**
+  `Consumer::republish_dead_letters` and `republish_dead_letters_with_properties` took the whole dead-letter buffer before their first await, then published and acked the messages one by one.
+  The first failing DLQ publish or ack, or a dropped future, discarded the rest of the taken messages: they were in no queue and no unacked tracker, so a retry saw an empty buffer and returned `Ok(0)` while the broker kept every one of them unacked against the consumer, out of the application's reach, until the next reconnect or the close.
+  Both engines now keep the taken messages in a guard and put back, at the front of the buffer and in their original order, whatever the call had not republished, the message whose publish failed or was in flight included.
+  A message whose publish succeeded is not put back when its ack then fails, and nothing is put back after a session reset, which empties the buffer while the broker redelivers the unacked messages (putting them back would publish each of them to the DLQ twice).
+  A publish that was in flight when the future was dropped may still reach the DLQ, so that one message can be republished twice; the pipeline is at-least-once.
+  The restored messages are not routed through the dead-letter classification again, so their flow permit is not refunded a second time and `total_msgs_dead_lettered` does not count them twice.
+  Both engines run the same `Connection` code and behave identically; `magnetar-proto` gains the public `Connection::restore_dead_letter`, and `drain_dead_letter` and the façade APIs are unchanged ([ADR-0154](specs/adr/0154-put-back-the-dead-letters-a-failed-republish-did-not-reach.md)).
+
+- **A request whose future was dropped no longer leaves an outcome behind.**
+  A `Producer::close()` under a `timeout`, a cancelled `get_schema()` or `Consumer::last_message_id()` left the request pending, so the broker's reply was recorded in the connection's `outcomes` map and nothing could ever take it: one permanent entry per cancelled call, kept for the life of the connection.
+  The producer's `RequestFut` did not even discard an outcome that had landed just before the drop, and a reply to a last-message-id request that `cancel_request` had retired was recorded all the same.
+  The request futures of both engines now hand the request to the connection when they drop (`Connection::abandon_request_waiter`): a pending close is retagged as a forgotten close, so its acknowledgement still fails the sends the producer had in flight, and a schema lookup and a last-message-id request are retired; a pending ack keeps being relinquished (`Connection::abandon_ack`) and a seek stays with its own drop guard.
+  The `GetLastMessageIdResponse` arm answers only a request that is still pending.
+  A session reset also stopped recording `SessionLost` for a pending producer open and a pending consumer subscribe, which nothing awaits through the outcome slab and which cost two permanent entries per reset.
+  Both engines run the same `Connection` code and behave identically; the façade and runtime APIs are unchanged, and `magnetar-proto` gains the public `Connection::abandon_request_waiter` ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)).
+
 - **A send the client gave up on is no longer written afterwards.**
   A producer stages the frame of each send in its slot until the connection drains it, and the drain is held while the broker has not acknowledged the (re-)attachment: after a broker-initiated `CommandCloseProducer`, which the client re-attaches in place, and during a reconnect rebuild.
   The `send_timeout` sweep removed an expired send's pending op and resolved its caller with `send timeout` but left the frame staged, so the broker's `CommandProducerSuccess` for the re-attach reopened the drain and wrote a message the caller had been told failed; a caller that retried published it twice, under two sequence ids that broker deduplication cannot match.
@@ -223,7 +260,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A watcher still awaiting its first reply is not kept: its caller is told `SessionLost`.
   Nobody awaits the re-registration, so its reply is consumed in place (no `OpOutcome`, no event), a refusal is logged with a `warn!` and retried by the next rebuild, and a registration the broker never answered is owed again after the next reset.
   The returned `Vec<RequestId>` of `rebuild_consumers()` is unchanged: it lists the re-subscribed consumers only.
-  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher is ever deregistered, so the ones `topic_list_snapshot` leaves behind are now registered again on every reconnect (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher was deregistered yet, so the ones `topic_list_snapshot` left behind were registered again on every reconnect, which [ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md) ends by closing a watcher with its last user (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
 
 - **A send relocated by a reconnect no longer hangs when its producer is closed before the rebuild.**
   `Producer::close()` and the last-clone drop guard mark the producer closed and leave its unacknowledged sends pending until the broker acknowledges the close.
@@ -429,6 +466,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - **Pulsar batch members retain their own metadata.** Tokio and Moonpool use the member's key, ordering key, event time and properties when republishing to a dead-letter or retry topic. The same metadata reaches the façade accessors, `TableView` and OpenTelemetry context extraction. Keyless members stay keyless, and only a missing event time inherits from the batch envelope. See [#905](https://github.com/CleverCloud/magnetar/pull/905).
+
+- **A seek the broker never answers no longer freezes the consumer for the life of the connection.**
+  `Connection::seek` freezes the consumer until the broker's reply lifts it, and `handle_timeout` bounded a pending ack and a pending producer open by a deadline but not a seek.
+  A reply that never came (a lost `CommandSuccess`/`CommandError`, or a broker that tore the consumer down mid-seek and went quiet) therefore left the consumer dropping every delivery, granting no flow, invisible to the stall watchdog and refused every re-attach, and parked the `seek_*` future forever, whether the future was still awaited or had been dropped.
+  A pending seek now has the connection's `operation_timeout` as its deadline (`poll_timeout` arms it, `handle_timeout` sweeps it) and its expiry is a rejection the broker never sent: the awaiting future fails with `ClientError::Broker { code: -1, message: "seek timeout" }`, and the rejected-seek recovery restores the queue and flow window, delivers the dispatches held meanwhile, or re-attaches a consumer the broker had closed.
+  The deadline runs from the instant the runtime issued the seek (`Connection::seek_at`, a new public entry; `Connection::seek` keeps its signature and falls back to the last decoded frame), because a seek is user-driven and never re-issued, so a baseline up to one keepalive interval old would fail a healthy seek.
+  A broker reply that arrives after the expiry is ignored.
+  Both engines run the same `Connection` code and behave identically ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)).
 
 - **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
   Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.

@@ -1098,35 +1098,37 @@ where
         .map_err(|err| PulsarError::Other(format!("partitions_for_topic: {err}")))
     }
 
-    /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
-    /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
-    /// this pattern right now" workflows. The watcher stays registered on the connection and the
-    /// broker keeps announcing its topic changes to it as `TopicListChanged` events; each is
-    /// addressed to the watcher it belongs to, and only that watcher's owner takes it from the
-    /// connection's buffer ([`crate::BrokerMetadataApi::poll_topic_list_change`], which a
-    /// [`crate::PatternConsumer`] does for its own watcher). This call returns the snapshot only
-    /// and keeps no id to take them with, so nothing consumes the deltas of the watcher it opens:
-    /// they are never taken from the buffer, and are not applied by any other consumer.
+    /// Return the topics that match `pattern` in `namespace` right now (PIP-145). Useful for
+    /// "discover all topics matching this pattern" workflows.
+    ///
+    /// A one-shot: the call registers a topic-list watcher at the broker to read the list and
+    /// closes it before it returns, so it leaves nothing registered and queues no delta for a
+    /// later [`crate::BrokerMetadataApi::poll_topic_list_change`]. Live updates belong to a
+    /// [`crate::PatternConsumer`], which holds its own watcher for as long as it lives
+    /// (ADR-0156).
     ///
     /// # Errors
     ///
     /// Returns [`PulsarError::Other`] if the broker refuses the watch.
     pub async fn topic_list_snapshot(&self, namespace: &str, pattern: &str) -> Result<Vec<String>> {
         let mut deadline = crate::BrokerMetadataApi::new_metadata_operation_deadline(&self.inner);
-        self.topic_list_snapshot_with_deadline(namespace, pattern, &mut deadline)
-            .await
-            .map(|(_, topics)| topics)
+        let (_watcher_id, topics, _watcher) = self
+            .topic_list_watch_with_deadline(namespace, pattern, &mut deadline)
+            .await?;
+        Ok(topics)
     }
 
-    /// The watcher id the connection allocated and the initial snapshot of a new topic-list
-    /// watcher; see [`Self::topic_list_snapshot`].
-    pub(crate) async fn topic_list_snapshot_with_deadline(
+    /// Register a topic-list watcher and read its first topic list. Resolves to the watcher id
+    /// the connection allocated, the initial snapshot and a lease: the watcher belongs to the
+    /// lease, and dropping it closes the watcher at the broker, on every way out of the caller,
+    /// so it lives exactly as long as the object that uses it.
+    pub(crate) async fn topic_list_watch_with_deadline(
         &self,
         namespace: &str,
         pattern: &str,
         deadline: &mut crate::OperationDeadline,
-    ) -> Result<(u64, Vec<String>)> {
-        crate::BrokerMetadataApi::watch_topic_list_with_deadline(
+    ) -> Result<(u64, Vec<String>, crate::WatcherLease)> {
+        crate::BrokerMetadataApi::watch_topic_list_leased_with_deadline(
             &self.inner,
             namespace,
             pattern,

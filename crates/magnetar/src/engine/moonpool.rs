@@ -22,7 +22,8 @@ use std::time::Duration;
 use super::{
     BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
     CreateProducerApi, OperationDeadline, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
-    SubscribeApi, TopicListChange, WatchTopicListFut, WatchTopicListWithIdFut,
+    SubscribeApi, TopicListChange, WatchTopicListFut, WatchTopicListLeasedFut,
+    WatchTopicListWithIdFut, WatcherLease,
 };
 use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, TransactionApi};
 
@@ -867,6 +868,27 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
                 last_broker_error,
             ),
         )
+    }
+
+    fn watch_topic_list_leased_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListLeasedFut<'a, Self> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(async move {
+            let (watcher_id, topics, lease) =
+                magnetar_runtime_moonpool::Client::watch_topic_list_leased_with_operation_deadline(
+                    self,
+                    namespace,
+                    pattern,
+                    timer,
+                    last_broker_error,
+                )
+                .await?;
+            Ok((watcher_id, topics, Box::new(lease) as WatcherLease))
+        })
     }
 
     fn poll_topic_list_change(&self, watcher_id: u64) -> Option<TopicListChange> {

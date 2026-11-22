@@ -107,7 +107,7 @@ use moonpool_core::{Providers, TimeError, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-pub use crate::client::{Client, ClientError, LookupTopicResult};
+pub use crate::client::{Client, ClientError, LookupTopicResult, TopicWatcherLease};
 pub use crate::consumer::Consumer;
 pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 pub use crate::dns::{DnsResolveFuture, DnsResolver, StaticDnsResolver, arc_dns_resolver};

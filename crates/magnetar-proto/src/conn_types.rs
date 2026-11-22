@@ -205,9 +205,14 @@ pub struct ConnectionConfig {
     /// terminalizes the producer instead of leaving its send-drain gate shut for the life of
     /// the connection (issue #887). A first attachment is excluded: the runtime's own open
     /// loop owns and bounds it with this same budget.
+    /// Since [ADR-0153](../../specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md) it is
+    /// also the deadline on a pending `CommandSeek`, awaited or forgotten, measured from the
+    /// instant the seek was issued: a seek the broker never answers fails with
+    /// `code=-1, "seek timeout"` and the consumer is recovered as after a rejected seek.
     /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md),
     /// [ADR-0080](../../specs/adr/0080-configurable-operation-retry-policy.md),
-    /// [ADR-0125](../../specs/adr/0125-deadline-on-a-pending-producer-open.md))
+    /// [ADR-0125](../../specs/adr/0125-deadline-on-a-pending-producer-open.md),
+    /// [ADR-0153](../../specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md))
     pub operation_timeout: Duration,
     /// Per-attempt timeout for the *initial* TCP/TLS dial. A dial that does not
     /// complete within this budget is abandoned and retried (see

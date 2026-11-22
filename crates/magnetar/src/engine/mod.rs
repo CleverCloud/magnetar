@@ -31,8 +31,8 @@
 //! - `mod.rs` (this file) — the [`Engine`] trait, the per-surface extension traits
 //!   (`TransactionApi`, `ProducerApi`, `ConsumerApi`, `BrokerMetadataApi`, `SubscribeApi`,
 //!   `CreateProducerApi`), the shared type aliases (`SubscribeFut`, `ReceiveOptFut`,
-//!   `ReceiveBatchFut`, `WatchTopicListFut`, `WatchTopicListWithIdFut`, `OpenProducerFut`), and the
-//!   [`TopicListChange`] data struct.
+//!   `ReceiveBatchFut`, `WatchTopicListFut`, `WatchTopicListWithIdFut`, `WatchTopicListLeasedFut`,
+//!   `OpenProducerFut`), the [`WatcherLease`] handle, and the [`TopicListChange`] data struct.
 //! - [`tokio`] — the [`TokioEngine`] marker + every `impl … for magnetar_runtime_tokio::*` block.
 //! - [`moonpool`] — the [`MoonpoolEngine`] marker + every `impl<P> … for
 //!   magnetar_runtime_moonpool::*` block.
@@ -681,6 +681,12 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// entry via `dlq_producer`, preserving the message's metadata.
     /// Acks each original after a successful republish. Returns the
     /// number of messages republished.
+    ///
+    /// A call that fails, or whose future is dropped, puts the messages it
+    /// had not republished back at the front of the dead-letter buffer (the
+    /// one whose publish failed included), so `drain_dead_letter` and a retry
+    /// still see them; nothing is put back after a session reset, which
+    /// empties the buffer while the broker redelivers the unacked messages.
     fn republish_dead_letters<'a>(
         &'a self,
         dlq_producer: &'a Self::Producer,
@@ -906,6 +912,11 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
 
     /// Subscribe to a topic-list watcher and return the initial topic
     /// snapshot for the given namespace + regex pattern (PIP-145).
+    ///
+    /// The watcher stays registered at the broker for the life of the connection, which is what
+    /// lets [`Self::poll_topic_list_change`] drain its deltas. A caller that only needs the
+    /// snapshot, or that owns the watcher for a bounded time, uses
+    /// [`Self::watch_topic_list_leased_with_deadline`] instead.
     fn watch_topic_list<'a>(
         &'a self,
         namespace: &'a str,
@@ -923,6 +934,22 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
         pattern: &'a str,
         deadline: &'a mut OperationDeadline,
     ) -> WatchTopicListWithIdFut<'a, Self>;
+
+    /// Like [`Self::watch_topic_list_with_deadline`], but the watcher belongs to the returned
+    /// [`WatcherLease`]: dropping it closes the watcher at the broker, so none outlives its
+    /// last user (ADR-0156). `PulsarClient::topic_list_snapshot` drops the lease before it
+    /// returns and `PatternConsumer` holds it for as long as the consumer lives. Resolves to
+    /// the watcher id, the initial snapshot and the lease.
+    ///
+    /// Required, with no default body: a default would be one more production path no test
+    /// reaches, and the only implementors in tree are the two engines' clients.
+    #[doc(hidden)]
+    fn watch_topic_list_leased_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListLeasedFut<'a, Self>;
 
     /// Drain the next pending `TopicListChanged` delta addressed to the watcher `watcher_id`
     /// from the connection's PIP-145 buffer, if any. Returns `None` when that watcher has no
@@ -1019,6 +1046,22 @@ pub type WatchTopicListWithIdFut<'a, B> = Pin<
     Box<
         dyn Future<Output = Result<(u64, Vec<String>), <B as BrokerMetadataApi>::Error>>
             + Send
+            + 'a,
+    >,
+>;
+
+/// Opaque lease on a PIP-145 topic-list watcher: dropping it closes the watcher at the broker
+/// (ADR-0156). Each engine's lease is its client's own type behind this alias.
+#[cfg(feature = "tokio")]
+pub type WatcherLease = Box<dyn Debug + Send + Sync>;
+
+/// Helper alias: `BrokerMetadataApi::watch_topic_list_leased_with_deadline` future return type.
+#[cfg(feature = "tokio")]
+pub type WatchTopicListLeasedFut<'a, B> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<(u64, Vec<String>, WatcherLease), <B as BrokerMetadataApi>::Error>,
+            > + Send
             + 'a,
     >,
 >;

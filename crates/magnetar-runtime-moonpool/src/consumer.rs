@@ -189,6 +189,52 @@ impl Drop for ConsumerCloseGuard {
     }
 }
 
+/// The dead letters a [`Consumer::republish_dead_letters_with_properties`] call took out of the
+/// consumer's buffer and has not republished yet.
+///
+/// The call takes the whole buffer before its first await, and a later `?` or a dropped future
+/// would take the rest with it: a drained dead letter is in no queue and no unacked tracker, so
+/// the broker would keep it unacked against this consumer with nobody left to hand it back.
+/// Whatever is still owed when the guard drops goes back to the front of the buffer through
+/// [`magnetar_proto::Connection::restore_dead_letter`], which skips it after a session reset.
+/// The `Drop` takes the connection lock (and, inside it, the slot lock), so the guard is only ever
+/// dropped with neither held. 1:1 with `magnetar_runtime_tokio::Consumer`'s guard of the same name.
+struct OwedDeadLetters<'a, P: Providers> {
+    consumer: &'a Consumer<P>,
+    /// `Connection::session_epoch` read in the same lock section as the drain.
+    session_epoch: u64,
+    owed: std::collections::VecDeque<IncomingMessage>,
+}
+
+impl<'a, P: Providers> OwedDeadLetters<'a, P> {
+    fn take(consumer: &'a Consumer<P>) -> Self {
+        let mut conn = consumer.shared.inner.lock();
+        Self {
+            consumer,
+            session_epoch: conn.session_epoch(),
+            owed: conn.drain_dead_letter(consumer.handle).into(),
+        }
+    }
+
+    /// The oldest message still owed. It stays owed until [`Self::settle`].
+    fn oldest(&self) -> Option<IncomingMessage> {
+        self.owed.front().cloned()
+    }
+
+    /// The oldest message was republished: it is no longer owed.
+    fn settle(&mut self) {
+        self.owed.pop_front();
+    }
+}
+
+impl<P: Providers> Drop for OwedDeadLetters<'_, P> {
+    fn drop(&mut self) {
+        let owed = std::mem::take(&mut self.owed).into();
+        let mut conn = self.consumer.shared.inner.lock();
+        conn.restore_dead_letter(self.consumer.handle, self.session_epoch, owed);
+    }
+}
+
 impl<P: Providers> std::fmt::Debug for Consumer<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Consumer")
@@ -587,7 +633,10 @@ impl<P: Providers> Consumer<P> {
     /// # Errors
     ///
     /// Returns the first [`ClientError`] encountered. Already-republished
-    /// messages stay republished — partial progress is not rolled back.
+    /// messages stay republished — partial progress is not rolled back — and the ones the
+    /// call did not get to stay owed: they are put back in the consumer's dead-letter buffer,
+    /// so [`Self::drain_dead_letter`] and a retry see them, whether the call failed or its
+    /// future was dropped (see [`Self::republish_dead_letters_with_properties`]).
     pub async fn republish_dead_letters(
         &self,
         dlq_producer: &crate::Producer<P>,
@@ -605,18 +654,29 @@ impl<P: Providers> Consumer<P> {
     /// the source is preserved via the `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID`
     /// stamps.
     ///
+    /// A message is owed until its publish to the DLQ producer has returned `Ok`: the call
+    /// takes the buffer once, and when it fails or its future is dropped it puts every message
+    /// not yet republished back at the front of the buffer, the one whose publish failed or was
+    /// in flight included. A publish that was in flight when the future was dropped may still
+    /// reach the DLQ, so that message can be republished twice (the pipeline is at-least-once,
+    /// and the original stays unacked until a republish completes). A message whose publish
+    /// succeeded is not put back when its ack fails: re-publishing it would only duplicate it.
+    /// Nothing is put back after a session reset, which empties the buffer and makes the
+    /// broker redeliver the unacked messages.
+    ///
     /// # Errors
     ///
     /// Returns the first [`ClientError`] encountered. Already-republished
-    /// messages stay republished — partial progress is not rolled back.
+    /// messages stay republished — partial progress is not rolled back — and the ones the
+    /// call did not get to stay owed, as above.
     pub async fn republish_dead_letters_with_properties(
         &self,
         dlq_producer: &crate::Producer<P>,
         extra_properties: Vec<(String, String)>,
     ) -> Result<usize, ClientError> {
-        let drained = self.drain_dead_letter();
+        let mut owed = OwedDeadLetters::take(self);
         let mut count = 0;
-        for msg in drained {
+        while let Some(msg) = owed.oldest() {
             let mut metadata = msg.republish_metadata();
             // Re-inject / override (e.g. OTel traceparent) before the
             // correlation stamps. Mirrors Java's `DeadLetterTopicMessageId`
@@ -656,6 +716,10 @@ impl<P: Providers> Consumer<P> {
                 source_message_id: None,
             };
             dlq_producer.send(outgoing).await?;
+            // Republished: no longer owed, so a failing or dropped ack below does not put it
+            // back (it would be published twice). `ack` stages the ack on its first poll, which
+            // is the very next step, so the message is acked unless the ack itself fails.
+            owed.settle();
             self.ack(msg.message_id).await?;
             count += 1;
         }
@@ -1321,6 +1385,9 @@ impl<P: Providers> Consumer<P> {
             }
         };
         self.shared.driver_waker.notify_one();
+        // The ack is staged above, before the returned future is first polled, so its
+        // `RequestFut` is built here and not inside the block: a future dropped without ever
+        // being polled must still hand its request to the connection (`RequestFut::drop`).
         let shared = self.shared.clone();
         let request = RequestFut { shared, request_id };
         async move {
@@ -1586,7 +1653,8 @@ impl<P: Providers> Consumer<P> {
     /// Mirrors `org.apache.pulsar.client.api.Consumer#seek(MessageId)`.
     ///
     /// # Errors
-    /// - [`ClientError::Broker`] when the broker rejects the seek.
+    /// - [`ClientError::Broker`] when the broker rejects the seek, or when it does not answer
+    ///   within `operation_timeout` (`code: -1`, `"seek timeout"`, ADR-0153).
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn seek_to_message(&self, message_id: MessageId) -> Result<(), ClientError> {
         self.seek_inner(SeekTarget::MessageId(message_id)).await
@@ -1606,7 +1674,8 @@ impl<P: Providers> Consumer<P> {
     /// UNIX epoch).
     ///
     /// # Errors
-    /// - [`ClientError::Broker`] when the broker rejects the seek.
+    /// - [`ClientError::Broker`] when the broker rejects the seek, or when it does not answer
+    ///   within `operation_timeout` (`code: -1`, `"seek timeout"`, ADR-0153).
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), ClientError> {
         self.seek_inner(SeekTarget::PublishTime(publish_time_ms))
@@ -1627,9 +1696,12 @@ impl<P: Providers> Consumer<P> {
             SeekTarget::PublishTime(ts) => (None, Some(*ts)),
         };
         let receiver_queue_size = self.slot.state.lock().receiver_queue_size;
+        // The seek's `operation_timeout` deadline (ADR-0153) is measured from this instant, not
+        // from the connection's last frame, which can be a whole keepalive interval old.
+        let now = self.shared.now_instant();
         let request_id = {
             let mut conn = self.shared.inner.lock();
-            conn.seek(self.handle, target)
+            conn.seek_at(self.handle, target, now)
         };
         self.shared.driver_waker.notify_one();
         StagedConsumerSeek {
@@ -2170,19 +2242,18 @@ impl Future for RequestFut {
 }
 
 impl Drop for RequestFut {
-    /// Drop-time cleanup: clear our entry from the connection's waker slab and
-    /// discard an outcome that may have landed immediately before cancellation
-    /// so a cancelled consumer-side request future (seek, get-last-msg-id, ack
-    /// receipt, etc.) leaves neither surface behind.
-    /// Mirrors the tokio engine's
-    /// [`magnetar_runtime_tokio::consumer::RequestFut::drop`]. Lookup
-    /// multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
+    /// Drop-time cleanup: hand a cancelled consumer-side request future (get-last-msg-id,
+    /// get-schema, ack receipt, seek) to the connection, which clears its waker, discards an
+    /// outcome that landed just before the drop and arranges for the broker's reply to record
+    /// none. A seek is left to its [`SeekAbandonGuard`]. Mirrors the tokio engine's
+    /// [`magnetar_runtime_tokio::consumer::RequestFut::drop`]; see
+    /// [`magnetar_proto::Connection::abandon_request_waiter`]. Lookup multi-agent review
+    /// MEDIUM-4; ADR-0024 four-layer parity.
     fn drop(&mut self) {
-        let key = PendingOpKey::Request(self.request_id);
-        let mut conn = self.shared.inner.lock();
-        conn.unregister_waker(key);
-        let _ = conn.take_outcome(key);
-        conn.abandon_ack(self.request_id);
+        self.shared
+            .inner
+            .lock()
+            .abandon_request_waiter(self.request_id);
     }
 }
 
@@ -4282,6 +4353,112 @@ mod tests {
         assert_eq!(received.payload.as_ref(), b"after");
     }
 
+    /// `pending_seek` of the consumer behind `handle`: the freeze `begin_seek` sets.
+    fn consumer_pending_seek(
+        shared: &ConnectionShared,
+        handle: magnetar_proto::ConsumerHandle,
+    ) -> Option<magnetar_proto::RequestId> {
+        shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .expect("consumer slot")
+            .state
+            .lock()
+            .pending_seek
+    }
+
+    /// Sweep the connection's timers one second past `operation_timeout`, with the connection
+    /// still up (one keepalive interval has elapsed, so a ping goes out, but the second one that
+    /// would fail the connection has not).
+    fn sweep_past_operation_timeout(shared: &ConnectionShared) {
+        let mut conn = shared.inner.lock();
+        let session = conn.session_epoch();
+        let expiry = Instant::now() + conn.operation_timeout() + std::time::Duration::from_secs(1);
+        conn.handle_timeout(expiry);
+        assert!(
+            conn.is_connected() && conn.session_epoch() == session,
+            "precondition: the sweep must not have torn the connection down"
+        );
+    }
+
+    /// A `seek_*` the broker never answers must not wait forever: `handle_timeout` sweeps a
+    /// pending ack and a pending producer open against `operation_timeout` but no seek, so the
+    /// future parks for the life of the connection and the consumer stays frozen under it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_seek_fails_its_future_and_thaws_the_consumer() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-unanswered", 3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        assert!(
+            !task.is_finished() && consumer_pending_seek(&shared, handle).is_some(),
+            "precondition: the seek is in flight and froze the consumer"
+        );
+
+        sweep_past_operation_timeout(&shared);
+
+        let mut finished = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            task.abort();
+        }
+        assert!(
+            finished,
+            "a seek the broker never answered must fail once operation_timeout elapsed"
+        );
+        let result = task.await.expect("seek task");
+        assert!(
+            result.is_err(),
+            "an unanswered seek must not report success, got {result:?}"
+        );
+        assert_eq!(
+            consumer_pending_seek(&shared, handle),
+            None,
+            "an unanswered seek must not freeze the consumer for the life of the connection"
+        );
+    }
+
+    /// The same silence after the caller gave up: the dropped seek future handed the seek to the
+    /// connection, and nothing is left to notice that the broker never answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_unanswered_seek_thaws_the_consumer() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-abandoned", 3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+        assert!(
+            consumer_pending_seek(&shared, handle).is_some(),
+            "precondition: the abandoned seek still freezes the consumer"
+        );
+
+        sweep_past_operation_timeout(&shared);
+
+        assert_eq!(
+            consumer_pending_seek(&shared, handle),
+            None,
+            "an abandoned seek the broker never answers must not freeze the consumer for the \
+             life of the connection"
+        );
+    }
+
     /// Deliver the `CommandMessage` of every entry in `entries` to `handle`, each carrying the
     /// payload `m<entry>`.
     fn feed_entries(
@@ -4403,6 +4580,118 @@ mod tests {
             "no CommandFlow may exceed the five units the broker spent, got {permits}"
         );
         assert!(!subscribed, "the broker still holds the consumer");
+    }
+
+    /// A seek the broker never answers is, as far as the client can tell, a seek it did not
+    /// apply: the sweep must hand the consumer back exactly as a rejection does -- the
+    /// messages it had, the ones dispatched while the seek was in flight, and the next one, in
+    /// order, with no flow beyond what the broker spent and no re-subscribe -- and fail the
+    /// future with a timeout the caller can match on (ADR-0153).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_seek_skips_no_dispatch() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-unanswered-held", 8);
+        feed_entries(&shared, handle, 0..3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        feed_entries(&shared, handle, 3..5);
+
+        sweep_past_operation_timeout(&shared);
+
+        let mut finished = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            task.abort();
+        }
+        assert!(
+            finished,
+            "a seek the broker never answered must fail once operation_timeout elapsed"
+        );
+        let result = task.await.expect("seek task");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Broker { code: -1, ref message }) if message == "seek timeout"
+            ),
+            "the timeout must surface to the caller, got {result:?}"
+        );
+        feed_entries(&shared, handle, 5..6);
+
+        assert_eq!(
+            receive_payloads(&consumer, 6).await,
+            ["m0", "m1", "m2", "m3", "m4", "m5"],
+            "in arrival order, none skipped"
+        );
+        let (permits, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            permits <= 6,
+            "no CommandFlow may exceed the six units the broker spent, got {permits}"
+        );
+        assert!(!subscribed, "the broker was never heard from");
+    }
+
+    /// A pending seek arms the connection's wake at its own `operation_timeout` deadline, so the
+    /// driver sweeps on time instead of on an unrelated tick; a dropped future keeps the
+    /// deadline it had (ADR-0153). A frame decoded twenty seconds after the seek moves the
+    /// keepalive wake past it, so the earliest wake can only be the seek's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_seek_arms_a_wake_at_its_operation_timeout() {
+        let (shared, _handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-wake", 3);
+        let before_issue = Instant::now();
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        let after_issue = Instant::now();
+        let mut pong = BytesMut::new();
+        encode_command(
+            &mut pong,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Pong as i32,
+                pong: Some(pb::CommandPong {}),
+                ..Default::default()
+            },
+        )
+        .expect("encode pong");
+        let operation_timeout = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(after_issue + std::time::Duration::from_secs(20), &pong)
+                .expect("a frame decoded after the seek");
+            conn.operation_timeout()
+        };
+
+        let awaited = shared
+            .inner
+            .lock()
+            .poll_timeout()
+            .expect("a pending seek arms a wake");
+        assert!(
+            before_issue + operation_timeout <= awaited
+                && awaited <= after_issue + operation_timeout,
+            "the wake is the seek's own operation_timeout, measured from its issue"
+        );
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+        assert_eq!(
+            shared.inner.lock().poll_timeout(),
+            Some(awaited),
+            "a forgotten seek keeps the deadline it had"
+        );
     }
 
     /// The seek `Success` lands, wakes the awaiting future, and the future is dropped before it
@@ -6870,6 +7159,227 @@ mod tests {
         assert_eq!(count, 0, "no DLQ messages present");
     }
 
+    /// `redelivery_count` stamped on the dead-letter frames: strictly greater than the
+    /// consumers' `max_redeliver_count` of [`open_dead_letter_fixture`], so every frame routes
+    /// to the dead-letter pending list instead of the receiver queue.
+    const OVER_REDELIVERED: u32 = 2;
+
+    /// A `CommandMessage` for `consumer_id` whose `redelivery_count` is [`OVER_REDELIVERED`].
+    fn dead_letter_message_bytes(consumer_id: u64, entry_id: u64) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(OVER_REDELIVERED),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "test".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, &meta, b"poison").expect("encode CommandMessage");
+        buf
+    }
+
+    /// A `Shared` consumer with a dead-letter threshold that holds `dead_letters` dead-lettered
+    /// messages, and a DLQ producer wired into the same connection. No broker is involved: the
+    /// frames are fed to the sans-io core directly, and the producer is never attached, so its
+    /// `send` stays pending unless the test closes it first.
+    fn open_dead_letter_fixture(
+        dead_letters: u64,
+    ) -> (
+        Consumer<TokioProviders>,
+        crate::producer::Producer<TokioProviders>,
+    ) {
+        use magnetar_proto::CreateProducerRequest;
+
+        let shared = handshake_complete_shared();
+        let (consumer_handle, producer_handle) = {
+            let mut conn = shared.inner.lock();
+            let consumer_handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/dlq-republish-error".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Shared,
+                max_redeliver_count: 1,
+                ..Default::default()
+            });
+            let producer_handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/dlq-republish-error-DLQ".to_owned(),
+                ..Default::default()
+            });
+            (consumer_handle, producer_handle)
+        };
+        {
+            let mut conn = shared.inner.lock();
+            for entry in 0..dead_letters {
+                conn.handle_bytes(
+                    Instant::now(),
+                    &dead_letter_message_bytes(consumer_handle.0, entry),
+                )
+                .expect("handle dead-letter CommandMessage");
+            }
+        }
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), consumer_handle);
+        let producer_slot = shared
+            .inner
+            .lock()
+            .producer(producer_handle)
+            .cloned()
+            .expect("test producer slot must exist");
+        let producer = crate::producer::Producer::assemble(
+            shared,
+            producer_handle,
+            producer_slot,
+            magnetar_proto::types::CompressionKind::None,
+            None,
+        );
+        (consumer, producer)
+    }
+
+    /// m12-A4: a DLQ publish that fails must not lose the dead letters the call never got to.
+    /// `republish_dead_letters` drains the whole pending buffer before its first await, so an
+    /// error on the first `send` dropped all three messages: they left the buffer without being
+    /// republished or acked, and a retry saw an empty buffer (`Ok(0)`) while the broker kept
+    /// them unacked against this consumer. A closed DLQ producer makes the first `send` fail
+    /// synchronously, so nothing was published and at least the two it never reached are still
+    /// owed (the failed one too, if the fix re-buffers it). 1:1 with the tokio
+    /// test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn republish_dead_letters_error_keeps_the_unprocessed_dead_letters() {
+        const DEAD_LETTERS: usize = 3;
+        let (consumer, producer) = open_dead_letter_fixture(DEAD_LETTERS as u64);
+        {
+            let mut conn = consumer.shared.inner.lock();
+            let _ = conn.close_producer_forget(producer.handle());
+        }
+
+        let result = consumer.republish_dead_letters(&producer).await;
+        assert!(
+            result.is_err(),
+            "a send on a closed DLQ producer must fail the republish: {result:?}"
+        );
+        // Whether the message whose send failed is re-buffered is a design choice of the fix
+        // (keeping it is the better outcome here, since nothing was published); the two behind it
+        // were never attempted and must not be gone.
+        let still_owed = consumer.drain_dead_letter().len();
+        assert!(
+            still_owed >= DEAD_LETTERS - 1,
+            "the dead letters the failed call never reached were dropped with its drained \
+             buffer: {still_owed} of {DEAD_LETTERS} still owed"
+        );
+    }
+
+    /// m12-A4, cancellation half: dropping the `republish_dead_letters` future while it waits for
+    /// the first publish must not lose the messages behind it. The DLQ producer is attached to
+    /// nothing, so the first `send` parks; the future is polled once and dropped. 1:1 with the
+    /// tokio test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn republish_dead_letters_cancelled_keeps_the_unattempted_dead_letters() {
+        const DEAD_LETTERS: usize = 3;
+        let (consumer, producer) = open_dead_letter_fixture(DEAD_LETTERS as u64);
+
+        let mut republish = Box::pin(consumer.republish_dead_letters(&producer));
+        std::future::poll_fn(|cx| {
+            assert!(
+                republish.as_mut().poll(cx).is_pending(),
+                "the first publish has no receipt, so the republish must be parked on it"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(republish);
+
+        // The message in flight when the future was dropped may be re-buffered or not (a design
+        // choice: it was handed to the producer but not acked); the two behind it were never
+        // attempted and must not be gone.
+        assert!(
+            consumer.drain_dead_letter().len() >= DEAD_LETTERS - 1,
+            "the dead letters the cancelled call never reached were dropped with its drained buffer"
+        );
+    }
+
+    /// m12-A4, ordering: the call that fails puts every message it took back, the one whose
+    /// publish failed included, in the order they were dispatched, so a retry republishes the
+    /// same sequence. A closed DLQ producer fails the first `send` before anything is published,
+    /// so all three are still owed. 1:1 with the tokio test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn republish_dead_letters_error_puts_every_message_back_in_order() {
+        const DEAD_LETTERS: usize = 3;
+        let (consumer, producer) = open_dead_letter_fixture(DEAD_LETTERS as u64);
+        {
+            let mut conn = consumer.shared.inner.lock();
+            let _ = conn.close_producer_forget(producer.handle());
+        }
+
+        let result = consumer.republish_dead_letters(&producer).await;
+        assert!(
+            result.is_err(),
+            "a closed DLQ producer must fail the republish: {result:?}"
+        );
+
+        let owed: Vec<u64> = consumer
+            .drain_dead_letter()
+            .iter()
+            .map(|message| message.message_id.entry_id)
+            .collect();
+        assert_eq!(
+            owed,
+            [0, 1, 2],
+            "every message the failed call took must be back, oldest first"
+        );
+    }
+
+    /// m12-A4, session gate: a dropped `republish_dead_letters` future must not put back the
+    /// messages it took before a session reset. The reset emptied the buffer and the broker
+    /// redelivers every unacked message to the new session (simulated here by feeding the three
+    /// frames again), so a restored copy would sit beside each redelivered one and the DLQ
+    /// would receive every message twice. 1:1 with the tokio test of the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn republish_dead_letters_dropped_after_a_reset_does_not_restore_stale_copies() {
+        const DEAD_LETTERS: usize = 3;
+        let (consumer, producer) = open_dead_letter_fixture(DEAD_LETTERS as u64);
+
+        let mut republish = Box::pin(consumer.republish_dead_letters(&producer));
+        std::future::poll_fn(|cx| {
+            assert!(
+                republish.as_mut().poll(cx).is_pending(),
+                "the first publish has no receipt, so the republish must be parked on it"
+            );
+            Poll::Ready(())
+        })
+        .await;
+
+        {
+            let mut conn = consumer.shared.inner.lock();
+            conn.reset();
+            for entry in 0..DEAD_LETTERS as u64 {
+                conn.handle_bytes(
+                    Instant::now(),
+                    &dead_letter_message_bytes(consumer.handle.0, entry),
+                )
+                .expect("redelivered dead-letter CommandMessage");
+            }
+        }
+        drop(republish);
+
+        assert_eq!(
+            consumer.drain_dead_letter().len(),
+            DEAD_LETTERS,
+            "the buffer must hold the redelivered copies only, not the pre-reset ones as well"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn reconsume_later_stamps_reconsumetimes_on_first_call() {
         // Behavioral check: even without a live broker we can drive
@@ -7167,5 +7677,72 @@ mod tests {
                 | crate::compress::CompressionError::SizeMismatch { .. }
                 | crate::compress::CompressionError::Zstd(_)
         ));
+    }
+
+    /// A `last_message_id()` future that is dropped (a caller-side timeout, a cancelled task)
+    /// before the broker answers must not leave the reply behind as an `OpOutcome` nobody can
+    /// take: `Connection::outcomes` lives as long as the connection. 1:1 with the tokio
+    /// engine's fixture (ADR-0024 parity).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_last_message_id_leaves_no_outcome_when_the_reply_lands_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/cancelled-last-message-id".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(consumer.last_message_id());
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            fut.as_mut().poll(&mut context).is_pending(),
+            "the request future must be waiting for the broker's reply"
+        );
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(request_id)),
+            "the last-message-id request must be pending on the connection"
+        );
+        drop(fut);
+
+        let reply = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetLastMessageIdResponse as i32,
+            get_last_message_id_response: Some(pb::CommandGetLastMessageIdResponse {
+                last_message_id: pb::MessageIdData {
+                    ledger_id: 7,
+                    entry_id: 11,
+                    ..Default::default()
+                },
+                request_id,
+                consumer_mark_delete_position: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &reply).expect("encode CommandGetLastMessageIdResponse");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandGetLastMessageIdResponse");
+
+        assert!(
+            shared
+                .inner
+                .lock()
+                .take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id)
+                ))
+                .is_none(),
+            "the CommandGetLastMessageIdResponse for a cancelled request left an outcome \
+             nobody can take"
+        );
     }
 }
