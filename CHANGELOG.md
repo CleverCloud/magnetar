@@ -438,6 +438,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Pulsar batch members retain their own metadata.** Tokio and Moonpool use the member's key, ordering key, event time and properties when republishing to a dead-letter or retry topic. The same metadata reaches the façade accessors, `TableView` and OpenTelemetry context extraction. Keyless members stay keyless, and only a missing event time inherits from the batch envelope. See [#905](https://github.com/CleverCloud/magnetar/pull/905).
 
+- **A seek the broker never answers no longer freezes the consumer for the life of the connection.**
+  `Connection::seek` freezes the consumer until the broker's reply lifts it, and `handle_timeout` bounded a pending ack and a pending producer open by a deadline but not a seek.
+  A reply that never came (a lost `CommandSuccess`/`CommandError`, or a broker that tore the consumer down mid-seek and went quiet) therefore left the consumer dropping every delivery, granting no flow, invisible to the stall watchdog and refused every re-attach, and parked the `seek_*` future forever, whether the future was still awaited or had been dropped.
+  A pending seek now has the connection's `operation_timeout` as its deadline (`poll_timeout` arms it, `handle_timeout` sweeps it) and its expiry is a rejection the broker never sent: the awaiting future fails with `ClientError::Broker { code: -1, message: "seek timeout" }`, and the rejected-seek recovery restores the queue and flow window, delivers the dispatches held meanwhile, or re-attaches a consumer the broker had closed.
+  The deadline runs from the instant the runtime issued the seek (`Connection::seek_at`, a new public entry; `Connection::seek` keeps its signature and falls back to the last decoded frame), because a seek is user-driven and never re-issued, so a baseline up to one keepalive interval old would fail a healthy seek.
+  A broker reply that arrives after the expiry is ignored.
+  Both engines run the same `Connection` code and behave identically ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)).
+
 - **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
   Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.
   It now takes the nearest `magnetarctl` among the ancestors of its own executable, which holds for both layouts.

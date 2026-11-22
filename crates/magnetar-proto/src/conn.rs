@@ -502,6 +502,16 @@ const PRODUCER_OPEN_TIMEOUT_CODE: i32 = -1;
 /// publish in a bug report.
 const PRODUCER_OPEN_TIMEOUT_MESSAGE: &str = "producer open timeout";
 
+/// Error code surfaced when a `CommandSeek` the broker never answers reaches its
+/// `operation_timeout` deadline (ADR-0153).
+///
+/// Same `-1` sentinel as [`SEND_TIMEOUT_CODE`], paired with [`CONSUMER_SEEK_TIMEOUT_MESSAGE`].
+const CONSUMER_SEEK_TIMEOUT_CODE: i32 = -1;
+
+/// Error message paired with [`CONSUMER_SEEK_TIMEOUT_CODE`]. Callers match on this exact
+/// string, distinct from the ack, send and producer-open sentinels that share the `-1` code.
+const CONSUMER_SEEK_TIMEOUT_MESSAGE: &str = "seek timeout";
+
 /// Error surfaced when a batched publish cannot be replayed after a connection reset.
 const BATCH_RESET_ERROR_CODE: i32 = -1;
 
@@ -620,6 +630,12 @@ enum PendingRequestKind {
     },
     ConsumerSeek {
         handle: ConsumerHandle,
+        /// Injected-clock (ADR-0011) baseline the `operation_timeout` deadline of ADR-0153 is
+        /// measured from, feeding [`Connection::poll_timeout`] / [`Connection::handle_timeout`]
+        /// like [`PendingRequestKind::ProducerOpen`]'s. [`Connection::seek_at`] stamps the
+        /// caller's own instant; the clock-free [`Connection::seek`] falls back to the
+        /// connection's `last_activity`, and `None` (nothing decoded yet) arms no deadline.
+        enqueued_at: Option<Instant>,
     },
     /// A seek whose awaiting future was dropped before the reply
     /// ([`Connection::abandon_consumer_seek_waiter`]): nobody will drain an outcome, and
@@ -627,6 +643,9 @@ enum PendingRequestKind {
     /// place, like [`Self::ConsumerCloseForgotten`].
     ConsumerSeekForgotten {
         handle: ConsumerHandle,
+        /// The [`Self::ConsumerSeek`] baseline, carried across the hand-off so the deadline
+        /// does not restart when the future is dropped.
+        enqueued_at: Option<Instant>,
     },
     ConsumerUnsubscribe {
         handle: ConsumerHandle,
@@ -2583,8 +2602,16 @@ impl Connection {
         request_id: RequestId,
     ) -> bool {
         if let Some(kind) = self.pending_requests.get_mut(&request_id) {
-            if matches!(kind, PendingRequestKind::ConsumerSeek { handle: h } if *h == handle) {
-                *kind = PendingRequestKind::ConsumerSeekForgotten { handle };
+            if let PendingRequestKind::ConsumerSeek {
+                handle: h,
+                enqueued_at,
+            } = *kind
+                && h == handle
+            {
+                *kind = PendingRequestKind::ConsumerSeekForgotten {
+                    handle,
+                    enqueued_at,
+                };
                 return true;
             }
             return false;
@@ -3299,7 +3326,7 @@ impl Connection {
                         );
                     }
                 }
-                if let Some(PendingRequestKind::ConsumerSeek { handle }) = kind {
+                if let Some(PendingRequestKind::ConsumerSeek { handle, .. }) = kind {
                     if let Some(slot) = self.consumers.get(&handle) {
                         let mut consumer = slot.state.lock();
                         let _ = consumer.seek_acked();
@@ -3310,7 +3337,7 @@ impl Connection {
                         consumer.seek_reattach_owed = Some(request_id);
                     }
                 }
-                if let Some(PendingRequestKind::ConsumerSeekForgotten { handle }) = kind {
+                if let Some(PendingRequestKind::ConsumerSeekForgotten { handle, .. }) = kind {
                     if let Some(slot) = self.consumers.get(&handle) {
                         let _ = slot.state.lock().seek_acked();
                     }
@@ -3514,8 +3541,8 @@ impl Connection {
                 // recovery is the connection's, so it is the same whether a future still
                 // awaits the reply or was dropped.
                 if let Some(
-                    PendingRequestKind::ConsumerSeek { handle }
-                    | PendingRequestKind::ConsumerSeekForgotten { handle },
+                    PendingRequestKind::ConsumerSeek { handle, .. }
+                    | PendingRequestKind::ConsumerSeekForgotten { handle, .. },
                 ) = kind
                 {
                     self.recover_consumer_after_rejected_seek(handle, request_id);
@@ -4880,6 +4907,66 @@ impl Connection {
             })
     }
 
+    /// Deadline of a pending `CommandSeek`, awaited or forgotten, or `None` when this request
+    /// arms none (ADR-0153).
+    ///
+    /// ONE predicate for both [`Self::poll_timeout`]'s arm and [`Self::handle_timeout`]'s
+    /// sweep, for the reason [`Self::pending_producer_open_deadline`] gives. A seek with no
+    /// `enqueued_at` baseline (issued through [`Self::seek`] before any frame was decoded) has
+    /// no instant to measure from and arms nothing; the reset that follows takes it.
+    fn pending_seek_deadline(
+        &self,
+        kind: &PendingRequestKind,
+    ) -> Option<(ConsumerHandle, Instant)> {
+        let (PendingRequestKind::ConsumerSeek {
+            handle,
+            enqueued_at: Some(enqueued_at),
+        }
+        | PendingRequestKind::ConsumerSeekForgotten {
+            handle,
+            enqueued_at: Some(enqueued_at),
+        }) = kind
+        else {
+            return None;
+        };
+        Some((
+            *handle,
+            crate::time::deadline_with_clamp(*enqueued_at, self.config.operation_timeout),
+        ))
+    }
+
+    /// Dispose of one `CommandSeek` whose `operation_timeout` elapsed without a reply
+    /// (ADR-0153).
+    ///
+    /// The silence is a rejection the broker never sent: the request is removed and the
+    /// consumer is recovered through the same path a `CommandError` takes
+    /// ([`Self::recover_consumer_after_rejected_seek`]), so an unanswered seek restores the
+    /// queue and flow window `begin_seek` set aside, delivers what was held meanwhile, or
+    /// re-attaches a consumer the broker tore down — and never thaws a newer seek
+    /// (`SeekRejection::Superseded`). An awaited seek also gets the error outcome its future
+    /// is parked on; a forgotten one has no future and records none.
+    ///
+    /// The outcome is recorded whether or not a waker is parked yet, like the `CommandError`
+    /// arm: a seek an aggregate consumer staged and has not yet polled would otherwise find
+    /// neither a reply nor a pending request on its first poll and park forever.
+    ///
+    /// A reply that arrives after the expiry finds no pending request and is ignored, so it
+    /// cannot thaw the consumer a second time.
+    fn expire_pending_seek(&mut self, rid: RequestId, handle: ConsumerHandle) {
+        if let Some(PendingRequestKind::ConsumerSeek { .. }) = self.pending_requests.remove(&rid) {
+            self.outcomes.insert(
+                PendingOpKey::Request(rid),
+                OpOutcome::Error {
+                    request_id: rid,
+                    code: CONSUMER_SEEK_TIMEOUT_CODE,
+                    message: CONSUMER_SEEK_TIMEOUT_MESSAGE.to_owned(),
+                },
+            );
+            self.wake_for_request(rid);
+        }
+        self.recover_consumer_after_rejected_seek(handle, rid);
+    }
+
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
     /// per-consumer tracker deadline (negative-ack delay + unacked-message timeout).
     ///
@@ -4991,6 +5078,13 @@ impl Connection {
         // same predicate the sweep applies.
         for kind in self.pending_requests.values() {
             if let Some((_, deadline)) = self.pending_producer_open_deadline(kind) {
+                consider(deadline);
+            }
+        }
+        // ADR-0153: the same wake for a pending `CommandSeek`, awaited or forgotten, so the
+        // sweep below fires on time instead of on an unrelated tick.
+        for kind in self.pending_requests.values() {
+            if let Some((_, deadline)) = self.pending_seek_deadline(kind) {
                 consider(deadline);
             }
         }
@@ -5545,6 +5639,23 @@ impl Connection {
             .collect();
         for (rid, handle) in expired_opens {
             self.expire_pending_producer_open(rid, handle);
+        }
+
+        // ADR-0153: `operation_timeout` backstop for a pending `CommandSeek`. `begin_seek`
+        // froze the consumer when the seek was issued and only the broker's reply lifts that, so
+        // a seek the broker never answers (a dropped reply on an otherwise healthy connection)
+        // froze it for the life of the connection and parked its future forever. Two-phase
+        // collect-then-mutate, the same shape as the sweeps above.
+        let expired_seeks: Vec<(RequestId, ConsumerHandle)> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(rid, kind)| {
+                let (handle, deadline) = self.pending_seek_deadline(kind)?;
+                (now >= deadline).then_some((*rid, handle))
+            })
+            .collect();
+        for (rid, handle) in expired_seeks {
+            self.expire_pending_seek(rid, handle);
         }
     }
 
@@ -7663,8 +7774,34 @@ impl Connection {
         request_id
     }
 
-    /// Issue a seek.
+    /// Issue a seek, measuring its `operation_timeout` deadline (ADR-0153) from the connection's
+    /// `last_activity`: the instant the last decoded frame, or the last keepalive ping, handed
+    /// in. The caller has no clock to offer, so the baseline can be up to one keepalive interval
+    /// older than this call, which makes the deadline fire early. A caller that owns a clock
+    /// should use [`Self::seek_at`].
     pub fn seek(&mut self, handle: ConsumerHandle, target: SeekTarget) -> RequestId {
+        self.seek_anchored(handle, target, self.last_activity)
+    }
+
+    /// Issue a seek whose `operation_timeout` deadline (ADR-0153) is measured from `now`, the
+    /// engine's clock at the call (ADR-0011). A seek is user-driven and is not re-issued when
+    /// it fails, so unlike a re-attach it cannot afford a baseline that is a keepalive interval
+    /// stale (see [`Self::seek`]): the runtimes use this entry.
+    pub fn seek_at(
+        &mut self,
+        handle: ConsumerHandle,
+        target: SeekTarget,
+        now: Instant,
+    ) -> RequestId {
+        self.seek_anchored(handle, target, Some(now))
+    }
+
+    fn seek_anchored(
+        &mut self,
+        handle: ConsumerHandle,
+        target: SeekTarget,
+        enqueued_at: Option<Instant>,
+    ) -> RequestId {
         let request_id = self.alloc_request_id();
         let (message_id, publish_time) = match target {
             SeekTarget::MessageId(mid) => (Some(broker_seek_message_id(mid.to_pb())), None),
@@ -7686,8 +7823,13 @@ impl Connection {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().begin_seek(request_id);
         }
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::ConsumerSeek { handle });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::ConsumerSeek {
+                handle,
+                enqueued_at,
+            },
+        );
         request_id
     }
 
@@ -22848,6 +22990,256 @@ mod consumer_stall_and_recovery_tests {
         assert!(state.pending_seek.is_none());
         assert!(state.seek_rollback.is_none());
         assert!(state.seek_reattach_owed.is_none());
+    }
+
+    /// `pending_seek` of the consumer behind `handle`.
+    fn pending_seek_of(conn: &Connection, handle: ConsumerHandle) -> Option<RequestId> {
+        conn.consumer(handle)
+            .expect("registered")
+            .state
+            .lock()
+            .pending_seek
+    }
+
+    /// A seek the broker never answers, on a connection that stays up. `pending_seek` is the
+    /// freeze `begin_seek` set: it holds the consumer's dispatches back, grants no flow, hides
+    /// the consumer from the stall watchdog and refuses every re-attach, and the reply is the
+    /// only thing that lifts it. `handle_timeout` sweeps a pending `Ack` and a pending
+    /// `ProducerOpen` against `operation_timeout` but no `ConsumerSeek`, so the seek is
+    /// neither failed to its awaiting future nor thawed, however long the broker stays silent.
+    #[test]
+    fn a_seek_the_broker_never_answers_is_failed_and_thaws_the_consumer() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        // The awaiting future's parked waker: an outcome is recorded for a parked request.
+        conn.register_waker(
+            PendingOpKey::Request(seek_rid),
+            std::task::Waker::noop().clone(),
+        );
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            Some(seek_rid),
+            "precondition: the seek froze the consumer"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none(),
+            "precondition: the broker has not answered"
+        );
+
+        // Past `operation_timeout`, with the connection still up (one keepalive interval has
+        // elapsed, so a ping goes out, but the second one that would fail it has not).
+        let session = conn.session_epoch();
+        conn.handle_timeout(t0 + conn.operation_timeout() + Duration::from_secs(1));
+        assert!(
+            conn.is_connected() && conn.session_epoch() == session,
+            "precondition: the sweep must not have torn the connection down"
+        );
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(seek_rid)).is_some(),
+            "the awaiting seek future must be failed once operation_timeout elapsed without a reply"
+        );
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            None,
+            "an unanswered seek must not freeze the consumer for the life of the connection"
+        );
+    }
+
+    /// The same silence after the caller gave up: the seek future was dropped, so the
+    /// connection owns the seek (`ConsumerSeekForgotten`) and nobody is left to notice that the
+    /// broker never answered.
+    #[test]
+    fn an_abandoned_seek_the_broker_never_answers_thaws_the_consumer() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek(handle, SeekTarget::MessageId(MessageId::EARLIEST));
+        let _ = drain_outbound(&mut conn, handle);
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            Some(seek_rid),
+            "precondition: the abandoned seek still freezes the consumer"
+        );
+
+        let session = conn.session_epoch();
+        conn.handle_timeout(t0 + conn.operation_timeout() + Duration::from_secs(1));
+        assert!(
+            conn.is_connected() && conn.session_epoch() == session,
+            "precondition: the sweep must not have torn the connection down"
+        );
+
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            None,
+            "an abandoned seek the broker never answers must not freeze the consumer for the \
+             life of the connection"
+        );
+    }
+
+    /// `poll_timeout` surfaces a pending seek's deadline, so a driver wakes for the sweep
+    /// instead of running it on an unrelated tick, and a seek whose future was dropped keeps the
+    /// deadline it had (the baseline crosses the retag). A frame decoded fifteen seconds after
+    /// the seek moves the keepalive wake out to `t0 + 55 s`, so the earliest wake can only be
+    /// the seek's `t0 + 10 s + operation_timeout`.
+    #[test]
+    fn a_pending_seek_arms_the_wake_of_its_operation_timeout_and_keeps_it_when_forgotten() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let issued = t0 + Duration::from_secs(10);
+        let seek_rid = conn.seek_at(handle, SeekTarget::MessageId(MessageId::EARLIEST), issued);
+        let _ = drain_outbound(&mut conn, handle);
+        feed_success(&mut conn, 9_999, t0 + Duration::from_secs(25));
+        let deadline = issued + conn.operation_timeout();
+
+        assert_eq!(conn.poll_timeout(), Some(deadline));
+        assert!(conn.abandon_consumer_seek_waiter(handle, seek_rid));
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(deadline),
+            "a forgotten seek keeps the deadline it had"
+        );
+    }
+
+    /// A seek is user-driven and never re-issued, so its deadline is measured from the clock the
+    /// engine handed in with it, not from the last decoded frame, which can be a whole keepalive
+    /// interval older: a sweep 31 s after the last frame but only 11 s after the seek must leave
+    /// the seek pending, and the sweep `operation_timeout` after the seek must fail it.
+    #[test]
+    fn a_seek_issued_through_seek_at_is_measured_from_the_callers_clock() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let issued = t0 + Duration::from_secs(20);
+        let seek_rid = conn.seek_at(handle, SeekTarget::MessageId(MessageId::EARLIEST), issued);
+        let _ = drain_outbound(&mut conn, handle);
+        conn.register_waker(
+            PendingOpKey::Request(seek_rid),
+            std::task::Waker::noop().clone(),
+        );
+
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            Some(seek_rid),
+            "eleven seconds after the seek is well inside its operation_timeout"
+        );
+        assert!(conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none());
+
+        let session = conn.session_epoch();
+        conn.handle_timeout(issued + conn.operation_timeout() + Duration::from_secs(1));
+        assert!(
+            conn.is_connected() && conn.session_epoch() == session,
+            "precondition: the sweep must not have torn the connection down"
+        );
+        assert_eq!(pending_seek_of(&conn, handle), None);
+        match conn.take_outcome(PendingOpKey::Request(seek_rid)) {
+            Some(OpOutcome::Error {
+                request_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(request_id, seek_rid);
+                assert_eq!(code, -1);
+                assert_eq!(message, "seek timeout");
+            }
+            other => panic!("the expired seek must fail with the timeout, got {other:?}"),
+        }
+    }
+
+    /// Two seeks in a chain: the older one expiring first fails its own future and must not thaw
+    /// the newer one, which the broker may yet answer (`SeekRejection::Superseded`).
+    #[test]
+    fn an_older_seeks_expiry_does_not_thaw_a_newer_seek() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let older = conn.seek_at(handle, SeekTarget::MessageId(MessageId::EARLIEST), t0);
+        let newer_at = t0 + Duration::from_secs(10);
+        let newer = conn.seek_at(handle, SeekTarget::MessageId(MessageId::LATEST), newer_at);
+        let _ = drain_outbound(&mut conn, handle);
+
+        conn.handle_timeout(t0 + conn.operation_timeout() + Duration::from_secs(1));
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(older)).is_some(),
+            "the older seek is failed"
+        );
+        assert_eq!(
+            pending_seek_of(&conn, handle),
+            Some(newer),
+            "the newer seek still freezes the consumer"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(newer)).is_none(),
+            "the newer seek is still awaiting its reply"
+        );
+
+        conn.handle_timeout(newer_at + conn.operation_timeout() + Duration::from_secs(1));
+        assert!(conn.take_outcome(PendingOpKey::Request(newer)).is_some());
+        assert_eq!(pending_seek_of(&conn, handle), None);
+    }
+
+    /// The broker's reply to a seek the client already gave up on finds no pending request: it
+    /// records no outcome, thaws nothing a second time and emits no re-subscribe or flow.
+    #[test]
+    fn a_reply_to_an_expired_seek_is_ignored() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek_at(handle, SeekTarget::MessageId(MessageId::EARLIEST), t0);
+        let _ = drain_outbound(&mut conn, handle);
+        conn.handle_timeout(t0 + conn.operation_timeout() + Duration::from_secs(1));
+        let _ = conn.take_outcome(PendingOpKey::Request(seek_rid));
+        let _ = drain_outbound(&mut conn, handle);
+        let ledger = flow_ledger(&conn, handle);
+
+        let late = t0 + conn.operation_timeout() + Duration::from_secs(2);
+        feed_success(&mut conn, seek_rid.0, late);
+
+        assert!(conn.take_outcome(PendingOpKey::Request(seek_rid)).is_none());
+        assert!(!conn.has_pending_request_for_test(seek_rid));
+        assert_eq!(pending_seek_of(&conn, handle), None);
+        assert_eq!(flow_ledger(&conn, handle), ledger);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(subs.is_empty(), "no re-subscribe: {subs:?}");
+        assert!(grants.is_empty(), "no flow: {grants:?}");
+    }
+
+    /// The order a real broker can produce: it closes the consumer (`CommandCloseConsumer`) while
+    /// it applies the seek and then never answers. The close arm cannot re-attach mid-seek and
+    /// the snapshot is gone, so the expiry must re-attach the consumer itself, once, and release
+    /// the flow it owes only on that subscribe's own `Success`.
+    #[test]
+    fn a_seek_that_expires_after_the_broker_closed_the_consumer_re_attaches_it() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = shared_consumer(None, t0);
+        let seek_rid = conn.seek_at(handle, SeekTarget::MessageId(MessageId::EARLIEST), t0);
+        let _ = drain_outbound(&mut conn, handle);
+        feed_broker_close(&mut conn, handle, t0);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(
+            subs.is_empty(),
+            "the close arm refuses to re-attach mid-seek"
+        );
+        assert!(
+            grants.is_empty(),
+            "no flow for a consumer the broker closed: {grants:?}"
+        );
+
+        let expiry = t0 + conn.operation_timeout() + Duration::from_secs(1);
+        conn.handle_timeout(expiry);
+
+        assert!(conn.take_outcome(PendingOpKey::Request(seek_rid)).is_some());
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert_eq!(subs.len(), 1, "exactly one CommandSubscribe: {subs:?}");
+        assert!(
+            grants.is_empty(),
+            "no grant until the re-subscribe is acknowledged: {grants:?}"
+        );
+        feed_success(&mut conn, subs[0], expiry);
+        let (subs, grants) = drain_outbound(&mut conn, handle);
+        assert!(subs.is_empty(), "no second CommandSubscribe: {subs:?}");
+        assert_eq!(grants, vec![RQ as u32], "exactly one full window");
     }
 
     #[test]

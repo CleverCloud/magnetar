@@ -625,6 +625,9 @@ The hold is bounded by the window the broker holds (the snapshot's `permit_balan
   The signal is explicit, never waker presence: a seek can be staged before its future's first poll, as the aggregate consumer does for every child.
   The corollary is that a staged aggregate seek dropped before `complete_staged_seek` is first polled has no guard, and needs none: the aggregate's own resynchronization covers it (`cancelled_aggregate_seek_requests_resynchronization`).
   `reset` clears the snapshot, the hold, the marker and the forgotten request.
+- **A seek the broker never answers** is bounded by `operation_timeout` ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)): `ConsumerSeek` and `ConsumerSeekForgotten` carry an `enqueued_at` baseline, `pending_seek_deadline` feeds both `poll_timeout` and the `handle_timeout` sweep, and an expired seek is treated as a rejection (`expire_pending_seek` fails an awaited future with `seek timeout` and runs the `CommandError` recovery above).
+  The runtimes issue the seek through `Connection::seek_at` with their own clock; the clock-free `Connection::seek` measures from `last_activity` and can fire up to a keepalive interval early.
+  A reply that lands after the expiry finds no pending request and is ignored.
 
 ### Per-consumer stall watchdog (issue #414, ADR-0101, ADR-0103)
 

@@ -1015,9 +1015,12 @@ impl Consumer {
             SeekTarget::PublishTime(ts) => (None, Some(*ts)),
         };
         let receiver_queue_size = self.slot.state.lock().receiver_queue_size;
+        // The seek's `operation_timeout` deadline (ADR-0153) is measured from this instant, not
+        // from the connection's last frame, which can be a whole keepalive interval old.
+        let now = std::time::Instant::now();
         let request_id = {
             let mut conn = self.shared.inner.lock();
-            conn.seek(self.handle, target)
+            conn.seek_at(self.handle, target, now)
         };
         self.shared.driver_waker.notify_one();
         StagedConsumerSeek {
@@ -3619,6 +3622,112 @@ mod tests {
         assert_eq!(received.payload.as_ref(), b"after");
     }
 
+    /// `pending_seek` of the consumer behind `handle`: the freeze `begin_seek` sets.
+    fn consumer_pending_seek(
+        shared: &ConnectionShared,
+        handle: magnetar_proto::ConsumerHandle,
+    ) -> Option<magnetar_proto::RequestId> {
+        shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .expect("consumer slot")
+            .state
+            .lock()
+            .pending_seek
+    }
+
+    /// Sweep the connection's timers one second past `operation_timeout`, with the connection
+    /// still up (one keepalive interval has elapsed, so a ping goes out, but the second one that
+    /// would fail the connection has not).
+    fn sweep_past_operation_timeout(shared: &ConnectionShared) {
+        let mut conn = shared.inner.lock();
+        let session = conn.session_epoch();
+        let expiry = Instant::now() + conn.operation_timeout() + std::time::Duration::from_secs(1);
+        conn.handle_timeout(expiry);
+        assert!(
+            conn.is_connected() && conn.session_epoch() == session,
+            "precondition: the sweep must not have torn the connection down"
+        );
+    }
+
+    /// A `seek_*` the broker never answers must not wait forever: `handle_timeout` sweeps a
+    /// pending ack and a pending producer open against `operation_timeout` but no seek, so the
+    /// future parks for the life of the connection and the consumer stays frozen under it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_seek_fails_its_future_and_thaws_the_consumer() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-unanswered", 3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        assert!(
+            !task.is_finished() && consumer_pending_seek(&shared, handle).is_some(),
+            "precondition: the seek is in flight and froze the consumer"
+        );
+
+        sweep_past_operation_timeout(&shared);
+
+        let mut finished = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            task.abort();
+        }
+        assert!(
+            finished,
+            "a seek the broker never answered must fail once operation_timeout elapsed"
+        );
+        let result = task.await.expect("seek task");
+        assert!(
+            result.is_err(),
+            "an unanswered seek must not report success, got {result:?}"
+        );
+        assert_eq!(
+            consumer_pending_seek(&shared, handle),
+            None,
+            "an unanswered seek must not freeze the consumer for the life of the connection"
+        );
+    }
+
+    /// The same silence after the caller gave up: the dropped seek future handed the seek to the
+    /// connection, and nothing is left to notice that the broker never answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_unanswered_seek_thaws_the_consumer() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-abandoned", 3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+        assert!(
+            consumer_pending_seek(&shared, handle).is_some(),
+            "precondition: the abandoned seek still freezes the consumer"
+        );
+
+        sweep_past_operation_timeout(&shared);
+
+        assert_eq!(
+            consumer_pending_seek(&shared, handle),
+            None,
+            "an abandoned seek the broker never answers must not freeze the consumer for the \
+             life of the connection"
+        );
+    }
+
     /// Deliver the `CommandMessage` of every entry in `entries` to `handle`, each carrying the
     /// payload `m<entry>`.
     fn feed_entries(
@@ -3740,6 +3849,118 @@ mod tests {
             "no CommandFlow may exceed the five units the broker spent, got {permits}"
         );
         assert!(!subscribed, "the broker still holds the consumer");
+    }
+
+    /// A seek the broker never answers is, as far as the client can tell, a seek it did not
+    /// apply: the sweep must hand the consumer back exactly as a rejection does -- the
+    /// messages it had, the ones dispatched while the seek was in flight, and the next one, in
+    /// order, with no flow beyond what the broker spent and no re-subscribe -- and fail the
+    /// future with a timeout the caller can match on (ADR-0153).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_seek_skips_no_dispatch() {
+        let (shared, handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-unanswered-held", 8);
+        feed_entries(&shared, handle, 0..3);
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        feed_entries(&shared, handle, 3..5);
+
+        sweep_past_operation_timeout(&shared);
+
+        let mut finished = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            task.abort();
+        }
+        assert!(
+            finished,
+            "a seek the broker never answered must fail once operation_timeout elapsed"
+        );
+        let result = task.await.expect("seek task");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Broker { code: -1, ref message }) if message == "seek timeout"
+            ),
+            "the timeout must surface to the caller, got {result:?}"
+        );
+        feed_entries(&shared, handle, 5..6);
+
+        assert_eq!(
+            receive_payloads(&consumer, 6).await,
+            ["m0", "m1", "m2", "m3", "m4", "m5"],
+            "in arrival order, none skipped"
+        );
+        let (permits, subscribed) = staged_flow_permits_and_subscribe(&shared);
+        assert!(
+            permits <= 6,
+            "no CommandFlow may exceed the six units the broker spent, got {permits}"
+        );
+        assert!(!subscribed, "the broker was never heard from");
+    }
+
+    /// A pending seek arms the connection's wake at its own `operation_timeout` deadline, so the
+    /// driver sweeps on time instead of on an unrelated tick; a dropped future keeps the
+    /// deadline it had (ADR-0153). A frame decoded twenty seconds after the seek moves the
+    /// keepalive wake past it, so the earliest wake can only be the seek's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_seek_arms_a_wake_at_its_operation_timeout() {
+        let (shared, _handle, consumer) =
+            established_seekable_consumer("persistent://public/default/seek-wake", 3);
+        let before_issue = Instant::now();
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.seek_to_earliest().await });
+        tokio::task::yield_now().await;
+        let _ = staged_seek_request_id(&shared);
+        let after_issue = Instant::now();
+        let mut pong = BytesMut::new();
+        encode_command(
+            &mut pong,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::Pong as i32,
+                pong: Some(pb::CommandPong {}),
+                ..Default::default()
+            },
+        )
+        .expect("encode pong");
+        let operation_timeout = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(after_issue + std::time::Duration::from_secs(20), &pong)
+                .expect("a frame decoded after the seek");
+            conn.operation_timeout()
+        };
+
+        let awaited = shared
+            .inner
+            .lock()
+            .poll_timeout()
+            .expect("a pending seek arms a wake");
+        assert!(
+            before_issue + operation_timeout <= awaited
+                && awaited <= after_issue + operation_timeout,
+            "the wake is the seek's own operation_timeout, measured from its issue"
+        );
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the seek task was aborted")
+                .is_cancelled(),
+            "the seek future must be dropped before the broker's reply"
+        );
+        assert_eq!(
+            shared.inner.lock().poll_timeout(),
+            Some(awaited),
+            "a forgotten seek keeps the deadline it had"
+        );
     }
 
     /// The seek `Success` lands, wakes the awaiting future, and the future is dropped before it
