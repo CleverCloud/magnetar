@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A closed producer no longer leaves its batch-flush deadline armed in the past.**
+  A batching producer with a `batching_max_publish_delay` arms `first_added_at + delay` as soon as its first message sits in the batch, and `Connection::poll_timeout` reports that deadline for every producer slot.
+  Closing the producer keeps the unflushed batch in place until the broker acknowledges the close, and `flush_batch` returns at once for a closed producer without clearing `first_added_at`, so once the delay had elapsed `handle_timeout` selected the slot as due and flushed nothing, and `poll_timeout` kept answering the same instant.
+  Each driver turned that into a zero sleep, took its timer arm, locked the connection and looped, until the close acknowledgement, a reset or `fail_all_pending` emptied the batch; the broker answers a close only once the producer's earlier publishes are persisted, so the loop lasted as long as that took.
+  The delay is opt-in and the loop ends with the close, so the severity is low.
+  `ProducerState::next_batch_deadline` now returns `None` for a closed producer, which also makes `batch_deadline_elapsed` false for it, so neither `poll_timeout` nor the `handle_timeout` batch sweep considers a closed producer's batch; an open producer's deadline is unchanged.
+  Both engines run the same `Connection` code and behave identically; no public API changed.
+
 - **A transport reset now forgets the raw scalable-topic watches that lived on the dead session.**
   A DAG session, a namespace scalable-topics watch and a TC-assignment watch live at the broker only as long as the TCP connection that carried their subscribe command, and nothing in the client writes that command again (`watch_scalable_topics` sends "a fresh subscribe, not a reconnect resync").
   `Connection::reset()` cleared the events, the outbound buffer and the scalable subscribe requests but kept `scalable_sessions`, `scalable_topic_watches` and `tc_assignment_watches` registered, so after a supervised reconnect `dag_snapshot`, `scalable_resolved_topic_name` and `scalable_topics_snapshot` kept reporting the layout and the topic set of the dead session as if the watch were live, and a later close staged a close frame for an id the new session never opened.

@@ -1329,13 +1329,23 @@ impl ProducerState {
     }
 
     /// Wall-clock deadline at which the batch should be force-flushed. Returns `None`
-    /// when batching has no max-publish-delay, or the batch is currently empty.
+    /// when batching has no max-publish-delay, the batch is currently empty, or the producer
+    /// is closed.
+    ///
+    /// A closed producer never flushes ([`Self::flush_batch`] returns 0 for it without clearing
+    /// `first_added_at`), and its unflushed batch stays in place until the close ack, a reset or
+    /// `fail_all_pending` discards it. Reporting the deadline meanwhile would leave it armed in
+    /// the past: `poll_timeout` would stay due, `handle_timeout` would flush nothing, and the
+    /// driver's timer arm would re-enter at a zero sleep until that release.
     ///
     /// Uses [`crate::time::deadline_with_clamp`] so a pathological
     /// `Duration::MAX` cannot panic via `Instant::add` overflow
     /// (invariant #6 — no panics in proto).
     #[must_use]
     pub fn next_batch_deadline(&self) -> Option<std::time::Instant> {
+        if self.closed {
+            return None;
+        }
         let max_delay = self.batching_max_publish_delay?;
         let first = self.batch.first_added_at?;
         Some(crate::time::deadline_with_clamp(first, max_delay))
