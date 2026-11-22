@@ -177,6 +177,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Both engines run the same `Connection` code and behave identically.
   A transaction the application never ends, or whose `CommandEndTxn` reply a reset swallowed and that the application never ends again, still keeps its record, since `TxnClient` has no timeout policy; the request and waker entries of a transaction call in flight at a reset are not touched here either.
 
+- **A dropped `commit` no longer lets a following `abort` put a second, conflicting `CommandEndTxn` on the wire.**
+  `Connection::end_txn` refuses a second end of a transaction with `TxnError::AlreadyEnding`, but the fence read only the runtime waiter lease.
+  Dropping the `Client::end_txn` future releases that lease through `release_end_txn_waiter` and deliberately keeps the request, so the `CommandEndTxn(Commit)` stays in flight and the transaction coordinator still applies it.
+  An `end_txn(txn, Abort)` issued after the drop therefore passed the fence, overwrote the transaction's local state with `Aborting` and staged a second `CommandEndTxn` behind the first on the same transaction; the Java client refuses that abort locally.
+  The coordinator, not the client, then arbitrated the pair, and the second end could surface to the caller as a broker status error that misdescribes what happened to the transaction.
+  `Connection::end_txn` now also refuses the opposite action for as long as the other action's request is unresolved, that is until its outcome is consumed or the request is cancelled, with `AlreadyEnding` naming the action in flight, and leaves the local state at the end in flight.
+  The same action still resumes the canonical request id.
+  Both engines run the same `Connection` code and behave identically; no public API changed.
+  A transaction whose cancelled end was answered but never consumed (a refusal, or a reset's `SessionLost`) refuses the opposite action until the same action is called again and consumes that outcome, the same as for an unanswered one.
+
 - **A topic-list snapshot reply that lands after its caller gave up no longer leaves the topic list behind.**
   `Connection::cancel_request` is what a dropped or timed-out `topic_list_snapshot` (and pattern-subscribe) future calls, and documents that "a late broker reply is ignored".
   The `CommandWatchTopicListSuccess` arm recorded a `TopicListSnapshot` outcome holding the broker's full topic list regardless, nobody was left to take it, and `reset()` does not clear `outcomes`, so each abandoned snapshot that was answered afterwards cost one such outcome for the life of the connection.

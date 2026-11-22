@@ -124,12 +124,14 @@ impl TxnAction {
 /// client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TxnError {
-    /// Another caller currently owns the waiter for this transaction's terminal operation.
+    /// This transaction's terminal operation is already under way: another caller owns its
+    /// waiter, or a cancelled caller's `CommandEndTxn` is still unresolved (its outcome not
+    /// consumed and its request not cancelled).
     #[error("transaction {txn_id} is already ending with {action:?}")]
     AlreadyEnding {
-        /// Transaction whose terminal operation is already being awaited.
+        /// Transaction whose terminal operation is already under way.
         txn_id: TxnId,
-        /// Terminal action owned by the active waiter.
+        /// Terminal action already under way: the active waiter's, or the unresolved request's.
         action: TxnAction,
     },
     /// `ServerError::TransactionConflict` — a competing transaction holds the resource (e.g.

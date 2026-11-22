@@ -8477,12 +8477,28 @@ impl Connection {
 
     /// Commit or abort the transaction. Returns the request id; the matching
     /// [`OpOutcome::EndTxn`] is consumed via [`Self::take_outcome`] once the broker replies.
+    ///
+    /// A transaction is ended with one action: the fence is [`TxnError::AlreadyEnding`] naming
+    /// the action already under way. It holds while a runtime waiter owns the lease and, past a
+    /// cancelled caller's [`Self::release_end_txn_waiter`], for as long as the
+    /// `CommandEndTxn` that caller staged is unresolved (its outcome not consumed and the
+    /// request not cancelled), because that frame stays on the wire and the coordinator will
+    /// still apply it. Only the same action resumes it.
     pub fn end_txn(&mut self, txn: TxnId, action: TxnAction) -> Result<RequestId, TxnError> {
         let key = (txn, action);
         if let Some(active_action) = self.end_txn_waiters.get(&txn).copied() {
             return Err(TxnError::AlreadyEnding {
                 txn_id: txn,
                 action: active_action,
+            });
+        }
+        if let Some(in_flight_action) = [TxnAction::Commit, TxnAction::Abort]
+            .into_iter()
+            .find(|other| *other != action && self.end_txn_requests.contains_key(&(txn, *other)))
+        {
+            return Err(TxnError::AlreadyEnding {
+                txn_id: txn,
+                action: in_flight_action,
             });
         }
         self.end_txn_waiters.insert(txn, action);
@@ -12188,6 +12204,82 @@ mod conn_state_tests {
             conn.end_txn(txn, TxnAction::Commit)
                 .expect("completed waiter releases lease"),
             first
+        );
+    }
+
+    /// A caller that gives up on `Transaction::commit` releases its runtime waiter lease, but the
+    /// `CommandEndTxn(Commit)` it staged stays in flight and the coordinator will still apply it.
+    /// The fence against a second, conflicting end must therefore hold for as long as that request
+    /// is unresolved, not only for as long as a waiter holds the lease: an abort issued after the
+    /// cancelled commit has to be refused locally, as the Java client does, instead of putting a
+    /// second `CommandEndTxn(Abort)` behind the first on the same transaction.
+    #[test]
+    fn end_txn_refuses_the_opposite_action_while_a_cancelled_end_is_in_flight() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        let txn = TxnId::new(7, 11);
+
+        let new_request = conn.new_txn(Duration::from_secs(60));
+        let mut encoded = BytesMut::new();
+        encode_command(
+            &mut encoded,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::NewTxnResponse as i32,
+                new_txn_response: Some(pb::CommandNewTxnResponse {
+                    request_id: new_request.0,
+                    txnid_most_bits: Some(txn.most_sig_bits),
+                    txnid_least_bits: Some(txn.least_sig_bits),
+                    error: None,
+                    message: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("encode NewTxn response");
+        conn.handle_bytes(Instant::now(), &encoded)
+            .expect("handle NewTxn response");
+
+        let commit = conn
+            .end_txn(txn, TxnAction::Commit)
+            .expect("the commit claims the EndTxn waiter");
+        // The commit's caller is dropped before the broker answers: the lease is released and the
+        // request stays on the wire.
+        conn.release_end_txn_waiter(txn, TxnAction::Commit);
+
+        assert!(
+            matches!(
+                conn.end_txn(txn, TxnAction::Abort),
+                Err(TxnError::AlreadyEnding {
+                    txn_id,
+                    action: TxnAction::Commit,
+                }) if txn_id == txn
+            ),
+            "an abort issued while the cancelled commit is still unresolved must be refused"
+        );
+        assert_eq!(
+            drain_outbound_commands(&mut conn)
+                .iter()
+                .filter(|command| command.r#type == pb::base_command::Type::EndTxn as i32)
+                .count(),
+            1,
+            "only the commit's CommandEndTxn may reach the wire"
+        );
+        assert_eq!(
+            conn.txn_client()
+                .transaction(txn)
+                .map(|metadata| metadata.state),
+            Some(crate::TxnState::Committing),
+            "a refused abort must leave the local state at the commit in flight"
+        );
+        assert_eq!(
+            conn.end_txn(txn, TxnAction::Commit)
+                .expect("the refused abort leaves the commit resumable"),
+            commit
         );
     }
 
