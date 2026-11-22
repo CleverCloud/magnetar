@@ -556,14 +556,21 @@ impl Producer {
         // reading it beside the live queue must be atomic against the re-attachment
         // acknowledgement that moves the sends back. `Producer::send` stays lock-free on the
         // global mutex.
+        //
+        // The `Notified` is created BEFORE the count is read. `notify_waiters()` stores no
+        // permit, so a pulse that lands after the read of a non-zero count but before the
+        // `Notified` exists would be lost and leave this flush parked, with nothing to
+        // acknowledge, until the next inbound frame. A `Notified` created ahead of the read
+        // still observes a pulse that lands between the read and the first poll: it snapshots
+        // the `notify_waiters()` call count at creation. It is deliberately not `enable()`d
+        // ahead of the read: `enable()` would take a `notify_one` permit another task's `send`
+        // or `close` stored for the driver even when the read finds nothing to wait for
+        // (ADR-0155).
         loop {
-            let pending = self.pending_count();
-            if pending == 0 {
+            let notified = self.shared.driver_waker.notified();
+            if self.pending_count() == 0 {
                 return Ok(());
             }
-            let notified = self.shared.driver_waker.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             notified.await;
         }
     }
@@ -2262,6 +2269,238 @@ mod tests {
             &shared,
             request_id,
             "the CommandGetSchemaResponse that landed before the drop",
+        );
+    }
+
+    /// Marks the stand-in driver as woken: `flush`'s own `driver_waker.notify_one()` is the
+    /// first thing the driver, parked in its `select!`, hears from a flush.
+    struct DriverWoken(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for DriverWoken {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `flush` reads the unacknowledged count first and only then creates the `Notified` it parks
+    /// on. The driver ends every inbound packet with `notify_waiters()`, which stores no permit,
+    /// so a pulse that lands between the count read and the creation of that `Notified` is lost:
+    /// a flush that read `1` parks with nothing left to acknowledge, and nothing wakes it until
+    /// the next inbound frame.
+    ///
+    /// No lock sits in that window, so a test cannot pin the flush inside it; it races it with
+    /// real threads. Other threads contending for the connection mutex raise the hit rate by a
+    /// large factor (measured; the race also hits without them, far less often). The likely
+    /// reason is that an unlock with a parked waiter takes `parking_lot`'s slow path, which frees
+    /// the lock before it wakes that waiter, so a driver stand-in spinning on `try_lock` can take
+    /// the lock inside that gap, apply the last receipt and pulse before the flush has created
+    /// its `Notified`. The stand-in starts spinning when the flush's own `notify_one()` reaches
+    /// it, so it is already in position when the flush reaches its read. The test is a bounded
+    /// race: on a host with few parallel CPUs or under heavy oversubscription it can pass against
+    /// the defect, but it cannot fail once the flush enrols before it reads.
+    ///
+    /// A flush is stranded when it is still pending a second after the pulse that followed the
+    /// final receipt, with nothing left unacknowledged. A flush that enrols before it reads cannot
+    /// be: the pulse either finds it parked or has already moved the `Notified`'s creation
+    /// snapshot. The stand-in pulses what the driver pulses after an inbound packet; a fix that
+    /// parks `flush` on a new `Notify` must pulse it here as well.
+    #[test]
+    fn flush_is_not_stranded_by_a_pulse_between_its_count_and_its_park() {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::task::Context;
+
+        const CONTENDERS: usize = 16;
+        const ITERATIONS: u64 = 10_000;
+        const STRANDED_AFTER: Duration = Duration::from_secs(1);
+
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/flush-pulse-race".to_owned(),
+            ..Default::default()
+        });
+        let producer = Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stranded = Arc::new(AtomicBool::new(false));
+        let pulsed = Arc::new(AtomicBool::new(false));
+        let driver_woken = Arc::new(DriverWoken(AtomicBool::new(false)));
+        let sequence_id = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+
+        // Other users of the connection mutex (further producers, consumers, the driver itself).
+        for _ in 0..CONTENDERS {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(shared.inner.lock());
+                }
+            }));
+        }
+
+        // The flushing task.
+        {
+            let producer = producer.clone();
+            let stop = stop.clone();
+            let stranded = stranded.clone();
+            let pulsed = pulsed.clone();
+            let start = start.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("build the flushing runtime");
+                loop {
+                    start.wait();
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Only a wait that began after the pulse counts: a stand-in descheduled under
+                    // load pulses late, not never, so the same flush is kept and waited on again.
+                    let is_stranded = runtime.block_on(async {
+                        let mut flush = std::pin::pin!(producer.flush());
+                        loop {
+                            let pulse_preceded = pulsed.load(Ordering::SeqCst);
+                            match tokio::time::timeout(STRANDED_AFTER, flush.as_mut()).await {
+                                Ok(_) => break false,
+                                Err(_) if pulse_preceded => break producer.pending_count() == 0,
+                                Err(_) => {}
+                            }
+                        }
+                    });
+                    if is_stranded {
+                        stranded.store(true, Ordering::SeqCst);
+                    }
+                    done.wait();
+                }
+            }));
+        }
+
+        // The stand-in for the driver: applies the receipt and pulses, in that order.
+        {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            let pulsed = pulsed.clone();
+            let driver_woken = driver_woken.clone();
+            let sequence_id = sequence_id.clone();
+            let start = start.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                loop {
+                    start.wait();
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let spin_started = Instant::now();
+                    while !driver_woken.0.load(Ordering::SeqCst)
+                        && spin_started.elapsed() < Duration::from_millis(2)
+                    {
+                        std::hint::spin_loop();
+                    }
+                    let receipt = {
+                        let cmd = pb::BaseCommand {
+                            r#type: pb::base_command::Type::SendReceipt as i32,
+                            send_receipt: Some(pb::CommandSendReceipt {
+                                producer_id: handle.0,
+                                sequence_id: sequence_id.load(Ordering::SeqCst),
+                                message_id: Some(pb::MessageIdData {
+                                    ledger_id: 1,
+                                    entry_id: sequence_id.load(Ordering::SeqCst),
+                                    ..Default::default()
+                                }),
+                                highest_sequence_id: None,
+                            }),
+                            ..Default::default()
+                        };
+                        let mut buf = BytesMut::new();
+                        encode_command(&mut buf, &cmd).expect("encode CommandSendReceipt");
+                        buf
+                    };
+                    loop {
+                        if let Some(mut conn) = shared.inner.try_lock() {
+                            conn.handle_bytes(Instant::now(), &receipt)
+                                .expect("handle CommandSendReceipt");
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    shared.event_waker.notify_waiters();
+                    shared.driver_waker.notify_waiters();
+                    pulsed.store(true, Ordering::SeqCst);
+                    done.wait();
+                }
+            }));
+        }
+
+        for iteration in 0..ITERATIONS {
+            let _ = shared.inner.lock().send(
+                handle,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                1_700_000_000_000,
+                Instant::now(),
+            );
+            assert_eq!(
+                producer.pending_count(),
+                1,
+                "iteration {iteration}: one send"
+            );
+            sequence_id.store(iteration, Ordering::SeqCst);
+            pulsed.store(false, Ordering::SeqCst);
+            driver_woken.0.store(false, Ordering::SeqCst);
+            let waker = std::task::Waker::from(driver_woken.clone());
+            let mut cx = Context::from_waker(&waker);
+            // Take the permit an earlier notify_one left, then park the stand-in driver on the
+            // same `Notify` the real one parks on, ahead of the flush.
+            drop({
+                let mut leftover = Box::pin(shared.driver_waker.notified());
+                let _ = leftover.as_mut().poll(&mut cx);
+                leftover
+            });
+            let mut parked_driver = Box::pin(shared.driver_waker.notified());
+            let _ = parked_driver.as_mut().poll(&mut cx);
+            start.wait();
+            done.wait();
+            // Consume the wake the stand-in was handed, so dropping it does not forward it.
+            let _ = parked_driver.as_mut().poll(&mut cx);
+            drop(parked_driver);
+            if stranded.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        start.wait();
+        for thread in threads {
+            thread.join().expect("join a race thread");
+        }
+        assert!(
+            !stranded.load(Ordering::SeqCst),
+            "flush stayed pending for {STRANDED_AFTER:?} after the pulse that followed the final \
+             receipt, with nothing unacknowledged: the pulse landed between flush's read of the \
+             pending count and the creation of the Notified it parks on, and notify_waiters() \
+             stores no permit"
         );
     }
 }

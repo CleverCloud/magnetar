@@ -33,6 +33,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Producer::flush()` can no longer miss the wake-up that follows the last receipt.**
+  `flush` read the producer's unacknowledged count and only then created the `Notified` it parks on.
+  The driver ends every inbound packet with `driver_waker.notify_waiters()`, which stores no permit, so a pulse that landed between the read of a non-zero count and the creation of that `Notified` was lost: a flush that had just read `1` parked with nothing left to acknowledge and stayed pending until the next inbound frame, up to a keep-alive interval.
+  Both engines now create the `Notified` before they read the count, so a pulse that follows the read is observed by the first poll.
+  The future is deliberately not `enable()`d before the read, because `enable()` takes a stored `notify_one` permit that belongs to the driver, which the early return of a flush with nothing to wait for would otherwise discard.
+  Both engines run the same shape and behave identically; no public API changed ([ADR-0155](specs/adr/0155-create-the-flush-notified-before-it-reads-the-unacknowledged-count.md)).
+
 - **A failed or cancelled `republish_dead_letters` no longer strands the dead letters it did not reach.**
   `Consumer::republish_dead_letters` and `republish_dead_letters_with_properties` took the whole dead-letter buffer before their first await, then published and acked the messages one by one.
   The first failing DLQ publish or ack, or a dropped future, discarded the rest of the taken messages: they were in no queue and no unacked tracker, so a retry saw an empty buffer and returned `Ok(0)` while the broker kept every one of them unacked against the consumer, out of the application's reach, until the next reconnect or the close.
