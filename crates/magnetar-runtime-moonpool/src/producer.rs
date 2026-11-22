@@ -704,7 +704,7 @@ impl<P: Providers> Producer<P> {
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -765,7 +765,7 @@ impl<P: Providers> Producer<P> {
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
-            key: PendingOpKey::Request(request_id),
+            request_id,
         }
         .await;
         match outcome {
@@ -1161,34 +1161,38 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
 /// Helper future to wait for a generic request outcome.
 struct RequestFut {
     shared: Arc<ConnectionShared>,
-    key: PendingOpKey,
+    request_id: magnetar_proto::RequestId,
 }
 
 impl Future for RequestFut {
     type Output = OpOutcome;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let key = PendingOpKey::Request(self.request_id);
         let mut conn = self.shared.inner.lock();
-        if let Some(outcome) = conn.take_outcome(self.key) {
+        if let Some(outcome) = conn.take_outcome(key) {
             drop(conn);
             return Poll::Ready(outcome);
         }
-        conn.register_waker(self.key, cx.waker().clone());
+        conn.register_waker(key, cx.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for RequestFut {
-    /// Drop-time cleanup: clear our entry from the connection's waker slab so
-    /// a cancelled producer-side request future (close-producer, etc.) does
-    /// not leak a [`std::task::Waker`] in the slab. For
-    /// [`PendingOpKey::Send`] keys the per-producer-slot waker is also
-    /// cleared by [`magnetar_proto::Connection::unregister_waker`]. Mirrors
+    /// Drop-time cleanup: hand a cancelled producer-side request future (close-producer,
+    /// get-schema) to the connection, which clears its waker, discards an outcome that landed
+    /// just before the drop and arranges for the broker's reply to record none. A cancelled
+    /// `close()` keeps failing the producer's pending sends when the broker answers it. Mirrors
     /// the tokio engine's
-    /// [`magnetar_runtime_tokio::producer::RequestFut::drop`]. Lookup
-    /// multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
+    /// [`magnetar_runtime_tokio::producer::RequestFut::drop`]; see
+    /// [`magnetar_proto::Connection::abandon_request_waiter`]. Lookup multi-agent review
+    /// MEDIUM-4; ADR-0024 four-layer parity.
     fn drop(&mut self) {
-        self.shared.inner.lock().unregister_waker(self.key);
+        self.shared
+            .inner
+            .lock()
+            .abandon_request_waiter(self.request_id);
     }
 }
 
@@ -2717,6 +2721,196 @@ mod tests {
             producer.batch_bytes(),
             0,
             "batching disabled → batch_bytes == 0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Cancelled request futures. A `Producer::close()` or `get_schema()` future that is dropped
+    // (a caller-side timeout, a cancelled task) must not leave the broker's reply behind as an
+    // `OpOutcome` that nobody can take: `Connection::outcomes` lives as long as the connection.
+    // 1:1 with the tokio engine's fixtures (ADR-0024 parity).
+
+    /// A producer on a handshaken connection, for the request-future cancellation fixtures.
+    fn producer_for_request_futures(shared: &Arc<ConnectionShared>) -> Producer<TokioProviders> {
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/cancelled-request".to_owned(),
+                ..Default::default()
+            })
+        };
+        Producer::assemble(
+            shared.clone(),
+            handle,
+            slot_for(shared, handle),
+            CompressionKind::None,
+            None,
+        )
+    }
+
+    /// Encode the broker's `CommandGetSchemaResponse` for `request_id`.
+    fn get_schema_response_bytes(request_id: u64, schema: Option<pb::Schema>) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchemaResponse as i32,
+            get_schema_response: Some(pb::CommandGetSchemaResponse {
+                request_id,
+                schema,
+                schema_version: Some(Bytes::from_static(b"v1")),
+                error_code: None,
+                error_message: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandGetSchemaResponse");
+        buf
+    }
+
+    /// Encode the broker's `CommandSuccess` for `request_id`.
+    fn success_bytes(request_id: u64) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandSuccess");
+        buf
+    }
+
+    /// Encode the broker's `CommandError` for `request_id`.
+    fn error_bytes(request_id: u64) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::UnknownError as i32,
+                message: "rejected".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandError");
+        buf
+    }
+
+    /// Polls `fut` once and proves it is parked on the broker's reply to `request_id`.
+    fn assert_parked_on_request<F: std::future::Future>(
+        shared: &Arc<ConnectionShared>,
+        fut: std::pin::Pin<&mut F>,
+        request_id: u64,
+    ) {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            fut.poll(&mut context).is_pending(),
+            "the request future must be waiting for the broker's reply"
+        );
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(request_id)),
+            "the request must be pending on the connection"
+        );
+    }
+
+    /// Delivers a broker frame to the connection, as the driver's read loop does.
+    fn deliver(shared: &Arc<ConnectionShared>, frame: &BytesMut) {
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), frame)
+            .expect("handle the broker frame");
+    }
+
+    /// Asserts the connection holds no outcome for `request_id`.
+    fn assert_no_outcome(shared: &Arc<ConnectionShared>, request_id: u64, reply: &str) {
+        assert!(
+            shared
+                .inner
+                .lock()
+                .take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id)
+                ))
+                .is_none(),
+            "{reply} for a cancelled request left an outcome nobody can take"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_get_schema_leaves_no_outcome_when_the_reply_lands_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.get_schema(None));
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        let schema = pb::Schema {
+            name: "cancelled-get-schema".to_owned(),
+            schema_data: Bytes::from_static(b"{}"),
+            r#type: pb::schema::Type::Json as i32,
+            properties: Vec::new(),
+        };
+        deliver(
+            &shared,
+            &get_schema_response_bytes(request_id, Some(schema)),
+        );
+
+        assert_no_outcome(&shared, request_id, "the CommandGetSchemaResponse");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_close_leaves_no_outcome_when_the_broker_acks_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.close());
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        deliver(&shared, &success_bytes(request_id));
+
+        assert_no_outcome(&shared, request_id, "the CommandSuccess");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_close_leaves_no_outcome_when_the_broker_rejects_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.close());
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        drop(fut);
+
+        deliver(&shared, &error_bytes(request_id));
+
+        assert_no_outcome(&shared, request_id, "the CommandError");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_request_future_discards_an_outcome_that_landed_before_the_drop() {
+        let shared = handshake_complete_shared();
+        let producer = producer_for_request_futures(&shared);
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(producer.get_schema(None));
+        assert_parked_on_request(&shared, fut.as_mut(), request_id);
+        // The reply lands and wakes the parked task, but the future is dropped before the task
+        // polls it again, so nothing ever takes the outcome.
+        deliver(&shared, &get_schema_response_bytes(request_id, None));
+        drop(fut);
+
+        assert_no_outcome(
+            &shared,
+            request_id,
+            "the CommandGetSchemaResponse that landed before the drop",
         );
     }
 }

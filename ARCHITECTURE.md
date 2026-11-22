@@ -537,6 +537,7 @@ Two close paths exist, with different reliability contracts.
 
 - **Explicit `Producer::close().await`** — the reliable path.
   Enqueues `CommandCloseProducer` via `Connection::close_producer`, wakes the driver, and awaits the broker ack through a `RequestFut` that drains the recorded `OpOutcome` with `take_outcome`.
+  A `close()` future dropped before the ack (a `timeout`, a `select!`) hands its request to the connection from `RequestFut::drop` (`Connection::abandon_request_waiter`), which retags it `ProducerCloseForgotten`: the ack still fails the producer's pending sends, and no `OpOutcome` is recorded for a future that is gone ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)).
 - **Last-clone drop (RAII)** — the safety net.
   Every `Producer` clone shares one `Arc<ProducerCloseGuard>`; when the last clone drops, the guard fires `Connection::close_producer_forget` — encode + wake, never await.
   The proto layer registers the request as `ProducerCloseForgotten` and consumes the broker ack in-place: recording an `OpOutcome` would leak one permanent entry per dropped producer, since no future will ever drain it.
@@ -925,6 +926,10 @@ At the bound, it drops and counts the observational event after settling the ope
 An awaited ACK owns its outcome as soon as it is staged, including before its first poll; an ACK emitted for grouping or chunk cleanup has no outcome owner.
 Dropping an ACK future relinquishes that ownership while retaining the pending request and wire ID for broker-error and timeout accounting.
 Responses, timeouts, reattachment and session loss record an outcome only for a live owner, and a late response after resolution cannot recreate it.
+
+**Abandoned request futures.**
+The producer and consumer `RequestFut::drop`s call `Connection::abandon_request_waiter` ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)), which unregisters the waker, discards an outcome that landed just before the drop, and acts by the kind still pending: an ACK is relinquished as above, a producer close is retagged `ProducerCloseForgotten`, a schema lookup and a last-message-id request are retired, and a seek is left to its own drop guard.
+Waker presence is not the signal, because an ACK is staged before its future's first poll; the drop is.
 
 ### Producer / consumer states
 
@@ -1801,7 +1806,7 @@ rebuild_producers() / rebuild_consumers() -> re-emit every still-open
 The error exit marks the connection disconnected (`mark_disconnected()`, state `Failed`) and wakes the per-client-buffer waiters before it propagates, exactly like a transport drop.
 Supervised, the `Failed` state lasts only until `reset()`; unsupervised (the façade default) the driver is gone for good, so the connection reports `!is_connected()` / `is_closed()` and the ADR-0059 fast-fail arms instead of leaving lookups to wait out `operation_timeout`.
 User futures stay live across the migration.
-`Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots single and chunked operations and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
+`Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost` — except a producer open and a consumer subscribe, which no future awaits through the outcome slab (the runtimes wait on `ProducerReady` / `SubscribeAcked` and the rebuild discards the ids it re-issues them under), so recording one would keep an untakeable entry per reset — but treats in-flight **publishes** specially: it snapshots single and chunked operations and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
 A producer batch has one ranged wire frame but one `OpSend` per logical member and therefore no safe per-message replay frame; reset installs a deterministic `SendError` for every such operation before waking it, including after flush and before receipt ([ADR-0096](specs/adr/0096-reconnect-batch-and-durable-cursor-safety.md)).
 The broker's reply to that frame resolves the members together as well: a `CommandSendReceipt` fans out over the pending sends that lie in `[lowest, highest]` (found by one pass over the producer's own queue, `ProducerState::pending_sequence_ids_in`, so the broker-written `highest` never sets the cost), and a `CommandSendError`, which names only one member (the highest sequence id) and carries no range, fails every pending op that shares the named op's `OpSend::batch_lowest`, so no member of a rejected batch waits for the send timeout ([ADR-0145](specs/adr/0145-fail-every-member-of-a-batch-the-broker-rejects.md)).
 Consumer rebuild likewise distinguishes client hints from durable state: a never-attached or non-durable consumer keeps only its explicit initial position, while every established durable `CommandSubscribe` reattach omits `start_message_id` so the broker's persisted cursor is authoritative.

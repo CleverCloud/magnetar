@@ -649,11 +649,12 @@ enum PendingRequestKind {
         handle: ProducerHandle,
     },
     /// Fire-and-forget close issued by the engines' last-clone drop guard
-    /// ([`Connection::close_producer_forget`]). No `RequestFut` will ever
-    /// drain the broker's ack, so the `Success`/`Error` handlers consume it
+    /// ([`Connection::close_producer_forget`]), or an explicit close whose awaiting future was
+    /// dropped before the ack ([`Connection::abandon_request_waiter`]). No `RequestFut` will
+    /// ever drain the broker's ack, so the `Success`/`Error` handlers consume it
     /// in-place instead of recording an [`OpOutcome`] — recording one would
     /// leak a permanent `outcomes` entry per dropped producer on a
-    /// long-lived connection.
+    /// long-lived connection. The ack still fails the producer's pending sends.
     ProducerCloseForgotten {
         handle: ProducerHandle,
     },
@@ -1129,7 +1130,10 @@ impl Connection {
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
     ///    round-trip, …). The corresponding user futures are woken with that outcome. A forgotten
-    ///    seek ([`Self::abandon_consumer_seek_waiter`]) has no future and is dropped without one.
+    ///    fire-and-forget ack ([`Self::ack_forget`]), seek ([`Self::abandon_consumer_seek_waiter`])
+    ///    or close ([`Self::abandon_request_waiter`]) has no future and is dropped without one, and
+    ///    so is a producer open or a consumer subscribe: the runtimes await those through events,
+    ///    never through the outcome slab, so an outcome for either could never be taken.
     /// 3. Snapshot every replayable in-flight producer publish into `in_flight_publish_snapshots`
     ///    (key = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
     ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
@@ -1201,7 +1205,17 @@ impl Connection {
                 let _ = self.wakers.remove(&key);
                 continue;
             }
-            self.outcomes.insert(key, OpOutcome::SessionLost { key });
+            // A producer open and a consumer subscribe are awaited through their events and the
+            // attachment state, never through the outcome slab, and the rebuild discards the
+            // request ids it re-issues them under: an outcome recorded for either could never be
+            // taken and would stay for the life of the connection, once per reset.
+            if !matches!(
+                kind,
+                PendingRequestKind::ProducerOpen { .. }
+                    | PendingRequestKind::ConsumerSubscribe { .. }
+            ) {
+                self.outcomes.insert(key, OpOutcome::SessionLost { key });
+            }
             if let Some(w) = self.wakers.remove(&key) {
                 w.wake();
             }
@@ -3392,7 +3406,7 @@ impl Connection {
                             request_id = ?request_id,
                             code = err.error,
                             message = %bounded_message,
-                            "broker rejected fire-and-forget producer close (producer dropped without explicit close)"
+                            "broker rejected a producer close nobody awaits (producer dropped without explicit close, or the future awaiting close() was dropped)"
                         );
                     }
                     Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
@@ -3871,21 +3885,31 @@ impl Connection {
                     ProtocolError::InvariantViolation("missing CommandGetLastMessageIdResponse"),
                 )?;
                 let rid = RequestId(resp.request_id);
-                self.pending_requests.remove(&rid);
-                let last_message_id = MessageId::from_pb(&resp.last_message_id);
-                let consumer_mark_delete_position = resp
-                    .consumer_mark_delete_position
-                    .as_ref()
-                    .map(MessageId::from_pb);
-                self.outcomes.insert(
-                    PendingOpKey::Request(rid),
-                    OpOutcome::LastMessageId {
-                        request_id: rid,
-                        last_message_id,
-                        consumer_mark_delete_position,
-                    },
-                );
-                self.wake_for_request(rid);
+                // Only a request still pending is answered. One that `cancel_request` or
+                // `abandon_request_waiter` retired (its awaiting future is gone), that a
+                // `reset` failed with `SessionLost`, or that this connection never issued has no
+                // future left to take an outcome, and recording one would keep it for the life
+                // of the connection (and overwrite a `SessionLost` a waiter still has to read).
+                if matches!(
+                    self.pending_requests.get(&rid),
+                    Some(PendingRequestKind::ConsumerGetLastMessageId { .. })
+                ) {
+                    self.pending_requests.remove(&rid);
+                    let last_message_id = MessageId::from_pb(&resp.last_message_id);
+                    let consumer_mark_delete_position = resp
+                        .consumer_mark_delete_position
+                        .as_ref()
+                        .map(MessageId::from_pb);
+                    self.outcomes.insert(
+                        PendingOpKey::Request(rid),
+                        OpOutcome::LastMessageId {
+                            request_id: rid,
+                            last_message_id,
+                            consumer_mark_delete_position,
+                        },
+                    );
+                    self.wake_for_request(rid);
+                }
             }
             pb::base_command::Type::CloseProducer => {
                 let close = command
@@ -5786,9 +5810,9 @@ impl Connection {
     /// the connection-wide slab, so we clear both sites unconditionally. For
     /// [`PendingOpKey::Request`] only the connection-wide slab is touched.
     ///
-    /// Called from the [`Drop`] impls on the runtime-side request futures
-    /// (`magnetar_runtime_tokio` / `magnetar_runtime_moonpool`
-    /// `RequestFut`) so a future that is cancelled
+    /// Called by [`Self::abandon_request_waiter`], which the [`Drop`] impls on the runtime-side
+    /// request futures (`magnetar_runtime_tokio` / `magnetar_runtime_moonpool`
+    /// `RequestFut`) call, so a future that is cancelled
     /// before its outcome lands does not leave an orphaned [`Waker`] in the
     /// `wakers` map. The leak is otherwise inert (the dispatcher would later
     /// `remove(&key)` and wake a no-op waker when the outcome arrives, or
@@ -5839,6 +5863,10 @@ impl Connection {
     /// An `EndTxn` request is the exception on purpose: its canonical request outlives a
     /// released waiter so that a retry resumes it ([`Self::release_end_txn_waiter`]).
     /// Idempotent so response-vs-drop races are harmless.
+    ///
+    /// The lookup-style client futures call this on drop. The producer and consumer request
+    /// futures call [`Self::abandon_request_waiter`] instead, because the reply arms of a producer
+    /// close and a seek read the pending kind that this removes.
     pub fn cancel_request(&mut self, request_id: RequestId) {
         let key = PendingOpKey::Request(request_id);
         self.unregister_waker(key);
@@ -5866,6 +5894,50 @@ impl Connection {
             self.pending_requests.get_mut(&request_id)
         {
             *has_waiter = false;
+        }
+    }
+
+    /// Hand a request whose awaiting future was dropped over to the connection, so the broker's
+    /// reply (or the session's loss) records no outcome nobody can take.
+    ///
+    /// The runtimes' producer and consumer `RequestFut`s call this from `Drop`. It unregisters the
+    /// future's waker, discards an outcome that landed before the drop and then acts on the kind
+    /// of the request still pending, because [`Self::cancel_request`] would also remove the kind a
+    /// reply arm reads and so cannot be used for every request:
+    ///
+    /// - `PendingRequestKind::ProducerClose` becomes `PendingRequestKind::ProducerCloseForgotten`,
+    ///   never removed: the `Success` and `Error` arms still fail the producer's pending sends once
+    ///   the broker answers the close, they merely record no outcome.
+    /// - `PendingRequestKind::Ack` has its waiter relinquished ([`Self::abandon_ack`]), which the
+    ///   `AckResponse` arm, [`Self::reset`] and [`Self::fail_all_pending`] already consume in
+    ///   place.
+    /// - `PendingRequestKind::GetSchema` and `PendingRequestKind::ConsumerGetLastMessageId` are
+    ///   removed, exactly as [`Self::cancel_request`] would: nothing else depends on them, and a
+    ///   late reply to a request that is no longer pending is ignored.
+    /// - `PendingRequestKind::ConsumerSeek` is left alone: the seek future's own drop guard
+    ///   ([`Self::abandon_consumer_seek_waiter`]) owns its hand-off and the re-attach it carries,
+    ///   and that guard is order-independent against the request future.
+    ///
+    /// Waker presence is deliberately not the signal: an ack is staged before its future's first
+    /// poll, so a live request can have no waker yet. The caller is the future's `Drop`, so
+    /// "dropped" is the signal. A request that was already answered is no longer pending, which
+    /// makes the call idempotent and harmless after a normal completion.
+    pub fn abandon_request_waiter(&mut self, request_id: RequestId) {
+        let key = PendingOpKey::Request(request_id);
+        self.unregister_waker(key);
+        let _ = self.take_outcome(key);
+        let Some(kind) = self.pending_requests.get_mut(&request_id) else {
+            return;
+        };
+        match *kind {
+            PendingRequestKind::ProducerClose { handle } => {
+                *kind = PendingRequestKind::ProducerCloseForgotten { handle };
+            }
+            PendingRequestKind::Ack { .. } => self.abandon_ack(request_id),
+            PendingRequestKind::GetSchema | PendingRequestKind::ConsumerGetLastMessageId { .. } => {
+                self.pending_requests.remove(&request_id);
+            }
+            _ => {}
         }
     }
 
@@ -7972,7 +8044,8 @@ impl Connection {
 
     /// Close a producer. The caller is expected to await the broker ack via
     /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
-    /// with [`Self::take_outcome`].
+    /// with [`Self::take_outcome`], and to hand the request over with
+    /// [`Self::abandon_request_waiter`] if it stops awaiting it.
     ///
     /// Sends the producer staged before the close are written ahead of
     /// `CommandCloseProducer` when the connection is `Connected` and the slot's

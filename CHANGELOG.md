@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A request whose future was dropped no longer leaves an outcome behind.**
+  A `Producer::close()` under a `timeout`, a cancelled `get_schema()` or `Consumer::last_message_id()` left the request pending, so the broker's reply was recorded in the connection's `outcomes` map and nothing could ever take it: one permanent entry per cancelled call, kept for the life of the connection.
+  The producer's `RequestFut` did not even discard an outcome that had landed just before the drop, and a reply to a last-message-id request that `cancel_request` had retired was recorded all the same.
+  The request futures of both engines now hand the request to the connection when they drop (`Connection::abandon_request_waiter`): a pending close is retagged as a forgotten close, so its acknowledgement still fails the sends the producer had in flight, and a schema lookup and a last-message-id request are retired; a pending ack keeps being relinquished (`Connection::abandon_ack`) and a seek stays with its own drop guard.
+  The `GetLastMessageIdResponse` arm answers only a request that is still pending.
+  A session reset also stopped recording `SessionLost` for a pending producer open and a pending consumer subscribe, which nothing awaits through the outcome slab and which cost two permanent entries per reset.
+  Both engines run the same `Connection` code and behave identically; the façade and runtime APIs are unchanged, and `magnetar-proto` gains the public `Connection::abandon_request_waiter` ([ADR-0152](specs/adr/0152-retire-the-waiter-of-a-request-whose-future-was-dropped.md)).
+
 - **A send the client gave up on is no longer written afterwards.**
   A producer stages the frame of each send in its slot until the connection drains it, and the drain is held while the broker has not acknowledged the (re-)attachment: after a broker-initiated `CommandCloseProducer`, which the client re-attaches in place, and during a reconnect rebuild.
   The `send_timeout` sweep removed an expired send's pending op and resolved its caller with `send timeout` but left the frame staged, so the broker's `CommandProducerSuccess` for the re-attach reopened the drain and wrote a message the caller had been told failed; a caller that retried published it twice, under two sequence ids that broker deduplication cannot match.

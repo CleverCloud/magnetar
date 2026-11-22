@@ -774,6 +774,9 @@ impl Consumer {
             }
         };
         shared.driver_waker.notify_one();
+        // The ack is staged above, before the returned future is first polled, so its
+        // `RequestFut` is built here and not inside the block: a future dropped without ever
+        // being polled must still hand its request to the connection (`RequestFut::drop`).
         let request = RequestFut { shared, request_id };
         async move {
             let outcome = request.await;
@@ -2183,19 +2186,18 @@ impl Future for RequestFut {
 }
 
 impl Drop for RequestFut {
-    /// Drop-time cleanup: clear our entry from the connection's waker slab and
-    /// discard an outcome that may have landed immediately before cancellation
-    /// so a cancelled consumer-side request future (seek, get-last-msg-id, ack
-    /// receipt, etc.) leaves neither surface behind.
-    /// See the matching docstring on
-    /// [`crate::client::RequestFut::drop`] for the rationale and
-    /// the lookup multi-agent review MEDIUM-4 finding.
+    /// Drop-time cleanup: hand a cancelled consumer-side request future (get-last-msg-id,
+    /// get-schema, ack receipt, seek) to the connection, which clears its waker, discards an
+    /// outcome that landed just before the drop and arranges for the broker's reply to record
+    /// none. A seek is left to its [`SeekAbandonGuard`]. See
+    /// [`magnetar_proto::Connection::abandon_request_waiter`] and the matching docstring on
+    /// [`crate::client::RequestFut::drop`] for the rationale and the lookup multi-agent review
+    /// MEDIUM-4 finding.
     fn drop(&mut self) {
-        let mut conn = self.shared.inner.lock();
-        let key = PendingOpKey::Request(self.request_id);
-        conn.unregister_waker(key);
-        let _ = conn.take_outcome(key);
-        conn.abandon_ack(self.request_id);
+        self.shared
+            .inner
+            .lock()
+            .abandon_request_waiter(self.request_id);
     }
 }
 
@@ -6370,5 +6372,77 @@ mod tests {
         consumer.force_close_best_effort();
         shared.mark_no_driver();
         consumer.force_close_best_effort();
+    }
+
+    /// A `last_message_id()` future that is dropped (a caller-side timeout, a cancelled task)
+    /// before the broker answers must not leave the reply behind as an `OpOutcome` nobody can
+    /// take: `Connection::outcomes` lives as long as the connection. 1:1 with the moonpool
+    /// engine's fixture (ADR-0024 parity).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_last_message_id_leaves_no_outcome_when_the_reply_lands_after_the_drop() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/cancelled-last-message-id".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer::assemble(
+            shared.clone(),
+            handle,
+            consumer_slot_for(&shared, handle),
+            None,
+        );
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let mut fut = Box::pin(consumer.last_message_id());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            fut.as_mut().poll(&mut context).is_pending(),
+            "the request future must be waiting for the broker's reply"
+        );
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(request_id)),
+            "the last-message-id request must be pending on the connection"
+        );
+        drop(fut);
+
+        let reply = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetLastMessageIdResponse as i32,
+            get_last_message_id_response: Some(pb::CommandGetLastMessageIdResponse {
+                last_message_id: pb::MessageIdData {
+                    ledger_id: 7,
+                    entry_id: 11,
+                    ..Default::default()
+                },
+                request_id,
+                consumer_mark_delete_position: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &reply).expect("encode CommandGetLastMessageIdResponse");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandGetLastMessageIdResponse");
+
+        assert!(
+            shared
+                .inner
+                .lock()
+                .take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(request_id)
+                ))
+                .is_none(),
+            "the CommandGetLastMessageIdResponse for a cancelled request left an outcome \
+             nobody can take"
+        );
     }
 }
