@@ -7535,6 +7535,32 @@ impl Connection {
             .unwrap_or_default()
     }
 
+    /// Put back, at the front of the consumer's dead-letter buffer, the messages a caller took
+    /// with [`Self::drain_dead_letter`] and did not finish with, so that a republish that failed
+    /// or was cancelled does not strand them: a drained dead letter is in no queue and no
+    /// unacked tracker, so nothing else would ever hand it back to the application.
+    ///
+    /// `drained_in_epoch` is [`Self::session_epoch`] as read in the same connection-lock section
+    /// as the drain. A [`Self::reset`] since then has already emptied the buffer and the broker
+    /// redelivers every unacked message to the new session, so the messages are dropped instead
+    /// of buffered a second time. They go straight into the buffer: they are not routed through
+    /// the dead-letter classification again, which would refund their flow permit and count them
+    /// in `total_msgs_dead_lettered` a second time. An unknown consumer ignores the call.
+    pub fn restore_dead_letter(
+        &mut self,
+        handle: ConsumerHandle,
+        drained_in_epoch: u64,
+        unprocessed: Vec<IncomingMessage>,
+    ) {
+        let same_session = drained_in_epoch == self.session_epoch;
+        if let Some(slot) = self.consumers.get(&handle).filter(|_| same_session) {
+            slot.state
+                .lock()
+                .dead_letter_pending
+                .splice(0..0, unprocessed);
+        }
+    }
+
     /// Returns the per-consumer pause flag, or `None` if the consumer handle is unknown.
     #[must_use]
     pub fn is_paused(&self, handle: ConsumerHandle) -> Option<bool> {

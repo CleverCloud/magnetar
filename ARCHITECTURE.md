@@ -1342,6 +1342,7 @@ One producer destination is shared across every child, each underlying operation
 Children run sequentially in deterministic vector/topic order, cancellation prevents future children from starting, and the first child error returns immediately with that topic in the context.
 Completed children remain completed: neither cancellation nor a later error rolls back their publications and acknowledgements.
 Concurrent aggregate calls are not serialized and race the runtimes' existing per-child destructive drains, so their counts and outcomes follow those drains; the coordinator adds no cross-call deduplication guarantee.
+A per-consumer call takes its buffer as a whole, but a call that fails or whose future is dropped puts every message it had not republished back at the front of the buffer (`Connection::restore_dead_letter`, [ADR-0154](specs/adr/0154-put-back-the-dead-letters-a-failed-republish-did-not-reach.md)): a message is owed until its DLQ publish returned `Ok`, and nothing is put back after a session reset, because the broker redelivers the unacked messages.
 
 ---
 

@@ -33,6 +33,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A failed or cancelled `republish_dead_letters` no longer strands the dead letters it did not reach.**
+  `Consumer::republish_dead_letters` and `republish_dead_letters_with_properties` took the whole dead-letter buffer before their first await, then published and acked the messages one by one.
+  The first failing DLQ publish or ack, or a dropped future, discarded the rest of the taken messages: they were in no queue and no unacked tracker, so a retry saw an empty buffer and returned `Ok(0)` while the broker kept every one of them unacked against the consumer, out of the application's reach, until the next reconnect or the close.
+  Both engines now keep the taken messages in a guard and put back, at the front of the buffer and in their original order, whatever the call had not republished, the message whose publish failed or was in flight included.
+  A message whose publish succeeded is not put back when its ack then fails, and nothing is put back after a session reset, which empties the buffer while the broker redelivers the unacked messages (putting them back would publish each of them to the DLQ twice).
+  A publish that was in flight when the future was dropped may still reach the DLQ, so that one message can be republished twice; the pipeline is at-least-once.
+  The restored messages are not routed through the dead-letter classification again, so their flow permit is not refunded a second time and `total_msgs_dead_lettered` does not count them twice.
+  Both engines run the same `Connection` code and behave identically; `magnetar-proto` gains the public `Connection::restore_dead_letter`, and `drain_dead_letter` and the façade APIs are unchanged ([ADR-0154](specs/adr/0154-put-back-the-dead-letters-a-failed-republish-did-not-reach.md)).
+
 - **A request whose future was dropped no longer leaves an outcome behind.**
   A `Producer::close()` under a `timeout`, a cancelled `get_schema()` or `Consumer::last_message_id()` left the request pending, so the broker's reply was recorded in the connection's `outcomes` map and nothing could ever take it: one permanent entry per cancelled call, kept for the life of the connection.
   The producer's `RequestFut` did not even discard an outcome that had landed just before the drop, and a reply to a last-message-id request that `cancel_request` had retired was recorded all the same.

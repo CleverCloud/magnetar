@@ -681,6 +681,12 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// entry via `dlq_producer`, preserving the message's metadata.
     /// Acks each original after a successful republish. Returns the
     /// number of messages republished.
+    ///
+    /// A call that fails, or whose future is dropped, puts the messages it
+    /// had not republished back at the front of the dead-letter buffer (the
+    /// one whose publish failed included), so `drain_dead_letter` and a retry
+    /// still see them; nothing is put back after a session reset, which
+    /// empties the buffer while the broker redelivers the unacked messages.
     fn republish_dead_letters<'a>(
         &'a self,
         dlq_producer: &'a Self::Producer,
