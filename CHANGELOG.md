@@ -33,6 +33,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A closed or dropped `PatternConsumer`, and a finished `topic_list_snapshot`, no longer leave a PIP-145 topic-list watcher behind.**
+  Nothing ever sent `CommandWatchTopicListClose`: each `PatternConsumer` and each `PulsarClient::topic_list_snapshot` call left a watcher at the broker and an entry in the connection's registry for the life of the connection, and since ADR-0136 every reconnect registered each of them again.
+  The broker pushed a `CommandWatchTopicUpdate` for every matching topic change to each, and both runtimes queued every one on a per-client queue with no bound that only `poll_topic_list_change` and `next_topic_list_change` drain.
+  A watcher the broker refused kept its registry entry too, and a snapshot future that was dropped or hit its deadline cancelled the registry entry but not the registration already on the wire.
+  `Connection::close_topic_watcher(watcher_id)` now forgets a watcher and stages one `CommandWatchTopicListClose` (nothing for an id it does not track, and nothing for a watcher a reset took down and that has not been registered again); `cancel_request` calls it for a watch still pending, and a refused watch loses its entry without a frame.
+  Each runtime's `Client::watch_topic_list_leased_with_operation_deadline` returns a `TopicWatcherLease` that closes the watcher when dropped, from the moment the registration is staged, so an error, a deadline, a dropped future and a reply that landed unread all close it; the persistent `Client::watch_topic_list` keeps its watcher for the life of the connection as before.
+  A `PatternConsumer` holds the lease until its last handle is closed or dropped, a failed child subscribe in the builder closes it too, and `topic_list_snapshot` drops it before it returns.
+  A `start_auto_reconcile` task holds a clone, so the watcher closes once that task ends or is aborted and the last clone drops.
+  The connection already queued a `TopicListChanged` only for a watcher it tracks ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)), so the delta queue stops growing once a watcher is closed.
+  Both engines run the same `Connection` code and behave identically.
+  `BrokerMetadataApi` gains the required method `watch_topic_list_leased_with_deadline`, which an out-of-tree implementor must add, and `topic_list_snapshot` is a one-shot: on the moonpool façade a caller that read its deltas through `runtime_client().next_topic_list_change()` must register its own watcher with the runtime client's `watch_topic_list`.
+  Still open: deltas already queued at the close, and the growth of the queue for as long as a live pattern consumer's watcher is registered and nothing drains it, which `subscribe_with_listener` gives its caller no way to do (`subscribe_with_listener_and_consumer` returns the consumer to call `update` on) (`docs/follow-ups.md` §31, [ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md)).
+
 - **`Producer::flush()` can no longer miss the wake-up that follows the last receipt.**
   `flush` read the producer's unacknowledged count and only then created the `Notified` it parks on.
   The driver ends every inbound packet with `driver_waker.notify_waiters()`, which stores no permit, so a pulse that landed between the read of a non-zero count and the creation of that `Notified` was lost: a flush that had just read `1` parked with nothing left to acknowledge and stayed pending until the next inbound frame, up to a keep-alive interval.
@@ -247,7 +260,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   A watcher still awaiting its first reply is not kept: its caller is told `SessionLost`.
   Nobody awaits the re-registration, so its reply is consumed in place (no `OpOutcome`, no event), a refusal is logged with a `warn!` and retried by the next rebuild, and a registration the broker never answered is owed again after the next reset.
   The returned `Vec<RequestId>` of `rebuild_consumers()` is unchanged: it lists the re-subscribed consumers only.
-  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher is ever deregistered, so the ones `topic_list_snapshot` leaves behind are now registered again on every reconnect (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+  The topic list the broker returns for the re-registration is not forwarded, so a topic created or deleted while the connection was down is still not reported; and no watcher was deregistered yet, so the ones `topic_list_snapshot` left behind were registered again on every reconnect, which [ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md) ends by closing a watcher with its last user (`docs/follow-ups.md` §31, [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
 
 - **A send relocated by a reconnect no longer hangs when its producer is closed before the rebuild.**
   `Producer::close()` and the last-clone drop guard mark the producer closed and leave its unacknowledged sends pending until the broker acknowledges the close.

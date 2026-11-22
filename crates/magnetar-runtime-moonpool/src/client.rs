@@ -1310,6 +1310,10 @@ impl<P: Providers> Client<P> {
     /// snapshot. Subsequent watcher deltas land on
     /// [`Self::next_topic_list_change`].
     ///
+    /// The watcher stays registered at the broker for the life of the connection once this
+    /// resolves: nothing here closes it, so a caller that only wants the snapshot should use
+    /// [`Self::watch_topic_list_leased_with_operation_deadline`] and drop the lease.
+    ///
     /// # Errors
     /// - [`ClientError::Broker`] when the broker rejects the subscribe.
     /// - [`ClientError::PeerClosed`] when the connection is terminal, the supervisor gave up, or
@@ -1344,14 +1348,44 @@ impl<P: Providers> Client<P> {
     /// (ADR-0060, 2026-11-19 amendment). Each re-issue allocates a new watcher id: `reset()`
     /// already discarded the severed watcher, so none is registered twice. 1:1 with the tokio
     /// engine's identically-named method (ADR-0024).
+    ///
+    /// The watcher it registers stays registered, as for [`Self::watch_topic_list`].
     #[doc(hidden)]
     pub async fn watch_topic_list_with_operation_deadline(
         &self,
         namespace: &str,
         pattern: &str,
-        mut deadline: OperationDeadline<'_>,
+        deadline: OperationDeadline<'_>,
         last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<(u64, Vec<String>), ClientError> {
+        let (watcher_id, topics, lease) = self
+            .watch_topic_list_leased_with_operation_deadline(
+                namespace,
+                pattern,
+                deadline,
+                last_broker_error,
+            )
+            .await?;
+        lease.detach();
+        Ok((watcher_id, topics))
+    }
+
+    /// [`Self::watch_topic_list_with_operation_deadline`] with the watcher tied to the returned
+    /// [`TopicWatcherLease`]: dropping the lease closes the watcher at the broker (ADR-0156).
+    ///
+    /// The lease exists from the moment the registration is staged, so every way out closes the
+    /// watcher: an error or a deadline (the pending registration is already on the wire), a
+    /// dropped future, and a reply that landed before the caller took it. A request severed by a
+    /// reconnect is re-issued under a new watcher id and a new lease; the severed watcher is
+    /// already gone from the connection, so its lease closes nothing.
+    #[doc(hidden)]
+    pub async fn watch_topic_list_leased_with_operation_deadline(
+        &self,
+        namespace: &str,
+        pattern: &str,
+        mut deadline: OperationDeadline<'_>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<(u64, Vec<String>, TopicWatcherLease), ClientError> {
         let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
         loop {
             if operation_deadline_expired(deadline.as_mut()) {
@@ -1360,9 +1394,13 @@ impl<P: Providers> Client<P> {
                     last_broker_error.clone(),
                 ));
             }
-            let request_id = {
+            let (request_id, watcher_id) = {
                 let mut conn = self.shared.inner.lock();
-                conn.watch_topic_list(namespace, pattern)
+                conn.watch_topic_list_with_watcher_id(namespace, pattern)
+            };
+            let lease = TopicWatcherLease {
+                shared: self.shared.clone(),
+                watcher_id: Some(watcher_id),
             };
             self.shared.driver_waker.notify_one();
             let request = RequestFut::cancellable(self.shared.clone(), request_id);
@@ -1380,7 +1418,7 @@ impl<P: Providers> Client<P> {
             match outcome {
                 OpOutcome::TopicListSnapshot {
                     watcher_id, topics, ..
-                } => return Ok((watcher_id, topics)),
+                } => return Ok((watcher_id, topics, lease)),
                 OpOutcome::SessionLost { .. } => {
                     self.await_session_reissue(
                         deadline.as_mut(),
@@ -2138,6 +2176,40 @@ impl Drop for RequestFut {
     }
 }
 
+/// A topic-list watcher (PIP-145) registered for one caller: dropping the lease closes the
+/// watcher at the broker (`CommandWatchTopicListClose`) and stops the connection tracking it
+/// (ADR-0156). Mirrors the tokio engine's identically-named lease.
+///
+/// Returned by [`Client::watch_topic_list_leased_with_operation_deadline`], and held from the
+/// moment the registration is staged, so a registration the caller never sees through is closed
+/// too. Closing is idempotent on the connection, so a lease dropped after the connection already
+/// stopped tracking its watcher (a refused registration, or a pending one that was cancelled)
+/// stages nothing. The `Drop` takes the connection lock, so the lease is only ever dropped with
+/// it not held, like a consumer's close guard.
+#[derive(Debug)]
+pub struct TopicWatcherLease {
+    shared: Arc<ConnectionShared>,
+    /// `None` once [`Self::detach`] handed the watcher over to the life of the connection.
+    watcher_id: Option<u64>,
+}
+
+impl TopicWatcherLease {
+    /// Give up the lease without closing the watcher: it stays registered until the connection
+    /// ends, which is what [`Client::watch_topic_list`] promises.
+    fn detach(mut self) {
+        self.watcher_id = None;
+    }
+}
+
+impl Drop for TopicWatcherLease {
+    fn drop(&mut self) {
+        if let Some(watcher_id) = self.watcher_id {
+            self.shared.inner.lock().close_topic_watcher(watcher_id);
+            self.shared.driver_waker.notify_one();
+        }
+    }
+}
+
 /// Normalise an advertised broker URL into the `host:port` form expected on
 /// `CommandConnect.proxy_to_broker_url`. The Apache Pulsar Proxy parses that field
 /// via `InetSocketAddress.createUnresolved`, so passing `pulsar://host:port` makes
@@ -2243,7 +2315,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        Client, ClientError, LookupIssue, LookupRetryState, LookupTopicResult,
+        Client, ClientError, LookupIssue, LookupRetryState, LookupTopicResult, TopicWatcherLease,
         direct_broker_authority, proxy_broker_authority,
     };
     use crate::{ConnectionShared, MoonpoolEngine, TopicListChange};
@@ -3326,6 +3398,104 @@ mod tests {
         assert_eq!(
             direct_broker_authority("pulsar://[::1]", 6650).unwrap(),
             "[::1]:6650"
+        );
+    }
+
+    /// Registers a watcher on `shared` and lets the broker acknowledge it. Returns the
+    /// registration's request id and the watcher id, with the registration frame already
+    /// drained.
+    fn acknowledged_watcher_for_test(
+        shared: &std::sync::Arc<ConnectionShared>,
+    ) -> (magnetar_proto::RequestId, u64) {
+        let (request_id, watcher_id) = shared
+            .inner
+            .lock()
+            .watch_topic_list_with_watcher_id("public/default", "events-.*");
+        assert!(
+            next_ordinary_command(shared).watch_topic_list.is_some(),
+            "the registration is staged"
+        );
+        apply_ordinary_broker_command(
+            shared,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::WatchTopicListSuccess as i32,
+                watch_topic_list_success: Some(pb::CommandWatchTopicListSuccess {
+                    request_id: request_id.0,
+                    watcher_id,
+                    topic: Vec::new(),
+                    topics_hash: "hash-1".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        while shared.inner.lock().poll_event().is_some() {}
+        (request_id, watcher_id)
+    }
+
+    /// ADR-0156: the reply lands, then the future awaiting it is dropped (or its deadline wins)
+    /// before it takes the outcome. `cancel_request`, which the dropped future calls, discards the
+    /// outcome and finds no pending request, so it cannot close the acknowledged watcher; the
+    /// lease, held since the registration was staged, does.
+    #[test]
+    fn dropping_the_lease_closes_a_watcher_whose_reply_the_caller_never_took() {
+        let client = ordinary_subscription_client_for_test();
+        let shared = client.shared.clone();
+        let (request_id, watcher_id) = acknowledged_watcher_for_test(&shared);
+        let lease = TopicWatcherLease {
+            shared: shared.clone(),
+            watcher_id: Some(watcher_id),
+        };
+
+        shared.inner.lock().cancel_request(request_id);
+        assert!(
+            shared.inner.lock().poll_transmit().is_empty(),
+            "cancelling the request alone leaves the acknowledged watcher registered"
+        );
+
+        drop(lease);
+        let close = next_ordinary_command(&shared)
+            .watch_topic_list_close
+            .expect("dropping the lease stages the close");
+        assert_eq!(close.watcher_id, watcher_id);
+    }
+
+    /// `detach` is how the persistent `watch_topic_list` keeps its watcher for the life of the
+    /// connection: dropping a detached lease stages nothing and the watcher still delivers.
+    #[test]
+    fn a_detached_lease_leaves_its_watcher_registered() {
+        let client = ordinary_subscription_client_for_test();
+        let shared = client.shared.clone();
+        let (_, watcher_id) = acknowledged_watcher_for_test(&shared);
+        let lease = TopicWatcherLease {
+            shared: shared.clone(),
+            watcher_id: Some(watcher_id),
+        };
+
+        lease.detach();
+
+        assert!(
+            shared.inner.lock().poll_transmit().is_empty(),
+            "a detached lease closes nothing"
+        );
+        apply_ordinary_broker_command(
+            &shared,
+            &pb::BaseCommand {
+                r#type: pb::base_command::Type::WatchTopicUpdate as i32,
+                watch_topic_update: Some(pb::CommandWatchTopicUpdate {
+                    watcher_id,
+                    new_topics: vec!["persistent://public/default/events-1".to_owned()],
+                    deleted_topics: Vec::new(),
+                    topics_hash: "hash-2".to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(
+                shared.inner.lock().poll_event(),
+                Some(magnetar_proto::ConnectionEvent::TopicListChanged { .. })
+            ),
+            "the watcher is still tracked"
         );
     }
 }

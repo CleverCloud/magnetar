@@ -1444,7 +1444,12 @@ Nobody awaits that request, so its reply is consumed in place: no `OpOutcome` is
 A registration the broker never answered is owed again after the next reset, and a rebuild is idempotent within a session.
 The topic list the broker returns is not forwarded, so a topic created or deleted while the connection was down is not reported to the pattern consumer; only later changes are.
 A `CommandWatchTopicListSuccess` is recorded as an outcome only while its request is still pending: a `topic_list_snapshot` future that was dropped or hit its operation deadline went through `Connection::cancel_request`, which removed the request and closed the watcher, so a reply that arrives afterwards is ignored instead of leaving the broker's whole topic list in `outcomes` for the life of the connection.
-Nothing deregisters a watcher (`CommandWatchTopicListClose` is never sent), so one lives as long as its connection and is registered again on every reconnect ([`docs/follow-ups.md`](docs/follow-ups.md) §31; [ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
+A watcher lives exactly as long as its last user ([ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md)).
+`Connection::close_topic_watcher(watcher_id)` forgets it and stages one `CommandWatchTopicListClose`; an id the connection does not track stages nothing, and a watcher a reset took down and that has not been registered again is only forgotten, because the broker holds nothing for it on the new session.
+`cancel_request` calls it for a watch still pending, and a refused watch loses its registry entry without a frame.
+The `CommandWatchTopicUpdate` arm queues a `TopicListChanged` only for a watcher the registry holds ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)), so the runtime's per-client delta queue stops growing once the watcher is closed.
+Each runtime's `Client::watch_topic_list_leased_with_operation_deadline` hands the caller a `TopicWatcherLease` held from the moment the registration is staged, whose `Drop` closes the watcher and wakes the driver; the persistent `watch_topic_list` detaches it.
+`PatternConsumer` holds the lease for as long as it lives and `PulsarClient::topic_list_snapshot` drops it before it returns, so a closed or dropped consumer and a finished or abandoned snapshot leave no watcher at the broker, no registry entry, and nothing to register again on a reconnect.
 
 ---
 

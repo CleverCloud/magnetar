@@ -69,7 +69,7 @@ pub use engine::{
     BackgroundApi, BackgroundFuture, BackgroundSleep, BrokerMetadataApi, ConsumerApi,
     CreateProducerApi, OpenProducerFut, OperationDeadline, ProducerApi, ReceiveBatchFut,
     ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange, WatchTopicListFut,
-    WatchTopicListWithIdFut,
+    WatchTopicListLeasedFut, WatchTopicListWithIdFut, WatcherLease,
 };
 pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 

@@ -13,7 +13,10 @@
 //!    topics_hash }`.
 //! 3. As the namespace changes, broker pushes `CommandWatchTopicUpdate { watcher_id, new_topics,
 //!    deleted_topics, topics_hash }`.
-//! 4. Client may send `CommandWatchTopicListClose { request_id, watcher_id }` to deregister.
+//! 4. Client sends `CommandWatchTopicListClose { request_id, watcher_id }` to deregister, once the
+//!    last user of the watcher is gone
+//!    ([`Connection::close_topic_watcher`](crate::Connection::close_topic_watcher), ADR-0156). The
+//!    broker's reply is not tracked: no future awaits it.
 //!
 //! # Across a reconnect
 //!
@@ -146,13 +149,14 @@ impl TopicWatcherRegistry {
             .is_some()
     }
 
-    // reason: called only from unit tests today; the engine hooks the close path through
-    // `Connection`'s pending-request dispatch instead, but the registry helper stays as the
-    // single ownership-clearing surface for the upcoming `CommandWatchTopicListClose` wiring.
-    #[allow(dead_code)]
-    pub(crate) fn close(&mut self, watcher_id: u64) {
-        self.by_watcher.remove(&watcher_id);
+    /// Stop tracking `watcher_id`: forget it and every request id that resolves to it. Returns
+    /// where its registration stood against the broker's current session, or `None` when the
+    /// registry held nothing for it, which is how the caller tells a watcher it must close at
+    /// the broker from one that is already gone.
+    pub(crate) fn close(&mut self, watcher_id: u64) -> Option<Registration> {
+        let watcher = self.by_watcher.remove(&watcher_id);
         self.by_request.retain(|_, v| *v != watcher_id);
+        watcher.map(|watcher| watcher.registration)
     }
 
     pub(crate) fn lookup_by_request(&mut self, request_id: RequestId) -> Option<&mut TopicWatcher> {
@@ -189,8 +193,26 @@ mod tests {
         );
         let w = r.lookup_by_request(RequestId(11)).expect("watcher present");
         assert_eq!(w.pattern, "public/default/foo-.*");
-        r.close(7);
+        assert_eq!(r.close(7), Some(Registration::Live));
         assert!(r.lookup_by_request(RequestId(11)).is_none());
+    }
+
+    #[test]
+    fn close_reports_where_the_registration_stood_and_nothing_for_an_unknown_watcher() {
+        let mut r = TopicWatcherRegistry::default();
+        r.insert(1, RequestId(10), watcher("a/.*", "a"));
+        r.insert(2, RequestId(20), watcher("b/.*", "b"));
+        r.insert(3, RequestId(30), watcher("c/.*", "c"));
+        r.lookup_by_watcher_id(2).unwrap().registration = Registration::Owed;
+        r.lookup_by_watcher_id(3).unwrap().registration = Registration::Awaiting(RequestId(31));
+
+        assert_eq!(r.close(1), Some(Registration::Live));
+        assert_eq!(r.close(2), Some(Registration::Owed));
+        assert_eq!(r.close(3), Some(Registration::Awaiting(RequestId(31))));
+        assert_eq!(r.close(1), None, "a watcher closes once");
+        assert_eq!(r.close(99), None, "an id never registered closes nothing");
+        assert!(r.by_watcher.is_empty());
+        assert!(r.by_request.is_empty());
     }
 
     #[test]

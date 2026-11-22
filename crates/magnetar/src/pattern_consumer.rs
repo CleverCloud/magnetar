@@ -10,8 +10,9 @@
 //!
 //! Reconciliation model
 //! --------------------
-//! - Initial snapshot: `topic_list_snapshot(namespace, pattern)` returns the current matching topic
-//!   set; the builder subscribes to each and keeps the id of the broker-side watcher it opened.
+//! - Initial snapshot: the builder registers a topic-list watcher and reads its first topic list
+//!   (`PulsarClient::topic_list_watch_with_deadline`), subscribes to each topic, and keeps the
+//!   watcher's id and its lease.
 //! - Streaming deltas: every `TopicListChanged` delta the broker pushes names its watcher, and the
 //!   connection buffers the deltas of all of its watchers together. Each
 //!   [`PatternConsumer::update`] call moves the pending deltas addressed to this consumer's own
@@ -22,6 +23,9 @@
 //!   next call resumes from what is left.
 //! - Callers drive reconciliation explicitly (no spawned task) — call `update()` from a timer or
 //!   before/after blocking work.
+//! - The consumer owns the topic-list watcher it registered at the broker for as long as it lives:
+//!   closing the last handle or dropping it closes the watcher too (`CommandWatchTopicListClose`),
+//!   and a failed build closes it before the error is returned (ADR-0156).
 //!
 //! Engine genericity (pass-2)
 //! --------------------------
@@ -104,6 +108,10 @@ struct Inner<C: ConsumerApi> {
     /// [`crate::ConsumerBuilder`] knob the user set on the original
     /// [`PatternConsumerBuilder`].
     template: ConsumerTemplate,
+    /// The topic-list watcher this consumer registered at the broker. Dropped with the last
+    /// handle, which closes it, so a closed or dropped consumer leaves no watcher behind
+    /// (ADR-0156).
+    _watcher: crate::WatcherLease,
 }
 
 #[derive(Debug, Clone)]
@@ -207,10 +215,11 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// it: newly-added topics are subscribed, removed topics are closed and dropped.
     ///
     /// Only the deltas of the broker-side watcher this consumer's builder opened are taken. Other
-    /// watchers on the client (another pattern consumer, a `topic_list_snapshot`) keep theirs
-    /// buffered for their own owners, so a consumer never subscribes a topic the broker announced
-    /// for somebody else's pattern. `client` must be the client that built the consumer: a watcher
-    /// id is only meaningful on the connection that allocated it.
+    /// watchers on the client (another pattern consumer, a runtime client's persistent
+    /// `watch_topic_list`) keep theirs buffered for their own owners, so a consumer never
+    /// subscribes a topic the broker announced for somebody else's pattern. `client` must be
+    /// the client that built the consumer: a watcher id is only meaningful on the connection
+    /// that allocated it.
     ///
     /// Deltas are applied in the order the broker sent them, so a topic created and then deleted
     /// between two calls is never subscribed. Idempotent; returns the count of additions and
@@ -568,6 +577,10 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// Engine-generic: works under any `E` whose `ClientState` implements both
     /// [`crate::SubscribeApi`] (for child-subscribes) and
     /// [`crate::BrokerMetadataApi`] (for delta polling) — both runtimes do.
+    ///
+    /// The task holds a clone of this consumer, so the topic-list watcher closes only when the
+    /// task ends and the last clone drops; abort the returned handle before relying on
+    /// [`PatternConsumer::close`] to release it.
     #[must_use = "the JoinHandle must be retained to abort the auto-reconcile task; dropping it detaches the task"]
     pub fn start_auto_reconcile<E>(
         &self,
@@ -612,6 +625,10 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// Close every underlying consumer. Drops the consumer set and returns the first
     /// per-child error encountered. Mirrors `MultiTopicsConsumer::close` semantics: best-effort
     /// teardown — every child gets a chance to close.
+    ///
+    /// Closing the last handle also closes the topic-list watcher the consumer registered at the
+    /// broker. With other clones outstanding this is a no-op, and the watcher closes when the
+    /// last clone is closed or dropped.
     ///
     /// # Errors
     ///
@@ -1099,9 +1116,11 @@ where
             start_message_rollback_duration_sec: self.start_message_rollback_duration_sec,
         };
 
-        let (watcher_id, topics) = self
+        // Held from here: a failed child subscribe below returns early and drops it, which
+        // closes the watcher.
+        let (watcher_id, topics, watcher) = self
             .client
-            .topic_list_snapshot_with_deadline(&namespace, &pattern, deadline)
+            .topic_list_watch_with_deadline(&namespace, &pattern, deadline)
             .await?;
 
         let mut opened: Vec<NamedConsumer<<E::ClientState as SubscribeApi>::Consumer>> =
@@ -1132,6 +1151,7 @@ where
                 namespace,
                 pattern,
                 template,
+                _watcher: watcher,
             }),
         })
     }
@@ -1358,6 +1378,7 @@ mod tests {
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,
+                _watcher: Box::new(()),
             }),
         }
     }

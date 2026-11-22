@@ -105,7 +105,7 @@ use tokio::sync::Notify;
 
 pub use crate::auth_file::file_token_auth;
 pub use crate::auto_cluster_failover::{AutoClusterFailover, TokioHealthProbe};
-pub use crate::client::Client;
+pub use crate::client::{Client, TopicWatcherLease};
 pub use crate::compress::CompressionError;
 pub use crate::consumer::{Consumer, ReceiveFut};
 pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};

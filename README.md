@@ -602,7 +602,8 @@ A cross (`❌`) is a known-missing feature.
 | Push listener on later topics   | ✅   | ✅       | `PatternConsumerBuilder::subscribe_with_listener_and_consumer()` returns the consumer next to the `MessageListenerHandle`: a topic created after subscribe reaches the listener once the caller's `update` (or `start_auto_reconcile`) on that consumer has subscribed it. `subscribe_with_listener()` returns the handle alone and delivers only the topics matched at subscribe. Java reconciles on its own; here discovery stays caller-driven. Proposed, [ADR-0140](specs/adr/0140-return-the-pattern-consumer-next-to-its-listener-handle.md). |
 
 The broker keeps a topic-list watcher per connection, so a supervised reconnect registers the acknowledged ones again and the delta stream resumes ([ADR-0136](specs/adr/0136-register-acknowledged-topic-list-watchers-again-after-a-reconnect.md)).
-A topic created or deleted while the connection was down is not reported to the pattern consumer, and no watcher is ever deregistered ([`docs/follow-ups.md`](docs/follow-ups.md) §31).
+A pattern consumer owns its watcher: closing the last handle or dropping it closes the watcher at the broker too, and `PulsarClient::topic_list_snapshot` is a one-shot that closes the watcher it registered before it returns ([ADR-0156](specs/adr/0156-close-a-topic-list-watcher-with-its-last-user.md)).
+A topic created or deleted while the connection was down is not reported to the pattern consumer ([`docs/follow-ups.md`](docs/follow-ups.md) §31).
 
 ### Reader
 

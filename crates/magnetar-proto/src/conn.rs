@@ -3399,6 +3399,12 @@ impl Connection {
                     let mut consumer = slot.state.lock();
                     consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
                 }
+                // A refused watch holds nothing at the broker, so only the registry entry goes
+                // (no close frame). The request kind that `cancel_request` reads to find the entry
+                // is consumed here, so the entry would otherwise stay until the next reset.
+                if let Some(PendingRequestKind::TopicWatcher { watcher_id }) = kind {
+                    self.topic_watchers.close(watcher_id);
+                }
                 if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
                     self.publish_consumer_unsubscribe(
                         handle,
@@ -5982,10 +5988,12 @@ impl Connection {
         let key = PendingOpKey::Request(request_id);
         self.unregister_waker(key);
         let _ = self.outcomes.remove(&key);
+        // A watch still pending has its registration on the wire, so the broker holds a watcher
+        // for it: close that too, not only the registry entry.
         if let Some(PendingRequestKind::TopicWatcher { watcher_id }) =
             self.pending_requests.remove(&request_id)
         {
-            self.topic_watchers.close(watcher_id);
+            self.close_topic_watcher(watcher_id);
         }
         let _ = self.lookup.take_lookup(request_id);
         let _ = self.lookup.take_partition(request_id);
@@ -8138,9 +8146,20 @@ impl Connection {
     /// Once the broker acknowledges it, the watcher outlives a supervised reconnect:
     /// [`Self::reset`] keeps it and [`Self::rebuild_consumers`] registers it again on the new
     /// session. One that is still awaiting its first reply when the session resets is not kept;
-    /// its request resolves with [`OpOutcome::SessionLost`]. Nothing deregisters a watcher yet
-    /// (`CommandWatchTopicListClose` is never sent), so it lives as long as the connection.
+    /// its request resolves with [`OpOutcome::SessionLost`]. The watcher lives until
+    /// [`Self::close_topic_watcher`] closes it, [`Self::cancel_request`] cancels its pending
+    /// registration, or the connection ends.
     pub fn watch_topic_list(&mut self, namespace: &str, pattern: &str) -> RequestId {
+        self.watch_topic_list_with_watcher_id(namespace, pattern).0
+    }
+
+    /// [`Self::watch_topic_list`], also returning the watcher id the registration names, which is
+    /// what [`Self::close_topic_watcher`] takes.
+    pub fn watch_topic_list_with_watcher_id(
+        &mut self,
+        namespace: &str,
+        pattern: &str,
+    ) -> (RequestId, u64) {
         let request_id = self.alloc_request_id();
         let watcher_id = self.next_watcher_id;
         self.next_watcher_id = self.next_watcher_id.wrapping_add(1);
@@ -8158,7 +8177,37 @@ impl Connection {
         );
         self.pending_requests
             .insert(request_id, PendingRequestKind::TopicWatcher { watcher_id });
-        request_id
+        (request_id, watcher_id)
+    }
+
+    /// Stop tracking the topic-list watcher `watcher_id` and ask the broker to drop it
+    /// (`CommandWatchTopicListClose`), so the broker stops pushing updates for it and neither a
+    /// reconnect nor a delta queue keeps paying for a watcher nobody uses (ADR-0156).
+    ///
+    /// Idempotent: an id the connection does not track (never registered, already closed, or
+    /// dropped by a reset while it still awaited its first reply) stages nothing. A watcher a
+    /// reset took down with its session and that has not been registered again is only forgotten:
+    /// the broker holds nothing for it on the current session. Any other watcher also gets the
+    /// frame, including one whose re-registration is on the wire, and the reply to that
+    /// registration is then ignored.
+    ///
+    /// The close registers no pending request. Nobody awaits it, and the broker's `Success` or
+    /// `Error` for a request id the connection does not track is consumed silently by their arms.
+    pub fn close_topic_watcher(&mut self, watcher_id: u64) {
+        if let Some(registration) = self.topic_watchers.close(watcher_id)
+            && registration != Registration::Owed
+        {
+            let request_id = self.alloc_request_id();
+            let base = pb::BaseCommand {
+                r#type: pb::base_command::Type::WatchTopicListClose as i32,
+                watch_topic_list_close: Some(pb::CommandWatchTopicListClose {
+                    request_id: request_id.0,
+                    watcher_id,
+                }),
+                ..Default::default()
+            };
+            let _ = self.encode_command(&base);
+        }
     }
 
     /// Encode one `CommandWatchTopicList`. `topics_hash` is the last hash the broker reported for
@@ -16374,6 +16423,47 @@ mod conn_state_tests {
         encode_command(&mut frame, &update).expect("encode WatchTopicUpdate");
         conn.handle_bytes(Instant::now(), &frame)
             .expect("handle WatchTopicUpdate");
+    }
+    /// A watch the broker refuses (`CommandError`) holds nothing at the broker, but its registry
+    /// entry must not outlive the future that awaited it: the `Error` arm removes the pending
+    /// `TopicWatcher` kind that `cancel_request` reads to find the entry, so the cancel the
+    /// dropped `RequestFut` makes afterwards finds nothing and the entry stays until a reset.
+    #[test]
+    fn cancel_request_removes_the_topic_watcher_of_a_refused_watch() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let request_id = conn.watch_topic_list("public/default", "events-.*");
+
+        let refusal = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request_id.0,
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "synthetic watch refusal".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &refusal).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Request(request_id)),
+                Some(OpOutcome::Error { .. })
+            ),
+            "control: the refusal resolves the watch with an error"
+        );
+
+        // What the cancellable `RequestFut` does when the awaiting future is dropped.
+        conn.cancel_request(request_id);
+
+        assert!(
+            conn.topic_watchers.lookup_by_request(request_id).is_none(),
+            "a refused watch must not keep its watcher registry entry once its future is gone"
+        );
     }
 
     /// Every `TopicListChanged` event queued on `conn`, as `(watcher_id, added)`.
