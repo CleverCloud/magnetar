@@ -1,6 +1,6 @@
 # ADR-0113 — Run the performance measurement nightly instead of on every pull request
 
-- **Status**: Accepted
+- **Status**: Retired on 2026-11-23. The scheduled and manually dispatched performance workflow was removed. The local harness remains available.
 - **Date**: 2026-10-09
 - **Decider**: Florentin Dubois
 - **Tags**: ci, performance, moonpool, process

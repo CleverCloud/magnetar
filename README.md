@@ -35,7 +35,7 @@ Neither report or artifact set can satisfy the other ([ADR-0121](specs/adr/0121-
 Magnetar is independent of the existing `pulsar-rs` crate — it shares neither code nor dependencies.
 The goal is feature-complete parity with the Apache Pulsar Java client.
 
-The [performance measurement harness](docs/performance.md) inventories executable test families, reports native suite costs and runs separate client collector passes in one frozen image. [performance.yml](.github/workflows/performance.yml) runs nightly on `main` against the head its last successful nightly measured, and on manual dispatch against `main` ([ADR-0113](specs/adr/0113-run-performance-measurement-nightly.md)); it reconciles workspace and fixed/open-seed Moonpool families and reports informative base / candidate / absolute / relative costs with explicit coverage gaps.
+The [performance measurement harness](docs/performance.md) can be run locally to inventory executable test families, measure native suite costs and compare client collector passes in one frozen image.
 Its current coverage is explicitly partial; a baseline must be qualified before production optimizations are evaluated.
 
 [`magnetar-proto`]: crates/magnetar-proto
