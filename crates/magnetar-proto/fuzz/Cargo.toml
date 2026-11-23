@@ -11,9 +11,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys  = "^0.4.13"
 arbitrary      = { version = "^1.5.0", features = ["derive"] }
-bytes          = "^1.12.1"
+bytes          = "^1.12.2"
 magnetar-proto = { path = ".." }
-prost          = "^0.14.4"
+prost          = "^0.14.6"
 
 [[bin]]
 name = "decode_one"
