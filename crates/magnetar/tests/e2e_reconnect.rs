@@ -107,6 +107,7 @@ const BROKER_RESTART_SEND_TIMEOUT: Duration = Duration::from_secs(90);
 async fn start_restartable_broker() -> Result<Running, Box<dyn std::error::Error>> {
     init_tracing();
     Pulsar::new(Broker::Default)
+        .config("advertisedAddress", "127.0.0.1")
         .config("listeningInterface", "lo")
         .config("allowLoopback", "true")
         .start()
