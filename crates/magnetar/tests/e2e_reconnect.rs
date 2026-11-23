@@ -39,7 +39,7 @@ use uuid::Uuid;
 mod common;
 
 use common::frame_proxy::{FrameProxy, authority};
-use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, init_tracing, start_pulsar};
+use common::pulsar::{BROKER_BINARY_PORT, Broker, Pulsar, Running, init_tracing, start_pulsar};
 
 static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -102,6 +102,17 @@ static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// [ADR-0072]: ../../../specs/adr/0072-java-parity-default-send-timeout.md
 const BROKER_RESTART_SEND_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// The colocated bookie must remain reachable at the address stored in existing
+/// ledgers even when Docker assigns a different bridge IP after a restart.
+async fn start_restartable_broker() -> Result<Running, Box<dyn std::error::Error>> {
+    init_tracing();
+    Pulsar::new(Broker::Default)
+        .config("listeningInterface", "lo")
+        .config("allowLoopback", "true")
+        .start()
+        .await
+}
+
 /// Open a producer carrying the broker-restart publish budget.
 ///
 /// Every broker-restart test below opens through this, so [`BROKER_RESTART_SEND_TIMEOUT`] cannot
@@ -152,7 +163,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn std::error::Error>>
 {
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
-    let (service_url, _admin_url, container) = start_pulsar().await?;
+    let (service_url, _admin_url, container) = start_restartable_broker().await?.into_parts();
 
     // The fixture maps the broker's 6650 to a random host port and reuses
     // that port across `docker restart` only when the port is explicitly
@@ -287,7 +298,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
 async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
-    let (service_url, _admin_url, container) = start_pulsar().await?;
+    let (service_url, _admin_url, container) = start_restartable_broker().await?.into_parts();
 
     let failover = ControlledClusterFailover::new(service_url);
     let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
@@ -416,16 +427,7 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
 async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
-    // The broker and bookie share this container. Use a stable loopback endpoint
-    // even if Docker assigns a new bridge IP: Pulsar 4.2.5 persists the address
-    // in the cookie; a fresh 5.0.0 bookie uses a logical ID and loopback endpoint.
-    init_tracing();
-    let (service_url, _admin_url, container) = Pulsar::new(Broker::Default)
-        .config("listeningInterface", "lo")
-        .config("allowLoopback", "true")
-        .start()
-        .await?
-        .into_parts();
+    let (service_url, _admin_url, container) = start_restartable_broker().await?.into_parts();
 
     // See the producer-restart test for why we wrap in
     // `ControlledClusterFailover` — `docker restart` against the fixture's
@@ -593,7 +595,7 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
 
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
 
-    let (service_url, _admin_url, container) = start_pulsar().await?;
+    let (service_url, _admin_url, container) = start_restartable_broker().await?.into_parts();
 
     // Strip the `pulsar://` scheme: the moonpool engine dials a raw
     // `host:port` authority. The failover provider keeps the scheme — the
@@ -726,7 +728,7 @@ fn assert_no_session_lost_leak<E: std::fmt::Debug>(e: &E, op: &str) {
 async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
 -> Result<(), Box<dyn std::error::Error>> {
     let _restart_guard = BROKER_RESTART_LOCK.lock().await;
-    let (service_url, _admin_url, container) = start_pulsar().await?;
+    let (service_url, _admin_url, container) = start_restartable_broker().await?.into_parts();
 
     let failover = ControlledClusterFailover::new(service_url);
     let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
