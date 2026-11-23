@@ -151,8 +151,8 @@ moonpool-sim = "^0.8.0"
 # `url=<pkg-url>` part and a typed JSON part (`functionConfig` /
 # `sourceConfig` / `sinkConfig`), even when no file is uploaded.
 reqwest = { version = "^0.13.5", default-features = false, features = ["json", "form", "multipart"] }
-url     = "^2.5.8"
-clap    = { version = "^4.6.8", features = ["derive", "env"] }
+url     = "^2.5.9"
+clap    = { version = "^4.6.9", features = ["derive", "env"] }
 
 # Telemetry + errors
 opentelemetry      = { version = "^0.33.1", default-features = false, features = ["trace"] }
@@ -160,7 +160,7 @@ opentelemetry_sdk  = { version = "^0.33.1", default-features = false, features =
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 thiserror          = "^2.0.21"
-anyhow             = "^1.0.104"
+anyhow             = "^1.0.105"
 hdrhistogram       = { version = "^7.6.0", default-features = false }
 
 # Test infrastructure

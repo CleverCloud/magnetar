@@ -27,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Raised the workspace dependency floors to `url` 2.5.9, `clap` 4.6.9 and `anyhow` 1.0.105. The `url` update fixes a stack overflow in `Url::origin()` ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)).
+  The fuzz workspace now requires `bytes` 1.12.2 and `prost` 0.14.6. Both Cargo lockfiles were refreshed for Rust 1.95.
+
 - **PIP-145 topic-list deltas are addressed to their watcher: `Client::poll_topic_list_change` and `BrokerMetadataApi::poll_topic_list_change` take a `watcher_id`, `TopicListChange` (both runtimes) gains a `watcher_id` field, and the hidden deadline seam `watch_topic_list_with_operation_deadline` / `BrokerMetadataApi::watch_topic_list_with_deadline` resolve to `(watcher_id, topics)`** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
   `ConnectionEvent::TopicListChanged` and `OpOutcome::TopicListSnapshot` carry the id too, and `watch_topic_list_with_deadline` no longer has a default body (a default cannot know the id), so an external `BrokerMetadataApi` implementor must add it.
   `watch_topic_list`, `PulsarClient::topic_list_snapshot` and the any-watcher `Client::next_topic_list_change` are unchanged.
