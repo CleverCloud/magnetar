@@ -260,7 +260,7 @@ done
 ```
 
 In CI, the per-PR / per-push pipeline ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) exercises the moonpool suite under the default seed via the regular `test` job.
-[performance.yml](../.github/workflows/performance.yml) additionally runs the complete no-buggify Moonpool package nightly on `main` and on manual dispatch with seeds 1..32 and the deduplicated open anchors from both exact references ([ADR-0113](../specs/adr/0113-run-performance-measurement-nightly.md)); `ci.yml`'s `seed-replay` replays the open anchors on every PR. The dedicated [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) workflow keeps daily discovery with 128 freshly rolled random `u64` seeds; see the 2026-10-03 amendment in [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) and [measurement scope](performance.md).
+Run fixed seeds 1..32 locally using the [testing guide](testing.md). The `seed-replay` job in `ci.yml` covers open anchors on each PR. The [daily sweep](../.github/workflows/moonpool-seed-sweep.yml) runs 128 random seeds.
 Failing seeds are echoed in the run summary — reproduce locally with `MOONPOOL_SEED=<hex> cargo test -p magnetar-runtime-moonpool …`.
 
 ## Differential equivalence harness

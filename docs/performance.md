@@ -2,7 +2,7 @@
 
 The versioned external driver starts with an executable test inventory and native suite measurements.
 It is a partial harness: the façade example supplies bounded client/control scenarios and a same-image campaign now connects those scenarios to independent collectors.
-The PR workflow reconciles complete functional family inventories and separately reports measured metrics; the advanced dimensions below and baseline qualification remain required work.
+The campaign harness reconciles functional family inventories and separately reports measured metrics. The advanced dimensions below and baseline qualification remain open.
 Doctests are inventoried and executed as functional evidence; their client performance metrics remain unmeasured.
 Production optimization must wait for that qualification.
 
@@ -48,8 +48,7 @@ Reconciliation failures persist a machine-readable reason and distinguish known 
 Repetitions are bounded to 2–20.
 After both builds and doctest execution finish, the driver repeats the base binary first to record base/base variation, then alternates base/candidate order.
 The SHA arguments are immutable lowercase 40-character revisions supplied by the caller; each checkout must match its expected side before building.
-CI resolves both revisions immutably and retains them together with the event contract: a nightly compares `main`'s head against the `main` head its last successful nightly measured, and a manual dispatch compares the dispatched ref against `main`'s head.
-A dispatched branch targeting another branch still compares performance against this frozen `main`; its target branch is not silently substituted.
+For a local comparison, supply the base and candidate revisions explicitly.
 
 ## Executable inventory and functional work
 
@@ -166,7 +165,7 @@ Invalid collections return an error status separately from performance verdicts.
 Current campaigns always report partial because scenario/instrumentation coverage and doctest performance measurements are incomplete; they cannot be presented as a qualified baseline.
 
 No privileged PR execution or external publisher is part of this initial driver.
-The complete workflow executes all families nightly and on manual dispatch with read-only repository permission, publishes raw artifacts and appends the Markdown to the Actions summary.
+Run the campaign locally to collect measurements.
 
 ## Existing isolated scenario example
 
@@ -326,9 +325,11 @@ Client scenario calibration also accepts identical conservative checkout inputs,
 GNU time CPU fields have 0.01-second granularity: zero reported fields are rendered `<0.01`, and CPU deltas/percentages are unavailable because quantization cannot prove an exact difference.
 This granularity is not an accuracy claim and is retained in both JSON and Markdown.
 
-## Nightly and on-demand delivery
+## Historical GitHub Actions delivery
 
-[performance.yml](../.github/workflows/performance.yml) runs nightly at 01:17 UTC on `main` and on manual dispatch; it no longer runs on pull requests ([ADR-0113](../specs/adr/0113-run-performance-measurement-nightly.md)). A nightly takes the head SHA of the last successful scheduled run as its base and `main`'s current head as its candidate, so consecutive nights cover `main` without a gap; without such a run, or when that head is no longer an ancestor of `main`, the base is `main` as of 24 hours earlier. When base and candidate are equal it writes "nothing to measure" to the summary and skips the workers and reconciliation. A manual dispatch resolves `refs/heads/main` independently and preserves that exact SHA together with the exact dispatched head SHA, including a branch that targets something other than main; a pull request that needs a measurement before merge dispatches the workflow on its branch. The workflow checks out the candidate head and never presents a merge ref or another target as a comparison against main. Only the prepare job holds `actions: read`, to look up the previous nightly. Nightly and manual runs use separate concurrency groups: a dispatch never cancels a running nightly, and a nightly still running when the next one fires makes it wait. The same audited performance example is overlaid onto the base reference; each reference retains its own Cargo.lock and builds with `--locked`. The image is built once with verified Dockerfile/base labels, saved into a checksummed artifact and loaded/inspected by workers. No external image registry is published.
+The performance workflow was retired on 2026-11-23. The following describes the archived campaign configuration.
+
+The former `performance.yml` ran nightly at 01:17 UTC on `main` and on manual dispatch; it no longer runs on pull requests ([ADR-0113](../specs/adr/0113-run-performance-measurement-nightly.md)). A nightly takes the head SHA of the last successful scheduled run as its base and `main`'s current head as its candidate, so consecutive nights cover `main` without a gap; without such a run, or when that head is no longer an ancestor of `main`, the base is `main` as of 24 hours earlier. When base and candidate are equal it writes "nothing to measure" to the summary and skips the workers and reconciliation. A manual dispatch resolves `refs/heads/main` independently and preserves that exact SHA together with the exact dispatched head SHA, including a branch that targets something other than main; a pull request that needs a measurement before merge dispatches the workflow on its branch. The workflow checks out the candidate head and never presents a merge ref or another target as a comparison against main. Only the prepare job holds `actions: read`, to look up the previous nightly. Nightly and manual runs use separate concurrency groups: a dispatch never cancels a running nightly, and a nightly still running when the next one fires makes it wait. The same audited performance example is overlaid onto the base reference; each reference retains its own Cargo.lock and builds with `--locked`. The image is built once with verified Dockerfile/base labels, saved into a checksummed artifact and loaded/inspected by workers. No external image registry is published.
 
 The command entry points are also available through `cargo xtask performance -- campaign ci ...`; the driver remains external to measured binaries:
 

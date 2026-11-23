@@ -84,15 +84,8 @@ class CampaignContracts(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 CAMPAIGN.proxy_network_identity(changed)
 
-    def test_ci_workspace_capacity_preserves_worker_caps_and_exhaustive_union(self):
-        workflow = Path(CAMPAIGN.__file__).resolve().parents[1] / ".github/workflows/performance.yml"
-        text = workflow.read_text()
-        shards, seed_workers = map(int, re.search(r"--shards (\d+) --seed-workers (\d+)", text).groups())
-        self.assertEqual((shards, seed_workers), (8, 4))
-        worker_job = text.split("  workers:\n", 1)[1].split("  reconcile:\n", 1)[0]
-        self.assertIn("timeout-minutes: 180", worker_job)
-        self.assertIn("max-parallel: 4", worker_job)
-        self.assertIn("fail-fast: false", worker_job)
+    def test_workspace_shards_and_seed_workers_cover_the_exhaustive_union(self):
+        shards, seed_workers = 8, 4
         families = [f"crate/tests/family-{index}.rs::family-{index}" for index in range(53)]
         assigned = [[family for family in families if CAMPAIGN.perf.shard_matches(family, shard, shards)]
                     for shard in range(shards)]
