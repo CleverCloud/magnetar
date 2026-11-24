@@ -268,7 +268,7 @@ checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
 
 [[package]]
 name = "magnetar-proto"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "bytes",
  "crc32c",

@@ -1,6 +1,6 @@
 # magnetarctl
 
-> **Status: stable (2.0.0).** The `produce`, `consume`, and `admin` subcommands are fully wired.
+> **Status: stable (2.1.0).** The `produce`, `consume`, and `admin` subcommands are fully wired.
 
 `magnetarctl` — the command-line client for Apache Pulsar built on the magnetar workspace.
 

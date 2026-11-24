@@ -4,11 +4,11 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.95-orange.svg)](specs/adr/0124-raise-msrv-to-rust-1-95.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (2.0.0).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
+> **Status: stable (2.1.0).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
-> PIP-460 scalable topics ship as an experimental, assignment-driven StreamConsumer behind a default-off feature; the CLI `produce`/`consume` subcommands remain not-yet-implemented.
-> Both experimental surfaces are excluded from the 1.0 stability promise.
-> PIP-460 scalable topics remain experimental and are excluded from the 1.0 stability promise.
+> PIP-460 scalable topics ship as an experimental, assignment-driven `StreamConsumer` behind the default-off `scalable-topics` feature.
+> `magnetarctl` includes data-plane `produce` and `consume` commands alongside its admin commands.
+> [ADR-0066](specs/adr/0066-release-1-0-0-first-stable.md) records the stability exceptions for PIP-460 and the CLI data-plane commands.
 
 ---
 
@@ -73,7 +73,7 @@ Its current coverage is explicitly partial; a baseline must be qualified before 
 
 ## Installation
 
-Magnetar's current release is `2.0.0`.
+Magnetar's current release is `2.1.0`.
 The façade is published to crates.io under the package name `magnetar-driver` (the `magnetar` name is held by an unrelated crate); its library / import name stays `magnetar`, so `use magnetar::...` is unchanged.
 
 Depend on it directly from crates.io:
@@ -81,14 +81,14 @@ Depend on it directly from crates.io:
 ```toml
 [dependencies]
 # crates.io package is `magnetar-driver`; the import path stays `magnetar`.
-magnetar-driver = "2.0.0"
+magnetar-driver = "2.1.0"
 ```
 
 Or pin the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v2.0.0" }
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v2.1.0" }
 ```
 
 The default feature set enables the tokio engine.
@@ -128,7 +128,7 @@ The workspace ships twelve crates:
 | `magnetar-runtime-moonpool` | Deterministic-simulation engine (rustls-over-bytepipe TLS, no native TLS).                                                          |
 | `magnetar-differential`     | Tokio ↔ moonpool `EventStream` equivalence harness (cross-engine tests).                                                            |
 | `magnetar-admin`            | REST admin client (`reqwest` + `rustls-tls`).                                                                                       |
-| `magnetarctl`               | `magnetarctl` binary — admin lookups today, produce / consume / inspect coming.                                                     |
+| `magnetarctl`               | `magnetarctl` binary with admin, produce and consume commands.                                                                      |
 | `magnetar-fakes`            | In-process broker fake (dev-dep). Mirrors Java's `MockBrokerService`.                                                               |
 | `magnetar-auth-oauth2`      | OAuth2 ClientCredentialsFlow auth provider.                                                                                         |
 | `magnetar-auth-sasl`        | SASL auth provider.                                                                                                                 |
@@ -183,14 +183,14 @@ The `magnetarctl` binary exposes a sozu / systemd-style identification banner:
 
 ```
 $ magnetarctl --version
-magnetarctl 2.0.0 (a1b2c3d4e5f6)
+magnetarctl 2.1.0 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.95.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
-- `-V` prints a single-line, never-colorized form: `magnetarctl 2.0.0 (sha)`.
+- `-V` prints a single-line, never-colorized form: `magnetarctl 2.1.0 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for reproducible builds.

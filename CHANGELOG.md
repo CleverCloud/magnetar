@@ -6,10 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-24
+
+### Upgrading from 2.0
+
+- External implementations of `ConsumerApi` must implement `is_terminal`.
+  Implementations of `SubscribeApi` or `CreateProducerApi` must also implement the new `BackgroundApi` supertrait.
+- External implementations of `BrokerMetadataApi` must implement both deadline-based watcher methods and accept a watcher ID in `poll_topic_list_change`.
+  Code that destructures topic-list events or outcomes must account for the watcher ID.
+  For ongoing runtime deltas, register a watcher with `watch_topic_list`.
+  `PulsarClient::topic_list_snapshot` now closes its watcher after returning the snapshot.
+- Struct literals for `SubscribeRequest`, `StreamConsumerOptions` or `SegmentConsumerOptions` must initialize `max_uncompressed_message_size`.
+  Builders and `Default` supply the 5 MiB default.
+
 ### Added
 
-- `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit. The option is also available on reader and V5 consumer builders; bounded codec output and the aggregate batch-memory budget still apply. Raw `None` payloads are not decompressed and retain the normal wire-frame limit.
-- Adding `max_uncompressed_message_size` to public `SubscribeRequest`, `StreamConsumerOptions`, and `SegmentConsumerOptions` requires downstream struct-literal initializers to provide the field; callers using `Default` or builders remain source-compatible.
+- `ConsumerBuilder::max_uncompressed_message_size(bytes)` sets the per-consumer decompressed-payload ceiling, defaulting to 5 MiB independently of the wire-frame limit.
+  The option is also available on reader and V5 consumer builders.
+  Bounded codec output and the aggregate batch-memory budget still apply.
+  Uncompressed payloads retain the normal wire-frame limit.
+  See [#914](https://github.com/CleverCloud/magnetar/pull/914).
 - **`Consumer::is_terminal()` on both runtime consumers, surfaced as `ConsumerApi::is_terminal()`, and `WrapperReceiver::is_terminal()`** ([ADR-0130](specs/adr/0130-tell-a-terminal-receive-error-from-a-message-error-in-push-delivery.md)).
   `Consumer::is_terminal()` evaluates the gate `receive()` itself resolves `Err(Closed)` on, which is broader than `is_closed()`: a per-handle terminal subscribe failure never sets `closed`.
   `ConsumerApi::is_terminal` is a required method of that trait, so an external implementor must add it.
@@ -27,14 +43,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Raised the workspace dependency floors to `url` 2.5.9, `clap` 4.6.9 and `anyhow` 1.0.105. The `url` update fixes a stack overflow in `Url::origin()` ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)).
-  The fuzz workspace now requires `bytes` 1.12.2 and `prost` 0.14.6. Both Cargo lockfiles were refreshed for Rust 1.95.
+- Raised the workspace dependency floors to `clap` 4.6.9 and `anyhow` 1.0.105.
+  The fuzz workspace now requires `bytes` 1.12.2 and `prost` 0.14.6.
+  The workspace and fuzz lockfiles were refreshed.
 
 - **PIP-145 topic-list deltas are addressed to their watcher: `Client::poll_topic_list_change` and `BrokerMetadataApi::poll_topic_list_change` take a `watcher_id`, `TopicListChange` (both runtimes) gains a `watcher_id` field, and the hidden deadline seam `watch_topic_list_with_operation_deadline` / `BrokerMetadataApi::watch_topic_list_with_deadline` resolve to `(watcher_id, topics)`** ([ADR-0132](specs/adr/0132-address-pip-145-topic-list-deltas-to-their-watcher.md)).
   `ConnectionEvent::TopicListChanged` and `OpOutcome::TopicListSnapshot` carry the id too, and `watch_topic_list_with_deadline` no longer has a default body (a default cannot know the id), so an external `BrokerMetadataApi` implementor must add it.
-  `watch_topic_list`, `PulsarClient::topic_list_snapshot` and the any-watcher `Client::next_topic_list_change` are unchanged.
+  `Client::watch_topic_list` still registers a persistent watcher, and `Client::next_topic_list_change` can still read events from any watcher.
+
+### Security
+
+- Updated `url` to 2.5.9 to address [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html).
 
 ### Fixed
+
+- **Long-lived connections reclaim closed handles and abandoned results.**
+  Both runtimes release closed producer and consumer slots and discard results whose futures were dropped.
+  The protocol bounds observation-only events while continuing to settle operations and deliver events needed by the driver.
+  See [#913](https://github.com/CleverCloud/magnetar/pull/913).
+
+- **A seek the broker never answers no longer freezes the consumer for the life of the connection.**
+  `Connection::seek` freezes the consumer until the broker's reply lifts it, and `handle_timeout` bounded a pending ack and a pending producer open by a deadline but not a seek.
+  A reply that never came (a lost `CommandSuccess`/`CommandError`, or a broker that tore the consumer down mid-seek and went quiet) therefore left the consumer dropping every delivery, granting no flow, invisible to the stall watchdog and refused every re-attach, and parked the `seek_*` future forever, whether the future was still awaited or had been dropped.
+  A pending seek now has the connection's `operation_timeout` as its deadline (`poll_timeout` arms it, `handle_timeout` sweeps it) and its expiry is a rejection the broker never sent: the awaiting future fails with `ClientError::Broker { code: -1, message: "seek timeout" }`, and the rejected-seek recovery restores the queue and flow window, delivers the dispatches held meanwhile, or re-attaches a consumer the broker had closed.
+  The deadline runs from the instant the runtime issued the seek (`Connection::seek_at`, a new public entry; `Connection::seek` keeps its signature and falls back to the last decoded frame), because a seek is user-driven and never re-issued, so a baseline up to one keepalive interval old would fail a healthy seek.
+  A broker reply that arrives after the expiry is ignored.
+  Both engines run the same `Connection` code and behave identically ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)).
 
 - **A closed or dropped `PatternConsumer`, and a finished `topic_list_snapshot`, no longer leave a PIP-145 topic-list watcher behind.**
   Nothing ever sent `CommandWatchTopicListClose`: each `PatternConsumer` and each `PulsarClient::topic_list_snapshot` call left a watcher at the broker and an entry in the connection's registry for the life of the connection, and since ADR-0136 every reconnect registered each of them again.
@@ -469,14 +503,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - **Pulsar batch members retain their own metadata.** Tokio and Moonpool use the member's key, ordering key, event time and properties when republishing to a dead-letter or retry topic. The same metadata reaches the façade accessors, `TableView` and OpenTelemetry context extraction. Keyless members stay keyless, and only a missing event time inherits from the batch envelope. See [#905](https://github.com/CleverCloud/magnetar/pull/905).
-
-- **A seek the broker never answers no longer freezes the consumer for the life of the connection.**
-  `Connection::seek` freezes the consumer until the broker's reply lifts it, and `handle_timeout` bounded a pending ack and a pending producer open by a deadline but not a seek.
-  A reply that never came (a lost `CommandSuccess`/`CommandError`, or a broker that tore the consumer down mid-seek and went quiet) therefore left the consumer dropping every delivery, granting no flow, invisible to the stall watchdog and refused every re-attach, and parked the `seek_*` future forever, whether the future was still awaited or had been dropped.
-  A pending seek now has the connection's `operation_timeout` as its deadline (`poll_timeout` arms it, `handle_timeout` sweeps it) and its expiry is a rejection the broker never sent: the awaiting future fails with `ClientError::Broker { code: -1, message: "seek timeout" }`, and the rejected-seek recovery restores the queue and flow window, delivers the dispatches held meanwhile, or re-attaches a consumer the broker had closed.
-  The deadline runs from the instant the runtime issued the seek (`Connection::seek_at`, a new public entry; `Connection::seek` keeps its signature and falls back to the last decoded frame), because a seek is user-driven and never re-issued, so a baseline up to one keepalive interval old would fail a healthy seek.
-  A broker reply that arrives after the expiry is ignored.
-  Both engines run the same `Connection` code and behave identically ([ADR-0153](specs/adr/0153-bound-a-pending-seek-by-operation-timeout.md)).
 
 - **`e2e_scalable_topic_info_cli_round_trip` finds `magnetarctl` again under Rust 1.100.**
   Cargo 1.100 moved test executables from `target/<profile>/deps/` to `target/<profile>/build/<package>/<hash>/out/`, while `magnetarctl` stays at `target/<profile>/magnetarctl`, so the test's fixed one-level walk no longer reached it and failed on every e2e axis.
@@ -1459,7 +1485,8 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
-[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/CleverCloud/magnetar/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/CleverCloud/magnetar/releases/tag/v2.1.0
 [2.0.0]: https://github.com/CleverCloud/magnetar/releases/tag/v2.0.0
 [1.8.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.8.0
 [1.7.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.7.2

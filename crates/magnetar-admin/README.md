@@ -1,6 +1,6 @@
 # magnetar-admin
 
-> **Status: stable (2.0.0).** Async admin REST client backing `magnetarctl` across the V2 + V3 surface — policies, schemas, brokers/bookies, subscriptions, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> **Status: stable (2.1.0).** Async admin REST client backing `magnetarctl` across the V2 + V3 surface — policies, schemas, brokers/bookies, subscriptions, and the V3 Functions / IO Sources / IO Sinks / Packages families.
 
 Async Apache Pulsar admin REST client (`/admin/v2/...`).
 Backed by `reqwest` with the `rustls-tls` feature — no `native-tls`, no `openssl`.
