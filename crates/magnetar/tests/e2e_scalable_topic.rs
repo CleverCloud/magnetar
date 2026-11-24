@@ -1169,14 +1169,14 @@ async fn exercise_strict_split(
     create_scalable_topic(container, &topic, 1).await?;
     created_topics.push(topic.clone());
     let (initial_epoch, parent_id) = initial_segment(client, &topic).await?;
-    let consumer = subscribe_byte_stream(
-        client,
-        &topic,
-        &subscription,
-        &format!("e2e-strict-consumer-{suffix}"),
-        OrderingMode::Strict,
-    )
-    .await?;
+    // The default budget grows when the split assigns both successors a FLOW permit.
+    let consumer = client
+        .scalable_stream_consumer(&topic, Arc::new(BytesSchema::new()))
+        .subscription(&subscription)
+        .consumer_name(format!("e2e-strict-consumer-{suffix}"))
+        .ordering_mode(OrderingMode::Strict)
+        .subscribe()
+        .await?;
     wait_for_status(&consumer, "one attached strict parent", |status| {
         status.assigned_segments() == 1 && status.attached_segments() == 1
     })
@@ -1192,7 +1192,15 @@ async fn exercise_strict_split(
     }
     split_scalable_segment(container, &topic, parent_id).await?;
     let child_payloads = payloads(&format!("strict-child-{suffix}"), 6);
-    publish_scalable_messages(container, service_url, &topic, &child_payloads).await?;
+    // Send the same key to one successor so the other stays idle after the split.
+    publish_scalable_messages_with_key(
+        container,
+        service_url,
+        &topic,
+        &child_payloads,
+        Some("strict-descendant"),
+    )
+    .await?;
     let blocked = wait_for_status(&consumer, "strict split DAG with parent only", |status| {
         status
             .layout_epoch()
@@ -1230,13 +1238,15 @@ async fn exercise_strict_split(
             .await?;
     let children =
         receive_expected_messages(&consumer, &child_payloads, "strict descendant phase").await?;
-    if children
+    let delivering_segments: BTreeSet<u64> = children
         .iter()
-        .any(|message| !child_ids.contains(&message.source().segment_id().0))
-    {
-        return Err(
-            "strict child payload was delivered outside the exact successor assignment".into(),
-        );
+        .map(|message| message.source().segment_id().0)
+        .collect();
+    if delivering_segments.len() != 1 || !delivering_segments.is_subset(&child_ids) {
+        return Err(format!(
+            "strict descendant payloads reached {delivering_segments:?}, expected one of {child_ids:?}"
+        )
+        .into());
     }
     consumer.acknowledge_batch(&children).await?;
     consumer.close().await?;

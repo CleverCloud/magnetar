@@ -239,6 +239,9 @@ The batching and chunking suite ([`e2e_batch_chunk.rs`](../crates/magnetar/tests
 
 The scalable-topic suite uses the shared `Broker::Scalable` fixture (`5.0.0` by default, overridden by `MAGNETAR_PULSAR_SCALABLE_IMAGE_TAG`) and the pinned `Broker::V4Lts` fixture (`4.2.5`) for capability refusal.
 Its `e2e_hardened_scalable_stream_consumer_contract` is a regular test under the `scalable-topics` product feature with no `#[ignore]` or separate e2e feature; compile/discovery without Docker is not runtime evidence.
+The Strict split phase uses the default growing receive budget ([ADR-0141](../specs/adr/0141-default-stream-consumer-budget-grows-per-assigned-segment.md)).
+It gives the two successors one FLOW permit each and publishes all descendant payloads with the same key.
+The test verifies that no descendant arrives before the parent is acknowledged and that the one active successor subsequently delivers every expected payload.
 The Tokio and Moonpool wrappers of `e2e_scalable_bucket_owners_preserve_keys_and_transactional_acknowledgements` exercise one segment assigned to two members by entry bucket: 16 stable keys, 320 plain messages with repeated cumulative ACK, transactional commit and abort, exact abort replay on a fresh consumer, and eventual clean leave while the client connection remains open.
 Its flow-control regression creates twelve direct Failover child-topic consumers with receiver queues of 2,000, sends five-chunk messages to one partition and small messages to the other eleven, and requires every partition to drain without reaching zero broker permits below the logical-message refill threshold.
 This topology is the end-to-end verification contract for [ADR-0076](../specs/adr/0076-conserve-flow-permits-across-chunk-reassembly.md).
